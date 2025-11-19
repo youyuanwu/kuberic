@@ -98,4 +98,5 @@ message IsLeaderRequest {}
 message IsLeaderReply {
   bool is_leader = 1;
   string leader_id = 2;
+  uint32 lease_transitions = 3;
 }

@@ -9,10 +9,12 @@ use greeter::{GreeterServer, MyGreeter};
 mod storage;
 use storage::{MyStorage, StorageServer};
 
-pub mod storage_client;
-
 pub mod leader;
-use leader::{LeaderElection, LeaderElectionServer, MyLeaderElection};
+pub mod storage_client;
+use leader::LeaderElection;
+pub mod leader_rpc;
+use leader_rpc::{LeaderElectionServer, MyLeaderElection};
+pub mod app;
 
 #[cfg(test)]
 mod tests;
@@ -31,40 +33,47 @@ async fn main() {
     let storage = MyStorage::default();
 
     // Initialize leader election
-    let leader_state = LeaderElection::new();
-    let leader_election = MyLeaderElection::new(leader_state.clone());
+    let leader_state = LeaderElection::new(
+        "xedio".to_string(),
+        "xdata-app-lease".to_string(),
+        std::time::Duration::from_secs(15),
+    );
+
+    let (app, leader_state_arc) = app::App::new(leader_state);
 
     info!("Starting gRPC server on {}", addr);
 
     // Create a cancellation token
     let cancellation_token = CancellationToken::new();
-    let token_clone = cancellation_token.clone();
-    let token_clone_election = cancellation_token.clone();
+    let token_sig = cancellation_token.clone();
+    let token_app = cancellation_token.clone();
 
     // Spawn leader election loop
-    tokio::spawn(async move {
-        leader_state.election_loop(token_clone_election).await;
+    let app_task = tokio::spawn(async move {
+        app.run(token_app).await;
     });
 
     // Spawn a task to listen for shutdown signals
     tokio::spawn(async move {
         wait_for_shutdown_signal().await;
         info!("Shutdown signal received, cancelling server...");
-        token_clone.cancel();
+        token_sig.cancel();
     });
 
     // Run the server with graceful shutdown using the cancellation token
     let result = Server::builder()
         .add_service(GreeterServer::new(greeter))
         .add_service(StorageServer::new(storage))
-        .add_service(LeaderElectionServer::new(leader_election))
+        .add_service(LeaderElectionServer::new(MyLeaderElection::new(
+            leader_state_arc,
+        )))
         .serve_with_shutdown(addr, cancellation_token.cancelled())
         .await;
 
     if let Err(e) = result {
         error!("Server error: {}", e);
     }
-
+    app_task.await.unwrap();
     info!("Server shutdown complete");
 }
 
