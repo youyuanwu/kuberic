@@ -12,6 +12,7 @@ tonic-prost.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 kube-leader-election.workspace = true
+kube-lease-manager.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true
 rand.workspace = true

@@ -16,6 +16,8 @@ pub mod leader_rpc;
 use leader_rpc::{LeaderElectionServer, MyLeaderElection};
 pub mod app;
 
+pub mod leader2;
+
 #[cfg(test)]
 mod tests;
 

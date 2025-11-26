@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 pub type Epoch = i32;
 
+#[derive(Debug)]
 pub enum LeaderElectionEvent {
     Leader(Epoch),
     StandBy(Epoch),
@@ -41,22 +42,22 @@ impl LeaderElection {
             .map(char::from)
             .collect();
         let holder_id = format!("shared-lease-{}", random.to_lowercase());
-
+        tracing::info!("Starting leader election with holder id {}", holder_id);
         let leadership = LeaseLock::new(
             client,
             &self.namespace,
             LeaseLockParams {
-                holder_id,
+                holder_id: holder_id.clone(),
                 lease_name: self.lease_name.clone(),
                 lease_ttl: self.lease_ttl,
             },
         );
         let mut cur_epoch: Epoch = 0;
         let mut on_new_leader = async |ll: LeaseLockResult| {
-            tracing::info!("Leader election try acquire or renew: {:?}", ll);
             if ll.acquired_lease {
                 let l = ll.lease.unwrap();
                 let epoch = l.spec.unwrap().lease_transitions.unwrap();
+                tracing::info!("Acquired leadership {} for epoch {}", holder_id, epoch);
                 assert!(epoch >= cur_epoch, "Epoch should not go backwards");
                 cur_epoch = epoch;
                 sender
@@ -64,9 +65,9 @@ impl LeaderElection {
                     .await
                     .unwrap();
             } else {
+                tracing::info!("No lease acquired, standing by");
                 // There is no lease acquired
                 // TODO: Make a kube call to get the current lease state
-
                 sender
                     .send(LeaderElectionEvent::StandBy(cur_epoch))
                     .await
@@ -75,6 +76,7 @@ impl LeaderElection {
         };
 
         loop {
+            let start_time = tokio::time::Instant::now();
             tokio::select! {
                 result = leadership.try_acquire_or_renew() => {
                     match result {
@@ -90,8 +92,14 @@ impl LeaderElection {
                 }
             }
             // sleep before next renew attempt
+            // should be the smaller of the half of lease ttl or time left until half ttl
+            let elapsed = start_time.elapsed();
+            let sleep_threshold = self.lease_ttl / 2;
+            if elapsed >= sleep_threshold {
+                continue;
+            }
             tokio::select! {
-                _ = tokio::time::sleep(self.lease_ttl / 2) => {},
+                _ = tokio::time::sleep(sleep_threshold) => {},
                 _ = token.cancelled() => {
                     tracing::info!("Leader election loop received shutdown signal");
                     break;
@@ -108,36 +116,79 @@ impl LeaderElection {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::Namespace;
 
-    const TEST_NAMESPACE: &str = "xedio-test-ns";
+    pub const TEST_NAMESPACE: &str = "xedio-test-ns";
 
-    async fn create_test_namespace() {
-        let client = kube::Client::try_default().await.unwrap();
-        let namespaces = kube::Api::all(client);
-        let ns = Namespace {
-            metadata: kube::api::ObjectMeta {
-                name: Some(TEST_NAMESPACE.to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        match namespaces
-            .create(&kube::api::PostParams::default(), &ns)
-            .await
-        {
-            Ok(_) => (),
-            Err(kube::Error::Api(ae)) if ae.code == 409 => (), // already exists
-            Err(e) => panic!("Failed to create test namespace: {}", e),
+    pub mod helper {
+
+        use crate::leader::LeaderElection;
+
+        pub struct LETestReceiver {
+            pub rx: tokio::sync::mpsc::Receiver<super::LeaderElectionEvent>,
+            pub token: tokio_util::sync::CancellationToken,
+            pub join_handle: tokio::task::JoinHandle<()>,
         }
+        impl LETestReceiver {
+            pub fn new(le: LeaderElection) -> Self {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                let token = tokio_util::sync::CancellationToken::new();
+                let token_cp = token.clone();
+                let join_handle = tokio::spawn(async move {
+                    le.election_loop(tx, token_cp).await;
+                });
+                LETestReceiver {
+                    rx,
+                    token,
+                    join_handle,
+                }
+            }
+
+            pub async fn must_receive_event(&mut self) -> super::LeaderElectionEvent {
+                self.rx.recv().await.unwrap()
+            }
+
+            pub async fn shutdown(mut self) {
+                self.token.cancel();
+                self.join_handle.await.unwrap();
+                // get the shutdown event
+                let e = self.rx.recv().await.unwrap();
+                matches!(e, super::LeaderElectionEvent::Shutdown(Ok(())));
+            }
+        }
+    }
+
+    /// Create test namespace once for all tests.
+    pub async fn init_test_namespace() {
+        static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        INIT.get_or_init(|| async {
+            let client = kube::Client::try_default().await.unwrap();
+            let namespaces = kube::Api::all(client);
+            let ns = Namespace {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(TEST_NAMESPACE.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            match namespaces
+                .create(&kube::api::PostParams::default(), &ns)
+                .await
+            {
+                Ok(_) => (),
+                Err(kube::Error::Api(ae)) if ae.code == 409 => (), // already exists
+                Err(e) => panic!("Failed to create test namespace: {}", e),
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
     #[test_log::test]
     async fn test_leader_election_new() {
-        create_test_namespace().await;
+        init_test_namespace().await;
         let le = LeaderElection::new(
             TEST_NAMESPACE.to_string(),
             "test-lease1".to_string(),
@@ -163,5 +214,52 @@ mod tests {
             .await
             .expect("Should receive shutdown event");
         matches!(ev, LeaderElectionEvent::Shutdown(Ok(())));
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    #[ignore = "Has race conditions, needs to be fixed"]
+    async fn test_change_leader() {
+        init_test_namespace().await;
+
+        let lease_name = "test-lease2".to_string();
+        let le1 = LeaderElection::new(
+            TEST_NAMESPACE.to_string(),
+            lease_name.clone(),
+            Duration::from_secs(2),
+        );
+        let le2 = LeaderElection::new(
+            TEST_NAMESPACE.to_string(),
+            lease_name.clone(),
+            Duration::from_secs(2),
+        );
+
+        let mut receiver1 = helper::LETestReceiver::new(le1);
+        let mut receiver2 = helper::LETestReceiver::new(le2);
+        // First receiver should become leader
+        let ev1 = receiver1.must_receive_event().await;
+        let leader_epoch = if let LeaderElectionEvent::Leader(epoch) = ev1 {
+            epoch
+        } else {
+            panic!("First receiver should become leader: got {:?}", ev1);
+        };
+        // Second receiver should be standby
+        let ev2 = receiver2.must_receive_event().await;
+        let standby_epoch = if let LeaderElectionEvent::StandBy(epoch) = ev2 {
+            epoch
+        } else {
+            panic!("Second receiver should be standby: got {:?}", ev2);
+        };
+        assert_eq!(leader_epoch, standby_epoch);
+        // Shutdown first receiver
+        receiver1.shutdown().await;
+        // Second receiver should become leader now
+        let ev2 = receiver2.must_receive_event().await;
+        let leader_epoch2 = if let LeaderElectionEvent::Leader(epoch) = ev2 {
+            epoch
+        } else {
+            panic!("Second receiver should become leader: got {:?}", ev2);
+        };
+        assert_eq!(leader_epoch2, leader_epoch + 1);
     }
 }
