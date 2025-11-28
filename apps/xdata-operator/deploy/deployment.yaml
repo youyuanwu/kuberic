@@ -1,0 +1,104 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: xedio
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xdata-operator
+  namespace: xedio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: xdata-operator
+rules:
+# Permissions to manage XdataApp CRDs
+- apiGroups: ["xedio.io"]
+  resources: ["xdataapps"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["xedio.io"]
+  resources: ["xdataapps/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["xedio.io"]
+  resources: ["xdataapps/finalizers"]
+  verbs: ["update"]
+# Permissions to manage StatefulSets
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Permissions to manage Services
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Permissions to manage ServiceAccounts
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Permissions to manage Roles and RoleBindings
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["roles", "rolebindings"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Permissions for PersistentVolumeClaims (managed by StatefulSet)
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
+# Permissions for leader election
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: xdata-operator
+subjects:
+- kind: ServiceAccount
+  name: xdata-operator
+  namespace: xedio
+roleRef:
+  kind: ClusterRole
+  name: xdata-operator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xdata-operator
+  namespace: xedio
+  labels:
+    app: xdata-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: xdata-operator
+  template:
+    metadata:
+      labels:
+        app: xdata-operator
+    spec:
+      serviceAccountName: xdata-operator
+      containers:
+      - name: operator
+        image: localhost/xdata-operator:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: RUST_LOG
+          value: "info"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL

@@ -1,26 +1,19 @@
-set(_app_executable ${CMAKE_SOURCE_DIR}/target/debug/xdata-app)
-
 # Cannot make output dep because we don't know the src changed.
-add_custom_target(xdata-app
-    COMMAND cargo build --package xdata-app
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMENT "Building xdata-app with Cargo"
-    VERBATIM
-)
 
-add_custom_target(xdata-app-image
-    COMMAND docker build -t xdata-app
+add_custom_target(xdata-app-image ALL
+    COMMAND docker build -t localhost/xdata-app
         -f apps/xdata-app/deploy/Dockerfile .
+    COMMAND ${KIND_EXE} load docker-image localhost/xdata-app:latest --name kind
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    DEPENDS xdata-app
+    DEPENDS build_rust_bins
 )
 
 add_custom_target(xdata-deploy
-    COMMAND kubectl apply -f apps/xdata-app/deploy/statefulset.yaml
+    COMMAND kubectl apply -f apps/xdata-operator/deploy/xdataapp-example.yaml
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
 add_custom_target(xdata-delete
-    COMMAND kubectl delete -f apps/xdata-app/deploy/statefulset.yaml
+    COMMAND kubectl delete -f apps/xdata-operator/deploy/xdataapp-example.yaml
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )

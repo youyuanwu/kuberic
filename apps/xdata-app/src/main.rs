@@ -3,23 +3,18 @@ use tonic::transport::Server;
 use tracing::{error, info};
 
 mod greeter;
-mod proto;
 use greeter::{GreeterServer, MyGreeter};
 
 mod storage;
 use storage::{MyStorage, StorageServer};
 
 pub mod leader;
-pub mod storage_client;
 use leader::LeaderElection;
 pub mod leader_rpc;
 use leader_rpc::{LeaderElectionServer, MyLeaderElection};
 pub mod app;
 
 pub mod leader2;
-
-#[cfg(test)]
-mod tests;
 
 #[tokio::main]
 async fn main() {

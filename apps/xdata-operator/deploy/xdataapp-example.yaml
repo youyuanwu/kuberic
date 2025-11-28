@@ -1,0 +1,46 @@
+---
+# Example XdataApp Custom Resource
+# This demonstrates how to deploy an xdata-app StatefulSet using the operator
+apiVersion: xedio.io/v1
+kind: XdataApp
+metadata:
+  name: xdata-app
+  namespace: xedio
+spec:
+  # Number of replicas (default: 3)
+  replicas: 3
+  
+  # Container image (default: localhost/xdata-app:latest)
+  image: localhost/xdata-app:latest
+  
+  # Image pull policy (default: IfNotPresent)
+  imagePullPolicy: IfNotPresent
+  
+  # Storage size for each pod's PVC (default: 256Mi)
+  storage: "256Mi"
+  
+  # Resource requirements
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "100m"
+    limits:
+      memory: "256Mi"
+      cpu: "500m"
+  
+  # Application port (default: 8080)
+  port: 8080
+  
+  # Environment variables (optional)
+  env:
+  - name: RUST_LOG
+    value: "info"
+  # - name: CUSTOM_VAR
+  #   value: "custom-value"
+  
+  # Enable NodePort services for individual pods (default: true)
+  nodePortEnabled: true
+  
+  # Base NodePort number (default: 30081)
+  # Will create services with ports 30081, 30082, 30083, etc.
+  nodePortBase: 30081

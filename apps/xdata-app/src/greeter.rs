@@ -1,9 +1,9 @@
 use tonic::{Request, Response, Status};
 use tracing::{debug, info};
 
-use crate::proto::hello_world;
 pub use hello_world::greeter_server::{Greeter, GreeterServer};
 use hello_world::{HelloReply, HelloRequest, PodNameReply, PodNameRequest};
+use xedio_shared::proto::hello_world;
 
 #[derive(Debug, Default)]
 pub struct MyGreeter {}

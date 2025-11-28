@@ -1,0 +1,16 @@
+[package]
+name = "xedio-tests"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+tokio.workspace = true
+xedio-data.workspace = true
+xedio-shared.workspace = true
+tonic.workspace = true
+kube.workspace = true
+k8s-openapi.workspace = true
+test-log.workspace = true
+tracing.workspace = true

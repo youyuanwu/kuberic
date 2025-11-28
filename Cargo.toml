@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = [ "apps/xdata-app","xedio-data"
+members = [ "apps/xdata-app", "apps/xdata-operator","xedio-data"
 
-]
+, "xedio-shared", "xedio-tests"]
 
 [workspace.dependencies]
 mssf-com = {version = "0.5" }
@@ -28,4 +28,11 @@ kube-leader-election = "0.42.0"
 kube = { version = "2", features = ["runtime", "derive"] }
 kube-lease-manager = "0.10.0"
 k8s-openapi = { version = "0.26", features = ["latest", "schemars"] }
+kuberator = "0.2"
 rand = "0.9"
+schemars = "1"
+
+xedio-data = { path = "xedio-data" }
+xedio-shared = { path = "xedio-shared" }
+xedio-tests = { path = "xedio-tests" }
+xdata-app = { path = "apps/xdata-app" }

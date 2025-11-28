@@ -2,6 +2,10 @@ name: build
 
 on: [push, pull_request]
 
+
+env:
+  XEDIO_CI: true
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
@@ -39,17 +43,19 @@ jobs:
       run: cmake -S . -B build
 
     - name: Build Docker Image
-      run: cmake --build build --target xdata-app-image
+      run: cmake --build build --target all
 
-    - name: Load Docker Image into KinD
-      run: kind load docker-image xdata-app:latest --name kind
-    
-    - name: Deploy to KinD
-      run: cmake --build build --target xdata-deploy
+    # Rust test auto deploys.
+    # - name: Deploy to KinD
+    #   run: cmake --build build --target xdata-deploy xdata-op-deploy
 
-    - name: Wait for xdata-app StatefulSet
-      run: |
-        kubectl wait --for=jsonpath='{.status.readyReplicas}'=3 --timeout=120s statefulset/xdata-app -n xedio
+    # - name: Wait for xdata-app StatefulSet
+    #   run: |
+    #     kubectl wait --for=jsonpath='{.status.readyReplicas}'=3 --timeout=120s statefulset/xdata-app -n xedio
+
+    # - name: Wait for xdata-operator Deployment
+    #   run: |
+    #     kubectl wait --for=jsonpath='{.status.readyReplicas}'=1 --timeout=120s deployment/xdata-operator -n xedio
 
     - name: Run cargo test
       run: cargo test --all -- --nocapture

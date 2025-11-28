@@ -63,7 +63,7 @@ spec:
       serviceAccountName: xdata-app
       containers:
       - name: xdata-app
-        image: xdata-app:latest
+        image: localhost/xdata-app:latest
         imagePullPolicy: IfNotPresent
         env:
         - name: RUST_LOG

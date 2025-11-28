@@ -1,11 +1,15 @@
-use crate::proto::hello_world::{HelloRequest, greeter_client::GreeterClient};
-use crate::storage_client::StorageClientExt;
+use xedio_shared::proto::hello_world;
+use xedio_shared::proto::hello_world::{HelloRequest, greeter_client::GreeterClient};
+use xedio_shared::storage_client::StorageClientExt;
 
 /// Test calling the gRPC service via NodePort
 /// This test assumes the service is deployed in k8s and accessible via NodePort
 /// Run with: cargo test -- --ignored
 #[tokio::test]
+#[test_log::test]
 async fn test_call_nodeport() {
+    crate::test_utils::ensure_test_env_deployed().await;
+
     // Replace with your actual node IP
     // You can find it with: kubectl get nodes -o wide
     let node_ip = std::env::var("K8S_NODE_IP").unwrap_or_else(|_| "localhost".to_string());
@@ -43,7 +47,7 @@ async fn test_call_nodeport() {
     assert_eq!(response.message, "Hello TestClient!");
 
     // Get the Pod name
-    let pod_name_request = tonic::Request::new(crate::proto::hello_world::PodNameRequest {});
+    let pod_name_request = tonic::Request::new(hello_world::PodNameRequest {});
     let pod_name_response = greeter_client
         .get_pod_name(pod_name_request)
         .await
@@ -54,8 +58,7 @@ async fn test_call_nodeport() {
     assert_eq!(pod_name_response.pod_name, "xdata-app-0"); // Adjust based on your pod naming
 
     // create a storage client
-    let storage_client =
-        crate::proto::hello_world::storage_client::StorageClient::new(channel.clone());
+    let storage_client = hello_world::storage_client::StorageClient::new(channel.clone());
 
     // Create a file handle for easier operations
     let mut file = storage_client.file("test.txt".to_string());
@@ -79,7 +82,7 @@ async fn test_call_nodeport() {
     assert_eq!(read_file_response.content, "Hello, Xedio!");
 
     // List files again
-    let list_files_request = tonic::Request::new(crate::proto::hello_world::ListFilesRequest {});
+    let list_files_request = tonic::Request::new(hello_world::ListFilesRequest {});
     let list_files_response = file
         .client_mut()
         .list_files(list_files_request)
@@ -95,9 +98,8 @@ async fn test_call_nodeport() {
     assert!(delete_file_response.success);
 
     // Check if it is leader
-    let mut client =
-        crate::proto::hello_world::leader_election_client::LeaderElectionClient::new(channel);
-    let is_leader_request = tonic::Request::new(crate::proto::hello_world::IsLeaderRequest {});
+    let mut client = hello_world::leader_election_client::LeaderElectionClient::new(channel);
+    let is_leader_request = tonic::Request::new(hello_world::IsLeaderRequest {});
     let is_leader_response = client
         .is_leader(is_leader_request)
         .await

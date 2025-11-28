@@ -16,9 +16,7 @@ kube-lease-manager.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true
 rand.workspace = true
-
-[build-dependencies]
-tonic-prost-build = "0.14"
+xedio-shared.workspace = true
 
 [dev-dependencies]
 test-log.workspace = true

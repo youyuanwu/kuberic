@@ -6,12 +6,12 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
-use crate::proto::hello_world;
 pub use hello_world::storage_server::{Storage, StorageServer};
 use hello_world::{
     DeleteFileReply, DeleteFileRequest, ListFilesReply, ListFilesRequest, ReadFileReply,
     ReadFileRequest, WriteFileReply, WriteFileRequest,
 };
+use xedio_shared::proto::hello_world;
 
 const DATA_DIR: &str = "/data";
 
