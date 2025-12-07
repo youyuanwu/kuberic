@@ -13,29 +13,23 @@ use kube::{
 use tokio_util::sync::CancellationToken;
 
 use std::{collections::BTreeMap, sync::Arc};
-use thiserror::Error;
+
 use tokio::time::Duration;
+
+use crate::shared::XError;
 
 use super::crd::ConfigMapGenerator;
 
 const FINALIZER_NAME: &str = "configmapgenerator.nullable.se/finalizer";
 
-#[derive(Debug, Error)]
-enum Error {
-    #[error("Finalizer error: {0}")]
-    FinalizerError(#[source] Box<kube::runtime::finalizer::Error<kube::Error>>),
-    #[error("MissingObjectKey: {0}")]
-    MissingObjectKey(&'static str),
-}
-
 /// Controller triggers this whenever our main object or our children changed
-async fn reconcile(generator: Arc<ConfigMapGenerator>, ctx: Arc<Data>) -> Result<Action, Error> {
+async fn reconcile(generator: Arc<ConfigMapGenerator>, ctx: Arc<Data>) -> Result<Action, XError> {
     let client = &ctx.client;
     let namespace = generator
         .metadata
         .namespace
         .as_ref()
-        .ok_or_else(|| Error::MissingObjectKey(".metadata.namespace"))?;
+        .ok_or_else(|| XError::MissingObjectKey(".metadata.namespace"))?;
 
     let cmg_api: Api<ConfigMapGenerator> = Api::namespaced(client.clone(), namespace);
 
@@ -52,7 +46,7 @@ async fn reconcile(generator: Arc<ConfigMapGenerator>, ctx: Arc<Data>) -> Result
         }
     })
     .await
-    .map_err(|e| Error::FinalizerError(Box::new(e)))
+    .map_err(|e| XError::FinalizerError(Box::new(e)))
 }
 
 /// Reconcile when the object is created or updated
@@ -114,7 +108,7 @@ async fn reconcile_cleanup(
 }
 
 /// The controller triggers this on reconcile errors
-fn error_policy(_object: Arc<ConfigMapGenerator>, _error: &Error, _ctx: Arc<Data>) -> Action {
+fn error_policy(_object: Arc<ConfigMapGenerator>, _error: &XError, _ctx: Arc<Data>) -> Action {
     Action::requeue(Duration::from_secs(1))
 }
 

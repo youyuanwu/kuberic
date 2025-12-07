@@ -2619,6 +2619,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "prost",
+ "serde_yaml",
  "tokio",
  "tonic",
  "tonic-prost",

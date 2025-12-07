@@ -1,4 +1,11 @@
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::{
+    api::core::v1::Namespace,
+    apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+};
+use kube::{
+    Api, ResourceExt,
+    runtime::{conditions, wait::await_condition},
+};
 
 /// Create test namespace once for all tests.
 pub async fn init_test_namespace() {
@@ -23,4 +30,27 @@ pub async fn init_test_namespace() {
         }
     })
     .await;
+}
+
+pub async fn apply_crd(
+    client: &kube::Client,
+    def: CustomResourceDefinition,
+) -> Result<(), crate::Error> {
+    let ssapply = kube::api::PatchParams::apply("xedio-test").force();
+    // Ensure the CRD is installed
+    let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
+
+    let crd = def;
+    let crd_name = crd.name_any();
+    tracing::info!("Creating CRD: {}", serde_yaml::to_string(&crd)?);
+
+    crds.patch(&crd_name, &ssapply, &kube::api::Patch::Apply(&crd))
+        .await?;
+
+    tracing::info!("Waiting for the api-server to accept the CRD");
+    let establish = await_condition(crds, &crd_name, conditions::is_crd_established());
+    tokio::time::timeout(std::time::Duration::from_secs(10), establish).await??;
+
+    tracing::info!("CRD established successfully");
+    Ok(())
 }

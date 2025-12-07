@@ -1,9 +1,4 @@
-use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use kube::{
-    Api, CustomResource, CustomResourceExt, ResourceExt,
-    api::PatchParams,
-    runtime::wait::{await_condition, conditions},
-};
+use kube::{Api, CustomResource, CustomResourceExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use xedio_shared::XEDIO_TEST_NAMESPACE;
@@ -33,32 +28,16 @@ impl ConfigMapGeneratorClient {
         }
     }
 
-    pub async fn apply_crd(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let ssapply = PatchParams::apply("crd_apply_example").force();
-
-        // Ensure the CRD is installed
-        let crds: Api<CustomResourceDefinition> = Api::all(self.client.clone());
-
+    pub async fn apply_crd(&self) -> Result<(), xedio_shared::Error> {
         let crd = ConfigMapGenerator::crd();
-        let crd_name = crd.name_any();
-        tracing::info!("Creating CRD: {}", serde_yaml::to_string(&crd)?);
-
-        crds.patch(&crd_name, &ssapply, &kube::api::Patch::Apply(&crd))
-            .await?;
-
-        tracing::info!("Waiting for the api-server to accept the CRD");
-        let establish = await_condition(crds, &crd_name, conditions::is_crd_established());
-        tokio::time::timeout(std::time::Duration::from_secs(10), establish).await??;
-
-        tracing::info!("CRD established successfully");
-        Ok(())
+        xedio_shared::kube_util::apply_crd(&self.client, crd).await
     }
 
     pub async fn create_config_map_generator(
         &self,
         name: &str,
         content: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), xedio_shared::Error> {
         let cmg_api: Api<ConfigMapGenerator> =
             Api::namespaced(self.client.clone(), &self.namespace);
         let cmg = ConfigMapGenerator {
@@ -81,10 +60,7 @@ impl ConfigMapGeneratorClient {
         Ok(())
     }
 
-    pub async fn delete_config_map_generator(
-        &self,
-        name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn delete_config_map_generator(&self, name: &str) -> Result<(), xedio_shared::Error> {
         let cmg_api: Api<ConfigMapGenerator> =
             Api::namespaced(self.client.clone(), &self.namespace);
         tracing::info!("Deleting ConfigMapGenerator: {}", name);
@@ -98,7 +74,7 @@ impl ConfigMapGeneratorClient {
         &self,
         name: &str,
         new_content: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), xedio_shared::Error> {
         let cmg_api: Api<ConfigMapGenerator> =
             Api::namespaced(self.client.clone(), &self.namespace);
         let patch_params = kube::api::PatchParams::apply("crd_patch_example").force();
