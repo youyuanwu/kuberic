@@ -118,9 +118,7 @@ impl LeaderElection {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::Namespace;
-
-    pub const TEST_NAMESPACE: &str = "xedio-test-ns";
+    use xedio_shared::XEDIO_TEST_NAMESPACE;
 
     pub mod helper {
 
@@ -160,37 +158,12 @@ pub mod tests {
         }
     }
 
-    /// Create test namespace once for all tests.
-    pub async fn init_test_namespace() {
-        static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-        INIT.get_or_init(|| async {
-            let client = kube::Client::try_default().await.unwrap();
-            let namespaces = kube::Api::all(client);
-            let ns = Namespace {
-                metadata: kube::api::ObjectMeta {
-                    name: Some(TEST_NAMESPACE.to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            match namespaces
-                .create(&kube::api::PostParams::default(), &ns)
-                .await
-            {
-                Ok(_) => (),
-                Err(kube::Error::Api(ae)) if ae.code == 409 => (), // already exists
-                Err(e) => panic!("Failed to create test namespace: {}", e),
-            }
-        })
-        .await;
-    }
-
     #[tokio::test]
     #[test_log::test]
     async fn test_leader_election_new() {
-        init_test_namespace().await;
+        xedio_shared::kube_util::init_test_namespace().await;
         let le = LeaderElection::new(
-            TEST_NAMESPACE.to_string(),
+            XEDIO_TEST_NAMESPACE.to_string(),
             "test-lease1".to_string(),
             Duration::from_secs(2),
         );
@@ -220,16 +193,16 @@ pub mod tests {
     #[test_log::test]
     #[ignore = "Has race conditions, needs to be fixed"]
     async fn test_change_leader() {
-        init_test_namespace().await;
+        xedio_shared::kube_util::init_test_namespace().await;
 
         let lease_name = "test-lease2".to_string();
         let le1 = LeaderElection::new(
-            TEST_NAMESPACE.to_string(),
+            XEDIO_TEST_NAMESPACE.to_string(),
             lease_name.clone(),
             Duration::from_secs(2),
         );
         let le2 = LeaderElection::new(
-            TEST_NAMESPACE.to_string(),
+            XEDIO_TEST_NAMESPACE.to_string(),
             lease_name.clone(),
             Duration::from_secs(2),
         );

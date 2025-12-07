@@ -29,7 +29,7 @@ use kuberator::cache::{CachingStrategy, StaticApiProvider};
 use kuberator::error::Result as KubeResult;
 use kuberator::k8s::K8sRepository;
 use kuberator::{Context, Finalize, Reconcile};
-use xedio_data::NAME_XEDIO;
+use xedio_shared::NAME_XEDIO;
 
 // Type alias for our repository
 type MyK8sRepo = K8sRepository<XdataApp, StaticApiProvider<XdataApp>>;
@@ -308,7 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the reconciler with graceful shutdown
     reconciler
-        .start(Some(xedio_data::utils::wait_for_shutdown_signal()))
+        .start(Some(xedio_shared::utils::wait_for_shutdown_signal()))
         .await;
 
     Ok(())

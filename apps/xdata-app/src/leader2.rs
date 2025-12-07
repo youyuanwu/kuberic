@@ -7,13 +7,12 @@ mod tests {
 
     use kube::Client;
     use kube_lease_manager::LeaseManagerBuilder;
-
-    use crate::leader::tests::TEST_NAMESPACE;
+    use xedio_shared::XEDIO_TEST_NAMESPACE;
 
     #[tokio::test]
     #[test_log::test]
     async fn test_leader_election_basic() {
-        crate::leader::tests::init_test_namespace().await;
+        xedio_shared::kube_util::init_test_namespace().await;
         // Use the default Kube client
         let client = Client::try_default().await.unwrap();
         // Create the simplest LeaseManager with reasonable defaults using a convenient builder.
@@ -25,7 +24,7 @@ mod tests {
         let count = 5;
         for i in 0..count {
             let manager = LeaseManagerBuilder::new(client.clone(), lease_name)
-                .with_namespace(TEST_NAMESPACE)
+                .with_namespace(XEDIO_TEST_NAMESPACE)
                 .with_duration(10)
                 .with_grace(5)
                 .with_create_mode(kube_lease_manager::LeaseCreateMode::AutoCreate)

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [ "apps/xdata-app", "apps/xdata-operator","xedio-data"
+members = ["apps/configmapgen", "apps/xdata-app", "apps/xdata-operator","xedio-data"
 
 , "xedio-shared", "xedio-tests"]
 
@@ -12,7 +12,6 @@ mssf-util = "0.5"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-test-log = "0.2"
 bytes = "1"
 futures = "0.3"
 async-trait = "0.1"
@@ -31,6 +30,12 @@ k8s-openapi = { version = "0.26", features = ["latest", "schemars"] }
 kuberator = "0.2"
 rand = "0.9"
 schemars = "1"
+test-log = {version = "0.2", default-features = false, features = ["trace"]}
+
+# example deps
+anyhow = "1"
+thiserror = "1"
+serde_yaml = "0.9"
 
 xedio-data = { path = "xedio-data" }
 xedio-shared = { path = "xedio-shared" }
