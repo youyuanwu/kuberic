@@ -16,7 +16,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use thiserror::Error;
 use tokio::time::Duration;
 
-use crate::crd::ConfigMapGenerator;
+use super::crd::ConfigMapGenerator;
 
 const FINALIZER_NAME: &str = "configmapgenerator.nullable.se/finalizer";
 

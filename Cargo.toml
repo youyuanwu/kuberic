@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["apps/configmapgen", "apps/xdata-app", "apps/xdata-operator","xedio-data"
+members = ["apps/xcontrollers", "apps/xdata-app", "apps/xdata-operator","xedio-data"
 
 , "xedio-shared", "xedio-tests"]
 

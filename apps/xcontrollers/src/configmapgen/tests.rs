@@ -1,6 +1,6 @@
 use tokio_util::sync::CancellationToken;
 
-use crate::crd::ConfigMapGeneratorClient;
+use super::crd::ConfigMapGeneratorClient;
 
 #[tokio::test]
 #[test_log::test]
@@ -18,7 +18,7 @@ async fn test_crd() {
     let h_ctrl = tokio::spawn({
         let token = token.clone();
         async move {
-            crate::controller::run_controller(token, kube_cli, reload_rx)
+            super::controller::run_controller(token, kube_cli, reload_rx)
                 .await
                 .unwrap();
         }

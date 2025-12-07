@@ -1,8 +1,4 @@
-pub mod controller;
-pub mod crd;
-
-#[cfg(test)]
-mod tests;
+pub mod configmapgen;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let client = kube::Client::try_default().await?;
-    controller::run_controller(token, client, reload_rx).await?;
+    configmapgen::controller::run_controller(token, client, reload_rx).await?;
 
     Ok(())
 }
