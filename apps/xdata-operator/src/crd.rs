@@ -154,10 +154,3 @@ impl Default for ResourceRequirements {
         }
     }
 }
-
-// Implement ObserveGeneration for XdataAppStatus
-impl kuberator::ObserveGeneration for XdataAppStatus {
-    fn add(&mut self, observed_generation: i64) {
-        self.observed_generation = Some(observed_generation);
-    }
-}

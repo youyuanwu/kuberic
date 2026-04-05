@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
-use rand::{Rng, distr::Alphanumeric};
+use rand::{RngExt, distr::Alphanumeric};
 use tokio_util::sync::CancellationToken;
 
 pub type Epoch = i32;
@@ -53,10 +53,9 @@ impl LeaderElection {
             },
         );
         let mut cur_epoch: Epoch = 0;
-        let mut on_new_leader = async |ll: LeaseLockResult| {
-            if ll.acquired_lease {
-                let l = ll.lease.unwrap();
-                let epoch = l.spec.unwrap().lease_transitions.unwrap();
+        let mut on_new_leader = async |ll: LeaseLockResult| match ll {
+            LeaseLockResult::Acquired(lease) => {
+                let epoch = lease.spec.unwrap().lease_transitions.unwrap();
                 tracing::info!("Acquired leadership {} for epoch {}", holder_id, epoch);
                 assert!(epoch >= cur_epoch, "Epoch should not go backwards");
                 cur_epoch = epoch;
@@ -64,10 +63,9 @@ impl LeaderElection {
                     .send(LeaderElectionEvent::Leader(epoch))
                     .await
                     .unwrap();
-            } else {
+            }
+            LeaseLockResult::NotAcquired(_) => {
                 tracing::info!("No lease acquired, standing by");
-                // There is no lease acquired
-                // TODO: Make a kube call to get the current lease state
                 sender
                     .send(LeaderElectionEvent::StandBy(cur_epoch))
                     .await

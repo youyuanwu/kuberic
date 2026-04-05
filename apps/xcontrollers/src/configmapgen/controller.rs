@@ -56,12 +56,9 @@ async fn reconcile_apply(
 ) -> Result<Action, kube::Error> {
     let client = &ctx.client;
     let namespace = generator.metadata.namespace.as_ref().ok_or_else(|| {
-        kube::Error::Api(kube::error::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "Missing .metadata.namespace".to_string(),
-            reason: "MissingObjectKey".to_string(),
-            code: 500,
-        })
+        kube::Error::Api(
+            kube::core::Status::failure("Missing .metadata.namespace", "MissingObjectKey").boxed(),
+        )
     })?;
 
     let mut contents = BTreeMap::new();
@@ -80,12 +77,10 @@ async fn reconcile_apply(
     cm_api
         .patch(
             cm.metadata.name.as_ref().ok_or_else(|| {
-                kube::Error::Api(kube::error::ErrorResponse {
-                    status: "Failure".to_string(),
-                    message: "Missing .metadata.name".to_string(),
-                    reason: "MissingObjectKey".to_string(),
-                    code: 500,
-                })
+                kube::Error::Api(
+                    kube::core::Status::failure("Missing .metadata.name", "MissingObjectKey")
+                        .boxed(),
+                )
             })?,
             &PatchParams::apply("configmapgenerator.kube-rt.nullable.se"),
             &Patch::Apply(&cm),
