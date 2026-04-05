@@ -116,7 +116,7 @@ impl LeaderElection {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use xedio_shared::XEDIO_TEST_NAMESPACE;
+    use kubelicate_shared::XEDIO_TEST_NAMESPACE;
 
     pub mod helper {
 
@@ -159,7 +159,7 @@ pub mod tests {
     #[tokio::test]
     #[test_log::test]
     async fn test_leader_election_new() {
-        xedio_shared::kube_util::init_test_namespace().await;
+        kubelicate_shared::kube_util::init_test_namespace().await;
         let le = LeaderElection::new(
             XEDIO_TEST_NAMESPACE.to_string(),
             "test-lease1".to_string(),
@@ -191,7 +191,7 @@ pub mod tests {
     #[test_log::test]
     #[ignore = "Has race conditions, needs to be fixed"]
     async fn test_change_leader() {
-        xedio_shared::kube_util::init_test_namespace().await;
+        kubelicate_shared::kube_util::init_test_namespace().await;
 
         let lease_name = "test-lease2".to_string();
         let le1 = LeaderElection::new(

@@ -11,7 +11,7 @@ use hello_world::{
     DeleteFileReply, DeleteFileRequest, ListFilesReply, ListFilesRequest, ReadFileReply,
     ReadFileRequest, WriteFileReply, WriteFileRequest,
 };
-use xedio_shared::proto::hello_world;
+use kubelicate_shared::proto::hello_world;
 
 const DATA_DIR: &str = "/data";
 

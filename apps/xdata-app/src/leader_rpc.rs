@@ -7,7 +7,7 @@ pub use hello_world::leader_election_server::{
     LeaderElection as LeaderElectionService, LeaderElectionServer,
 };
 use hello_world::{IsLeaderReply, IsLeaderRequest};
-use xedio_shared::proto::hello_world;
+use kubelicate_shared::proto::hello_world;
 
 #[derive(Debug, Clone)]
 pub struct MyLeaderElection {

@@ -3,7 +3,7 @@ use tracing::{debug, info};
 
 pub use hello_world::greeter_server::{Greeter, GreeterServer};
 use hello_world::{HelloReply, HelloRequest, PodNameReply, PodNameRequest};
-use xedio_shared::proto::hello_world;
+use kubelicate_shared::proto::hello_world;
 
 #[derive(Debug, Default)]
 pub struct MyGreeter {}

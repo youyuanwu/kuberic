@@ -1,5 +1,5 @@
 [package]
-name = "xedio-tests"
+name = "kubelicate-tests"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,8 +7,8 @@ edition = "2024"
 
 [dev-dependencies]
 tokio.workspace = true
-xedio-data.workspace = true
-xedio-shared.workspace = true
+kubelicate-data.workspace = true
+kubelicate-shared.workspace = true
 tonic.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true

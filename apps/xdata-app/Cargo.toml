@@ -16,7 +16,7 @@ kube-lease-manager.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true
 rand.workspace = true
-xedio-shared.workspace = true
+kubelicate-shared.workspace = true
 
 [dev-dependencies]
 test-log.workspace = true

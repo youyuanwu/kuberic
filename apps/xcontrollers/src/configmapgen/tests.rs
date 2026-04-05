@@ -5,7 +5,7 @@ use super::crd::ConfigMapGeneratorClient;
 #[tokio::test]
 #[test_log::test]
 async fn test_crd() {
-    xedio_shared::kube_util::init_test_namespace().await;
+    kubelicate_shared::kube_util::init_test_namespace().await;
     let kube_cli = kube::Client::try_default().await.unwrap();
     let crd_cli = ConfigMapGeneratorClient::new_with_test_namespace(kube_cli.clone()); // create the client
     // create the crd

@@ -27,7 +27,7 @@ pub mod test_utils {
             .expect("Failed to create k8s client");
         // check if the deployment exists
         let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
-            kube::Api::namespaced(client.clone(), xedio_shared::NAME_XEDIO);
+            kube::Api::namespaced(client.clone(), kubelicate_shared::NAME_XEDIO);
         let deployment_name = "xdata-operator";
         match deployments.get(deployment_name).await {
             Ok(_) => {
@@ -49,7 +49,7 @@ pub mod test_utils {
 
                 // Wait for deployment to be ready
                 crate::test_utils::wait_deployment_replica_ready(
-                    xedio_shared::NAME_XEDIO,
+                    kubelicate_shared::NAME_XEDIO,
                     deployment_name,
                     1,
                     120,
@@ -84,7 +84,7 @@ pub mod test_utils {
             .await
             .expect("Failed to create k8s client");
         let statefulsets: kube::Api<k8s_openapi::api::apps::v1::StatefulSet> =
-            kube::Api::namespaced(client.clone(), xedio_shared::NAME_XEDIO);
+            kube::Api::namespaced(client.clone(), kubelicate_shared::NAME_XEDIO);
         let statefulset_name = "xdata-app";
         match statefulsets.get(statefulset_name).await {
             Ok(_) => {
@@ -112,7 +112,7 @@ pub mod test_utils {
 
         // Statefulset takes some time to show up.
         let mut attempts = 0;
-        while wait_statefulset_replica_ready(xedio_shared::NAME_XEDIO, "xdata-app", 3, 180)
+        while wait_statefulset_replica_ready(kubelicate_shared::NAME_XEDIO, "xdata-app", 3, 180)
             .await
             .is_err()
         {

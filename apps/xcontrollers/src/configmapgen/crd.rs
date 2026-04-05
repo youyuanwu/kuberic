@@ -1,7 +1,7 @@
 use kube::{Api, CustomResource, CustomResourceExt};
+use kubelicate_shared::XEDIO_TEST_NAMESPACE;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use xedio_shared::XEDIO_TEST_NAMESPACE;
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(group = "nullable.se", version = "v1", kind = "ConfigMapGenerator")]
@@ -28,16 +28,16 @@ impl ConfigMapGeneratorClient {
         }
     }
 
-    pub async fn apply_crd(&self) -> Result<(), xedio_shared::Error> {
+    pub async fn apply_crd(&self) -> Result<(), kubelicate_shared::Error> {
         let crd = ConfigMapGenerator::crd();
-        xedio_shared::kube_util::apply_crd(&self.client, crd).await
+        kubelicate_shared::kube_util::apply_crd(&self.client, crd).await
     }
 
     pub async fn create_config_map_generator(
         &self,
         name: &str,
         content: &str,
-    ) -> Result<(), xedio_shared::Error> {
+    ) -> Result<(), kubelicate_shared::Error> {
         let cmg_api: Api<ConfigMapGenerator> =
             Api::namespaced(self.client.clone(), &self.namespace);
         let cmg = ConfigMapGenerator {
@@ -60,7 +60,10 @@ impl ConfigMapGeneratorClient {
         Ok(())
     }
 
-    pub async fn delete_config_map_generator(&self, name: &str) -> Result<(), xedio_shared::Error> {
+    pub async fn delete_config_map_generator(
+        &self,
+        name: &str,
+    ) -> Result<(), kubelicate_shared::Error> {
         let cmg_api: Api<ConfigMapGenerator> =
             Api::namespaced(self.client.clone(), &self.namespace);
         tracing::info!("Deleting ConfigMapGenerator: {}", name);
@@ -74,7 +77,7 @@ impl ConfigMapGeneratorClient {
         &self,
         name: &str,
         new_content: &str,
-    ) -> Result<(), xedio_shared::Error> {
+    ) -> Result<(), kubelicate_shared::Error> {
         let cmg_api: Api<ConfigMapGenerator> =
             Api::namespaced(self.client.clone(), &self.namespace);
         let patch_params = kube::api::PatchParams::apply("crd_patch_example").force();

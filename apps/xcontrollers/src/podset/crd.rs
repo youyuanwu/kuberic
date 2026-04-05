@@ -40,9 +40,9 @@ impl PodSetClient {
         PodSetClient { client, namespace }
     }
 
-    pub async fn apply_crd(&self) -> Result<(), xedio_shared::Error> {
+    pub async fn apply_crd(&self) -> Result<(), kubelicate_shared::Error> {
         use kube::CustomResourceExt;
-        xedio_shared::kube_util::apply_crd(&self.client, PodSet::crd()).await?;
+        kubelicate_shared::kube_util::apply_crd(&self.client, PodSet::crd()).await?;
         Ok(())
     }
 
@@ -52,7 +52,7 @@ impl PodSetClient {
     }
 
     // Use patch to create the podset.
-    pub async fn create_podset(&self, name: &str) -> Result<PodSet, xedio_shared::Error> {
+    pub async fn create_podset(&self, name: &str) -> Result<PodSet, kubelicate_shared::Error> {
         let podset = PodSet {
             metadata: kube::api::ObjectMeta {
                 name: Some(name.to_string()),

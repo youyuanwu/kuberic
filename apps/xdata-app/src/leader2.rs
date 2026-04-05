@@ -7,12 +7,12 @@ mod tests {
 
     use kube::Client;
     use kube_lease_manager::LeaseManagerBuilder;
-    use xedio_shared::XEDIO_TEST_NAMESPACE;
+    use kubelicate_shared::XEDIO_TEST_NAMESPACE;
 
     #[tokio::test]
     #[test_log::test]
     async fn test_leader_election_basic() {
-        xedio_shared::kube_util::init_test_namespace().await;
+        kubelicate_shared::kube_util::init_test_namespace().await;
         // Use the default Kube client
         let client = Client::try_default().await.unwrap();
         // Create the simplest LeaseManager with reasonable defaults using a convenient builder.

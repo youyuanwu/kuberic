@@ -1,5 +1,5 @@
 [package]
-name = "xedio-shared"
+name = "kubelicate-shared"
 version = "0.1.0"
 edition = "2024"
 
@@ -14,4 +14,4 @@ k8s-openapi.workspace = true
 serde_yaml.workspace = true
 
 [build-dependencies]
-tonic-prost-build = "0.14"
+tonic-prost-build.workspace = true

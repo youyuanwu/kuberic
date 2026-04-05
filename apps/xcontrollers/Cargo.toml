@@ -17,7 +17,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio-util.workspace = true
-xedio-shared.workspace = true
+kubelicate-shared.workspace = true
 serde_yaml.workspace = true
 
 [dev-dependencies]

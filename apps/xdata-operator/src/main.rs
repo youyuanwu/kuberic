@@ -26,7 +26,7 @@ use kube::runtime::controller::{Action, Config, Controller};
 use kube::runtime::finalizer::{Event, finalizer};
 use kube::runtime::watcher;
 use kube::{Api, Client};
-use xedio_shared::NAME_XEDIO;
+use kubelicate_shared::NAME_XEDIO;
 
 const FINALIZER_NAME: &str = "xdataapp.xedio.io/finalizer";
 
@@ -291,7 +291,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Controller::new(xapps, watcher::Config::default())
         .owns(statefulsets, watcher::Config::default())
         .with_config(config)
-        .graceful_shutdown_on(xedio_shared::utils::wait_for_shutdown_signal())
+        .graceful_shutdown_on(kubelicate_shared::utils::wait_for_shutdown_signal())
         .run(reconcile, error_policy, Arc::new(Data { client }))
         .for_each(|res| async move {
             match res {

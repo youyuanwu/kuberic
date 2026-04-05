@@ -1,11 +1,11 @@
 use kube::client;
+use kubelicate_shared::XEDIO_TEST_NAMESPACE;
 use tokio_util::sync::CancellationToken;
-use xedio_shared::XEDIO_TEST_NAMESPACE;
 
 #[tokio::test]
 #[test_log::test]
 async fn test_crd() {
-    xedio_shared::kube_util::init_test_namespace().await;
+    kubelicate_shared::kube_util::init_test_namespace().await;
 
     let k8s_client = client::Client::try_default().await.unwrap();
     let client =

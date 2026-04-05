@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn({
         let token = token.clone();
         async move {
-            xedio_shared::utils::wait_for_shutdown_signal().await;
+            kubelicate_shared::utils::wait_for_shutdown_signal().await;
             token.cancel();
         }
     });

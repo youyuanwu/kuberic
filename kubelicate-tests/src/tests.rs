@@ -1,6 +1,6 @@
-use xedio_shared::proto::hello_world;
-use xedio_shared::proto::hello_world::{HelloRequest, greeter_client::GreeterClient};
-use xedio_shared::storage_client::StorageClientExt;
+use kubelicate_shared::proto::hello_world;
+use kubelicate_shared::proto::hello_world::{HelloRequest, greeter_client::GreeterClient};
+use kubelicate_shared::storage_client::StorageClientExt;
 
 /// Test calling the gRPC service via NodePort
 /// This test assumes the service is deployed in k8s and accessible via NodePort
