@@ -1037,6 +1037,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kubelicate-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "prost",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
 name = "kubelicate-data"
 version = "0.1.0"
 dependencies = [

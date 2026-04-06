@@ -1,0 +1,19 @@
+[package]
+name = "kubelicate-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tonic-prost.workspace = true
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-prost-build.workspace = true

@@ -4,6 +4,7 @@ members = [
   "apps/xcontrollers",
   "apps/xdata-app",
   "apps/xdata-operator",
+  "kubelicate-core",
   "kubelicate-data",
 
   "kubelicate-shared",
