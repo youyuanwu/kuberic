@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::{KubelicateError, Result};
 use crate::events::{
@@ -20,6 +20,34 @@ use crate::types::{
 };
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ---------------------------------------------------------------------------
+// Helpers for copy protocol (OperationStream ↔ Vec materialization)
+// ---------------------------------------------------------------------------
+
+/// Collect all operations from a stream into a Vec.
+async fn collect_stream(mut stream: crate::types::OperationStream) -> Vec<(Lsn, bytes::Bytes)> {
+    let mut ops = Vec::new();
+    while let Some(op) = stream.get_operation().await {
+        ops.push((op.lsn, op.data.clone()));
+        op.acknowledge();
+    }
+    ops
+}
+
+/// Create an OperationStream from materialized operations.
+fn vec_to_stream(ops: Vec<(Lsn, bytes::Bytes)>) -> crate::types::OperationStream {
+    let (tx, stream) = crate::types::OperationStream::channel(ops.len().max(1));
+    tokio::spawn(async move {
+        for (lsn, data) in ops {
+            let op = crate::types::Operation::new(lsn, data, None);
+            if tx.send(op).await.is_err() {
+                break;
+            }
+        }
+    });
+    stream
+}
 
 // ---------------------------------------------------------------------------
 // RuntimeCommand — what the gRPC control server sends to the runtime
@@ -102,6 +130,10 @@ pub struct PodRuntime {
     reply_timeout: Duration,
     role: Role,
     epoch: Epoch,
+    /// Replication stream for secondary. Moved into ServiceContext at Open.
+    replication_stream: Option<crate::types::OperationStream>,
+    /// Copy stream for secondary. Moved into ServiceContext at Open.
+    copy_stream: Option<crate::types::OperationStream>,
 }
 
 pub struct PodRuntimeBundle {
@@ -153,8 +185,21 @@ impl PodRuntimeBuilder {
         let (state_provider_tx, state_provider_rx) = mpsc::channel(16);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
-        // Start data plane gRPC server
-        let data_receiver = SecondaryReceiver::new(secondary_state);
+        // Create replication stream: SecondaryReceiver → OperationStream → user
+        let (repl_op_tx, repl_op_rx) = mpsc::channel(256);
+        let replication_stream = crate::types::OperationStream::new(repl_op_rx);
+
+        // Create copy stream: CopyStream RPC → OperationStream → user
+        let (copy_op_tx, copy_op_rx) = mpsc::channel(256);
+        let copy_stream = crate::types::OperationStream::new(copy_op_rx);
+
+        // Start data plane gRPC server (persisted mode + copy support)
+        let data_receiver = SecondaryReceiver::with_streams(
+            secondary_state,
+            repl_op_tx,
+            copy_op_tx,
+            state_provider_tx.clone(),
+        );
         let data_listener = tokio::net::TcpListener::bind(&self.data_bind)
             .await
             .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
@@ -225,6 +270,8 @@ impl PodRuntimeBuilder {
             reply_timeout: self.reply_timeout,
             role: Role::None,
             epoch: Epoch::default(),
+            replication_stream: Some(replication_stream),
+            copy_stream: Some(copy_stream),
         };
 
         Ok(PodRuntimeBundle {
@@ -251,6 +298,7 @@ impl PodRuntime {
     /// gRPC control server with correct replicator/user event ordering.
     /// Blocks until shutdown.
     pub async fn serve(mut self) {
+        info!("PodRuntime serve loop started");
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 RuntimeCommand::Open { mode, reply } => {
@@ -299,13 +347,7 @@ impl PodRuntime {
                     );
                 }
                 RuntimeCommand::BuildReplica { replica, reply } => {
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| ReplicatorControlEvent::BuildReplica {
-                            replica,
-                            reply: r,
-                        })
-                        .await,
-                    );
+                    let _ = reply.send(self.handle_build_replica(replica).await);
                 }
                 RuntimeCommand::RemoveReplica { replica_id, reply } => {
                     let _ = reply.send(
@@ -359,13 +401,18 @@ impl PodRuntime {
         let replicator_handle =
             StateReplicatorHandle::new(self.data_tx.clone(), self.state.clone());
 
+        // Move streams out before borrowing self for send_lifecycle
+        let replication_stream = self.replication_stream.take();
+        let copy_stream = self.copy_stream.take();
+        let token = self.shutdown.child_token();
+
         self.send_lifecycle(|reply| LifecycleEvent::Open {
             ctx: ServiceContext {
                 partition,
                 replicator: replicator_handle,
-                copy_stream: None,
-                replication_stream: None,
-                token: self.shutdown.child_token(),
+                copy_stream,
+                replication_stream,
+                token,
             },
             reply,
         })
@@ -472,6 +519,99 @@ impl PodRuntime {
         }
     }
 
+    /// BuildReplica: primary orchestrates the copy protocol by calling the
+    /// secondary's data-plane gRPC service directly.
+    ///
+    /// Flow:
+    /// 1. Connect to secondary's data plane (replicator_address from replica_info)
+    /// 2. GetCopyContext from secondary → get context data
+    /// 3. GetCopyState from own StateProvider → get full state
+    /// 4. CopyStream to secondary → stream state data
+    async fn handle_build_replica(&mut self, replica: ReplicaInfo) -> Result<()> {
+        use crate::proto::replicator_data_client::ReplicatorDataClient;
+
+        let secondary_addr = &replica.replicator_address;
+        info!(
+            secondary_id = replica.id,
+            %secondary_addr,
+            "BuildReplica: connecting to secondary data plane"
+        );
+
+        // 1. Connect to secondary's data-plane gRPC
+        let channel = tonic::transport::Channel::from_shared(secondary_addr.clone())
+            .map_err(|e| KubelicateError::Internal(Box::new(e)))?
+            .connect()
+            .await
+            .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
+        let mut data_client = ReplicatorDataClient::new(channel);
+
+        // 2. GetCopyContext from secondary
+        let ctx_resp = data_client
+            .get_copy_context(crate::proto::GetCopyContextRequest {})
+            .await
+            .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
+        let copy_context_ops = ctx_resp.into_inner().operations;
+        info!(
+            context_items = copy_context_ops.len(),
+            "BuildReplica: got copy context from secondary"
+        );
+
+        // Wrap context into an OperationStream for the local state provider
+        let copy_context = vec_to_stream(
+            copy_context_ops
+                .into_iter()
+                .map(|op| (op.lsn, bytes::Bytes::from(op.data)))
+                .collect(),
+        );
+
+        // 3. GetCopyState from own StateProvider
+        let up_to_lsn = self.state.committed_lsn();
+        let state_stream: crate::types::OperationStream = self
+            .send_state_provider(|reply| StateProviderEvent::GetCopyState {
+                up_to_lsn,
+                copy_context,
+                reply,
+            })
+            .await?;
+
+        // Collect state into items for streaming to secondary
+        let state_ops = collect_stream(state_stream).await;
+        info!(
+            items = state_ops.len(),
+            up_to_lsn, "BuildReplica: got copy state from local StateProvider"
+        );
+
+        // 4. CopyStream to secondary — stream all state items
+        let items: Vec<crate::proto::CopyItem> = state_ops
+            .into_iter()
+            .map(|(lsn, data)| crate::proto::CopyItem {
+                lsn,
+                data: data.to_vec(),
+            })
+            .collect();
+
+        let item_stream = tokio_stream::iter(items);
+        let resp = data_client
+            .copy_stream(item_stream)
+            .await
+            .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
+
+        info!(
+            items_received = resp.into_inner().items_received,
+            "BuildReplica: copy complete"
+        );
+
+        // Also notify the replicator actor (for bookkeeping)
+        let _ = self
+            .send_replicator_control(|reply| ReplicatorControlEvent::BuildReplica {
+                replica,
+                reply,
+            })
+            .await;
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -504,7 +644,10 @@ impl PodRuntime {
         match tokio::time::timeout(self.reply_timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(KubelicateError::Closed),
-            Err(_) => Err(KubelicateError::Internal("lifecycle timeout".into())),
+            Err(_) => {
+                warn!("lifecycle event reply timed out");
+                Err(KubelicateError::Internal("lifecycle timeout".into()))
+            }
         }
     }
 

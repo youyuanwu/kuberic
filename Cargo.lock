@@ -1228,6 +1228,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "test-log",
  "tokio",
  "tokio-stream",
  "tokio-util",

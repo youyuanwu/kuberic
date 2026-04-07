@@ -133,10 +133,17 @@ message ReplicateResponse {
     int64 lsn = 1;
 }
 
-// ---- Data plane: Pod ↔ Pod (replication) ----
+// ---- Data plane: Pod ↔ Pod (replication + copy) ----
 
 service ReplicatorData {
+    // Incremental replication: primary streams ops, secondary ACKs
     rpc ReplicationStream(stream ReplicationItem) returns (stream ReplicationAck);
+
+    // Copy protocol: primary ↔ secondary during BuildReplica
+    // 1. Primary calls GetCopyContext on secondary → secondary sends its context
+    rpc GetCopyContext(GetCopyContextRequest) returns (GetCopyContextResponse);
+    // 2. Primary streams full state to secondary
+    rpc CopyStream(stream CopyItem) returns (CopyStreamResponse);
 }
 
 message ReplicationItem {
@@ -148,4 +155,23 @@ message ReplicationItem {
 
 message ReplicationAck {
     int64 lsn = 1;
+}
+
+message GetCopyContextRequest {}
+message GetCopyContextResponse {
+    repeated RawOperation operations = 1;
+}
+
+message RawOperation {
+    int64 lsn = 1;
+    bytes data = 2;
+}
+
+message CopyItem {
+    int64 lsn = 1;
+    bytes data = 2;
+}
+
+message CopyStreamResponse {
+    int64 items_received = 1;
 }

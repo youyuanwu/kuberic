@@ -1,28 +1,3 @@
-//! KV-Stateful: Replicated Key-Value Store
-//!
-//! A stateful key-value store using kubelicate-core's PodRuntime.
-//! Demonstrates the full replication protocol:
-//! - Primary replicates writes via `replicate()`
-//! - Secondary drains copy_stream and replication_stream
-//! - StateProvider callbacks (GetCopyContext, GetCopyState, etc.)
-//! - Client-facing gRPC API for Get/Put/Delete
-//!
-//! Usage:
-//!   # Demo mode — single replica, simulates operator + client:
-//!   cargo run -p kv-stateful -- --demo
-//!
-//!   # Normal mode — waits for operator gRPC commands:
-//!   cargo run -p kv-stateful -- --replica-id 1
-
-mod demo;
-mod server;
-mod service;
-mod state;
-
-mod proto {
-    tonic::include_proto!("kvstore.v1");
-}
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +7,7 @@ use kubelicate_core::types::CancellationToken;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use state::{KvState, SharedState};
+use kv_stateful::state::{KvState, SharedState};
 
 #[derive(Parser)]
 #[command(name = "kv-stateful", about = "Replicated key-value store example")]
@@ -84,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let runtime_handle = tokio::spawn(bundle.runtime.serve());
-    let service_handle = tokio::spawn(service::run_service(
+    let service_handle = tokio::spawn(kv_stateful::service::run_service(
         bundle.lifecycle_rx,
         bundle.state_provider_rx,
         state.clone(),
@@ -93,9 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.demo {
         info!("Demo mode: simulating operator + client");
-        demo::simulate_operator(control_address.clone()).await;
-        demo::run_demo_client(args.client_bind).await;
-        demo::demo_close(control_address).await;
+        kv_stateful::demo::simulate_operator(control_address.clone()).await;
+        kv_stateful::demo::run_demo_client(args.client_bind).await;
+        kv_stateful::demo::demo_close(control_address).await;
     } else {
         info!("Waiting for operator commands on {}", control_address);
         info!("Press Ctrl+C to shut down");

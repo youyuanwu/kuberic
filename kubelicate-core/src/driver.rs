@@ -189,6 +189,8 @@ impl PartitionDriver {
                 catch_up_capability: -1,
                 must_catch_up: false,
             };
+            // Primary handles the full copy protocol internally
+            // (connects to secondary's data plane, runs GetCopyContext + CopyStream)
             self.replicas[&primary_id]
                 .handle
                 .build_replica(replica_info)

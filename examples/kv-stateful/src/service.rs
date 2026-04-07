@@ -53,16 +53,18 @@ pub async fn run_service(
                         Role::IdleSecondary => {
                             if let Some(copy) = c.copy_stream.take() {
                                 let st = state.clone();
+                                let t = token.clone();
                                 bg_handles.push(tokio::spawn(
-                                    drain_stream(st, copy, "copy"),
+                                    drain_stream(st, copy, t, "copy"),
                                 ));
                             }
                         }
                         Role::ActiveSecondary => {
                             if let Some(repl) = c.replication_stream.take() {
                                 let st = state.clone();
+                                let t = token.clone();
                                 bg_handles.push(tokio::spawn(
-                                    drain_stream(st, repl, "replication"),
+                                    drain_stream(st, repl, t, "replication"),
                                 ));
                             }
                         }

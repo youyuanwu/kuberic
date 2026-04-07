@@ -86,6 +86,7 @@ pub struct ReplicaInfo {
     pub id: ReplicaId,
     pub role: Role,
     pub status: ReplicaStatus,
+    /// Data plane address (replication streams + copy protocol).
     pub replicator_address: String,
     pub current_progress: Lsn,
     pub catch_up_capability: Lsn,
