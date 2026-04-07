@@ -237,7 +237,7 @@ impl ReplicatorControl for ControlServer {
 use crate::pod::RuntimeCommand;
 
 /// V2 control server that routes all commands through the PodRuntime's
-/// command channel. This ensures correct replicator/ServiceEvent ordering.
+/// command channel. This ensures correct replicator/event ordering.
 pub struct ControlServerV2 {
     cmd_tx: mpsc::Sender<RuntimeCommand>,
     #[allow(dead_code)]

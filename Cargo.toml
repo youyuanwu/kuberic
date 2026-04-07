@@ -4,7 +4,7 @@ members = [
   "apps/xcontrollers",
   "apps/xdata-app",
   "apps/xdata-operator",
-  "examples/echo-stateful",
+  "examples/kv-stateful",
   "kubelicate-core",
   "kubelicate-data",
   "kubelicate-operator",

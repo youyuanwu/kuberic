@@ -155,3 +155,66 @@ pub struct ReplData {
     pub data: Bytes,
     pub lsn: Lsn,
 }
+
+// ---------------------------------------------------------------------------
+// Operation + OperationStream (pull-based secondary delivery)
+// ---------------------------------------------------------------------------
+
+/// A single replicated operation delivered to the user via an OperationStream.
+/// The user must call `acknowledge()` after applying the operation.
+///
+/// In persisted mode, `acknowledge()` gates quorum — the primary waits for
+/// the secondary to acknowledge before completing `replicate()`.
+/// In volatile mode, `acknowledge()` only releases memory.
+pub struct Operation {
+    pub lsn: Lsn,
+    pub data: Bytes,
+    ack_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Operation {
+    pub fn new(lsn: Lsn, data: Bytes, ack_tx: Option<tokio::sync::oneshot::Sender<()>>) -> Self {
+        Self { lsn, data, ack_tx }
+    }
+
+    /// Acknowledge this operation. Mandatory for persisted replicators —
+    /// blocks subsequent ops until called.
+    pub fn acknowledge(mut self) {
+        if let Some(tx) = self.ack_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl std::fmt::Debug for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Operation")
+            .field("lsn", &self.lsn)
+            .field("data_len", &self.data.len())
+            .field("has_ack", &self.ack_tx.is_some())
+            .finish()
+    }
+}
+
+/// Stream of operations delivered to the user on secondaries.
+/// Wraps an mpsc receiver — user calls `get_operation()` in a loop.
+pub struct OperationStream {
+    rx: tokio::sync::mpsc::Receiver<Operation>,
+}
+
+impl OperationStream {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Operation>) -> Self {
+        Self { rx }
+    }
+
+    /// Returns the next operation, or None when the stream ends.
+    pub async fn get_operation(&mut self) -> Option<Operation> {
+        self.rx.recv().await
+    }
+
+    /// Create a pair (sender, stream) for wiring.
+    pub fn channel(buffer: usize) -> (tokio::sync::mpsc::Sender<Operation>, Self) {
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer);
+        (tx, Self { rx })
+    }
+}

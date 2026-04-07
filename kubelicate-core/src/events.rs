@@ -6,8 +6,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::Result;
 use crate::handles::{PartitionHandle, StateReplicatorHandle};
 use crate::types::{
-    CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
-    ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, OperationStream, ReplicaId,
+    ReplicaInfo, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,12 +74,12 @@ pub struct ReplicateRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Service events (runtime → user event loop)
+// Lifecycle events (runtime → user, SF's IStatefulServiceReplica)
 // ---------------------------------------------------------------------------
 
-/// Events delivered by the kubelicate runtime to the user service.
-/// The user processes these in an event loop with owned mutable state.
-pub enum ServiceEvent {
+/// Lifecycle events delivered on the lifecycle channel.
+/// Rare but high-priority — handle immediately (blocks reconfiguration).
+pub enum LifecycleEvent {
     /// Replica opened. Initialize state, store handles.
     Open {
         ctx: ServiceContext,
@@ -108,12 +108,77 @@ pub enum ServiceEvent {
     Abort,
 }
 
+// ---------------------------------------------------------------------------
+// State provider events (runtime/replicator → user, SF's IStateProvider)
+// ---------------------------------------------------------------------------
+
+/// State provider callbacks delivered on the state_provider channel.
+/// Role-specific. May involve heavy work (e.g., copy state production).
+pub enum StateProviderEvent {
+    /// Epoch changed (secondaries only).
+    /// Primary gets epoch via ChangeRole, not UpdateEpoch.
+    /// Operations with LSN above `previous_epoch_last_lsn` from the old
+    /// epoch may be stale (uncommitted zombie primary writes).
+    UpdateEpoch {
+        epoch: Epoch,
+        previous_epoch_last_lsn: Lsn,
+        reply: oneshot::Sender<Result<()>>,
+    },
+
+    /// "What's your last applied LSN?" (secondary, during build/catchup)
+    GetLastCommittedLsn { reply: oneshot::Sender<Result<Lsn>> },
+
+    /// "What state do you already have?" (new idle secondary, during build)
+    GetCopyContext {
+        reply: oneshot::Sender<Result<OperationStream>>,
+    },
+
+    /// "Produce state for this secondary" (primary, during build_replica)
+    GetCopyState {
+        up_to_lsn: Lsn,
+        copy_context: OperationStream,
+        reply: oneshot::Sender<Result<OperationStream>>,
+    },
+
+    /// "Quorum was lost, data loss possible" (new primary after quorum loss)
+    OnDataLoss {
+        reply: oneshot::Sender<Result<bool>>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// ServiceEvent — kept as a backward-compatible union for transition
+// (will be removed once all consumers switch to dual-channel)
+// ---------------------------------------------------------------------------
+
+/// Legacy combined event type. Prefer LifecycleEvent + StateProviderEvent.
+pub enum ServiceEvent {
+    Open {
+        ctx: ServiceContext,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ChangeRole {
+        new_role: Role,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    Close {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Abort,
+}
+
 /// Handles provided to the user at Open time.
 pub struct ServiceContext {
     /// Query read/write access status, report faults.
     pub partition: Arc<PartitionHandle>,
     /// Replicate writes to quorum (usable on primary only).
     pub replicator: StateReplicatorHandle,
+    /// Copy stream — secondary pulls full-state operations during build.
+    /// None on primary.
+    pub copy_stream: Option<OperationStream>,
+    /// Replication stream — secondary pulls incremental operations.
+    /// None on primary.
+    pub replication_stream: Option<OperationStream>,
     /// Cancellation token for the replica's lifetime.
     /// Cancelled when close or abort is triggered.
     pub token: CancellationToken,

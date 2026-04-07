@@ -6,7 +6,8 @@ use tracing::warn;
 
 use crate::error::{KubelicateError, Result};
 use crate::events::{
-    ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent, ServiceContext, ServiceEvent,
+    LifecycleEvent, ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent, ServiceContext,
+    StateProviderEvent,
 };
 use crate::handles::{PartitionHandle, PartitionState, StateReplicatorHandle};
 use crate::types::{AccessStatus, CancellationToken, Epoch, FaultType, OpenMode, Role};
@@ -18,9 +19,10 @@ const DEFAULT_SERVICE_BUFFER: usize = 16;
 const DEFAULT_FAULT_BUFFER: usize = 4;
 
 /// The kubelicate runtime. Wires the replicator actor, manages access status,
-/// enforces promotion/demotion ordering, and delivers ServiceEvents to the user.
+/// enforces promotion/demotion ordering, and delivers events to the user.
 pub struct KubelicateRuntime {
-    service_tx: mpsc::Sender<ServiceEvent>,
+    lifecycle_tx: mpsc::Sender<LifecycleEvent>,
+    state_provider_tx: mpsc::Sender<StateProviderEvent>,
     control_tx: mpsc::Sender<ReplicatorControlEvent>,
     #[allow(dead_code)]
     data_tx: mpsc::Sender<ReplicateRequest>,
@@ -61,18 +63,20 @@ impl KubelicateRuntimeBuilder {
     }
 
     /// Build the runtime, returning it along with the channels needed to
-    /// spawn the replicator actor and the user service event receiver.
+    /// spawn the replicator actor and the user service event receivers.
     pub fn build(self) -> RuntimeBundle {
         let channels = ReplicatorChannels::new(self.control_buffer, self.data_buffer);
         let state = Arc::new(PartitionState::new());
-        let (service_tx, service_rx) = mpsc::channel(self.service_buffer);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(self.service_buffer);
+        let (state_provider_tx, state_provider_rx) = mpsc::channel(self.service_buffer);
         let (fault_tx, fault_rx) = mpsc::channel(DEFAULT_FAULT_BUFFER);
 
         let partition = Arc::new(PartitionHandle::new(state.clone(), fault_tx));
         let replicator_handle = StateReplicatorHandle::new(channels.data_tx.clone(), state.clone());
 
         let runtime = KubelicateRuntime {
-            service_tx,
+            lifecycle_tx,
+            state_provider_tx,
             control_tx: channels.control_tx,
             data_tx: channels.data_tx,
             state: state.clone(),
@@ -85,7 +89,8 @@ impl KubelicateRuntimeBuilder {
             runtime,
             replicator_control_rx: channels.control_rx,
             replicator_data_rx: channels.data_rx,
-            service_rx,
+            lifecycle_rx,
+            state_provider_rx,
             partition,
             replicator_handle,
             state,
@@ -95,12 +100,13 @@ impl KubelicateRuntimeBuilder {
 
 /// Everything produced by the builder. The caller spawns the replicator actor
 /// with `replicator_control_rx` + `replicator_data_rx`, and runs the user
-/// service event loop with `service_rx`.
+/// service event loop with `lifecycle_rx` + `state_provider_rx`.
 pub struct RuntimeBundle {
     pub runtime: KubelicateRuntime,
     pub replicator_control_rx: mpsc::Receiver<ReplicatorControlEvent>,
     pub replicator_data_rx: mpsc::Receiver<ReplicateRequest>,
-    pub service_rx: mpsc::Receiver<ServiceEvent>,
+    pub lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
+    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
     pub partition: Arc<PartitionHandle>,
     pub replicator_handle: StateReplicatorHandle,
     pub state: Arc<PartitionState>,
@@ -132,21 +138,21 @@ impl KubelicateRuntime {
         }
     }
 
-    /// Send a service event to the user and await the reply with timeout.
-    async fn send_service<T>(
+    /// Send a lifecycle event to the user and await the reply with timeout.
+    async fn send_lifecycle<T>(
         &self,
-        make_event: impl FnOnce(oneshot::Sender<Result<T>>) -> ServiceEvent,
+        make_event: impl FnOnce(oneshot::Sender<Result<T>>) -> LifecycleEvent,
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
         let event = make_event(tx);
 
-        match tokio::time::timeout(self.reply_timeout, self.service_tx.send(event)).await {
+        match tokio::time::timeout(self.reply_timeout, self.lifecycle_tx.send(event)).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(KubelicateError::Closed),
             Err(_) => {
-                warn!("service event channel send timed out (backpressure)");
+                warn!("lifecycle event channel send timed out (backpressure)");
                 return Err(KubelicateError::Internal(
-                    "service event send timeout".into(),
+                    "lifecycle event send timeout".into(),
                 ));
             }
         }
@@ -155,8 +161,40 @@ impl KubelicateRuntime {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(KubelicateError::Closed),
             Err(_) => {
-                warn!("service event reply timed out");
-                Err(KubelicateError::Internal("service reply timeout".into()))
+                warn!("lifecycle event reply timed out");
+                Err(KubelicateError::Internal("lifecycle reply timeout".into()))
+            }
+        }
+    }
+
+    /// Send a state provider event to the user and await the reply with timeout.
+    #[allow(dead_code)]
+    async fn send_state_provider<T>(
+        &self,
+        make_event: impl FnOnce(oneshot::Sender<Result<T>>) -> StateProviderEvent,
+    ) -> Result<T> {
+        let (tx, rx) = oneshot::channel();
+        let event = make_event(tx);
+
+        match tokio::time::timeout(self.reply_timeout, self.state_provider_tx.send(event)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(KubelicateError::Closed),
+            Err(_) => {
+                warn!("state_provider event channel send timed out");
+                return Err(KubelicateError::Internal(
+                    "state_provider event send timeout".into(),
+                ));
+            }
+        }
+
+        match tokio::time::timeout(self.reply_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(KubelicateError::Closed),
+            Err(_) => {
+                warn!("state_provider event reply timed out");
+                Err(KubelicateError::Internal(
+                    "state_provider reply timeout".into(),
+                ))
             }
         }
     }
@@ -176,11 +214,13 @@ impl KubelicateRuntime {
         self.send_control(|reply| ReplicatorControlEvent::Open { mode, reply })
             .await?;
 
-        // 2. Deliver Open to user service
-        self.send_service(|reply| ServiceEvent::Open {
+        // 2. Deliver Open to user via lifecycle channel
+        self.send_lifecycle(|reply| LifecycleEvent::Open {
             ctx: ServiceContext {
                 partition,
                 replicator: replicator_handle,
+                copy_stream: None,
+                replication_stream: None,
                 token: self.token.child_token(),
             },
             reply,
@@ -209,14 +249,14 @@ impl KubelicateRuntime {
             self.set_status_for_role(new_role);
 
             let _addr: String = self
-                .send_service(|reply| ServiceEvent::ChangeRole { new_role, reply })
+                .send_lifecycle(|reply| LifecycleEvent::ChangeRole { new_role, reply })
                 .await?;
         } else {
             // Demotion: user stops work BEFORE replicator tears down
             self.set_status_for_role(new_role);
 
             let _addr: String = self
-                .send_service(|reply| ServiceEvent::ChangeRole { new_role, reply })
+                .send_lifecycle(|reply| LifecycleEvent::ChangeRole { new_role, reply })
                 .await?;
 
             self.send_control(|reply| ReplicatorControlEvent::ChangeRole {
@@ -239,7 +279,7 @@ impl KubelicateRuntime {
 
         // 1. Close user service
         let _ = self
-            .send_service(|reply| ServiceEvent::Close { reply })
+            .send_lifecycle(|reply| LifecycleEvent::Close { reply })
             .await;
 
         // 2. Close replicator
@@ -259,14 +299,14 @@ impl KubelicateRuntime {
         self.state.set_read_status(AccessStatus::NotPrimary);
         self.state.set_write_status(AccessStatus::NotPrimary);
 
-        let _ = self.service_tx.try_send(ServiceEvent::Abort);
+        let _ = self.lifecycle_tx.try_send(LifecycleEvent::Abort);
         let _ = self.control_tx.try_send(ReplicatorControlEvent::Abort);
 
         self.token.cancel();
     }
 
     // -----------------------------------------------------------------------
-    // Replicator-only control operations (no ServiceEvent counterpart)
+    // Replicator-only control operations (no lifecycle event counterpart)
     // -----------------------------------------------------------------------
 
     pub async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
@@ -366,6 +406,7 @@ impl KubelicateRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::LifecycleEvent;
     use crate::noop::NoopReplicator;
     use crate::types::AccessStatus;
 
@@ -381,7 +422,8 @@ mod tests {
         let partition = bundle.partition.clone();
         let _replicator_handle = bundle.replicator_handle;
         let runtime = bundle.runtime;
-        let mut service_rx = bundle.service_rx;
+        let mut lifecycle_rx = bundle.lifecycle_rx;
+        let mut _state_provider_rx = bundle.state_provider_rx;
 
         // Spawn the noop replicator actor
         let repl_state = state.clone();
@@ -394,19 +436,19 @@ mod tests {
             .await;
         });
 
-        // Spawn the user service event loop
+        // Spawn the user lifecycle event loop
         let user_handle = tokio::spawn(async move {
             let mut _svc_partition = None;
             let mut svc_replicator = None;
 
-            while let Some(event) = service_rx.recv().await {
+            while let Some(event) = lifecycle_rx.recv().await {
                 match event {
-                    ServiceEvent::Open { ctx, reply } => {
+                    LifecycleEvent::Open { ctx, reply } => {
                         _svc_partition = Some(ctx.partition);
                         svc_replicator = Some(ctx.replicator);
                         let _ = reply.send(Ok(()));
                     }
-                    ServiceEvent::ChangeRole { new_role, reply } => {
+                    LifecycleEvent::ChangeRole { new_role, reply } => {
                         if new_role == Role::Primary {
                             // Verify we can replicate as primary
                             let repl = svc_replicator.as_ref().unwrap();
@@ -421,11 +463,11 @@ mod tests {
                         }
                         let _ = reply.send(Ok(String::new()));
                     }
-                    ServiceEvent::Close { reply } => {
+                    LifecycleEvent::Close { reply } => {
                         let _ = reply.send(Ok(()));
                         break;
                     }
-                    ServiceEvent::Abort => break,
+                    LifecycleEvent::Abort => break,
                 }
             }
         });
@@ -518,22 +560,23 @@ mod tests {
             .await;
         });
 
-        // Spawn minimal user service
-        let mut service_rx = bundle.service_rx;
+        // Spawn minimal user lifecycle loop
+        let mut lifecycle_rx = bundle.lifecycle_rx;
+        let _state_provider_rx = bundle.state_provider_rx;
         let _user_handle = tokio::spawn(async move {
-            while let Some(event) = service_rx.recv().await {
+            while let Some(event) = lifecycle_rx.recv().await {
                 match event {
-                    ServiceEvent::Open { reply, .. } => {
+                    LifecycleEvent::Open { reply, .. } => {
                         let _ = reply.send(Ok(()));
                     }
-                    ServiceEvent::ChangeRole { reply, .. } => {
+                    LifecycleEvent::ChangeRole { reply, .. } => {
                         let _ = reply.send(Ok(String::new()));
                     }
-                    ServiceEvent::Close { reply } => {
+                    LifecycleEvent::Close { reply } => {
                         let _ = reply.send(Ok(()));
                         break;
                     }
-                    ServiceEvent::Abort => break,
+                    LifecycleEvent::Abort => break,
                 }
             }
         });
@@ -579,10 +622,11 @@ mod tests {
             .await;
         });
 
-        let mut service_rx = bundle.service_rx;
+        let mut lifecycle_rx = bundle.lifecycle_rx;
+        let _state_provider_rx = bundle.state_provider_rx;
         let user_handle = tokio::spawn(async move {
-            while let Some(event) = service_rx.recv().await {
-                if let ServiceEvent::Abort = event {
+            while let Some(event) = lifecycle_rx.recv().await {
+                if let LifecycleEvent::Abort = event {
                     break;
                 }
             }

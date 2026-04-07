@@ -7,7 +7,8 @@ use tracing::info;
 
 use crate::error::{KubelicateError, Result};
 use crate::events::{
-    ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent, ServiceContext, ServiceEvent,
+    LifecycleEvent, ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent, ServiceContext,
+    StateProviderEvent,
 };
 use crate::handles::{PartitionHandle, PartitionState, StateReplicatorHandle};
 use crate::proto::replicator_data_server::ReplicatorDataServer;
@@ -93,7 +94,8 @@ pub struct StatusInfo {
 pub struct PodRuntime {
     control_tx: mpsc::Sender<ReplicatorControlEvent>,
     data_tx: mpsc::Sender<ReplicateRequest>,
-    service_tx: mpsc::Sender<ServiceEvent>,
+    lifecycle_tx: mpsc::Sender<LifecycleEvent>,
+    state_provider_tx: mpsc::Sender<StateProviderEvent>,
     cmd_rx: mpsc::Receiver<RuntimeCommand>,
     state: Arc<PartitionState>,
     shutdown: CancellationToken,
@@ -104,7 +106,8 @@ pub struct PodRuntime {
 
 pub struct PodRuntimeBundle {
     pub runtime: PodRuntime,
-    pub service_rx: mpsc::Receiver<ServiceEvent>,
+    pub lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
+    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
     pub control_address: String,
     pub data_address: String,
 }
@@ -146,7 +149,8 @@ impl PodRuntimeBuilder {
         let state = Arc::new(PartitionState::new());
         let secondary_state = Arc::new(SecondaryState::new());
         let shutdown = CancellationToken::new();
-        let (service_tx, service_rx) = mpsc::channel(16);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(16);
+        let (state_provider_tx, state_provider_rx) = mpsc::channel(16);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
         // Start data plane gRPC server
@@ -213,7 +217,8 @@ impl PodRuntimeBuilder {
         let runtime = PodRuntime {
             control_tx: channels.control_tx,
             data_tx: channels.data_tx,
-            service_tx,
+            lifecycle_tx,
+            state_provider_tx,
             cmd_rx,
             state,
             shutdown,
@@ -224,7 +229,8 @@ impl PodRuntimeBuilder {
 
         Ok(PodRuntimeBundle {
             runtime,
-            service_rx,
+            lifecycle_rx,
+            state_provider_rx,
             control_address,
             data_address,
         })
@@ -258,13 +264,7 @@ impl PodRuntime {
                     let _ = reply.send(self.handle_change_role(epoch, role).await);
                 }
                 RuntimeCommand::UpdateEpoch { epoch, reply } => {
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| ReplicatorControlEvent::UpdateEpoch {
-                            epoch,
-                            reply: r,
-                        })
-                        .await,
-                    );
+                    let _ = reply.send(self.handle_update_epoch(epoch).await);
                 }
                 RuntimeCommand::UpdateCatchUpConfiguration {
                     current,
@@ -317,12 +317,7 @@ impl PodRuntime {
                     );
                 }
                 RuntimeCommand::OnDataLoss { reply } => {
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| ReplicatorControlEvent::OnDataLoss {
-                            reply: r,
-                        })
-                        .await,
-                    );
+                    let _ = reply.send(self.handle_on_data_loss().await);
                 }
                 RuntimeCommand::Replicate { data, reply } => {
                     let (r_tx, r_rx) = oneshot::channel();
@@ -359,15 +354,17 @@ impl PodRuntime {
         self.send_replicator_control(|reply| ReplicatorControlEvent::Open { mode, reply })
             .await?;
 
-        // 2. Create handles and deliver Open to user
+        // 2. Create handles and deliver Open to user via lifecycle channel
         let partition = Arc::new(PartitionHandle::new(self.state.clone(), mpsc::channel(4).0));
         let replicator_handle =
             StateReplicatorHandle::new(self.data_tx.clone(), self.state.clone());
 
-        self.send_service(|reply| ServiceEvent::Open {
+        self.send_lifecycle(|reply| LifecycleEvent::Open {
             ctx: ServiceContext {
                 partition,
                 replicator: replicator_handle,
+                copy_stream: None,
+                replication_stream: None,
                 token: self.shutdown.child_token(),
             },
             reply,
@@ -392,13 +389,13 @@ impl PodRuntime {
             .await?;
             self.set_status_for_role(new_role);
             let _: String = self
-                .send_service(|reply| ServiceEvent::ChangeRole { new_role, reply })
+                .send_lifecycle(|reply| LifecycleEvent::ChangeRole { new_role, reply })
                 .await?;
         } else {
             // Demotion: status first, then user, then replicator
             self.set_status_for_role(new_role);
             let _: String = self
-                .send_service(|reply| ServiceEvent::ChangeRole { new_role, reply })
+                .send_lifecycle(|reply| LifecycleEvent::ChangeRole { new_role, reply })
                 .await?;
             self.send_replicator_control(|reply| ReplicatorControlEvent::ChangeRole {
                 epoch,
@@ -420,7 +417,7 @@ impl PodRuntime {
             .set_write_status(AccessStatus::ReconfigurationPending);
 
         let _ = self
-            .send_service(|reply| ServiceEvent::Close { reply })
+            .send_lifecycle(|reply| LifecycleEvent::Close { reply })
             .await;
         let _ = self
             .send_replicator_control(|reply| ReplicatorControlEvent::Close { reply })
@@ -430,6 +427,49 @@ impl PodRuntime {
         self.state.set_write_status(AccessStatus::NotPrimary);
         self.role = Role::None;
         Ok(())
+    }
+
+    async fn handle_update_epoch(&mut self, epoch: Epoch) -> Result<()> {
+        // Get the committed LSN before epoch change (for user notification)
+        let previous_epoch_last_lsn = self.state.committed_lsn();
+
+        // 1. Update replicator epoch (handles truncation)
+        self.send_replicator_control(|reply| ReplicatorControlEvent::UpdateEpoch { epoch, reply })
+            .await?;
+
+        // 2. Notify user via state_provider channel (secondaries only)
+        if self.role != Role::Primary {
+            let _ = self
+                .send_state_provider(|reply| StateProviderEvent::UpdateEpoch {
+                    epoch,
+                    previous_epoch_last_lsn,
+                    reply,
+                })
+                .await;
+        }
+
+        self.epoch = epoch;
+        Ok(())
+    }
+
+    async fn handle_on_data_loss(&mut self) -> Result<DataLossAction> {
+        // 1. Ask replicator (returns DataLossAction::None by default in MVP)
+        let replicator_action: DataLossAction = self
+            .send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss { reply })
+            .await?;
+
+        // 2. Notify user via state_provider channel
+        let user_changed = self
+            .send_state_provider(|reply| StateProviderEvent::OnDataLoss { reply })
+            .await
+            .unwrap_or(false);
+
+        // If either replicator or user reports state changed, return StateChanged
+        if user_changed || replicator_action == DataLossAction::StateChanged {
+            Ok(DataLossAction::StateChanged)
+        } else {
+            Ok(DataLossAction::None)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -452,19 +492,35 @@ impl PodRuntime {
         }
     }
 
-    async fn send_service<T>(
+    async fn send_lifecycle<T>(
         &self,
-        make: impl FnOnce(oneshot::Sender<Result<T>>) -> ServiceEvent,
+        make: impl FnOnce(oneshot::Sender<Result<T>>) -> LifecycleEvent,
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        self.service_tx
+        self.lifecycle_tx
             .send(make(tx))
             .await
             .map_err(|_| KubelicateError::Closed)?;
         match tokio::time::timeout(self.reply_timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(KubelicateError::Closed),
-            Err(_) => Err(KubelicateError::Internal("service timeout".into())),
+            Err(_) => Err(KubelicateError::Internal("lifecycle timeout".into())),
+        }
+    }
+
+    async fn send_state_provider<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T>>) -> StateProviderEvent,
+    ) -> Result<T> {
+        let (tx, rx) = oneshot::channel();
+        self.state_provider_tx
+            .send(make(tx))
+            .await
+            .map_err(|_| KubelicateError::Closed)?;
+        match tokio::time::timeout(self.reply_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(KubelicateError::Closed),
+            Err(_) => Err(KubelicateError::Internal("state_provider timeout".into())),
         }
     }
 
@@ -485,6 +541,7 @@ impl PodRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::LifecycleEvent;
 
     #[tokio::test]
     async fn test_pod_runtime_user_lifecycle() {
@@ -495,22 +552,23 @@ mod tests {
             .unwrap();
 
         let runtime = bundle.runtime;
-        let mut service_rx = bundle.service_rx;
+        let mut lifecycle_rx = bundle.lifecycle_rx;
+        let mut _state_provider_rx = bundle.state_provider_rx;
 
-        // Spawn user event loop
+        // Spawn user event loop (lifecycle channel only for this test)
         let user_handle = tokio::spawn(async move {
             let mut _partition = None;
             let mut replicator = None;
             let mut replicated_lsns = vec![];
 
-            while let Some(event) = service_rx.recv().await {
+            while let Some(event) = lifecycle_rx.recv().await {
                 match event {
-                    ServiceEvent::Open { ctx, reply } => {
+                    LifecycleEvent::Open { ctx, reply } => {
                         _partition = Some(ctx.partition.clone());
                         replicator = Some(ctx.replicator);
                         let _ = reply.send(Ok(()));
                     }
-                    ServiceEvent::ChangeRole { new_role, reply } => {
+                    LifecycleEvent::ChangeRole { new_role, reply } => {
                         if new_role == Role::Primary {
                             let r = replicator.as_ref().unwrap();
                             let lsn = r
@@ -524,11 +582,11 @@ mod tests {
                         }
                         let _ = reply.send(Ok(String::new()));
                     }
-                    ServiceEvent::Close { reply } => {
+                    LifecycleEvent::Close { reply } => {
                         let _ = reply.send(Ok(()));
                         break;
                     }
-                    ServiceEvent::Abort => break,
+                    LifecycleEvent::Abort => break,
                 }
             }
             replicated_lsns
