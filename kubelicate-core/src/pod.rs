@@ -96,10 +96,6 @@ pub enum RuntimeCommand {
     OnDataLoss {
         reply: oneshot::Sender<Result<DataLossAction>>,
     },
-    Replicate {
-        data: bytes::Bytes,
-        reply: oneshot::Sender<Result<Lsn>>,
-    },
     GetStatus {
         reply: oneshot::Sender<StatusInfo>,
     },
@@ -360,17 +356,6 @@ impl PodRuntime {
                 }
                 RuntimeCommand::OnDataLoss { reply } => {
                     let _ = reply.send(self.handle_on_data_loss().await);
-                }
-                RuntimeCommand::Replicate { data, reply } => {
-                    let (r_tx, r_rx) = oneshot::channel();
-                    let _ = self
-                        .data_tx
-                        .send(ReplicateRequest { data, reply: r_tx })
-                        .await;
-                    let _ = reply.send(match r_rx.await {
-                        Ok(result) => result,
-                        Err(_) => Err(KubelicateError::Closed),
-                    });
                 }
                 RuntimeCommand::GetStatus { reply } => {
                     let _ = reply.send(StatusInfo {

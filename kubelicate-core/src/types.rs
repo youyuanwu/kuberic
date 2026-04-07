@@ -90,8 +90,10 @@ pub struct ReplicaInfo {
     pub replicator_address: String,
     pub current_progress: Lsn,
     pub catch_up_capability: Lsn,
-    /// Whether this replica must catch up as part of WaitForQuorumCatchup.
-    /// Exactly one replica (the primary candidate) is marked true during failover.
+    /// Whether this replica must individually catch up for WaitForCatchUpQuorum(Write).
+    /// When set, the QuorumTracker requires this replica to have ACKed all ops
+    /// up to highest_lsn, not just that quorum was met. Used during failover
+    /// (SF pre-promotion phase) or when adding a critical replica.
     pub must_catch_up: bool,
 }
 
@@ -103,10 +105,13 @@ pub struct ReplicaSetConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaSetQuorumMode {
-    /// Full quorum: all replicas in config must catch up.
+    /// Every replica in the config must individually catch up to highest LSN.
+    /// SF legacy fallback for replicators without `must_catch_up` support.
+    /// Not used by PartitionDriver — kept for completeness.
     All,
-    /// Write quorum: a subset forming write quorum must catch up,
-    /// and the subset must include the must_catch_up replica.
+    /// Write-quorum subset must catch up, and every `must_catch_up` replica
+    /// must individually catch up. Default mode used by PartitionDriver for
+    /// all workflows (create, failover, switchover, restart).
     Write,
 }
 

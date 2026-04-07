@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
 use tonic::transport::Channel;
@@ -8,7 +8,7 @@ use crate::error::{KubelicateError, Result};
 use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
-    AccessStatus, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
+    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
     ReplicaSetQuorumMode, Role,
 };
 
@@ -18,20 +18,12 @@ pub struct GrpcReplicaHandle {
     id: ReplicaId,
     client: ReplicatorControlClient<Channel>,
     /// The data plane address (secondary gRPC server for replication streams).
-    /// This is what gets passed to the primary's `update_configuration` so it
-    /// knows where to connect for data replication.
     data_address: String,
-    // Cached status
-    read_status: AtomicU8,
-    write_status: AtomicU8,
     current_progress: AtomicI64,
     catch_up_capability: AtomicI64,
 }
 
 impl GrpcReplicaHandle {
-    /// Connect to a remote pod's control server.
-    /// `control_address`: the ReplicatorControl gRPC endpoint
-    /// `data_address`: the ReplicatorData gRPC endpoint (for replication streams)
     pub async fn connect(
         id: ReplicaId,
         control_address: String,
@@ -47,8 +39,6 @@ impl GrpcReplicaHandle {
             id,
             client: ReplicatorControlClient::new(channel),
             data_address,
-            read_status: AtomicU8::new(AccessStatus::NotPrimary as u8),
-            write_status: AtomicU8::new(AccessStatus::NotPrimary as u8),
             current_progress: AtomicI64::new(0),
             catch_up_capability: AtomicI64::new(0),
         })
@@ -202,35 +192,6 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .await
             .map_err(Self::map_err)?;
         Ok(())
-    }
-
-    async fn replicate(&self, data: bytes::Bytes) -> Result<Lsn> {
-        let mut client = self.client.clone();
-        let resp = client
-            .replicate(self::ReplicateRequest {
-                data: data.to_vec(),
-            })
-            .await
-            .map_err(Self::map_err)?;
-        let lsn = resp.into_inner().lsn;
-        self.current_progress.store(lsn, Ordering::Release);
-        Ok(lsn)
-    }
-
-    fn set_read_status(&self, status: AccessStatus) {
-        self.read_status.store(status as u8, Ordering::Release);
-    }
-
-    fn set_write_status(&self, status: AccessStatus) {
-        self.write_status.store(status as u8, Ordering::Release);
-    }
-
-    fn read_status(&self) -> AccessStatus {
-        AccessStatus::from_u8(self.read_status.load(Ordering::Acquire))
-    }
-
-    fn write_status(&self) -> AccessStatus {
-        AccessStatus::from_u8(self.write_status.load(Ordering::Acquire))
     }
 
     fn replicator_address(&self) -> String {

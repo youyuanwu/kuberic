@@ -5,7 +5,7 @@ use tracing::info;
 
 use crate::error::{KubelicateError, Result};
 use crate::types::{
-    AccessStatus, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
+    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
     ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 
@@ -44,15 +44,6 @@ pub trait ReplicaHandle: Send + Sync {
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()>;
     async fn build_replica(&self, replica: ReplicaInfo) -> Result<()>;
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()>;
-
-    // Replicate data (primary only, data path)
-    async fn replicate(&self, data: bytes::Bytes) -> Result<Lsn>;
-
-    // Access status (runtime responsibility, but exposed for driver)
-    fn set_read_status(&self, status: AccessStatus);
-    fn set_write_status(&self, status: AccessStatus);
-    fn read_status(&self) -> AccessStatus;
-    fn write_status(&self) -> AccessStatus;
 
     /// The gRPC address where this replica's replication server listens.
     fn replicator_address(&self) -> String;
@@ -248,22 +239,7 @@ impl PartitionDriver {
 
         self.current_config = config;
 
-        // 7. Set access status (runtime responsibility)
-        self.replicas[&primary_id]
-            .handle
-            .set_read_status(AccessStatus::Granted);
-        self.replicas[&primary_id]
-            .handle
-            .set_write_status(AccessStatus::Granted);
-
-        for &id in &secondary_ids {
-            self.replicas[&id]
-                .handle
-                .set_read_status(AccessStatus::NotPrimary);
-            self.replicas[&id]
-                .handle
-                .set_write_status(AccessStatus::NotPrimary);
-        }
+        // Access status is set by each pod's PodRuntime during change_role()
 
         info!(
             primary = primary_id,
@@ -277,32 +253,12 @@ impl PartitionDriver {
     }
 
     // -----------------------------------------------------------------------
-    // Workflow: Replicate
-    // -----------------------------------------------------------------------
-
-    /// Replicate data through the primary.
-    pub async fn replicate(&self, data: bytes::Bytes) -> Result<Lsn> {
-        let pid = self.primary_id.ok_or(KubelicateError::NotPrimary)?;
-        self.replicas[&pid].handle.replicate(data).await
-    }
-
-    // -----------------------------------------------------------------------
     // Workflow: Delete Partition
     // -----------------------------------------------------------------------
 
     /// Gracefully shut down all replicas.
     pub async fn delete_partition(&mut self) -> Result<()> {
-        // 1. Revoke access status
-        for entry in self.replicas.values() {
-            entry
-                .handle
-                .set_read_status(AccessStatus::ReconfigurationPending);
-            entry
-                .handle
-                .set_write_status(AccessStatus::ReconfigurationPending);
-        }
-
-        // 2. Demote primary
+        // 1. Demote primary
         if let Some(pid) = self.primary_id {
             self.replicas[&pid]
                 .handle
@@ -310,20 +266,14 @@ impl PartitionDriver {
                 .await?;
         }
 
-        // 3. Change all to None
+        // 2. Change all to None
         for entry in self.replicas.values() {
             entry.handle.change_role(self.epoch, Role::None).await?;
         }
 
-        // 4. Close all
+        // 3. Close all
         for entry in self.replicas.values() {
             entry.handle.close().await?;
-        }
-
-        // 5. Final status
-        for entry in self.replicas.values() {
-            entry.handle.set_read_status(AccessStatus::NotPrimary);
-            entry.handle.set_write_status(AccessStatus::NotPrimary);
         }
 
         self.replicas.clear();
@@ -372,14 +322,8 @@ impl PartitionDriver {
         }
 
         // 1. Fence ALL surviving secondaries with new epoch
-        for entry in self.replicas.values() {
+        for entry in self.replicas.values_mut() {
             entry.handle.update_epoch(new_epoch).await?;
-            entry
-                .handle
-                .set_write_status(AccessStatus::ReconfigurationPending);
-            entry
-                .handle
-                .set_read_status(AccessStatus::ReconfigurationPending);
         }
 
         // 2. Select new primary by highest current_progress (LSN)
@@ -456,24 +400,6 @@ impl PartitionDriver {
 
         self.current_config = new_config;
 
-        // 5. Grant access status on new primary
-        self.replicas[&new_primary_id]
-            .handle
-            .set_read_status(AccessStatus::Granted);
-        self.replicas[&new_primary_id]
-            .handle
-            .set_write_status(AccessStatus::Granted);
-
-        // Secondaries → NotPrimary
-        for &id in &secondary_ids {
-            self.replicas[&id]
-                .handle
-                .set_read_status(AccessStatus::NotPrimary);
-            self.replicas[&id]
-                .handle
-                .set_write_status(AccessStatus::NotPrimary);
-        }
-
         info!(
             new_primary = new_primary_id,
             epoch = ?self.epoch,
@@ -515,24 +441,14 @@ impl PartitionDriver {
             "starting switchover"
         );
 
-        // 1. Revoke write status on old primary (reads still OK for now)
-        self.replicas[&old_primary_id]
-            .handle
-            .set_write_status(AccessStatus::ReconfigurationPending);
-
-        // 2. Fence all secondaries with new epoch
+        // 1. Fence all secondaries with new epoch
         for (&id, entry) in &self.replicas {
             if id != old_primary_id {
                 entry.handle.update_epoch(new_epoch).await?;
             }
         }
 
-        // 3. Revoke read status on old primary
-        self.replicas[&old_primary_id]
-            .handle
-            .set_read_status(AccessStatus::ReconfigurationPending);
-
-        // 4. Demote old primary → ActiveSecondary
+        // 2. Demote old primary → ActiveSecondary
         self.replicas[&old_primary_id]
             .handle
             .change_role(new_epoch, Role::ActiveSecondary)
@@ -598,30 +514,139 @@ impl PartitionDriver {
 
         self.current_config = new_config;
 
-        // 7. Grant access status
-        self.replicas[&target_id]
-            .handle
-            .set_read_status(AccessStatus::Granted);
-        self.replicas[&target_id]
-            .handle
-            .set_write_status(AccessStatus::Granted);
-
-        // Old primary + other secondaries → NotPrimary
-        for &id in &secondary_ids {
-            self.replicas[&id]
-                .handle
-                .set_read_status(AccessStatus::NotPrimary);
-            self.replicas[&id]
-                .handle
-                .set_write_status(AccessStatus::NotPrimary);
-        }
-
         info!(
             new_primary = target_id,
             epoch = ?self.epoch,
             "switchover complete"
         );
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow: Restart Secondary
+    // -----------------------------------------------------------------------
+
+    /// Restart a secondary replica. The old handle is replaced with a new one
+    /// (simulating pod restart with fresh state). The primary rebuilds it via
+    /// the copy protocol.
+    ///
+    /// 1. Close old secondary
+    /// 2. Replace handle with new one (fresh state)
+    /// 3. Open + set epoch on new handle
+    /// 4. build_replica on primary (copies state via data plane)
+    /// 5. Promote idle → active
+    /// 6. Reconfigure quorum
+    pub async fn restart_secondary(
+        &mut self,
+        secondary_id: ReplicaId,
+        new_handle: Box<dyn ReplicaHandle>,
+    ) -> Result<()> {
+        let primary_id = self.primary_id.ok_or(KubelicateError::NotPrimary)?;
+        assert_ne!(
+            secondary_id, primary_id,
+            "cannot restart the primary with restart_secondary"
+        );
+
+        let epoch = self.epoch;
+        info!(secondary_id, ?epoch, "restarting secondary");
+
+        // 1. Close old secondary (best effort — may be dead)
+        if let Some(old) = self.replicas.get(&secondary_id) {
+            let _ = old.handle.close().await;
+        }
+
+        // 2. Replace handle
+        self.replicas.insert(
+            secondary_id,
+            ReplicaState {
+                handle: new_handle,
+                role: Role::None,
+            },
+        );
+
+        // 3. Open + set epoch + assign idle role
+        let handle = &self.replicas[&secondary_id].handle;
+        handle.open(OpenMode::New).await?;
+        handle.update_epoch(epoch).await?;
+        handle.change_role(epoch, Role::IdleSecondary).await?;
+        self.replicas.get_mut(&secondary_id).unwrap().role = Role::IdleSecondary;
+
+        // 4. build_replica on primary (copies state via data plane)
+        let addr = self.replicas[&secondary_id].handle.replicator_address();
+        let replica_info = ReplicaInfo {
+            id: secondary_id,
+            role: Role::IdleSecondary,
+            status: ReplicaStatus::Up,
+            replicator_address: addr,
+            current_progress: -1,
+            catch_up_capability: -1,
+            must_catch_up: false,
+        };
+        self.replicas[&primary_id]
+            .handle
+            .build_replica(replica_info)
+            .await?;
+
+        // 5. Promote idle → active
+        self.replicas[&secondary_id]
+            .handle
+            .change_role(epoch, Role::ActiveSecondary)
+            .await?;
+        self.replicas.get_mut(&secondary_id).unwrap().role = Role::ActiveSecondary;
+
+        // 6. Reconfigure quorum (rebuild full config)
+        let secondary_ids: Vec<ReplicaId> = self
+            .replicas
+            .keys()
+            .filter(|&&id| id != primary_id)
+            .cloned()
+            .collect();
+
+        let total_count = self.replicas.len() as u32;
+        let write_quorum = total_count / 2 + 1;
+
+        let members: Vec<ReplicaInfo> = secondary_ids
+            .iter()
+            .map(|&id| {
+                let entry = &self.replicas[&id];
+                ReplicaInfo {
+                    id,
+                    role: Role::ActiveSecondary,
+                    status: ReplicaStatus::Up,
+                    replicator_address: entry.handle.replicator_address(),
+                    current_progress: entry.handle.current_progress(),
+                    catch_up_capability: entry.handle.catch_up_capability(),
+                    must_catch_up: id == secondary_id,
+                }
+            })
+            .collect();
+
+        let new_config = ReplicaSetConfig {
+            members,
+            write_quorum,
+        };
+
+        self.replicas[&primary_id]
+            .handle
+            .update_catch_up_configuration(new_config.clone(), self.current_config.clone())
+            .await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        self.replicas[&primary_id]
+            .handle
+            .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
+            .await?;
+
+        self.replicas[&primary_id]
+            .handle
+            .update_current_configuration(new_config.clone())
+            .await?;
+
+        self.current_config = new_config;
+
+        info!(secondary_id, "secondary restarted");
         Ok(())
     }
 }
@@ -643,7 +668,7 @@ pub mod testing {
     use crate::proto::replicator_data_server::ReplicatorDataServer;
     use crate::replicator::actor::WalReplicatorActor;
     use crate::replicator::secondary::{SecondaryReceiver, SecondaryState};
-    use crate::types::CancellationToken;
+    use crate::types::{AccessStatus, CancellationToken};
 
     /// In-process replica handle: wraps channels to a local replicator actor
     /// and a local gRPC secondary server.
@@ -719,6 +744,11 @@ pub mod testing {
                 .map_err(|_| KubelicateError::Closed)?;
             rx.await.map_err(|_| KubelicateError::Closed)?
         }
+
+        /// Get a user-facing StateReplicatorHandle for writing data (test helper).
+        pub fn state_replicator(&self) -> StateReplicatorHandle {
+            StateReplicatorHandle::new(self.data_tx.clone(), self.state.clone())
+        }
     }
 
     #[async_trait]
@@ -746,10 +776,21 @@ pub mod testing {
         }
 
         async fn change_role(&self, epoch: Epoch, role: Role) -> Result<()> {
-            // Also update secondary state epoch on role change
             self.secondary_state.update_epoch(epoch);
             self.send_control(|reply| ReplicatorControlEvent::ChangeRole { epoch, role, reply })
-                .await
+                .await?;
+            // Mirror PodRuntime: set access status based on role
+            match role {
+                Role::Primary => {
+                    self.state.set_read_status(AccessStatus::Granted);
+                    self.state.set_write_status(AccessStatus::Granted);
+                }
+                _ => {
+                    self.state.set_read_status(AccessStatus::NotPrimary);
+                    self.state.set_write_status(AccessStatus::NotPrimary);
+                }
+            }
+            Ok(())
         }
 
         async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
@@ -816,27 +857,6 @@ pub mod testing {
                 .await
         }
 
-        async fn replicate(&self, data: bytes::Bytes) -> Result<Lsn> {
-            let handle = StateReplicatorHandle::new(self.data_tx.clone(), self.state.clone());
-            handle.replicate(data, CancellationToken::new()).await
-        }
-
-        fn set_read_status(&self, status: AccessStatus) {
-            self.state.set_read_status(status);
-        }
-
-        fn set_write_status(&self, status: AccessStatus) {
-            self.state.set_write_status(status);
-        }
-
-        fn read_status(&self) -> AccessStatus {
-            self.state.read_status()
-        }
-
-        fn write_status(&self) -> AccessStatus {
-            self.state.write_status()
-        }
-
         fn replicator_address(&self) -> String {
             self.grpc_address.clone()
         }
@@ -856,9 +876,10 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+    use crate::types::CancellationToken;
 
     #[tokio::test]
-    async fn test_driver_create_replicate_delete() {
+    async fn test_driver_create_delete() {
         let mut driver = PartitionDriver::new();
         let handles = spawn_replicas(3).await.unwrap();
 
@@ -869,36 +890,15 @@ mod tests {
         assert_eq!(driver.epoch(), Epoch::new(0, 1));
 
         let pid = driver.primary_id().unwrap();
-        let primary = driver.handle(pid).unwrap();
-        assert_eq!(primary.read_status(), AccessStatus::Granted);
-        assert_eq!(primary.write_status(), AccessStatus::Granted);
 
-        // Replicate 5 operations
-        for i in 1..=5 {
-            let lsn = driver
-                .replicate(bytes::Bytes::from(format!("op-{}", i)))
-                .await
-                .unwrap();
-            assert_eq!(lsn, i);
-        }
-
-        // Verify primary progress
-        assert_eq!(primary.current_progress(), 5);
-
-        // Give ACKs time to propagate
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Verify secondaries received data
+        // Verify secondaries exist
         for id in driver.replica_ids() {
             if id == pid {
                 continue;
             }
-            let _handle = driver.handle(id).unwrap();
-            // Downcast not needed — we can check progress via the trait
-            // For secondary log contents, we access via the testing handle
+            assert!(driver.handle(id).is_some());
         }
 
-        // Delete partition
         driver.delete_partition().await.unwrap();
         assert!(driver.primary_id().is_none());
         assert_eq!(driver.replica_ids().len(), 0);
@@ -912,13 +912,7 @@ mod tests {
         driver.create_partition(handles).await.unwrap();
 
         let pid = driver.primary_id().unwrap();
-        assert_eq!(
-            driver.handle(pid).unwrap().write_status(),
-            AccessStatus::Granted
-        );
-
-        let lsn = driver.replicate(bytes::Bytes::from("solo")).await.unwrap();
-        assert_eq!(lsn, 1);
+        assert!(driver.handle(pid).is_some());
 
         driver.delete_partition().await.unwrap();
     }
@@ -932,37 +926,15 @@ mod tests {
 
         let old_primary = driver.primary_id().unwrap();
 
-        // Replicate some data before failure
-        for i in 1..=3 {
-            driver
-                .replicate(bytes::Bytes::from(format!("pre-failover-{}", i)))
-                .await
-                .unwrap();
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
         // Simulate primary failure → failover
         driver.failover(old_primary).await.unwrap();
 
         let new_primary = driver.primary_id().unwrap();
         assert_ne!(new_primary, old_primary);
-        assert_eq!(driver.epoch(), Epoch::new(0, 2)); // Epoch incremented
-
-        // New primary should have Granted status
-        let new_primary_handle = driver.handle(new_primary).unwrap();
-        assert_eq!(new_primary_handle.read_status(), AccessStatus::Granted);
-        assert_eq!(new_primary_handle.write_status(), AccessStatus::Granted);
+        assert_eq!(driver.epoch(), Epoch::new(0, 2));
 
         // Should only have 2 replicas now (failed one removed)
         assert_eq!(driver.replica_ids().len(), 2);
-
-        // Can replicate on new primary
-        let lsn = driver
-            .replicate(bytes::Bytes::from("post-failover"))
-            .await
-            .unwrap();
-        assert!(lsn > 0);
 
         driver.delete_partition().await.unwrap();
     }
@@ -975,16 +947,6 @@ mod tests {
         driver.create_partition(handles).await.unwrap();
 
         let old_primary = driver.primary_id().unwrap();
-
-        // Replicate some data
-        for i in 1..=3 {
-            driver
-                .replicate(bytes::Bytes::from(format!("pre-switch-{}", i)))
-                .await
-                .unwrap();
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Pick a secondary as target
         let target = *driver
@@ -999,48 +961,32 @@ mod tests {
         assert_eq!(driver.primary_id(), Some(target));
         assert_eq!(driver.epoch(), Epoch::new(0, 2));
 
-        // All 3 replicas still present (no one was removed)
+        // All 3 replicas still present
         assert_eq!(driver.replica_ids().len(), 3);
-
-        // New primary has Granted
-        assert_eq!(
-            driver.handle(target).unwrap().write_status(),
-            AccessStatus::Granted
-        );
-
-        // Old primary is now secondary (NotPrimary)
-        assert_eq!(
-            driver.handle(old_primary).unwrap().write_status(),
-            AccessStatus::NotPrimary
-        );
-
-        // Can replicate on new primary
-        let lsn = driver
-            .replicate(bytes::Bytes::from("post-switch"))
-            .await
-            .unwrap();
-        assert!(lsn > 0);
 
         driver.delete_partition().await.unwrap();
     }
 
     #[tokio::test]
     async fn test_driver_epoch_truncation() {
-        let mut driver = PartitionDriver::new();
-
         // Spawn manually to keep secondary_state ref
         let h1 = InProcessReplicaHandle::spawn(1).await.unwrap();
         let h2 = InProcessReplicaHandle::spawn(2).await.unwrap();
         let h3 = InProcessReplicaHandle::spawn(3).await.unwrap();
         let sec2_state = h2.secondary_state.clone();
+        let primary_replicator = h1.state_replicator();
 
         let handles: Vec<Box<dyn ReplicaHandle>> = vec![Box::new(h1), Box::new(h2), Box::new(h3)];
+        let mut driver = PartitionDriver::new();
         driver.create_partition(handles).await.unwrap();
 
-        // Replicate 3 ops
+        // Replicate 3 ops via the user-facing StateReplicatorHandle
         for i in 1..=3 {
-            driver
-                .replicate(bytes::Bytes::from(format!("op-{}", i)))
+            primary_replicator
+                .replicate(
+                    bytes::Bytes::from(format!("op-{}", i)),
+                    CancellationToken::new(),
+                )
                 .await
                 .unwrap();
         }

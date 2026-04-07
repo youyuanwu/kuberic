@@ -19,8 +19,21 @@ pub struct QuorumTracker {
     /// Previous configuration (non-empty during reconfiguration)
     previous_members: HashSet<ReplicaId>,
     previous_write_quorum: u32,
+    /// Replicas marked as must_catch_up (from current config)
+    must_catch_up_ids: HashSet<ReplicaId>,
+    /// Per-replica highest ACKed LSN (for must_catch_up enforcement)
+    replica_acked_lsn: HashMap<ReplicaId, Lsn>,
     /// Highest committed LSN
     committed_lsn: Lsn,
+    /// Highest registered LSN (current progress)
+    highest_lsn: Lsn,
+    /// Waiters for catch-up quorum
+    catch_up_waiters: Vec<CatchUpWaiter>,
+}
+
+struct CatchUpWaiter {
+    mode: crate::types::ReplicaSetQuorumMode,
+    reply: oneshot::Sender<Result<()>>,
 }
 
 struct PendingOp {
@@ -39,7 +52,11 @@ impl QuorumTracker {
             current_write_quorum: 0,
             previous_members: HashSet::new(),
             previous_write_quorum: 0,
+            must_catch_up_ids: HashSet::new(),
+            replica_acked_lsn: HashMap::new(),
             committed_lsn: 0,
+            highest_lsn: 0,
+            catch_up_waiters: Vec::new(),
         }
     }
 
@@ -48,17 +65,20 @@ impl QuorumTracker {
     }
 
     /// Update to dual-config mode (during reconfiguration).
+    /// Extracts `must_catch_up` replica IDs from the current config members.
     pub fn set_catch_up_configuration(
         &mut self,
         current_members: HashSet<ReplicaId>,
         current_write_quorum: u32,
         previous_members: HashSet<ReplicaId>,
         previous_write_quorum: u32,
+        must_catch_up_ids: HashSet<ReplicaId>,
     ) {
         self.current_members = current_members;
         self.current_write_quorum = current_write_quorum;
         self.previous_members = previous_members;
         self.previous_write_quorum = previous_write_quorum;
+        self.must_catch_up_ids = must_catch_up_ids;
     }
 
     /// Update to single-config mode (reconfiguration complete).
@@ -71,6 +91,7 @@ impl QuorumTracker {
         self.current_write_quorum = current_write_quorum;
         self.previous_members.clear();
         self.previous_write_quorum = 0;
+        self.must_catch_up_ids.clear();
     }
 
     /// Register a new pending operation. The primary's own ACK is counted
@@ -81,8 +102,22 @@ impl QuorumTracker {
         primary_id: ReplicaId,
         reply: oneshot::Sender<Result<Lsn>>,
     ) {
+        if lsn > self.highest_lsn {
+            self.highest_lsn = lsn;
+        }
+
         let mut acked_by = HashSet::new();
         acked_by.insert(primary_id);
+
+        // Track primary's own ACK progress
+        self.replica_acked_lsn
+            .entry(primary_id)
+            .and_modify(|v| {
+                if lsn > *v {
+                    *v = lsn;
+                }
+            })
+            .or_insert(lsn);
 
         let mut op = PendingOp {
             acked_by,
@@ -98,16 +133,31 @@ impl QuorumTracker {
         // Only insert if not already committed
         if op.reply.is_some() {
             self.pending.insert(lsn, op);
+        } else {
+            self.notify_catch_up_waiters();
         }
     }
 
     /// Record an ACK from a secondary. If this causes quorum to be met,
     /// the operation is committed and the reply is sent.
     pub fn ack(&mut self, lsn: Lsn, replica_id: ReplicaId) {
+        // Track per-replica progress
+        self.replica_acked_lsn
+            .entry(replica_id)
+            .and_modify(|v| {
+                if lsn > *v {
+                    *v = lsn;
+                }
+            })
+            .or_insert(lsn);
+
         if let Some(op) = self.pending.get_mut(&lsn) {
             op.acked_by.insert(replica_id);
         } else {
-            return; // Already committed or unknown LSN
+            // Already committed or unknown LSN — still notify waiters
+            // since the must_catch_up replica might have just caught up
+            self.notify_catch_up_waiters();
+            return;
         }
 
         // Re-check quorum after inserting the ACK (avoids borrow conflict)
@@ -120,6 +170,7 @@ impl QuorumTracker {
             let mut op = self.pending.remove(&lsn).unwrap();
             self.commit_op(&mut op);
             self.try_commit_pending();
+            self.notify_catch_up_waiters();
         }
     }
 
@@ -134,11 +185,67 @@ impl QuorumTracker {
                 }));
             }
         }
+        // Also fail any catch-up waiters
+        for waiter in self.catch_up_waiters.drain(..) {
+            let _ = waiter.reply.send(Err(match &error {
+                KubelicateError::NotPrimary => KubelicateError::NotPrimary,
+                KubelicateError::Closed => KubelicateError::Closed,
+                _ => KubelicateError::Internal(error.to_string().into()),
+            }));
+        }
     }
 
     /// Number of pending (uncommitted) operations.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Register a waiter that will be notified when catch-up is complete.
+    ///
+    /// - `All` mode: all pending ops committed (quorum met for each).
+    /// - `Write` mode: all pending ops committed AND every `must_catch_up`
+    ///   replica has individually ACKed all ops.
+    ///
+    /// If already caught up, replies immediately.
+    pub fn wait_for_catch_up(
+        &mut self,
+        mode: crate::types::ReplicaSetQuorumMode,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        if self.is_caught_up(mode) {
+            let _ = reply.send(Ok(()));
+        } else {
+            self.catch_up_waiters.push(CatchUpWaiter { mode, reply });
+        }
+    }
+
+    fn is_caught_up(&self, mode: crate::types::ReplicaSetQuorumMode) -> bool {
+        if !self.pending.is_empty() {
+            return false;
+        }
+        match mode {
+            crate::types::ReplicaSetQuorumMode::Write => {
+                // Write mode: every must_catch_up replica must have individually
+                // ACKed up to highest_lsn
+                for &id in &self.must_catch_up_ids {
+                    let acked = self.replica_acked_lsn.get(&id).copied().unwrap_or(0);
+                    if acked < self.highest_lsn {
+                        return false;
+                    }
+                }
+            }
+            crate::types::ReplicaSetQuorumMode::All => {
+                // All mode: every member in current config must have ACKed
+                // up to highest_lsn (brute-force fallback)
+                for &id in &self.current_members {
+                    let acked = self.replica_acked_lsn.get(&id).copied().unwrap_or(0);
+                    if acked < self.highest_lsn {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     // -----------------------------------------------------------------------
@@ -173,6 +280,20 @@ impl QuorumTracker {
         }
         if let Some(reply) = op.reply.take() {
             let _ = reply.send(Ok(op.lsn));
+        }
+    }
+
+    fn notify_catch_up_waiters(&mut self) {
+        if self.catch_up_waiters.is_empty() {
+            return;
+        }
+        let waiters = std::mem::take(&mut self.catch_up_waiters);
+        for waiter in waiters {
+            if self.is_caught_up(waiter.mode) {
+                let _ = waiter.reply.send(Ok(()));
+            } else {
+                self.catch_up_waiters.push(waiter);
+            }
         }
     }
 
@@ -254,7 +375,13 @@ mod tests {
         let primary_id = 1;
 
         // During reconfiguration: CC = {1, 2, 3} quorum=2, PC = {1, 2} quorum=2
-        tracker.set_catch_up_configuration(HashSet::from([1, 2, 3]), 2, HashSet::from([1, 2]), 2);
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::from([1, 2]),
+            2,
+            HashSet::new(), // no must_catch_up in this test
+        );
 
         let (tx, rx) = oneshot::channel();
         tracker.register(1, primary_id, tx);
@@ -319,5 +446,71 @@ mod tests {
         assert!(matches!(result2, Err(KubelicateError::NotPrimary)));
 
         assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_must_catch_up_enforcement() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let mut tracker = QuorumTracker::new();
+
+        // 3 replicas: write quorum = 2, replica 2 is must_catch_up
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::new(),
+            0,
+            HashSet::from([2]), // replica 2 must catch up
+        );
+
+        let (tx, rx) = oneshot::channel();
+        tracker.register(1, 1, tx);
+
+        // Secondary 3 ACKs → quorum met (1+3=2), op committed
+        tracker.ack(1, 3);
+        let lsn = rx.await.unwrap().unwrap();
+        assert_eq!(lsn, 1);
+        assert_eq!(tracker.pending_count(), 0);
+
+        // Now wait_for_catch_up(Write): pending==0, but replica 2
+        // hasn't ACKed LSN 1 yet
+        let (wait_tx, mut wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+
+        // Should NOT have fired yet — must_catch_up replica 2 is behind
+        assert!(wait_rx.try_recv().is_err());
+
+        // Replica 2 finally ACKs LSN 1 (late ACK for already-committed op)
+        tracker.ack(1, 2);
+
+        // Now the waiter should fire
+        let result = wait_rx.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wait_catch_up_all_mode() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let mut tracker = QuorumTracker::new();
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (tx, _rx) = oneshot::channel();
+        tracker.register(1, 1, tx);
+
+        // Register a wait_for_catch_up(All) — pending > 0
+        let (wait_tx, mut wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::All, wait_tx);
+        assert!(wait_rx.try_recv().is_err());
+
+        // Replica 2 ACKs → quorum met, op committed, but All requires ALL members
+        tracker.ack(1, 2);
+        // pending==0, but replica 3 hasn't ACKed yet
+        assert!(wait_rx.try_recv().is_err());
+
+        // Replica 3 ACKs → all members caught up
+        tracker.ack(1, 3);
+        let result = wait_rx.await.unwrap();
+        assert!(result.is_ok());
     }
 }

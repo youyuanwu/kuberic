@@ -453,8 +453,38 @@ because the new primary is already chosen.
 
 | Mode | Semantics | Used When |
 |---|---|---|
-| `All` | Every replica in the configuration must catch up | Non-swap reconfigurations (secondary restarts) |
-| `Write` | A write-quorum subset must catch up, and the subset MUST include the `must_catch_up` replica (the primary candidate) | Swap primary — avoids slow replicas blocking the swap |
+| `All` | **Every** replica in the configuration must individually catch up to highest LSN | Legacy fallback for replicators that don't support `must_catch_up` |
+| `Write` | A write-quorum subset must catch up, and the subset MUST include every `must_catch_up` replica | Default for modern replicators — swap, failover, restart |
+
+**Source:** `FailoverUnitProxy.ReplicatorCatchupReplicaSetAsyncOperation.cpp`
+
+The RA (Reconfiguration Agent) selects the mode via `GetCatchupModeCallerHoldsLock()`:
+
+```cpp
+case CatchupType::CatchupQuorum:
+    return FABRIC_REPLICA_SET_WRITE_QUORUM;
+case CatchupType::PreWriteStatusRevokeCatchup:
+case CatchupType::CatchupDuringSwap:
+    return replicator->DoesReplicatorSupportCatchupSpecificQuorum
+        ? FABRIC_REPLICA_SET_WRITE_QUORUM
+        : FABRIC_REPLICA_SET_QUORUM_ALL;
+```
+
+Three catchup types:
+- **`CatchupQuorum`** — Standard reconfiguration (add/remove secondary).
+  Always uses `Write` mode.
+- **`PreWriteStatusRevokeCatchup`** — During switchover, before revoking
+  write status on the old primary. Ensures the target secondary is caught up
+  so no data is lost when writes stop. Uses `Write` (with `must_catch_up`)
+  if supported, otherwise falls back to `All`.
+- **`CatchupDuringSwap`** — During swap/switchover after demotion. Same
+  fallback logic as pre-write-status revoke.
+
+`FABRIC_REPLICA_SET_QUORUM_ALL` exists only as a **backward compatibility
+fallback**. The `DoesReplicatorSupportCatchupSpecificQuorum` property was
+added in a later SF version. Older replicators that can't mark specific
+replicas as `must_catch_up` must wait for ALL replicas to catch up instead —
+a stricter but correct alternative.
 
 ---
 
@@ -607,19 +637,22 @@ captured boundary. Only when both are ACKed is the secondary considered built.
 
 **Mode: All (`FABRIC_REPLICA_SET_QUORUM_ALL`)**
 - Completes when ALL replicas' completed progress ≥ latest sequence number
-- Used during non-swap reconfigurations (e.g., secondary restart)
-- Check: `completed >= latestSequenceNumber`
+- Legacy fallback for replicators without `must_catch_up` support
+- Check: every member's `completed >= latestSequenceNumber`
 
 **Mode: Write Quorum (`FABRIC_REPLICA_SET_WRITE_QUORUM`)**
-- Completes when write quorum replicas are caught up AND the `must_catch_up`
-  replica is caught up
-- Used during failover/swap primary
+- Completes when write quorum replicas are caught up AND every `must_catch_up`
+  replica has individually caught up
+- Default for modern replicators during all reconfiguration types
 - Check: `committed >= previousConfigCatchupLsn` AND
   `lowestLSNAmongstMustCatchupReplicas >= committed`
 
-Key detail: even in Write Quorum mode, the `must_catch_up` replica (the
-primary candidate) must be fully caught up — quorum of other replicas
-catching up is not sufficient if the candidate itself hasn't caught up.
+Key detail: even in Write Quorum mode, the `must_catch_up` replica (e.g.,
+the primary candidate during swap, or the restarted secondary) must be fully
+caught up individually — quorum of other replicas catching up is not
+sufficient if the must_catch_up replica itself hasn't caught up. This
+prevents promoting a replica that is missing data, or finalizing a config
+where a critical replica is lagging.
 
 ### Replication During Reconfiguration
 

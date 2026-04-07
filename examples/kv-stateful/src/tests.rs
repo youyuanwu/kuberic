@@ -4,7 +4,6 @@ use std::time::Duration;
 use kubelicate_core::driver::{PartitionDriver, ReplicaHandle};
 use kubelicate_core::grpc::handle::GrpcReplicaHandle;
 use kubelicate_core::pod::PodRuntime;
-use kubelicate_core::types::AccessStatus;
 use tokio::sync::RwLock;
 
 use crate::proto;
@@ -189,10 +188,6 @@ async fn test_operator_three_replica_failover() {
 
     let new_primary = driver.primary_id().unwrap();
     assert_ne!(new_primary, 1);
-    assert_eq!(
-        driver.handle(new_primary).unwrap().write_status(),
-        AccessStatus::Granted
-    );
 
     // Determine which pod is the new primary
     let new_primary_pod = if new_primary == 2 { &pod2 } else { &pod3 };
@@ -297,6 +292,66 @@ async fn test_operator_kv_crud_operations() {
         assert_eq!(st.data.len(), 1);
         assert_eq!(st.data.get("a").unwrap(), "10");
         assert_eq!(st.last_applied_lsn, 5); // 2 puts + 1 overwrite + 2 deletes
+    }
+
+    driver.delete_partition().await.unwrap();
+}
+
+/// Operator-driven test: create 3 replicas, write data on primary,
+/// restart a secondary, verify it received the data via copy stream.
+#[test_log::test(tokio::test)]
+async fn test_operator_restart_secondary_copies_state() {
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+    let handles: Vec<Box<dyn ReplicaHandle>> = vec![Box::new(h1), Box::new(h2), Box::new(h3)];
+
+    let mut driver = PartitionDriver::new();
+    driver.create_partition(handles).await.unwrap();
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Write 3 KV pairs on primary
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    for i in 1..=3 {
+        kv.put(proto::PutRequest {
+            key: format!("key-{}", i),
+            value: format!("val-{}", i),
+        })
+        .await
+        .unwrap();
+    }
+
+    // Verify primary has 3 entries
+    {
+        let st = pod1.state.read().await;
+        assert_eq!(st.data.len(), 3);
+        assert_eq!(st.last_applied_lsn, 3);
+    }
+
+    // Restart secondary 2 with a fresh pod
+    let pod2_new = KvPod::start(20).await; // fresh pod, new state
+    let h2_new = pod2_new.replica_handle(2).await; // same replica ID, new handle
+
+    driver.restart_secondary(2, Box::new(h2_new)).await.unwrap();
+
+    // Wait for copy stream to be processed by the KV service
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify the restarted secondary received the data via copy stream
+    {
+        let st = pod2_new.state.read().await;
+        assert_eq!(
+            st.data.len(),
+            3,
+            "restarted secondary should have 3 entries from copy"
+        );
+        assert_eq!(st.data.get("key-1").unwrap(), "val-1");
+        assert_eq!(st.data.get("key-2").unwrap(), "val-2");
+        assert_eq!(st.data.get("key-3").unwrap(), "val-3");
     }
 
     driver.delete_partition().await.unwrap();

@@ -62,8 +62,6 @@ service ReplicatorControl {
     rpc BuildReplica(BuildReplicaRequest) returns (BuildReplicaResponse);
     rpc RemoveReplica(RemoveReplicaRequest) returns (RemoveReplicaResponse);
     rpc OnDataLoss(OnDataLossRequest) returns (OnDataLossResponse);
-
-    rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
 }
 
 message OpenRequest {
@@ -124,13 +122,6 @@ message RemoveReplicaResponse {}
 message OnDataLossRequest {}
 message OnDataLossResponse {
     bool state_changed = 1;
-}
-
-message ReplicateRequest {
-    bytes data = 1;
-}
-message ReplicateResponse {
-    int64 lsn = 1;
 }
 
 // ---- Data plane: Pod ↔ Pod (replication + copy) ----

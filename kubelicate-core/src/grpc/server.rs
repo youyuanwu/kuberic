@@ -3,18 +3,16 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
-use crate::error::KubelicateError;
-use crate::events::{ReplicateRequest, ReplicatorControlEvent};
+use crate::events::ReplicatorControlEvent;
 use crate::handles::PartitionState;
 use crate::proto::replicator_control_server::ReplicatorControl;
 use crate::proto::*;
 use crate::types::{Epoch, Role};
 
 /// gRPC control server for a single replica. Routes operator commands
-/// to the replicator's control and data channels.
+/// to the replicator's control channel.
 pub struct ControlServer {
     control_tx: mpsc::Sender<ReplicatorControlEvent>,
-    data_tx: mpsc::Sender<ReplicateRequest>,
     state: Arc<PartitionState>,
     #[allow(dead_code)]
     replica_id: i64,
@@ -26,12 +24,10 @@ impl ControlServer {
     pub fn new(
         replica_id: i64,
         control_tx: mpsc::Sender<ReplicatorControlEvent>,
-        data_tx: mpsc::Sender<ReplicateRequest>,
         state: Arc<PartitionState>,
     ) -> Self {
         Self {
             control_tx,
-            data_tx,
             state,
             replica_id,
             role: std::sync::Mutex::new(Role::None),
@@ -201,32 +197,6 @@ impl ReplicatorControl for ControlServer {
         Ok(Response::new(OnDataLossResponse {
             state_changed: action == crate::types::DataLossAction::StateChanged,
         }))
-    }
-
-    async fn replicate(
-        &self,
-        req: Request<crate::proto::ReplicateRequest>,
-    ) -> Result<Response<ReplicateResponse>, Status> {
-        let data = bytes::Bytes::from(req.into_inner().data);
-        let (tx, rx) = oneshot::channel();
-        self.data_tx
-            .send(crate::events::ReplicateRequest { data, reply: tx })
-            .await
-            .map_err(|_| Status::unavailable("replicator closed"))?;
-
-        let lsn = rx
-            .await
-            .map_err(|_| Status::unavailable("replicator closed"))?
-            .map_err(|e| match e {
-                KubelicateError::NotPrimary => Status::failed_precondition("not primary"),
-                KubelicateError::NoWriteQuorum => Status::unavailable("no write quorum"),
-                KubelicateError::ReconfigurationPending => {
-                    Status::unavailable("reconfiguration pending")
-                }
-                other => Status::internal(other.to_string()),
-            })?;
-
-        Ok(Response::new(ReplicateResponse { lsn }))
     }
 }
 
@@ -404,26 +374,5 @@ impl ReplicatorControl for ControlServerV2 {
         Ok(Response::new(OnDataLossResponse {
             state_changed: action == crate::types::DataLossAction::StateChanged,
         }))
-    }
-
-    async fn replicate(
-        &self,
-        req: Request<crate::proto::ReplicateRequest>,
-    ) -> Result<Response<ReplicateResponse>, Status> {
-        let data = bytes::Bytes::from(req.into_inner().data);
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(RuntimeCommand::Replicate { data, reply: tx })
-            .await
-            .map_err(|_| Status::unavailable("runtime closed"))?;
-        let lsn = rx
-            .await
-            .map_err(|_| Status::unavailable("runtime closed"))?
-            .map_err(|e| match e {
-                KubelicateError::NotPrimary => Status::failed_precondition("not primary"),
-                KubelicateError::NoWriteQuorum => Status::unavailable("no write quorum"),
-                other => Status::internal(other.to_string()),
-            })?;
-        Ok(Response::new(ReplicateResponse { lsn }))
     }
 }

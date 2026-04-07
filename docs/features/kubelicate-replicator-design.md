@@ -206,6 +206,13 @@ Write Quorum = ⌊N/2⌋ + 1  (primary counts toward quorum)
 quorum from BOTH previous and current configurations. A replica in both
 configs counts toward both with one ACK. See `QuorumTracker`.
 
+**Catch-up quorum mode:** `PartitionDriver` always uses `Write` mode for
+`wait_for_catch_up_quorum`. This requires write-quorum ACKs plus individual
+confirmation of any `must_catch_up` replicas (e.g., restarted secondaries).
+The `All` mode (every replica must catch up) exists as a SF legacy fallback
+for replicators without `must_catch_up` support — it is implemented in
+`QuorumTracker` but not used by the driver.
+
 ---
 
 ## Operator Design
@@ -651,35 +658,33 @@ rebuild.
 
 ## MVP Simplifications
 
-| Full Design | MVP (implemented) |
+| Full Design | Current Status |
 |---|---|
 | Replicator WAL on disk | No WAL — replicator queues in memory, user `acknowledge()` releases |
-| Incremental catchup via WAL replay | Full rebuild via copy stream |
-| build_replica copies state + replays WAL | Full state copy only (build_replica is no-op in MVP) |
-| Copy stream delivers full state | Copy stream not yet wired (no-op build) |
-| `acknowledge()` gates quorum (persisted mode) | MVP: replicator auto-ACKs on receive (volatile mode) |
-| `must_catch_up` enforced in catchup | MVP: QuorumTracker doesn't enforce must_catch_up independently |
-| Build completes on copy+repl ACKed | MVP: build_replica is a no-op |
+| Incremental catchup via WAL replay | Full rebuild via copy stream (no WAL to replay) |
+| build_replica copies state + replays WAL | Full state copy via data-plane CopyStream RPC |
+| Copy stream delivers full state | ✅ Implemented — GetCopyContext + GetCopyState + CopyStream on data plane |
+| `acknowledge()` gates quorum (persisted mode) | ✅ Implemented — SecondaryReceiver defers ACK until user acknowledges |
+| `must_catch_up` enforced in catchup | ✅ Implemented — QuorumTracker tracks per-replica ACK progress |
+| Build completes on copy+repl ACKed | Partial — copy stream completes, but no concurrent-write-during-build boundary handling |
 | mTLS on all gRPC | Deferred — assumes trusted cluster |
 | ReportFault rate limiting | Operator-side, basic |
 
-### Known Gaps vs SF (to address post-MVP)
+### Known Gaps vs SF
 
-1. **Acknowledge-gated quorum.** Current code ACKs to primary on replicator
-   receive, not on user `acknowledge()`. To implement persisted mode, the
-   secondary replicator must hold the ACK until the user pulls the operation
-   from the stream and calls `acknowledge()`. This requires wiring the
-   `OperationStream` into the `SecondaryReceiver`'s ACK path.
+1. **Build completion with concurrent writes.** SF build completes when the
+   secondary ACKs both the last copy op AND the last replication op that
+   existed at the copy boundary moment. This handles concurrent writes during
+   build. Our build serializes: copy completes fully before replication starts.
+   Concurrent writes during build are buffered by the replicator and delivered
+   after copy, but there is no two-phase completion check.
 
-2. **must_catch_up enforcement.** `QuorumTracker` counts all ACKs equally.
-   For `wait_for_catch_up_quorum(Write)`, it should additionally verify that
-   the `must_catch_up` replica (the primary candidate) is fully caught up —
-   not just that a quorum is caught up.
+2. **WAL persistence.** The replicator has no write-ahead log. State survives
+   only in the user's state provider. This means incremental catchup (replay
+   from WAL) is not possible — every restart requires a full copy rebuild.
 
-3. **Build completion condition.** SF build completes when the secondary ACKs
-   both the last copy op AND the last replication op that existed at the copy
-   boundary moment. This handles concurrent writes during build. Our build
-   is a no-op — when implemented, it needs this two-phase completion check.
+3. **mTLS.** All gRPC channels are unencrypted. Production deployments need
+   mTLS or equivalent pod-to-pod encryption.
 
 ---
 
@@ -710,38 +715,51 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 
 ```
 kubelicate-core/
-├── proto/kubelicate.proto           # gRPC: ReplicatorControl (12 RPCs) + ReplicatorData
+├── proto/kubelicate.proto           # gRPC: ReplicatorControl (11 RPCs) + ReplicatorData (3 RPCs)
 ├── src/
-│   ├── types.rs                     # Epoch, Role, AccessStatus, ReplicaInfo, ReplicaSetConfig
+│   ├── types.rs                     # Epoch, Role, AccessStatus, ReplicaInfo, Operation, OperationStream
 │   ├── error.rs                     # KubelicateError enum (NotPrimary, NoWriteQuorum, etc.)
-│   ├── events.rs                    # ReplicatorControlEvent, ReplicateRequest, ServiceEvent
+│   ├── events.rs                    # LifecycleEvent, StateProviderEvent, ReplicatorControlEvent
 │   ├── handles.rs                   # PartitionState (atomics), PartitionHandle, StateReplicatorHandle
 │   ├── noop.rs                      # NoopReplicator actor (testing)
 │   ├── runtime.rs                   # KubelicateRuntime (lower-level harness)
-│   ├── pod.rs                       # PodRuntime (full pod: actor + gRPC + user events)
+│   ├── pod.rs                       # PodRuntime (full pod: actor + gRPC + user events + copy protocol)
 │   ├── driver.rs                    # PartitionDriver + ReplicaHandle trait + InProcessReplicaHandle
 │   ├── replicator/
-│   │   ├── quorum.rs                # QuorumTracker (single + dual-config)
+│   │   ├── quorum.rs                # QuorumTracker (single + dual-config + must_catch_up)
 │   │   ├── actor.rs                 # WalReplicatorActor (control + data event loop)
 │   │   ├── primary.rs               # PrimarySender (gRPC streams to secondaries)
-│   │   └── secondary.rs             # SecondaryReceiver (gRPC server, epoch validation)
+│   │   └── secondary.rs             # SecondaryReceiver (replication + copy gRPC server)
 │   └── grpc/
 │       ├── convert.rs               # Proto ↔ domain type conversions
-│       ├── server.rs                # ControlServer (ReplicatorControl gRPC impl)
+│       ├── server.rs                # ControlServer + ControlServerV2 (gRPC impl)
 │       └── handle.rs                # GrpcReplicaHandle (remote ReplicaHandle for operator)
+
+kubelicate-operator/                 # K8s operator (CRD + reconciler)
+
+examples/kv-stateful/                # Replicated KV store example
+├── src/
+│   ├── lib.rs                       # Module declarations
+│   ├── main.rs                      # Binary entry point
+│   ├── state.rs                     # KvOp, KvState, drain_stream
+│   ├── server.rs                    # Client-facing KV gRPC server
+│   ├── service.rs                   # Lifecycle + StateProvider event loop
+│   ├── demo.rs                      # Operator/client simulators
+│   └── tests.rs                     # Integration tests (operator-driven)
+└── proto/kvstore.proto              # Client KV API (Get/Put/Delete)
 ```
 
-**Tests (19):**
+**Tests (29):**
 - `noop.rs` — 3 tests: lifecycle, replicate handle, not-primary rejection
 - `runtime.rs` — 3 tests: full lifecycle, replicate-before-promote, abort
-- `replicator/quorum.rs` — 5 tests: single/three/dual-config, out-of-order, fail-all
-- `driver.rs` — 5 tests: create+replicate+delete, single, failover, switchover, epoch truncation
-- `grpc/e2e_tests.rs` — 2 tests: full gRPC create+replicate+delete, gRPC failover
+- `replicator/quorum.rs` — 7 tests: single/three/dual-config, out-of-order, fail-all, must_catch_up, wait_catch_up_all
+- `driver.rs` — 5 tests: create+delete, single, failover, switchover, epoch truncation
+- `grpc/e2e_tests.rs` — 2 tests: gRPC create+delete, gRPC failover
 - `pod.rs` — 1 test: user lifecycle (open→promote→replicate→demote→close)
+- `kubelicate-operator` — 4 tests: reconciler phases + failover detection
+- `kv-stateful` — 4 tests: single replica KV, 3-replica failover, CRUD, restart+copy
 
 **Background references:**
 - `docs/background/service-fabric-stateful-failover.md` — SF architecture study
 - `docs/background/cloudnative-pg-architecture.md` — CNPG architecture study
-- `build/service-fabric-rs/` — SF Rust bindings (reference)
-- `build/service-fabric/` — SF C++ source (reference)
-- `build/cloudnative-pg/` — CNPG Go source (reference)
+- `docs/features/kv-stateful-design.md` — KV store example design

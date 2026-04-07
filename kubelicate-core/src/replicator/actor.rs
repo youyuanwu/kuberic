@@ -127,11 +127,19 @@ impl WalReplicatorActor {
                                 pc_members.insert(self.replica_id);
                             }
 
+                            let must_catch_up: HashSet<ReplicaId> = current
+                                .members
+                                .iter()
+                                .filter(|r| r.must_catch_up)
+                                .map(|r| r.id)
+                                .collect();
+
                             quorum_tracker.lock().await.set_catch_up_configuration(
                                 cc_members,
                                 current.write_quorum,
                                 pc_members,
                                 previous.write_quorum,
+                                must_catch_up,
                             );
 
                             // Connect to new secondaries
@@ -185,9 +193,8 @@ impl WalReplicatorActor {
 
                             let _ = reply.send(Ok(()));
                         }
-                        ReplicatorControlEvent::WaitForCatchUpQuorum { reply, .. } => {
-                            // MVP: immediately reply — all ops committed synchronously
-                            let _ = reply.send(Ok(()));
+                        ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply } => {
+                            quorum_tracker.lock().await.wait_for_catch_up(mode, reply);
                         }
                         ReplicatorControlEvent::BuildReplica { reply, .. } => {
                             // MVP: no copy stream, just acknowledge
