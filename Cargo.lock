@@ -1222,9 +1222,13 @@ dependencies = [
 name = "kv-stateful"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "clap",
+ "k8s-openapi",
+ "kube",
  "kubelicate-core",
+ "kubelicate-operator",
  "prost",
  "serde",
  "serde_json",

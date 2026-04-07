@@ -18,6 +18,9 @@ pub trait ClusterApi: Send + Sync {
     /// Create a pod.
     async fn create_pod(&self, namespace: &str, pod: &Pod) -> Result<(), String>;
 
+    /// Delete a pod by name.
+    async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String>;
+
     /// Update a pod's labels.
     async fn patch_pod_labels(
         &self,
@@ -67,6 +70,18 @@ impl ClusterApi for KubeClusterApi {
         match api.create(&kube::api::PostParams::default(), pod).await {
             Ok(_) => Ok(()),
             Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(()), // already exists
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn delete_pod(&self, namespace: &str, pod_name: &str) -> Result<(), String> {
+        let api: kube::Api<Pod> = kube::Api::namespaced(self.client.clone(), namespace);
+        match api
+            .delete(pod_name, &kube::api::DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()), // already gone
             Err(e) => Err(e.to_string()),
         }
     }

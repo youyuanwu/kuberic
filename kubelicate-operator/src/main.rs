@@ -1,9 +1,3 @@
-mod cluster_api;
-mod crd;
-mod reconciler;
-#[cfg(test)]
-mod tests;
-
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -13,9 +7,9 @@ use kube::runtime::watcher;
 use kube::{Api, Client};
 use tracing::info;
 
-use cluster_api::KubeClusterApi;
-use crd::KubelicateSet;
-use reconciler::{ReconcileAction, ReconcilerState};
+use kubelicate_operator::cluster_api::KubeClusterApi;
+use kubelicate_operator::crd::KubelicateSet;
+use kubelicate_operator::reconciler::{ReconcileAction, ReconcilerState};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -50,7 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .owns(pods, watcher::Config::default())
         .run(
             |set: Arc<KubelicateSet>, ctx: Arc<Context>| async move {
-                match reconciler::reconcile_set(&set, &ctx.api, &ctx.state).await {
+                match kubelicate_operator::reconciler::reconcile_set(&set, &ctx.api, &ctx.state)
+                    .await
+                {
                     Ok(ReconcileAction::Requeue(d)) => Ok(Action::requeue(d)),
                     Err(e) => Err(OperatorError(e)),
                 }

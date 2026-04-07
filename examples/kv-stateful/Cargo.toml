@@ -28,6 +28,10 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 test-log.workspace = true
+kubelicate-operator = { path = "../../kubelicate-operator" }
+k8s-openapi.workspace = true
+kube.workspace = true
+async-trait.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true

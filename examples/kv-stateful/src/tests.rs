@@ -356,3 +356,129 @@ async fn test_operator_restart_secondary_copies_state() {
 
     driver.delete_partition().await.unwrap();
 }
+
+/// Operator-driven test: scale-up from 1 to 3 replicas, verify new replicas
+/// receive existing data via copy stream.
+#[test_log::test(tokio::test)]
+async fn test_operator_scale_up() {
+    // Start with 1 replica (primary only)
+    let pod1 = KvPod::start(1).await;
+    let h1 = pod1.replica_handle(1).await;
+
+    let mut driver = PartitionDriver::new();
+    driver.create_partition(vec![Box::new(h1)]).await.unwrap();
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Write data on single-replica primary
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    for i in 1..=5 {
+        kv.put(proto::PutRequest {
+            key: format!("k{}", i),
+            value: format!("v{}", i),
+        })
+        .await
+        .unwrap();
+    }
+
+    // Scale up: add replica 2
+    let pod2 = KvPod::start(2).await;
+    let h2 = pod2.replica_handle(2).await;
+    driver.add_replica(Box::new(h2)).await.unwrap();
+
+    // Scale up: add replica 3
+    let pod3 = KvPod::start(3).await;
+    let h3 = pod3.replica_handle(3).await;
+    driver.add_replica(Box::new(h3)).await.unwrap();
+
+    assert_eq!(driver.replica_ids().len(), 3);
+
+    // Wait for copy streams to be processed
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify both new replicas received all 5 KV pairs via copy
+    for (name, pod) in [("pod2", &pod2), ("pod3", &pod3)] {
+        let st = pod.state.read().await;
+        assert_eq!(st.data.len(), 5, "{name} should have 5 entries from copy");
+        for i in 1..=5 {
+            assert_eq!(
+                st.data.get(&format!("k{}", i)).unwrap(),
+                &format!("v{}", i),
+                "{name} missing k{i}"
+            );
+        }
+    }
+
+    // Write more data — should replicate to all 3 replicas now
+    kv.put(proto::PutRequest {
+        key: "after-scale".to_string(),
+        value: "yes".to_string(),
+    })
+    .await
+    .unwrap();
+
+    // Verify primary has 6 entries
+    {
+        let st = pod1.state.read().await;
+        assert_eq!(st.data.len(), 6);
+    }
+
+    driver.delete_partition().await.unwrap();
+}
+
+/// Operator-driven test: scale-down from 3 to 1 replica.
+#[test_log::test(tokio::test)]
+async fn test_operator_scale_down() {
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+    assert_eq!(driver.replica_ids().len(), 3);
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Write some data
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    kv.put(proto::PutRequest {
+        key: "before".to_string(),
+        value: "scale-down".to_string(),
+    })
+    .await
+    .unwrap();
+
+    // Scale down: remove replica 3 (min_replicas=1)
+    driver.remove_secondary(3, 1).await.unwrap();
+    assert_eq!(driver.replica_ids().len(), 2);
+
+    // Scale down: remove replica 2
+    driver.remove_secondary(2, 1).await.unwrap();
+    assert_eq!(driver.replica_ids().len(), 1);
+
+    // Primary still works with single replica
+    let resp = kv
+        .put(proto::PutRequest {
+            key: "after".to_string(),
+            value: "scale-down".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().lsn > 0);
+
+    // Reads still work
+    let resp = kv
+        .get(proto::GetRequest {
+            key: "before".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.get_ref().value, "scale-down");
+
+    driver.delete_partition().await.unwrap();
+}

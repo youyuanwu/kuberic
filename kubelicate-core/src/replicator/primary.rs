@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::proto::ReplicationItem;
 use crate::proto::replicator_data_client::ReplicatorDataClient;
@@ -21,11 +21,18 @@ pub struct SecondaryConnection {
 
 /// Primary-side replication sender. Manages connections to all configured
 /// secondaries, sends operations, and routes ACKs back to the QuorumTracker.
+///
+/// Supports build buffering: ops arriving during `build_replica` are buffered
+/// per-replica. When the secondary connects via `add_secondary`, buffered ops
+/// are replayed before live replication starts.
 pub struct PrimarySender {
     connections: HashMap<ReplicaId, SecondaryConnection>,
     #[allow(dead_code)]
     primary_id: ReplicaId,
     epoch: Epoch,
+    /// Ops buffered for replicas being built. Key = replica_id being built.
+    /// Populated by `send_to_all` when a build is in progress.
+    build_buffers: HashMap<ReplicaId, Vec<ReplicationItem>>,
 }
 
 impl PrimarySender {
@@ -34,6 +41,7 @@ impl PrimarySender {
             connections: HashMap::new(),
             primary_id,
             epoch,
+            build_buffers: HashMap::new(),
         }
     }
 
@@ -41,7 +49,14 @@ impl PrimarySender {
         self.epoch = epoch;
     }
 
+    /// Start buffering ops for a replica being built. Call before
+    /// `build_replica` starts the copy protocol.
+    pub fn start_build(&mut self, replica_id: ReplicaId) {
+        self.build_buffers.insert(replica_id, Vec::new());
+    }
+
     /// Connect to a secondary's replication gRPC endpoint.
+    /// If ops were buffered during build, they are replayed first.
     /// Spawns a background task that streams items and routes ACKs.
     pub async fn add_secondary(
         &mut self,
@@ -87,6 +102,27 @@ impl PrimarySender {
         self.connections
             .insert(replica_id, SecondaryConnection { item_tx });
 
+        // Replay any ops buffered during build
+        if let Some(buffered) = self.build_buffers.remove(&replica_id)
+            && !buffered.is_empty()
+        {
+            info!(
+                replica_id,
+                count = buffered.len(),
+                "replaying buffered ops from build window"
+            );
+            let conn = self.connections.get(&replica_id).unwrap();
+            for item in buffered {
+                if conn.item_tx.send(item).await.is_err() {
+                    warn!(replica_id, "replay failed — removing broken connection");
+                    self.connections.remove(&replica_id);
+                    return Err(crate::KubelicateError::Internal(
+                        format!("failed to replay buffered ops to replica {replica_id}").into(),
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -95,8 +131,14 @@ impl PrimarySender {
         self.connections.remove(&replica_id);
     }
 
-    /// Send an operation to all connected secondaries.
-    pub async fn send_to_all(&self, lsn: Lsn, data: &bytes::Bytes) {
+    /// Cancel a pending build for a replica (clears buffered ops).
+    pub fn cancel_build(&mut self, replica_id: ReplicaId) {
+        self.build_buffers.remove(&replica_id);
+    }
+
+    /// Send an operation to all connected secondaries and buffer for
+    /// any replicas currently being built.
+    pub async fn send_to_all(&mut self, lsn: Lsn, data: &bytes::Bytes) {
         let item = ReplicationItem {
             epoch_data_loss: self.epoch.data_loss_number,
             epoch_config: self.epoch.configuration_number,
@@ -111,6 +153,11 @@ impl PrimarySender {
                     lsn, "failed to send to secondary — channel closed"
                 );
             }
+        }
+
+        // Buffer for replicas being built (not yet connected)
+        for buffer in self.build_buffers.values_mut() {
+            buffer.push(item.clone());
         }
     }
 
@@ -129,8 +176,9 @@ impl PrimarySender {
         self.connections.keys().cloned().collect()
     }
 
-    /// Close all connections (drops senders, which closes gRPC streams).
+    /// Close all connections and clear build buffers.
     pub fn close_all(&mut self) {
         self.connections.clear();
+        self.build_buffers.clear();
     }
 }

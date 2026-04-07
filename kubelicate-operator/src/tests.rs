@@ -81,6 +81,12 @@ impl ClusterApi for MockClusterApi {
         Ok(())
     }
 
+    async fn delete_pod(&self, _namespace: &str, pod_name: &str) -> Result<(), String> {
+        let mut pods = self.pods.lock().unwrap();
+        pods.retain(|p| p.metadata.name.as_deref() != Some(pod_name));
+        Ok(())
+    }
+
     async fn patch_pod_labels(
         &self,
         _namespace: &str,

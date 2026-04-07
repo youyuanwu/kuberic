@@ -163,14 +163,113 @@ pub async fn reconcile_set(
                 }
             }
 
-            // Check scaling
             let desired = set.spec.replicas as usize;
-            if pods.len() < desired {
-                info!(name, actual = pods.len(), desired, "scaling up");
-                for i in pods.len()..desired {
+            let actual = pods.len();
+            let set_key = format!("{}/{}", namespace, name);
+
+            // Scale-up: create missing pods
+            if actual < desired {
+                info!(name, actual, desired, "scale-up: creating pods");
+                for i in actual..desired {
                     let pod = build_pod(set, &namespace, i as i32);
                     api.create_pod(&namespace, &pod).await?;
                 }
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
+            }
+
+            // Scale-up: add newly ready pods to the partition via driver
+            if let Some(driver) = state.drivers.lock().await.get_mut(&set_key) {
+                let driver_count = driver.replica_ids().len();
+                if driver_count < desired {
+                    // Find pods that are ready but not in the driver
+                    for pod in &ready_pods {
+                        let pod_name = pod.name_any();
+                        let replica_id: ReplicaId = pod
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get("kubelicate.io/replica-id"))
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0)
+                            + 1; // labels are 0-indexed, IDs are 1-indexed
+
+                        if driver.handle(replica_id).is_none() {
+                            info!(name, pod = %pod_name, replica_id, "scale-up: adding replica to partition");
+                            match api.create_replica_handle(replica_id, pod, &set.spec).await {
+                                Ok(handle) => {
+                                    if let Err(e) = driver.add_replica(handle).await {
+                                        warn!(replica_id, error = %e, "failed to add replica");
+                                        return Ok(ReconcileAction::Requeue(Duration::from_secs(
+                                            5,
+                                        )));
+                                    }
+                                    // Update label
+                                    let mut labels = BTreeMap::new();
+                                    labels.insert(
+                                        "kubelicate.io/role".to_string(),
+                                        "secondary".to_string(),
+                                    );
+                                    let _ =
+                                        api.patch_pod_labels(&namespace, &pod_name, labels).await;
+                                }
+                                Err(e) => {
+                                    warn!(pod = %pod_name, error = %e, "failed to create handle");
+                                    return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
+                                }
+                            }
+                        }
+                    }
+
+                    // Update status
+                    let status = KubelicateSetStatus {
+                        ready_replicas: driver.replica_ids().len() as i32,
+                        replicas: pods.len() as i32,
+                        members: build_member_status(&pods, &set.spec),
+                        ..set.status.clone().unwrap_or_default()
+                    };
+                    api.patch_set_status(&namespace, &name, &status).await?;
+                }
+            }
+
+            // Scale-down: remove excess secondaries via driver, then delete pods
+            if actual > desired
+                && let Some(driver) = state.drivers.lock().await.get_mut(&set_key)
+            {
+                let primary_id = driver.primary_id();
+
+                // Pick the highest-ID secondary to remove (prefer newest)
+                let mut to_remove: Vec<ReplicaId> = driver
+                    .replica_ids()
+                    .into_iter()
+                    .filter(|id| Some(*id) != primary_id)
+                    .collect();
+                to_remove.sort();
+                to_remove.reverse(); // highest first
+
+                let remove_count = actual - desired;
+                for replica_id in to_remove.into_iter().take(remove_count) {
+                    info!(name, replica_id, "scale-down: removing secondary");
+                    if let Err(e) = driver
+                        .remove_secondary(replica_id, set.spec.min_replicas as usize)
+                        .await
+                    {
+                        warn!(replica_id, error = %e, "failed to remove secondary");
+                        return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
+                    }
+
+                    // Delete the pod
+                    let pod_name = format!("{}-{}", name, replica_id - 1);
+                    let _ = api.delete_pod(&namespace, &pod_name).await;
+                }
+
+                // Update status
+                let status = KubelicateSetStatus {
+                    ready_replicas: driver.replica_ids().len() as i32,
+                    replicas: driver.replica_ids().len() as i32,
+                    members: build_member_status(&pods, &set.spec),
+                    ..set.status.clone().unwrap_or_default()
+                };
+                api.patch_set_status(&namespace, &name, &status).await?;
             }
 
             Ok(ReconcileAction::Requeue(Duration::from_secs(30)))

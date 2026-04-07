@@ -146,6 +146,74 @@ build → catch-up → finalize cycle.
 
 ---
 
+## Protocol: Scale-Up (Add Replica)
+
+Add a new replica to a running partition. Implemented in
+`PartitionDriver::add_replica()`.
+
+```
+1. Operator creates new Pod + waits for Ready
+2. Operator creates GrpcReplicaHandle for the new pod
+3. driver.add_replica(handle):
+   a. Open + UpdateEpoch + ChangeRole(IdleSecondary)
+   b. build_replica on primary:
+      - Connect to secondary's data plane
+      - GetCopyContext from secondary
+      - GetCopyState from own StateProvider
+      - CopyStream to secondary (full state transfer)
+   c. change_role(ActiveSecondary) — promote idle → active
+   d. update_catch_up_configuration (must_catch_up on new replica)
+      - Seed new replica's ACK progress to committed_lsn
+      - Primary connects replication stream to new secondary
+      - Buffered ops during copy are replayed
+   e. wait_for_catch_up_quorum(Write)
+   f. update_current_configuration (finalize)
+```
+
+**Restart secondary** (`restart_secondary`) reuses the same flow: closes the
+old handle, removes it from the driver, then calls `add_replica` with the
+fresh handle.
+
+---
+
+## Protocol: Restart Secondary
+
+Replace a failed/restarting secondary with a fresh handle. Implemented in
+`PartitionDriver::restart_secondary()`.
+
+```
+1. Close old secondary (best effort)
+2. Remove old handle from driver
+3. add_replica(new_handle) — same flow as scale-up
+```
+
+---
+
+## Protocol: Scale-Down (Remove Secondary)
+
+Remove a secondary from the partition. Implemented in
+`PartitionDriver::remove_secondary()`.
+
+```
+1. Verify replica_count > min_replicas
+2. update_catch_up_configuration (config WITHOUT the target replica)
+3. wait_for_catch_up_quorum(Write) — ensure remaining replicas are caught up
+4. update_current_configuration (finalize new config)
+5. change_role(None) on removed replica
+6. close removed replica
+7. Remove handle from driver
+```
+
+Config is updated FIRST (SF's config-first approach) — this ensures
+write quorum is maintained throughout. The primary's replicator stops
+sending to the removed replica after configuration update.
+
+**If removing the primary:** Not supported directly. The operator must
+call `switchover(target)` first to move primary to another replica,
+then remove the demoted secondary.
+
+---
+
 ## Access Status State Machine
 
 **Normal operation:**
@@ -213,6 +281,14 @@ The `All` mode (every replica must catch up) exists as a SF legacy fallback
 for replicators without `must_catch_up` support — it is implemented in
 `QuorumTracker` but not used by the driver.
 
+**Catch-up baseline (matching SF `previousConfigCatchupLsn`):**
+`QuorumTracker` records `catch_up_baseline_lsn` at `set_catch_up_configuration`
+time. The `must_catch_up` check only applies to ops after this baseline — ops
+before it were covered by the copy stream. If no new ops arrive after the
+config change, catch-up is trivially met. Replica progress is seeded from
+`ReplicaInfo::current_progress` (operator-reported) and updated by actual
+replication ACKs thereafter.
+
 ---
 
 ## Operator Design
@@ -226,6 +302,42 @@ for replicators without `must_catch_up` support — it is implemented in
 **Reconciliation:** Uses `PartitionDriver` with `GrpcReplicaHandle`
 (same driver as tests, different transport). CRD status is the durable
 state machine — write-ahead pattern (CRD write before gRPC calls).
+
+**Scale-up reconciliation:** When `spec.replicas > current pod count`:
+1. Create new Pod (with ownership labels)
+2. Wait for Pod Ready
+3. Connect `GrpcReplicaHandle` to new pod
+4. `driver.add_replica(handle)` — builds via copy stream, joins quorum
+5. Update CRD status with new configuration
+
+**Scale-down reconciliation:** When `spec.replicas < current pod count`:
+
+Design follows SF's config-first approach (remove from quorum before closing):
+
+```
+1. Operator selects secondary to remove (prefer newest, never primary)
+2. driver.remove_secondary(replica_id):
+   a. Verify replica_count > min_replicas (safety)
+   b. update_catch_up_configuration (new config WITHOUT the replica)
+   c. wait_for_catch_up_quorum(Write)
+   d. update_current_configuration (finalize)
+   e. change_role(None) on removed replica
+   f. close removed replica
+   g. Remove from driver
+3. Operator deletes Pod + PVC
+4. Update CRD status
+```
+
+**Safety:**
+- Cannot scale below `spec.minReplicas`
+- Config update happens BEFORE close — write quorum is maintained
+  because the old config still includes the replica until finalized
+- If primary is targeted, operator must switchover first, then remove
+  the demoted secondary
+
+**Selection heuristic:** Prefer the secondary with the highest replica ID
+(newest). CNPG uses the same approach. SF uses PLB load balancing which
+is more sophisticated but unnecessary for our initial implementation.
 
 **All gRPC calls have timeouts** (default 30s). One reconfiguration at a
 time. Phases are idempotent (safe to re-execute after operator crash).
@@ -666,24 +778,17 @@ rebuild.
 | Copy stream delivers full state | ✅ Implemented — GetCopyContext + GetCopyState + CopyStream on data plane |
 | `acknowledge()` gates quorum (persisted mode) | ✅ Implemented — SecondaryReceiver defers ACK until user acknowledges |
 | `must_catch_up` enforced in catchup | ✅ Implemented — QuorumTracker tracks per-replica ACK progress |
-| Build completes on copy+repl ACKed | Partial — copy stream completes, but no concurrent-write-during-build boundary handling |
+| Build completes on copy+repl ACKed | ✅ Implemented — PrimarySender buffers ops during copy, replays on connect |
 | mTLS on all gRPC | Deferred — assumes trusted cluster |
 | ReportFault rate limiting | Operator-side, basic |
 
 ### Known Gaps vs SF
 
-1. **Build completion with concurrent writes.** SF build completes when the
-   secondary ACKs both the last copy op AND the last replication op that
-   existed at the copy boundary moment. This handles concurrent writes during
-   build. Our build serializes: copy completes fully before replication starts.
-   Concurrent writes during build are buffered by the replicator and delivered
-   after copy, but there is no two-phase completion check.
-
-2. **WAL persistence.** The replicator has no write-ahead log. State survives
+1. **WAL persistence.** The replicator has no write-ahead log. State survives
    only in the user's state provider. This means incremental catchup (replay
    from WAL) is not possible — every restart requires a full copy rebuild.
 
-3. **mTLS.** All gRPC channels are unencrypted. Production deployments need
+2. **mTLS.** All gRPC channels are unencrypted. Production deployments need
    mTLS or equivalent pod-to-pod encryption.
 
 ---

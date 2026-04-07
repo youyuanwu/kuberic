@@ -15,6 +15,9 @@ pub mod state;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod reconciler_tests;
+
 pub mod proto {
     tonic::include_proto!("kvstore.v1");
 }

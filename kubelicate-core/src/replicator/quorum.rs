@@ -27,6 +27,10 @@ pub struct QuorumTracker {
     committed_lsn: Lsn,
     /// Highest registered LSN (current progress)
     highest_lsn: Lsn,
+    /// highest_lsn at the time of last set_catch_up_configuration.
+    /// must_catch_up only applies to ops after this point — earlier ops
+    /// were covered by the copy stream.
+    catch_up_baseline_lsn: Lsn,
     /// Waiters for catch-up quorum
     catch_up_waiters: Vec<CatchUpWaiter>,
 }
@@ -56,6 +60,7 @@ impl QuorumTracker {
             replica_acked_lsn: HashMap::new(),
             committed_lsn: 0,
             highest_lsn: 0,
+            catch_up_baseline_lsn: 0,
             catch_up_waiters: Vec::new(),
         }
     }
@@ -65,7 +70,8 @@ impl QuorumTracker {
     }
 
     /// Update to dual-config mode (during reconfiguration).
-    /// Extracts `must_catch_up` replica IDs from the current config members.
+    /// Seeds `replica_acked_lsn` for must_catch_up replicas from their
+    /// reported `current_progress` (the operator knows each replica's LSN).
     pub fn set_catch_up_configuration(
         &mut self,
         current_members: HashSet<ReplicaId>,
@@ -73,12 +79,28 @@ impl QuorumTracker {
         previous_members: HashSet<ReplicaId>,
         previous_write_quorum: u32,
         must_catch_up_ids: HashSet<ReplicaId>,
+        member_progress: HashMap<ReplicaId, Lsn>,
     ) {
         self.current_members = current_members;
         self.current_write_quorum = current_write_quorum;
         self.previous_members = previous_members;
         self.previous_write_quorum = previous_write_quorum;
         self.must_catch_up_ids = must_catch_up_ids;
+        self.catch_up_baseline_lsn = self.highest_lsn;
+
+        // Seed ACK progress from operator-reported replica progress.
+        // This accounts for data delivered via copy stream.
+        for (id, progress) in &member_progress {
+            self.replica_acked_lsn
+                .entry(*id)
+                .and_modify(|v| {
+                    if *progress > *v {
+                        *v = *progress;
+                    }
+                })
+                .or_insert(*progress);
+        }
+        self.notify_catch_up_waiters();
     }
 
     /// Update to single-config mode (reconfiguration complete).
@@ -223,23 +245,26 @@ impl QuorumTracker {
         if !self.pending.is_empty() {
             return false;
         }
+        // The check LSN: only ops after the catch-up baseline matter.
+        // If no new ops arrived since the config change, catch-up is trivial.
+        let check_lsn = self.highest_lsn;
+        if check_lsn <= self.catch_up_baseline_lsn {
+            // No new ops since config change — nothing to catch up to
+            return true;
+        }
         match mode {
             crate::types::ReplicaSetQuorumMode::Write => {
-                // Write mode: every must_catch_up replica must have individually
-                // ACKed up to highest_lsn
                 for &id in &self.must_catch_up_ids {
                     let acked = self.replica_acked_lsn.get(&id).copied().unwrap_or(0);
-                    if acked < self.highest_lsn {
+                    if acked < check_lsn {
                         return false;
                     }
                 }
             }
             crate::types::ReplicaSetQuorumMode::All => {
-                // All mode: every member in current config must have ACKed
-                // up to highest_lsn (brute-force fallback)
                 for &id in &self.current_members {
                     let acked = self.replica_acked_lsn.get(&id).copied().unwrap_or(0);
-                    if acked < self.highest_lsn {
+                    if acked < check_lsn {
                         return false;
                     }
                 }
@@ -380,7 +405,8 @@ mod tests {
             2,
             HashSet::from([1, 2]),
             2,
-            HashSet::new(), // no must_catch_up in this test
+            HashSet::new(),
+            HashMap::new(),
         );
 
         let (tx, rx) = oneshot::channel();
@@ -460,7 +486,8 @@ mod tests {
             2,
             HashSet::new(),
             0,
-            HashSet::from([2]), // replica 2 must catch up
+            HashSet::from([2]),
+            HashMap::from([(2, 0), (3, 0)]), // both secondaries start at LSN 0
         );
 
         let (tx, rx) = oneshot::channel();

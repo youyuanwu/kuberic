@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex as TokioMutex, mpsc};
@@ -134,12 +134,20 @@ impl WalReplicatorActor {
                                 .map(|r| r.id)
                                 .collect();
 
+                            // Build member progress map from operator-reported LSNs
+                            let member_progress: HashMap<ReplicaId, Lsn> = current
+                                .members
+                                .iter()
+                                .map(|r| (r.id, r.current_progress))
+                                .collect();
+
                             quorum_tracker.lock().await.set_catch_up_configuration(
                                 cc_members,
                                 current.write_quorum,
                                 pc_members,
                                 previous.write_quorum,
                                 must_catch_up,
+                                member_progress,
                             );
 
                             // Connect to new secondaries
@@ -196,12 +204,20 @@ impl WalReplicatorActor {
                         ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply } => {
                             quorum_tracker.lock().await.wait_for_catch_up(mode, reply);
                         }
-                        ReplicatorControlEvent::BuildReplica { reply, .. } => {
-                            // MVP: no copy stream, just acknowledge
+                        ReplicatorControlEvent::BuildReplica { replica, reply } => {
+                            // Copy has completed. Start buffering replication ops
+                            // for this replica until it joins the config.
+                            if let Some(sender) = &mut primary_sender {
+                                sender.start_build(replica.id);
+                            }
                             let _ = reply.send(Ok(()));
                         }
                         ReplicatorControlEvent::RemoveReplica { replica_id, reply } => {
+                            // Remove an idle replica (not in active configuration).
+                            // Cancels any in-progress build and drops the connection.
+                            // Active secondaries are removed via UpdateConfiguration.
                             if let Some(sender) = &mut primary_sender {
+                                sender.cancel_build(replica_id);
                                 sender.remove_secondary(replica_id);
                             }
                             let _ = reply.send(Ok(()));
@@ -221,7 +237,7 @@ impl WalReplicatorActor {
                     quorum_tracker.lock().await.register(lsn, self.replica_id, req.reply);
 
                     // Send to all connected secondaries
-                    if let Some(sender) = &primary_sender {
+                    if let Some(sender) = &mut primary_sender {
                         sender.send_to_all(lsn, &req.data).await;
                     }
 

@@ -654,6 +654,48 @@ sufficient if the must_catch_up replica itself hasn't caught up. This
 prevents promoting a replica that is missing data, or finalizing a config
 where a critical replica is lagging.
 
+### Catch-Up Completion Logic (from C++ source)
+
+**Source:** `PrimaryReplicator.CatchupAsyncOperation.cpp`, `ReplicaManager.cpp`
+
+The `UpdateCatchupOperation` callback fires whenever any replica's progress
+updates. It re-checks the catch-up condition:
+
+**`previousConfigCatchupLsn`**: Recorded at `UpdateCatchUpConfiguration`
+time as `ReplicationQueueManager::LastSequenceNumber`. This is the baseline
+— only ops up to this LSN existed when the config changed.
+
+**Write Quorum mode (`IsQuorumProgressAchieved`):**
+```cpp
+bool progressAchieved = (committed >= previousConfigCatchupLsn);
+if (lowestLSNAmongstMustCatchupReplicas != MaxLSN) {
+    // must_catch_up replicas exist
+    progressAchieved = progressAchieved &&
+        (lowestLSNAmongstMustCatchupReplicas >= committed);
+}
+```
+
+Two conditions:
+1. **`committed >= previousConfigCatchupLsn`** — quorum has committed all
+   ops that existed at config-change time
+2. **`lowestLSNAmongstMustCatchupReplicas >= committed`** — every
+   must_catch_up replica has individually ACKed up to committed LSN
+
+If no must_catch_up replicas exist (`lowestLSN == MaxLSN`), only check 1
+applies. If no new ops arrived after config change, `committed ==
+previousConfigCatchupLsn` and check 1 trivially passes.
+
+**`lowestLSNAmongstMustCatchupReplicas`** is computed from `activeReplicas_`
+by calling `GetLastApplyLsn()` on each replica with `MustCatchup == Yes`.
+This is the replica's **actual reported ACK from the replication channel**,
+not operator-provided data.
+
+**All mode (`IsAllProgressAchieved`):**
+```cpp
+bool progressAchieved = (completed >= latestSequenceNumber);
+```
+Simple: every replica's completed progress ≥ latest sequence number.
+
 ### Replication During Reconfiguration
 
 `replicate()` continues to work during reconfiguration with dual-config
@@ -662,6 +704,63 @@ commits when it's acknowledged by write quorum in BOTH configurations.
 The `wait_for_catch_up_quorum` async operation is completed by a callback
 (`UpdateCatchupOperation`) that fires whenever any replica's progress
 updates — it re-checks the catchup condition after each ACK.
+
+---
+
+## Scale-Down (Replica Removal)
+
+**Source:** `PlacementTask.cpp`, `ReconfigurationTask.cpp`, `MovementTask.cpp`
+
+### How FM Chooses Which Replica to Remove
+
+The PLB (Placement & Load Balancing) decides which replicas to drop based on
+load balancing heuristics (not newest/oldest). It generates movement actions
+with `DropSecondary`, `DropPrimary`, or `DropInstance` types.
+
+### Sequence: Remove a Secondary
+
+Order is **config-first, then close**:
+
+1. **PLB marks**: replica gets `IsToBeDroppedByPLB = true`
+2. **Wait for ready**: FM waits for `IsReady` state (stable, caught up)
+3. **Start reconfiguration**: `StartReconfiguration(isPrimaryChange: false)`
+4. **Remove from config**: `RemoveFromCurrentConfiguration(replica)` —
+   removes from CC FIRST, before closing the replica
+5. **Primary broadcasts**: new config without the dropped secondary via
+   Phase0_Demote → Phase4_Activate flow
+6. **Close replica**: replica receives close, releases resources
+
+```cpp
+// ReconfigurationTask.cpp line 418-428
+for (auto it = failoverUnit.BeginIterator;
+     it != failoverUnit.EndIterator &&
+     count > TargetReplicaSetSize; ++it) {
+    if (it->IsCurrentConfigurationSecondary &&
+        it->IsToBeDropped && it->IsReady) {
+        failoverUnit.RemoveFromCurrentConfiguration(it);
+        count--;
+    }
+}
+```
+
+### Removing the Primary
+
+SF **never drops the primary directly**. If PLB marks the primary for drop:
+
+1. `ReconfigSwapPrimary()` is called — switchover to a stable secondary
+2. Old primary becomes secondary
+3. Then dropped as a normal secondary
+4. Safety assert: `ASSERT_IF(newPrimary->IsToBeDropped, ...)` — new primary
+   must NOT be marked for drop
+
+### Safety Guarantees
+
+- **MinReplicaSetSize**: removal only when `CurrentConfig.ReplicaCount >
+  MinReplicaSetSize`
+- **Write quorum**: maintained because removal only when `count >
+  TargetReplicaSetSize`; dropped replicas excluded from quorum
+- **Implicit drain**: FM waits for `IsReady` (caught up) before removing,
+  allowing in-flight writes to complete
 
 ---
 
@@ -1456,6 +1555,29 @@ trait IPrimaryReplicator: IReplicator {
 
     fn remove_replica(&self, replica_id: i64) -> Result<()>;
 }
+```
+
+**`remove_replica` semantics (from C++ source):**
+
+`RemoveReplica` only operates on **idle replicas** — those in `InBuild` or `Idle`
+state, NOT in the active configuration. Active secondaries are removed by
+updating the configuration (removing them from the members list via
+`update_catch_up_replica_set_configuration`).
+
+When called on the primary's replicator (`ReplicaManager::RemoveReplica`):
+1. Searches `idleReplicas_` list only
+2. Closes the replication session
+3. Calls `session->CancelCopy()` to cancel any in-progress copy/build
+4. Updates progress and completes any now-committed replicate operations
+5. Returns `REReplicaDoesNotExist` if the replica wasn't found
+
+Used by the RA in two scenarios:
+- **During re-build:** When a stale idle entry (older instance) exists for the same
+  node. The old idle must be removed before the new build can start
+  (`ReplicatorBuildIdleReplicaAsyncOperation`).
+- **When `ReplicatorRemovePending` is set:** The RA marks a faulted/dropped replica
+  for removal. On the next processing cycle, it sends `ReplicatorRemoveIdleReplica`
+  to the primary's proxy.
 ```
 
 ### Key Types

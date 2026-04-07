@@ -524,86 +524,48 @@ impl PartitionDriver {
     }
 
     // -----------------------------------------------------------------------
-    // Workflow: Restart Secondary
+    // Workflow: Remove Secondary (scale-down)
     // -----------------------------------------------------------------------
 
-    /// Restart a secondary replica. The old handle is replaced with a new one
-    /// (simulating pod restart with fresh state). The primary rebuilds it via
-    /// the copy protocol.
+    /// Remove a secondary from the partition. Config-first: the configuration
+    /// is updated before the replica is closed, maintaining write quorum.
     ///
-    /// 1. Close old secondary
-    /// 2. Replace handle with new one (fresh state)
-    /// 3. Open + set epoch on new handle
-    /// 4. build_replica on primary (copies state via data plane)
-    /// 5. Promote idle → active
-    /// 6. Reconfigure quorum
-    pub async fn restart_secondary(
+    /// 1. Verify not removing primary, and above min count
+    /// 2. Reconfigure without the target replica
+    /// 3. Change role to None + close the removed replica
+    /// 4. Remove from driver
+    pub async fn remove_secondary(
         &mut self,
         secondary_id: ReplicaId,
-        new_handle: Box<dyn ReplicaHandle>,
+        min_replicas: usize,
     ) -> Result<()> {
         let primary_id = self.primary_id.ok_or(KubelicateError::NotPrimary)?;
         assert_ne!(
             secondary_id, primary_id,
-            "cannot restart the primary with restart_secondary"
+            "cannot remove the primary — use switchover first"
+        );
+        assert!(
+            self.replicas.contains_key(&secondary_id),
+            "replica {} not found",
+            secondary_id
+        );
+        assert!(
+            self.replicas.len() > min_replicas,
+            "cannot scale below min_replicas ({})",
+            min_replicas
         );
 
-        let epoch = self.epoch;
-        info!(secondary_id, ?epoch, "restarting secondary");
+        info!(secondary_id, "removing secondary (scale-down)");
 
-        // 1. Close old secondary (best effort — may be dead)
-        if let Some(old) = self.replicas.get(&secondary_id) {
-            let _ = old.handle.close().await;
-        }
-
-        // 2. Replace handle
-        self.replicas.insert(
-            secondary_id,
-            ReplicaState {
-                handle: new_handle,
-                role: Role::None,
-            },
-        );
-
-        // 3. Open + set epoch + assign idle role
-        let handle = &self.replicas[&secondary_id].handle;
-        handle.open(OpenMode::New).await?;
-        handle.update_epoch(epoch).await?;
-        handle.change_role(epoch, Role::IdleSecondary).await?;
-        self.replicas.get_mut(&secondary_id).unwrap().role = Role::IdleSecondary;
-
-        // 4. build_replica on primary (copies state via data plane)
-        let addr = self.replicas[&secondary_id].handle.replicator_address();
-        let replica_info = ReplicaInfo {
-            id: secondary_id,
-            role: Role::IdleSecondary,
-            status: ReplicaStatus::Up,
-            replicator_address: addr,
-            current_progress: -1,
-            catch_up_capability: -1,
-            must_catch_up: false,
-        };
-        self.replicas[&primary_id]
-            .handle
-            .build_replica(replica_info)
-            .await?;
-
-        // 5. Promote idle → active
-        self.replicas[&secondary_id]
-            .handle
-            .change_role(epoch, Role::ActiveSecondary)
-            .await?;
-        self.replicas.get_mut(&secondary_id).unwrap().role = Role::ActiveSecondary;
-
-        // 6. Reconfigure quorum (rebuild full config)
+        // 1. Reconfigure without the target replica (config-first)
         let secondary_ids: Vec<ReplicaId> = self
             .replicas
             .keys()
-            .filter(|&&id| id != primary_id)
+            .filter(|&&id| id != primary_id && id != secondary_id)
             .cloned()
             .collect();
 
-        let total_count = self.replicas.len() as u32;
+        let total_count = (self.replicas.len() - 1) as u32; // after removal
         let write_quorum = total_count / 2 + 1;
 
         let members: Vec<ReplicaInfo> = secondary_ids
@@ -617,7 +579,7 @@ impl PartitionDriver {
                     replicator_address: entry.handle.replicator_address(),
                     current_progress: entry.handle.current_progress(),
                     catch_up_capability: entry.handle.catch_up_capability(),
-                    must_catch_up: id == secondary_id,
+                    must_catch_up: false,
                 }
             })
             .collect();
@@ -646,7 +608,195 @@ impl PartitionDriver {
 
         self.current_config = new_config;
 
-        info!(secondary_id, "secondary restarted");
+        // 2. Close the removed replica
+        let removed = self.replicas.remove(&secondary_id).unwrap();
+        let _ = removed.handle.change_role(self.epoch, Role::None).await;
+        let _ = removed.handle.close().await;
+
+        info!(
+            secondary_id,
+            remaining = self.replicas.len(),
+            "secondary removed"
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow: Add Replica (scale-up or rebuild)
+    // -----------------------------------------------------------------------
+
+    /// Add a new replica to the partition. The primary builds it via the
+    /// copy protocol, then it joins the quorum configuration.
+    ///
+    /// Used for:
+    /// - **Scale-up:** operator creates a new pod, calls add_replica
+    /// - **Restart:** restart_secondary calls this after closing the old handle
+    ///
+    /// Flow:
+    /// 1. Open + set epoch + assign idle role
+    /// 2. build_replica on primary (copies state via data plane)
+    /// 3. Promote idle → active
+    /// 4. Reconfigure quorum (must_catch_up on the new replica)
+    pub async fn add_replica(&mut self, handle: Box<dyn ReplicaHandle>) -> Result<()> {
+        let primary_id = self.primary_id.ok_or(KubelicateError::NotPrimary)?;
+        let replica_id = handle.id();
+
+        assert_ne!(
+            replica_id, primary_id,
+            "cannot add the primary as a secondary"
+        );
+        assert!(
+            !self.replicas.contains_key(&replica_id),
+            "replica {} already exists — use restart_secondary to replace",
+            replica_id
+        );
+
+        let epoch = self.epoch;
+        info!(replica_id, ?epoch, "adding replica");
+
+        // Store handle
+        self.replicas.insert(
+            replica_id,
+            ReplicaState {
+                handle,
+                role: Role::None,
+            },
+        );
+
+        // 1. Open + set epoch + assign idle role
+        let h = &self.replicas[&replica_id].handle;
+        h.open(OpenMode::New).await?;
+        h.update_epoch(epoch).await?;
+        h.change_role(epoch, Role::IdleSecondary).await?;
+        self.replicas.get_mut(&replica_id).unwrap().role = Role::IdleSecondary;
+
+        // 2. build_replica on primary (copies state via data plane)
+        let addr = self.replicas[&replica_id].handle.replicator_address();
+        let replica_info = ReplicaInfo {
+            id: replica_id,
+            role: Role::IdleSecondary,
+            status: ReplicaStatus::Up,
+            replicator_address: addr,
+            current_progress: -1,
+            catch_up_capability: -1,
+            must_catch_up: false,
+        };
+        self.replicas[&primary_id]
+            .handle
+            .build_replica(replica_info)
+            .await?;
+
+        // 3. Promote idle → active
+        self.replicas[&replica_id]
+            .handle
+            .change_role(epoch, Role::ActiveSecondary)
+            .await?;
+        self.replicas.get_mut(&replica_id).unwrap().role = Role::ActiveSecondary;
+
+        // 4. Reconfigure quorum (rebuild full config, must_catch_up on new replica)
+        self.reconfigure_quorum(primary_id, Some(replica_id))
+            .await?;
+
+        info!(replica_id, "replica added");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Workflow: Restart Secondary
+    // -----------------------------------------------------------------------
+
+    /// Restart a secondary replica. The old handle is replaced with a new one
+    /// (simulating pod restart with fresh state). The primary rebuilds it via
+    /// the copy protocol.
+    pub async fn restart_secondary(
+        &mut self,
+        secondary_id: ReplicaId,
+        new_handle: Box<dyn ReplicaHandle>,
+    ) -> Result<()> {
+        let primary_id = self.primary_id.ok_or(KubelicateError::NotPrimary)?;
+        assert_ne!(
+            secondary_id, primary_id,
+            "cannot restart the primary with restart_secondary"
+        );
+        assert!(
+            self.replicas.contains_key(&secondary_id),
+            "replica {} not found — use add_replica for new replicas",
+            secondary_id
+        );
+
+        info!(secondary_id, "restarting secondary");
+
+        // 1. Close old secondary (best effort — may be dead)
+        if let Some(old) = self.replicas.get(&secondary_id) {
+            let _ = old.handle.close().await;
+        }
+
+        // 2. Remove old handle, then add_replica with new one
+        self.replicas.remove(&secondary_id);
+
+        // Ensure new_handle has the same ID
+        assert_eq!(new_handle.id(), secondary_id);
+        self.add_replica(new_handle).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal: Reconfigure quorum after adding/rebuilding a replica
+    // -----------------------------------------------------------------------
+
+    async fn reconfigure_quorum(
+        &mut self,
+        primary_id: ReplicaId,
+        must_catch_up_id: Option<ReplicaId>,
+    ) -> Result<()> {
+        let secondary_ids: Vec<ReplicaId> = self
+            .replicas
+            .keys()
+            .filter(|&&id| id != primary_id)
+            .cloned()
+            .collect();
+
+        let total_count = self.replicas.len() as u32;
+        let write_quorum = total_count / 2 + 1;
+
+        let members: Vec<ReplicaInfo> = secondary_ids
+            .iter()
+            .map(|&id| {
+                let entry = &self.replicas[&id];
+                ReplicaInfo {
+                    id,
+                    role: Role::ActiveSecondary,
+                    status: ReplicaStatus::Up,
+                    replicator_address: entry.handle.replicator_address(),
+                    current_progress: entry.handle.current_progress(),
+                    catch_up_capability: entry.handle.catch_up_capability(),
+                    must_catch_up: must_catch_up_id == Some(id),
+                }
+            })
+            .collect();
+
+        let new_config = ReplicaSetConfig {
+            members,
+            write_quorum,
+        };
+
+        self.replicas[&primary_id]
+            .handle
+            .update_catch_up_configuration(new_config.clone(), self.current_config.clone())
+            .await?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        self.replicas[&primary_id]
+            .handle
+            .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
+            .await?;
+
+        self.replicas[&primary_id]
+            .handle
+            .update_current_configuration(new_config.clone())
+            .await?;
+
+        self.current_config = new_config;
         Ok(())
     }
 }
