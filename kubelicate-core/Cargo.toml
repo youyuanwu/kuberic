@@ -3,6 +3,9 @@ name = "kubelicate-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+testing = []
+
 [dependencies]
 tokio.workspace = true
 tokio-util.workspace = true

@@ -628,7 +628,7 @@ impl PartitionDriver {
 // In-process ReplicaHandle implementation (for tests)
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use super::*;
     use std::sync::Arc;

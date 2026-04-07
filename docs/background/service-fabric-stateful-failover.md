@@ -576,6 +576,60 @@ or rebalancing):
 - Replica being built does NOT count towards quorum
 - A replica cannot simultaneously be in-build and in the configuration
 
+### Build Completion Condition (from C++ source)
+
+**Source:** `PrimaryReplicator.BuildIdleAsyncOperation.cpp`
+
+Build is complete when **both** of these are ACKed by the secondary:
+1. The last copy operation produced by the state provider
+2. The last replication operation that existed at the moment the last copy
+   op was produced
+
+From the source comments:
+> "This is necessary because subsequent operations may override operations
+> provided by copy, so that the state when copy is finished is inconsistent."
+
+The primary captures `lastReplicationSequenceNumber` at the exact moment the
+copy enumerator produces its final item. The build waits for the secondary to
+ACK both this copy LSN and this replication LSN.
+
+This handles **concurrent writes during build**: while the state provider is
+producing the copy state, the primary may be accepting new writes. These
+writes go into the replication queue. The secondary first drains the copy
+stream (full state), then drains any replication operations up to the
+captured boundary. Only when both are ACKed is the secondary considered built.
+
+### Catchup Mechanics (from C++ source)
+
+**Source:** `PrimaryReplicator.CatchupAsyncOperation.cpp`
+
+`wait_for_catch_up_quorum()` has two modes:
+
+**Mode: All (`FABRIC_REPLICA_SET_QUORUM_ALL`)**
+- Completes when ALL replicas' completed progress ≥ latest sequence number
+- Used during non-swap reconfigurations (e.g., secondary restart)
+- Check: `completed >= latestSequenceNumber`
+
+**Mode: Write Quorum (`FABRIC_REPLICA_SET_WRITE_QUORUM`)**
+- Completes when write quorum replicas are caught up AND the `must_catch_up`
+  replica is caught up
+- Used during failover/swap primary
+- Check: `committed >= previousConfigCatchupLsn` AND
+  `lowestLSNAmongstMustCatchupReplicas >= committed`
+
+Key detail: even in Write Quorum mode, the `must_catch_up` replica (the
+primary candidate) must be fully caught up — quorum of other replicas
+catching up is not sufficient if the candidate itself hasn't caught up.
+
+### Replication During Reconfiguration
+
+`replicate()` continues to work during reconfiguration with dual-config
+quorum. The primary sends to all replicas in both PC and CC. An operation
+commits when it's acknowledged by write quorum in BOTH configurations.
+The `wait_for_catch_up_quorum` async operation is completed by a callback
+(`UpdateCatchupOperation`) that fires whenever any replica's progress
+updates — it re-checks the catchup condition after each ACK.
+
 ---
 
 ## Data Loss Handling
@@ -645,6 +699,224 @@ When a primary is demoted:
 3. The service must handle this — transient exceptions can be retried on the
    new primary
 4. Secondary replicas have **read-only access** to Reliable Collections
+
+---
+
+## StateReplicator and StateProvider Interfaces
+
+Below Reliable Collections sits a lower-level contract between the **Fabric
+Replicator** (system-provided) and the **State Provider** (user/system-
+implemented). Understanding this layer is critical for building custom
+replication — it's the interface our kubelicate design is modeled after.
+
+**Source:** `service-fabric-apps-rs/crates/libs/mssf-ext/src/traits.rs`,
+Microsoft documentation for `IStateReplicator` and `IStateProvider`.
+
+### IStateProvider — What the Service Implements
+
+The state provider is the service's state management layer. The Fabric
+Replicator calls it to manage state during replication and reconfiguration.
+
+```
+trait StateProvider {
+    // Epoch barrier — segments operations by primary configuration
+    async fn update_epoch(epoch, previous_epoch_last_lsn, token) -> Result<()>;
+
+    // Returns the last committed (applied + persisted) LSN
+    fn get_last_committed_sequence_number() -> Result<i64>;
+
+    // Called on data loss (quorum lost). Returns true if state was modified.
+    async fn on_data_loss(token) -> Result<bool>;
+
+    // Secondary → Primary: send context about what state this secondary has
+    fn get_copy_context() -> Result<OperationDataStream>;
+
+    // Primary → Secondary: send state needed to build the secondary
+    // up_to_lsn: everything up to this LSN goes via copy; after this via replication
+    fn get_copy_state(up_to_lsn, copy_context_stream) -> Result<OperationDataStream>;
+}
+```
+
+**Key details:**
+- `update_epoch()` receives `previous_epoch_last_lsn` — the last LSN from
+  the previous primary. The state provider uses this to fence out stale
+  operations.
+- `get_copy_context()` / `get_copy_state()` form a **bidirectional exchange**:
+  the secondary sends its context (what it already has), and the primary
+  responds with only the missing state. For empty secondaries (in-memory
+  services), `get_copy_context()` returns empty — the primary sends
+  everything.
+- `get_last_committed_sequence_number()` is called by the replicator to
+  determine where the copy stream should start and to report progress for
+  primary selection.
+
+### IStateReplicator — What the Service Calls
+
+The state replicator is the Fabric Replicator's interface exposed to the
+service. The primary uses it to replicate; secondaries use it to receive.
+
+```
+trait StateReplicator {
+    // Primary: replicate data to quorum. Returns (lsn, future<lsn>).
+    // lsn is assigned immediately; future completes on quorum ACK.
+    fn replicate(data, token) -> (i64, Future<i64>);
+
+    // Secondary: get the stream of copy operations (full state transfer)
+    fn get_copy_stream() -> OperationStream;
+
+    // Secondary: get the stream of replication operations (incremental)
+    fn get_replication_stream() -> OperationStream;
+
+    // Modify replicator settings at runtime (e.g., security credentials)
+    fn update_replicator_settings(settings) -> Result<()>;
+}
+```
+
+**Key details:**
+- `replicate()` returns **both** an immediate LSN (for local bookkeeping)
+  **and** a future that completes when quorum ACKs the operation. The service
+  can prepare a local write immediately using the LSN, then commit when the
+  future completes.
+- `get_copy_stream()` and `get_replication_stream()` return `OperationStream`
+  objects. The secondary **pulls** operations from these streams by calling
+  `get_operation()`. This is a pull model, not push.
+
+### IOperation — Individual Replicated Operations
+
+Each operation from the copy or replication stream:
+
+```
+trait Operation {
+    fn get_metadata() -> OperationMetadata;  // type + sequence number
+    fn get_data() -> Buf;                    // the replicated bytes
+    fn acknowledge() -> Result<()>;          // ACK: "I've applied this"
+}
+```
+
+**The `acknowledge()` method is the critical ACK mechanism:**
+- For **persisted services**, calling `acknowledge()` is **mandatory**. The
+  Fabric Replicator will NOT release subsequent operations until the current
+  one is acknowledged. This creates backpressure — the secondary controls
+  the pace.
+- For **volatile services**, operations are implicitly acknowledged on
+  receipt (unless `isRequireServiceAck` is set to true).
+- An operation must be acknowledged by a **quorum** of replicas before the
+  primary's `replicate()` future completes.
+
+### Data Flow: Primary Side
+
+```
+User Code          StateProvider        StateReplicator       FabricReplicator
+   │                    │                    │                      │
+   │── write(data) ────►│                    │                      │
+   │                    │── replicate(data) ►│                      │
+   │                    │   returns (lsn,    │                      │
+   │                    │    future)         │                      │
+   │                    │                    │── send to secondaries │
+   │                    │                    │◄── quorum ACKs ──────│
+   │                    │◄── future done ───│                      │
+   │◄── commit ────────│                    │                      │
+```
+
+### Data Flow: Secondary Side (Pull Model)
+
+```
+FabricReplicator         StateReplicator              User/StateProvider
+      │                       │                              │
+      │                       │◄── get_copy_stream() ───────│
+      │── copy ops ──────────►│                              │
+      │                       │──── Operation ──────────────►│
+      │                       │                        apply + persist
+      │                       │◄──── acknowledge() ─────────│
+      │                       │                              │
+      │   (copy done)         │                              │
+      │                       │◄── get_replication_stream() ─│
+      │── repl ops ──────────►│                              │
+      │                       │──── Operation ──────────────►│
+      │                       │                        apply + persist
+      │                       │◄──── acknowledge() ─────────│
+      │◄── ACK ──────────────│                              │
+```
+
+**Key insight — `Acknowledge()` semantics depend on the service mode:**
+
+The behavior of `Operation.Acknowledge()` depends on the
+`RequireServiceAck` replicator setting:
+
+**Persisted services** (`RequireServiceAck = true`, the default):
+- `Acknowledge()` IS in the quorum path
+- The primary's `replicate()` does NOT complete until a quorum of
+  secondaries have called `Acknowledge()`
+- This means the secondary's apply speed directly affects primary write
+  latency
+- The durability guarantee is strong: quorum commit = quorum of services
+  have applied the operation
+- From the .NET docs: *"An operation must be acknowledged by a quorum of
+  replicas before the Primary replica receives the ReplicateAsync operation
+  complete responses."*
+
+**Volatile services** (`RequireServiceAck = false`):
+- `Acknowledge()` is NOT in the quorum path
+- The replicator auto-ACKs to the primary on receive
+- `Acknowledge()` only releases the operation from the replicator's queue
+  (memory management / backpressure)
+- The primary's `replicate()` completes faster (on replicator receive, not
+  service apply)
+
+**Internally** (from C++ source, `ReplicationAckMessageBody.h`):
+
+The ACK message sent from secondary to primary contains **four values**:
+
+```
+ReplicationAckMessageBody {
+    replicationReceivedLSN   // what replicator received (auto-tracked)
+    replicationQuorumLSN     // what service acknowledged via Acknowledge()
+    copyReceivedLSN          // copy received
+    copyQuorumLSN            // copy acknowledged
+}
+```
+
+The variable name `replicationQuorumLSN` is definitive — this IS the value
+used for quorum evaluation. In persisted mode, it advances only when the
+service calls `Acknowledge()`. In volatile mode, the replicator auto-advances
+it on receive (making it equal to `replicationReceivedLSN`).
+
+The primary's `PrimaryReplicator::ReplicationAckMessageHandler()` passes
+both values to `session->UpdateAckProgress()`, which evaluates quorum
+against the QuorumLSN fields.
+
+**Implications for volatile mode:**
+
+Volatile mode (`RequireServiceAck = false`) trades durability for latency:
+
+| Aspect | Persisted | Volatile |
+|---|---|---|
+| Quorum gated on | Service `Acknowledge()` | Replicator receive |
+| Write latency | Includes secondary apply time | Replicator-to-replicator only |
+| On failover | Promoted secondary has applied all quorum-ACKed ops | Promoted secondary may NOT have applied all ops yet — user must drain stream to catch up |
+| Data loss risk | None (quorum = applied) | Possible gap between received and applied |
+| When to use | Default. Databases, KV stores. | In-memory caches, volatile state |
+
+**The critical safety implication:** In volatile mode, after failover the
+new primary's user state may lag behind what was quorum-committed. The
+replicator has the data (received), but the user hasn't applied it yet. The
+user MUST drain the replication stream before accepting new writes — otherwise
+the new primary's state is inconsistent with what clients saw as committed.
+
+### Copy Stream vs Replication Stream
+
+| Stream | When | Content | Purpose |
+|---|---|---|---|
+| **Copy** | During `build_replica` | Full state snapshot | Brings new/empty secondary up to a point-in-time |
+| **Replication** | After copy completes | Incremental operations | Ongoing stream of new writes from the primary |
+
+The copy stream has an `up_to_lsn` boundary. Everything ≤ `up_to_lsn` comes
+via copy; everything > `up_to_lsn` comes via the replication stream. The
+replicator buffers operations with LSN > `up_to_lsn` during the copy phase
+and delivers them once the secondary starts consuming the replication stream.
+
+**Recommended ordering:** Drain copy stream first, then replication stream.
+Parallel consumption is supported but complex.
 
 ---
 

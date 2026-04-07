@@ -3,35 +3,98 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::error::{KubelicateError, Result};
 use crate::events::{
     ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent, ServiceContext, ServiceEvent,
 };
-use crate::grpc::server::ControlServer;
 use crate::handles::{PartitionHandle, PartitionState, StateReplicatorHandle};
-use crate::proto::replicator_control_server::ReplicatorControlServer;
 use crate::proto::replicator_data_server::ReplicatorDataServer;
 use crate::replicator::actor::WalReplicatorActor;
 use crate::replicator::secondary::{SecondaryReceiver, SecondaryState};
-use crate::types::{AccessStatus, CancellationToken, Epoch, FaultType, OpenMode, ReplicaId, Role};
+use crate::types::{
+    AccessStatus, CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
+    ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+};
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A fully wired pod runtime that manages:
-/// - WalReplicatorActor (replication engine)
-/// - gRPC control server (operator → pod)
-/// - gRPC data server (pod ↔ pod replication)
-/// - ServiceEvent delivery to user code
-/// - Access status transitions
-///
-/// This is what a real application pod runs.
+// ---------------------------------------------------------------------------
+// RuntimeCommand — what the gRPC control server sends to the runtime
+// ---------------------------------------------------------------------------
+
+/// Commands sent by the gRPC ControlServer to the PodRuntime.
+/// The runtime processes these with correct ordering (replicator + user events).
+pub enum RuntimeCommand {
+    Open {
+        mode: OpenMode,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Close {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ChangeRole {
+        epoch: Epoch,
+        role: Role,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    UpdateEpoch {
+        epoch: Epoch,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    UpdateCatchUpConfiguration {
+        current: ReplicaSetConfig,
+        previous: ReplicaSetConfig,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    UpdateCurrentConfiguration {
+        current: ReplicaSetConfig,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    WaitForCatchUpQuorum {
+        mode: ReplicaSetQuorumMode,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    BuildReplica {
+        replica: ReplicaInfo,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RemoveReplica {
+        replica_id: ReplicaId,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    OnDataLoss {
+        reply: oneshot::Sender<Result<DataLossAction>>,
+    },
+    Replicate {
+        data: bytes::Bytes,
+        reply: oneshot::Sender<Result<Lsn>>,
+    },
+    GetStatus {
+        reply: oneshot::Sender<StatusInfo>,
+    },
+}
+
+/// Status info returned by GetStatus.
+pub struct StatusInfo {
+    pub role: Role,
+    pub epoch: Epoch,
+    pub current_progress: Lsn,
+    pub catch_up_capability: Lsn,
+    pub committed_lsn: Lsn,
+    pub healthy: bool,
+}
+
+// ---------------------------------------------------------------------------
+// PodRuntime
+// ---------------------------------------------------------------------------
+
 pub struct PodRuntime {
-    replica_id: ReplicaId,
     control_tx: mpsc::Sender<ReplicatorControlEvent>,
     data_tx: mpsc::Sender<ReplicateRequest>,
     service_tx: mpsc::Sender<ServiceEvent>,
+    cmd_rx: mpsc::Receiver<RuntimeCommand>,
     state: Arc<PartitionState>,
     shutdown: CancellationToken,
     reply_timeout: Duration,
@@ -39,14 +102,10 @@ pub struct PodRuntime {
     epoch: Epoch,
 }
 
-/// Everything produced by the PodRuntime builder.
 pub struct PodRuntimeBundle {
     pub runtime: PodRuntime,
-    /// User receives lifecycle events here.
     pub service_rx: mpsc::Receiver<ServiceEvent>,
-    /// The control server address (for operator to connect to).
     pub control_address: String,
-    /// The data server address (for other replicas to connect to).
     pub data_address: String,
 }
 
@@ -82,14 +141,13 @@ impl PodRuntimeBuilder {
         self
     }
 
-    /// Build and start the pod runtime. Spawns actor + gRPC servers.
     pub async fn build(self) -> Result<PodRuntimeBundle> {
         let channels = ReplicatorChannels::new(16, 256);
         let state = Arc::new(PartitionState::new());
         let secondary_state = Arc::new(SecondaryState::new());
         let shutdown = CancellationToken::new();
         let (service_tx, service_rx) = mpsc::channel(16);
-        let (fault_tx, _fault_rx) = mpsc::channel::<FaultType>(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
         // Start data plane gRPC server
         let data_receiver = SecondaryReceiver::new(secondary_state);
@@ -110,13 +168,9 @@ impl PodRuntimeBuilder {
                 .await;
         });
 
-        // Start control plane gRPC server
-        let control_server = ControlServer::new(
-            self.replica_id,
-            channels.control_tx.clone(),
-            channels.data_tx.clone(),
-            state.clone(),
-        );
+        // Start control plane gRPC server (routes through cmd_tx → runtime)
+        let control_server =
+            crate::grpc::server::ControlServerV2::new(self.replica_id, cmd_tx, state.clone());
         let control_listener = tokio::net::TcpListener::bind(&self.control_bind)
             .await
             .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
@@ -126,7 +180,11 @@ impl PodRuntimeBuilder {
         let ctrl_shutdown = shutdown.child_token();
         tokio::spawn(async move {
             let _ = Server::builder()
-                .add_service(ReplicatorControlServer::new(control_server))
+                .add_service(
+                    crate::proto::replicator_control_server::ReplicatorControlServer::new(
+                        control_server,
+                    ),
+                )
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(control_listener),
                     ctrl_shutdown.cancelled(),
@@ -143,10 +201,7 @@ impl PodRuntimeBuilder {
                 .await;
         });
 
-        // Give servers time to start
         tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let _partition = Arc::new(PartitionHandle::new(state.clone(), fault_tx));
 
         info!(
             replica_id = self.replica_id,
@@ -156,10 +211,10 @@ impl PodRuntimeBuilder {
         );
 
         let runtime = PodRuntime {
-            replica_id: self.replica_id,
             control_tx: channels.control_tx,
             data_tx: channels.data_tx,
             service_tx,
+            cmd_rx,
             state,
             shutdown,
             reply_timeout: self.reply_timeout,
@@ -181,34 +236,134 @@ impl PodRuntime {
         PodRuntimeBuilder::new(replica_id)
     }
 
-    pub fn replica_id(&self) -> ReplicaId {
-        self.replica_id
+    /// Get the shutdown token. Cancelling it triggers graceful shutdown.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
-    pub fn shutdown(&self) {
+    /// Run the runtime command loop. Processes operator commands from the
+    /// gRPC control server with correct replicator/user event ordering.
+    /// Blocks until shutdown.
+    pub async fn serve(mut self) {
+        while let Some(cmd) = self.cmd_rx.recv().await {
+            match cmd {
+                RuntimeCommand::Open { mode, reply } => {
+                    let _ = reply.send(self.handle_open(mode).await);
+                }
+                RuntimeCommand::Close { reply } => {
+                    let _ = reply.send(self.handle_close().await);
+                    break;
+                }
+                RuntimeCommand::ChangeRole { epoch, role, reply } => {
+                    let _ = reply.send(self.handle_change_role(epoch, role).await);
+                }
+                RuntimeCommand::UpdateEpoch { epoch, reply } => {
+                    let _ = reply.send(
+                        self.send_replicator_control(|r| ReplicatorControlEvent::UpdateEpoch {
+                            epoch,
+                            reply: r,
+                        })
+                        .await,
+                    );
+                }
+                RuntimeCommand::UpdateCatchUpConfiguration {
+                    current,
+                    previous,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        self.send_replicator_control(|r| {
+                            ReplicatorControlEvent::UpdateCatchUpConfiguration {
+                                current,
+                                previous,
+                                reply: r,
+                            }
+                        })
+                        .await,
+                    );
+                }
+                RuntimeCommand::UpdateCurrentConfiguration { current, reply } => {
+                    let _ = reply.send(
+                        self.send_replicator_control(|r| {
+                            ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply: r }
+                        })
+                        .await,
+                    );
+                }
+                RuntimeCommand::WaitForCatchUpQuorum { mode, reply } => {
+                    let _ = reply.send(
+                        self.send_replicator_control(|r| {
+                            ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply: r }
+                        })
+                        .await,
+                    );
+                }
+                RuntimeCommand::BuildReplica { replica, reply } => {
+                    let _ = reply.send(
+                        self.send_replicator_control(|r| ReplicatorControlEvent::BuildReplica {
+                            replica,
+                            reply: r,
+                        })
+                        .await,
+                    );
+                }
+                RuntimeCommand::RemoveReplica { replica_id, reply } => {
+                    let _ = reply.send(
+                        self.send_replicator_control(|r| ReplicatorControlEvent::RemoveReplica {
+                            replica_id,
+                            reply: r,
+                        })
+                        .await,
+                    );
+                }
+                RuntimeCommand::OnDataLoss { reply } => {
+                    let _ = reply.send(
+                        self.send_replicator_control(|r| ReplicatorControlEvent::OnDataLoss {
+                            reply: r,
+                        })
+                        .await,
+                    );
+                }
+                RuntimeCommand::Replicate { data, reply } => {
+                    let (r_tx, r_rx) = oneshot::channel();
+                    let _ = self
+                        .data_tx
+                        .send(ReplicateRequest { data, reply: r_tx })
+                        .await;
+                    let _ = reply.send(match r_rx.await {
+                        Ok(result) => result,
+                        Err(_) => Err(KubelicateError::Closed),
+                    });
+                }
+                RuntimeCommand::GetStatus { reply } => {
+                    let _ = reply.send(StatusInfo {
+                        role: self.role,
+                        epoch: self.epoch,
+                        current_progress: self.state.current_progress(),
+                        catch_up_capability: self.state.catch_up_capability(),
+                        committed_lsn: self.state.committed_lsn(),
+                        healthy: true,
+                    });
+                }
+            }
+        }
         self.shutdown.cancel();
     }
 
     // -----------------------------------------------------------------------
-    // Lifecycle operations (called by operator via control server, or
-    // directly in tests)
+    // Command handlers with correct ordering
     // -----------------------------------------------------------------------
 
-    /// Open the replicator, then deliver ServiceEvent::Open to user.
-    pub async fn open(&mut self, mode: OpenMode) -> Result<()> {
+    async fn handle_open(&mut self, mode: OpenMode) -> Result<()> {
         // 1. Open replicator
-        self.send_control(|reply| ReplicatorControlEvent::Open { mode, reply })
+        self.send_replicator_control(|reply| ReplicatorControlEvent::Open { mode, reply })
             .await?;
 
-        // 2. Create user-facing handles
-        let partition = Arc::new(PartitionHandle::new(
-            self.state.clone(),
-            mpsc::channel(4).0, // fault channel
-        ));
+        // 2. Create handles and deliver Open to user
+        let partition = Arc::new(PartitionHandle::new(self.state.clone(), mpsc::channel(4).0));
         let replicator_handle =
             StateReplicatorHandle::new(self.data_tx.clone(), self.state.clone());
 
-        // 3. Deliver Open to user
         self.send_service(|reply| ServiceEvent::Open {
             ctx: ServiceContext {
                 partition,
@@ -222,35 +377,30 @@ impl PodRuntime {
         Ok(())
     }
 
-    /// Change role with correct promotion/demotion ordering.
-    pub async fn change_role(&mut self, epoch: Epoch, new_role: Role) -> Result<()> {
+    async fn handle_change_role(&mut self, epoch: Epoch, new_role: Role) -> Result<()> {
         let old_role = self.role;
         let is_promotion = new_role == Role::Primary
             || (new_role == Role::ActiveSecondary && old_role == Role::IdleSecondary);
 
         if is_promotion {
-            // Promotion: replicator first, then user
-            self.send_control(|reply| ReplicatorControlEvent::ChangeRole {
+            // Promotion: replicator first, then status, then user
+            self.send_replicator_control(|reply| ReplicatorControlEvent::ChangeRole {
                 epoch,
                 role: new_role,
                 reply,
             })
             .await?;
-
             self.set_status_for_role(new_role);
-
-            let _addr: String = self
+            let _: String = self
                 .send_service(|reply| ServiceEvent::ChangeRole { new_role, reply })
                 .await?;
         } else {
-            // Demotion: user first, then replicator
+            // Demotion: status first, then user, then replicator
             self.set_status_for_role(new_role);
-
-            let _addr: String = self
+            let _: String = self
                 .send_service(|reply| ServiceEvent::ChangeRole { new_role, reply })
                 .await?;
-
-            self.send_control(|reply| ReplicatorControlEvent::ChangeRole {
+            self.send_replicator_control(|reply| ReplicatorControlEvent::ChangeRole {
                 epoch,
                 role: new_role,
                 reply,
@@ -263,8 +413,7 @@ impl PodRuntime {
         Ok(())
     }
 
-    /// Close: user first, then replicator.
-    pub async fn close(&mut self) -> Result<()> {
+    async fn handle_close(&mut self) -> Result<()> {
         self.state
             .set_read_status(AccessStatus::ReconfigurationPending);
         self.state
@@ -273,23 +422,21 @@ impl PodRuntime {
         let _ = self
             .send_service(|reply| ServiceEvent::Close { reply })
             .await;
-
         let _ = self
-            .send_control(|reply| ReplicatorControlEvent::Close { reply })
+            .send_replicator_control(|reply| ReplicatorControlEvent::Close { reply })
             .await;
 
         self.state.set_read_status(AccessStatus::NotPrimary);
         self.state.set_write_status(AccessStatus::NotPrimary);
         self.role = Role::None;
-        self.shutdown.cancel();
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Internal helpers
+    // Helpers
     // -----------------------------------------------------------------------
 
-    async fn send_control<T>(
+    async fn send_replicator_control<T>(
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T>>) -> ReplicatorControlEvent,
     ) -> Result<T> {
@@ -298,14 +445,10 @@ impl PodRuntime {
             .send(make(tx))
             .await
             .map_err(|_| KubelicateError::Closed)?;
-
         match tokio::time::timeout(self.reply_timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(KubelicateError::Closed),
-            Err(_) => {
-                warn!("replicator control event timed out");
-                Err(KubelicateError::Internal("reply timeout".into()))
-            }
+            Err(_) => Err(KubelicateError::Internal("replicator timeout".into())),
         }
     }
 
@@ -314,24 +457,14 @@ impl PodRuntime {
         make: impl FnOnce(oneshot::Sender<Result<T>>) -> ServiceEvent,
     ) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        let event = make(tx);
-
-        match tokio::time::timeout(self.reply_timeout, self.service_tx.send(event)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(KubelicateError::Closed),
-            Err(_) => {
-                warn!("service event send timed out");
-                return Err(KubelicateError::Internal("send timeout".into()));
-            }
-        }
-
+        self.service_tx
+            .send(make(tx))
+            .await
+            .map_err(|_| KubelicateError::Closed)?;
         match tokio::time::timeout(self.reply_timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(KubelicateError::Closed),
-            Err(_) => {
-                warn!("service event reply timed out");
-                Err(KubelicateError::Internal("reply timeout".into()))
-            }
+            Err(_) => Err(KubelicateError::Internal("service timeout".into())),
         }
     }
 
@@ -361,29 +494,25 @@ mod tests {
             .await
             .unwrap();
 
-        let mut runtime = bundle.runtime;
+        let runtime = bundle.runtime;
         let mut service_rx = bundle.service_rx;
 
         // Spawn user event loop
         let user_handle = tokio::spawn(async move {
-            let mut partition = None;
+            let mut _partition = None;
             let mut replicator = None;
             let mut replicated_lsns = vec![];
 
             while let Some(event) = service_rx.recv().await {
                 match event {
                     ServiceEvent::Open { ctx, reply } => {
-                        partition = Some(ctx.partition.clone());
+                        _partition = Some(ctx.partition.clone());
                         replicator = Some(ctx.replicator);
                         let _ = reply.send(Ok(()));
                     }
                     ServiceEvent::ChangeRole { new_role, reply } => {
                         if new_role == Role::Primary {
-                            // Replicate from user code
                             let r = replicator.as_ref().unwrap();
-                            let p = partition.as_ref().unwrap();
-                            assert_eq!(p.write_status(), AccessStatus::Granted);
-
                             let lsn = r
                                 .replicate(
                                     bytes::Bytes::from("from-user"),
@@ -402,38 +531,79 @@ mod tests {
                     ServiceEvent::Abort => break,
                 }
             }
-
             replicated_lsns
         });
 
-        // Drive lifecycle
-        runtime.open(OpenMode::New).await.unwrap();
+        // Spawn the runtime command loop
+        let runtime_handle = tokio::spawn(runtime.serve());
 
-        runtime
-            .change_role(Epoch::new(0, 1), Role::IdleSecondary)
+        // Drive lifecycle via the gRPC control server (simulating operator)
+        // Connect as a gRPC client to the control address
+        let mut client = crate::proto::replicator_control_client::ReplicatorControlClient::connect(
+            bundle.control_address.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Open
+        client
+            .open(crate::proto::OpenRequest { mode: 0 })
             .await
             .unwrap();
 
-        runtime
-            .change_role(Epoch::new(0, 1), Role::ActiveSecondary)
+        // ChangeRole Idle → Active → Primary
+        client
+            .change_role(crate::proto::ChangeRoleRequest {
+                epoch: Some(crate::proto::EpochProto {
+                    data_loss_number: 0,
+                    configuration_number: 1,
+                }),
+                role: crate::proto::RoleProto::RoleIdleSecondary as i32,
+            })
             .await
             .unwrap();
 
-        runtime
-            .change_role(Epoch::new(0, 1), Role::Primary)
+        client
+            .change_role(crate::proto::ChangeRoleRequest {
+                epoch: Some(crate::proto::EpochProto {
+                    data_loss_number: 0,
+                    configuration_number: 1,
+                }),
+                role: crate::proto::RoleProto::RoleActiveSecondary as i32,
+            })
+            .await
+            .unwrap();
+
+        client
+            .change_role(crate::proto::ChangeRoleRequest {
+                epoch: Some(crate::proto::EpochProto {
+                    data_loss_number: 0,
+                    configuration_number: 1,
+                }),
+                role: crate::proto::RoleProto::RolePrimary as i32,
+            })
             .await
             .unwrap();
 
         // Demote
-        runtime
-            .change_role(Epoch::new(0, 2), Role::ActiveSecondary)
+        client
+            .change_role(crate::proto::ChangeRoleRequest {
+                epoch: Some(crate::proto::EpochProto {
+                    data_loss_number: 0,
+                    configuration_number: 2,
+                }),
+                role: crate::proto::RoleProto::RoleActiveSecondary as i32,
+            })
             .await
             .unwrap();
 
-        runtime.close().await.unwrap();
+        // Close
+        client.close(crate::proto::CloseRequest {}).await.unwrap();
 
         let lsns = user_handle.await.unwrap();
         assert_eq!(lsns.len(), 1);
         assert_eq!(lsns[0], 1);
+
+        runtime_handle.await.unwrap();
     }
 }

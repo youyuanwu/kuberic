@@ -122,6 +122,7 @@ impl PartitionHandle {
 /// User-facing write handle. Backed by the replicator's data channel.
 /// Includes fast-path access status check to avoid channel round-trip
 /// when writes are not allowed.
+#[derive(Clone)]
 pub struct StateReplicatorHandle {
     data_tx: mpsc::Sender<ReplicateRequest>,
     state: Arc<PartitionState>,

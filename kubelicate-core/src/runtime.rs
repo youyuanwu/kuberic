@@ -582,7 +582,9 @@ mod tests {
         let mut service_rx = bundle.service_rx;
         let user_handle = tokio::spawn(async move {
             while let Some(event) = service_rx.recv().await {
-                if let ServiceEvent::Abort = event { break }
+                if let ServiceEvent::Abort = event {
+                    break;
+                }
             }
         });
 
