@@ -18,14 +18,15 @@ failover, handles backups, and integrates with the broader Kubernetes ecosystem.
 8. [Failover Orchestration](#failover-orchestration)
 9. [Switchover (Planned Failover)](#switchover-planned-failover)
 10. [Split-Brain Prevention & Fencing](#split-brain-prevention--fencing)
-11. [Backup & Recovery](#backup--recovery)
-12. [WAL Archiving](#wal-archiving)
-13. [Connection Pooling (Pooler)](#connection-pooling-pooler)
-14. [Plugin System (CNPG-I)](#plugin-system-cnpg-i)
-15. [Monitoring & Observability](#monitoring--observability)
-16. [Storage Architecture](#storage-architecture)
-17. [Networking & Service Routing](#networking--service-routing)
-18. [Key Source Code Map](#key-source-code-map)
+11. [Failure Scenarios & Recovery](#failure-scenarios--recovery)
+12. [Backup & Recovery](#backup--recovery)
+13. [WAL Archiving](#wal-archiving)
+14. [Connection Pooling (Pooler)](#connection-pooling-pooler)
+15. [Plugin System (CNPG-I)](#plugin-system-cnpg-i)
+16. [Monitoring & Observability](#monitoring--observability)
+17. [Storage Architecture](#storage-architecture)
+18. [Networking & Service Routing](#networking--service-routing)
+19. [Key Source Code Map](#key-source-code-map)
 
 ---
 
@@ -734,6 +735,443 @@ The operator creates two PDBs per cluster:
 |---|---|---|---|
 | Primary PDB | `cnpg.io/podRole=primary` | 1 | Prevents voluntary eviction of the primary |
 | Replica PDB | cluster instances | N-2 | Allows draining one replica at a time |
+
+---
+
+## Failure Scenarios & Recovery
+
+How CNPG detects and recovers from every major failure mode. Each scenario
+documents the detection mechanism, recovery flow, and relevant source code.
+
+### 1. Primary Pod Crash / Not Ready
+
+**Detection:** The reconciler calls `InstanceClient.GetStatusFromInstances()`
+on every reconciliation to fetch the HTTP status from each pod's instance
+manager. If the primary pod is not ready (`IsPodReady() == false`) or returns
+an error from the HTTP status endpoint, the operator enters failover.
+
+**Source:** `internal/controller/cluster_controller.go:402`,
+`internal/controller/replicas.go:51-180`
+
+**Recovery flow:**
+
+```
+Primary unreachable or not ready
+  │
+  ├─ Set targetPrimary = PendingFailoverMarker
+  │   (signals old primary to shut down if it comes back)
+  │
+  ├─ enforceFailoverDelay()
+  │   ├─ Record currentPrimaryFailingSinceTimestamp
+  │   ├─ Wait spec.failoverDelay seconds (default 0, 30s during online upgrade)
+  │   └─ If primary recovers during delay → clear timestamp, cancel failover
+  │
+  ├─ Wait for AreWalReceiversDown() == true
+  │   (all replicas have disconnected from old primary)
+  │
+  ├─ evaluateQuorumCheck()
+  │   ├─ Strong consistency: R + W > N
+  │   │   N = synchronous standby count
+  │   │   W = sync replication factor
+  │   │   R = promotable replicas within sync standbys
+  │   └─ If quorum check FAILS → block failover, stay in PhaseFailOver
+  │
+  ├─ Select best candidate: sort replicas by:
+  │   1. No errors (healthy pods first)
+  │   2. ReceivedLsn (highest WAL received from old primary)
+  │   3. ReplayLsn (highest WAL applied)
+  │   4. Pod name (deterministic tiebreak)
+  │
+  ├─ Set targetPrimary = selected candidate
+  ├─ Instance manager on candidate: pg_ctl promote
+  ├─ Promoted instance: issues CHECKPOINT
+  └─ Operator: update labels, services, CRD status
+```
+
+**Source:** `pkg/postgres/status.go:280-324` (election sort),
+`internal/controller/replicas.go:365-407` (failover delay),
+`internal/controller/replicas_quorum.go:35-134` (quorum check)
+
+**Key details:**
+- **Failover delay** is configurable via `spec.failoverDelay` (int32 seconds).
+  Prevents rapid repeated failovers and gives transient issues time to resolve.
+- **Quorum check** prevents failover when it would violate strong consistency
+  (not enough sync replicas available to guarantee no data loss).
+- **Election uses LSN, not timeline ID.** Most advanced replica by WAL position
+  is always selected. Timeline is tracked but not used in the sort.
+
+---
+
+### 2. Secondary Pod Crash / Not Ready
+
+**Detection:** Secondaries are tracked in `cluster.Status.InstancesStatus` and
+`InstancesReportedState`. On each reconciliation, `getManagedInstances()` lists
+pods with the cluster label. Inactive pods are identified by
+`IsPodActive()` → checks `pod.Status.Phase` and `DeletionTimestamp`.
+
+**Source:** `internal/controller/cluster_status.go:73-80`,
+`pkg/utils/pod_conditions.go:47-52`
+
+**Recovery flow:**
+
+CNPG does **not** use StatefulSets — each pod is managed directly by the
+operator. When a secondary pod is not ready or deleted:
+
+1. The operator detects the pod is missing/failed on next reconciliation
+2. PVC survives (bound to the node) since pods and PVCs are managed separately
+3. Operator creates a replacement pod attached to the existing PVC
+4. New pod starts, instance manager recovers PostgreSQL from the PVC data
+5. If PVC is also gone, pod is created with a fresh PVC and rebuilt via
+   `pg_basebackup` from the primary
+
+**No explicit health-check loop or threshold** — detection is immediate on
+reconciliation. K8s informer watches trigger reconciliation when pod status
+changes.
+
+**Impact on replication:** If a sync standby is lost, the operator may need to
+reconfigure `synchronous_standby_names` to maintain write availability. The
+operator adjusts this setting based on the count of ready replicas.
+
+---
+
+### 3. Pod Deleted / Missing from Pod List
+
+**Detection:** `getManagedInstances()` compares the current pod list against
+`cluster.Status.InstanceNames`. Missing pods are detected immediately.
+
+**Source:** `internal/controller/cluster_status.go:146-150`,
+`internal/controller/cluster_create.go:1348-1426`
+
+**Recovery flow:**
+
+```
+Pod missing, PVC exists (DanglingPVC)
+  │
+  ├─ findInstancePodToCreate()
+  │   ├─ Check cluster.Status.DanglingPVC (PVCs without pods)
+  │   └─ Wait for PVC StatusReady
+  │
+  ├─ Create pod spec with existing PVC attachment
+  ├─ Set controller reference to Cluster
+  └─ Requeue after 1 second for scheduler pickup
+```
+
+If both pod and PVC are missing, the operator creates both from scratch. The
+new instance bootstraps via `pg_basebackup` (full copy from primary).
+
+**Force-deleted pods:** Handled the same way. The operator doesn't distinguish
+between graceful and force deletion — a missing pod triggers recreation.
+
+---
+
+### 4. CrashLoopBackOff
+
+**Detection:** `IsPodAlive()` specifically checks container state for
+`Waiting.Reason == "CrashLoopBackOff"`. Pods in this state are treated as
+NOT alive.
+
+**Source:** `pkg/utils/pod_conditions.go:70-80`
+
+**Behavior:**
+- CrashLooping pods are excluded from the healthy replica pool by
+  `FilterActivePods()`
+- They **cannot be elected as primary** (errors sort to the bottom in the
+  election sort)
+- K8s handles restart with exponential backoff
+- The operator doesn't cap retries — it relies on K8s restart policy
+
+**Unrecoverable instances:** CNPG supports an annotation
+`cnpg.io/unrecoverable` that marks an instance for immediate deletion. The
+reconciler checks this on every loop and deletes marked pods, then requeues
+after 5 seconds.
+
+**Source:** `internal/controller/cluster_unrecoverable.go:38-116`
+
+---
+
+### 5. Network Partition
+
+CNPG handles network partitions at **three levels**: operator-side detection,
+primary self-fencing, and multi-primary resolution.
+
+#### Operator-Side Detection
+
+The operator calls each pod's HTTP status endpoint (`/pg/status`). If all
+ready pods return errors:
+
+```go
+// AllReadyInstancesStatusUnreachable() returns true when:
+// - At least one pod is Active && Ready (kubelet says OK)
+// - ALL such pods have Error != nil (operator HTTP query failed)
+```
+
+**Response:** Log warning, update phase with network error message, requeue
+after 10 seconds to retry. The operator does NOT failover purely on network
+errors — it waits for the situation to resolve.
+
+**Source:** `pkg/postgres/status.go:400-418`,
+`internal/controller/cluster_controller.go:463-478`
+
+#### Primary Self-Fencing (Isolation Check)
+
+Covered in detail in the [Split-Brain Prevention & Fencing](#split-brain-prevention--fencing)
+section. In brief: the primary's liveness probe fails when it cannot reach
+BOTH the K8s API server AND any peer instance. Kubelet kills the pod →
+operator promotes a reachable replica.
+
+#### Multi-Primary Resolution
+
+When a network partition heals and the operator sees two primaries:
+
+1. Operator **halts all actions** for 5 seconds
+2. Waits for instance manager self-healing (old primary recognizes demotion)
+3. Does NOT force a role change (prevents failback to the wrong primary)
+4. After self-healing, old primary uses `pg_rewind` to rejoin as replica
+
+**Source:** `internal/controller/cluster_controller.go:414-432`
+
+---
+
+### 6. Node Failure / Node Drain
+
+**Detection:** `isNodeUnschedulableOrBeingDrained()` checks the node's
+`Unschedulable` flag and configurable drain taints.
+
+**Source:** `internal/controller/replicas.go:183-209`
+
+**Node drain handling:**
+
+```
+Node marked Unschedulable or tainted
+  │
+  ├─ setPrimaryOnSchedulableNode()
+  │   ├─ Check if primary is on the affected node
+  │   ├─ Verify replicas exist on schedulable nodes
+  │   ├─ Wait for any pending pods to complete
+  │   └─ Trigger switchover to replica on healthy node
+  │
+  └─ Pods on drained node are evicted (subject to PDB)
+     └─ PVCs survive → pods recreated on new nodes
+```
+
+**Pod anti-affinity (built-in):**
+
+```go
+// CreateGeneratedAntiAffinity() in pkg/specs/pods.go:348-387
+// Generates default inter-pod anti-affinity spreading instances across nodes
+```
+
+Configurable via `spec.affinity.podAntiAffinityType`:
+- `preferred` (default): soft anti-affinity, pods spread across nodes but
+  can colocate if scheduling fails
+- `required`: hard anti-affinity, pods MUST be on different nodes
+
+Additional rules via `spec.affinity.additionalPodAntiAffinity`.
+
+**Multi-pod failure:** If the primary and all sync replicas are on the same
+node, failover may select a replica with less data. The quorum check
+(`R + W > N`) prevents failover when it would violate consistency.
+
+---
+
+### 7. Quorum Loss / Data Loss
+
+**When quorum is lost** (majority of sync replicas down), CNPG takes a
+conservative approach:
+
+**Quorum evaluation** (`replicas_quorum.go:96-133`):
+
+```
+Strong Consistency Formula: R + W > N
+  R = count of promotable replicas within synchronous standbys
+  W = sync replication factor (from synchronous_standby_names)
+  N = cardinality of the synchronous standby name set
+
+If R + W <= N:
+  → Failover is BLOCKED
+  → Cluster stays in PhaseFailOver
+  → No automatic promotion occurs
+  → Manual intervention required
+```
+
+**Candidate filtering** (`replicas_quorum.go:88-94`):
+- Only ready pods with no errors qualify
+- Must be in the `synchronous_standby_names` set
+- Must pass `IsPodReady()` check
+
+**Source:** `internal/controller/replicas_quorum.go:35-134`,
+`api/v1/cluster_types.go:386-391`
+
+**Key principle:** CNPG will NOT automatically failover with potential data loss.
+If quorum cannot be established, the cluster remains unavailable until:
+- Enough replicas recover, OR
+- An administrator manually forces promotion (accepting data loss)
+
+This differs from systems that auto-failover with `RPO > 0` — CNPG defaults
+to availability sacrifice over data loss.
+
+---
+
+### 8. Operator Crash / Restart
+
+CNPG's operator is a stateless Kubernetes controller — all durable state lives
+in the Cluster CRD status and Kubernetes resources (pods, PVCs, services).
+
+**State reconstruction on restart:**
+
+**Source:** `internal/controller/cluster_restore.go:42-99`
+
+```
+Operator restarts
+  │
+  ├─ Controller-runtime reloads informer cache
+  │   (Cluster CRDs, Pods, PVCs, Services, Secrets)
+  │
+  ├─ First reconciliation per cluster:
+  │   ├─ Check LatestGeneratedNode == 0 (first time seeing this cluster)
+  │   │
+  │   ├─ If yes → reconcileRestoredCluster():
+  │   │   ├─ List PVCs with cluster label
+  │   │   ├─ Read nodeSerial annotations from PVCs
+  │   │   ├─ Read instanceRole annotations → identify primary
+  │   │   ├─ Take ownership of orphan PVCs (set controller reference)
+  │   │   ├─ Set LatestGeneratedNode = highest serial found
+  │   │   └─ Set TargetPrimary = primary serial (or highest if unknown)
+  │   │
+  │   └─ Resume normal reconciliation loop
+  │
+  └─ Subsequent reconciliations: normal flow
+```
+
+**CRD status fields that survive restart:**
+
+| Field | Purpose |
+|-------|---------|
+| `CurrentPrimary` | Active primary pod name |
+| `TargetPrimary` | Target during switchover/failover |
+| `LatestGeneratedNode` | Highest pod serial ever created |
+| `InstanceNames[]` | List of instance pod names |
+| `InstancesReportedState` | Per-instance IsPrimary, TimelineID, IP |
+| `CurrentPrimaryFailingSinceTimestamp` | When primary started failing |
+| `Phase` / `PhaseReason` | Current cluster state |
+| `Conditions[]` | Standard K8s conditions |
+| `DanglingPVC[]` | PVCs without attached pods |
+
+**PVC-driven recovery:** The key insight is that PVCs are the authoritative
+record of cluster topology. Even if the CRD status is stale (operator crashed
+mid-update), the operator can reconstruct the cluster from PVC annotations.
+
+**Instance manager session ID:** Each instance manager generates a unique
+`SessionID` on startup. The operator compares stored vs. current session IDs
+to detect container restarts it missed while down.
+
+**Source:** `pkg/postgres/status.go:90-93`,
+`internal/controller/backup_controller.go:548-592`
+
+---
+
+### 9. Stale/Zombie Primary (Split Brain)
+
+**Prevention layers (defense in depth):**
+
+| Layer | Mechanism | Source |
+|-------|-----------|--------|
+| **1. Timeline ID** | Promoted replica gets new timeline. Old primary's WAL is incompatible. | PostgreSQL built-in |
+| **2. Fencing annotation** | Operator marks old primary fenced. Instance manager refuses connections. | `pkg/utils/fencing.go` |
+| **3. Primary isolation check** | Primary's liveness probe fails when isolated. Kubelet kills it. | `probes/liveness.go` |
+| **4. Pending failover marker** | `targetPrimary = PendingFailoverMarker` signals old primary to demote. | `replicas.go:139` |
+| **5. Instance manager self-healing** | Old primary detects it's not the designated primary, demotes to standby. | Instance controller |
+| **6. pg_rewind** | Old primary rejoins as replica after aligning WAL with new primary. | `instance.go:1253-1306` |
+
+**pg_rewind flow:**
+
+```
+Old primary comes back after failover
+  │
+  ├─ Instance manager detects: I was primary but targetPrimary != me
+  │
+  ├─ Rewind():
+  │   ├─ Set PgRewindIsRunning = true (suppresses liveness probe failure)
+  │   ├─ Back up pg_control file
+  │   ├─ Run: pg_rewind -P --source-server <new_primary_conninfo>
+  │   │                     --target-pgdata <pgdata>
+  │   │                     --restore-target-wal   (PG13+)
+  │   ├─ Clean up pg_control backup on success
+  │   └─ Set PgRewindIsRunning = false
+  │
+  ├─ Start PostgreSQL in standby mode pointing to new primary
+  └─ Resume normal replication
+```
+
+**Startup probe bypass:** While pg_rewind is running, the startup probe skips
+its check (`CanCheckReadiness()` returns false), preventing kubelet from
+killing the pod during what can be a lengthy WAL-replay operation.
+
+---
+
+### 10. Requeue Strategy
+
+CNPG uses event-driven reconciliation (informer watches) augmented with
+explicit requeue intervals for in-progress operations:
+
+| Situation | Requeue Interval | Reason |
+|-----------|-----------------|--------|
+| Optimistic lock conflict on status update | Immediate (1s) | Retry with fresh version |
+| Unknown plugin | 10s | Retry plugin loading |
+| Plugin error | 15s | Retry after error |
+| Switchover/failover in progress | 1s | Poll for completion |
+| Old primary detected (multi-primary) | 5s | Wait for self-healing |
+| All instances unreachable | 10s | Network issue recovery |
+| Kubelet probe refresh needed | 1s | Readiness probe lag |
+| Pod creation/deletion | 1s | Wait for informer cache |
+| Unrecoverable instance deletion | 5s | Delete + wait |
+| Normal reconciliation | No explicit requeue | Watches trigger next run |
+
+**Source:** `internal/controller/cluster_controller.go:153-270`
+
+**Optimistic locking:** All status updates use optimistic locking. On conflict
+(another reconciliation updated the CRD first), the operator immediately
+retries. This is the most common requeue reason and keeps the system eventually
+consistent without heavy locking.
+
+---
+
+### 11. Cluster Conditions
+
+CNPG sets standard Kubernetes conditions on the Cluster CRD:
+
+| Condition Type | Meaning |
+|---------------|---------|
+| `ContinuousArchiving` | WAL archiving to object store is working |
+| `Backup` | Last backup completed successfully |
+| `Ready` | Cluster is fully operational |
+| `ConsistentSystemID` | All instances report the same PostgreSQL system identifier |
+
+**Source:** `api/v1/cluster_types.go:1092-1155`
+
+**ConsistentSystemID** is particularly important: if any instance reports a
+different system identifier, the cluster has a corruption or misconfiguration
+issue. The operator sets this condition to `False` with reason `"Mismatch"`,
+which is a signal for immediate investigation.
+
+---
+
+### Summary: CNPG Failure Handling vs. Kubelicate
+
+| Aspect | CNPG | Kubelicate (Current) |
+|--------|------|---------------------|
+| **Primary detection** | HTTP status poll + liveness probe | gRPC `GetStatus` (primary only) |
+| **Secondary detection** | Immediate via pod watches | ❌ Not implemented |
+| **Failover election** | LSN-based sort (Received → Replay → pod name) | LSN from `ReplicaInfo` |
+| **Failover delay** | Configurable `spec.failoverDelay` | None |
+| **Quorum check** | R + W > N, blocks unsafe failover | Quorum tracker, must_catch_up |
+| **Fencing** | Annotation-based + liveness self-fence | Epoch fencing (update_epoch) |
+| **Split-brain** | 5 layers of defense | Epoch fencing only |
+| **Pod recreation** | PVC-driven, automatic | ❌ Not implemented |
+| **Operator restart** | PVC-annotation-based reconstruction | ❌ Not implemented |
+| **Node drain** | Switchover + PDB | ❌ Not implemented |
+| **CrashLoop** | Excluded from election, K8s restart | ❌ Not detected |
+| **Network partition** | 3-level detection (operator, probe, self-heal) | ❌ Not implemented |
 
 ---
 

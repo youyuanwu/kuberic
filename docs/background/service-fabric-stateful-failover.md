@@ -18,7 +18,7 @@ replicator protocol, reconfiguration phases, and the Rust API surface from
 7. [Epoch-Based Fencing](#epoch-based-fencing)
 8. [Quorum and Consistency](#quorum-and-consistency)
 9. [Building New Replicas](#building-new-replicas)
-10. [Data Loss Handling](#data-loss-handling)
+10. [Quorum Loss and Data Loss](#quorum-loss-and-data-loss)
 11. [Reliable Collections and the State Manager](#reliable-collections-and-the-state-manager)
 12. [Rust API Surface (service-fabric-rs)](#rust-api-surface-service-fabric-rs)
 13. [ReadStatus and WriteStatus](#readstatus-and-writestatus)
@@ -518,12 +518,37 @@ Timeline:
 
 ### Data Loss Epoch
 
-When write quorum is lost (e.g., majority of replicas fail simultaneously),
-the `data_loss_number` is incremented. The new primary receives an
-`on_data_loss()` callback, allowing the service to:
-- Accept the loss and continue
-- Restore from an external backup
-- Signal that state has changed (triggers rebuild of all secondaries)
+When the Failover Manager determines that data loss has occurred (see
+[Quorum Loss and Data Loss](#quorum-loss-and-data-loss)), it increments
+`Epoch.data_loss_number`. This is a distinct event from incrementing
+`configuration_number`:
+
+- **`configuration_number`** — incremented on every reconfiguration
+  (failover, switchover, add/remove replica). Normal operation.
+- **`data_loss_number`** — incremented only when FM explicitly declares
+  data loss. Much rarer. Signals that committed operations may be lost.
+
+**Source:** `FailoverUnit.cpp:867`
+
+```cpp
+void FailoverUnit::UpdateEpochForDataLoss()
+{
+    failoverUnitDesc_.CurrentConfigurationEpoch = Epoch(
+        max(DateTime::Now().Ticks,
+            failoverUnitDesc_.CurrentConfigurationEpoch.DataLossVersion + 1),
+        failoverUnitDesc_.CurrentConfigurationEpoch.ConfigurationVersion);
+}
+```
+
+Epoch comparison is lexicographic: `data_loss_number` is compared first,
+then `configuration_number`. A data loss epoch always supersedes all
+prior configuration-only epochs.
+
+The new primary receives an `on_data_loss()` callback, allowing the
+service to accept the loss, restore from backup, or signal state change
+(which triggers rebuild of all secondaries). See
+[Quorum Loss and Data Loss](#quorum-loss-and-data-loss) for the full
+protocol.
 
 ---
 
@@ -764,28 +789,417 @@ SF **never drops the primary directly**. If PLB marks the primary for drop:
 
 ---
 
-## Data Loss Handling
+## Quorum Loss and Data Loss
 
-**Data loss** occurs when write quorum is lost — a majority of replicas
-(including the primary) fail simultaneously, and the surviving replicas may
-not have all committed operations.
+These are **two distinct concepts** in Service Fabric. Quorum loss is a
+runtime state where writes are blocked. Data loss is an explicit FM decision
+that committed operations may be irrecoverable. The relationship is:
+quorum loss *may* lead to data loss, but does not always.
 
-### Sequence
+### Definitions
 
-1. FM detects quorum loss
-2. FM increments `Epoch.data_loss_number`
-3. FM selects the surviving replica with the highest LSN as new primary
-4. New primary's `on_data_loss()` is called
-5. If `on_data_loss()` returns `true` (state changed), SF rebuilds all other
-   replicas from the new primary
-6. If `false`, SF attempts incremental catchup
+| Concept | Definition | Triggered By |
+|---------|-----------|--------------|
+| **Quorum loss** | `UpCount < WriteQuorumSize` in the current configuration. Primary is alive but writes are blocked. | Automatic — detected when replicas fail |
+| **Data loss** | FM increments `Epoch.data_loss_number`. Signals committed ops may be lost. | Explicit FM decision — only after timeout or total configuration loss |
+
+### Quorum Loss
+
+**Detection:** `FailoverUnit::IsQuorumLost()` checks two conditions:
+
+```cpp
+// FailoverUnit.cpp:1579
+bool FailoverUnit::IsQuorumLost() const
+{
+    if (!HasPersistedState || CurrentConfiguration.IsEmpty)
+        return false;
+
+    // Write quorum loss: not enough UP replicas for writes
+    if (CurrentConfiguration.UpCount < CurrentConfiguration.WriteQuorumSize)
+        return true;
+
+    // Read quorum loss during reconfiguration: can't guarantee
+    // data in previous config is preserved
+    return (IsInReconfiguration &&
+            PreviousConfiguration.UpCount < PreviousConfiguration.ReadQuorumSize);
+}
+```
+
+Where `WriteQuorumSize = ReplicaCount / 2 + 1` and
+`ReadQuorumSize = (ReplicaCount + 1) / 2`.
+
+**What happens during quorum loss:**
+
+The primary is **alive** but the replicator **immediately blocks writes**.
+`replicate()` does not hang or buffer — it returns `NoWriteQuorum` error
+synchronously.
+
+```cpp
+// Replicator.cpp:889-908
+bool Replicator::VerifyAccessGranted(__out ErrorCode & error)
+{
+    FABRIC_SERVICE_PARTITION_ACCESS_STATUS writeStatus =
+        partition_.GetWriteStatus();
+    switch(writeStatus)
+    {
+    case FABRIC_SERVICE_PARTITION_ACCESS_STATUS_NO_WRITE_QUORUM:
+        error = ErrorCode(Common::ErrorCodeValue::NoWriteQuorum);
+        return false;
+    // ...
+    }
+}
+```
+
+The FM (not the replicator) controls the `WriteStatus`. The RA's
+`ReadWriteStatusCalculator` dynamically checks:
+
+```cpp
+// FailoverUnitProxy.ReadWriteStatusCalculator.cpp
+// WriteStatus is "dynamic" — computed on each query:
+return fup.HasMinReplicaSetAndWriteQuorum(fupLock, needsPC_)
+    ? AccessStatus::Granted
+    : AccessStatus::NoWriteQuorum;
+```
+
+`HasMinReplicaSetAndWriteQuorum` requires BOTH:
+1. `ccFailoverReplicaSetSize >= MinReplicaSetSize` — enough replicas exist
+2. `ccReplicatorReplicaSetSize >= ccWriteQuorum` — enough are ACKing
+
+**Source:** `FailoverUnitProxy.cpp:1399-1454`, `ReplicaManager.cpp:1351-1374`
+
+### Quorum Loss Recovery (Without Data Loss)
+
+When FM detects quorum loss, it does **not** immediately declare data loss.
+Instead it waits:
+
+```
+Quorum Loss Timeline:
+
+T0: Secondaries fail
+    IsQuorumLost() → true
+    FM records SetQuorumLossTime(now)
+    FM fires FTQuorumLoss event
+    Primary blocks writes (NoWriteQuorum)
+
+T1: Waiting period (QuorumLossWaitDuration)
+    FM checks on each background tick:
+    - Are secondaries coming back?
+    - Has the timeout expired?
+    Primary stays alive, reads still work
+
+T2a: Quorum RESTORED (secondaries recover)
+    IsQuorumLost() → false
+    FM fires FTQuorumRestored event
+    Writes resume immediately
+    NO DATA LOSS — no epoch change
+
+T2b: Timeout exceeded (secondaries don't recover)
+    FM calls DropOfflineReplicas()
+    → Triggers data loss protocol (see below)
+```
+
+**Source:** `ReconfigurationTask.cpp:100-138`
+
+```cpp
+if (failoverUnit.IsQuorumLost())
+{
+    // Record when quorum loss started
+    if (lockedFailoverUnit.Old && !lockedFailoverUnit.Old->IsQuorumLost())
+    {
+        failoverUnit.SetQuorumLossTime(DateTime::Now().Ticks);
+    }
+
+    TimeSpan quorumLossWaitDuration = (fm_->IsMaster ?
+        FailoverConfig::GetConfig().FullRebuildWaitDuration :
+        failoverUnit.ServiceInfoObj->ServiceDescription.QuorumLossWaitDuration);
+
+    if (failoverUnit.LastQuorumLossDuration >= quorumLossWaitDuration)
+    {
+        lockedFailoverUnit.EnableUpdate();
+        failoverUnit.DropOfflineReplicas();  // → data loss path
+    }
+}
+else if (lockedFailoverUnit.Old && lockedFailoverUnit.Old->IsQuorumLost())
+{
+    // Quorum restored — NO data loss
+    fm_->FTEvents.FTQuorumRestored(failoverUnit.Id.Guid, failoverUnit);
+}
+```
+
+**Key insight:** `QuorumLossWaitDuration` is configurable per-service. The
+default is generous — SF gives failed replicas time to recover before
+declaring data loss. This is a critical design choice: the system
+sacrifices write *availability* to preserve *consistency*.
+
+### When Data Loss Is Declared
+
+FM declares data loss by calling `UpdateEpochForDataLoss()` in two scenarios:
+
+**Scenario 1: `ClearConfiguration()`** — All replicas are offline or
+dropped (total loss). Called after `DropOfflineReplicas()` removes the
+remaining offline replicas from the configuration.
+
+```cpp
+// FailoverUnit.cpp:1217-1222
+void FailoverUnit::ClearConfiguration()
+{
+    UpdateEpochForDataLoss();  // Increment data_loss_number
+    // Clear all config state...
+}
+```
+
+**Scenario 2: `ClearCurrentConfiguration()`** — No replicas remain in the
+current configuration and data previously existed:
+
+```cpp
+// FailoverUnit.cpp:1240-1246
+void FailoverUnit::ClearCurrentConfiguration()
+{
+    bool dataloss = !NoData ||
+        (static_cast<int>(CurrentConfiguration.ReplicaCount) >= MinReplicaSetSize);
+    if (dataloss)
+        UpdateEpochForDataLoss();
+    // Clear current config...
+}
+```
+
+The `dataloss` condition checks: if the service previously had data (`!NoData`)
+OR the configuration was at least `MinReplicaSetSize`, then data loss is
+real. If the service was still empty (`NoData == true`) and the config was
+smaller than `MinReplicaSetSize`, no data loss is declared — there was
+nothing to lose.
+
+### The Data Loss Protocol
+
+Once data loss is declared, the FM-RA-Replicator chain executes:
+
+```
+FM declares data loss:
+  │
+  ├─ UpdateEpochForDataLoss():
+  │    new_epoch.data_loss_number = max(now.ticks, old + 1)
+  │    (Uses wall-clock ticks in prod, simple +1 in test mode)
+  │
+  ├─ FM sends DoReconfiguration to RA:
+  │    Contains: new epoch with higher data_loss_number
+  │    IsDataLossBetweenPCAndCC = true
+  │    (PC.DataLossVersion != CC.DataLossVersion)
+  │
+  ├─ RA receives on new primary:
+  │    Checks IsDataLossBetweenPCAndCC
+  │
+  ├─ RA calls Replicator::BeginOnDataLoss():
+  │    Replicator forwards to state provider's on_data_loss()
+  │
+  ├─ State provider's on_data_loss() returns isStateChanged:
+  │
+  │    ├─ TRUE: State provider had state at some LSN
+  │    │    Replicator calls GetLastCommittedSequenceNumber()
+  │    │    Replicator resets replication queue to that LSN
+  │    │    FM rebuilds all secondaries from new primary
+  │    │
+  │    └─ FALSE: State provider discarded everything
+  │         Cold start — no state recovery needed
+  │         New primary starts fresh
+  │
+  └─ Primary transitions to Ready
+     Writes resume with new epoch
+```
+
+**Source:** `FailoverUnitProxy.ReplicatorOnDataLossAsyncOperation.cpp:27-137`
+
+```cpp
+bool isDataLoss =
+    owner_.ReplicaDescription.CurrentConfigurationRole == ReplicaRole::Primary &&
+    owner_.FailoverUnitDescription.PreviousConfigurationEpoch != Epoch::InvalidEpoch() &&
+    owner_.FailoverUnitDescription.IsDataLossBetweenPCAndCC;
+
+if (!isDataLoss) {
+    owner_.currentReplicaState_ = ReplicaStates::Ready;
+    return;  // No callback needed
+}
+
+// Invoke state provider callback
+AsyncOperationSPtr operation = owner_.replicator_->BeginOnDataLoss(...);
+```
+
+After the callback:
+
+```cpp
+if (isStateChanged_ == TRUE)
+{
+    error = parent_.stateProvider_.GetLastCommittedSequenceNumber(newProgress);
+    parent_.stateProviderInitialProgress_ = newProgress;
+    error = parent_.primary_->ResetReplicationQueue(
+        parent_.stateProviderInitialProgress_);
+}
+```
+
+### Data Loss vs Quorum Loss: Full Comparison
+
+```
+                    ┌──────────────────┐
+                    │  Normal Operation │
+                    │  Writes flowing   │
+                    └────────┬─────────┘
+                             │
+                    Secondaries fail
+                    (UpCount < WriteQuorumSize)
+                             │
+                    ┌────────▼─────────┐
+                    │  QUORUM LOSS     │
+                    │  Primary alive   │
+                    │  Writes BLOCKED  │
+                    │  (NoWriteQuorum) │
+                    │  Reads still OK  │
+                    └───┬──────────┬───┘
+                        │          │
+               Replicas │          │ QuorumLossWait-
+               recover  │          │ Duration expires
+                        │          │
+              ┌─────────▼──┐   ┌───▼──────────────┐
+              │  QUORUM    │   │  DropOffline-     │
+              │  RESTORED  │   │  Replicas()       │
+              │            │   │                   │
+              │  No data   │   │  Config cleared   │
+              │  loss      │   │  or reduced       │
+              │  Writes    │   └───────┬───────────┘
+              │  resume    │           │
+              └────────────┘  UpdateEpochForDataLoss()
+                                       │
+                              ┌────────▼─────────┐
+                              │  DATA LOSS       │
+                              │  data_loss_number│
+                              │  incremented     │
+                              │                  │
+                              │  FM sends        │
+                              │  DoReconfigura-  │
+                              │  tion with       │
+                              │  IsDataLoss=true │
+                              └────────┬─────────┘
+                                       │
+                              ┌────────▼─────────┐
+                              │  on_data_loss()  │
+                              │  callback on     │
+                              │  new primary     │
+                              │                  │
+                              │  User decides:   │
+                              │  accept/restore  │
+                              │  /rebuild        │
+                              └────────┬─────────┘
+                                       │
+                              ┌────────▼─────────┐
+                              │  RECOVERY        │
+                              │  Writes resume   │
+                              │  Secondaries     │
+                              │  rebuilt          │
+                              └──────────────────┘
+```
+
+| Aspect | Quorum Loss | Data Loss |
+|--------|------------|-----------|
+| **What it is** | Runtime state: not enough replicas for writes | FM decision: committed ops may be irrecoverable |
+| **Detection** | Automatic — `IsQuorumLost()` | Explicit FM decision after timeout |
+| **Primary status** | Alive, blocks writes | May be alive or dead |
+| **Reads** | Still work on primary | N/A during transition |
+| **Writes** | `NoWriteQuorum` error immediately | Resume after `on_data_loss()` completes |
+| **Epoch change** | No — same epoch | Yes — `data_loss_number` incremented |
+| **User callback** | None | `on_data_loss()` on new primary |
+| **Recovery** | Automatic when replicas return | Requires `on_data_loss()` + potential rebuild |
+| **Can lead to other?** | Quorum loss → data loss (after timeout) | Data loss presupposes quorum loss |
+| **Frequency** | Common (transient node failures) | Rare (catastrophic failures only) |
+| **Configurable** | `WriteQuorumSize` (computed from replica count) | `QuorumLossWaitDuration` (per-service) |
+| **MinReplicaSetSize** | Affects `HasMinReplicaSetAndWriteQuorum` check | Affects whether data loss is declared |
+
+### Quorum Loss Without Data Loss — When It Happens
+
+1. **Transient replica failure.** Secondary pods restart and rejoin before
+   `QuorumLossWaitDuration` expires. Most common case.
+
+2. **Network partition heals.** Secondaries were unreachable but come back
+   with their state intact. Quorum restored, no data loss.
+
+3. **Partial failure.** In a 5-replica set (quorum=3), 2 secondaries fail.
+   Only 1 secondary left + primary = 2 < quorum=3. If one secondary
+   recovers: 2 secondaries + primary = 3 = quorum. Writes resume.
+
+### Data Loss Without Quorum Loss — Can It Happen?
+
+**Not in normal operation.** Data loss requires `ClearConfiguration()` or
+`ClearCurrentConfiguration()`, which are only called when replicas are
+dropped (after quorum loss timeout). However, there is one edge case:
+
+- During a reconfiguration, if the *read quorum* of the *previous*
+  configuration is lost (`PreviousConfiguration.UpCount < ReadQuorumSize`),
+  the FM may not be able to guarantee that all committed ops from the
+  previous epoch were preserved. This is a subtle form of data loss that
+  can occur even if the current configuration has write quorum.
+
+### The Replicator's Role During Quorum Loss
+
+The replicator is **passive** during quorum loss. It does not independently
+detect or act on quorum loss:
+
+1. **FM controls write status.** The RA's `ReadWriteStatusCalculator` sets
+   `WriteStatus = NoWriteQuorum` dynamically. The replicator reads this via
+   `partition_.GetWriteStatus()`.
+
+2. **Replicator rejects writes.** `replicate()` calls `VerifyAccessGranted()`
+   which checks `GetWriteStatus()`. If not `Granted`, returns error
+   immediately — no buffering.
+
+3. **FM controls data_loss_number.** The replicator never increments
+   `data_loss_number` — it only stores and propagates the epoch that FM
+   provides via `UpdateEpoch()`.
+
+4. **Replicator executes on_data_loss.** When RA calls
+   `Replicator::BeginOnDataLoss()`, the replicator forwards to the state
+   provider's callback. If `isStateChanged == true`, the replicator resets
+   its replication queue to the state provider's last committed LSN.
+
+**Source:** `Replicator.cpp:889-908`, `ReplicaManager.cpp:881-923`,
+`Replicator.OnDatalossAsyncOperation.cpp:82-137`
+
+### MinReplicaSetSize vs WriteQuorumSize
+
+These are related but distinct:
+
+```
+MinReplicaSetSize: The minimum number of replicas that must participate
+                   in replication for writes to be accepted.
+
+WriteQuorumSize:   ⌊ReplicaCount/2⌋ + 1. The majority needed for quorum.
+
+Invariant:         MinReplicaSetSize ≤ WriteQuorumSize ≤ ReplicaCount
+```
+
+Both are checked by `HasMinReplicaSetAndWriteQuorum`:
+
+```cpp
+// FailoverUnitProxy.cpp:1399-1454
+int ccWriteQuorum = ccFailoverReplicaSetSize / 2 + 1;
+bool quorumCheck =
+    ccFailoverReplicaSetSize >= serviceDescription_.MinReplicaSetSize &&
+    ccReplicatorReplicaSetSize >= ccWriteQuorum;
+```
+
+Writes are blocked if **either** condition fails:
+- Not enough replicas in the configuration (`< MinReplicaSetSize`)
+- Not enough ACKing replicas for majority (`< WriteQuorumSize`)
+
+The FM uses `MinReplicaSetSize` to decide whether to declare data loss
+when clearing configuration: if the configuration had `≥ MinReplicaSetSize`
+replicas, real data existed and loss is declared. If `< MinReplicaSetSize`,
+the service may have been in a startup state with no committed data.
 
 ### Prevention
 
-- Use `MinReplicaSetSize` ≥ 2 to require quorum for writes
+- Use `MinReplicaSetSize ≥ 2` to require quorum for writes
 - Place replicas across fault domains and upgrade domains
 - Use synchronous replication (the default for Reliable Collections)
 - Monitor health reports from `System.FM` for quorum warnings
+- Set `QuorumLossWaitDuration` appropriately (longer = more time for
+  recovery, but longer write outage)
 
 ---
 
@@ -1653,9 +2067,14 @@ enum ReplicaSetQuorumMode {
 | **Epoch** | `src/prod/src/ServiceModel/reliability/failover/Epoch.h` | Configuration versioning |
 | **ReconfigurationType** | `src/prod/src/ServiceModel/reliability/failover/ReconfigurationType.h` | Failover vs SwapPrimary vs Other |
 | **DoReconfiguration Message** | `src/prod/src/Reliability/Failover/common/DoReconfigurationMessageBody.h` | FM→RA protocol message |
-| **FailoverUnit Config** | `src/prod/src/Reliability/Failover/fm/FailoverUnitConfiguration.h` | WriteQuorumSize, ReadQuorumSize |
+| **FailoverUnit** | `src/prod/src/Reliability/Failover/fm/FailoverUnit.h/cpp` | `IsQuorumLost()`, `UpdateEpochForDataLoss()`, `ClearConfiguration()` |
+| **FailoverUnit Config** | `src/prod/src/Reliability/Failover/fm/FailoverUnitConfiguration.h` | WriteQuorumSize, ReadQuorumSize formulas |
+| **FailoverUnit Description** | `src/prod/src/Reliability/Failover/common/FailoverUnitDescription.h` | `IsDataLossBetweenPCAndCC`, epoch fields |
 | **AccessStatus Enum** | `src/prod/src/Reliability/Failover/ra/AccessStatus.h` | TryAgain, NotPrimary, NoWriteQuorum, Granted |
 | **ReadWriteStatusCalculator** | `src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReadWriteStatusCalculator.h/cpp` | Full state machine for read/write status per reconfiguration phase |
+| **ReplicatorOnDataLoss** | `src/prod/src/Reliability/Failover/ra/FailoverUnitProxy.ReplicatorOnDataLossAsyncOperation.cpp` | `IsDataLossBetweenPCAndCC` check, `BeginOnDataLoss()` invocation |
+| **Replicator VerifyAccess** | `src/prod/src/Reliability/Replication/Replicator.cpp` | `VerifyAccessGranted()` — checks WriteStatus before replicate() |
+| **ReplicaManager** | `src/prod/src/Reliability/Replication/ReplicaManager.cpp` | `HasEnoughReplicas()`, epoch storage, quorum tracking |
 | **ReadWriteStatusValue** | `src/prod/src/Reliability/Failover/ra/ReadWriteStatusValue.h` | Pair of read + write AccessStatus |
 | **ReadWriteStatusState** | `src/prod/src/Reliability/Failover/ra/ReadWriteStatusState.h` | State tracking on FailoverUnitProxy |
 | **ComStatefulServicePartition** | `src/prod/src/Reliability/Failover/ra/ComStatefulServicePartition.h/cpp` | GetReadStatus/GetWriteStatus COM implementation |

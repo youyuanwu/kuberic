@@ -163,6 +163,20 @@ pub async fn reconcile_set(
                 }
             }
 
+            // Check if switchover requested (target_primary != current_primary)
+            let target_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
+            if let (Some(current), Some(target)) = (&current_primary, &target_primary)
+                && current != target
+            {
+                info!(name, current = %current, target = %target, "switchover requested");
+                let status = KubelicateSetStatus {
+                    phase: Phase::Switchover,
+                    ..set.status.clone().unwrap_or_default()
+                };
+                api.patch_set_status(&namespace, &name, &status).await?;
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+
             let desired = set.spec.replicas as usize;
             let actual = pods.len();
             let set_key = format!("{}/{}", namespace, name);
@@ -334,9 +348,85 @@ pub async fn reconcile_set(
             Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
         }
 
-        Phase::Switchover | Phase::Deleting => {
+        Phase::Switchover => {
+            let set_key = format!("{}/{}", namespace, name);
+            let mut drivers = state.drivers.lock().await;
+
+            let target_primary_name = set
+                .status
+                .as_ref()
+                .and_then(|s| s.target_primary.clone())
+                .unwrap_or_default();
+
+            let current_primary_name = set
+                .status
+                .as_ref()
+                .and_then(|s| s.current_primary.clone())
+                .unwrap_or_default();
+
+            if let Some(driver) = drivers.get_mut(&set_key) {
+                // Resolve target pod name → replica ID
+                let target_id: Option<ReplicaId> = pods
+                    .iter()
+                    .find(|p| p.name_any() == target_primary_name)
+                    .and_then(|p| {
+                        p.metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|l| l.get("kubelicate.io/replica-id"))
+                            .and_then(|v| v.parse::<i64>().ok())
+                            .map(|idx| idx + 1)
+                    });
+
+                if let Some(target_id) = target_id {
+                    info!(name, target_id, target = %target_primary_name, "running driver switchover");
+                    driver
+                        .switchover(target_id)
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                    let epoch = driver.epoch();
+
+                    // Update labels
+                    let mut labels = BTreeMap::new();
+                    labels.insert("kubelicate.io/role".to_string(), "primary".to_string());
+                    let _ = api
+                        .patch_pod_labels(&namespace, &target_primary_name, labels)
+                        .await;
+
+                    let mut labels = BTreeMap::new();
+                    labels.insert("kubelicate.io/role".to_string(), "secondary".to_string());
+                    let _ = api
+                        .patch_pod_labels(&namespace, &current_primary_name, labels)
+                        .await;
+
+                    let members = build_member_status(&pods, &set.spec);
+                    let status = KubelicateSetStatus {
+                        epoch: EpochStatus {
+                            data_loss_number: epoch.data_loss_number,
+                            configuration_number: epoch.configuration_number,
+                        },
+                        current_primary: Some(target_primary_name.clone()),
+                        target_primary: Some(target_primary_name),
+                        phase: Phase::Healthy,
+                        reconfiguration_phase: ReconfigurationPhase::None,
+                        ready_replicas: ready_pods.len() as i32,
+                        replicas: pods.len() as i32,
+                        members,
+                        primary_failing_since: None,
+                    };
+                    api.patch_set_status(&namespace, &name, &status).await?;
+                } else {
+                    warn!(name, target = %target_primary_name, "switchover target not found");
+                }
+            } else {
+                warn!(name, "no driver state for switchover, requeueing");
+            }
+
             Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
         }
+
+        Phase::Deleting => Ok(ReconcileAction::Requeue(Duration::from_secs(10))),
     }
 }
 

@@ -293,3 +293,112 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
     assert!(resp.get_ref().found);
     assert_eq!(resp.get_ref().value, "reconciler");
 }
+
+/// Reconciler test: create partition → write data → switchover → write on new primary.
+#[test_log::test(tokio::test)]
+async fn test_reconciler_switchover() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    // Pending → Creating
+    let set = make_set("myapp", 3, None);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+
+    // Creating → Healthy
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubelicateSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+    let original_primary = status.current_primary.clone().unwrap();
+
+    // Write data on original primary
+    let client_addr = api.client_address(&original_primary).unwrap();
+    let mut kv = connect_kv(&client_addr).await;
+    kv.put(proto::PutRequest {
+        key: "before-switch".to_string(),
+        value: "original".to_string(),
+    })
+    .await
+    .unwrap();
+
+    // Pick a secondary as switchover target
+    let target_name = {
+        let pods = api.pods.lock().unwrap();
+        pods.iter()
+            .map(|p| p.metadata.name.clone().unwrap())
+            .find(|n| n != &original_primary)
+            .unwrap()
+    };
+
+    // Healthy → Switchover: set target_primary to a different pod
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubelicateSetStatus {
+            phase: Phase::Healthy,
+            current_primary: Some(original_primary.clone()),
+            target_primary: Some(target_name.clone()),
+            ..status.clone()
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Switchover);
+
+    // Switchover → Healthy: execute the switchover
+    let set = make_set("myapp", 3, Some(status.clone()));
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(
+        status.current_primary.as_deref(),
+        Some(target_name.as_str())
+    );
+    assert_ne!(
+        status.current_primary.as_deref(),
+        Some(original_primary.as_str())
+    );
+
+    // Write on new primary
+    let new_client_addr = api.client_address(&target_name).unwrap();
+    let mut kv2 = connect_kv(&new_client_addr).await;
+
+    let resp = kv2
+        .put(proto::PutRequest {
+            key: "after-switch".to_string(),
+            value: "new-primary".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().lsn > 0);
+
+    // Read back on new primary
+    let resp = kv2
+        .get(proto::GetRequest {
+            key: "after-switch".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().found);
+    assert_eq!(resp.get_ref().value, "new-primary");
+
+    // Write to old primary should fail (no longer primary)
+    let result = kv
+        .put(proto::PutRequest {
+            key: "stale-write".to_string(),
+            value: "should-fail".to_string(),
+        })
+        .await;
+    assert!(result.is_err(), "write to demoted primary should fail");
+}

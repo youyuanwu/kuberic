@@ -4,7 +4,8 @@ High-level design for a Service Fabric–inspired stateful replication system
 running on Kubernetes. The operator acts as the Failover Manager; user
 application pods run an in-process replicator that reacts to operator signals.
 
-**Implementation:** `kubelicate-core` crate (4600 LOC, 19 tests).
+**Implementation:** `kubelicate-core` (5700 LOC, 21 tests), `kubelicate-operator`
+(1200 LOC, 4 tests), `kv-stateful` example (1600 LOC, 8 tests). 33 tests total.
 
 ---
 
@@ -15,15 +16,18 @@ application pods run an in-process replicator that reacts to operator signals.
 3. [Protocol: Failover](#protocol-failover)
 4. [Protocol: Switchover](#protocol-switchover)
 5. [Protocol: Create Partition](#protocol-create-partition)
-6. [Access Status State Machine](#access-status-state-machine)
-7. [Epoch Fencing](#epoch-fencing)
-8. [Quorum Model](#quorum-model)
-9. [Operator Design](#operator-design)
-10. [User Application Model](#user-application-model)
-11. [MVP Simplifications](#mvp-simplifications)
-12. [Degenerate Configurations](#degenerate-configurations)
-13. [Open Questions](#open-questions)
-14. [Source Code Map](#source-code-map)
+6. [Protocol: Scale-Up (Add Replica)](#protocol-scale-up-add-replica)
+7. [Protocol: Restart Secondary](#protocol-restart-secondary)
+8. [Protocol: Scale-Down (Remove Secondary)](#protocol-scale-down-remove-secondary)
+9. [Access Status State Machine](#access-status-state-machine)
+10. [Epoch Fencing](#epoch-fencing)
+11. [Quorum Model](#quorum-model)
+12. [Operator Design](#operator-design)
+13. [User Application Model](#user-application-model)
+14. [MVP Simplifications](#mvp-simplifications)
+15. [Degenerate Configurations](#degenerate-configurations)
+16. [Open Questions](#open-questions)
+17. [Source Code Map](#source-code-map)
 
 ---
 
@@ -79,6 +83,10 @@ application pods run an in-process replicator that reacts to operator signals.
 | **Fence-before-promote** | update_epoch to all secondaries BEFORE change_role(Primary) | Prevents zombie primary writes to unfenced nodes |
 | **State provider as durability layer** | Persisted mode: `acknowledge()` gates quorum (SF default) | Strongest guarantee: replicate() returns only after quorum applied |
 | **Primary self-fencing** | Liveness probe isolation check (CNPG-style) | Defense-in-depth for asymmetric partitions |
+| **Failover delay** | Optional `spec.failoverDelay` (default 0 = immediate) | K8s adaptation — SF failovers immediately, K8s pod probes can flap |
+| **Data loss protocol** | Failover always proceeds; `on_data_loss()` if quorum lost | SF FM pattern — system always makes progress, user decides |
+| **gRPC failure tracking** | Per-replica failure counter in CRD status | K8s adaptation — replaces SF federation heartbeats |
+| **Operator restart recovery** | Reconstruct driver from CRD status + pod list | SF FM pattern — stateless operator, durable state in API |
 | **mTLS deferred** | Post-MVP; MVP assumes trusted cluster | Reduces initial complexity |
 | **ReplicaHandle trait** | Driver works with any transport | Tests: in-process channels. Operator: gRPC client. |
 
@@ -89,18 +97,42 @@ application pods run an in-process replicator that reacts to operator signals.
 Unplanned primary failure. Implemented in `PartitionDriver::failover()`.
 
 ```
-1. Increment epoch (configuration_number++)
-2. Fence ALL surviving secondaries: update_epoch(new_epoch)
+1. Enforce failover delay (if spec.failoverDelay > 0, K8s-specific):
+   - Record failingSinceTimestamp
+   - Requeue until delay elapsed or primary recovers
+   - Default: 0 (immediate, matching SF behavior)
+2. Increment epoch (configuration_number++)
+3. Fence ALL surviving secondaries: update_epoch(new_epoch)
    → Secondaries reject ops from old epoch
    → Set all status to ReconfigurationPending
-3. Select new primary: replica with highest current_progress (LSN)
-4. Promote: change_role(new_epoch, Primary) on winner
-5. Reconfigure quorum: update_catch_up → wait_for_catch_up → update_current
-6. Grant access: new primary → Granted, secondaries → NotPrimary
+4. Select new primary: replica with highest current_progress (LSN)
+   - Exclude crash-looping and unreachable replicas
+   - Matches SF FM's CompareForPrimary() logic
+5. Check quorum availability:
+   a. If write quorum available (≥ ⌊N/2⌋+1 survivors):
+      Normal failover — no data loss
+   b. If write quorum NOT available:
+      Wait spec.quorumLossWaitDuration (default 60s)
+      for replicas to recover (SF QuorumLossWaitDuration)
+      If replicas recover → normal failover (no data loss)
+      If timeout expires → data loss protocol:
+        Increment epoch.data_loss_number
+        Promote best available replica
+        Call on_data_loss() on new primary
+        Rebuild all secondaries from new primary
+6. Promote: change_role(new_epoch, Primary) on winner
+7. Reconfigure quorum: update_catch_up → wait_for_catch_up → update_current
+8. Grant access: new primary → Granted, secondaries → NotPrimary
+9. Clean up old primary: close/delete pod, create replacement secondary
 ```
 
-**Key invariant:** Step 2 (fence) happens BEFORE step 4 (promote). No window
+**Key invariant:** Step 3 (fence) happens BEFORE step 6 (promote). No window
 for zombie primary to write to unfenced secondaries.
+
+**SF alignment:** Step 5b matches SF's `ReconfigurationTask` behavior:
+wait `QuorumLossWaitDuration` before declaring data loss. The user's
+`on_data_loss()` handler is the decision point. This is a middle ground —
+SF waits but eventually proceeds (unlike CNPG which blocks indefinitely).
 
 ---
 
@@ -294,23 +326,98 @@ replication ACKs thereafter.
 ## Operator Design
 
 **CRD:** `KubelicateSet` with `spec.replicas`, `spec.minReplicas`,
-`spec.failoverDelay`, `spec.switchoverDelay`.
+`spec.failoverDelay`, `spec.switchoverDelay`, `spec.replacementDelay`,
+`spec.quorumLossWaitDuration`, `spec.grpcFailureThreshold`,
+`spec.maxRecreateAttempts`, `spec.podAntiAffinityType`.
 
 **Status fields:** `epoch`, `currentPrimary`, `targetPrimary`, `phase`,
-`reconfigurationPhase`, `currentConfiguration`, `previousConfiguration`.
+`reconfigurationPhase`, `currentConfiguration`, `previousConfiguration`,
+`failingSinceTimestamp`, `quorumLossSince`, `instanceNames`,
+`instanceStates`, `conditions`.
 
 **Reconciliation:** Uses `PartitionDriver` with `GrpcReplicaHandle`
 (same driver as tests, different transport). CRD status is the durable
 state machine — write-ahead pattern (CRD write before gRPC calls).
 
-**Scale-up reconciliation:** When `spec.replicas > current pod count`:
+### Reconciler Phases
+
+| Phase | Description |
+|-------|-------------|
+| `Pending` | CRD created, no pods yet |
+| `Creating` | Pods created, waiting for ready + partition initialization |
+| `Healthy` | Normal operation — monitors health, handles scale, detects failures |
+| `FailingOver` | Primary failed, running failover protocol (incl. data loss path) |
+| `Switchover` | Planned primary change in progress |
+
+Note: No `WaitingForQuorum` phase. Following SF's design, the system always
+makes progress during failover. If quorum is lost, the data loss protocol
+kicks in (`on_data_loss()`) rather than blocking.
+
+### Healthy Phase Responsibilities
+
+The Healthy phase runs multiple checks on each reconciliation:
+
+```
+Healthy phase:
+  │
+  ├─ 1. Primary health check
+  │    Pod ready? gRPC reachable?
+  │    → If not: enforce failover delay → FailingOver
+  │
+  ├─ 2. Switchover detection
+  │    targetPrimary != currentPrimary?
+  │    → If yes: → Switchover
+  │
+  ├─ 3. Secondary health check
+  │    All secondaries ready? gRPC reachable?
+  │    → If not (after replacementDelay): replace
+  │
+  ├─ 4. Missing pod detection
+  │    driver.replica_ids() vs list_pods()
+  │    → If mismatch: force_remove + replace
+  │
+  ├─ 5. Scale reconciliation
+  │    spec.replicas vs current count
+  │    → Scale up: create pods + add_replica
+  │    → Scale down: remove_secondary + delete pod
+  │
+  ├─ 6. Node drain detection
+  │    Any pod's node unschedulable?
+  │    → If primary: switchover to healthy node
+  │
+  ├─ 7. Multi-primary detection
+  │    GetStatus on all replicas
+  │    → If multiple primaries: close stale one
+  │
+  └─ 8. Condition updates
+       Set Ready/Degraded/QuorumAvailable conditions
+```
+
+### gRPC Failure Tracking
+
+Per-replica `grpc_failure_count` persisted in CRD status. Incremented
+on Unavailable/DeadlineExceeded, reset on success. When count reaches
+`spec.grpcFailureThreshold` (default 3), treat replica as unreachable
+even if pod shows Ready.
+
+### Operator Restart Recovery
+
+On first reconcile after restart, reconstruct `PartitionDriver` from
+CRD status + pod list via `PartitionDriver::recover()`. See
+`operator-failure-scenarios.md` §8 for full design.
+
+### Scale-up reconciliation
+
+When `spec.replicas > current pod count`:
 1. Create new Pod (with ownership labels)
 2. Wait for Pod Ready
 3. Connect `GrpcReplicaHandle` to new pod
 4. `driver.add_replica(handle)` — builds via copy stream, joins quorum
 5. Update CRD status with new configuration
 
-**Scale-down reconciliation:** When `spec.replicas < current pod count`:
+### Scale-down reconciliation
+
+When `spec.replicas < current pod count`:
 
 Design follows SF's config-first approach (remove from quorum before closing):
 
@@ -781,6 +888,16 @@ rebuild.
 | Build completes on copy+repl ACKed | ✅ Implemented — PrimarySender buffers ops during copy, replays on connect |
 | mTLS on all gRPC | Deferred — assumes trusted cluster |
 | ReportFault rate limiting | Operator-side, basic |
+| Failover delay | ❌ Not implemented — optional K8s adaptation, default 0 (SF-aligned) |
+| Data loss failover | ❌ Not implemented — SF `on_data_loss()` protocol for quorum loss |
+| Secondary health detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §2 |
+| Missing pod detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §3 |
+| gRPC failure tracking | ❌ Not implemented — K8s adaptation of SF federation heartbeats |
+| Operator restart recovery | ❌ Not implemented — designed, PartitionDriver::recover() |
+| Primary self-fencing (liveness probe) | ❌ Not implemented — K8s defense-in-depth (from CNPG) |
+| Node drain handling | ❌ Not implemented — K8s adaptation (analogous to SF PLB) |
+| CRD conditions (Ready, Degraded, Quorum) | ❌ Not implemented — K8s addition |
+| force_remove_secondary | ❌ Not implemented — SF `RemoveFromCurrentConfiguration` |
 
 ### Known Gaps vs SF
 
@@ -790,6 +907,29 @@ rebuild.
 
 2. **mTLS.** All gRPC channels are unencrypted. Production deployments need
    mTLS or equivalent pod-to-pod encryption.
+
+### Known Gaps vs CNPG (deliberate divergences)
+
+CNPG patterns we **adopted** (K8s-specific value-adds):
+1. Pod anti-affinity generation from CRD spec
+2. Primary self-fencing via liveness probe isolation check
+3. gRPC failure tracking (replaces CNPG's HTTP failure tracking)
+4. Node drain detection with proactive switchover
+5. CRD conditions (Ready, Degraded, QuorumAvailable)
+6. Operator restart recovery from CRD status + pod list
+7. Optional failover delay for environments with flappy probes
+
+CNPG patterns we **rejected** (conflict with SF model):
+1. **`R + W > N` quorum formula.** CNPG uses Dynamo-style quorum for PostgreSQL
+   sync standbys. We use SF's `WriteQuorum = ⌊N/2⌋+1` which is simpler and
+   already handled by `QuorumTracker`.
+2. **Blocking on quorum loss.** CNPG blocks failover indefinitely when quorum
+   check fails. SF always makes progress via the `on_data_loss()` callback.
+   Our model has the user's state provider as the data loss decision point.
+3. **Annotation-based fencing.** CNPG fences instances via a JSON annotation.
+   We use SF's epoch-based fencing (replicator-level, stronger).
+4. **pg_rewind for replica rejoin.** CNPG rewinds the old primary's WAL to
+   rejoin as replica. We use full copy rebuild (no WAL on disk).
 
 ---
 
@@ -809,10 +949,25 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 ## Open Questions
 
 1. **Multi-partition support** — multiple independent replica sets per
-   KubelicateSet.
+   KubelicateSet. SF supports this via partitioning schemes. Current
+   design: one partition per CRD.
 2. **Pod identity and PVC binding** — how to bind recreated pods to correct
-   PVCs.
-3. **Replication transport** — gRPC vs QUIC vs direct TCP for data plane.
+   PVCs. Relevant for WAL persistence.
+3. **Operator state recovery** — reconstructing PartitionDriver from CRD
+   status after operator restart. Design in `operator-failure-scenarios.md` §8.
+   Needs `PartitionDriver::recover()` method. SF's FM is similarly stateless,
+   reconstructing from the FailoverUnit persistent state.
+4. **force_remove_secondary** — removing a dead replica from quorum when
+   gRPC calls to it fail. SF has `RemoveFromCurrentConfiguration` (config-first
+   removal) and `RemoveReplica` (cancel in-progress builds). We need both
+   error-tolerant paths.
+5. **Data loss protocol integration** — the `on_data_loss()` callback exists
+   in our user API but the operator never triggers it. Need to implement
+   quorum loss detection and `data_loss_number` increment in the driver.
+6. **Liveness probe HTTP endpoint** — PodRuntime currently exposes only gRPC.
+   The self-fencing liveness probe (K8s-specific addition) needs an HTTP
+   health endpoint. This is not an SF pattern — it compensates for K8s
+   lacking SF's federation-level failure detection.
 
 ---
 
@@ -831,18 +986,25 @@ kubelicate-core/
 │   ├── pod.rs                       # PodRuntime (full pod: actor + gRPC + user events + copy protocol)
 │   ├── driver.rs                    # PartitionDriver + ReplicaHandle trait + InProcessReplicaHandle
 │   ├── replicator/
-│   │   ├── quorum.rs                # QuorumTracker (single + dual-config + must_catch_up)
+│   │   ├── quorum.rs                # QuorumTracker (single + dual-config + must_catch_up + baseline)
 │   │   ├── actor.rs                 # WalReplicatorActor (control + data event loop)
-│   │   ├── primary.rs               # PrimarySender (gRPC streams to secondaries)
+│   │   ├── primary.rs               # PrimarySender (gRPC streams + build buffering)
 │   │   └── secondary.rs             # SecondaryReceiver (replication + copy gRPC server)
 │   └── grpc/
 │       ├── convert.rs               # Proto ↔ domain type conversions
 │       ├── server.rs                # ControlServer + ControlServerV2 (gRPC impl)
 │       └── handle.rs                # GrpcReplicaHandle (remote ReplicaHandle for operator)
 
-kubelicate-operator/                 # K8s operator (CRD + reconciler)
+kubelicate-operator/
+├── src/
+│   ├── lib.rs                       # Public API (cluster_api, crd, reconciler)
+│   ├── main.rs                      # Binary entry point (kube controller)
+│   ├── crd.rs                       # KubelicateSet CRD with spec/status/enums
+│   ├── cluster_api.rs               # ClusterApi trait + KubeClusterApi impl
+│   ├── reconciler.rs                # Reconcile loop (Pending→Creating→Healthy→FailingOver→Switchover)
+│   └── tests.rs                     # Mock reconciler tests
 
-examples/kv-stateful/                # Replicated KV store example
+examples/kv-stateful/
 ├── src/
 │   ├── lib.rs                       # Module declarations
 │   ├── main.rs                      # Binary entry point
@@ -850,11 +1012,12 @@ examples/kv-stateful/                # Replicated KV store example
 │   ├── server.rs                    # Client-facing KV gRPC server
 │   ├── service.rs                   # Lifecycle + StateProvider event loop
 │   ├── demo.rs                      # Operator/client simulators
-│   └── tests.rs                     # Integration tests (operator-driven)
+│   ├── tests.rs                     # Operator-driven integration tests (6)
+│   └── reconciler_tests.rs          # Reconciler-driven E2E tests (2)
 └── proto/kvstore.proto              # Client KV API (Get/Put/Delete)
 ```
 
-**Tests (29):**
+**Tests (33):**
 - `noop.rs` — 3 tests: lifecycle, replicate handle, not-primary rejection
 - `runtime.rs` — 3 tests: full lifecycle, replicate-before-promote, abort
 - `replicator/quorum.rs` — 7 tests: single/three/dual-config, out-of-order, fail-all, must_catch_up, wait_catch_up_all
@@ -862,9 +1025,12 @@ examples/kv-stateful/                # Replicated KV store example
 - `grpc/e2e_tests.rs` — 2 tests: gRPC create+delete, gRPC failover
 - `pod.rs` — 1 test: user lifecycle (open→promote→replicate→demote→close)
 - `kubelicate-operator` — 4 tests: reconciler phases + failover detection
-- `kv-stateful` — 4 tests: single replica KV, 3-replica failover, CRUD, restart+copy
+- `kv-stateful/tests.rs` — 6 tests: single replica, failover, CRUD, restart+copy, scale-up, scale-down
+- `kv-stateful/reconciler_tests.rs` — 2 tests: reconciler create+serve, reconciler switchover
 
-**Background references:**
+**Documentation:**
 - `docs/background/service-fabric-stateful-failover.md` — SF architecture study
 - `docs/background/cloudnative-pg-architecture.md` — CNPG architecture study
+- `docs/features/kubelicate-replicator-design.md` — Replicator protocol design
 - `docs/features/kv-stateful-design.md` — KV store example design
+- `docs/features/operator-failure-scenarios.md` — Failure scenarios + recovery

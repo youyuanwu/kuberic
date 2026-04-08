@@ -217,9 +217,16 @@ examples/kv-stateful/
 ├── Cargo.toml
 ├── build.rs
 ├── proto/
-│   └── kvstore.proto
+│   └── kvstore.proto            # Client API: Get/Put/Delete
 └── src/
-    └── main.rs
+    ├── lib.rs                   # Module declarations
+    ├── main.rs                  # Binary entry point + CLI args
+    ├── state.rs                 # KvOp, KvState, SharedState, drain_stream
+    ├── server.rs                # Client-facing KV gRPC server (KvServer)
+    ├── service.rs               # Lifecycle + StateProvider event loop
+    ├── demo.rs                  # Operator/client simulators for --demo mode
+    ├── tests.rs                 # Operator-driven integration tests
+    └── reconciler_tests.rs      # Reconciler-driven E2E tests
 ```
 
 ---
@@ -230,14 +237,31 @@ examples/kv-stateful/
   writes (from replicate or stream drain) take a write lock. The write lock is
   held only for the HashMap mutation, not during the `replicate()` await.
 
-- **Client gRPC server lifecycle**: Started when promoted to Primary or
-  ActiveSecondary (for reads). Stopped on Close/Abort. Bind address is
-  configurable via CLI args.
+- **Client gRPC server lifecycle**: Started when promoted to Primary.
+  Stopped on Close/Abort. Bind address is configurable via CLI args.
 
 - **Serialization**: JSON via serde_json. Each `replicate()` payload is one
   `KvOp`. Copy state operations are also `KvOp::Put` for each entry.
 
-- **MVP**: Copy and replication streams are not yet wired in kubelicate-core
-  (build_replica is a no-op, replication_stream is None). The app code handles
-  them correctly but they won't be exercised until core wiring is complete.
-  The primary write path via `replicate()` works end-to-end.
+- **Stream cancellation**: `drain_stream` accepts a `CancellationToken` and
+  uses biased `select!` to stop cleanly on role change or shutdown.
+
+- **Copy + replication fully wired**: BuildReplica on the primary runs the
+  full data-plane copy protocol (GetCopyContext → GetCopyState → CopyStream).
+  Replication stream delivers incremental ops with acknowledge-gated quorum.
+
+---
+
+## Tests (8)
+
+**Operator-driven** (tests.rs):
+- `test_operator_single_replica_kv` — single replica, Put/Get/Delete
+- `test_operator_three_replica_failover` — 3 replicas, write, failover, write on new primary
+- `test_operator_kv_crud_operations` — full CRUD: put, overwrite, delete, verify
+- `test_operator_restart_secondary_copies_state` — restart secondary, verify copy stream delivers data
+- `test_operator_scale_up` — scale 1→3, verify copy delivers all data to new replicas
+- `test_operator_scale_down` — scale 3→1, verify primary still works
+
+**Reconciler-driven** (reconciler_tests.rs):
+- `test_reconciler_creates_partition_and_serves_kv` — full Pending→Creating→Healthy, write+read via KV API
+- `test_reconciler_switchover` — switchover via target_primary, write on new primary, verify old rejects writes
