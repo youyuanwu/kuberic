@@ -75,6 +75,25 @@ impl KvClusterApi {
         }
     }
 
+    /// Mark a specific pod as not ready (simulates pod failure for
+    /// testing reconciler failure detection paths).
+    fn mark_pod_not_ready(&self, pod_name: &str) {
+        let mut pods = self.pods.lock().unwrap();
+        if let Some(pod) = pods
+            .iter_mut()
+            .find(|p| p.metadata.name.as_deref() == Some(pod_name))
+        {
+            pod.status = Some(PodStatus {
+                conditions: Some(vec![PodCondition {
+                    type_: "Ready".to_string(),
+                    status: "False".to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+        }
+    }
+
     fn last_status(&self) -> Option<KubelicateSetStatus> {
         self.statuses.lock().unwrap().last().cloned()
     }
@@ -401,4 +420,76 @@ async fn test_reconciler_switchover() {
         })
         .await;
     assert!(result.is_err(), "write to demoted primary should fail");
+}
+
+/// Reconciler test: Creating phase requeues when pods are not yet ready.
+#[test_log::test(tokio::test)]
+async fn test_reconciler_creating_waits_for_ready() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    // Pending → Creating (creates pods but they're not ready yet)
+    let set = make_set("myapp", 3, None);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    assert_eq!(api.pods.lock().unwrap().len(), 3);
+
+    // Don't mark pods ready — reconcile Creating phase
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubelicateSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+    let result = reconcile_set(&set, &api, &state).await.unwrap();
+
+    // Should requeue (waiting for pods to become ready)
+    assert!(
+        matches!(
+            result,
+            kubelicate_operator::reconciler::ReconcileAction::Requeue(_)
+        ),
+        "should requeue when pods not ready"
+    );
+
+    // Status should still be Creating (no transition to Healthy)
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Creating);
+}
+
+/// Reconciler test: Healthy phase detects primary pod NotReady → FailingOver.
+#[test_log::test(tokio::test)]
+async fn test_reconciler_detects_primary_failure() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    // Create and initialize the partition (Pending → Creating → Healthy)
+    let set = make_set("myapp", 3, None);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubelicateSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+    let primary_name = status.current_primary.clone().unwrap();
+
+    // Mark primary as not ready (simulate pod crash)
+    api.mark_pod_not_ready(&primary_name);
+
+    // Reconcile Healthy — should detect failure → FailingOver
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::FailingOver);
 }
