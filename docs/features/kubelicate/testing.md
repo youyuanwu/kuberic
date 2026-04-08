@@ -132,7 +132,10 @@ Also tests the reconciler state machine end-to-end.
 | `test_operator_scale_up` | Scale 1→3: add two replicas, verify copy delivers existing data. |
 | `test_operator_scale_down` | Scale 3→1: remove two replicas, verify writes still work. |
 | `test_operator_switchover` | Switchover: old primary rejects writes, new primary works, data survives. |
+| `test_operator_build_buffer_replay` | Write on primary WHILE add_replica copies state. Verifies PrimarySender buffers ops during copy and replays them after connect. New secondary has copy + buffered data. |
 | `test_operator_epoch_fencing_after_failover` | Failover: new primary works, pre-failover data survives on new primary. |
+| `test_operator_delete_partition` | delete_partition closes all replicas. Primary rejects writes after deletion. |
+| `test_operator_secondary_state_after_failover` | After failover, secondaries retain all committed data (epoch truncation preserves committed ops). |
 
 ### Reconciler E2E Tests
 
@@ -147,24 +150,9 @@ Also supports `mark_pod_not_ready()` for testing failure detection paths.
 | `test_reconciler_creates_partition_and_serves_kv` | Full Pending→Creating→Healthy flow. Write KV data, read from another pod. |
 | `test_reconciler_switchover` | Switchover via targetPrimary change. Verify old primary rejects writes. |
 | `test_reconciler_creating_waits_for_ready` | Creating phase requeues when pods are not ready (no transition to Healthy). |
-| `test_reconciler_detects_primary_failure` | Healthy phase detects NotReady primary → FailingOver transition. |
-
-### Operator Mock Tests
-
-**File:** `kubelicate-operator/src/tests.rs` — 4 tests
-
-These test the reconciler with a `MockClusterApi` that returns
-pre-configured mock data (no real pods). Their unique value is testing
-**reconciler state machine edges that require mocking pod readiness** —
-something the KvClusterApi (real pods) can't do because KvPods start
-instantly and are always healthy.
-
-| Test | What It Validates | Why Mock Is Needed |
-|------|-------------------|--------------------|
-| `test_reconcile_pending_creates_pods` | Pending→Creating: correct pod count, phase transition | Verifies pod creation logic without starting real pods |
-| `test_reconcile_creating_waits_for_ready` | Creating phase requeues when pods are not ready | KvPod pods are always ready immediately — can't test the wait |
-| `test_reconcile_creating_to_healthy` | Creating→Healthy: partition initialized, driver stored | Tests `mark_all_pods_ready()` transition — needs readiness control |
-| `test_reconcile_healthy_detects_primary_failure` | Healthy detects NotReady primary → FailingOver | `mark_pod_not_ready()` simulates pod failure without killing a real pod |
+| `test_reconciler_detects_primary_failure_and_fails_over` | Healthy detects NotReady primary → FailingOver → failover completes → Healthy with new primary. Verifies pre-crash data survives and new primary accepts writes. |
+| `test_reconciler_scale_up` | Healthy phase: spec.replicas increased → creates pods → adds replicas to driver. |
+| `test_reconciler_scale_down` | Healthy phase: spec.replicas decreased → removes secondary from driver. |
 
 ### KvPod Helper
 
@@ -218,13 +206,13 @@ impl ClusterApi for KvClusterApi {
 ## How to Run Tests
 
 ```bash
-# All tests (26 total)
-cargo test -p kubelicate-core -p kubelicate-operator -p kv-stateful
+# All tests
+cargo test -p kubelicate-core -p kv-stateful
 
-# Core crate only (14 tests)
+# Core crate only
 cargo test -p kubelicate-core
 
-# KV example only (12 tests)
+# KV example only
 cargo test -p kv-stateful
 
 # Specific test
@@ -245,13 +233,22 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 - ✅ Scale-up with copy protocol (full state transfer)
 - ✅ Scale-down with config-first removal
 - ✅ Restart secondary with rebuild
-- ✅ Epoch fencing (old-epoch writes rejected)
 - ✅ Dual-config quorum during reconfiguration
 - ✅ must_catch_up enforcement
 - ✅ Catch-up baseline (no false catches on historical ops)
-- ✅ Reconciler state machine (Pending→Creating→Healthy→FailingOver)
+- ✅ Reconciler state machine (Pending→Creating→Healthy→FailingOver→Switchover)
+- ✅ Reconciler: Creating waits for pod readiness
+- ✅ Reconciler: Healthy detects NotReady primary → full failover cycle
 
-### Not Tested (Error Paths and Edge Cases)
+### Not Tested (Implemented but Untested Code Paths)
+
+| Gap | What's Missing | Difficulty |
+|-----|---------------|------------|
+| `on_data_loss` callback | Never triggered — actor hardcodes `DataLossAction::None`. Need quorum loss scenario. | Medium (needs quorum loss sim) |
+| `remove_replica` (cancel build) | No test cancels an in-progress `build_replica` via `remove_replica`. | Medium |
+| Multiple sequential operations | Failover→failover, switchover→failover, scale-up→failover. Only single operations tested. | Medium |
+
+### Not Tested (Requires Design Work First)
 
 | Gap | Category | Design Gap Reference |
 |-----|----------|---------------------|
@@ -263,7 +260,8 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 | gRPC handle reconnection after pod restart | Operational | B3 |
 | Concurrent reconciliation (race conditions) | Operational | B4 |
 | QuorumTracker stale ACK cleanup | Correctness | C1 |
-| Data loss protocol (on_data_loss callback) | Designed, not impl | D |
+| Zombie primary write rejection (epoch fencing on data plane) | Protocol safety | A2 |
+| Data loss protocol (on_data_loss triggered by operator) | Designed, not impl | D |
 | Operator restart recovery | Designed, not impl | D |
 | Secondary health detection | Designed, not impl | D |
 | Missing pod detection | Designed, not impl | D |

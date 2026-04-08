@@ -113,7 +113,7 @@ pub enum LifecycleEvent {
 // ---------------------------------------------------------------------------
 
 /// State provider callbacks delivered on the state_provider channel.
-/// Role-specific. May involve heavy work (e.g., copy state production).
+/// Role-specific.
 pub enum StateProviderEvent {
     /// Epoch changed (secondaries only).
     /// Primary gets epoch via ChangeRole, not UpdateEpoch.

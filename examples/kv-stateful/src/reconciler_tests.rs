@@ -458,9 +458,10 @@ async fn test_reconciler_creating_waits_for_ready() {
     assert_eq!(status.phase, Phase::Creating);
 }
 
-/// Reconciler test: Healthy phase detects primary pod NotReady → FailingOver.
+/// Reconciler test: Healthy phase detects primary pod NotReady → FailingOver,
+/// then FailingOver phase completes failover → back to Healthy with new primary.
 #[test_log::test(tokio::test)]
-async fn test_reconciler_detects_primary_failure() {
+async fn test_reconciler_detects_primary_failure_and_fails_over() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
 
@@ -483,6 +484,16 @@ async fn test_reconciler_detects_primary_failure() {
     assert_eq!(status.phase, Phase::Healthy);
     let primary_name = status.current_primary.clone().unwrap();
 
+    // Write data on primary before failure
+    let client_addr = api.client_address(&primary_name).unwrap();
+    let mut kv = connect_kv(&client_addr).await;
+    kv.put(proto::PutRequest {
+        key: "before-crash".to_string(),
+        value: "important".to_string(),
+    })
+    .await
+    .unwrap();
+
     // Mark primary as not ready (simulate pod crash)
     api.mark_pod_not_ready(&primary_name);
 
@@ -492,4 +503,184 @@ async fn test_reconciler_detects_primary_failure() {
 
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::FailingOver);
+
+    // Reconcile FailingOver — should run failover → Healthy with new primary
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+
+    // New primary should be different from the crashed one
+    let new_primary = status.current_primary.clone().unwrap();
+    assert_ne!(new_primary, primary_name);
+
+    // New primary should serve data that was written before crash
+    let new_client_addr = api.client_address(&new_primary).unwrap();
+    let mut kv2 = connect_kv(&new_client_addr).await;
+    let resp = kv2
+        .get(proto::GetRequest {
+            key: "before-crash".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().found);
+    assert_eq!(resp.get_ref().value, "important");
+
+    // New primary accepts new writes
+    let resp = kv2
+        .put(proto::PutRequest {
+            key: "after-failover".to_string(),
+            value: "recovered".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().lsn > 0);
+
+    // Driver now has 2 replicas (failed primary was removed, not demoted).
+    // The old primary pod is still running but orphaned — nobody closed it
+    // or replaced it. The partition is "Healthy" but degraded.
+    // TODO: Healthy phase should detect spec.replicas (3) > driver count (2)
+    //       and create a replacement. See operator-failure-scenarios.md §2, §9.
+    {
+        let drivers = state.drivers.lock().await;
+        let driver = drivers.get("default/myapp").unwrap();
+        assert_eq!(
+            driver.replica_ids().len(),
+            2,
+            "failed primary removed, not replaced yet"
+        );
+        assert_eq!(
+            api.pods.lock().unwrap().len(),
+            3,
+            "old pod still exists (orphaned)"
+        );
+    }
+}
+
+/// Reconciler test: Healthy phase detects spec.replicas > actual → scale-up.
+#[test_log::test(tokio::test)]
+async fn test_reconciler_scale_up() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    // Create partition with 1 replica
+    let set = make_set("myapp", 1, None);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+
+    let set = make_set(
+        "myapp",
+        1,
+        Some(KubelicateSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+    let primary_name = status.current_primary.clone().unwrap();
+
+    // Write data on primary
+    let client_addr = api.client_address(&primary_name).unwrap();
+    let mut kv = connect_kv(&client_addr).await;
+    kv.put(proto::PutRequest {
+        key: "before-scale".to_string(),
+        value: "original".to_string(),
+    })
+    .await
+    .unwrap();
+
+    // Scale up: change spec to 3 replicas
+    // First reconcile creates new pods
+    let set = make_set("myapp", 3, Some(status.clone()));
+    reconcile_set(&set, &api, &state).await.unwrap();
+    assert_eq!(api.pods.lock().unwrap().len(), 3);
+
+    // Mark new pods ready
+    api.mark_all_pods_ready();
+
+    // Second reconcile adds new replicas to driver via add_replica
+    let status = api.last_status().unwrap();
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    // Driver should have 3 replicas
+    {
+        let drivers = state.drivers.lock().await;
+        let driver = drivers.get("default/myapp").unwrap();
+        assert_eq!(driver.replica_ids().len(), 3);
+    }
+
+    // Primary still works
+    let resp = kv
+        .get(proto::GetRequest {
+            key: "before-scale".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().found);
+}
+
+/// Reconciler test: Healthy phase detects spec.replicas < actual → scale-down.
+#[test_log::test(tokio::test)]
+async fn test_reconciler_scale_down() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    // Create partition with 3 replicas
+    let set = make_set("myapp", 3, None);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubelicateSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+
+    // Write data
+    let primary_name = status.current_primary.clone().unwrap();
+    let client_addr = api.client_address(&primary_name).unwrap();
+    let mut kv = connect_kv(&client_addr).await;
+    kv.put(proto::PutRequest {
+        key: "before-scale-down".to_string(),
+        value: "yes".to_string(),
+    })
+    .await
+    .unwrap();
+
+    // Scale down: change spec to 1 replica
+    let set = make_set("myapp", 1, Some(status.clone()));
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    // Driver should have fewer replicas
+    {
+        let drivers = state.drivers.lock().await;
+        let driver = drivers.get("default/myapp").unwrap();
+        // Scale-down removes one at a time, may need multiple reconcile loops
+        assert!(
+            driver.replica_ids().len() < 3,
+            "should have removed at least one replica"
+        );
+    }
+
+    // Primary still works
+    let resp = kv
+        .put(proto::PutRequest {
+            key: "after-scale-down".to_string(),
+            value: "still-works".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().lsn > 0);
 }

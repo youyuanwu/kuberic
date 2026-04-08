@@ -215,7 +215,7 @@ impl PodRuntimeBuilder {
 
         // Start control plane gRPC server (routes through cmd_tx → runtime)
         let control_server =
-            crate::grpc::server::ControlServerV2::new(self.replica_id, cmd_tx, state.clone());
+            crate::grpc::server::ControlServer::new(self.replica_id, cmd_tx, state.clone());
         let control_listener = tokio::net::TcpListener::bind(&self.control_bind)
             .await
             .map_err(|e| KubelicateError::Internal(Box::new(e)))?;

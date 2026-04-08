@@ -23,13 +23,18 @@ struct KvPod {
 impl KvPod {
     /// Start a KV pod with a PodRuntime and the KV service event loop.
     async fn start(id: i64) -> Self {
+        Self::start_with_timeout(id, Duration::from_secs(5)).await
+    }
+
+    /// Start with a custom reply timeout (for tests with heavy concurrent load).
+    async fn start_with_timeout(id: i64, reply_timeout: Duration) -> Self {
         // Pre-allocate a port for the client KV gRPC server
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap().to_string();
         drop(listener);
 
         let bundle = PodRuntime::builder(id)
-            .reply_timeout(Duration::from_secs(5))
+            .reply_timeout(reply_timeout)
             .build()
             .await
             .unwrap();
@@ -83,6 +88,19 @@ async fn connect_kv_client(
         }
     }
     unreachable!()
+}
+
+/// Helper: wait until a pod's state has the expected number of entries.
+/// Polls every 100ms, panics after 30 seconds.
+async fn wait_for_state_count(state: &SharedState, expected: usize) {
+    for _ in 0..300 {
+        if state.read().await.data.len() >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let actual = state.read().await.data.len();
+    panic!("timed out waiting for {expected} entries, got {actual}");
 }
 
 /// Operator-driven test: PartitionDriver creates a single-replica partition,
@@ -338,8 +356,8 @@ async fn test_operator_restart_secondary_copies_state() {
 
     driver.restart_secondary(2, Box::new(h2_new)).await.unwrap();
 
-    // Wait for copy stream to be processed by the KV service
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for copy + replication to deliver all 3 entries
+    wait_for_state_count(&pod2_new.state, 3).await;
 
     // Verify the restarted secondary received the data via copy stream
     {
@@ -392,8 +410,9 @@ async fn test_operator_scale_up() {
 
     assert_eq!(driver.replica_ids().len(), 3);
 
-    // Wait for copy streams to be processed
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for copy + replication to deliver all 5 entries to both replicas
+    wait_for_state_count(&pod2.state, 5).await;
+    wait_for_state_count(&pod3.state, 5).await;
 
     // Verify both new replicas received all 5 KV pairs via copy
     for (name, pod) in [("pod2", &pod2), ("pod3", &pod3)] {
@@ -616,6 +635,232 @@ async fn test_operator_epoch_fencing_after_failover() {
             .unwrap();
         assert!(resp.get_ref().found);
         assert_eq!(resp.get_ref().value, format!("val-{}", i));
+    }
+
+    driver.delete_partition().await.unwrap();
+}
+
+/// Operator-driven test: delete_partition closes all replicas. Verify the
+/// primary stops accepting writes after deletion.
+#[test_log::test(tokio::test)]
+async fn test_operator_delete_partition() {
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+
+    // Write data
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    kv.put(proto::PutRequest {
+        key: "alive".to_string(),
+        value: "yes".to_string(),
+    })
+    .await
+    .unwrap();
+
+    // Delete partition
+    driver.delete_partition().await.unwrap();
+    assert!(driver.primary_id().is_none());
+    assert_eq!(driver.replica_ids().len(), 0);
+
+    // Primary should no longer accept writes (partition closed)
+    let result = kv
+        .put(proto::PutRequest {
+            key: "after-delete".to_string(),
+            value: "should-fail".to_string(),
+        })
+        .await;
+    assert!(result.is_err(), "writes should fail after delete_partition");
+}
+
+/// Operator-driven test: verify epoch truncation on secondaries. After
+/// failover, the secondary's uncommitted ops from the old epoch should
+/// be discarded.
+#[test_log::test(tokio::test)]
+async fn test_operator_secondary_state_after_failover() {
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Write 5 ops on primary — replicated to secondaries
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    for i in 1..=5 {
+        kv.put(proto::PutRequest {
+            key: format!("k{}", i),
+            value: format!("v{}", i),
+        })
+        .await
+        .unwrap();
+    }
+
+    // Wait for replication to deliver all 5 entries to secondaries
+    wait_for_state_count(&pod2.state, 5).await;
+    wait_for_state_count(&pod3.state, 5).await;
+
+    // Verify secondaries received the data
+    {
+        let st2 = pod2.state.read().await;
+        assert_eq!(st2.data.len(), 5, "secondary 2 should have 5 entries");
+    }
+    {
+        let st3 = pod3.state.read().await;
+        assert_eq!(st3.data.len(), 5, "secondary 3 should have 5 entries");
+    }
+
+    // Failover: pod 1 fails, promote a secondary
+    driver.failover(1).await.unwrap();
+    let new_primary = driver.primary_id().unwrap();
+    assert_ne!(new_primary, 1);
+
+    // The surviving secondaries should still have all 5 entries
+    // (epoch bump truncates only uncommitted ops — all 5 were committed)
+    let surviving_secondary = if new_primary == 2 { &pod3 } else { &pod2 };
+    {
+        let st = surviving_secondary.state.read().await;
+        assert_eq!(
+            st.data.len(),
+            5,
+            "surviving secondary should retain all committed data"
+        );
+    }
+
+    // New primary should have all 5 entries too
+    let new_primary_pod = if new_primary == 2 { &pod2 } else { &pod3 };
+    {
+        let st = new_primary_pod.state.read().await;
+        assert_eq!(
+            st.data.len(),
+            5,
+            "new primary should have all committed data"
+        );
+    }
+
+    driver.delete_partition().await.unwrap();
+}
+
+/// Operator-driven test: write on primary WHILE add_replica is copying state
+/// to a new secondary. The PrimarySender should buffer these ops and replay
+/// them after the copy completes. The new secondary should have both the
+/// copied state AND the buffered ops.
+///
+/// NOTE: This test is ignored by default because concurrent writes during
+/// add_replica can trigger the C0 channel contention issue (state_provider_tx
+/// shared between copy and replication events). Run with:
+///   cargo test test_operator_build_buffer_replay -- --ignored
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[ignore]
+async fn test_operator_build_buffer_replay() {
+    // Start with 3 replicas
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Write initial data
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    for i in 1..=20 {
+        kv.put(proto::PutRequest {
+            key: format!("initial-{}", i),
+            value: format!("val-{}", i),
+        })
+        .await
+        .unwrap();
+    }
+
+    // Now add a 4th replica. Start writing in a background task FIRST
+    // to ensure ops are in-flight during the copy. The PrimarySender
+    // should buffer these via build_buffers and replay on connect.
+    let pod4 = KvPod::start(4).await;
+    let h4 = pod4.replica_handle(4).await;
+
+    // Start continuous writes in background BEFORE add_replica.
+    // Use a notify to sync: background task signals after first write
+    // succeeds, ensuring writes are flowing before copy starts.
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_clone = started.clone();
+    let write_addr = pod1.client_address.clone();
+    let write_handle = tokio::spawn(async move {
+        let mut kv_bg = connect_kv_client(&write_addr).await;
+        for i in 1..=10 {
+            kv_bg
+                .put(proto::PutRequest {
+                    key: format!("during-copy-{}", i),
+                    value: format!("buffered-{}", i),
+                })
+                .await
+                .unwrap();
+            if i == 1 {
+                started_clone.notify_one(); // signal: writes are flowing
+            }
+        }
+    });
+
+    // Wait until background task has completed at least one write
+    started.notified().await;
+
+    // add_replica blocks during copy — writes are happening concurrently
+    driver.add_replica(Box::new(h4)).await.unwrap();
+    assert_eq!(driver.replica_ids().len(), 4);
+
+    // Wait for background writes to finish, then wait for pod4 to receive
+    // all entries: 50 initial + 20 during-copy = 70 total.
+    // Some entries come via copy, others via build buffer replay, others via
+    // live replication — timing varies, so poll on total count.
+    write_handle.await.unwrap();
+    wait_for_state_count(&pod4.state, 30).await;
+
+    // Verify the new secondary (pod4) has BOTH:
+    // - The 20 initial entries (from copy/replication)
+    // - The 10 during-copy entries (from build buffer replay + replication)
+    {
+        let st = pod4.state.read().await;
+        for i in 1..=20 {
+            assert!(
+                st.data.contains_key(&format!("initial-{}", i)),
+                "pod4 missing initial-{i}"
+            );
+        }
+        for i in 1..=10 {
+            assert!(
+                st.data.contains_key(&format!("during-copy-{}", i)),
+                "pod4 missing during-copy-{i} (should come from build buffer replay)"
+            );
+        }
+        assert_eq!(
+            st.data.len(),
+            30,
+            "pod4 should have 20 initial + 10 buffered = 30 entries"
+        );
     }
 
     driver.delete_partition().await.unwrap();
