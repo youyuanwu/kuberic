@@ -131,6 +131,7 @@ pub async fn run_service(
                     let _ = reply.send(Ok(lsn));
                 }
                 StateProviderEvent::GetCopyContext { reply } => {
+                    // Fast — just send current LSN. Safe to run inline.
                     let lsn = state.read().await.last_applied_lsn;
                     let (tx, stream) = OperationStream::channel(1);
                     let data = Bytes::from(lsn.to_string());
@@ -140,33 +141,46 @@ pub async fn run_service(
                     let _ = reply.send(Ok(stream));
                 }
                 StateProviderEvent::GetCopyState { up_to_lsn, mut copy_context, reply } => {
-                    let peer_lsn = if let Some(op) = copy_context.get_operation().await {
-                        String::from_utf8_lossy(&op.data).parse::<i64>().unwrap_or(0)
-                    } else {
-                        0
-                    };
+                    // Spawn to background — state serialization can be slow
+                    // for large datasets and must not block the event loop.
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let peer_lsn = if let Some(op) = copy_context.get_operation().await {
+                            String::from_utf8_lossy(&op.data).parse::<i64>().unwrap_or(0)
+                        } else {
+                            0
+                        };
 
-                    info!(peer_lsn, up_to_lsn, "producing copy state");
+                        info!(peer_lsn, up_to_lsn, "producing copy state");
 
-                    let (tx, stream) = OperationStream::channel(64);
-                    let st = state.read().await;
-                    if peer_lsn < st.last_applied_lsn {
-                        let current_lsn = st.last_applied_lsn;
-                        for (k, v) in &st.data {
-                            let op = KvOp::Put {
-                                key: k.clone(),
-                                value: v.clone(),
-                            };
+                        // Collect state snapshot under read lock, then drop
+                        // the lock BEFORE sending. This avoids deadlock: the
+                        // drain task needs write lock to apply replication ops,
+                        // and tx.send() can block if the receiver is slow.
+                        let snapshot: Vec<(String, String)> = {
+                            let guard = st.read().await;
+                            if peer_lsn < guard.last_applied_lsn {
+                                guard.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                            } else {
+                                Vec::new()
+                            }
+                        };
+                        let current_lsn = st.read().await.last_applied_lsn;
+
+                        let (tx, stream) = OperationStream::channel(64);
+                        // Reply with the stream immediately
+                        let _ = reply.send(Ok(stream));
+
+                        for (k, v) in snapshot {
+                            let op = KvOp::Put { key: k, value: v };
                             let data = Bytes::from(serde_json::to_vec(&op).unwrap());
                             if tx.send(Operation::new(current_lsn, data, None)).await.is_err() {
                                 break;
                             }
                         }
-                    }
-                    drop(tx);
-                    drop(st);
-                    info!("copy state produced");
-                    let _ = reply.send(Ok(stream));
+                        drop(tx);
+                        info!("copy state produced");
+                    });
                 }
                 StateProviderEvent::OnDataLoss { reply } => {
                     info!("data loss reported, accepting state as-is");

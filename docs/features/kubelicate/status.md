@@ -123,12 +123,13 @@ kubelicate-core/
 │   ├── driver.rs                    # PartitionDriver + ReplicaHandle trait + InProcessReplicaHandle
 │   ├── replicator/
 │   │   ├── quorum.rs                # QuorumTracker (single + dual-config + must_catch_up + baseline)
-│   │   ├── actor.rs                 # WalReplicatorActor (control + data event loop)
-│   │   ├── primary.rs               # PrimarySender (gRPC streams + build buffering)
+│   │   ├── queue.rs                 # ReplicationQueue (in-memory op retention for replay to new replicas)
+│   │   ├── actor.rs                 # WalReplicatorActor (control + data event loop + ReplicationQueue)
+│   │   ├── primary.rs               # PrimarySender (unbounded per-secondary channels + replay)
 │   │   └── secondary.rs             # SecondaryReceiver (replication + copy gRPC server)
 │   └── grpc/
 │       ├── convert.rs               # Proto ↔ domain type conversions
-│       ├── server.rs                # ControlServer + ControlServerV2 (gRPC impl)
+│       ├── server.rs                # ControlServer (routes through PodRuntime command loop)
 │       └── handle.rs                # GrpcReplicaHandle (remote ReplicaHandle for operator)
 
 kubelicate-operator/

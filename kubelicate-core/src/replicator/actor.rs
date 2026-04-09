@@ -8,14 +8,17 @@ use crate::error::KubelicateError;
 use crate::events::{ReplicateRequest, ReplicatorControlEvent};
 use crate::handles::PartitionState;
 use crate::replicator::primary::PrimarySender;
+use crate::replicator::queue::ReplicationQueue;
 use crate::replicator::quorum::QuorumTracker;
 use crate::types::{DataLossAction, Epoch, Lsn, ReplicaId, Role};
 
-/// The WalReplicator actor. Processes control and data events, manages
-/// gRPC connections to secondaries, and tracks quorum acknowledgments.
+/// The WalReplicator actor. Processes control and data events in a single
+/// loop with biased select (control has priority). The data path is
+/// non-blocking because PrimarySender::send_to_all uses unbounded channels
+/// with per-secondary drain tasks (matching SF's async dispatch model).
 ///
-/// "Wal" is a misnomer for the MVP — there is no WAL persistence. The name
-/// is kept for forward compatibility; persistence will be added later.
+/// Owns a ReplicationQueue that retains ops for replay to new replicas,
+/// matching SF's ReplicationQueueManager pattern.
 pub struct WalReplicatorActor {
     replica_id: ReplicaId,
 }
@@ -25,6 +28,7 @@ impl WalReplicatorActor {
         Self { replica_id }
     }
 
+    #[allow(unused_assignments)]
     pub async fn run(
         self,
         mut control_rx: mpsc::Receiver<ReplicatorControlEvent>,
@@ -32,11 +36,11 @@ impl WalReplicatorActor {
         state: Arc<PartitionState>,
     ) {
         let mut role = Role::None;
-        #[allow(unused_assignments)]
         let mut epoch = Epoch::default();
         let mut next_lsn: Lsn = 1;
         let quorum_tracker = Arc::new(TokioMutex::new(QuorumTracker::new()));
         let mut primary_sender: Option<PrimarySender> = None;
+        let mut replication_queue = ReplicationQueue::new();
 
         loop {
             tokio::select! {
@@ -51,11 +55,11 @@ impl WalReplicatorActor {
                         }
                         ReplicatorControlEvent::Close { reply } => {
                             info!(replica_id = self.replica_id, "replicator closing");
-                            // Fail pending operations
                             quorum_tracker.lock().await.fail_all(KubelicateError::Closed);
                             if let Some(mut sender) = primary_sender.take() {
                                 sender.close_all();
                             }
+                            replication_queue.clear();
                             let _ = reply.send(Ok(()));
                             break;
                         }
@@ -64,6 +68,7 @@ impl WalReplicatorActor {
                             if let Some(mut sender) = primary_sender.take() {
                                 sender.close_all();
                             }
+                            replication_queue.clear();
                             break;
                         }
                         ReplicatorControlEvent::ChangeRole {
@@ -78,18 +83,17 @@ impl WalReplicatorActor {
                                 "replicator changing role"
                             );
 
-                            // Teardown old role
                             if role == Role::Primary && new_role != Role::Primary {
                                 quorum_tracker.lock().await.fail_all(KubelicateError::NotPrimary);
                                 if let Some(mut sender) = primary_sender.take() {
                                     sender.close_all();
                                 }
+                                replication_queue.clear();
                             }
 
                             epoch = new_epoch;
                             role = new_role;
 
-                            // Setup new role
                             if role == Role::Primary {
                                 primary_sender = Some(PrimarySender::new(self.replica_id, epoch));
                             }
@@ -105,12 +109,7 @@ impl WalReplicatorActor {
                                 ?new_epoch,
                                 "updating epoch"
                             );
-                            let _ = &new_epoch; // used conceptually; actual value tracked for future use
                             epoch = new_epoch;
-                            let _ = &epoch;
-                            // Truncation: secondaries should truncate uncommitted ops.
-                            // For the in-memory MVP, the secondary receiver handles this
-                            // via SecondaryState::update_epoch().
                             let _ = reply.send(Ok(()));
                         }
                         ReplicatorControlEvent::UpdateCatchUpConfiguration {
@@ -120,7 +119,7 @@ impl WalReplicatorActor {
                         } => {
                             let mut cc_members: HashSet<ReplicaId> =
                                 current.members.iter().map(|r| r.id).collect();
-                            cc_members.insert(self.replica_id); // Primary counts toward quorum
+                            cc_members.insert(self.replica_id);
                             let mut pc_members: HashSet<ReplicaId> =
                                 previous.members.iter().map(|r| r.id).collect();
                             if !pc_members.is_empty() {
@@ -134,7 +133,6 @@ impl WalReplicatorActor {
                                 .map(|r| r.id)
                                 .collect();
 
-                            // Build member progress map from operator-reported LSNs
                             let member_progress: HashMap<ReplicaId, Lsn> = current
                                 .members
                                 .iter()
@@ -150,12 +148,13 @@ impl WalReplicatorActor {
                                 member_progress,
                             );
 
-                            // Connect to new secondaries
+                            // Connect new secondaries and replay pending ops
                             if let Some(sender) = &mut primary_sender {
                                 for member in &current.members {
                                     if member.id != self.replica_id
                                         && !sender.has_connection(&member.id)
-                                        && let Err(e) = sender
+                                    {
+                                        if let Err(e) = sender
                                             .add_secondary(
                                                 member.id,
                                                 member.replicator_address.clone(),
@@ -168,7 +167,24 @@ impl WalReplicatorActor {
                                                 error = %e,
                                                 "failed to connect to secondary"
                                             );
+                                            continue;
                                         }
+
+                                        // Replay all ops from replication queue.
+                                        // Some may duplicate the copy stream — that's
+                                        // OK, apply_op is idempotent (same key = overwrite).
+                                        let pending = replication_queue.ops_from(1);
+                                        if !pending.is_empty() {
+                                            info!(
+                                                replica_id = member.id,
+                                                count = pending.len(),
+                                                "replaying ops from replication queue"
+                                            );
+                                            for (lsn, data) in &pending {
+                                                sender.send_to_one(member.id, *lsn, data);
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -180,14 +196,13 @@ impl WalReplicatorActor {
                         } => {
                             let mut cc_members: HashSet<ReplicaId> =
                                 current.members.iter().map(|r| r.id).collect();
-                            cc_members.insert(self.replica_id); // Primary counts toward quorum
+                            cc_members.insert(self.replica_id);
 
                             quorum_tracker.lock().await.set_current_configuration(
                                 cc_members.clone(),
                                 current.write_quorum,
                             );
 
-                            // Remove connections not in current config
                             if let Some(sender) = &mut primary_sender {
                                 let to_remove: Vec<ReplicaId> = sender
                                     .connected_ids()
@@ -200,24 +215,28 @@ impl WalReplicatorActor {
                             }
 
                             let _ = reply.send(Ok(()));
+
+                            // GC replication queue — config is finalized,
+                            // all replicas are caught up. Safe to remove
+                            // ops up to committed_lsn.
+                            let committed = state.committed_lsn();
+                            replication_queue.gc(committed);
                         }
                         ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply } => {
                             quorum_tracker.lock().await.wait_for_catch_up(mode, reply);
                         }
                         ReplicatorControlEvent::BuildReplica { replica, reply } => {
-                            // Copy has completed. Start buffering replication ops
-                            // for this replica until it joins the config.
-                            if let Some(sender) = &mut primary_sender {
-                                sender.start_build(replica.id);
-                            }
+                            // No-op with replication queue design — pending ops
+                            // are replayed at add_secondary time from the queue.
+                            info!(
+                                replica_id = replica.id,
+                                queue_len = replication_queue.len(),
+                                "BuildReplica: queue has ops for replay at connect time"
+                            );
                             let _ = reply.send(Ok(()));
                         }
                         ReplicatorControlEvent::RemoveReplica { replica_id, reply } => {
-                            // Remove an idle replica (not in active configuration).
-                            // Cancels any in-progress build and drops the connection.
-                            // Active secondaries are removed via UpdateConfiguration.
                             if let Some(sender) = &mut primary_sender {
-                                sender.cancel_build(replica_id);
                                 sender.remove_secondary(replica_id);
                             }
                             let _ = reply.send(Ok(()));
@@ -233,16 +252,21 @@ impl WalReplicatorActor {
                     let lsn = next_lsn;
                     next_lsn += 1;
 
+                    // Store in replication queue for replay to new replicas
+                    replication_queue.push(lsn, req.data.clone());
+
                     // Register with quorum tracker (primary's own ACK counted)
                     quorum_tracker.lock().await.register(lsn, self.replica_id, req.reply);
 
-                    // Send to all connected secondaries
+                    // Non-blocking: send_to_all uses unbounded channels
                     if let Some(sender) = &mut primary_sender {
-                        sender.send_to_all(lsn, &req.data).await;
+                        sender.send_to_all(lsn, &req.data);
                     }
 
-                    // Update progress
+                    // Update progress and committed LSN
                     state.set_current_progress(lsn);
+                    let committed = quorum_tracker.lock().await.committed_lsn();
+                    state.set_committed_lsn(committed);
                 }
 
                 else => break,

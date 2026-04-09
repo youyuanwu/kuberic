@@ -5,34 +5,37 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::proto::ReplicationItem;
 use crate::proto::replicator_data_client::ReplicatorDataClient;
 use crate::replicator::quorum::QuorumTracker;
 use crate::types::{Epoch, Lsn, ReplicaId};
 
-/// A connection to one secondary replica for sending replication operations
-/// and receiving ACKs.
-pub struct SecondaryConnection {
-    /// Send items to this secondary's gRPC stream
-    item_tx: mpsc::Sender<ReplicationItem>,
+/// A connection to one secondary replica. Uses an unbounded channel so
+/// send_to_all never blocks the actor. A background drain task bridges
+/// the unbounded channel to the bounded gRPC stream.
+struct SecondaryConnection {
+    /// Unbounded sender — send_to_all writes here, never blocks
+    item_tx: mpsc::UnboundedSender<ReplicationItem>,
 }
 
 /// Primary-side replication sender. Manages connections to all configured
 /// secondaries, sends operations, and routes ACKs back to the QuorumTracker.
 ///
-/// Supports build buffering: ops arriving during `build_replica` are buffered
-/// per-replica. When the secondary connects via `add_secondary`, buffered ops
-/// are replayed before live replication starts.
+/// **Non-blocking design (matching SF):** `send_to_all` enqueues ops into
+/// per-secondary unbounded channels and returns immediately. Each secondary
+/// has a background drain task that reads from the unbounded channel and
+/// writes to the gRPC stream. A slow secondary's drain task blocks
+/// independently without affecting the actor or other secondaries.
+///
+/// Pending ops for new replicas are replayed from the ReplicationQueue
+/// at `add_secondary` time — no build buffers needed.
 pub struct PrimarySender {
     connections: HashMap<ReplicaId, SecondaryConnection>,
     #[allow(dead_code)]
     primary_id: ReplicaId,
     epoch: Epoch,
-    /// Ops buffered for replicas being built. Key = replica_id being built.
-    /// Populated by `send_to_all` when a build is in progress.
-    build_buffers: HashMap<ReplicaId, Vec<ReplicationItem>>,
 }
 
 impl PrimarySender {
@@ -41,7 +44,6 @@ impl PrimarySender {
             connections: HashMap::new(),
             primary_id,
             epoch,
-            build_buffers: HashMap::new(),
         }
     }
 
@@ -49,21 +51,24 @@ impl PrimarySender {
         self.epoch = epoch;
     }
 
-    /// Start buffering ops for a replica being built. Call before
-    /// `build_replica` starts the copy protocol.
-    pub fn start_build(&mut self, replica_id: ReplicaId) {
-        self.build_buffers.insert(replica_id, Vec::new());
-    }
-
     /// Connect to a secondary's replication gRPC endpoint.
     /// If ops were buffered during build, they are replayed first.
-    /// Spawns a background task that streams items and routes ACKs.
+    ///
+    /// Spawns two background tasks per secondary:
+    /// 1. **Drain task**: reads from unbounded channel, writes to bounded
+    ///    gRPC stream. May block on slow secondary — only blocks this task.
+    /// 2. **ACK reader**: reads ACKs from gRPC response stream, routes to
+    ///    QuorumTracker.
     pub async fn add_secondary(
         &mut self,
         replica_id: ReplicaId,
         address: String,
         quorum_tracker: Arc<tokio::sync::Mutex<QuorumTracker>>,
     ) -> crate::Result<()> {
+        if self.connections.contains_key(&replica_id) {
+            return Ok(()); // already connected
+        }
+
         let channel = Channel::from_shared(address)
             .map_err(|e| crate::KubelicateError::Internal(Box::new(e)))?
             .connect()
@@ -72,8 +77,9 @@ impl PrimarySender {
 
         let mut client = ReplicatorDataClient::new(channel);
 
-        let (item_tx, item_rx) = mpsc::channel::<ReplicationItem>(256);
-        let outbound = ReceiverStream::new(item_rx);
+        // Bounded channel for the gRPC stream (backpressure at transport level)
+        let (grpc_tx, grpc_rx) = mpsc::channel::<ReplicationItem>(256);
+        let outbound = ReceiverStream::new(grpc_rx);
 
         let response = client
             .replication_stream(outbound)
@@ -83,7 +89,7 @@ impl PrimarySender {
         let mut ack_stream = response.into_inner();
         let rid = replica_id;
 
-        // Spawn ACK reader — routes ACKs to the quorum tracker
+        // Spawn ACK reader
         tokio::spawn(async move {
             while let Some(result) = ack_stream.next().await {
                 match result {
@@ -99,31 +105,44 @@ impl PrimarySender {
             }
         });
 
-        self.connections
-            .insert(replica_id, SecondaryConnection { item_tx });
+        // Unbounded channel: send_to_all writes here (never blocks)
+        let (unbounded_tx, mut unbounded_rx) = mpsc::unbounded_channel::<ReplicationItem>();
 
-        // Replay any ops buffered during build
-        if let Some(buffered) = self.build_buffers.remove(&replica_id)
-            && !buffered.is_empty()
-        {
-            info!(
-                replica_id,
-                count = buffered.len(),
-                "replaying buffered ops from build window"
-            );
-            let conn = self.connections.get(&replica_id).unwrap();
-            for item in buffered {
-                if conn.item_tx.send(item).await.is_err() {
-                    warn!(replica_id, "replay failed — removing broken connection");
-                    self.connections.remove(&replica_id);
-                    return Err(crate::KubelicateError::Internal(
-                        format!("failed to replay buffered ops to replica {replica_id}").into(),
-                    ));
+        // Spawn drain task: bridges unbounded → bounded gRPC stream.
+        // This task may block on grpc_tx.send() if the secondary is slow,
+        // but that only blocks THIS task, not the actor.
+        tokio::spawn(async move {
+            while let Some(item) = unbounded_rx.recv().await {
+                if grpc_tx.send(item).await.is_err() {
+                    warn!(replica_id = rid, "gRPC stream closed, drain task exiting");
+                    break;
                 }
             }
-        }
+        });
+
+        self.connections.insert(
+            replica_id,
+            SecondaryConnection {
+                item_tx: unbounded_tx,
+            },
+        );
 
         Ok(())
+    }
+
+    /// Send a single item to a specific secondary (for replay from queue).
+    pub fn send_to_one(&self, replica_id: ReplicaId, lsn: Lsn, data: &bytes::Bytes) {
+        let item = ReplicationItem {
+            epoch_data_loss: self.epoch.data_loss_number,
+            epoch_config: self.epoch.configuration_number,
+            lsn,
+            data: data.to_vec(),
+        };
+        if let Some(conn) = self.connections.get(&replica_id)
+            && conn.item_tx.send(item).is_err()
+        {
+            warn!(replica_id, lsn, "send_to_one: channel closed");
+        }
     }
 
     /// Remove a secondary connection.
@@ -131,14 +150,9 @@ impl PrimarySender {
         self.connections.remove(&replica_id);
     }
 
-    /// Cancel a pending build for a replica (clears buffered ops).
-    pub fn cancel_build(&mut self, replica_id: ReplicaId) {
-        self.build_buffers.remove(&replica_id);
-    }
-
-    /// Send an operation to all connected secondaries and buffer for
-    /// any replicas currently being built.
-    pub async fn send_to_all(&mut self, lsn: Lsn, data: &bytes::Bytes) {
+    /// Send an operation to all connected secondaries. Non-blocking —
+    /// uses unbounded channels. Matches SF's fire-and-forget dispatch.
+    pub fn send_to_all(&mut self, lsn: Lsn, data: &bytes::Bytes) {
         let item = ReplicationItem {
             epoch_data_loss: self.epoch.data_loss_number,
             epoch_config: self.epoch.configuration_number,
@@ -146,18 +160,18 @@ impl PrimarySender {
             data: data.to_vec(),
         };
 
-        for (rid, conn) in &self.connections {
-            if conn.item_tx.send(item.clone()).await.is_err() {
+        let mut dead = Vec::new();
+        for (&rid, conn) in &self.connections {
+            if conn.item_tx.send(item.clone()).is_err() {
                 warn!(
                     replica_id = rid,
-                    lsn, "failed to send to secondary — channel closed"
+                    lsn, "secondary channel closed — removing connection"
                 );
+                dead.push(rid);
             }
         }
-
-        // Buffer for replicas being built (not yet connected)
-        for buffer in self.build_buffers.values_mut() {
-            buffer.push(item.clone());
+        for rid in dead {
+            self.connections.remove(&rid);
         }
     }
 
@@ -176,9 +190,8 @@ impl PrimarySender {
         self.connections.keys().cloned().collect()
     }
 
-    /// Close all connections and clear build buffers.
+    /// Close all connections.
     pub fn close_all(&mut self) {
         self.connections.clear();
-        self.build_buffers.clear();
     }
 }

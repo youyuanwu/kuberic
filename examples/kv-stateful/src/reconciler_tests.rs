@@ -5,6 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
 use kube::api::ObjectMeta;
+use serial_test::serial;
 use tokio::sync::RwLock;
 
 use kubelicate_core::driver::ReplicaHandle;
@@ -262,6 +263,7 @@ async fn connect_kv(
 
 /// Full reconciler test: Pending → Creating → Healthy → write KV data.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_reconciler_creates_partition_and_serves_kv() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -315,6 +317,7 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
 
 /// Reconciler test: create partition → write data → switchover → write on new primary.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_reconciler_switchover() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -424,6 +427,7 @@ async fn test_reconciler_switchover() {
 
 /// Reconciler test: Creating phase requeues when pods are not yet ready.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_reconciler_creating_waits_for_ready() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -461,6 +465,7 @@ async fn test_reconciler_creating_waits_for_ready() {
 /// Reconciler test: Healthy phase detects primary pod NotReady → FailingOver,
 /// then FailingOver phase completes failover → back to Healthy with new primary.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_reconciler_detects_primary_failure_and_fails_over() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -560,6 +565,7 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
 
 /// Reconciler test: Healthy phase detects spec.replicas > actual → scale-up.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_reconciler_scale_up() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -626,6 +632,7 @@ async fn test_reconciler_scale_up() {
 
 /// Reconciler test: Healthy phase detects spec.replicas < actual → scale-down.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_reconciler_scale_down() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();

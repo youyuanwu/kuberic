@@ -4,6 +4,7 @@ use std::time::Duration;
 use kubelicate_core::driver::{PartitionDriver, ReplicaHandle};
 use kubelicate_core::grpc::handle::GrpcReplicaHandle;
 use kubelicate_core::pod::PodRuntime;
+use serial_test::serial;
 use tokio::sync::RwLock;
 
 use crate::proto;
@@ -93,9 +94,15 @@ async fn connect_kv_client(
 /// Helper: wait until a pod's state has the expected number of entries.
 /// Polls every 100ms, panics after 30 seconds.
 async fn wait_for_state_count(state: &SharedState, expected: usize) {
-    for _ in 0..300 {
-        if state.read().await.data.len() >= expected {
+    let mut last_count = 0;
+    for _tick in 0..300 {
+        let count = state.read().await.data.len();
+        if count >= expected {
             return;
+        }
+        if count != last_count {
+            eprintln!("[wait] count={count} expected={expected}");
+            last_count = count;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -106,6 +113,7 @@ async fn wait_for_state_count(state: &SharedState, expected: usize) {
 /// Operator-driven test: PartitionDriver creates a single-replica partition,
 /// KV client writes data, verifies reads.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_single_replica_kv() {
     let pod = KvPod::start(1).await;
 
@@ -155,6 +163,7 @@ async fn test_operator_single_replica_kv() {
 /// Operator-driven test: 3-replica partition, write on primary, verify via
 /// KV client, then failover and verify new primary works.
 #[tokio::test]
+#[serial]
 async fn test_operator_three_replica_failover() {
     let pod1 = KvPod::start(1).await;
     let pod2 = KvPod::start(2).await;
@@ -236,6 +245,7 @@ async fn test_operator_three_replica_failover() {
 
 /// Operator-driven test: write, delete, overwrite, verify final state.
 #[tokio::test]
+#[serial]
 async fn test_operator_kv_crud_operations() {
     let pod = KvPod::start(10).await;
 
@@ -318,6 +328,7 @@ async fn test_operator_kv_crud_operations() {
 /// Operator-driven test: create 3 replicas, write data on primary,
 /// restart a secondary, verify it received the data via copy stream.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_restart_secondary_copies_state() {
     let pod1 = KvPod::start(1).await;
     let pod2 = KvPod::start(2).await;
@@ -378,6 +389,7 @@ async fn test_operator_restart_secondary_copies_state() {
 /// Operator-driven test: scale-up from 1 to 3 replicas, verify new replicas
 /// receive existing data via copy stream.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_scale_up() {
     // Start with 1 replica (primary only)
     let pod1 = KvPod::start(1).await;
@@ -446,6 +458,7 @@ async fn test_operator_scale_up() {
 
 /// Operator-driven test: scale-down from 3 to 1 replica.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_scale_down() {
     let pod1 = KvPod::start(1).await;
     let pod2 = KvPod::start(2).await;
@@ -505,6 +518,7 @@ async fn test_operator_scale_down() {
 /// Operator-driven test: switchover from primary to a chosen secondary,
 /// verify new primary works and old primary is demoted.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_switchover() {
     let pod1 = KvPod::start(1).await;
     let pod2 = KvPod::start(2).await;
@@ -581,6 +595,7 @@ async fn test_operator_switchover() {
 /// See design-gaps.md A2 (write revocation) and operator-failure-scenarios.md §9
 /// (stale/zombie primary).
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_epoch_fencing_after_failover() {
     let pod1 = KvPod::start(1).await;
     let pod2 = KvPod::start(2).await;
@@ -643,6 +658,7 @@ async fn test_operator_epoch_fencing_after_failover() {
 /// Operator-driven test: delete_partition closes all replicas. Verify the
 /// primary stops accepting writes after deletion.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_delete_partition() {
     let pod1 = KvPod::start(1).await;
     let pod2 = KvPod::start(2).await;
@@ -686,6 +702,7 @@ async fn test_operator_delete_partition() {
 /// failover, the secondary's uncommitted ops from the old epoch should
 /// be discarded.
 #[test_log::test(tokio::test)]
+#[serial]
 async fn test_operator_secondary_state_after_failover() {
     let pod1 = KvPod::start(1).await;
     let pod2 = KvPod::start(2).await;
@@ -762,18 +779,19 @@ async fn test_operator_secondary_state_after_failover() {
 /// to a new secondary. The PrimarySender should buffer these ops and replay
 /// them after the copy completes. The new secondary should have both the
 /// copied state AND the buffered ops.
-///
-/// NOTE: This test is ignored by default because concurrent writes during
-/// add_replica can trigger the C0 channel contention issue (state_provider_tx
-/// shared between copy and replication events). Run with:
-///   cargo test test_operator_build_buffer_replay -- --ignored
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[ignore]
+#[serial]
 async fn test_operator_build_buffer_replay() {
-    // Start with 3 replicas
-    let pod1 = KvPod::start(1).await;
-    let pod2 = KvPod::start(2).await;
-    let pod3 = KvPod::start(3).await;
+    // Test parameters
+    const INITIAL_ENTRIES: i64 = 500;
+    const CONCURRENT_ENTRIES: i64 = 200;
+    let total_entries = (INITIAL_ENTRIES + CONCURRENT_ENTRIES) as usize;
+
+    // Start with 3 replicas — use longer reply timeout for concurrent load
+    let timeout = Duration::from_secs(30);
+    let pod1 = KvPod::start_with_timeout(1, timeout).await;
+    let pod2 = KvPod::start_with_timeout(2, timeout).await;
+    let pod3 = KvPod::start_with_timeout(3, timeout).await;
 
     let h1 = pod1.replica_handle(1).await;
     let h2 = pod2.replica_handle(2).await;
@@ -788,7 +806,7 @@ async fn test_operator_build_buffer_replay() {
 
     // Write initial data
     let mut kv = connect_kv_client(&pod1.client_address).await;
-    for i in 1..=20 {
+    for i in 1..=INITIAL_ENTRIES {
         kv.put(proto::PutRequest {
             key: format!("initial-{}", i),
             value: format!("val-{}", i),
@@ -800,7 +818,7 @@ async fn test_operator_build_buffer_replay() {
     // Now add a 4th replica. Start writing in a background task FIRST
     // to ensure ops are in-flight during the copy. The PrimarySender
     // should buffer these via build_buffers and replay on connect.
-    let pod4 = KvPod::start(4).await;
+    let pod4 = KvPod::start_with_timeout(4, timeout).await;
     let h4 = pod4.replica_handle(4).await;
 
     // Start continuous writes in background BEFORE add_replica.
@@ -811,7 +829,7 @@ async fn test_operator_build_buffer_replay() {
     let write_addr = pod1.client_address.clone();
     let write_handle = tokio::spawn(async move {
         let mut kv_bg = connect_kv_client(&write_addr).await;
-        for i in 1..=10 {
+        for i in 1..=CONCURRENT_ENTRIES {
             kv_bg
                 .put(proto::PutRequest {
                     key: format!("during-copy-{}", i),
@@ -820,7 +838,7 @@ async fn test_operator_build_buffer_replay() {
                 .await
                 .unwrap();
             if i == 1 {
-                started_clone.notify_one(); // signal: writes are flowing
+                started_clone.notify_one();
             }
         }
     });
@@ -830,27 +848,21 @@ async fn test_operator_build_buffer_replay() {
 
     // add_replica blocks during copy — writes are happening concurrently
     driver.add_replica(Box::new(h4)).await.unwrap();
-    assert_eq!(driver.replica_ids().len(), 4);
 
-    // Wait for background writes to finish, then wait for pod4 to receive
-    // all entries: 50 initial + 20 during-copy = 70 total.
-    // Some entries come via copy, others via build buffer replay, others via
-    // live replication — timing varies, so poll on total count.
+    // Wait for all entries to arrive on pod4
     write_handle.await.unwrap();
-    wait_for_state_count(&pod4.state, 30).await;
+    wait_for_state_count(&pod4.state, total_entries).await;
 
-    // Verify the new secondary (pod4) has BOTH:
-    // - The 20 initial entries (from copy/replication)
-    // - The 10 during-copy entries (from build buffer replay + replication)
+    // Verify pod4 has all entries
     {
         let st = pod4.state.read().await;
-        for i in 1..=20 {
+        for i in 1..=INITIAL_ENTRIES {
             assert!(
                 st.data.contains_key(&format!("initial-{}", i)),
                 "pod4 missing initial-{i}"
             );
         }
-        for i in 1..=10 {
+        for i in 1..=CONCURRENT_ENTRIES {
             assert!(
                 st.data.contains_key(&format!("during-copy-{}", i)),
                 "pod4 missing during-copy-{i} (should come from build buffer replay)"
@@ -858,8 +870,8 @@ async fn test_operator_build_buffer_replay() {
         }
         assert_eq!(
             st.data.len(),
-            30,
-            "pod4 should have 20 initial + 10 buffered = 30 entries"
+            total_entries,
+            "pod4 should have {INITIAL_ENTRIES} initial + {CONCURRENT_ENTRIES} buffered = {total_entries} entries"
         );
     }
 

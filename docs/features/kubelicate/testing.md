@@ -132,7 +132,7 @@ Also tests the reconciler state machine end-to-end.
 | `test_operator_scale_up` | Scale 1→3: add two replicas, verify copy delivers existing data. |
 | `test_operator_scale_down` | Scale 3→1: remove two replicas, verify writes still work. |
 | `test_operator_switchover` | Switchover: old primary rejects writes, new primary works, data survives. |
-| `test_operator_build_buffer_replay` | Write on primary WHILE add_replica copies state. Verifies PrimarySender buffers ops during copy and replays them after connect. New secondary has copy + buffered data. |
+| `test_operator_build_buffer_replay` | Write 500 entries, then add a 4th replica while writing 200 more concurrently. Verifies ReplicationQueue replay delivers all ops to the new secondary. 700 total entries verified. |
 | `test_operator_epoch_fencing_after_failover` | Failover: new primary works, pre-failover data survives on new primary. |
 | `test_operator_delete_partition` | delete_partition closes all replicas. Primary rejects writes after deletion. |
 | `test_operator_secondary_state_after_failover` | After failover, secondaries retain all committed data (epoch truncation preserves committed ops). |

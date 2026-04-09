@@ -343,7 +343,30 @@ impl PodRuntime {
                     );
                 }
                 RuntimeCommand::BuildReplica { replica, reply } => {
-                    let _ = reply.send(self.handle_build_replica(replica).await);
+                    // Start buffering synchronously — send_to_all is now
+                    // non-blocking (try_send) so the actor processes this
+                    // immediately without blocking on slow secondaries.
+                    let _ = self
+                        .send_replicator_control(|r| ReplicatorControlEvent::BuildReplica {
+                            replica: replica.clone(),
+                            reply: r,
+                        })
+                        .await;
+
+                    // Spawn the copy protocol to background
+                    let state_provider_tx = self.state_provider_tx.clone();
+                    let state = self.state.clone();
+                    let reply_timeout = self.reply_timeout;
+                    tokio::spawn(async move {
+                        let result = run_build_replica_copy(
+                            replica,
+                            state_provider_tx,
+                            state,
+                            reply_timeout,
+                        )
+                        .await;
+                        let _ = reply.send(result);
+                    });
                 }
                 RuntimeCommand::RemoveReplica { replica_id, reply } => {
                     let _ = reply.send(
@@ -504,99 +527,6 @@ impl PodRuntime {
         }
     }
 
-    /// BuildReplica: primary orchestrates the copy protocol by calling the
-    /// secondary's data-plane gRPC service directly.
-    ///
-    /// Flow:
-    /// 1. Connect to secondary's data plane (replicator_address from replica_info)
-    /// 2. GetCopyContext from secondary → get context data
-    /// 3. GetCopyState from own StateProvider → get full state
-    /// 4. CopyStream to secondary → stream state data
-    async fn handle_build_replica(&mut self, replica: ReplicaInfo) -> Result<()> {
-        use crate::proto::replicator_data_client::ReplicatorDataClient;
-
-        let secondary_addr = &replica.replicator_address;
-        info!(
-            secondary_id = replica.id,
-            %secondary_addr,
-            "BuildReplica: connecting to secondary data plane"
-        );
-
-        // 1. Connect to secondary's data-plane gRPC
-        let channel = tonic::transport::Channel::from_shared(secondary_addr.clone())
-            .map_err(|e| KubelicateError::Internal(Box::new(e)))?
-            .connect()
-            .await
-            .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
-        let mut data_client = ReplicatorDataClient::new(channel);
-
-        // 2. GetCopyContext from secondary
-        let ctx_resp = data_client
-            .get_copy_context(crate::proto::GetCopyContextRequest {})
-            .await
-            .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
-        let copy_context_ops = ctx_resp.into_inner().operations;
-        info!(
-            context_items = copy_context_ops.len(),
-            "BuildReplica: got copy context from secondary"
-        );
-
-        // Wrap context into an OperationStream for the local state provider
-        let copy_context = vec_to_stream(
-            copy_context_ops
-                .into_iter()
-                .map(|op| (op.lsn, bytes::Bytes::from(op.data)))
-                .collect(),
-        );
-
-        // 3. GetCopyState from own StateProvider
-        let up_to_lsn = self.state.committed_lsn();
-        let state_stream: crate::types::OperationStream = self
-            .send_state_provider(|reply| StateProviderEvent::GetCopyState {
-                up_to_lsn,
-                copy_context,
-                reply,
-            })
-            .await?;
-
-        // Collect state into items for streaming to secondary
-        let state_ops = collect_stream(state_stream).await;
-        info!(
-            items = state_ops.len(),
-            up_to_lsn, "BuildReplica: got copy state from local StateProvider"
-        );
-
-        // 4. CopyStream to secondary — stream all state items
-        let items: Vec<crate::proto::CopyItem> = state_ops
-            .into_iter()
-            .map(|(lsn, data)| crate::proto::CopyItem {
-                lsn,
-                data: data.to_vec(),
-            })
-            .collect();
-
-        let item_stream = tokio_stream::iter(items);
-        let resp = data_client
-            .copy_stream(item_stream)
-            .await
-            .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
-
-        info!(
-            items_received = resp.into_inner().items_received,
-            "BuildReplica: copy complete"
-        );
-
-        // Also notify the replicator actor (for bookkeeping)
-        let _ = self
-            .send_replicator_control(|reply| ReplicatorControlEvent::BuildReplica {
-                replica,
-                reply,
-            })
-            .await;
-
-        Ok(())
-    }
-
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
@@ -664,6 +594,102 @@ impl PodRuntime {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone build_replica task (runs outside PodRuntime's command loop)
+// ---------------------------------------------------------------------------
+
+/// Copy phase of BuildReplica — runs as a spawned async task.
+async fn run_build_replica_copy(
+    replica: ReplicaInfo,
+    state_provider_tx: mpsc::Sender<StateProviderEvent>,
+    state: Arc<PartitionState>,
+    reply_timeout: Duration,
+) -> Result<()> {
+    use crate::proto::replicator_data_client::ReplicatorDataClient;
+
+    let secondary_addr = &replica.replicator_address;
+    info!(
+        secondary_id = replica.id,
+        %secondary_addr,
+        "BuildReplica: connecting to secondary data plane"
+    );
+
+    // 1. Connect to secondary's data-plane gRPC
+    let channel = tonic::transport::Channel::from_shared(secondary_addr.clone())
+        .map_err(|e| KubelicateError::Internal(Box::new(e)))?
+        .connect()
+        .await
+        .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
+    let mut data_client = ReplicatorDataClient::new(channel);
+
+    // 2. GetCopyContext from secondary
+    let ctx_resp = data_client
+        .get_copy_context(crate::proto::GetCopyContextRequest {})
+        .await
+        .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
+    let copy_context_ops = ctx_resp.into_inner().operations;
+    info!(
+        context_items = copy_context_ops.len(),
+        "BuildReplica: got copy context from secondary"
+    );
+
+    // Wrap context into an OperationStream for the local state provider
+    let copy_context = vec_to_stream(
+        copy_context_ops
+            .into_iter()
+            .map(|op| (op.lsn, bytes::Bytes::from(op.data)))
+            .collect(),
+    );
+
+    // 3. GetCopyState from own StateProvider
+    let up_to_lsn = state.committed_lsn();
+    let state_stream: crate::types::OperationStream = {
+        let (tx, rx) = oneshot::channel();
+        state_provider_tx
+            .send(StateProviderEvent::GetCopyState {
+                up_to_lsn,
+                copy_context,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| KubelicateError::Closed)?;
+        match tokio::time::timeout(reply_timeout, rx).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(_)) => return Err(KubelicateError::Closed),
+            Err(_) => return Err(KubelicateError::Internal("state_provider timeout".into())),
+        }
+    };
+
+    // Collect state into items for streaming to secondary
+    let state_ops = collect_stream(state_stream).await;
+    info!(
+        items = state_ops.len(),
+        up_to_lsn, "BuildReplica: got copy state from local StateProvider"
+    );
+
+    // 4. CopyStream to secondary — stream all state items
+    let items: Vec<crate::proto::CopyItem> = state_ops
+        .into_iter()
+        .map(|(lsn, data)| crate::proto::CopyItem {
+            lsn,
+            data: data.to_vec(),
+        })
+        .collect();
+
+    let item_stream = tokio_stream::iter(items);
+    let resp = data_client
+        .copy_stream(item_stream)
+        .await
+        .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
+
+    info!(
+        items_received = resp.into_inner().items_received,
+        "BuildReplica: copy complete"
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

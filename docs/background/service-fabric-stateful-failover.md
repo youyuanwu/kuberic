@@ -303,6 +303,98 @@ cannot catch up incrementally and must be rebuilt from scratch.
 - During reconfiguration with both current and previous configurations,
   writes must be acknowledged by a write quorum of **both** configurations
 
+### Async Dispatch to Secondaries (from C++ source)
+
+The primary replicator **never blocks** on any individual secondary when
+sending operations. The write path is fully asynchronous:
+
+**Source:** `ReplicaManager.cpp`, `ReplicationSession.cpp`
+
+```cpp
+// In AddReplicateOperationPrivate:
+
+// 1. Enqueue op into the replication queue (in-memory, fast)
+replicationQueueManager_.Enqueue(move(comOperationPointer), epoch_, opComPtr);
+
+// 2. Dispatch to sessions via a JOB QUEUE (async, non-blocking)
+beginReplicateJobQueueUPtr_->Enqueue(
+    ComReplicateJobPtr(move(opRawPtr), move(sessions), currentCompletedLsn));
+
+// 3. Return immediately — primary's write path is not blocked
+return ErrorCode(Common::ErrorCodeValue::Success);
+```
+
+The `beginReplicateJobQueueUPtr_` is an async job queue that processes
+sends to each session in a separate thread. Each `SendReplicateOperation`
+creates a transport message and calls `SendTransportMessage`, which is a
+**fire-and-forget datagram send** — no waiting for the message to be
+delivered.
+
+```cpp
+// In ReplicationSession::SendReplicateOperation:
+MessageUPtr message = ReplicationTransport::CreateReplicationOperationMessage(...);
+return SendTransportMessage(replicationOperationHeadersSPtr_, move(message), true);
+
+// SendTransportMessage calls transport_->SendMessage() which is non-blocking
+```
+
+**Key design points:**
+- The primary's `replicate()` call enqueues the op and returns immediately
+- Sending to each secondary happens in a background job queue
+- A slow secondary doesn't block the primary or other secondaries
+- Backpressure is handled at the quorum level: `replicate()` returns a
+  future that completes when write quorum ACKs arrive. The primary can
+  continue accepting new writes while waiting for ACKs.
+- If a secondary's send queue fills up (`REQueueFull`), the replicator
+  logs a health warning but continues operating
+
+**Contrast with our implementation:** Our `send_to_all` awaits
+`item_tx.send()` sequentially for each secondary. A slow secondary
+blocks the entire actor loop, preventing new writes from being processed.
+The fix is to use unbounded (or very large) per-secondary channels so
+`send_to_all` never blocks, matching SF's fire-and-forget dispatch model.
+
+### Retry and Flow Control (ReliableOperationSender)
+
+Each secondary connection is wrapped in a `ReliableOperationSender`
+that handles retries and flow control independently.
+
+**Source:** `ReliableOperationSender.h/cpp`
+
+**Mechanism:**
+- Each sender maintains a **send window** (`sendWindowSize_`, starts at
+  a configurable value, max bounded by `maxSendWindowSize_`).
+- Ops are sent up to the window size. Unsent ops queue in `pendingOperations_`.
+- A **retry timer** (`retrySendTimer_`) fires every `RetryInterval`
+  (configurable). On each tick:
+  1. If no ACK received since last tick, **halve the send window**
+     (backoff for overwhelmed secondaries)
+  2. Collect up to `sendWindowSize_` pending ops
+  3. Send them via `opCallback_` (which calls `SendReplicateOperation`)
+  4. If `SendReplicateOperation` returns false (`TransportSendQueueFull`),
+     stop sending more ops in this tick
+
+**Error handling in `SendTransportMessage`:**
+
+| Error | Action |
+|-------|--------|
+| Success | Continue normally |
+| `TransportSendQueueFull` | Return `false` — sender stops retrying this tick, will retry on next timer |
+| `MessageTooLarge` | Report fault — fatal error, replica marked unhealthy |
+| Other errors | Ignored — transport layer handles retries |
+
+**Flow control features:**
+- **Adaptive window:** Window shrinks on no-ACK (secondary overloaded),
+  grows when ACKs resume (via `ackDurationList_` tracking average ACK
+  latency)
+- **No data loss:** Ops stay in `pendingOperations_` until ACKed. The
+  retry timer re-sends them. A slow secondary eventually catches up.
+- **No blocking:** The primary's write path (`AddReplicateOperationPrivate`)
+  enqueues to the replication queue and returns immediately. The
+  `ReliableOperationSender` drains ops from the queue asynchronously.
+- **Per-secondary isolation:** Each secondary has its own sender with its
+  own window and timer. A slow secondary doesn't affect others.
+
 ---
 
 ## Failover: Reconfiguration in Detail
@@ -630,6 +722,60 @@ or rebalancing):
 - `must_catch_up` = false
 - Replica being built does NOT count towards quorum
 - A replica cannot simultaneously be in-build and in the configuration
+
+### Adding Idle Replicas — Closing the Copy/Replication Gap
+
+**Source:** `ReplicaManager::TryAddIdleReplica` in `ReplicaManager.cpp`
+
+When the primary starts building a new idle replica, the critical challenge
+is ensuring **zero gap** between the copy stream (full state) and the
+replication stream (incremental ops). SF handles this atomically:
+
+```cpp
+// Under write lock (exclusive access to replication queue):
+ErrorCode ReplicaManager::TryAddIdleReplica(...) {
+    AcquireWriteLock lock(lock_);
+
+    // 1. Create idle replica session
+    session = CreateReplica(replica);
+    idleReplicas_.push_back(session);
+
+    // 2. Get replication start sequence = committed LSN + 1
+    //    AND get ALL pending (uncommitted) ops from the queue
+    replicationQueueManager_.GetPendingOperationsToSendDuringBuild(
+        ..., replicationStartSeq, pendingOperations);
+
+    // Release lock — new replicate() calls will include the idle replica
+}
+
+// 3. Send pending ops to idle replica IMMEDIATELY (outside lock)
+session->AddReplicateOperations(pendingOperations, currentCompletedLsn);
+```
+
+**Why this works — three ranges with zero gap:**
+
+```
+[0, committed_lsn]              → Copy stream (from state provider)
+(committed_lsn, highest_lsn]    → Pending ops (from replication queue)
+(highest_lsn, ∞)                → Live replication (new ops via send_to_all)
+```
+
+- The copy stream produces state up to `committed_lsn` (the state provider
+  only has committed data).
+- The replication queue retains all ops from `committed_lsn + 1` to
+  `highest_lsn` (uncommitted, in-flight). These are sent to the idle
+  replica immediately at build start.
+- New ops (LSN > `highest_lsn`) are sent via normal `send_to_all` because
+  the idle replica's session was registered under the lock before any new
+  `AddReplicateOperation` can run.
+
+The write lock ensures that step 2 (get pending ops) and the registration
+of the idle replica happen atomically. No new `AddReplicateOperation` can
+sneak in between — it would need the same lock.
+
+**The replication queue is the key enabler.** Without a queue that retains
+uncommitted ops, there's no way to bridge the gap between committed state
+(copy) and future ops (replication). This is why WAL persistence matters.
 
 ### Build Completion Condition (from C++ source)
 

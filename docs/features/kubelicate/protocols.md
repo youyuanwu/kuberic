@@ -300,29 +300,40 @@ Operator                    Primary                     Secondary             Us
 | add_secondary | `PrimarySender` opens ReplicationStream gRPC, replays buffer | Replicator actor |
 | Live replication | Ops flow into `repl_op_tx` → user's `replication_stream` | Primary's `send_to_all()` |
 
-### The Build Buffer (Bridging Copy and Replication)
+### The Replication Queue (Bridging Copy and Replication)
 
-During the copy window (steps 3-4), the primary continues accepting
-writes from clients. These writes must not be lost — the secondary
-needs them after the copy completes. The `PrimarySender` handles this:
+During the copy window, the primary continues accepting writes. These
+must reach the new secondary after the copy completes. The actor's
+`ReplicationQueue` handles this (matching SF's `ReplicationQueueManager`):
 
 ```
-PrimarySender::start_build(replica_id)
-  → creates empty Vec in build_buffers[replica_id]
+Data path (every replicate):
+  replication_queue.push(lsn, data)  → retains op in BTreeMap
+  sender.send_to_all(lsn, data)     → non-blocking (unbounded channels)
 
-send_to_all(lsn, data) during copy:
-  → sends to all CONNECTED secondaries (existing ones)
-  → ALSO appends to build_buffers[replica_id]
+UpdateCatchUpConfiguration (when new secondary connects, step 5):
+  sender.add_secondary(replica_id, addr)  → opens gRPC stream
+  pending = replication_queue.ops_from(1) → all retained ops
+  for (lsn, data) in pending:
+    sender.send_to_one(replica_id, lsn, data)  → replay to new secondary
+  → then live ops flow via send_to_all
 
-PrimarySender::add_secondary(replica_id, addr)  [step 5]
-  → opens gRPC ReplicationStream to secondary
-  → replays ALL buffered ops (build_buffers.remove())
-  → then live ops flow through item_tx
+UpdateCurrentConfiguration (config finalized, step 7):
+  replication_queue.gc(committed_lsn)  → remove committed ops
 ```
 
-This ensures **zero-gap** between copy and replication: the copy covers
-`[0, up_to_lsn]`, the buffer covers `(up_to_lsn, connect_time]`, and
-live replication covers `(connect_time, ∞)`.
+**Coverage with zero gap:**
+- Copy delivers app state at snapshot time
+- Queue replay delivers all ops retained since primary started
+  (some overlap with copy — idempotent, same key = overwrite)
+- Live replication delivers new ops after connection
+- **No ops lost** — the queue retains everything until GC'd after
+  the config is finalized.
+
+**Non-blocking send_to_all:** Each secondary has a two-stage channel:
+unbounded sender (never blocks actor) → background drain task →
+bounded gRPC stream (may block, only blocks that secondary's task).
+This matches SF's async job queue dispatch model.
 
 ### No Reconnection (Intentional)
 

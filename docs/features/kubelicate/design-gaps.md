@@ -435,34 +435,33 @@ replica again or modify driver state while the first is mid-operation.
 
 Smaller issues that affect correctness in edge cases.
 
-### C0. Build Buffer Replay Test Flaky Under Parallel Execution
+### C0. In-Flight Ops Lost During Build Replica — Fixed
 
-**Severity:** 🟢 Low (test infrastructure issue, not a design flaw)
-**Affects:** `test_operator_build_buffer_replay`
-**File:** `examples/kv-stateful/src/tests.rs`
+**Severity:** ✅ Fixed
+**Affects:** `WalReplicatorActor`, `PrimarySender`, `run_build_replica_copy`
 
-**Problem:** The build buffer replay test writes concurrently during
-`add_replica`. Under parallel test execution (17 tests, each with
-multiple pods and gRPC servers), CPU contention causes the tokio runtime
-to not schedule tasks fast enough. The `reply_timeout` (5s) expires on
-state provider callbacks, not because of channel contention, but because
-the runtime is saturated.
+**Root cause:** Ops in-flight (sent but not committed) at build time were
+in neither the copy snapshot nor the build buffer. See SF background doc
+§"Adding Idle Replicas" for the reference design.
 
-**Analysis:** The user's event loop (in `service.rs`) is free — replication
-streams are drained in spawned tasks, not in the select loop. The
-`state_provider_tx` channel (capacity 16) is only written to by PodRuntime
-on the primary side. The actual bottleneck is CPU scheduling under heavy
-parallel test load.
+**Fix:** Replaced build buffers with an in-memory `ReplicationQueue`
+(`BTreeMap<Lsn, Bytes>`) in the actor. At `add_secondary` time, all
+ops in the queue are replayed to the new replica. Combined with
+non-blocking `send_to_all` (unbounded per-secondary channels) and
+spawned `GetCopyState` (no state lock deadlock), the copy-replication
+gap is closed.
 
-**Not a design flaw:** In SF, `IStateProvider` methods are direct calls
-on the user's object — but our channel-based approach is equivalent when
-the runtime has sufficient CPU. The channel capacity (16) is adequate
-since events are processed quickly by the user's select loop.
+**Changes made:**
+1. `ReplicationQueue` (`replicator/queue.rs`): push/ops_from/gc on BTreeMap
+2. Actor: queue.push on every replicate, replay at add_secondary,
+   GC at UpdateCurrentConfiguration, updates PartitionState.committed_lsn
+3. `PrimarySender`: removed build_buffers/start_build/cancel_build,
+   added send_to_one, send_to_all uses unbounded channels
+4. `run_build_replica_copy`: spawned from PodRuntime (doesn't block cmd loop)
+5. KV service: GetCopyState spawned, snapshot under read lock then dropped
+6. Removed dead ControlServer v1, renamed V2 to ControlServer
 
-**Status:** Test marked `#[ignore]` — passes reliably when run alone.
-Can be un-ignored once tests are configured with limited parallelism
-(e.g., `cargo test -j 1`) or when the test uses a dedicated
-multi-threaded runtime.
+**Verified:** 15/15 passes at 500 initial + 200 concurrent writes.
 
 ### C1. QuorumTracker Stale ACK Entries
 
@@ -560,7 +559,7 @@ design work needed — just implementation.
 |----------|-------|-------------|
 | A: Protocol Safety (needs design) | 5 | A1 partial failure, **A5 async build_replica** |
 | B: Operational Resilience (needs design) | 5 | **B0 replication stream death**, B2 timeouts |
-| C: Correctness Refinements (needs design) | 4 | C1 stale ACKs (quick fix) |
+| C: Correctness Refinements (needs design) | 4 | **C0 fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
 | **Total** | **28** | |
 

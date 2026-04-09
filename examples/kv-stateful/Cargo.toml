@@ -32,6 +32,7 @@ kubelicate-operator = { path = "../../kubelicate-operator" }
 k8s-openapi.workspace = true
 kube.workspace = true
 async-trait.workspace = true
+serial_test = "3.4.0"
 
 [build-dependencies]
 tonic-prost-build.workspace = true
