@@ -48,37 +48,49 @@ Both could accept writes from different primaries
 
 ---
 
-### A2. Switchover Write Revocation Missing
+### A2. Switchover Write Revocation — ✅ Fixed
 
-**Severity:** 🔴 Critical
+**Severity:** ✅ Resolved
 **Affects:** `switchover()`
 **File:** `kubelicate-core/src/driver.rs`
 
-**Problem:** Design specifies staged revocation: "write revoked first
-(step 2), reads later (step 4)". Implementation jumps directly to
-`change_role(ActiveSecondary)`. During the gap between epoch fencing
-and demotion, the old primary can still accept and commit writes that
-the new primary won't have.
+**Problem (was):** The switchover jumped directly to `change_role(ActiveSecondary)`
+without revoking writes first. During the gap between epoch fencing and
+demotion, the old primary could still accept and commit writes.
 
-**SF reference:** SF's SwapPrimary has an explicit Phase 0 (Demote) with
-double-catchup — first catchup WITH writes still flowing, then write
-revocation, then second catchup WITHOUT writes, then activate.
+**Fix:** Added `RevokeWriteStatus` RPC to the control plane. The switchover
+now calls `revoke_write_status()` on the old primary as its **first step**,
+before epoch fencing and demotion. This sets `write_status = ReconfigurationPending`,
+immediately rejecting new writes via the existing fast-path check in
+`replicate()`. In-flight writes continue to completion and are failed by
+demotion's `fail_all()`.
 
-**Design needed:**
-- Two-phase revocation protocol:
-  1. `set_write_status(ReconfigurationPending)` on old primary
-  2. Wait for in-flight `replicate()` calls to drain (with timeout)
-  3. Verify: old primary's committed LSN matches what secondaries have
-  4. Then demote via `change_role(ActiveSecondary)`
-- How to implement "wait for drain": the old primary's
-  `StateReplicatorHandle` should reject new `replicate()` calls, and
-  existing pending operations should complete (or timeout).
-- Currently `PartitionState` has `write_status` as an atomic — we can
-  set it to `ReconfigurationPending` from the driver. But there's no
-  RPC for this (the `ReplicaHandle` trait has no `revoke_write` method).
+**Switchover sequence (now):**
+1. `revoke_write_status()` on old primary → new writes rejected immediately
+2. Fence secondaries with new epoch
+3. Demote old primary → `change_role(ActiveSecondary)` → in-flight writes failed
+4. Promote target → `change_role(Primary)`
+5. Rebuild configuration + catch-up
 
-**New RPC needed:** `RevokeWriteStatus` — tells the pod to set
-`write_status = ReconfigurationPending` and drain pending writes.
+**Changes made:**
+1. Proto: `RevokeWriteStatus` RPC + request/response messages
+2. `ReplicaHandle` trait: `revoke_write_status()` method
+3. `GrpcReplicaHandle`: calls RPC
+4. `InProcessReplicaHandle`: sets `PartitionState` directly
+5. `PodRuntime`: `RuntimeCommand::RevokeWriteStatus` + handler
+6. `ControlServer`: gRPC handler
+7. `switchover()`: calls `revoke_write_status()` as step 1
+
+**Remaining consideration:** SF's SwapPrimary has a double-catchup pattern
+(catchup WITH writes → revoke → catchup WITHOUT writes → promote). Our
+implementation skips the first catchup-with-writes phase. For most workloads
+this is fine — the write revocation + catch-up at step 5 is sufficient.
+Double-catchup would reduce the catch-up window after revocation for
+high-throughput workloads.
+
+**Test:** Concurrent writer during `driver.switchover()` checks for
+`ReconfigurationPending` error messages. Verified: test fails without fix
+(`reconfig=0`), passes with fix (`reconfig>0`).
 
 ---
 
@@ -588,7 +600,7 @@ design work needed — just implementation.
 
 | Category | Count | Top Priority |
 |----------|-------|-------------|
-| A: Protocol Safety (needs design) | 5 | A1 partial failure, **A5 async build_replica** |
+| A: Protocol Safety (needs design) | 5 | A1 partial failure, **A2 ✅ fixed**, **A5 async build_replica** |
 | B: Operational Resilience (needs design) | 5 | **B0 replication stream death**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
@@ -599,9 +611,8 @@ design work needed — just implementation.
 2. **A5 (async build + catch-up with stall detection)** — blocks reconciler, breaks on large datasets
 3. A1 + A4 (partial failure + ordering) — foundational safety
 4. B2 (short RPC timeouts) — prevents hangs on control-plane calls
-5. A2 (write revocation) — switchover correctness
-6. A3 (promotion failure) — failover resilience
-7. D items P0 (data loss, operator restart, secondary health)
-8. B3 + B4 (reconnection, operation locking) — operational maturity
-9. B1 streaming improvement — large dataset support
-10. C1-C3 (refinements) — can be done alongside other work
+5. A3 (promotion failure) — failover resilience
+6. D items P0 (data loss, operator restart, secondary health)
+7. B3 + B4 (reconnection, operation locking) — operational maturity
+8. B1 streaming improvement — large dataset support
+9. C1-C3 (refinements) — can be done alongside other work

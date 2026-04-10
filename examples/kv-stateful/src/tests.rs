@@ -877,3 +877,91 @@ async fn test_operator_build_buffer_replay() {
 
     driver.delete_partition().await.unwrap();
 }
+
+/// **A2 test:** Writes are rejected during switchover via the driver's
+/// production code path. A concurrent writer detects the
+/// `ReconfigurationPending` error that only occurs when
+/// `revoke_write_status()` is called — proving the A2 fix is active.
+///
+/// Without the A2 fix, all failures would be "not primary" (after
+/// demotion). With the fix, early failures show "reconfiguration pending"
+/// (before demotion, during the revoke window).
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_a2_write_revocation_during_switchover() {
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+
+    // Write baseline
+    let mut kv1 = connect_kv_client(&pod1.client_address).await;
+    for i in 0..10 {
+        kv1.put(proto::PutRequest {
+            key: format!("pre-{i}"),
+            value: "v".into(),
+        })
+        .await
+        .unwrap();
+    }
+
+    // Spawn concurrent writer to old primary (pod1).
+    // Tracks error messages to distinguish ReconfigurationPending from NotPrimary.
+    let addr = pod1.client_address.clone();
+    let writer = tokio::spawn(async move {
+        let mut client = connect_kv_client(&addr).await;
+        let mut successes = 0u32;
+        let mut reconfig_errors = 0u32;
+        let mut other_errors = 0u32;
+        for i in 0..200 {
+            match client
+                .put(proto::PutRequest {
+                    key: format!("concurrent-{i}"),
+                    value: "v".into(),
+                })
+                .await
+            {
+                Ok(_) => successes += 1,
+                Err(e) => {
+                    let msg = e.message().to_string();
+                    if msg.contains("reconfiguration") {
+                        reconfig_errors += 1;
+                    } else {
+                        other_errors += 1;
+                    }
+                }
+            }
+        }
+        (successes, reconfig_errors, other_errors)
+    });
+
+    // Small delay to let the writer start sending
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Run the full driver switchover — this calls revoke_write_status
+    // internally before fencing and demotion.
+    driver.switchover(2).await.unwrap();
+    assert_eq!(driver.primary_id(), Some(2));
+
+    let (successes, reconfig_errors, other_errors) = writer.await.unwrap();
+
+    // A2 proof: at least one error is ReconfigurationPending, which only
+    // happens because revoke_write_status is called BEFORE demotion.
+    // Without the A2 fix, ALL errors would be "not primary" (other_errors).
+    assert!(
+        reconfig_errors > 0,
+        "A2: expected ReconfigurationPending errors during switchover, \
+         got successes={successes} reconfig={reconfig_errors} other={other_errors}"
+    );
+
+    driver.delete_partition().await.unwrap();
+}

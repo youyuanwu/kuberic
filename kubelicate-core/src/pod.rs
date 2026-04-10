@@ -96,6 +96,9 @@ pub enum RuntimeCommand {
     OnDataLoss {
         reply: oneshot::Sender<Result<DataLossAction>>,
     },
+    RevokeWriteStatus {
+        reply: oneshot::Sender<Result<()>>,
+    },
     GetStatus {
         reply: oneshot::Sender<StatusInfo>,
     },
@@ -379,6 +382,12 @@ impl PodRuntime {
                 }
                 RuntimeCommand::OnDataLoss { reply } => {
                     let _ = reply.send(self.handle_on_data_loss().await);
+                }
+                RuntimeCommand::RevokeWriteStatus { reply } => {
+                    info!("revoking write status for switchover");
+                    self.state
+                        .set_write_status(AccessStatus::ReconfigurationPending);
+                    let _ = reply.send(Ok(()));
                 }
                 RuntimeCommand::GetStatus { reply } => {
                     let _ = reply.send(StatusInfo {

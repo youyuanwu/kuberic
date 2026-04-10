@@ -179,4 +179,13 @@ impl ReplicatorControl for ControlServer {
             state_changed: action == crate::types::DataLossAction::StateChanged,
         }))
     }
+
+    async fn revoke_write_status(
+        &self,
+        _req: Request<RevokeWriteStatusRequest>,
+    ) -> Result<Response<RevokeWriteStatusResponse>, Status> {
+        self.send_cmd(|reply| RuntimeCommand::RevokeWriteStatus { reply })
+            .await?;
+        Ok(Response::new(RevokeWriteStatusResponse {}))
+    }
 }

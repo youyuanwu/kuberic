@@ -194,6 +194,15 @@ impl ReplicaHandle for GrpcReplicaHandle {
         Ok(())
     }
 
+    async fn revoke_write_status(&self) -> Result<()> {
+        let mut client = self.client.clone();
+        client
+            .revoke_write_status(RevokeWriteStatusRequest {})
+            .await
+            .map_err(Self::map_err)?;
+        Ok(())
+    }
+
     fn replicator_address(&self) -> String {
         self.data_address.clone()
     }

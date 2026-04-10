@@ -45,6 +45,11 @@ pub trait ReplicaHandle: Send + Sync {
     async fn build_replica(&self, replica: ReplicaInfo) -> Result<()>;
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()>;
 
+    /// Revoke write status before switchover demotion.
+    /// Sets write_status = ReconfigurationPending so new writes are
+    /// immediately rejected. In-flight writes continue to completion.
+    async fn revoke_write_status(&self) -> Result<()>;
+
     /// The gRPC address where this replica's replication server listens.
     fn replicator_address(&self) -> String;
 }
@@ -441,14 +446,21 @@ impl PartitionDriver {
             "starting switchover"
         );
 
-        // 1. Fence all secondaries with new epoch
+        // 1. Revoke write status on old primary (SF Phase 0: Demote)
+        // New writes are immediately rejected; in-flight writes continue.
+        self.replicas[&old_primary_id]
+            .handle
+            .revoke_write_status()
+            .await?;
+
+        // 2. Fence all secondaries with new epoch
         for (&id, entry) in &self.replicas {
             if id != old_primary_id {
                 entry.handle.update_epoch(new_epoch).await?;
             }
         }
 
-        // 2. Demote old primary → ActiveSecondary
+        // 3. Demote old primary → ActiveSecondary
         self.replicas[&old_primary_id]
             .handle
             .change_role(new_epoch, Role::ActiveSecondary)
@@ -1005,6 +1017,12 @@ pub mod testing {
         async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
             self.send_control(|reply| ReplicatorControlEvent::RemoveReplica { replica_id, reply })
                 .await
+        }
+
+        async fn revoke_write_status(&self) -> Result<()> {
+            self.state
+                .set_write_status(AccessStatus::ReconfigurationPending);
+            Ok(())
         }
 
         fn replicator_address(&self) -> String {
