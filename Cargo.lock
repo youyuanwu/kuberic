@@ -1229,6 +1229,7 @@ dependencies = [
  "kube",
  "kubelicate-core",
  "kubelicate-operator",
+ "kv-stateful",
  "prost",
  "serde",
  "serde_json",

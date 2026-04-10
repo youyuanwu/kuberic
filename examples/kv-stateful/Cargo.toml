@@ -3,6 +3,9 @@ name = "kv-stateful"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+testing = []
+
 [lib]
 name = "kv_stateful"
 path = "src/lib.rs"
@@ -28,6 +31,7 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 test-log.workspace = true
+kv-stateful = { path = ".", features = ["testing"] }
 kubelicate-operator = { path = "../../kubelicate-operator" }
 k8s-openapi.workspace = true
 kube.workspace = true

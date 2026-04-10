@@ -12,11 +12,8 @@ pub mod server;
 pub mod service;
 pub mod state;
 
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod reconciler_tests;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 pub mod proto {
     tonic::include_proto!("kvstore.v1");
