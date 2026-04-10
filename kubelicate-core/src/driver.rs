@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::error::{KubelicateError, Result};
 use crate::types::{
@@ -113,6 +113,13 @@ impl PartitionDriver {
 
     pub fn handle(&self, id: ReplicaId) -> Option<&dyn ReplicaHandle> {
         self.replicas.get(&id).map(|s| s.handle.as_ref())
+    }
+
+    /// Remove a replica from the driver's tracking without notifying
+    /// the primary's replicator. Used when the reconciler detects a pod
+    /// is permanently dead before failover. Returns the handle for cleanup.
+    pub fn remove_replica_from_driver(&mut self, id: ReplicaId) -> Option<Box<dyn ReplicaHandle>> {
+        self.replicas.remove(&id).map(|s| s.handle)
     }
 
     // -----------------------------------------------------------------------
@@ -299,13 +306,12 @@ impl PartitionDriver {
     /// Failover after the primary has failed. The failed primary's handle
     /// may be unreachable — the driver does not call it.
     ///
-    /// Follows the fence-before-promote protocol:
-    /// 1. Increment epoch
-    /// 2. Fence all surviving secondaries (update_epoch)
-    /// 3. Select new primary by highest current_progress
-    /// 4. Promote new primary (change_role)
-    /// 5. Reconfigure quorum (excluding the failed primary)
-    /// 6. Update access status
+    /// Matches SF's reconfiguration phases:
+    /// 1. Remove failed primary, increment epoch
+    /// 2. Select new primary by highest current_progress (Phase 1: GetLSN)
+    /// 3. Promote new primary with new epoch (Phase 4: Activate)
+    /// 4. Reconfigure quorum — epoch distributed to secondaries as part
+    ///    of the new configuration (best-effort, skip unreachable)
     pub async fn failover(&mut self, failed_primary_id: ReplicaId) -> Result<()> {
         assert_eq!(
             Some(failed_primary_id),
@@ -326,12 +332,7 @@ impl PartitionDriver {
             ));
         }
 
-        // 1. Fence ALL surviving secondaries with new epoch
-        for entry in self.replicas.values_mut() {
-            entry.handle.update_epoch(new_epoch).await?;
-        }
-
-        // 2. Select new primary by highest current_progress (LSN)
+        // 1. Select new primary by highest current_progress (LSN)
         let new_primary_id = self
             .replicas
             .values()
@@ -345,13 +346,28 @@ impl PartitionDriver {
             "selected new primary"
         );
 
-        // 3. Promote new primary (fence-before-promote: epoch already sent)
+        // 2. Promote new primary (SF Phase 4: Activate)
+        // The new epoch is delivered with the promotion — no separate
+        // fencing step needed. The old primary is dead and can't send ops.
         self.replicas[&new_primary_id]
             .handle
             .change_role(new_epoch, Role::Primary)
             .await?;
         self.replicas.get_mut(&new_primary_id).unwrap().role = Role::Primary;
         self.primary_id = Some(new_primary_id);
+
+        // 3. Distribute epoch to surviving secondaries (best-effort).
+        // Unreachable secondaries are skipped — they'll be rebuilt later.
+        // This prevents a zombie primary (if it recovers) from sending
+        // ops to secondaries that still accept the old epoch.
+        for (&id, entry) in &self.replicas {
+            if id != new_primary_id && entry.handle.update_epoch(new_epoch).await.is_err() {
+                warn!(
+                    replica_id = id,
+                    "failed to update epoch on secondary (will be rebuilt)"
+                );
+            }
+        }
 
         // 4. Rebuild configuration (all surviving non-primary replicas)
         let secondary_ids: Vec<ReplicaId> = self
@@ -420,12 +436,12 @@ impl PartitionDriver {
 
     /// Graceful primary change to a specific target secondary.
     ///
-    /// 1. Revoke write status on old primary (staged: write first, then read)
-    /// 2. Wait for catchup on target
-    /// 3. Demote old primary to secondary
-    /// 4. Promote target to primary
-    /// 5. Reconfigure
-    /// 6. Update access status
+    /// Matches SF's SwapPrimary reconfiguration:
+    /// 1. Revoke write status on old primary (SF Phase 0: Demote)
+    /// 2. Demote old primary → ActiveSecondary
+    /// 3. Promote target → Primary (SF Phase 4: Activate)
+    /// 4. Distribute epoch to other secondaries (best-effort)
+    /// 5. Reconfigure quorum + catchup
     pub async fn switchover(&mut self, target_id: ReplicaId) -> Result<()> {
         let old_primary_id = self.primary_id.ok_or(KubelicateError::NotPrimary)?;
 
@@ -453,21 +469,15 @@ impl PartitionDriver {
             .revoke_write_status()
             .await?;
 
-        // 2. Fence all secondaries with new epoch
-        for (&id, entry) in &self.replicas {
-            if id != old_primary_id {
-                entry.handle.update_epoch(new_epoch).await?;
-            }
-        }
-
-        // 3. Demote old primary → ActiveSecondary
+        // 2. Demote old primary → ActiveSecondary
         self.replicas[&old_primary_id]
             .handle
             .change_role(new_epoch, Role::ActiveSecondary)
             .await?;
         self.replicas.get_mut(&old_primary_id).unwrap().role = Role::ActiveSecondary;
 
-        // 5. Promote target → Primary
+        // 3. Promote target → Primary (SF Phase 4: Activate)
+        // The new epoch is delivered with the role change.
         self.replicas[&target_id]
             .handle
             .change_role(new_epoch, Role::Primary)
@@ -475,7 +485,23 @@ impl PartitionDriver {
         self.replicas.get_mut(&target_id).unwrap().role = Role::Primary;
         self.primary_id = Some(target_id);
 
-        // 6. Rebuild configuration
+        // 4. Distribute epoch to other secondaries (best-effort).
+        // Unreachable secondaries are skipped — they'll be rebuilt later.
+        // The old primary already has the epoch from step 2 (change_role).
+        // The target already has it from step 3.
+        for (&id, entry) in &self.replicas {
+            if id != old_primary_id
+                && id != target_id
+                && entry.handle.update_epoch(new_epoch).await.is_err()
+            {
+                warn!(
+                    replica_id = id,
+                    "failed to update epoch on secondary (will be rebuilt)"
+                );
+            }
+        }
+
+        // 5. Rebuild configuration
         let secondary_ids: Vec<ReplicaId> = self
             .replicas
             .keys()

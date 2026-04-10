@@ -15,36 +15,45 @@ These gaps affect data safety and correctness. The design docs don't
 cover the error paths adequately. Additional design is required before
 implementation.
 
-### A1. Partial Failure in Multi-Replica Operations
+### A1. Partial Failure in Multi-Replica Operations — ✅ Fixed
 
-**Severity:** 🔴 Critical
-**Affects:** `failover()`, `switchover()`, `create_partition()`, `add_replica()`
+**Severity:** ✅ Resolved
+**Affects:** `failover()`, `switchover()`
 **File:** `kubelicate-core/src/driver.rs`
 
-**Problem:** All multi-replica operations loop with `?` (fail-on-first-error).
-If `update_epoch` succeeds on replica 2 but fails on replica 3, the system
-is in an inconsistent state — some secondaries fenced with the new epoch,
-others still in the old epoch. No rollback, no retry-remaining.
+**Problem (was):** The switchover/failover had a "fence-before-promote"
+pattern — `update_epoch` was called on ALL secondaries with `?`
+(fail-on-first-error) BEFORE promotion. An unreachable secondary blocked
+the entire operation and left the partition in an inconsistent state
+(write status revoked but never rolled back).
 
-**Example:**
-```
-Failover starts, new_epoch = (0, 2)
-Replica 2: update_epoch → SUCCESS (now in epoch 2)
-Replica 3: update_epoch → TIMEOUT (still in epoch 1)
-Function returns Err → driver state unchanged
-Result: Replica 2 in epoch (0,2), Replica 3 in epoch (0,1)
-Both could accept writes from different primaries
-```
+**Root cause:** The fence-before-promote pattern was incorrect — SF doesn't
+do it. In SF, epoch distribution happens in Phase 4 (ACTIVATE), AFTER
+the new primary is active. Pre-promotion fencing is unnecessary because:
+- **Failover:** old primary is dead → can't send ops
+- **Switchover:** old primary's writes are revoked → can't send new ops
 
-**Design needed:**
-- Retry-all semantics: on partial failure, retry failed replicas (not
-  start over). `update_epoch` is idempotent — safe to retry.
-- Track per-replica epoch state in the driver (which replicas were
-  successfully fenced).
-- Define "minimum fencing quorum": how many secondaries must be fenced
-  before promotion is safe? (Answer: write quorum - 1, since primary
-  counts toward quorum.)
-- If minimum fencing quorum not achievable, abort failover and report error.
+**Fix:** Restructured both `failover()` and `switchover()` to match SF's
+Phase 4 pattern:
+1. Promotion happens first (with new epoch delivered to promoted replicas)
+2. Epoch distributed to other secondaries **after** promotion, best-effort
+3. Unreachable secondaries are skipped with a warning (rebuilt later)
+
+**Switchover flow (now):**
+1. `revoke_write_status()` on old primary (A2 fix)
+2. `change_role(ActiveSecondary)` on old primary
+3. `change_role(Primary)` on target (Phase 4)
+4. Best-effort `update_epoch` on other secondaries
+5. Reconfigure quorum + catchup
+
+**Failover flow (now):**
+1. Select best candidate by LSN
+2. `change_role(Primary)` on winner (Phase 4)
+3. Best-effort `update_epoch` on other secondaries
+4. Reconfigure quorum + catchup
+
+**Test:** Switchover with one secondary closed succeeds — unreachable pod
+is skipped during epoch distribution, new primary is active and serving.
 
 ---
 
@@ -600,7 +609,7 @@ design work needed — just implementation.
 
 | Category | Count | Top Priority |
 |----------|-------|-------------|
-| A: Protocol Safety (needs design) | 5 | A1 partial failure, **A2 ✅ fixed**, **A5 async build_replica** |
+| A: Protocol Safety (needs design) | 5 | **A1 ✅ fixed**, **A2 ✅ fixed**, **A5 async build_replica** |
 | B: Operational Resilience (needs design) | 5 | **B0 replication stream death**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
@@ -609,7 +618,7 @@ design work needed — just implementation.
 **Recommended order:**
 1. **B0 (replication stream death)** — silent data path failure, critical
 2. **A5 (async build + catch-up with stall detection)** — blocks reconciler, breaks on large datasets
-3. A1 + A4 (partial failure + ordering) — foundational safety
+3. A4 (gRPC control plane ordering) — foundational safety
 4. B2 (short RPC timeouts) — prevents hangs on control-plane calls
 5. A3 (promotion failure) — failover resilience
 6. D items P0 (data loss, operator restart, secondary health)

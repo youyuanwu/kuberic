@@ -16,14 +16,11 @@ Unplanned primary failure. Implemented in `PartitionDriver::failover()`.
    - Record failingSinceTimestamp
    - Requeue until delay elapsed or primary recovers
    - Default: 0 (immediate, matching SF behavior)
-2. Increment epoch (configuration_number++)
-3. Fence ALL surviving secondaries: update_epoch(new_epoch)
-   → Secondaries reject ops from old epoch
-   → Set all status to ReconfigurationPending
-4. Select new primary: replica with highest current_progress (LSN)
+2. Remove failed primary, increment epoch
+3. Select new primary: replica with highest current_progress (LSN)
    - Exclude crash-looping and unreachable replicas
    - Matches SF FM's CompareForPrimary() logic
-5. Check quorum availability:
+4. Check quorum availability:
    a. If write quorum available (≥ ⌊N/2⌋+1 survivors):
       Normal failover — no data loss
    b. If write quorum NOT available:
@@ -35,19 +32,18 @@ Unplanned primary failure. Implemented in `PartitionDriver::failover()`.
         Promote best available replica
         Call on_data_loss() on new primary
         Rebuild all secondaries from new primary
-6. Promote: change_role(new_epoch, Primary) on winner
+5. Promote: change_role(new_epoch, Primary) on winner (SF Phase 4: Activate)
+6. Distribute epoch to surviving secondaries (best-effort, skip unreachable)
+   → Unreachable secondaries are rebuilt later
 7. Reconfigure quorum: update_catch_up → wait_for_catch_up → update_current
 8. Grant access: new primary → Granted, secondaries → NotPrimary
 9. Clean up old primary: close/delete pod, create replacement secondary
 ```
 
-**Key invariant:** Step 3 (fence) happens BEFORE step 6 (promote). No window
-for zombie primary to write to unfenced secondaries.
-
-**SF alignment:** Step 5b matches SF's `ReconfigurationTask` behavior:
-wait `QuorumLossWaitDuration` before declaring data loss. The user's
-`on_data_loss()` handler is the decision point. This is a middle ground —
-SF waits but eventually proceeds (unlike CNPG which blocks indefinitely).
+**SF alignment:** Epoch is distributed AFTER promotion (Phase 4: Activate),
+not before. The old primary is dead and can't send ops — no pre-promotion
+fencing needed. Unreachable secondaries are skipped (best-effort) and
+rebuilt when they come back.
 
 ---
 
@@ -56,18 +52,24 @@ SF waits but eventually proceeds (unlike CNPG which blocks indefinitely).
 Planned primary change. Implemented in `PartitionDriver::switchover()`.
 
 ```
-1. Increment epoch
-2. Revoke write status on old primary (reads still OK)
-3. Fence all secondaries: update_epoch(new_epoch)
-4. Revoke read status on old primary
-5. Demote old primary: change_role(ActiveSecondary)
-6. Promote target: change_role(Primary)
-7. Reconfigure quorum
-8. Grant access on new primary
+1. Revoke write status on old primary (SF Phase 0: Demote)
+   → New writes immediately rejected (ReconfigurationPending)
+   → In-flight writes continue to completion
+2. Demote old primary: change_role(new_epoch, ActiveSecondary)
+3. Promote target: change_role(new_epoch, Primary) (SF Phase 4: Activate)
+4. Distribute epoch to other secondaries (best-effort, skip unreachable)
+5. Reconfigure quorum: update_catch_up → wait_for_catch_up → update_current
 ```
 
-**Staged revocation:** Write revoked first (step 2), reads later (step 4).
-Minimizes client disruption.
+**SF alignment:** Matches SF's SwapPrimary: Phase 0 (write revocation) →
+Phase 4 (activate new primary + epoch distribution). Epoch distributed
+AFTER promotion, not before. Unreachable secondaries don't block the
+switchover — they're skipped and rebuilt later.
+
+**No fence-before-promote:** The old primary's writes are revoked (step 1)
+before any other action. No new ops can enter the pipeline. In-flight ops
+complete and are failed by demotion (step 2). The epoch update after
+promotion (step 4) prevents a zombie primary from interfering later.
 
 ---
 
