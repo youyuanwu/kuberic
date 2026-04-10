@@ -103,66 +103,94 @@ high-throughput workloads.
 
 ---
 
-### A3. Promotion Failure Leaves Partition Unavailable
+### A3. Promotion Failure Leaves Partition Unavailable — ✅ Fixed (switchover)
 
-**Severity:** 🔴 Critical
-**Affects:** `failover()`, `switchover()`
+**Severity:** ✅ Switchover fixed / 🟡 Failover handled by reconciler retry
+**Affects:** `switchover()`
 **File:** `kubelicate-core/src/driver.rs`
 
-**Problem:** After all secondaries are fenced with the new epoch, if
-`change_role(Primary)` on the winner fails (network error, pod crash),
-no replica can accept writes. Secondaries reject old-epoch ops, but
-no primary exists in the new epoch. Partition is permanently
-write-unavailable until operator intervention.
+**Problem:** If `change_role(Primary)` on the target fails during
+switchover, the old primary is already demoted. No replica can accept
+writes. The driver returns `Err` but doesn't rollback the demotion.
 
-**Design needed:**
-- **For failover:** Retry promotion with exponential backoff (the
-  candidate might be temporarily unreachable). If candidate is truly
-  dead, select next-best candidate and retry.
-  ```
-  candidates = sorted by LSN (descending)
-  for candidate in candidates:
-      if change_role(Primary) succeeds:
-          break
-      else:
-          mark candidate as failed, try next
-  if all candidates fail:
-      enter degraded state, requeue
-  ```
-- **For switchover:** If target promotion fails, rollback:
-  re-promote the old primary (it was only demoted, not fenced).
+For failover, this is less severe: the driver returns `Err` and the
+reconciler retries (matching SF's FM retry-via-new-reconfiguration
+pattern). The reconciler re-evaluates which replicas are alive and
+picks a different candidate.
+
+**SF reference:** SF has explicit `AbortPhase0Demote` and
+`RevertConfiguration()` in the RA. When a swap is aborted (target dies
+or higher-priority reconfig arrives), SF:
+1. Cancels the catchup (`SendCancelCatchupMessage`)
+2. Enters `AbortPhase0Demote` state
+3. Calls `RevertConfiguration()` — restores all replicas' roles to their
+   pre-swap state (CC role = PC role)
+4. Reports `ReconfigurationResult::AbortSwapPrimary`
+
+SF doesn't retry inside the reconfiguration — the FM's outer loop handles
+retry by triggering a new reconfiguration.
+
+**Fix (switchover):** Target promotion is wrapped in a 5s timeout. On
+failure or timeout, the driver re-promotes the old primary via
+`change_role(new_epoch, Primary)` — matching SF's `RevertConfiguration()`
+pattern. The old primary becomes primary in the new epoch, which is safe.
+
+**Remaining:** After rollback, the quorum configuration is stale (still
+expects secondary ACKs from the old config). The reconciler must
+reconfigure the quorum on the next reconcile cycle. The partition is
+recoverable (primary exists) but writes hang until reconfigured.
+
+**Test:** Close the switchover target before switchover → promotion fails
+→ verify old primary is re-promoted (primary_id restored).
+
+**Design:**
+- **Switchover:** If target promotion fails, rollback:
   ```
   if change_role(Primary, target) fails:
-      change_role(Primary, old_primary)  // rollback
-      update_epoch back to previous      // unfence
+      change_role(Primary, old_primary)  // re-promote
+      // old primary still has the new epoch — that's fine,
+      // it becomes primary in the new epoch
   ```
-- The driver needs a `failover_with_retry()` method that implements
-  the candidate loop, separate from the current `failover()`.
+- **Failover:** Return `Err`, let reconciler retry with a different
+  candidate. This already works with the current code + reconciler.
+
+**Operator crash recovery (related):**
+
+If the operator crashes mid-switchover, no rollback happens. The
+`PartitionDriver` is in-memory only. On restart, the reconciler must
+reconstruct state from pod `GetStatus` queries:
+- Pod with `role=Primary` + highest epoch → that's the primary
+- No pod with `role=Primary` → treat as primary failure → failover
+- Pods with stale epochs → need rebuild
+
+This "no primary → failover" pattern naturally handles mid-switchover
+crashes: the old primary was demoted, no new primary promoted, so the
+reconciler triggers failover and promotes the best available replica.
+
+The `PartitionDriver::recover()` method (D item, not yet implemented)
+would formalize this query-and-reconstruct pattern.
 
 ---
 
 ### A4. gRPC Control Plane Ordering
 
-**Severity:** 🔴 Critical
+**Severity:** 🟡 Medium (reduced — no fence-before-promote invariant to violate)
 **Affects:** All driver → replica communication
 **File:** `kubelicate-core/src/grpc/handle.rs`
 
 **Problem:** Control RPCs (`update_epoch`, `change_role`, `open`, etc.)
 share a single tonic channel. gRPC/HTTP2 multiplexing can reorder
-requests. If `change_role` arrives before `update_epoch`, the replica
-processes the role change in the old epoch — violating the
-fence-before-promote invariant.
+requests. With the A1 fix, there's no fence-before-promote invariant
+to violate, but ordering still matters for correctness (e.g.,
+`change_role` should not arrive before `open`).
 
 **Design needed:**
 - **Option 1: Per-handle mutex.** Wrap the control client in a
   `tokio::sync::Mutex`. Every control RPC acquires the lock first.
   Simple, correct, minor contention (control RPCs are rare).
-- **Option 2: Sequence numbers.** Add a monotonic sequence number to
-  every control RPC request. Server-side rejects out-of-order requests
-  with a retry hint. More complex, handles network reordering.
-- **Recommendation:** Option 1 (mutex) for now. The driver already
-  calls RPCs sequentially (not concurrently), so contention is zero.
-  The mutex is a safety net against future parallelization.
+- **Recommendation:** Option 1 (mutex). The driver already calls RPCs
+  sequentially (not concurrently), so contention is zero. The mutex is
+  a safety net against future parallelization.
 
 ---
 
@@ -589,7 +617,7 @@ design work needed — just implementation.
 | Item | Design Location | Priority |
 |------|----------------|----------|
 | Data loss protocol (`on_data_loss()` + `data_loss_number`) | operator-failure-scenarios.md §1, §7 | P0 |
-| Operator restart recovery (`PartitionDriver::recover()`) | operator-failure-scenarios.md §8 | P0 |
+| Operator restart recovery (`PartitionDriver::recover()`) | operator-failure-scenarios.md §8, A3 notes above | P0 |
 | Secondary health detection + replacement | operator-failure-scenarios.md §2 | P0 |
 | Missing pod detection | operator-failure-scenarios.md §3 | P0 |
 | gRPC failure tracking (per-replica counter) | operator-failure-scenarios.md §5 | P1 |
@@ -609,7 +637,7 @@ design work needed — just implementation.
 
 | Category | Count | Top Priority |
 |----------|-------|-------------|
-| A: Protocol Safety (needs design) | 5 | **A1 ✅ fixed**, **A2 ✅ fixed**, **A5 async build_replica** |
+| A: Protocol Safety (needs design) | 5 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A5 async build_replica** |
 | B: Operational Resilience (needs design) | 5 | **B0 replication stream death**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |

@@ -477,11 +477,36 @@ impl PartitionDriver {
         self.replicas.get_mut(&old_primary_id).unwrap().role = Role::ActiveSecondary;
 
         // 3. Promote target → Primary (SF Phase 4: Activate)
-        // The new epoch is delivered with the role change.
-        self.replicas[&target_id]
-            .handle
-            .change_role(new_epoch, Role::Primary)
-            .await?;
+        // If this fails or times out, rollback: re-promote old primary
+        // (SF AbortPhase0Demote + RevertConfiguration pattern).
+        let promote_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.replicas[&target_id]
+                .handle
+                .change_role(new_epoch, Role::Primary),
+        )
+        .await;
+
+        let promote_err = match promote_result {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some(KubelicateError::Internal("promotion timed out".into())),
+        };
+
+        if let Some(e) = promote_err {
+            warn!(
+                target_id,
+                error = %e,
+                "target promotion failed, rolling back — re-promoting old primary"
+            );
+            self.replicas[&old_primary_id]
+                .handle
+                .change_role(new_epoch, Role::Primary)
+                .await?;
+            self.replicas.get_mut(&old_primary_id).unwrap().role = Role::Primary;
+            self.primary_id = Some(old_primary_id);
+            return Err(e);
+        }
         self.replicas.get_mut(&target_id).unwrap().role = Role::Primary;
         self.primary_id = Some(target_id);
 

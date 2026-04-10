@@ -31,6 +31,7 @@ impl GrpcReplicaHandle {
     ) -> Result<Self> {
         let channel = Channel::from_shared(control_address)
             .map_err(|e| KubelicateError::Internal(Box::new(e)))?
+            .connect_timeout(std::time::Duration::from_secs(5))
             .connect()
             .await
             .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
