@@ -965,3 +965,87 @@ async fn test_a2_write_revocation_during_switchover() {
 
     driver.delete_partition().await.unwrap();
 }
+
+/// **A1 bug exposure:** Partial failure in switchover leaves the partition
+/// write-unavailable with no rollback. When one replica is unreachable,
+/// `switchover()` fails mid-way: write revocation (step 1) already ran
+/// but the error return doesn't undo it. The old primary permanently
+/// rejects writes even though it was never demoted or replaced.
+///
+/// This is deterministic — the revocation always runs before fencing,
+/// so a fencing failure always leaves revoked writes with no rollback.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_a1_partial_failure_leaves_partition_write_unavailable() {
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Write baseline — proves the partition is healthy
+    let mut kv1 = connect_kv_client(&pod1.client_address).await;
+    kv1.put(proto::PutRequest {
+        key: "before".into(),
+        value: "ok".into(),
+    })
+    .await
+    .unwrap();
+
+    // Kill pod 3 — simulates node crash during switchover
+    let h3_kill = pod3.replica_handle(3).await;
+    h3_kill.close().await.unwrap();
+    // Give gRPC server time to shut down
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Attempt switchover — should fail because pod 3 is unreachable.
+    // The driver's switchover():
+    //   step 1: revoke_write_status(pod1) → SUCCEEDS (writes now blocked)
+    //   step 2: update_epoch(pod2) → succeeds (or pod3 first — either way one fails)
+    //   step 2: update_epoch(pod3) → FAILS (connection refused)
+    //   → returns Err, no rollback of step 1
+    let result = driver.switchover(2).await;
+    assert!(
+        result.is_err(),
+        "switchover should fail when a replica is unreachable"
+    );
+
+    // The driver still thinks pod 1 is primary (switchover failed)
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // BUG: The old primary's write status was revoked in step 1 but
+    // never rolled back. Writes fail with ReconfigurationPending.
+    let write_result = kv1
+        .put(proto::PutRequest {
+            key: "after-failed-switchover".into(),
+            value: "should-work".into(),
+        })
+        .await;
+
+    // This SHOULD succeed (the switchover failed, primary should be
+    // fully functional). But it FAILS because write revocation was
+    // never rolled back.
+    //
+    // After A1 is fixed, change this to assert!(write_result.is_ok()).
+    assert!(
+        write_result.is_err(),
+        "A1 BUG: write fails after failed switchover — revocation not rolled back"
+    );
+
+    // Verify the error is ReconfigurationPending (not NotPrimary),
+    // proving the revocation from step 1 is still in effect.
+    let err_msg = write_result.unwrap_err().message().to_string();
+    assert!(
+        err_msg.contains("reconfiguration"),
+        "A1 BUG: error should be ReconfigurationPending, got: {err_msg}"
+    );
+}
