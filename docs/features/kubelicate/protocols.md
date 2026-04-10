@@ -311,9 +311,14 @@ Data path (every replicate):
   replication_queue.push(lsn, data)  → retains op in BTreeMap
   sender.send_to_all(lsn, data)     → non-blocking (unbounded channels)
 
+run_build_replica_copy (after collecting state snapshot):
+  copy_lsn = max LSN of snapshot items  → state provider's last_applied_lsn
+  state.set_copy_lsn(replica_id, copy_lsn)  → stored in PartitionState
+
 UpdateCatchUpConfiguration (when new secondary connects, step 5):
   sender.add_secondary(replica_id, addr)  → opens gRPC stream
-  pending = replication_queue.ops_from(1) → all retained ops
+  copy_lsn = state.take_copy_lsn(replica_id)  → retrieve boundary
+  pending = replication_queue.ops_from(copy_lsn + 1)  → only post-copy ops
   for (lsn, data) in pending:
     sender.send_to_one(replica_id, lsn, data)  → replay to new secondary
   → then live ops flow via send_to_all
@@ -322,13 +327,17 @@ UpdateCurrentConfiguration (config finalized, step 7):
   replication_queue.gc(committed_lsn)  → remove committed ops
 ```
 
-**Coverage with zero gap:**
-- Copy delivers app state at snapshot time
-- Queue replay delivers all ops retained since primary started
-  (some overlap with copy — idempotent, same key = overwrite)
-- Live replication delivers new ops after connection
-- **No ops lost** — the queue retains everything until GC'd after
-  the config is finalized.
+**Three ranges with zero gap (matching SF):**
+```
+[0, copy_lsn]              → Copy stream (from state provider snapshot)
+(copy_lsn, highest_lsn]    → Replay from replication queue
+(highest_lsn, ∞)           → Live replication (new ops via send_to_all)
+```
+
+**No ops lost, no duplicates** — the copy delivers state through `copy_lsn`,
+the queue replays only ops beyond that boundary, and live replication
+continues from the highest LSN. This is correct for both idempotent and
+non-idempotent operations.
 
 **Non-blocking send_to_all:** Each secondary has a two-stage channel:
 unbounded sender (never blocks actor) → background drain task →

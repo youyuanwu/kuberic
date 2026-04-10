@@ -4,7 +4,7 @@ use bytes::Bytes;
 use kubelicate_core::handles::{PartitionHandle, StateReplicatorHandle};
 use kubelicate_core::types::{AccessStatus, CancellationToken};
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::proto;
 use crate::state::{KvOp, SharedState};
@@ -68,7 +68,7 @@ impl proto::kv_store_server::KvStore for KvServer {
 
         self.state.write().await.apply_op(lsn, &op);
 
-        info!(lsn, ?op, "replicated + applied");
+        debug!(lsn, ?op, "replicated + applied");
         Ok(Response::new(proto::PutResponse { lsn }))
     }
 
@@ -90,7 +90,7 @@ impl proto::kv_store_server::KvStore for KvServer {
 
         self.state.write().await.apply_op(lsn, &op);
 
-        info!(lsn, ?op, "replicated + applied");
+        debug!(lsn, ?op, "replicated + applied");
         Ok(Response::new(proto::DeleteResponse { existed, lsn }))
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use kubelicate_core::types::{CancellationToken, Lsn, OperationStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum KvOp {
@@ -69,7 +69,7 @@ pub async fn drain_stream(
                 match serde_json::from_slice::<KvOp>(&op.data) {
                     Ok(kv_op) => {
                         state.write().await.apply_op(lsn, &kv_op);
-                        info!(lsn, ?kv_op, label, "applied from stream");
+                        debug!(lsn, ?kv_op, label, "applied from stream");
                     }
                     Err(e) => {
                         warn!(lsn, error = %e, label, "failed to deserialize stream op");

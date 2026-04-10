@@ -435,33 +435,64 @@ replica again or modify driver state while the first is mid-operation.
 
 Smaller issues that affect correctness in edge cases.
 
-### C0. In-Flight Ops Lost During Build Replica — Fixed
+### C0. Replication Queue Replay — ✅ Fixed
 
-**Severity:** ✅ Fixed
-**Affects:** `WalReplicatorActor`, `PrimarySender`, `run_build_replica_copy`
+**Severity:** ✅ Resolved
+**Affects:** `WalReplicatorActor`, `ReplicationQueue`, `PartitionState`, KV service
 
-**Root cause:** Ops in-flight (sent but not committed) at build time were
-in neither the copy snapshot nor the build buffer. See SF background doc
-§"Adding Idle Replicas" for the reference design.
+**What was fixed (Phase 1 — ReplicationQueue):**
+The in-flight ops gap is closed — all ops are retained in the `ReplicationQueue`
+and replayed to new replicas at `add_secondary` time. No data loss.
 
-**Fix:** Replaced build buffers with an in-memory `ReplicationQueue`
-(`BTreeMap<Lsn, Bytes>`) in the actor. At `add_secondary` time, all
-ops in the queue are replayed to the new replica. Combined with
-non-blocking `send_to_all` (unbounded per-secondary channels) and
-spawned `GetCopyState` (no state lock deadlock), the copy-replication
-gap is closed.
+**What was fixed (Phase 2 — Precise LSN boundary):**
+The replay now uses the precise copy boundary LSN instead of replaying
+everything from LSN 1. Two changes:
+
+1. **Copy LSN tracking (`PartitionState.copy_lsn_map`):** After
+   `run_build_replica_copy` collects the state snapshot, it extracts the
+   copy boundary LSN (max LSN of copy items = `last_applied_lsn` at
+   snapshot time) and stores it per-replica via `state.set_copy_lsn()`.
+   At `UpdateCatchUpConfiguration` time, the actor reads it via
+   `state.take_copy_lsn()` and replays only `ops_from(copy_lsn + 1)`.
+
+2. **Copy stream full consumption:** The KV service's role change handler
+   was cancelling the copy drain task when transitioning from IdleSecondary
+   to ActiveSecondary, losing items still in the channel. Fixed by waiting
+   for the copy drain to finish naturally (sender is already dropped by
+   the gRPC handler) before starting the replication drain. This ensures
+   the secondary receives the complete copy state before replication begins.
+
+**Three ranges with zero gap (matching SF):**
+```
+[0, copy_lsn]              → Copy stream (from state provider snapshot)
+(copy_lsn, highest_lsn]    → Replay from replication queue
+(highest_lsn, ∞)           → Live replication (new ops via send_to_all)
+```
 
 **Changes made:**
-1. `ReplicationQueue` (`replicator/queue.rs`): push/ops_from/gc on BTreeMap
-2. Actor: queue.push on every replicate, replay at add_secondary,
-   GC at UpdateCurrentConfiguration, updates PartitionState.committed_lsn
-3. `PrimarySender`: removed build_buffers/start_build/cancel_build,
-   added send_to_one, send_to_all uses unbounded channels
-4. `run_build_replica_copy`: spawned from PodRuntime (doesn't block cmd loop)
-5. KV service: GetCopyState spawned, snapshot under read lock then dropped
-6. Removed dead ControlServer v1, renamed V2 to ControlServer
+1. `PartitionState` (`handles.rs`): added `copy_lsn_map: Mutex<HashMap<ReplicaId, Lsn>>`
+   with `set_copy_lsn()` and `take_copy_lsn()` methods
+2. `run_build_replica_copy` (`pod.rs`): extracts `copy_lsn` from collected state items,
+   stores via `state.set_copy_lsn(replica.id, copy_lsn)`
+3. Actor (`actor.rs`): at `UpdateCatchUpConfiguration`, reads `state.take_copy_lsn(&member.id)`
+   and replays from `copy_lsn + 1` instead of `1`
+4. KV service (`service.rs`): on IdleSecondary → ActiveSecondary transition,
+   waits for copy drain to complete naturally instead of cancelling
 
-**Verified:** 15/15 passes at 500 initial + 200 concurrent writes.
+**Why this is correct for non-idempotent ops:**
+- The copy snapshot captures all state through `last_applied_lsn` at snapshot time
+- The actor's queue LSNs match the app's LSNs (assigned by the same actor)
+- `ops_from(copy_lsn + 1)` replays only ops NOT in the snapshot
+- No overlap, no gap
+
+**Remaining consideration:** User apps that handle the IdleSecondary →
+ActiveSecondary role change must ensure the copy stream is fully consumed
+before starting replication. The KV app demonstrates the correct pattern.
+This could be enforced at the framework level in the future (e.g., the
+framework waits for the copy stream to drain before delivering the
+replication stream).
+
+**Verified:** 5/5 passes at 500 initial + 200 concurrent writes.
 
 ### C1. QuorumTracker Stale ACK Entries
 
@@ -559,7 +590,7 @@ design work needed — just implementation.
 |----------|-------|-------------|
 | A: Protocol Safety (needs design) | 5 | A1 partial failure, **A5 async build_replica** |
 | B: Operational Resilience (needs design) | 5 | **B0 replication stream death**, B2 timeouts |
-| C: Correctness Refinements (needs design) | 4 | **C0 fixed**, C1 stale ACKs |
+| C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
 | **Total** | **28** | |
 

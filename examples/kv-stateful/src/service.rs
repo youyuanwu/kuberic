@@ -36,12 +36,23 @@ pub async fn run_service(
                 LifecycleEvent::ChangeRole { new_role, reply } => {
                     info!(?new_role, "role changed");
 
-                    // Cancel previous background tasks
-                    if let Some(token) = bg_token.take() {
-                        token.cancel();
-                    }
-                    for h in bg_handles.drain(..) {
-                        let _ = h.await;
+                    if new_role == Role::ActiveSecondary {
+                        // IdleSecondary → ActiveSecondary: let copy drain finish
+                        // naturally without cancelling. The copy stream is already
+                        // closed (sender dropped by gRPC handler), so the drain
+                        // completes once remaining items are consumed. This ensures
+                        // no copy items are lost — critical for non-idempotent ops.
+                        for h in bg_handles.drain(..) {
+                            let _ = h.await;
+                        }
+                    } else {
+                        // Cancel previous background tasks for other transitions
+                        if let Some(token) = bg_token.take() {
+                            token.cancel();
+                        }
+                        for h in bg_handles.drain(..) {
+                            let _ = h.await;
+                        }
                     }
 
                     let token = CancellationToken::new();
@@ -157,15 +168,18 @@ pub async fn run_service(
                         // the lock BEFORE sending. This avoids deadlock: the
                         // drain task needs write lock to apply replication ops,
                         // and tx.send() can block if the receiver is slow.
-                        let snapshot: Vec<(String, String)> = {
+                        let (snapshot, current_lsn): (Vec<(String, String)>, i64) = {
                             let guard = st.read().await;
-                            if peer_lsn < guard.last_applied_lsn {
-                                guard.data.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                            let lsn = guard.last_applied_lsn;
+                            if peer_lsn < lsn {
+                                let data: Vec<_> = guard.data.iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                                (data, lsn)
                             } else {
-                                Vec::new()
+                                (Vec::new(), lsn)
                             }
                         };
-                        let current_lsn = st.read().await.last_applied_lsn;
 
                         let (tx, stream) = OperationStream::channel(64);
                         // Reply with the stream immediately

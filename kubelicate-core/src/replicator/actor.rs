@@ -170,13 +170,20 @@ impl WalReplicatorActor {
                                             continue;
                                         }
 
-                                        // Replay all ops from replication queue.
-                                        // Some may duplicate the copy stream — that's
-                                        // OK, apply_op is idempotent (same key = overwrite).
-                                        let pending = replication_queue.ops_from(1);
+                                        // Replay ops beyond the copy boundary.
+                                        // copy_lsn is the snapshot LSN recorded by
+                                        // run_build_replica_copy — the secondary
+                                        // already has state through this LSN.
+                                        let copy_lsn = state
+                                            .take_copy_lsn(&member.id)
+                                            .unwrap_or(0);
+                                        let replay_from = copy_lsn + 1;
+                                        let pending = replication_queue.ops_from(replay_from);
                                         if !pending.is_empty() {
                                             info!(
                                                 replica_id = member.id,
+                                                copy_lsn,
+                                                replay_from,
                                                 count = pending.len(),
                                                 "replaying ops from replication queue"
                                             );

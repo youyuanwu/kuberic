@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 
 use bytes::Bytes;
@@ -6,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{KubelicateError, Result};
 use crate::events::ReplicateRequest;
-use crate::types::{AccessStatus, CancellationToken, FaultType, Lsn};
+use crate::types::{AccessStatus, CancellationToken, FaultType, Lsn, ReplicaId};
 
 // ---------------------------------------------------------------------------
 // PartitionState — shared atomics written by replicator, read by handles
@@ -14,12 +16,18 @@ use crate::types::{AccessStatus, CancellationToken, FaultType, Lsn};
 
 /// Shared partition state. Written by the replicator actor on the control
 /// channel, read lock-free by PartitionHandle and StateReplicatorHandle.
+///
+/// `copy_lsn_map` stores per-replica copy boundary LSNs. Written by
+/// `run_build_replica_copy` after snapshotting state, read by the actor
+/// at `UpdateCatchUpConfiguration` to replay only ops beyond the copy
+/// boundary (matching SF's gap-free build approach).
 pub struct PartitionState {
     read_status: AtomicU8,
     write_status: AtomicU8,
     current_progress: AtomicI64,
     catch_up_capability: AtomicI64,
     committed_lsn: AtomicI64,
+    copy_lsn_map: Mutex<HashMap<ReplicaId, Lsn>>,
 }
 
 impl PartitionState {
@@ -30,6 +38,7 @@ impl PartitionState {
             current_progress: AtomicI64::new(0),
             catch_up_capability: AtomicI64::new(0),
             committed_lsn: AtomicI64::new(0),
+            copy_lsn_map: Mutex::new(HashMap::new()),
         }
     }
 
@@ -75,6 +84,19 @@ impl PartitionState {
 
     pub fn set_committed_lsn(&self, lsn: Lsn) {
         self.committed_lsn.store(lsn, Ordering::Release);
+    }
+
+    /// Record the copy snapshot LSN for a replica being built.
+    /// Called by `run_build_replica_copy` after collecting state.
+    pub fn set_copy_lsn(&self, replica_id: ReplicaId, lsn: Lsn) {
+        self.copy_lsn_map.lock().unwrap().insert(replica_id, lsn);
+    }
+
+    /// Take (read and remove) the copy snapshot LSN for a replica.
+    /// Called by the actor at UpdateCatchUpConfiguration to determine
+    /// the precise replay boundary.
+    pub fn take_copy_lsn(&self, replica_id: &ReplicaId) -> Option<Lsn> {
+        self.copy_lsn_map.lock().unwrap().remove(replica_id)
     }
 }
 

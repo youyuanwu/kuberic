@@ -664,9 +664,16 @@ async fn run_build_replica_copy(
 
     // Collect state into items for streaming to secondary
     let state_ops = collect_stream(state_stream).await;
+
+    // Extract copy boundary LSN — the highest LSN in the snapshot.
+    // This is the state provider's last_applied_lsn at snapshot time.
+    // The actor will replay only ops beyond this LSN to the new replica.
+    let copy_lsn = state_ops.iter().map(|(lsn, _)| *lsn).max().unwrap_or(0);
+    state.set_copy_lsn(replica.id, copy_lsn);
+
     info!(
         items = state_ops.len(),
-        up_to_lsn, "BuildReplica: got copy state from local StateProvider"
+        up_to_lsn, copy_lsn, "BuildReplica: got copy state from local StateProvider"
     );
 
     // 4. CopyStream to secondary — stream all state items
