@@ -644,6 +644,61 @@ protocol.
 
 ---
 
+## Failure Detection (from C++ source)
+
+SF uses **layered failure detection** — it does NOT monitor replication
+streams directly. Failure is detected at the node and process level:
+
+### Layer 1: Federation Subsystem (node-level)
+
+Nodes exchange **lease-based heartbeats** on a ring topology (128-bit
+token space). When a node's lease expires, the Federation subsystem
+declares `NodeDown`. This is fast (seconds) and catches entire node
+failures — the most common failure mode.
+
+### Layer 2: RA → FM (process-level)
+
+When the RA (Reconfiguration Agent) on a node detects that a local
+replica's process has crashed, it sends a `ReplicaDown` message to the
+FM (Failover Manager):
+
+**Source:** `FailoverManager.cpp:2340`
+```cpp
+void FailoverManager::ReplicaDownAsyncMessageHandler(Message & request, ...) {
+    shared_ptr<ReplicaDownOperation> operation =
+        make_shared<ReplicaDownOperation>(*this, from);
+    operation->Start(operation, *this, move(body));
+}
+```
+
+The FM then calls `FailoverUnit::OnReplicaDown()` which marks the replica
+as `IsUp = false`, invalidates the configuration, and triggers
+reconfiguration if the primary is affected.
+
+### Layer 3: FM Health Monitoring (cluster-level)
+
+The FM tracks replica health via periodic `ChangeNotification` messages
+from each RA. If an RA stops sending notifications (because its node
+died between heartbeat intervals), the FM eventually marks all replicas
+on that node as down.
+
+### What SF Does NOT Detect
+
+A broken replication stream **without** a node or process failure (e.g.,
+network partition between pods while both processes are alive) is NOT
+directly detected by any layer. It manifests indirectly:
+- The replicator stops receiving ACKs from the secondary
+- If quorum is lost → writes fail with `NoWriteQuorum`
+- The service can call `ReportFault()` to trigger failover
+- Otherwise the partition operates in degraded mode silently
+
+This is a known limitation of SF's design — the Federation lease system
+catches most real-world failures (node death, network isolation from
+cluster), but pod-to-pod network partitions within a healthy cluster
+are harder to detect.
+
+---
+
 ## Quorum and Consistency
 
 ### Write Quorum
@@ -799,6 +854,32 @@ producing the copy state, the primary may be accepting new writes. These
 writes go into the replication queue. The secondary first drains the copy
 stream (full state), then drains any replication operations up to the
 captured boundary. Only when both are ACKed is the secondary considered built.
+
+### Async Build: Fire-and-Retry Pattern (from C++ source)
+
+**Source:** `ReconfigurationAgentProxy.cpp`, `FailoverUnit.cpp`
+
+The RA (Reconfiguration Agent) does NOT block waiting for a build to
+complete. Instead, it uses a fire-and-retry pattern:
+
+1. **RA → RAProxy:** RA sends `ReplicatorBuildIdleReplica` message
+2. **RAProxy → Replicator:** RAProxy calls `BeginBuildIdleReplica()`
+   (COM async begin/end pattern)
+3. **In-progress:** If the build is still running, the RAProxy returns
+   `RAProxyBuildIdleReplicaInProgress` and **suppresses the reply**.
+   ```cpp
+   bool sendReply = result != ErrorCodeValue::RAProxyBuildIdleReplicaInProgress;
+   ```
+4. **Retry timer:** The RA has a `MessageRetryTimer` that re-sends the
+   build message periodically. The RAProxy drops duplicates:
+   `MessageDropInvalidWorkInProgress`
+5. **Completion:** When the build finishes, the RAProxy sends the reply.
+   The RA receives it and advances to the next phase.
+6. **Cancellation:** RA can send `CancelCatchupReplicaSet` to abort.
+
+**Key insight:** No progress reporting — just "done" or "still working."
+The FM monitors overall health (via heartbeats and lease expiry), not
+per-operation progress. The same pattern applies to `CatchupReplicaSet`.
 
 ### Catchup Mechanics (from C++ source)
 

@@ -172,31 +172,29 @@ would formalize this query-and-reconstruct pattern.
 
 ---
 
-### A4. gRPC Control Plane Ordering
+### A4. gRPC Control Plane Ordering — ✅ Not a Problem
 
-**Severity:** 🟡 Medium (reduced — no fence-before-promote invariant to violate)
-**Affects:** All driver → replica communication
-**File:** `kubelicate-core/src/grpc/handle.rs`
+**Severity:** ✅ Closed (no issue)
+**Affects:** N/A
 
-**Problem:** Control RPCs (`update_epoch`, `change_role`, `open`, etc.)
-share a single tonic channel. gRPC/HTTP2 multiplexing can reorder
-requests. With the A1 fix, there's no fence-before-promote invariant
-to violate, but ordering still matters for correctness (e.g.,
-`change_role` should not arrive before `open`).
+**Original concern:** gRPC/HTTP2 multiplexing could reorder control RPCs.
 
-**Design needed:**
-- **Option 1: Per-handle mutex.** Wrap the control client in a
-  `tokio::sync::Mutex`. Every control RPC acquires the lock first.
-  Simple, correct, minor contention (control RPCs are rare).
-- **Recommendation:** Option 1 (mutex). The driver already calls RPCs
-  sequentially (not concurrently), so contention is zero. The mutex is
-  a safety net against future parallelization.
+**Analysis:** The driver calls all RPCs **sequentially** — each `.await`
+completes before the next RPC is sent. There are never concurrent RPCs
+to the same handle. HTTP2 multiplexing can only reorder concurrent
+requests; sequential request-response pairs are inherently ordered.
+
+The only exception is `abort()` (fire-and-forget via `tokio::spawn`),
+which is a last-resort shutdown where ordering doesn't matter.
+
+**Conclusion:** No fix needed. A mutex would add complexity for zero
+benefit since the driver is single-threaded per-partition.
 
 ---
 
 ### A5. Synchronous BuildReplica and CatchUp Block Operator
 
-**Severity:** 🔴 Critical (for large datasets)
+**Severity:** 🔴 Critical (for large datasets) / 🟢 OK for MVP
 **Affects:** `PartitionDriver::add_replica()`, `reconfigure_quorum()`,
 `GrpcReplicaHandle::build_replica()`, `wait_for_catch_up_quorum()`
 **Files:** `driver.rs`, `handle.rs`, `pod.rs`, `server.rs`, `quorum.rs`
@@ -216,57 +214,54 @@ Both have the same consequences:
   failover detection can proceed.
 - **Operator restart** — drops the gRPC connection, aborts mid-operation,
   no way to resume.
-- **Cannot distinguish slow vs stuck** — a fixed timeout doesn't work
-  because a 10GB copy that takes 2 hours is legitimate.
 
-**SF doesn't have this problem:** SF's FM sends commands asynchronously.
-The RA reports progress, the FM monitors. The FM never blocks on a
-single operation.
+**SF's approach (from C++ source):**
 
-**Design needed — async operations with progress-based stall detection:**
+SF uses a **fire-and-retry** pattern, NOT progress-based polling:
+
+1. **RA → RAProxy:** RA sends `ReplicatorBuildIdleReplica` message (async)
+2. **RAProxy → Replicator:** Calls `BeginBuildIdleReplica()` (COM async)
+3. **In-progress handling:** If the build is still running, the RAProxy
+   returns `RAProxyBuildIdleReplicaInProgress` and **does not reply** to
+   the RA. The RA's `MessageRetryTimer` re-sends the message periodically.
+   The RAProxy drops duplicates (`MessageDropInvalidWorkInProgress`).
+4. **Completion:** When the build finishes, the RAProxy sends the reply.
+5. **Cancellation:** RA can send `CancelCatchupReplicaSet` to abort.
+
+Key insight: **no progress reporting** — just "done" or "still working."
+The FM monitors overall health (via heartbeats), not build progress.
+
+**Design (SF-aligned fire-and-retry):**
 
 ```
 Current (synchronous, blocking):
   operator ──BuildReplica RPC──► primary (blocks for hours) ──► response
   operator ──WaitForCatchUp RPC──► primary (blocks forever) ──► response
 
-Better (async, progress-polled):
+SF-aligned (fire-and-retry):
   operator ──BuildReplica RPC──► primary (returns immediately)
-  operator ──WaitForCatchUp RPC──► not needed (poll instead)
+  operator ──GetStatus RPC──► primary (replica state: InBuild/Ready)
+  operator ──GetStatus RPC──► primary (replica state: Ready → done!)
 
-  Operator polls GetStatus on primary every 5s:
-    build_progress: { state: Copying, lsn: 5000, items: 12000 }
-    catch_up_progress: { replica_4_acked: 98, highest: 102, gap: 4 }
-
-  Stall detection (not fixed timeout):
-    If progress.lsn unchanged for > stall_timeout (default 30s):
-      → stalled or dead — abort, restart_secondary
-    If progress.lsn advancing:
-      → still working, keep waiting (even if it takes hours)
+  Reconciler loop (every 10s):
+    1. Poll GetStatus on primary
+    2. If replica is Ready → proceed to next step
+    3. If replica is InBuild → requeue, keep waiting
+    4. If primary unreachable → cancel build, restart
 ```
 
-**Progress signals needed:**
+**Implementation approach (simpler than previous design):**
+- `BuildReplica` RPC returns immediately after starting the background
+  copy task (which already runs in a spawned task — C0 fix).
+- `GetStatus` response adds per-replica build state (InBuild/Ready).
+- `wait_for_catch_up_quorum` stays as-is for now (short for small data),
+  but the reconciler wraps it with a timeout and requeue.
+- No progress fields needed for MVP — just state transitions.
+- Stall detection is the reconciler's health check timeout, not a
+  per-operation progress tracker.
 
-| Operation | Progress Field | Source |
-|-----------|---------------|--------|
-| `build_replica` | Items/bytes copied, current LSN | Primary's `handle_build_replica` |
-| `wait_for_catch_up` | Per-replica `acked_lsn` vs `highest_lsn` | `QuorumTracker::replica_acked_lsn` |
-
-**Implementation approach:**
-- `BuildReplica` RPC returns immediately with a build ID.
-  Primary runs copy in background. Operator polls via `GetStatus`.
-- `wait_for_catch_up_quorum` removed from `ReplicaHandle` trait.
-  Instead, operator reads catch-up progress from `GetStatus` response
-  and determines completion itself.
-- **Stall detector** in the reconciler: tracks `last_progress_lsn` and
-  `last_progress_time`. If unchanged for `stall_timeout`, treat the
-  replica as dead and trigger `restart_secondary`.
-- Build-in-progress state persisted in CRD status. On operator restart,
-  it sees "replica X build in progress" and resumes polling.
-
-**This subsumes B2 (timeout enforcement) for these operations** — stall
-detection is the correct model, not fixed timeouts. Fixed timeouts remain
-appropriate for short RPCs (update_epoch, change_role, etc.).
+**This is a future architectural change.** Current synchronous approach
+is correct for MVP and small datasets. All tests pass with it.
 
 ---
 
@@ -275,79 +270,92 @@ hang, leak resources, or fail to recover.
 
 ### B0. Replication Stream Failure Goes Undetected
 
-**Severity:** 🔴 Critical
+**Severity:** 🟡 Medium (reduced — `send_to_all` cleanup already implemented)
 **Affects:** `PrimarySender`, `WalReplicatorActor`, operator reconciler
 **Files:** `primary.rs`, `actor.rs`, `reconciler.rs`
 
 **Problem:** The replication stream is a long-lived bidirectional gRPC
-stream that lives for the entire lifetime of a secondary replica. Unlike
-the copy stream (short-lived, operator retries the build), the replication
-stream carries all ongoing writes. When it breaks, **nobody is notified**:
+stream. When it breaks, detection is partial:
 
-1. The ACK reader task (spawned at `primary.rs:87`) logs a warning and
-   exits silently. No callback, no channel notification.
-2. The dead `item_tx` stays in `PrimarySender::connections`. `send_to_all()`
-   tries to send, gets `Err` (receiver dropped), logs a warning. Does NOT
-   remove the connection or notify anyone.
-3. The secondary stops ACKing. With 3 replicas (quorum=2), writes still
-   succeed via primary + 1 remaining secondary. But if a second stream
-   breaks, pending `replicate()` calls hang forever — `QuorumTracker`
-   has no per-operation timeout.
-4. The operator reconciler is blind to this. It checks pod readiness
-   (`is_pod_ready`), not replication stream health. A pod can be Ready
-   (process running, kubelet OK) but its replication stream dead.
+**What's already fixed:**
+- `send_to_all()` (primary.rs:163-175) detects dead channels via
+  `item_tx.send().is_err()`, logs a warning, and **removes the dead
+  connection** from `PrimarySender::connections`. This was implemented
+  during the non-blocking send work.
 
-**Failure timeline:**
-```
-T0: Replication stream to Replica 3 breaks (network blip)
-    ACK reader exits. item_tx still in connections.
-    PrimarySender logs warning on each send_to_all(), keeps going.
-    QuorumTracker stops receiving ACKs from Replica 3.
-    Writes still succeed (quorum = primary + Replica 2 = 2).
+**No auto-reconnection (intentional, matching SF):**
+When a connection is removed, the secondary silently drops out of
+replication. We do NOT auto-reconnect because:
+1. The pod might be truly dead — reconnection retries would be futile
+2. Even if reconnected, the secondary missed ops — its data is stale
+   and needs a full rebuild (copy), not just reconnection
+3. Auto-reconnection would bypass the operator's lifecycle control
 
-T1: Replication stream to Replica 2 also breaks
-    Now: quorum = primary only = 1 < write_quorum(2)
-    All pending replicate() calls hang forever.
-    No timeout. No notification to operator.
-    User sees: replicate() never returns.
+SF handles this the same way: the replicator stops sending, the FM
+detects the replica is unreachable (via heartbeat failure), and
+orchestrates a `BuildIdleReplica` rebuild. The replicator never
+reconnects on its own.
 
-T2: ??? — operator never detects this.
-    Pods are Ready. No failover triggered. System is frozen.
-```
+**The missing piece:** We remove the dead connection but **don't notify
+the operator**. The operator's reconciler checks pod readiness (K8s),
+not replication stream health. A pod can be Running/Ready (process alive)
+but its replication stream dead (e.g., network partition between pods).
 
-**Design needed:**
+**What's still a gap:**
 
-- **Dead connection detection + cleanup:** When the ACK reader task
-  exits (stream error or EOF), it should:
-  1. Remove the connection from `PrimarySender::connections`
-  2. Notify the replicator actor (e.g., via a `mpsc::Sender` for
-     connection-death events)
-  3. The actor can then update `QuorumTracker` (remove replica from
-     active set) and surface `NoWriteQuorum` if quorum is now lost.
+1. **ACK reader exits silently** — the spawned ACK reader task
+   (primary.rs:93) logs a warning and exits. No callback to the actor.
+   However, the dead connection IS removed on the next `send_to_all()`
+   call (send fails → cleanup). So the gap is timing: between the ACK
+   reader dying and the next write, the connection appears alive.
 
-- **Operator-visible health signal:** The replicator should expose
-  replication health via `GetStatus` RPC (or `ReplicaInfo`). The
-  reconciler can then detect "pod Ready but replication broken" and
-  trigger `restart_secondary`.
+2. **QuorumTracker has no per-operation timeout** — if ALL secondaries
+   die, `replicate()` hangs forever. With 3 replicas (quorum=2), losing
+   one secondary is fine (quorum still met). Losing both means writes
+   hang. In practice, the reconciler detects pod failures (NotReady) and
+   triggers failover before both streams die simultaneously.
 
-- **Per-operation timeout in QuorumTracker:** `register()` should
-  accept a timeout. If quorum ACK doesn't arrive within the timeout,
-  fail the pending `replicate()` call with `NoWriteQuorum` instead of
-  hanging forever.
+3. **Operator can't detect replication health** — pods can be Ready but
+   replication broken. `GetStatus` doesn't report replication stream
+   status. The reconciler only checks pod readiness.
 
-- **Automatic removal of dead connections in `send_to_all()`:**
-  Currently logs a warning and keeps the dead entry. Should remove it:
-  ```rust
-  let mut dead = Vec::new();
-  for (rid, conn) in &self.connections {
-      if conn.item_tx.send(item.clone()).await.is_err() {
-          dead.push(*rid);
-      }
-  }
-  for rid in dead {
-      self.connections.remove(&rid);
-  }
-  ```
+**Remaining design (for production hardening):**
+
+- **Per-operation timeout in QuorumTracker:** `register()` should accept
+  a timeout. If quorum ACK doesn't arrive, fail with `NoWriteQuorum`
+  instead of hanging. This is the most important remaining fix.
+
+- **Replication health in GetStatus:** Add `connected_secondaries` count
+  or per-replica replication status to the GetStatus response. The
+  reconciler can then detect "Ready but replication broken."
+  This maps to SF's RA→FM `ChangeNotification` pattern — the pod
+  reports its health, the operator acts on it.
+
+- **ACK reader death notification** (nice-to-have): When the ACK reader
+  exits, notify the actor to proactively remove the connection. Currently
+  cleanup happens lazily on the next `send_to_all()`, which is fine for
+  most workloads.
+
+**SF failure detection model (for reference):**
+
+SF does NOT monitor replication streams directly. It uses layered detection:
+
+| Layer | Mechanism | Detects | Speed |
+|-------|-----------|---------|-------|
+| Federation | Lease-based heartbeats between nodes | Node failure | Seconds |
+| RA → FM | `ReplicaDown` message when local process crashes | Process crash | Seconds |
+| FM health | Periodic `ChangeNotification` from each RA | Silent node death | ~30s |
+
+A broken replication stream without node/process failure (network partition
+between pods) is detected indirectly: quorum loss → writes fail → user
+reports fault. This is a known gap in SF too, though SF's Federation
+leases catch most real failures at the node level.
+
+**Our K8s equivalents:**
+- Node-level: K8s kubelet → pods go NotReady
+- Pod-level: Liveness probe → pod restart
+- Replication-level: **Our gap** — no equivalent of Federation leases
+  between pods. Fix: `connected_secondaries` in GetStatus (see above).
 
 ---
 
@@ -637,19 +645,18 @@ design work needed — just implementation.
 
 | Category | Count | Top Priority |
 |----------|-------|-------------|
-| A: Protocol Safety (needs design) | 5 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A5 async build_replica** |
-| B: Operational Resilience (needs design) | 5 | **B0 replication stream death**, B2 timeouts |
+| A: Protocol Safety | 5 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build |
+| B: Operational Resilience (needs design) | 5 | B0 partially fixed (QuorumTracker timeout remaining), B2 timeouts |
 | C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
 | **Total** | **28** | |
 
 **Recommended order:**
-1. **B0 (replication stream death)** — silent data path failure, critical
-2. **A5 (async build + catch-up with stall detection)** — blocks reconciler, breaks on large datasets
-3. A4 (gRPC control plane ordering) — foundational safety
-4. B2 (short RPC timeouts) — prevents hangs on control-plane calls
-5. A3 (promotion failure) — failover resilience
-6. D items P0 (data loss, operator restart, secondary health)
-7. B3 + B4 (reconnection, operation locking) — operational maturity
-8. B1 streaming improvement — large dataset support
-9. C1-C3 (refinements) — can be done alongside other work
+1. B0 QuorumTracker timeout — prevents write hangs on dual stream failure
+2. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
+3. B2 (short RPC timeouts) — prevents hangs on control-plane calls
+4. A3 failover candidate retry — failover resilience
+5. D items P0 (data loss, operator restart, secondary health)
+6. B3 + B4 (reconnection, operation locking) — operational maturity
+7. B1 streaming improvement — large dataset support
+8. C1-C3 (refinements) — can be done alongside other work
