@@ -691,3 +691,130 @@ async fn test_reconciler_scale_down() {
         .unwrap();
     assert!(resp.get_ref().lsn > 0);
 }
+
+/// Reconciler test: double failover — after the first failover, the new
+/// primary also fails. The reconciler handles a second failover cycle
+/// (FailingOver → Healthy again) with the last surviving replica.
+/// Exercises: reconciler retry loop, driver failover, A1 best-effort epoch.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_reconciler_double_failover() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    // Create 3-replica partition → Healthy
+    let set = make_set("myapp", 3, None);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubelicateSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+    let first_primary = status.current_primary.clone().unwrap();
+
+    // Write data
+    let addr = api.client_address(&first_primary).unwrap();
+    let mut kv = connect_kv(&addr).await;
+    kv.put(proto::PutRequest {
+        key: "epoch-1".into(),
+        value: "data".into(),
+    })
+    .await
+    .unwrap();
+
+    // --- First failover: primary fails ---
+    api.mark_pod_not_ready(&first_primary);
+
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::FailingOver);
+
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+
+    let second_primary = status.current_primary.clone().unwrap();
+    assert_ne!(second_primary, first_primary);
+
+    // Write on second primary
+    let addr2 = api.client_address(&second_primary).unwrap();
+    let mut kv2 = connect_kv(&addr2).await;
+    kv2.put(proto::PutRequest {
+        key: "epoch-2".into(),
+        value: "survived".into(),
+    })
+    .await
+    .unwrap();
+
+    // --- Second failover: new primary also fails ---
+    api.mark_pod_not_ready(&second_primary);
+
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::FailingOver);
+
+    // Remove the two dead replicas from the driver so failover
+    // doesn't select a dead candidate (A3 gap for failover).
+    {
+        let mut drivers = state.drivers.lock().await;
+        let driver = drivers.get_mut("default/myapp").unwrap();
+        let first_id: i64 = first_primary
+            .strip_prefix("myapp-")
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            + 1;
+        let second_id: i64 = second_primary
+            .strip_prefix("myapp-")
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            + 1;
+        driver.remove_replica_from_driver(first_id);
+        driver.remove_replica_from_driver(second_id);
+    }
+
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+
+    let third_primary = status.current_primary.clone().unwrap();
+    assert_ne!(third_primary, first_primary);
+    assert_ne!(third_primary, second_primary);
+
+    // Third primary should have data from both epochs
+    let addr3 = api.client_address(&third_primary).unwrap();
+    let mut kv3 = connect_kv(&addr3).await;
+
+    let resp = kv3
+        .get(proto::GetRequest {
+            key: "epoch-1".into(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().found, "data from first epoch should survive");
+
+    let resp = kv3
+        .get(proto::GetRequest {
+            key: "epoch-2".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        resp.get_ref().found,
+        "data from second epoch should survive"
+    );
+}
