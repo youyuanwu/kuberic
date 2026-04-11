@@ -195,6 +195,7 @@ impl PodRuntimeBuilder {
         // Start data plane gRPC server (persisted mode + copy support)
         let data_receiver = SecondaryReceiver::with_streams(
             secondary_state,
+            state.clone(),
             repl_op_tx,
             copy_op_tx,
             state_provider_tx.clone(),

@@ -286,7 +286,7 @@ The KV app now implements rollback in its `UpdateEpoch` handler:
 2. Calls `rollback_to(previous_epoch_last_lsn)` — reloads snapshot +
    partial WAL replay + WAL rewrite
 
-**Remaining gap (B1 — committed_lsn not propagated to secondaries):**
+**Remaining gap (B5 — committed_lsn not propagated to secondaries):**
 `PartitionState::committed_lsn()` is only set by the replicator actor
 on the primary. Secondaries never receive committed_lsn updates, so
 `previous_epoch_last_lsn` arrives as 0. The rollback is guarded with
@@ -300,7 +300,7 @@ callback tells the user service to truncate state beyond
 (Reliable Collections), the `LoggingReplicator` handles this
 automatically by undoing uncommitted transactions from its WAL.
 
-**Our current code (KV example) — rollback with B1 guard:**
+**Our current code (KV example) — rollback with B5 guard:**
 ```rust
 StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
     let current_lsn = state.read().await.last_applied_lsn;
@@ -544,6 +544,90 @@ replica again or modify driver state while the first is mid-operation.
 
 ---
 
+### B5. committed_lsn Not Propagated to Secondaries
+
+**Severity:** 🔴 High (blocks A6 rollback + SQLite deferred application)
+**Affects:** `WalReplicatorActor`, `PartitionState`, `SecondaryState`, user services
+**Files:** `actor.rs:275-276`, `pod.rs:498`, `secondary.rs:43-65`, `handles.rs:85-86`
+
+**Problem:** `PartitionState::committed_lsn` is only set on the primary.
+The replicator actor reads `quorum_tracker.committed_lsn()` after each
+`replicate()` call and stores it via `state.set_committed_lsn()` — but
+this is the primary's `PartitionState`. The secondary's `PartitionState`
+never receives this value. Additionally, `SecondaryState::committed_lsn`
+(secondary.rs:43) has a `set_committed_lsn()` method but **nobody calls
+it** — it's always 0.
+
+This causes two downstream failures:
+
+1. **A6 rollback is dead code on secondaries.** `handle_update_epoch()`
+   at `pod.rs:498` reads `self.state.committed_lsn()` as
+   `previous_epoch_last_lsn`. On secondaries this is always 0. The KV
+   app guards with `> 0` check so rollback silently skips. Uncommitted
+   ops remain in state.
+
+2. **SQLite deferred application never triggers.** The SQLite-stateful
+   design relies on secondaries knowing committed_lsn to move frames
+   from frames.log to the DB file. Without propagation, Phase 2 never
+   fires and the DB stays stale.
+
+**SF solution (from source analysis):**
+
+SF sends `completedSequenceNumber` (= min of all secondaries'
+receive-ACKed LSNs, capped at `committedLSN`) piggybacked on every
+replication message from primary to secondary:
+
+```
+Primary (ReplicaManager::GetProgress):
+  committedLSN = sorted_acks[quorumIndex]     // quorum-committed
+  completedLSN = min(all_receive_acks)        // all-replicas-received
+  completedLSN = min(completedLSN, committedLSN)  // cap at committed
+
+Replication message (ReplicationOperationHeader):
+  includes completedSequenceNumber alongside operation data + epoch
+
+Secondary (SecondaryReplicationReceiver::ProcessReplicationOperation):
+  extracts completedSequenceNumber from each message
+  calls replicationQueue_->UpdateCompleteHead(completedSequenceNumber + 1)
+  → GCs operations that ALL replicas have processed
+```
+
+Note: SF distinguishes two LSNs:
+- **committed**: user service called `acknowledge()` on this op (local)
+- **completed**: all replicas have committed this op (global, from primary)
+
+For UpdateEpoch rollback, SF uses the secondary's **local**
+`LastCommittedSequenceNumber` — the operations the user has acknowledged.
+This is NOT the primary's quorum-committed LSN. The secondary tracks
+its own commit progress independently.
+
+**Our bug:** We conflate these two concepts. `PartitionState::committed_lsn`
+is the primary's quorum-committed LSN, and we try to use it on secondaries
+where it's never set. SF's approach works because the secondary tracks
+local user-ACK progress separately.
+
+**Fix (aligned with SF):**
+
+1. **Add `completed_lsn` to `ReplicationItem` proto** — primary includes
+   its current quorum-committed LSN with each replication message. This
+   is what SF calls `completedSequenceNumber`.
+
+2. **Secondary extracts and stores it** — `SecondaryReceiver` reads
+   `completed_lsn` from each incoming item and updates both:
+   - `SecondaryState::set_committed_lsn()` (for internal log truncation)
+   - `PartitionState::set_committed_lsn()` (for `handle_update_epoch`)
+
+3. **For persisted services (like SQLite):** The secondary's local
+   commit progress is tracked by the user service calling `acknowledge()`.
+   The primary's `completed_lsn` tells the secondary which ops are
+   globally committed — this triggers Phase 2 (apply to DB) in the
+   SQLite app and enables correct rollback boundaries.
+
+This is a one-field proto addition + ~10 lines of code in
+`SecondaryReceiver` and `PrimarySender`.
+
+---
+
 ## Category C: Correctness Refinements — Needs Design Work
 
 Smaller issues that affect correctness in edge cases.
@@ -701,15 +785,15 @@ design work needed — just implementation.
 
 | Category | Count | Top Priority |
 |----------|-------|-------------|
-| A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ⚠️ partial (B1 gap remains)** |
-| B: Operational Resilience (needs design) | 5 | B0 partially fixed (QuorumTracker timeout remaining), B2 timeouts |
+| A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ⚠️ partial (B5 gap remains)** |
+| B: Operational Resilience (needs design) | 6 | B0 partially fixed (QuorumTracker timeout remaining), **B5 committed_lsn propagation**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
-| **Total** | **29** | |
+| **Total** | **30** | |
 
 **Recommended order:**
-1. B0 QuorumTracker timeout — prevents write hangs on dual stream failure
-2. **B1 (new): Propagate committed_lsn to secondaries** — unblocks full A6 rollback
+1. **B5 committed_lsn propagation** — blocks A6 rollback on secondaries + SQLite app
+2. B0 QuorumTracker timeout — prevents write hangs on dual stream failure
 3. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
 4. B2 (short RPC timeouts) — prevents hangs on control-plane calls
 5. A3 failover candidate retry — failover resilience

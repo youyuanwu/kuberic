@@ -24,6 +24,8 @@ use crate::types::{Epoch, Lsn, Operation};
 /// - **CopyStream**: receives full state from primary during build
 pub struct SecondaryReceiver {
     state: Arc<SecondaryState>,
+    /// Partition-level state for committed_lsn propagation (B5).
+    partition_state: Option<Arc<crate::handles::PartitionState>>,
     /// If set, incoming replication items are forwarded to the user's
     /// OperationStream (persisted mode). Otherwise auto-ACK (volatile).
     operation_tx: Option<mpsc::Sender<Operation>>,
@@ -107,6 +109,13 @@ impl SecondaryState {
             self.received_lsn.store(item.lsn, Ordering::Release);
         }
 
+        // Update committed_lsn from primary's progress (B5 fix).
+        // The primary piggybacks its quorum-committed LSN on each item.
+        if item.committed_lsn > self.committed_lsn.load(Ordering::Acquire) {
+            self.committed_lsn
+                .store(item.committed_lsn, Ordering::Release);
+        }
+
         Ok(())
     }
 }
@@ -122,6 +131,7 @@ impl SecondaryReceiver {
     pub fn new(state: Arc<SecondaryState>) -> Self {
         Self {
             state,
+            partition_state: None,
             operation_tx: None,
             copy_stream_tx: None,
             state_provider_tx: None,
@@ -131,12 +141,14 @@ impl SecondaryReceiver {
     /// Create in persisted mode with full copy support.
     pub fn with_streams(
         state: Arc<SecondaryState>,
+        partition_state: Arc<crate::handles::PartitionState>,
         operation_tx: mpsc::Sender<Operation>,
         copy_stream_tx: mpsc::Sender<Operation>,
         state_provider_tx: mpsc::Sender<StateProviderEvent>,
     ) -> Self {
         Self {
             state,
+            partition_state: Some(partition_state),
             operation_tx: Some(operation_tx),
             copy_stream_tx: Some(Mutex::new(Some(copy_stream_tx))),
             state_provider_tx: Some(state_provider_tx),
@@ -154,6 +166,7 @@ impl ReplicatorData for SecondaryReceiver {
     ) -> Result<Response<Self::ReplicationStreamStream>, Status> {
         let mut inbound = request.into_inner();
         let state = self.state.clone();
+        let partition_state = self.partition_state.clone();
         let (ack_tx, ack_rx) = mpsc::channel(256);
         let operation_tx = self.operation_tx.clone();
 
@@ -165,6 +178,15 @@ impl ReplicatorData for SecondaryReceiver {
                         match state.accept_item(&item) {
                             Ok(()) => {
                                 debug!(lsn, "accepted replication item");
+
+                                // Propagate committed_lsn to PartitionState (B5 fix).
+                                // This makes committed_lsn visible to PodRuntime's
+                                // handle_update_epoch for correct rollback boundaries.
+                                if let Some(ref ps) = partition_state
+                                    && item.committed_lsn > ps.committed_lsn()
+                                {
+                                    ps.set_committed_lsn(item.committed_lsn);
+                                }
 
                                 if let Some(ref op_tx) = operation_tx {
                                     // Persisted mode: forward to user, defer ACK

@@ -146,6 +146,12 @@ message ReplicationItem {
     int64 epoch_config = 2;
     int64 lsn = 3;
     bytes data = 4;
+    // Primary's current quorum-committed LSN. Secondaries use this to:
+    // 1. Track which ops are committed (for UpdateEpoch rollback boundary)
+    // 2. GC their internal operation queues
+    // 3. Trigger deferred page application (SQLite app)
+    // Matches SF's completedSequenceNumber in ReplicationOperationHeader.
+    int64 committed_lsn = 5;
 }
 
 message ReplicationAck {

@@ -188,7 +188,7 @@ impl WalReplicatorActor {
                                                 "replaying ops from replication queue"
                                             );
                                             for (lsn, data) in &pending {
-                                                sender.send_to_one(member.id, *lsn, data);
+                                                sender.send_to_one(member.id, *lsn, data, state.committed_lsn());
                                             }
                                         }
                                     }
@@ -265,15 +265,16 @@ impl WalReplicatorActor {
                     // Register with quorum tracker (primary's own ACK counted)
                     quorum_tracker.lock().await.register(lsn, self.replica_id, req.reply);
 
-                    // Non-blocking: send_to_all uses unbounded channels
-                    if let Some(sender) = &mut primary_sender {
-                        sender.send_to_all(lsn, &req.data);
-                    }
-
                     // Update progress and committed LSN
                     state.set_current_progress(lsn);
                     let committed = quorum_tracker.lock().await.committed_lsn();
                     state.set_committed_lsn(committed);
+
+                    // Non-blocking: send_to_all uses unbounded channels.
+                    // Include committed_lsn so secondaries can track commit progress.
+                    if let Some(sender) = &mut primary_sender {
+                        sender.send_to_all(lsn, &req.data, committed);
+                    }
                 }
 
                 else => break,

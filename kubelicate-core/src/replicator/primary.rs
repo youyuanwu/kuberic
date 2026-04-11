@@ -131,12 +131,19 @@ impl PrimarySender {
     }
 
     /// Send a single item to a specific secondary (for replay from queue).
-    pub fn send_to_one(&self, replica_id: ReplicaId, lsn: Lsn, data: &bytes::Bytes) {
+    pub fn send_to_one(
+        &self,
+        replica_id: ReplicaId,
+        lsn: Lsn,
+        data: &bytes::Bytes,
+        committed_lsn: Lsn,
+    ) {
         let item = ReplicationItem {
             epoch_data_loss: self.epoch.data_loss_number,
             epoch_config: self.epoch.configuration_number,
             lsn,
             data: data.to_vec(),
+            committed_lsn,
         };
         if let Some(conn) = self.connections.get(&replica_id)
             && conn.item_tx.send(item).is_err()
@@ -152,12 +159,13 @@ impl PrimarySender {
 
     /// Send an operation to all connected secondaries. Non-blocking —
     /// uses unbounded channels. Matches SF's fire-and-forget dispatch.
-    pub fn send_to_all(&mut self, lsn: Lsn, data: &bytes::Bytes) {
+    pub fn send_to_all(&mut self, lsn: Lsn, data: &bytes::Bytes, committed_lsn: Lsn) {
         let item = ReplicationItem {
             epoch_data_loss: self.epoch.data_loss_number,
             epoch_config: self.epoch.configuration_number,
             lsn,
             data: data.to_vec(),
+            committed_lsn,
         };
 
         let mut dead = Vec::new();
