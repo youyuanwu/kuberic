@@ -154,12 +154,11 @@ use std::path::Path;
 pub type SharedState = Arc<RwLock<KvState>>;
 
 /// Drain a copy or replication stream, applying each operation to shared state.
-/// Stops when the stream ends, the cancellation token fires, or a deserialization fails.
+/// Stops when the stream ends or the cancellation token fires.
 ///
-/// Operations are applied to in-memory state and acknowledged immediately.
-/// WAL writes happen separately on the primary side (server.rs). Secondaries
-/// don't need WAL persistence in drain_stream because they rebuild from the
-/// primary via copy stream on restart.
+/// Each operation is applied to in-memory state AND persisted to WAL before
+/// acknowledging. The acknowledge gates the secondary's ACK back to the
+/// primary, so WAL persistence is on the quorum path.
 pub async fn drain_stream(
     state: SharedState,
     mut stream: OperationStream,
@@ -178,8 +177,10 @@ pub async fn drain_stream(
                 let lsn = op.lsn;
                 match serde_json::from_slice::<KvOp>(&op.data) {
                     Ok(kv_op) => {
-                        // Apply to in-memory state (fast, no I/O under lock)
-                        state.write().await.apply_op_in_memory(lsn, &kv_op);
+                        if let Err(e) = state.write().await.apply_op(lsn, &kv_op).await {
+                            warn!(lsn, error = %e, label, "WAL write failed, not acknowledging");
+                            continue;
+                        }
                         debug!(lsn, ?kv_op, label, "applied from stream");
                         op.acknowledge();
                     }

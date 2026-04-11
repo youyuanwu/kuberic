@@ -149,11 +149,28 @@ pub async fn run_service(
 
             Some(event) = state_provider_rx.recv() => match event {
                 StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
-                    // For now, log epoch changes without rollback.
-                    // Full rollback (A6 fix) requires refactoring to avoid
-                    // holding the write lock across async file I/O.
-                    // See design-gaps.md A6 for the planned approach.
-                    info!(previous_epoch_last_lsn, "epoch updated");
+                    // A6: Rollback uncommitted ops on epoch change.
+                    // Currently the framework doesn't propagate committed_lsn to
+                    // secondaries, so previous_epoch_last_lsn may be 0 even when
+                    // all ops were committed. Only rollback when we have a real
+                    // boundary (non-zero) and it's less than what we've applied.
+                    let current_lsn = state.read().await.last_applied_lsn;
+                    if previous_epoch_last_lsn > 0 && previous_epoch_last_lsn < current_lsn {
+                        info!(previous_epoch_last_lsn, current_lsn, "epoch updated — rolling back uncommitted ops");
+                        if let Some(token) = bg_token.take() {
+                            token.cancel();
+                        }
+                        for h in bg_handles.drain(..) {
+                            let _ = h.await;
+                        }
+                        bg_token = Some(CancellationToken::new());
+
+                        if let Err(e) = state.write().await.rollback_to(previous_epoch_last_lsn).await {
+                            tracing::warn!(error = %e, "rollback failed");
+                        }
+                    } else {
+                        info!(previous_epoch_last_lsn, current_lsn, "epoch updated");
+                    }
                     let _ = reply.send(Ok(()));
                 }
                 StateProviderEvent::GetLastCommittedLsn { reply } => {

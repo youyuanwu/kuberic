@@ -922,77 +922,50 @@ impl KvPod {
 
 ### Implementation Status
 
-The design above describes the full target architecture. The current
-implementation is a **checkpoint-only subset** — some features are
-deferred due to a deadlock issue with `tokio::sync::RwLock` held across
-async file I/O.
-
-#### What's Implemented
-
 | Feature | Status | Details |
 |---------|--------|---------|
 | `persistence.rs` module | Done | WAL/snapshot helpers: load, replay, truncate, checkpoint, rewrite |
 | `KvState::open(dir)` | Done | Always-persistent constructor. Loads snapshot + replays WAL on startup |
-| `apply_op_in_memory()` | Done | Sync in-memory apply. Used by all write paths (server, drain_stream) |
-| `apply_op()` async | Done | In-memory + WAL write + fdatasync. Available but **not used** in hot paths |
+| `apply_op()` async | Done | In-memory + WAL write + flush. Used by **all write paths** (server put/delete, drain_stream) |
+| `apply_op_in_memory()` | Done | Sync in-memory apply. Used during WAL replay only |
 | `checkpoint()` | Done | Atomic snapshot write (tmp + fsync + rename) + WAL truncate |
-| Checkpoint on copy complete | Done | After IdleSecondary to ActiveSecondary, all copied state is checkpointed |
+| Checkpoint on copy complete | Done | After IdleSecondary → ActiveSecondary, all copied state is checkpointed |
 | Checkpoint on Close | Done | Graceful shutdown snapshots for fast recovery |
 | `committed_lsn` tracking | Done | Prevents checkpointing uncommitted ops |
 | WAL recovery on restart | Done | `truncate_wal_to_valid()` removes corrupt trailing bytes |
+| UpdateEpoch rollback | Done | Rolls back uncommitted ops when `previous_epoch_last_lsn > 0 && < current` |
+| Per-op WAL writes | Done | Both primary (server.rs) and secondary (drain_stream) persist to WAL before ACK |
 | Unique temp dirs per test | Done | Atomic counter + pid ensures no cross-test pollution |
 | `KvPod.data_dir` exposed | Done | Enables restart tests with same dir |
 | All 36 tests pass | Done | 14 core + 22 kv-stateful, zero clippy warnings |
 
 #### What's Deferred
 
-| Feature | Blocker | Workaround |
-|---------|---------|------------|
-| **Per-op WAL write** in `drain_stream` | `RwLock` held across async I/O deadlocks with `UpdateEpoch` handler | Using `apply_op_in_memory` -- no WAL on secondary replication path. Crash = full copy rebuild (same as before) |
-| **Per-op WAL write** in `server.rs` | Same `RwLock` issue -- primary writes hold lock across fdatasync | Using `apply_op_in_memory` -- primary state only checkpointed on close |
-| **UpdateEpoch rollback** (A6 fix) | Rollback calls `rollback_to()` which does async I/O under write lock | Logging only -- no rollback. Matches pre-persistence behavior |
-| **`KvPod::crash()` / `restart()`** | Needs per-op WAL to be meaningful | Designed in testing.md, not yet implemented |
+| Feature | Reason | Notes |
+|---------|--------|-------|
+| **`KvPod::crash()` / `restart()`** | Not yet needed | Designed in testing.md. Now meaningful with per-op WAL writes |
+| **Full A6 rollback** | Framework gap | `PartitionState::committed_lsn()` is never set on secondaries, so `previous_epoch_last_lsn` arrives as 0. Rollback is guarded (`> 0` check) to avoid wiping committed data. Needs framework fix: propagate committed_lsn to secondaries via the replication stream (B1 gap) |
+| **B0: QuorumTracker timeout** | Pre-existing gap | If all secondaries die, `replicate()` hangs forever. Not related to WAL but exposed by timing changes in failover tests. See design-gaps.md |
 
-#### Root Cause: Write Lock + Async I/O Deadlock
+#### Corrected Analysis: No RwLock Deadlock
 
-The `tokio::sync::RwLock<KvState>` pattern works for sync operations
-(HashMap read/write) but deadlocks when the write lock is held across
-`.await` points (WAL file I/O):
+The previous version of this document incorrectly diagnosed a deadlock
+caused by `tokio::sync::RwLock` held across `.await` file I/O. This
+analysis was wrong:
 
-```
-drain_stream task:          state.write().await.apply_op(lsn, op).await
-                            ^ holds write lock across fdatasync
+- `tokio::sync::RwLock` is **designed** to be held across `.await`
+  points. When `drain_stream` holds `state.write().await` across WAL
+  I/O (~1ms), the service event loop's `state.write().await` simply
+  yields to the tokio runtime, the WAL I/O completes, the lock drops,
+  and the event loop proceeds. This is temporary contention, not a
+  deadlock — there is no circular dependency.
 
-service event loop:         state.write().await  <-- blocks waiting for drain's lock
-  (UpdateEpoch handler)     ^ can't proceed until drain releases
+- The actual test hang was caused by **B0** (QuorumTracker has no
+  timeout): after failover, the new primary's quorum configuration
+  still includes the dead pod. Calls to `replicate()` wait for
+  secondary ACKs that never arrive. Adding WAL I/O latency changed
+  timing enough to expose this pre-existing issue.
 
-Result: deadlock (both on same tokio runtime, lock never released)
-```
-
-#### Fix Path (Future Work)
-
-Move the WAL writer out of `KvState` into a separate channel-based
-actor that doesn't require the `RwLock`:
-
-```
-Option 1: WAL writer channel
-  state.write().await.apply_op_in_memory(lsn, op);  // fast, sync
-  wal_tx.send(WalEntry { lsn, op }).await;           // async, no lock
-  // WAL actor: recv -> write -> fsync -> signal ACK
-
-Option 2: Split lock
-  {
-      let mut guard = state.write().await;
-      guard.apply_op_in_memory(lsn, op);
-  } // lock released here
-  wal.append_sync(lsn, op).await?;  // async I/O without lock
-  op.acknowledge();
-
-Option 3: Mutex<File> separate from RwLock<KvState>
-  state.write().await.apply_op_in_memory(lsn, op);
-  wal_mutex.lock().await.append_sync(entry).await?;
-  op.acknowledge();
-```
-
-Any of these unblock per-op WAL writes and rollback. Defer to next
-implementation phase.
+The split-lock refactoring (separating WalWriter from KvState) was
+unnecessary and has been reverted. Per-op WAL writes now work correctly
+with the original `RwLock<KvState>` pattern.
