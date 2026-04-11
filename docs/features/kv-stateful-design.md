@@ -70,7 +70,24 @@ enum KvOp {
 ```
 
 Each `replicate()` call sends one `KvOp`. The LSN is assigned by the
-replicator, not by the app.
+replicator actor (monotonic counter in its single `select!` loop) and
+returned to the caller. Users never provide LSNs — this is a deliberate
+design choice matching SF's `IReplicator::Replicate()`:
+
+- **Total ordering:** The actor serializes LSN assignment, guaranteeing
+  monotonic, gap-free sequences. User-generated LSNs could arrive out of
+  order from concurrent callers, breaking QuorumTracker, ReplicationQueue,
+  and secondary WAL replay which all assume monotonic LSNs.
+- **No gaps or duplicates:** The counter guarantees contiguity. Users
+  could produce gaps (1, 2, 5) or duplicates (1, 2, 2), corrupting
+  replication queue lookups and quorum tracking.
+- **Epoch fencing:** The replicator gates LSN assignment on primary role.
+  User-generated LSNs would bypass this — a stale primary could generate
+  conflicting LSNs during a network partition.
+
+LSN generation is a core replicator responsibility. Moving it to the
+user would require the user to solve distributed total-order broadcast
+— which is the problem the replicator exists to solve.
 
 ---
 
