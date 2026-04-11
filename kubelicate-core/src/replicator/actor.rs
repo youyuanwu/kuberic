@@ -159,6 +159,7 @@ impl WalReplicatorActor {
                                                 member.id,
                                                 member.replicator_address.clone(),
                                                 quorum_tracker.clone(),
+                                                state.clone(),
                                             )
                                             .await
                                         {
@@ -265,9 +266,12 @@ impl WalReplicatorActor {
                     // Register with quorum tracker (primary's own ACK counted)
                     quorum_tracker.lock().await.register(lsn, self.replica_id, req.reply);
 
-                    // Update progress and committed LSN
-                    state.set_current_progress(lsn);
+                    // Read committed_lsn AFTER register — the registration may
+                    // have triggered immediate commit (single replica case), and
+                    // previous ops' ACKs may have been processed by the background
+                    // ACK reader, advancing committed_lsn further.
                     let committed = quorum_tracker.lock().await.committed_lsn();
+                    state.set_current_progress(lsn);
                     state.set_committed_lsn(committed);
 
                     // Non-blocking: send_to_all uses unbounded channels.

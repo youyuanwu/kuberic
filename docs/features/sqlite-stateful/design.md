@@ -282,10 +282,9 @@ The secondary uses a **two-phase approach**: persist for durability
 (before ACK), then apply to DB file (after commit confirmation).
 
 **Prerequisites:** This model requires `committed_lsn` to be
-propagated to secondaries (B5 gap). Until B5 is resolved in the
-framework, committed_lsn must be piggybacked on replication items
-(e.g., as a field in the replication stream protocol) or persisted
-by the primary and fetched by secondaries on reconnection.
+propagated to secondaries. This is resolved — B5 fix adds
+`committed_lsn` to `ReplicationItem`, piggybacked on every
+replication message from primary to secondary.
 
 **Phase 1 — Persist and ACK (on receive):**
 
@@ -596,24 +595,7 @@ Client retry on timeout is safe because page-level replication is
 idempotent. On failover, the new primary has a consistent state —
 it just may be missing the last transaction from the old primary.
 
-### KP-2: B5 Gap Dependency (committed_lsn Propagation)
-
-The deferred-application model requires secondaries to know
-`committed_lsn` to trigger Phase 2 (apply to DB). The framework
-currently only sets `committed_lsn` on the primary
-(`actor.rs:275-276`). Secondaries never receive it.
-
-**Impact:** Without B5, Phase 2 never triggers and the secondary's
-DB file stays stale. The secondary has all data durably in
-`frames.log` but can't apply it.
-
-**Workaround until B5 is fixed:** Piggyback committed_lsn on the
-replication stream protocol — add a `committed_lsn` field to
-`ReplicationItem` that the primary sets on each item. The secondary
-reads it from incoming items and advances its local committed_lsn.
-This requires a minor protocol change in kubelicate-core.
-
-### KP-3: Per-Commit Synchronous Replication Throughput
+### KP-2: Per-Commit Synchronous Replication Throughput
 
 Every SQL COMMIT pays a full network RTT for quorum replication.
 With page-level payloads (~16KB per simple INSERT vs. ~100 bytes

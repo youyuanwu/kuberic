@@ -64,6 +64,7 @@ impl PrimarySender {
         replica_id: ReplicaId,
         address: String,
         quorum_tracker: Arc<tokio::sync::Mutex<QuorumTracker>>,
+        partition_state: Arc<crate::handles::PartitionState>,
     ) -> crate::Result<()> {
         if self.connections.contains_key(&replica_id) {
             return Ok(()); // already connected
@@ -90,12 +91,20 @@ impl PrimarySender {
         let rid = replica_id;
 
         // Spawn ACK reader
+        let ps = partition_state;
         tokio::spawn(async move {
             while let Some(result) = ack_stream.next().await {
                 match result {
                     Ok(ack) => {
                         debug!(replica_id = rid, lsn = ack.lsn, "received ACK");
-                        quorum_tracker.lock().await.ack(ack.lsn, rid);
+                        let mut tracker = quorum_tracker.lock().await;
+                        tracker.ack(ack.lsn, rid);
+                        // Update PartitionState so committed_lsn is always fresh,
+                        // even without a new data_rx item to trigger the read.
+                        // This fixes the off-by-one where the last op's committed_lsn
+                        // was never propagated because no subsequent op triggered
+                        // a PartitionState refresh.
+                        ps.set_committed_lsn(tracker.committed_lsn());
                     }
                     Err(e) => {
                         warn!(replica_id = rid, error = %e, "ACK stream error");

@@ -420,32 +420,31 @@ async fn test_operator_secondary_state_after_failover() {
     let new_primary = driver.primary_id().unwrap();
     assert_ne!(new_primary, 1);
 
-    // The surviving secondaries retain committed data.
-    // Some in-flight ops may be rolled back by UpdateEpoch if they weren't
-    // quorum-committed before the primary failed. With 3 replicas and
-    // write_quorum=2, most ops are committed immediately (primary + one
-    // secondary ACK). The last op may not have been committed if the ACK
-    // hadn't been processed yet.
+    // After failover at steady state: all 5 ops returned success to the
+    // client, so all 5 are quorum-committed. However, committed_lsn
+    // propagation to secondaries has a one-item lag (piggybacked on the
+    // NEXT item). The last op's committed_lsn=5 was never sent because
+    // there was no subsequent item. So the secondary sees committed=4
+    // and may roll back op 5.
+    //
+    // This is correct and matches SF's behavior: the rolled-back op
+    // will be re-replicated during catch-up from the new primary.
     let surviving_secondary = if new_primary == 2 { &pod3 } else { &pod2 };
-    {
-        let st = surviving_secondary.state.read().await;
-        assert!(
-            st.data.len() >= 4 && st.data.len() <= 5,
-            "surviving secondary should retain at least 4 of 5 entries (last may be uncommitted), got {}",
-            st.data.len()
-        );
-    }
-
-    // New primary should have the same data as surviving secondary
     let new_primary_pod = if new_primary == 2 { &pod2 } else { &pod3 };
-    {
-        let st = new_primary_pod.state.read().await;
-        assert!(
-            st.data.len() >= 4 && st.data.len() <= 5,
-            "new primary should have at least 4 of 5 entries, got {}",
-            st.data.len()
-        );
-    }
+
+    let secondary_len = surviving_secondary.state.read().await.data.len();
+    let primary_len = new_primary_pod.state.read().await.data.len();
+
+    assert_eq!(primary_len, 5, "new primary should have all 5 entries");
+    assert!(
+        (4..=5).contains(&secondary_len),
+        "surviving secondary may roll back last op due to committed_lsn lag, got {}",
+        secondary_len
+    );
+    assert!(
+        secondary_len <= primary_len,
+        "secondary should not have more data than primary"
+    );
 
     driver.delete_partition().await.unwrap();
 }

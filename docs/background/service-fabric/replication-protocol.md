@@ -159,6 +159,87 @@ that handles retries and flow control independently.
 
 ---
 
+### Committed LSN Propagation to Secondaries (from C++ source)
+
+The primary propagates its committed/completed LSN to secondaries so
+they can GC their operation queues and know which operations are
+globally committed.
+
+**Source:** `ReplicaManager.cpp`, `ReplicationSession.cpp`,
+`ReliableOperationSender.cpp`, `ReplicationOperationHeader.h`,
+`SecondaryReplicationReceiver.cpp`
+
+**Two LSN concepts (SF distinguishes these):**
+
+| Name | Meaning | Who computes | Who uses |
+|------|---------|-------------|----------|
+| `committedLSN` | Quorum-acknowledged by write quorum replicas | Primary (`ReplicaManager::GetProgress`, sorted ACKs at `quorumIndex`) | Primary queue management, user `replicate()` completion |
+| `completedLSN` | Acknowledged by ALL replicas (min of all receive ACKs, capped at committedLSN) | Primary (`ReplicaManager::GetProgress`) | Secondary queue GC |
+
+**Propagation mechanism — piggybacked on replication messages:**
+
+The primary includes `completedSequenceNumber` in the
+`ReplicationOperationHeader` of every replication message:
+
+```
+ReplicationSession::SendReplicateOperation(op, completedSeqNumber)
+  → ReplicationTransport::CreateReplicationOperationMessage(op, ..., completedSequenceNumber)
+    → ReplicationOperationHeader { ..., completedSequenceNumber_ }
+```
+
+The secondary extracts it in `ProcessReplicationOperation`:
+
+```
+SecondaryReplicationReceiver::ProcessReplicationOperation(batchOp, completedSequenceNumber)
+  if completedSequenceNumber != InvalidLSN:
+    replicationQueue_->UpdateCompleteHead(completedSequenceNumber + 1)
+    → GC: remove ops with LSN <= completedSequenceNumber
+```
+
+**How the cached value stays fresh — ACK-driven updates:**
+
+The `ReliableOperationSender` caches `completedSeqNumber_` (initialized
+to `InvalidLSN`). It's updated from the ACK processing path:
+
+```
+ACK arrives
+  → PrimaryReplicator::ReplicationAckMessageHandler
+    → session->UpdateAckProgress(receivedLSN, quorumLSN, ...)
+      → callback: UpdateProgressAndCatchupOperation
+        → ReplicaManager::UpdateProgress
+          → GetProgressCallerHoldsLock → computes new committedLSN, completedLSN
+          → UpdateProgressInQueueCallerHoldsLock → updates queue heads + commits
+            → ReliableOperationSender::Add/Open with new completedSeqNumber
+```
+
+At send time, the sender reads the cached `completedSeqNumber_` and
+includes it in the outbound message.
+
+**One-item lag:** The piggybacked value is read at send time. For the
+last op in a burst (no subsequent op to piggyback on), the committed
+value may lag by one. SF mitigates this with the `RequestAck` timer.
+
+**RequestAck periodic heartbeat:**
+
+The `ReliableOperationSender` has a retry timer that fires
+periodically. When it fires, it reads the latest `completedSeqNumber_`
+and can send a `RequestAck` message to the secondary even without new
+data ops. This ensures secondaries eventually learn the latest
+committed progress.
+
+```
+ReliableOperationSender::OnTimerCallback
+  → reads completedSeqNumber_
+  → if requestAck needed: opCallback_(nullptr, true, completedSeqNumber)
+    → ReplicationSession::SendRequestAck()
+    → secondary receives RequestAck with updated completedSequenceNumber
+```
+
+Without this heartbeat, the last op's committed status is only
+propagated when the next data op is sent.
+
+---
+
 
 ## Quorum and Consistency
 

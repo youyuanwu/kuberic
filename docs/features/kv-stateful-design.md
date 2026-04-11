@@ -244,15 +244,15 @@ When `UpdateEpoch(previous_epoch_last_lsn)` arrives, the service:
 2. Calls `rollback_to(previous_epoch_last_lsn)` — reloads snapshot +
    partial WAL replay + WAL rewrite
 
-**Limitation (B5 gap):** `PartitionState::committed_lsn()` is never
-set on secondaries, so `previous_epoch_last_lsn` arrives as 0. Rollback
-is guarded (`> 0` check) to avoid wiping committed data. Full A6 fix
-requires the framework to propagate committed_lsn to secondaries.
+**UpdateEpoch rollback (A6 + B5):** With B5 fix, `committed_lsn` is
+propagated to secondaries via `ReplicationItem`. `previous_epoch_last_lsn`
+is now correct. Rollback fires when `previous_epoch_last_lsn < current_lsn`,
+reloading from snapshot + partial WAL replay. Drain tasks are NOT cancelled
+during rollback — the replication stream continues (matches SF).
 
 ### Remaining Work
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `KvPod::crash()` / `restart()` | Designed | In testing.md. Now meaningful with per-op WAL writes |
-| Full A6 rollback | Blocked on B5 | Needs framework to propagate committed_lsn to secondaries |
 | B0: QuorumTracker timeout | Pre-existing gap | `replicate()` hangs forever if all secondaries die |
