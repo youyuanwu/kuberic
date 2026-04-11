@@ -263,9 +263,9 @@ SF-aligned (fire-and-retry):
 **This is a future architectural change.** Current synchronous approach
 is correct for MVP and small datasets. All tests pass with it.
 
-### A6. Uncommitted Operations Not Rolled Back on Epoch Change
+### A6. Uncommitted Operations Not Rolled Back on Epoch Change — ⚠️ Partially Fixed
 
-**Severity:** 🔴 High (data corruption for non-idempotent operations)
+**Severity:** 🟡 Medium (reduced — KV app implements rollback, framework gap remains)
 **Affects:** `SecondaryReceiver`, user services, `StateProviderEvent`
 **Files:** `secondary.rs`, `events.rs`, kv-stateful `service.rs`
 
@@ -280,19 +280,19 @@ On epoch change, the replicator truncates its in-memory log back to
 But the **user service's state is NOT rolled back** — it still contains
 the uncommitted operation.
 
-**Scenario:**
-```
-1. Primary has LSN 5 committed, sends LSN 6 to secondaries
-2. Secondary applies LSN 6 to user state, calls acknowledge()
-3. Primary crashes BEFORE quorum for LSN 6 is met
-4. Failover: secondary promoted with new epoch
-5. Replicator truncates log: removes LSN 6 from in-memory queue
-6. User service still has LSN 6 applied ← INCONSISTENT
-```
+**What's fixed (KV example — Option 1 user-side rollback):**
+The KV app now implements rollback in its `UpdateEpoch` handler:
+1. Cancels active drain tasks (prevents races with rollback)
+2. Calls `rollback_to(previous_epoch_last_lsn)` — reloads snapshot +
+   partial WAL replay + WAL rewrite
 
-For idempotent operations (key-value puts), this is usually harmless.
-For non-idempotent operations (counters, queues, financial ledgers),
-this causes data corruption.
+**Remaining gap (B1 — committed_lsn not propagated to secondaries):**
+`PartitionState::committed_lsn()` is only set by the replicator actor
+on the primary. Secondaries never receive committed_lsn updates, so
+`previous_epoch_last_lsn` arrives as 0. The rollback is guarded with
+a `> 0` check to avoid wiping committed data. Full fix requires the
+framework to propagate committed_lsn to secondaries (e.g., piggyback
+on replication stream ACKs or via periodic configuration updates).
 
 **SF solution:** `IStateProvider::UpdateEpoch(epoch, previousEpochLastLsn)`
 callback tells the user service to truncate state beyond
@@ -300,50 +300,24 @@ callback tells the user service to truncate state beyond
 (Reliable Collections), the `LoggingReplicator` handles this
 automatically by undoing uncommitted transactions from its WAL.
 
-**Our current code (KV example) — no rollback:**
+**Our current code (KV example) — rollback with B1 guard:**
 ```rust
 StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
-    info!(previous_epoch_last_lsn, "epoch updated");
-    let _ = reply.send(Ok(()));  // No rollback!
+    let current_lsn = state.read().await.last_applied_lsn;
+    if previous_epoch_last_lsn > 0 && previous_epoch_last_lsn < current_lsn {
+        // Cancel drains, then rollback
+        state.write().await.rollback_to(previous_epoch_last_lsn).await;
+    }
+    let _ = reply.send(Ok(()));
 }
 ```
 
-**Fix options (choose one):**
-
-1. **User-side rollback (SF V1 model):** Document that user services
-   MUST implement rollback in `UpdateEpoch`. Pass `previous_epoch_last_lsn`
-   and require user to discard state beyond that LSN. Hard for arbitrary
-   state stores (how do you "undo" a HashMap insert?).
-
-2. **Defer user dispatch until committed (simplest):** Secondary ACKs
-   to primary after WAL persist (Option C), but does NOT dispatch to
-   user's `OperationStream` until the operation is committed. Committed
-   notification comes when primary's `committed_lsn` advances. No
-   rollback ever needed because user only sees committed ops. Adds
-   latency (user apply waits for quorum round-trip).
-
-3. **Framework WAL rollback (Option C complement):** The replicator
-   WAL tracks committed vs uncommitted entries. On epoch change,
-   truncate WAL beyond `committed_lsn`. On user service restart, replay
-   only committed WAL entries. Uncommitted ops never reach user state
-   because the WAL is the source of truth for replay.
-
-**Recommendation:** Two complementary approaches for different contexts:
-
-- **Option 1 (user-side rollback):** For apps that can implement rollback
-  — e.g., KV stores that persist via snapshot + WAL and can reload from
-  a known-committed snapshot. The KV example app uses this approach. See
-  `kv-stateful-design.md` § UpdateEpoch Rollback. Requires cancelling
-  drain tasks before rollback to avoid races.
-
-- **Option 2 (defer dispatch until committed):** The framework-level
-  solution for apps that can't implement rollback. Would require changes
-  to `SecondaryReceiver` — defer dispatch to user's `OperationStream`
-  until the primary confirms the op is committed. Changes ACK semantics:
-  - Current: ACK = "user applied + acknowledged"
-  - New: ACK = "WAL persisted" (fast), user apply happens after commit
-  This aligns with Option C in `wal-persistence.md` — the two-level ACK
-  model. Deferred to future framework WAL work.
+**Future framework-level fix (Option 2 — defer dispatch until committed):**
+For apps that can't implement rollback, the framework could defer
+dispatch to user's `OperationStream` until the primary confirms the op
+is committed. This changes ACK semantics (ACK = WAL persisted, user
+apply after commit). Aligns with Option C in `wal-persistence.md`.
+Deferred to future framework WAL work.
 
 ---
 
@@ -727,15 +701,15 @@ design work needed — just implementation.
 
 | Category | Count | Top Priority |
 |----------|-------|-------------|
-| A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 uncommitted rollback** |
+| A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ⚠️ partial (B1 gap remains)** |
 | B: Operational Resilience (needs design) | 5 | B0 partially fixed (QuorumTracker timeout remaining), B2 timeouts |
 | C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
 | **Total** | **29** | |
 
 **Recommended order:**
-1. **A6 uncommitted rollback** — data corruption for non-idempotent ops
-2. B0 QuorumTracker timeout — prevents write hangs on dual stream failure
+1. B0 QuorumTracker timeout — prevents write hangs on dual stream failure
+2. **B1 (new): Propagate committed_lsn to secondaries** — unblocks full A6 rollback
 3. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
 4. B2 (short RPC timeouts) — prevents hangs on control-plane calls
 5. A3 failover candidate retry — failover resilience
