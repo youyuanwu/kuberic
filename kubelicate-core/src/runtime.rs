@@ -5,10 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::error::{KubelicateError, Result};
-use crate::events::{
-    LifecycleEvent, ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent, ServiceContext,
-    StateProviderEvent,
-};
+use crate::events::{LifecycleEvent, ReplicateRequest, ReplicatorControlEvent, StateProviderEvent};
 use crate::handles::{PartitionHandle, PartitionState, StateReplicatorHandle};
 use crate::types::{AccessStatus, CancellationToken, Epoch, FaultType, OpenMode, Role};
 
@@ -65,20 +62,21 @@ impl KubelicateRuntimeBuilder {
     /// Build the runtime, returning it along with the channels needed to
     /// spawn the replicator actor and the user service event receivers.
     pub fn build(self) -> RuntimeBundle {
-        let channels = ReplicatorChannels::new(self.control_buffer, self.data_buffer);
+        let (control_tx, control_rx) = mpsc::channel(self.control_buffer);
+        let (data_tx, data_rx) = mpsc::channel(self.data_buffer);
         let state = Arc::new(PartitionState::new());
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(self.service_buffer);
         let (state_provider_tx, state_provider_rx) = mpsc::channel(self.service_buffer);
         let (fault_tx, fault_rx) = mpsc::channel(DEFAULT_FAULT_BUFFER);
 
         let partition = Arc::new(PartitionHandle::new(state.clone(), fault_tx));
-        let replicator_handle = StateReplicatorHandle::new(channels.data_tx.clone(), state.clone());
+        let replicator_handle = StateReplicatorHandle::new(data_tx.clone(), state.clone());
 
         let runtime = KubelicateRuntime {
             lifecycle_tx,
             state_provider_tx,
-            control_tx: channels.control_tx,
-            data_tx: channels.data_tx,
+            control_tx,
+            data_tx,
             state: state.clone(),
             fault_rx,
             reply_timeout: self.reply_timeout,
@@ -87,8 +85,8 @@ impl KubelicateRuntimeBuilder {
 
         RuntimeBundle {
             runtime,
-            replicator_control_rx: channels.control_rx,
-            replicator_data_rx: channels.data_rx,
+            replicator_control_rx: control_rx,
+            replicator_data_rx: data_rx,
             lifecycle_rx,
             state_provider_rx,
             partition,
@@ -203,29 +201,34 @@ impl KubelicateRuntime {
     // Lifecycle operations (called by the operator or test harness)
     // -----------------------------------------------------------------------
 
-    /// Open the replicator, then deliver Open event to the user service.
-    pub async fn open(
-        &self,
-        mode: OpenMode,
-        partition: Arc<PartitionHandle>,
-        replicator_handle: StateReplicatorHandle,
-    ) -> Result<()> {
-        // 1. Open replicator
+    /// Open the replicator. In the new API, the user creates the replicator
+    /// in the Open callback. This legacy runtime pre-creates everything and
+    /// sends OpenContext for the user to create the replicator.
+    ///
+    /// For backward compatibility with tests that use RuntimeBundle's
+    /// pre-created channels, this method sends a minimal OpenContext and
+    /// the test's Open handler returns a ReplicatorHandle that wraps
+    /// the pre-created control_tx.
+    pub async fn open(&self, mode: OpenMode) -> Result<()> {
+        // 1. Open replicator directly (we still hold control_tx)
         self.send_control(|reply| ReplicatorControlEvent::Open { mode, reply })
             .await?;
 
-        // 2. Deliver Open to user via lifecycle channel
-        self.send_lifecycle(|reply| LifecycleEvent::Open {
-            ctx: ServiceContext {
-                partition,
-                replicator: replicator_handle,
-                copy_stream: None,
-                replication_stream: None,
-                token: self.token.child_token(),
-            },
-            reply,
-        })
-        .await?;
+        // 2. Deliver Open to user — they return a ReplicatorHandle
+        // For KubelicateRuntime tests, the user returns a handle wrapping
+        // the same control_tx we already have (no-op separation).
+        let _handle: crate::replicator::ReplicatorHandle = self
+            .send_lifecycle(|reply| LifecycleEvent::Open {
+                ctx: crate::replicator::OpenContext {
+                    replica_id: 0, // tests don't use this
+                    open_mode: mode,
+                    data_bind: "127.0.0.1:0".to_string(),
+                    token: self.token.child_token(),
+                    fault_tx: mpsc::channel(4).0,
+                },
+                reply,
+            })
+            .await?;
 
         Ok(())
     }
@@ -419,8 +422,7 @@ mod tests {
             .build();
 
         let state = bundle.state.clone();
-        let partition = bundle.partition.clone();
-        let _replicator_handle = bundle.replicator_handle;
+        let _partition = bundle.partition.clone();
         let runtime = bundle.runtime;
         let mut lifecycle_rx = bundle.lifecycle_rx;
         let mut _state_provider_rx = bundle.state_provider_rx;
@@ -437,16 +439,25 @@ mod tests {
         });
 
         // Spawn the user lifecycle event loop
+        let user_replicator = bundle.replicator_handle;
         let user_handle = tokio::spawn(async move {
-            let mut _svc_partition = None;
             let mut svc_replicator = None;
 
             while let Some(event) = lifecycle_rx.recv().await {
                 match event {
-                    LifecycleEvent::Open { ctx, reply } => {
-                        _svc_partition = Some(ctx.partition);
-                        svc_replicator = Some(ctx.replicator);
-                        let _ = reply.send(Ok(()));
+                    LifecycleEvent::Open { ctx: _, reply } => {
+                        // In KubelicateRuntime tests, the replicator is pre-created.
+                        // We return a dummy handle since the runtime already opened
+                        // the replicator directly.
+                        svc_replicator = Some(user_replicator.clone());
+                        let dummy_handle = crate::replicator::ReplicatorHandle::new(
+                            mpsc::channel(1).0,
+                            Arc::new(PartitionState::new()),
+                            mpsc::channel(1).0,
+                            String::new(),
+                            CancellationToken::new(),
+                        );
+                        let _ = reply.send(Ok(dummy_handle));
                     }
                     LifecycleEvent::ChangeRole { new_role, reply } => {
                         if new_role == Role::Primary {
@@ -475,14 +486,7 @@ mod tests {
         // --- Drive lifecycle as the operator would ---
 
         // 1. Open
-        runtime
-            .open(
-                OpenMode::New,
-                partition.clone(),
-                StateReplicatorHandle::new(runtime.data_tx.clone(), state.clone()),
-            )
-            .await
-            .unwrap();
+        runtime.open(OpenMode::New).await.unwrap();
 
         // Status: not primary yet
         assert_eq!(state.read_status(), AccessStatus::NotPrimary);
@@ -567,7 +571,14 @@ mod tests {
             while let Some(event) = lifecycle_rx.recv().await {
                 match event {
                     LifecycleEvent::Open { reply, .. } => {
-                        let _ = reply.send(Ok(()));
+                        let dummy_handle = crate::replicator::ReplicatorHandle::new(
+                            mpsc::channel(1).0,
+                            Arc::new(PartitionState::new()),
+                            mpsc::channel(1).0,
+                            String::new(),
+                            CancellationToken::new(),
+                        );
+                        let _ = reply.send(Ok(dummy_handle));
                     }
                     LifecycleEvent::ChangeRole { reply, .. } => {
                         let _ = reply.send(Ok(String::new()));
@@ -582,14 +593,7 @@ mod tests {
         });
 
         // Open but don't promote
-        runtime
-            .open(
-                OpenMode::New,
-                bundle.partition.clone(),
-                StateReplicatorHandle::new(runtime.data_tx.clone(), state.clone()),
-            )
-            .await
-            .unwrap();
+        runtime.open(OpenMode::New).await.unwrap();
 
         // Try to replicate — should fail fast
         let repl = StateReplicatorHandle::new(runtime.data_tx.clone(), state.clone());

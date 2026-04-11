@@ -48,26 +48,31 @@ impl KvPod {
         let client_address = listener.local_addr().unwrap().to_string();
         drop(listener);
 
+        // Pre-bind the data plane port so we know the address before Open.
+        // The address is passed via OpenContext.data_bind, and WalReplicator::create()
+        // binds to it inside the user's Open handler.
+        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let data_bind = format!("127.0.0.1:{}", data_port);
+        let data_address = format!("http://{}", data_bind);
+        drop(data_listener); // release — WalReplicator::create() will rebind
+
         let bundle = PodRuntime::builder(id)
             .reply_timeout(reply_timeout)
+            .data_bind(data_bind)
             .build()
             .await
             .unwrap();
 
         let control_address = bundle.control_address.clone();
-        let data_address = bundle.data_address.clone();
         let state: SharedState =
             Arc::new(RwLock::new(KvState::open(data_dir.clone()).await.unwrap()));
 
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle = tokio::spawn(crate::service::run_service(
-            bundle.lifecycle_rx,
-            bundle.state_provider_rx,
-            st,
-            bind,
-        ));
+        let service_handle =
+            tokio::spawn(crate::service::run_service(bundle.lifecycle_rx, st, bind));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 

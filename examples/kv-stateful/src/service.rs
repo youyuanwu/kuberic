@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use kubelicate_core::events::{LifecycleEvent, ServiceContext, StateProviderEvent};
+use kubelicate_core::events::{LifecycleEvent, StateProviderEvent};
+use kubelicate_core::handles::StateReplicatorHandle;
+use kubelicate_core::replicator::WalReplicator;
 use kubelicate_core::types::{CancellationToken, Operation, OperationStream, Role};
 use tokio::sync::mpsc;
 use tracing::info;
@@ -9,13 +11,20 @@ use crate::state::{KvOp, SharedState, drain_stream};
 
 /// Main service event loop. Processes lifecycle and state provider events
 /// with biased select (lifecycle takes priority).
+///
+/// In the new API, the user creates the replicator in the Open handler
+/// and returns a ReplicatorHandle to the runtime.
 pub async fn run_service(
     mut lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
-    mut state_provider_rx: mpsc::Receiver<StateProviderEvent>,
     state: SharedState,
     client_bind: String,
 ) {
-    let mut ctx: Option<ServiceContext> = None;
+    let mut partition = None;
+    let mut replicator: Option<StateReplicatorHandle> = None;
+    let mut state_provider_rx: Option<mpsc::Receiver<StateProviderEvent>> = None;
+    let mut copy_stream: Option<OperationStream> = None;
+    let mut replication_stream: Option<OperationStream> = None;
+    let mut token: Option<CancellationToken> = None;
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut bg_token: Option<CancellationToken> = None;
     let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -28,24 +37,38 @@ pub async fn run_service(
             biased;
 
             Some(event) = lifecycle_rx.recv() => match event {
-                LifecycleEvent::Open { ctx: c, reply } => {
-                    info!("service opened");
-                    ctx = Some(c);
-                    let _ = reply.send(Ok(()));
+                LifecycleEvent::Open { ctx, reply } => {
+                    info!("service opened — creating replicator");
+                    // User creates the replicator and returns the handle
+                    match WalReplicator::create(
+                        ctx.replica_id,
+                        &ctx.data_bind,
+                        ctx.fault_tx.clone(),
+                    ).await {
+                        Ok((handle, handles)) => {
+                            partition = Some(handles.partition);
+                            replicator = Some(handles.replicator);
+                            copy_stream = handles.copy_stream;
+                            replication_stream = handles.replication_stream;
+                            state_provider_rx = Some(handles.state_provider_rx);
+                            token = Some(ctx.token);
+                            let _ = reply.send(Ok(handle));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to create replicator");
+                            let _ = reply.send(Err(e));
+                        }
+                    }
                 }
                 LifecycleEvent::ChangeRole { new_role, reply } => {
                     info!(?new_role, "role changed");
 
                     if new_role == Role::ActiveSecondary {
                         // IdleSecondary → ActiveSecondary: let copy drain finish
-                        // naturally without cancelling. The copy stream is already
-                        // closed (sender dropped by gRPC handler), so the drain
-                        // completes once remaining items are consumed. This ensures
-                        // no copy items are lost — critical for non-idempotent ops.
                         for h in bg_handles.drain(..) {
                             let _ = h.await;
                         }
-                        // Checkpoint after copy completes — all copied state is committed
+                        // Checkpoint after copy completes
                         {
                             let mut guard = state.write().await;
                             guard.committed_lsn = guard.last_applied_lsn;
@@ -54,45 +77,40 @@ pub async fn run_service(
                             }
                         }
                     } else {
-                        // Cancel previous background tasks for other transitions
-                        if let Some(token) = bg_token.take() {
-                            token.cancel();
+                        if let Some(t) = bg_token.take() {
+                            t.cancel();
                         }
                         for h in bg_handles.drain(..) {
                             let _ = h.await;
                         }
                     }
 
-                    let token = CancellationToken::new();
-                    bg_token = Some(token.clone());
-
-                    let c = ctx.as_mut().unwrap();
+                    let t = CancellationToken::new();
+                    bg_token = Some(t.clone());
 
                     match new_role {
                         Role::IdleSecondary => {
-                            if let Some(copy) = c.copy_stream.take() {
+                            if let Some(cs) = copy_stream.take() {
                                 let st = state.clone();
-                                let t = token.clone();
                                 bg_handles.push(tokio::spawn(
-                                    drain_stream(st, copy, t, "copy"),
+                                    drain_stream(st, cs, t.clone(), "copy"),
                                 ));
                             }
                         }
                         Role::ActiveSecondary => {
-                            if let Some(repl) = c.replication_stream.take() {
+                            if let Some(rs) = replication_stream.take() {
                                 let st = state.clone();
-                                let t = token.clone();
                                 bg_handles.push(tokio::spawn(
-                                    drain_stream(st, repl, t, "replication"),
+                                    drain_stream(st, rs, t.clone(), "replication"),
                                 ));
                             }
                         }
                         Role::Primary => {
                             if client_server_handle.is_none() {
                                 let srv_state = state.clone();
-                                let partition = c.partition.clone();
-                                let replicator = c.replicator.clone();
-                                let srv_token = c.token.clone();
+                                let p = partition.as_ref().unwrap().clone();
+                                let r = replicator.as_ref().unwrap().clone();
+                                let srv_token = token.as_ref().unwrap().clone();
                                 let shutdown = CancellationToken::new();
                                 let shutdown_cp = shutdown.clone();
                                 let bind = client_bind.clone();
@@ -100,7 +118,7 @@ pub async fn run_service(
                                 client_server_shutdown = Some(shutdown);
                                 client_server_handle = Some(tokio::spawn(async move {
                                     run_client_server(
-                                        bind, srv_state, partition, replicator,
+                                        bind, srv_state, p, r,
                                         srv_token, shutdown_cp,
                                     ).await;
                                 }));
@@ -147,7 +165,12 @@ pub async fn run_service(
                 }
             },
 
-            Some(event) = state_provider_rx.recv() => match event {
+            Some(event) = async {
+                match state_provider_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match event {
                 StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
                     // A6: Rollback uncommitted ops on epoch change.
                     // Only rollback when previous_epoch_last_lsn is meaningful

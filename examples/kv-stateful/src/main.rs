@@ -58,15 +58,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(
         control = %control_address,
-        data = %bundle.data_address,
         client_bind = %args.client_bind,
-        "ready"
+        "ready (data address will be logged after Open)"
     );
 
     let runtime_handle = tokio::spawn(bundle.runtime.serve());
     let service_handle = tokio::spawn(kv_stateful::service::run_service(
         bundle.lifecycle_rx,
-        bundle.state_provider_rx,
         state.clone(),
         args.client_bind.clone(),
     ));

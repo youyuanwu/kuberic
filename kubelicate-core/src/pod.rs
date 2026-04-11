@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -6,48 +5,14 @@ use tonic::transport::Server;
 use tracing::{info, warn};
 
 use crate::error::{KubelicateError, Result};
-use crate::events::{
-    LifecycleEvent, ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent, ServiceContext,
-    StateProviderEvent,
-};
-use crate::handles::{PartitionHandle, PartitionState, StateReplicatorHandle};
-use crate::proto::replicator_data_server::ReplicatorDataServer;
-use crate::replicator::actor::WalReplicatorActor;
-use crate::replicator::secondary::{SecondaryReceiver, SecondaryState};
+use crate::events::{LifecycleEvent, ReplicatorControlEvent};
+use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
     AccessStatus, CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
     ReplicaSetConfig, ReplicaSetQuorumMode, Role,
 };
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
-
-// ---------------------------------------------------------------------------
-// Helpers for copy protocol (OperationStream ↔ Vec materialization)
-// ---------------------------------------------------------------------------
-
-/// Collect all operations from a stream into a Vec.
-async fn collect_stream(mut stream: crate::types::OperationStream) -> Vec<(Lsn, bytes::Bytes)> {
-    let mut ops = Vec::new();
-    while let Some(op) = stream.get_operation().await {
-        ops.push((op.lsn, op.data.clone()));
-        op.acknowledge();
-    }
-    ops
-}
-
-/// Create an OperationStream from materialized operations.
-fn vec_to_stream(ops: Vec<(Lsn, bytes::Bytes)>) -> crate::types::OperationStream {
-    let (tx, stream) = crate::types::OperationStream::channel(ops.len().max(1));
-    tokio::spawn(async move {
-        for (lsn, data) in ops {
-            let op = crate::types::Operation::new(lsn, data, None);
-            if tx.send(op).await.is_err() {
-                break;
-            }
-        }
-    });
-    stream
-}
 
 // ---------------------------------------------------------------------------
 // RuntimeCommand — what the gRPC control server sends to the runtime
@@ -119,28 +84,21 @@ pub struct StatusInfo {
 // ---------------------------------------------------------------------------
 
 pub struct PodRuntime {
-    control_tx: mpsc::Sender<ReplicatorControlEvent>,
-    data_tx: mpsc::Sender<ReplicateRequest>,
     lifecycle_tx: mpsc::Sender<LifecycleEvent>,
-    state_provider_tx: mpsc::Sender<StateProviderEvent>,
     cmd_rx: mpsc::Receiver<RuntimeCommand>,
-    state: Arc<PartitionState>,
+    replicator_handle: Option<ReplicatorHandle>,
     shutdown: CancellationToken,
     reply_timeout: Duration,
     role: Role,
     epoch: Epoch,
-    /// Replication stream for secondary. Moved into ServiceContext at Open.
-    replication_stream: Option<crate::types::OperationStream>,
-    /// Copy stream for secondary. Moved into ServiceContext at Open.
-    copy_stream: Option<crate::types::OperationStream>,
+    replica_id: ReplicaId,
+    data_bind: String,
 }
 
 pub struct PodRuntimeBundle {
     pub runtime: PodRuntime,
     pub lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
-    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
     pub control_address: String,
-    pub data_address: String,
 }
 
 pub struct PodRuntimeBuilder {
@@ -176,50 +134,14 @@ impl PodRuntimeBuilder {
     }
 
     pub async fn build(self) -> Result<PodRuntimeBundle> {
-        let channels = ReplicatorChannels::new(16, 256);
-        let state = Arc::new(PartitionState::new());
-        let secondary_state = Arc::new(SecondaryState::new());
         let shutdown = CancellationToken::new();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(16);
-        let (state_provider_tx, state_provider_rx) = mpsc::channel(16);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
-        // Create replication stream: SecondaryReceiver → OperationStream → user
-        let (repl_op_tx, repl_op_rx) = mpsc::channel(256);
-        let replication_stream = crate::types::OperationStream::new(repl_op_rx);
-
-        // Create copy stream: CopyStream RPC → OperationStream → user
-        let (copy_op_tx, copy_op_rx) = mpsc::channel(256);
-        let copy_stream = crate::types::OperationStream::new(copy_op_rx);
-
-        // Start data plane gRPC server (persisted mode + copy support)
-        let data_receiver = SecondaryReceiver::with_streams(
-            secondary_state,
-            state.clone(),
-            repl_op_tx,
-            copy_op_tx,
-            state_provider_tx.clone(),
-        );
-        let data_listener = tokio::net::TcpListener::bind(&self.data_bind)
-            .await
-            .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
-        let data_addr = data_listener.local_addr().unwrap();
-        let data_address = format!("http://{}", data_addr);
-
-        let data_shutdown = shutdown.child_token();
-        tokio::spawn(async move {
-            let _ = Server::builder()
-                .add_service(ReplicatorDataServer::new(data_receiver))
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(data_listener),
-                    data_shutdown.cancelled(),
-                )
-                .await;
-        });
-
-        // Start control plane gRPC server (routes through cmd_tx → runtime)
-        let control_server =
-            crate::grpc::server::ControlServer::new(self.replica_id, cmd_tx, state.clone());
+        // Control plane gRPC server (runtime-owned, unchanged)
+        // PartitionState is not available yet — it's created by the replicator
+        // at Open time. ControlServer needs to work without it initially.
+        let control_server = crate::grpc::server::ControlServer::new(self.replica_id, cmd_tx);
         let control_listener = tokio::net::TcpListener::bind(&self.control_bind)
             .await
             .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
@@ -241,45 +163,30 @@ impl PodRuntimeBuilder {
                 .await;
         });
 
-        // Start replicator actor
-        let actor = WalReplicatorActor::new(self.replica_id);
-        let state_cp = state.clone();
-        tokio::spawn(async move {
-            actor
-                .run(channels.control_rx, channels.data_rx, state_cp)
-                .await;
-        });
-
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         info!(
             replica_id = self.replica_id,
             %control_address,
-            %data_address,
-            "pod runtime started"
+            "pod runtime started (replicator deferred to Open)"
         );
 
         let runtime = PodRuntime {
-            control_tx: channels.control_tx,
-            data_tx: channels.data_tx,
             lifecycle_tx,
-            state_provider_tx,
             cmd_rx,
-            state,
+            replicator_handle: None,
             shutdown,
             reply_timeout: self.reply_timeout,
             role: Role::None,
             epoch: Epoch::default(),
-            replication_stream: Some(replication_stream),
-            copy_stream: Some(copy_stream),
+            replica_id: self.replica_id,
+            data_bind: self.data_bind,
         };
 
         Ok(PodRuntimeBundle {
             runtime,
             lifecycle_rx,
-            state_provider_rx,
             control_address,
-            data_address,
         })
     }
 }
@@ -309,7 +216,10 @@ impl PodRuntime {
                     break;
                 }
                 RuntimeCommand::ChangeRole { epoch, role, reply } => {
-                    let _ = reply.send(self.handle_change_role(epoch, role).await);
+                    let _ = reply.send(match self.require_handle() {
+                        Ok(_) => self.handle_change_role(epoch, role).await,
+                        Err(e) => Err(e),
+                    });
                 }
                 RuntimeCommand::UpdateEpoch { epoch, reply } => {
                     let _ = reply.send(self.handle_update_epoch(epoch).await);
@@ -347,9 +257,7 @@ impl PodRuntime {
                     );
                 }
                 RuntimeCommand::BuildReplica { replica, reply } => {
-                    // Start buffering synchronously — send_to_all is now
-                    // non-blocking (try_send) so the actor processes this
-                    // immediately without blocking on slow secondaries.
+                    // Tell actor to buffer (same as before)
                     let _ = self
                         .send_replicator_control(|r| ReplicatorControlEvent::BuildReplica {
                             replica: replica.clone(),
@@ -357,20 +265,22 @@ impl PodRuntime {
                         })
                         .await;
 
-                    // Spawn the copy protocol to background
-                    let state_provider_tx = self.state_provider_tx.clone();
-                    let state = self.state.clone();
-                    let reply_timeout = self.reply_timeout;
-                    tokio::spawn(async move {
-                        let result = run_build_replica_copy(
-                            replica,
-                            state_provider_tx,
-                            state,
-                            reply_timeout,
-                        )
-                        .await;
-                        let _ = reply.send(result);
-                    });
+                    // Spawn the copy protocol in background
+                    if let Some(handle) = &self.replicator_handle {
+                        let state_provider_tx = handle.state_provider_tx().clone();
+                        let state = handle.state().clone();
+                        let reply_timeout = self.reply_timeout;
+                        tokio::spawn(async move {
+                            let result = run_build_replica_copy(
+                                replica,
+                                state_provider_tx,
+                                state,
+                                reply_timeout,
+                            )
+                            .await;
+                            let _ = reply.send(result);
+                        });
+                    }
                 }
                 RuntimeCommand::RemoveReplica { replica_id, reply } => {
                     let _ = reply.send(
@@ -386,18 +296,22 @@ impl PodRuntime {
                 }
                 RuntimeCommand::RevokeWriteStatus { reply } => {
                     info!("revoking write status for switchover");
-                    self.state
-                        .set_write_status(AccessStatus::ReconfigurationPending);
+                    if let Some(handle) = &self.replicator_handle {
+                        handle
+                            .state()
+                            .set_write_status(AccessStatus::ReconfigurationPending);
+                    }
                     let _ = reply.send(Ok(()));
                 }
                 RuntimeCommand::GetStatus { reply } => {
+                    let handle = self.replicator_handle.as_ref();
                     let _ = reply.send(StatusInfo {
                         role: self.role,
                         epoch: self.epoch,
-                        current_progress: self.state.current_progress(),
-                        catch_up_capability: self.state.catch_up_capability(),
-                        committed_lsn: self.state.committed_lsn(),
-                        healthy: true,
+                        current_progress: handle.map_or(0, |h| h.state().current_progress()),
+                        catch_up_capability: handle.map_or(0, |h| h.state().catch_up_capability()),
+                        committed_lsn: handle.map_or(0, |h| h.state().committed_lsn()),
+                        healthy: handle.is_some(),
                     });
                 }
             }
@@ -409,33 +323,49 @@ impl PodRuntime {
     // Command handlers with correct ordering
     // -----------------------------------------------------------------------
 
+    /// Get handle or return error for pre-Open commands.
+    fn require_handle(&self) -> Result<&ReplicatorHandle> {
+        self.replicator_handle
+            .as_ref()
+            .ok_or(KubelicateError::Internal("replicator not opened".into()))
+    }
+
     async fn handle_open(&mut self, mode: OpenMode) -> Result<()> {
-        // 1. Open replicator
-        self.send_replicator_control(|reply| ReplicatorControlEvent::Open { mode, reply })
+        if self.replicator_handle.is_some() {
+            return Err(KubelicateError::Internal("already opened".into()));
+        }
+
+        // 1. Send OpenContext to user, receive ReplicatorHandle back
+        let (fault_tx, _fault_rx) = mpsc::channel(4);
+
+        let handle: ReplicatorHandle = self
+            .send_lifecycle(|reply| LifecycleEvent::Open {
+                ctx: OpenContext {
+                    replica_id: self.replica_id,
+                    open_mode: mode,
+                    data_bind: self.data_bind.clone(),
+                    token: self.shutdown.child_token(),
+                    fault_tx,
+                },
+                reply,
+            })
             .await?;
 
-        // 2. Create handles and deliver Open to user via lifecycle channel
-        let partition = Arc::new(PartitionHandle::new(self.state.clone(), mpsc::channel(4).0));
-        let replicator_handle =
-            StateReplicatorHandle::new(self.data_tx.clone(), self.state.clone());
+        // 2. Open the replicator (via channel)
+        handle
+            .send_control(
+                |r| ReplicatorControlEvent::Open { mode, reply: r },
+                self.reply_timeout,
+            )
+            .await?;
 
-        // Move streams out before borrowing self for send_lifecycle
-        let replication_stream = self.replication_stream.take();
-        let copy_stream = self.copy_stream.take();
-        let token = self.shutdown.child_token();
+        info!(
+            data_address = %handle.data_address(),
+            "replicator opened"
+        );
 
-        self.send_lifecycle(|reply| LifecycleEvent::Open {
-            ctx: ServiceContext {
-                partition,
-                replicator: replicator_handle,
-                copy_stream,
-                replication_stream,
-                token,
-            },
-            reply,
-        })
-        .await?;
-
+        // 3. Store handle for future lifecycle calls
+        self.replicator_handle = Some(handle);
         Ok(())
     }
 
@@ -444,14 +374,20 @@ impl PodRuntime {
         let is_promotion = new_role == Role::Primary
             || (new_role == Role::ActiveSecondary && old_role == Role::IdleSecondary);
 
+        let handle = self.require_handle()?;
+
         if is_promotion {
             // Promotion: replicator first, then status, then user
-            self.send_replicator_control(|reply| ReplicatorControlEvent::ChangeRole {
-                epoch,
-                role: new_role,
-                reply,
-            })
-            .await?;
+            handle
+                .send_control(
+                    |reply| ReplicatorControlEvent::ChangeRole {
+                        epoch,
+                        role: new_role,
+                        reply,
+                    },
+                    self.reply_timeout,
+                )
+                .await?;
             self.set_status_for_role(new_role);
             let _: String = self
                 .send_lifecycle(|reply| LifecycleEvent::ChangeRole { new_role, reply })
@@ -462,12 +398,16 @@ impl PodRuntime {
             let _: String = self
                 .send_lifecycle(|reply| LifecycleEvent::ChangeRole { new_role, reply })
                 .await?;
-            self.send_replicator_control(|reply| ReplicatorControlEvent::ChangeRole {
-                epoch,
-                role: new_role,
-                reply,
-            })
-            .await?;
+            handle
+                .send_control(
+                    |reply| ReplicatorControlEvent::ChangeRole {
+                        epoch,
+                        role: new_role,
+                        reply,
+                    },
+                    self.reply_timeout,
+                )
+                .await?;
         }
 
         self.role = new_role;
@@ -476,65 +416,46 @@ impl PodRuntime {
     }
 
     async fn handle_close(&mut self) -> Result<()> {
-        self.state
-            .set_read_status(AccessStatus::ReconfigurationPending);
-        self.state
-            .set_write_status(AccessStatus::ReconfigurationPending);
+        if let Some(handle) = &self.replicator_handle {
+            handle
+                .state()
+                .set_read_status(AccessStatus::ReconfigurationPending);
+            handle
+                .state()
+                .set_write_status(AccessStatus::ReconfigurationPending);
+        }
 
         let _ = self
             .send_lifecycle(|reply| LifecycleEvent::Close { reply })
             .await;
-        let _ = self
-            .send_replicator_control(|reply| ReplicatorControlEvent::Close { reply })
-            .await;
 
-        self.state.set_read_status(AccessStatus::NotPrimary);
-        self.state.set_write_status(AccessStatus::NotPrimary);
+        if let Ok(handle) = self.require_handle() {
+            let _ = handle
+                .send_control(
+                    |reply| ReplicatorControlEvent::Close { reply },
+                    self.reply_timeout,
+                )
+                .await;
+            handle.state().set_read_status(AccessStatus::NotPrimary);
+            handle.state().set_write_status(AccessStatus::NotPrimary);
+        }
+
         self.role = Role::None;
         Ok(())
     }
 
     async fn handle_update_epoch(&mut self, epoch: Epoch) -> Result<()> {
-        // Get the committed LSN before epoch change (for user notification)
-        let previous_epoch_last_lsn = self.state.committed_lsn();
-
-        // 1. Update replicator epoch (handles truncation)
+        // Route entirely through replicator — it handles user notification
         self.send_replicator_control(|reply| ReplicatorControlEvent::UpdateEpoch { epoch, reply })
             .await?;
-
-        // 2. Notify user via state_provider channel (secondaries only)
-        if self.role != Role::Primary {
-            let _ = self
-                .send_state_provider(|reply| StateProviderEvent::UpdateEpoch {
-                    epoch,
-                    previous_epoch_last_lsn,
-                    reply,
-                })
-                .await;
-        }
-
         self.epoch = epoch;
         Ok(())
     }
 
     async fn handle_on_data_loss(&mut self) -> Result<DataLossAction> {
-        // 1. Ask replicator (returns DataLossAction::None by default in MVP)
-        let replicator_action: DataLossAction = self
-            .send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss { reply })
-            .await?;
-
-        // 2. Notify user via state_provider channel
-        let user_changed = self
-            .send_state_provider(|reply| StateProviderEvent::OnDataLoss { reply })
+        // Route through replicator — it handles dual-query (replicator + user)
+        self.send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss { reply })
             .await
-            .unwrap_or(false);
-
-        // If either replicator or user reports state changed, return StateChanged
-        if user_changed || replicator_action == DataLossAction::StateChanged {
-            Ok(DataLossAction::StateChanged)
-        } else {
-            Ok(DataLossAction::None)
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -545,16 +466,8 @@ impl PodRuntime {
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T>>) -> ReplicatorControlEvent,
     ) -> Result<T> {
-        let (tx, rx) = oneshot::channel();
-        self.control_tx
-            .send(make(tx))
-            .await
-            .map_err(|_| KubelicateError::Closed)?;
-        match tokio::time::timeout(self.reply_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(KubelicateError::Closed),
-            Err(_) => Err(KubelicateError::Internal("replicator timeout".into())),
-        }
+        let handle = self.require_handle()?;
+        handle.send_control(make, self.reply_timeout).await
     }
 
     async fn send_lifecycle<T>(
@@ -576,45 +489,61 @@ impl PodRuntime {
         }
     }
 
-    async fn send_state_provider<T>(
-        &self,
-        make: impl FnOnce(oneshot::Sender<Result<T>>) -> StateProviderEvent,
-    ) -> Result<T> {
-        let (tx, rx) = oneshot::channel();
-        self.state_provider_tx
-            .send(make(tx))
-            .await
-            .map_err(|_| KubelicateError::Closed)?;
-        match tokio::time::timeout(self.reply_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(KubelicateError::Closed),
-            Err(_) => Err(KubelicateError::Internal("state_provider timeout".into())),
-        }
-    }
-
     fn set_status_for_role(&self, role: Role) {
-        match role {
-            Role::Primary => {
-                self.state.set_read_status(AccessStatus::Granted);
-                self.state.set_write_status(AccessStatus::Granted);
-            }
-            _ => {
-                self.state.set_read_status(AccessStatus::NotPrimary);
-                self.state.set_write_status(AccessStatus::NotPrimary);
+        if let Some(handle) = &self.replicator_handle {
+            match role {
+                Role::Primary => {
+                    handle.state().set_read_status(AccessStatus::Granted);
+                    handle.state().set_write_status(AccessStatus::Granted);
+                }
+                _ => {
+                    handle.state().set_read_status(AccessStatus::NotPrimary);
+                    handle.state().set_write_status(AccessStatus::NotPrimary);
+                }
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Standalone build_replica task (runs outside PodRuntime's command loop)
+// Helpers for copy protocol (OperationStream ↔ Vec materialization)
+// ---------------------------------------------------------------------------
+
+/// Collect all operations from a stream into a Vec.
+async fn collect_stream(mut stream: crate::types::OperationStream) -> Vec<(Lsn, bytes::Bytes)> {
+    let mut ops = Vec::new();
+    while let Some(op) = stream.get_operation().await {
+        ops.push((op.lsn, op.data.clone()));
+        op.acknowledge();
+    }
+    ops
+}
+
+/// Create an OperationStream from materialized operations.
+fn vec_to_stream(ops: Vec<(Lsn, bytes::Bytes)>) -> crate::types::OperationStream {
+    let (tx, stream) = crate::types::OperationStream::channel(ops.len().max(1));
+    tokio::spawn(async move {
+        for (lsn, data) in ops {
+            let op = crate::types::Operation::new(lsn, data, None);
+            if tx.send(op).await.is_err() {
+                break;
+            }
+        }
+    });
+    stream
+}
+
+// ---------------------------------------------------------------------------
+// Copy protocol (BuildReplica)
 // ---------------------------------------------------------------------------
 
 /// Copy phase of BuildReplica — runs as a spawned async task.
+/// Uses state_provider_tx from the ReplicatorHandle to reach the user's
+/// state provider callbacks.
 async fn run_build_replica_copy(
     replica: ReplicaInfo,
-    state_provider_tx: mpsc::Sender<StateProviderEvent>,
-    state: Arc<PartitionState>,
+    state_provider_tx: mpsc::Sender<crate::events::StateProviderEvent>,
+    state: std::sync::Arc<crate::handles::PartitionState>,
     reply_timeout: Duration,
 ) -> Result<()> {
     use crate::proto::replicator_data_client::ReplicatorDataClient;
@@ -626,7 +555,6 @@ async fn run_build_replica_copy(
         "BuildReplica: connecting to secondary data plane"
     );
 
-    // 1. Connect to secondary's data-plane gRPC
     let channel = tonic::transport::Channel::from_shared(secondary_addr.clone())
         .map_err(|e| KubelicateError::Internal(Box::new(e)))?
         .connect()
@@ -634,7 +562,6 @@ async fn run_build_replica_copy(
         .map_err(|e| KubelicateError::Internal(Box::new(e)))?;
     let mut data_client = ReplicatorDataClient::new(channel);
 
-    // 2. GetCopyContext from secondary
     let ctx_resp = data_client
         .get_copy_context(crate::proto::GetCopyContextRequest {})
         .await
@@ -645,7 +572,6 @@ async fn run_build_replica_copy(
         "BuildReplica: got copy context from secondary"
     );
 
-    // Wrap context into an OperationStream for the local state provider
     let copy_context = vec_to_stream(
         copy_context_ops
             .into_iter()
@@ -653,12 +579,11 @@ async fn run_build_replica_copy(
             .collect(),
     );
 
-    // 3. GetCopyState from own StateProvider
     let up_to_lsn = state.committed_lsn();
     let state_stream: crate::types::OperationStream = {
         let (tx, rx) = oneshot::channel();
         state_provider_tx
-            .send(StateProviderEvent::GetCopyState {
+            .send(crate::events::StateProviderEvent::GetCopyState {
                 up_to_lsn,
                 copy_context,
                 reply: tx,
@@ -672,12 +597,8 @@ async fn run_build_replica_copy(
         }
     };
 
-    // Collect state into items for streaming to secondary
     let state_ops = collect_stream(state_stream).await;
 
-    // Extract copy boundary LSN — the highest LSN in the snapshot.
-    // This is the state provider's last_applied_lsn at snapshot time.
-    // The actor will replay only ops beyond this LSN to the new replica.
     let copy_lsn = state_ops.iter().map(|(lsn, _)| *lsn).max().unwrap_or(0);
     state.set_copy_lsn(replica.id, copy_lsn);
 
@@ -686,7 +607,6 @@ async fn run_build_replica_copy(
         up_to_lsn, copy_lsn, "BuildReplica: got copy state from local StateProvider"
     );
 
-    // 4. CopyStream to secondary — stream all state items
     let items: Vec<crate::proto::CopyItem> = state_ops
         .into_iter()
         .map(|(lsn, data)| crate::proto::CopyItem {
@@ -713,6 +633,7 @@ async fn run_build_replica_copy(
 mod tests {
     use super::*;
     use crate::events::LifecycleEvent;
+    use crate::replicator::WalReplicator;
 
     #[tokio::test]
     async fn test_pod_runtime_user_lifecycle() {
@@ -724,20 +645,25 @@ mod tests {
 
         let runtime = bundle.runtime;
         let mut lifecycle_rx = bundle.lifecycle_rx;
-        let mut _state_provider_rx = bundle.state_provider_rx;
 
-        // Spawn user event loop (lifecycle channel only for this test)
+        // Spawn user event loop — creates replicator at Open
         let user_handle = tokio::spawn(async move {
-            let mut _partition = None;
             let mut replicator = None;
             let mut replicated_lsns = vec![];
 
             while let Some(event) = lifecycle_rx.recv().await {
                 match event {
                     LifecycleEvent::Open { ctx, reply } => {
-                        _partition = Some(ctx.partition.clone());
-                        replicator = Some(ctx.replicator);
-                        let _ = reply.send(Ok(()));
+                        // User creates replicator and returns handle
+                        let (handle, handles) = WalReplicator::create(
+                            ctx.replica_id,
+                            &ctx.data_bind,
+                            ctx.fault_tx.clone(),
+                        )
+                        .await
+                        .unwrap();
+                        replicator = Some(handles.replicator);
+                        let _ = reply.send(Ok(handle));
                     }
                     LifecycleEvent::ChangeRole { new_role, reply } => {
                         if new_role == Role::Primary {
@@ -767,7 +693,6 @@ mod tests {
         let runtime_handle = tokio::spawn(runtime.serve());
 
         // Drive lifecycle via the gRPC control server (simulating operator)
-        // Connect as a gRPC client to the control address
         let mut client = crate::proto::replicator_control_client::ReplicatorControlClient::connect(
             bundle.control_address.clone(),
         )

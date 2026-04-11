@@ -1,174 +1,144 @@
 # Kubelicate: User Application Model
 
 Event-based API for building stateful services on Kubelicate. The user
-receives events on mpsc channels, processes them, and interacts with
-the replicator via `StateReplicatorHandle`.
+creates the replicator at Open time, keeps `ServiceContext` handles,
+and interacts with the replicator via `StateReplicatorHandle`.
 
 > Part of the [Kubelicate Design](../kubelicate-replicator-design.md).
+> Separation design: [Runtime–Replicator Separation](implemented/runtime-replicator-separation.md).
 
 ---
 
 ## Overview
 
-User receives `ServiceEvent` on an mpsc channel. Events fall into two
-categories: **lifecycle events** (SF's `IStatefulServiceReplica`) and
-**state provider callbacks** (SF's `IStateProvider`).
+The runtime delivers `LifecycleEvent` on an mpsc channel. The critical
+event is **Open**, where the user creates the replicator and returns a
+`ReplicatorHandle` to the runtime. The user keeps `ServiceContext` with
+the write handle, partition, streams, and state provider channel.
+
+---
+
+## Open Flow (User Creates Replicator)
+
+```
+Runtime ──── LifecycleEvent::Open { ctx: OpenContext } ────► User
+                                                               │
+                                                    1. WalReplicator::create(...)
+                                                    2. Keep ServiceContext
+                                                    3. Return ReplicatorHandle
+                                                               │
+Runtime ◄──── Ok(ReplicatorHandle) ────────────────────────────┘
+```
+
+The user chooses which replicator implementation to use. Currently
+`WalReplicator` is the only implementation (WAL-based persisted quorum).
 
 ---
 
 ## Lifecycle Events
 
+```rust
+pub enum LifecycleEvent {
+    Open {
+        ctx: OpenContext,
+        reply: oneshot::Sender<Result<ReplicatorHandle>>,
+    },
+    ChangeRole {
+        new_role: Role,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    Close { reply: oneshot::Sender<Result<()>> },
+    Abort,
+}
 ```
-ServiceEvent::Open { ctx, reply }         — store handles (Partition, StateReplicator, streams)
-ServiceEvent::ChangeRole { role, reply }  — start/stop work based on role
-ServiceEvent::Close { reply }             — drain and cleanup
-ServiceEvent::Abort                       — emergency stop
+
+| Event | When | What to do |
+|-------|------|------------|
+| `Open` | Pod startup | Create replicator, keep handles, return `ReplicatorHandle` |
+| `ChangeRole` | Role change | Start/stop background work based on role |
+| `Close` | Graceful shutdown | Drain in-flight work, checkpoint, reply |
+| `Abort` | Emergency shutdown | Release resources, no reply |
+
+---
+
+## OpenContext and ServiceContext
+
+```rust
+/// Provided by the runtime at Open.
+pub struct OpenContext {
+    pub replica_id: ReplicaId,
+    pub open_mode: OpenMode,
+    pub data_bind: String,
+    pub token: CancellationToken,
+    pub fault_tx: mpsc::Sender<FaultType>,
+}
+
+/// Produced by WalReplicator::create(). User keeps these.
+pub struct ServiceContext {
+    pub replicator: StateReplicatorHandle,
+    pub partition: Arc<PartitionHandle>,
+    pub copy_stream: Option<OperationStream>,
+    pub replication_stream: Option<OperationStream>,
+    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
+}
 ```
 
 ---
 
 ## State Provider Callbacks
 
-These are called by the replicator when it needs information about or
-cooperation from the user's state. They mirror SF's `IStateProvider`.
-
-```
-ServiceEvent::GetLastCommittedLsn { reply }
-    — Replicator asks: "what's your last durably applied LSN?"
-    — Called during build and catchup to determine progress.
-    — Reply: Result<Lsn>
-
-ServiceEvent::GetCopyContext { reply }
-    — Called on a new secondary to send context to the primary.
-    — The secondary tells the primary what state it already has
-      (e.g., a checkpoint LSN, or empty for a brand-new replica).
-    — Reply: Result<OperationStream> (stream of context data)
-    — For empty replicas, reply with an empty stream.
-
-ServiceEvent::GetCopyState { up_to_lsn, copy_context, reply }
-    — Called on the primary during build_replica.
-    — The primary produces the full state up to `up_to_lsn`,
-      using the secondary's copy_context to send only what's needed.
-    — Reply: Result<OperationStream> (stream of state data)
-    — The replicator delivers this to the secondary's copy_stream.
-
-ServiceEvent::OnDataLoss { reply }
-    — Called when write quorum was lost and data loss may have occurred.
-    — The user can restore from backup, accept the loss, or reconcile.
-    — Reply: Result<bool> (true if state was changed → triggers rebuild)
-```
-
----
-
-## Event Enums and Channels
-
-Events are delivered on **two separate channels**, allowing the user to
-prioritize lifecycle events over state provider callbacks:
-
-- **`lifecycle_rx`** — `mpsc::Receiver<LifecycleEvent>` — rare, must be
-  handled immediately (ChangeRole, Close)
-- **`state_provider_rx`** — `mpsc::Receiver<StateProviderEvent>` — may be
-  slow (GetCopyState produces a full state snapshot)
+Delivered on `ServiceContext.state_provider_rx`. These are sent by the
+replicator (not the runtime) when it needs cooperation from the user's
+state. The user handles them in a `tokio::select!` alongside lifecycle.
 
 ```rust
-/// Lifecycle events (SF's IStatefulServiceReplica).
-/// Delivered on all roles. Handle immediately.
-pub enum LifecycleEvent {
-    Open {
-        ctx: ServiceContext,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    ChangeRole {
-        new_role: Role,
-        reply: oneshot::Sender<Result<String>>,
-    },
-    Close {
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Abort,
-}
-
-/// State provider callbacks (SF's IStateProvider).
-/// Role-specific. May involve heavy work (copy state production).
 pub enum StateProviderEvent {
-    /// Epoch changed (secondaries only).
-    /// Primary gets epoch via ChangeRole, not UpdateEpoch.
-    UpdateEpoch {
-        epoch: Epoch,
-        previous_epoch_last_lsn: Lsn,
-        reply: oneshot::Sender<Result<()>>,
-    },
-
-    /// "What's your last applied LSN?" (secondary, during build/catchup)
-    GetLastCommittedLsn {
-        reply: oneshot::Sender<Result<Lsn>>,
-    },
-
-    /// "What state do you already have?" (new idle secondary, during build)
-    GetCopyContext {
-        reply: oneshot::Sender<Result<OperationStream>>,
-    },
-
-    /// "Produce state for this secondary" (primary, during build_replica)
-    GetCopyState {
-        up_to_lsn: Lsn,
-        copy_context: OperationStream,
-        reply: oneshot::Sender<Result<OperationStream>>,
-    },
-
-    /// "Quorum was lost, data loss possible" (new primary after quorum loss)
-    OnDataLoss {
-        reply: oneshot::Sender<Result<bool>>,
-    },
+    UpdateEpoch { epoch, previous_epoch_last_lsn, reply },
+    GetLastCommittedLsn { reply },
+    GetCopyContext { reply },
+    GetCopyState { up_to_lsn, copy_context, reply },
+    OnDataLoss { reply },
 }
 ```
 
-**ServiceContext (provided at Open):**
-
-```rust
-pub struct ServiceContext {
-    pub partition: Arc<PartitionHandle>,
-    pub replicator: StateReplicatorHandle,
-    pub copy_stream: Option<OperationStream>,
-    pub replication_stream: Option<OperationStream>,
-    pub token: CancellationToken,
-}
-```
-
-**PodRuntimeBundle provides both channels:**
-
-```rust
-pub struct PodRuntimeBundle {
-    pub runtime: PodRuntime,
-    pub lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
-    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
-    pub control_address: String,
-    pub data_address: String,
-}
-```
+| Event | Sender | When | Role |
+|-------|--------|------|------|
+| `UpdateEpoch` | Replicator | Reconfiguration | Secondary |
+| `GetLastCommittedLsn` | Replicator | Build / catchup | Secondary |
+| `GetCopyContext` | Replicator | build_replica | Idle (new) |
+| `GetCopyState` | Replicator | build_replica | Primary |
+| `OnDataLoss` | Replicator | Quorum loss | New Primary |
 
 ---
 
-## User Event Loop (Prioritized Select)
+## User Event Loop
 
 ```rust
 async fn run_service(
     mut lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
-    mut state_provider_rx: mpsc::Receiver<StateProviderEvent>,
+    state: SharedState,
+    client_bind: String,
 ) {
-    let mut ctx = None;
+    let mut replicator = None;
+    let mut state_provider_rx = None;
 
     loop {
         tokio::select! {
             biased; // Lifecycle takes priority
 
             Some(event) = lifecycle_rx.recv() => match event {
-                LifecycleEvent::Open { ctx: c, reply } => {
-                    ctx = Some(c);
-                    let _ = reply.send(Ok(()));
+                LifecycleEvent::Open { ctx, reply } => {
+                    // Create replicator, keep handles
+                    let (handle, svc_ctx) = WalReplicator::create(
+                        ctx.replica_id, &ctx.data_bind, ctx.fault_tx.clone(),
+                    ).await.unwrap();
+                    replicator = Some(svc_ctx.replicator);
+                    state_provider_rx = Some(svc_ctx.state_provider_rx);
+                    // ... store partition, streams, token ...
+                    let _ = reply.send(Ok(handle));
                 }
                 LifecycleEvent::ChangeRole { new_role, reply } => {
-                    // start/stop background work based on role
+                    // start/stop work
                     let _ = reply.send(Ok(String::new()));
                 }
                 LifecycleEvent::Close { reply } => {
@@ -178,18 +148,17 @@ async fn run_service(
                 LifecycleEvent::Abort => break,
             },
 
-            Some(event) = state_provider_rx.recv() => match event {
-                StateProviderEvent::GetLastCommittedLsn { reply } => {
-                    let _ = reply.send(Ok(my_last_lsn));
+            Some(event) = async {
+                match state_provider_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
                 }
-                StateProviderEvent::GetCopyState { up_to_lsn, copy_context, reply } => {
-                    let stream = produce_copy_state(up_to_lsn, copy_context);
-                    let _ = reply.send(Ok(stream));
-                }
+            } => match event {
                 StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
-                    truncate_stale_ops(previous_epoch_last_lsn);
+                    rollback_uncommitted(previous_epoch_last_lsn);
                     let _ = reply.send(Ok(()));
                 }
+                // ... handle other state provider events ...
                 _ => {}
             },
 
@@ -199,47 +168,36 @@ async fn run_service(
 }
 ```
 
-**Why two channels:**
-
-| Concern | Lifecycle channel | StateProvider channel |
-|---|---|---|
-| Frequency | Rare (startup, role change, shutdown) | During build/catchup/failover |
-| Latency requirement | Immediate (blocks reconfiguration) | Can take time (copy state) |
-| Priority | **High** — ChangeRole/Close must not be delayed | Normal |
-| Blocking risk | Never blocked by state provider work | Can be slow without affecting lifecycle |
+**Key difference from old API:** The user no longer receives handles
+passively — they create the replicator in the Open handler and choose
+which implementation to use.
 
 ---
 
-## When Each Event is Delivered
+## PodRuntimeBundle
 
-| Event | Group | Called by | When | Applicable roles |
-|---|---|---|---|---|
-| `Open` | Lifecycle | Runtime | Pod startup | All |
-| `ChangeRole` | Lifecycle | Runtime | Role change | All |
-| `Close` | Lifecycle | Runtime | Graceful shutdown | All |
-| `Abort` | Lifecycle | Runtime | Emergency shutdown | All |
-| `UpdateEpoch` | StateProvider | Replicator | Reconfiguration | Secondary, Idle |
-| `GetLastCommittedLsn` | StateProvider | Replicator | Build / catchup | Secondary, Idle |
-| `GetCopyContext` | StateProvider | Replicator | build_replica | Idle (new) |
-| `GetCopyState` | StateProvider | Replicator | build_replica | Primary |
-| `OnDataLoss` | StateProvider | Replicator | Quorum loss | New Primary |
+```rust
+pub struct PodRuntimeBundle {
+    pub runtime: PodRuntime,
+    pub lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
+    pub control_address: String,
+}
+```
 
-**Note on `UpdateEpoch`:** Called on secondaries that stay in the same role
-but receive a new epoch (e.g., a different replica was promoted). The user
-receives `previous_epoch_last_lsn` — operations with LSN above this from
-the old epoch may be stale (uncommitted zombie primary writes).
+`data_address` is no longer in the bundle — it comes from the replicator
+created at Open time (`ReplicatorHandle::data_address()`).
 
-**Ordering guarantee:** On promotion (S→P), the replicator is set up before
-the user is notified. On demotion (P→S), the user stops before the replicator
-tears down.
+---
 
-**Writes (primary):** `ctx.replicator.replicate(data, token)` — goes through
-the data channel to the quorum-replicating actor. Fast-path `write_status()`
-check before entering the channel.
+## ChangeRole Ordering
 
-**Status polling:** `ctx.partition.read_status()` / `write_status()` are
-atomic reads (~1ns). No events for status changes — user polls in their
-work loop.
+| Direction | Transitions | Order |
+|-----------|-------------|-------|
+| **Promotion** | None→Primary, Idle→Active, *→Primary | 1. Replicator  2. Status  3. User |
+| **Demotion** | P→S, Active→None, *→None | 1. Status  2. User  3. Replicator |
+
+On promotion, the replicator is ready before the user starts writing.
+On demotion, writes are fenced before the user is notified.
 
 ---
 
@@ -319,35 +277,21 @@ Primary                    Secondary Replicator           Secondary User
 gives the strongest durability guarantee: primary's `replicate()` returns
 only after a quorum of secondaries have applied + acknowledged.
 
-### Stream Usage by Role (from SF kvmap sample)
+### Stream Usage by Role
 
 **`ChangeRole(IdleSecondary)`** — drain copy stream:
 
 ```rust
-if let Some(mut copy) = ctx.copy_stream.take() {
-    tokio::spawn(async move {
-        while let Some(op) = copy.get_operation().await {
-            let kv: (String, String) = serde_json::from_slice(&op.data).unwrap();
-            state.insert(kv.0, kv.1);
-            op.acknowledge();
-        }
-        info!("copy stream drained");
-    });
+if let Some(copy) = copy_stream.take() {
+    tokio::spawn(drain_stream(state.clone(), copy, token.clone(), "copy"));
 }
 ```
 
 **`ChangeRole(ActiveSecondary)`** — drain replication stream:
 
 ```rust
-if let Some(mut repl) = ctx.replication_stream.take() {
-    tokio::spawn(async move {
-        while let Some(op) = repl.get_operation().await {
-            let kv: (String, String) = serde_json::from_slice(&op.data).unwrap();
-            state.insert(kv.0, kv.1);
-            op.acknowledge();
-            info!(lsn = op.lsn, "applied repl op");
-        }
-    });
+if let Some(repl) = replication_stream.take() {
+    tokio::spawn(drain_stream(state.clone(), repl, token.clone(), "replication"));
 }
 ```
 
@@ -355,7 +299,7 @@ if let Some(mut repl) = ctx.replication_stream.take() {
 
 ```rust
 let data = serde_json::to_vec(&("key", "value")).unwrap();
-let lsn = ctx.replicator.replicate(Bytes::from(data), token).await?;
+let lsn = replicator.replicate(Bytes::from(data), token).await?;
 ```
 
 ### Copy Protocol (StateProvider Callbacks)
@@ -382,15 +326,16 @@ current LSN. Primary uses this to know what the secondary already has.
 **`GetCopyState`** (primary): receives `up_to_lsn` + copy context stream.
 Reads the secondary's LSN from context, produces only the missing state.
 
-Example from the SF kvmap sample:
+Example from the KV app:
 
 ```rust
 // GetCopyContext (secondary) — send current LSN
 StateProviderEvent::GetCopyContext { reply } => {
-    let (tx, rx) = mpsc::channel(1);
-    tx.send(Operation { lsn: 0, data: Bytes::from(last_lsn.to_string()), ack_tx: None }).await;
+    let lsn = state.read().await.last_applied_lsn;
+    let (tx, stream) = OperationStream::channel(1);
+    let _ = tx.send(Operation::new(0, Bytes::from(lsn.to_string()), None)).await;
     drop(tx);
-    reply.send(Ok(OperationStream { rx }));
+    let _ = reply.send(Ok(stream));
 }
 
 // GetCopyState (primary) — read context, produce state
@@ -399,15 +344,12 @@ StateProviderEvent::GetCopyState { up_to_lsn, mut copy_context, reply } => {
         String::from_utf8_lossy(&op.data).parse::<i64>().unwrap_or(0)
     } else { 0 };
 
-    let (tx, rx) = mpsc::channel(16);
-    if peer_lsn < last_lsn {
-        for (k, v) in &state {
-            let data = serde_json::to_vec(&(k, v)).unwrap();
-            tx.send(Operation { lsn: last_lsn, data: Bytes::from(data), ack_tx: None }).await;
-        }
-    }
+    // Snapshot under read lock, then send without lock
+    let snapshot = { /* collect state */ };
+    let (tx, stream) = OperationStream::channel(64);
+    let _ = reply.send(Ok(stream));
+    for (k, v) in snapshot { /* send ops */ }
     drop(tx);
-    reply.send(Ok(OperationStream { rx }));
 }
 ```
 

@@ -1,9 +1,6 @@
-use std::sync::Arc;
-
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
-use crate::handles::PartitionState;
 use crate::pod::RuntimeCommand;
 use crate::proto::replicator_control_server::ReplicatorControl;
 use crate::proto::*;
@@ -15,22 +12,12 @@ use crate::types::{Epoch, Role};
 pub struct ControlServer {
     cmd_tx: mpsc::Sender<RuntimeCommand>,
     #[allow(dead_code)]
-    state: Arc<PartitionState>,
-    #[allow(dead_code)]
     replica_id: i64,
 }
 
 impl ControlServer {
-    pub fn new(
-        replica_id: i64,
-        cmd_tx: mpsc::Sender<RuntimeCommand>,
-        state: Arc<PartitionState>,
-    ) -> Self {
-        Self {
-            cmd_tx,
-            state,
-            replica_id,
-        }
+    pub fn new(replica_id: i64, cmd_tx: mpsc::Sender<RuntimeCommand>) -> Self {
+        Self { cmd_tx, replica_id }
     }
 
     async fn send_cmd<T>(

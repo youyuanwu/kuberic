@@ -92,7 +92,7 @@ impl NoopReplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::ReplicatorChannels;
+    use crate::events::ReplicateRequest;
     use crate::types::{AccessStatus, CancellationToken, Epoch, OpenMode};
 
     /// Simulates what the runtime does: sets access status around replicator calls.
@@ -111,18 +111,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_lifecycle() {
-        let channels = ReplicatorChannels::new(16, 16);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(16);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel::<ReplicateRequest>(16);
         let state = Arc::new(PartitionState::new());
 
         let state_cp = state.clone();
         let handle = tokio::spawn(async move {
-            NoopReplicator::run(channels.control_rx, channels.data_rx, state_cp).await;
+            NoopReplicator::run(control_rx, data_rx, state_cp).await;
         });
 
         // Open
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .control_tx
+        control_tx
             .send(ReplicatorControlEvent::Open {
                 mode: OpenMode::New,
                 reply: tx,
@@ -133,8 +133,7 @@ mod tests {
 
         // ChangeRole to Primary
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .control_tx
+        control_tx
             .send(ReplicatorControlEvent::ChangeRole {
                 epoch: Epoch::new(0, 1),
                 role: Role::Primary,
@@ -152,8 +151,7 @@ mod tests {
 
         // Replicate
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .data_tx
+        data_tx
             .send(ReplicateRequest {
                 data: bytes::Bytes::from("hello"),
                 reply: tx,
@@ -166,8 +164,7 @@ mod tests {
 
         // Replicate again
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .data_tx
+        data_tx
             .send(ReplicateRequest {
                 data: bytes::Bytes::from("world"),
                 reply: tx,
@@ -179,8 +176,7 @@ mod tests {
 
         // ChangeRole to Secondary
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .control_tx
+        control_tx
             .send(ReplicatorControlEvent::ChangeRole {
                 epoch: Epoch::new(0, 2),
                 role: Role::ActiveSecondary,
@@ -198,8 +194,7 @@ mod tests {
 
         // Close
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .control_tx
+        control_tx
             .send(ReplicatorControlEvent::Close { reply: tx })
             .await
             .unwrap();
@@ -212,20 +207,20 @@ mod tests {
     async fn test_noop_replicate_handle() {
         use crate::handles::StateReplicatorHandle;
 
-        let channels = ReplicatorChannels::new(16, 16);
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel(16);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel::<ReplicateRequest>(16);
         let state = Arc::new(PartitionState::new());
 
-        let replicator_handle = StateReplicatorHandle::new(channels.data_tx.clone(), state.clone());
+        let replicator_handle = StateReplicatorHandle::new(data_tx.clone(), state.clone());
 
         let state_cp = state.clone();
         let handle = tokio::spawn(async move {
-            NoopReplicator::run(channels.control_rx, channels.data_rx, state_cp).await;
+            NoopReplicator::run(control_rx, data_rx, state_cp).await;
         });
 
         // Open + ChangeRole(Primary)
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .control_tx
+        control_tx
             .send(ReplicatorControlEvent::Open {
                 mode: OpenMode::New,
                 reply: tx,
@@ -235,8 +230,7 @@ mod tests {
         rx.await.unwrap().unwrap();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .control_tx
+        control_tx
             .send(ReplicatorControlEvent::ChangeRole {
                 epoch: Epoch::new(0, 1),
                 role: Role::Primary,
@@ -259,8 +253,7 @@ mod tests {
 
         // Close
         let (tx, rx) = tokio::sync::oneshot::channel();
-        channels
-            .control_tx
+        control_tx
             .send(ReplicatorControlEvent::Close { reply: tx })
             .await
             .unwrap();
@@ -273,14 +266,15 @@ mod tests {
     async fn test_noop_replicate_not_primary() {
         use crate::handles::StateReplicatorHandle;
 
-        let channels = ReplicatorChannels::new(16, 16);
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(16);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel::<ReplicateRequest>(16);
         let state = Arc::new(PartitionState::new());
 
-        let replicator_handle = StateReplicatorHandle::new(channels.data_tx.clone(), state.clone());
+        let replicator_handle = StateReplicatorHandle::new(data_tx.clone(), state.clone());
 
         let state_cp = state.clone();
         let _handle = tokio::spawn(async move {
-            NoopReplicator::run(channels.control_rx, channels.data_rx, state_cp).await;
+            NoopReplicator::run(control_rx, data_rx, state_cp).await;
         });
 
         // Don't promote to primary — status is NotPrimary

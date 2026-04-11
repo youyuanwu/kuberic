@@ -876,7 +876,7 @@ pub mod testing {
     use tokio::sync::{mpsc, oneshot};
     use tonic::transport::Server;
 
-    use crate::events::{ReplicateRequest, ReplicatorChannels, ReplicatorControlEvent};
+    use crate::events::{ReplicateRequest, ReplicatorControlEvent};
     use crate::handles::{PartitionState, StateReplicatorHandle};
     use crate::proto::replicator_data_server::ReplicatorDataServer;
     use crate::replicator::actor::WalReplicatorActor;
@@ -900,7 +900,8 @@ pub mod testing {
     impl InProcessReplicaHandle {
         /// Spawn a new in-process replica (actor + gRPC server).
         pub async fn spawn(id: ReplicaId) -> Result<Self> {
-            let channels = ReplicatorChannels::new(16, 256);
+            let (control_tx, control_rx) = mpsc::channel(16);
+            let (data_tx, data_rx) = mpsc::channel::<ReplicateRequest>(256);
             let state = Arc::new(PartitionState::new());
             let secondary_state = Arc::new(SecondaryState::new());
             let shutdown_token = CancellationToken::new();
@@ -928,15 +929,13 @@ pub mod testing {
             let actor = WalReplicatorActor::new(id);
             let state_cp = state.clone();
             let actor_handle = tokio::spawn(async move {
-                actor
-                    .run(channels.control_rx, channels.data_rx, state_cp)
-                    .await;
+                actor.run(control_rx, data_rx, state_cp).await;
             });
 
             Ok(Self {
                 id,
-                control_tx: channels.control_tx,
-                data_tx: channels.data_tx,
+                control_tx,
+                data_tx,
                 state,
                 secondary_state,
                 grpc_address,

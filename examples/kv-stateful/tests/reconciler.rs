@@ -129,14 +129,21 @@ impl ClusterApi for KvClusterApi {
         let client_address = listener.local_addr().unwrap().to_string();
         drop(listener);
 
+        // Pre-bind data plane port
+        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let data_bind = format!("127.0.0.1:{}", data_port);
+        let data_address = format!("http://{}", data_bind);
+        drop(data_listener);
+
         let bundle = PodRuntime::builder(replica_id)
             .reply_timeout(Duration::from_secs(5))
+            .data_bind(data_bind)
             .build()
             .await
             .unwrap();
 
         let control_address = bundle.control_address.clone();
-        let data_address = bundle.data_address.clone();
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data_dir = std::env::temp_dir().join("kv-test").join(format!(
@@ -150,12 +157,7 @@ impl ClusterApi for KvClusterApi {
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle = tokio::spawn(service::run_service(
-            bundle.lifecycle_rx,
-            bundle.state_provider_rx,
-            st,
-            bind,
-        ));
+        let service_handle = tokio::spawn(service::run_service(bundle.lifecycle_rx, st, bind));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 

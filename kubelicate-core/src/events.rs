@@ -1,13 +1,11 @@
-use std::sync::Arc;
-
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::error::Result;
-use crate::handles::{PartitionHandle, StateReplicatorHandle};
+use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
-    CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, OperationStream, ReplicaId,
-    ReplicaInfo, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    DataLossAction, Epoch, Lsn, OpenMode, OperationStream, ReplicaId, ReplicaInfo,
+    ReplicaSetConfig, ReplicaSetQuorumMode, Role,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,20 +78,20 @@ pub struct ReplicateRequest {
 /// Lifecycle events delivered on the lifecycle channel.
 /// Rare but high-priority — handle immediately (blocks reconfiguration).
 pub enum LifecycleEvent {
-    /// Replica opened. Initialize state, store handles.
+    /// Replica opened. Create replicator, return handle to runtime.
+    ///
+    /// The user creates the replicator (e.g., `WalReplicator::create()`),
+    /// keeps the user-facing handles, and returns the `ReplicatorHandle`
+    /// to the runtime.
     Open {
-        ctx: ServiceContext,
-        reply: oneshot::Sender<Result<()>>,
+        ctx: OpenContext,
+        reply: oneshot::Sender<Result<ReplicatorHandle>>,
     },
 
     /// Role changed. Start/stop background work accordingly.
     ///
     /// Reply with the new listening address (e.g., "http://0.0.0.0:8080")
     /// or empty string if not listening in this role.
-    ///
-    /// Ordering guarantee: the runtime calls the replicator's ChangeRole
-    /// BEFORE delivering this event on promotion (S→P), and AFTER on
-    /// demotion (P→S).
     ChangeRole {
         new_role: Role,
         reply: oneshot::Sender<Result<String>>,
@@ -147,64 +145,16 @@ pub enum StateProviderEvent {
 }
 
 // ---------------------------------------------------------------------------
-// ServiceEvent — kept as a backward-compatible union for transition
-// (will be removed once all consumers switch to dual-channel)
+// ServiceContext — user-facing handles, defined in replicator::ServiceContext
 // ---------------------------------------------------------------------------
 
-/// Legacy combined event type. Prefer LifecycleEvent + StateProviderEvent.
-pub enum ServiceEvent {
-    Open {
-        ctx: ServiceContext,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    ChangeRole {
-        new_role: Role,
-        reply: oneshot::Sender<Result<String>>,
-    },
-    Close {
-        reply: oneshot::Sender<Result<()>>,
-    },
-    Abort,
-}
-
-/// Handles provided to the user at Open time.
-pub struct ServiceContext {
-    /// Query read/write access status, report faults.
-    pub partition: Arc<PartitionHandle>,
-    /// Replicate writes to quorum (usable on primary only).
-    pub replicator: StateReplicatorHandle,
-    /// Copy stream — secondary pulls full-state operations during build.
-    /// None on primary.
-    pub copy_stream: Option<OperationStream>,
-    /// Replication stream — secondary pulls incremental operations.
-    /// None on primary.
-    pub replication_stream: Option<OperationStream>,
-    /// Cancellation token for the replica's lifetime.
-    /// Cancelled when close or abort is triggered.
-    pub token: CancellationToken,
-}
+// Users receive OpenContext in the Open event, create a replicator,
+// and keep ServiceContext (partition, replicator, streams, state_provider_rx).
+// The token comes from OpenContext.token.
 
 // ---------------------------------------------------------------------------
-// Channel bundle for wiring
+// Channel bundle — REMOVED (internal to WalReplicator)
 // ---------------------------------------------------------------------------
 
-/// All channels needed to wire the replicator actor, runtime, and user service.
-pub struct ReplicatorChannels {
-    pub control_tx: mpsc::Sender<ReplicatorControlEvent>,
-    pub control_rx: mpsc::Receiver<ReplicatorControlEvent>,
-    pub data_tx: mpsc::Sender<ReplicateRequest>,
-    pub data_rx: mpsc::Receiver<ReplicateRequest>,
-}
-
-impl ReplicatorChannels {
-    pub fn new(control_buffer: usize, data_buffer: usize) -> Self {
-        let (control_tx, control_rx) = mpsc::channel(control_buffer);
-        let (data_tx, data_rx) = mpsc::channel(data_buffer);
-        Self {
-            control_tx,
-            control_rx,
-            data_tx,
-            data_rx,
-        }
-    }
-}
+// ReplicatorChannels is no longer needed in the public API.
+// Channel creation is internal to WalReplicator::create().
