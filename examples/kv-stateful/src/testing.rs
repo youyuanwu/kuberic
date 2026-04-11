@@ -1,6 +1,7 @@
 //! Test utilities for the KV-Stateful example.
 //! Compiled under `#[cfg(test)]` or `feature = "testing"`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ pub struct KvPod {
     pub data_address: String,
     pub client_address: String,
     pub state: SharedState,
+    pub data_dir: PathBuf,
     _runtime_handle: tokio::task::JoinHandle<()>,
     _service_handle: tokio::task::JoinHandle<()>,
 }
@@ -28,6 +30,20 @@ impl KvPod {
 
     /// Start with a custom reply timeout (for tests with heavy concurrent load).
     pub async fn start_with_timeout(id: i64, reply_timeout: Duration) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join("kv-test").join(format!(
+            "pod-{}-{}-{}",
+            id,
+            std::process::id(),
+            n
+        ));
+        Self::start_with_dir(id, data_dir, reply_timeout).await
+    }
+
+    /// Start with a specific data directory (for restart tests).
+    /// Pass a dir from a previous pod to exercise WAL recovery.
+    pub async fn start_with_dir(id: i64, data_dir: PathBuf, reply_timeout: Duration) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap().to_string();
         drop(listener);
@@ -40,7 +56,8 @@ impl KvPod {
 
         let control_address = bundle.control_address.clone();
         let data_address = bundle.data_address.clone();
-        let state: SharedState = Arc::new(RwLock::new(KvState::new()));
+        let state: SharedState =
+            Arc::new(RwLock::new(KvState::open(data_dir.clone()).await.unwrap()));
 
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
@@ -59,6 +76,7 @@ impl KvPod {
             data_address,
             client_address,
             state,
+            data_dir,
             _runtime_handle: runtime_handle,
             _service_handle: service_handle,
         }

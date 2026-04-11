@@ -8,7 +8,7 @@ use kv_stateful::testing::{KvPod, connect_kv_client};
 
 /// Operator-driven test: 3-replica partition, write on primary, verify via
 /// KV client, then failover and verify new primary works.
-#[tokio::test]
+#[test_log::test(tokio::test)]
 #[serial]
 async fn test_operator_three_replica_failover() {
     let pod1 = KvPod::start(1).await;

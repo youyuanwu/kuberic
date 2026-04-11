@@ -66,7 +66,7 @@ impl proto::kv_store_server::KvStore for KvServer {
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
 
-        self.state.write().await.apply_op(lsn, &op);
+        self.state.write().await.apply_op_in_memory(lsn, &op);
 
         debug!(lsn, ?op, "replicated + applied");
         Ok(Response::new(proto::PutResponse { lsn }))
@@ -88,7 +88,7 @@ impl proto::kv_store_server::KvStore for KvServer {
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
 
-        self.state.write().await.apply_op(lsn, &op);
+        self.state.write().await.apply_op_in_memory(lsn, &op);
 
         debug!(lsn, ?op, "replicated + applied");
         Ok(Response::new(proto::DeleteResponse { existed, lsn }))

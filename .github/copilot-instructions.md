@@ -75,3 +75,4 @@ examples/kv-stateful/    Example KV store app using the framework
 - Tests use real gRPC (no mocks) via `KvPod` helper and `GrpcReplicaHandle`
 - `#[serial]` on all KV tests, `testing` feature flag for shared test utilities
 - Design gaps tracked in `design-gaps.md` with SF source citations
+- **Do not git commit unless explicitly instructed** — stage changes but wait for user

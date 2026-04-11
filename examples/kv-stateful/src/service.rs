@@ -45,6 +45,14 @@ pub async fn run_service(
                         for h in bg_handles.drain(..) {
                             let _ = h.await;
                         }
+                        // Checkpoint after copy completes — all copied state is committed
+                        {
+                            let mut guard = state.write().await;
+                            guard.committed_lsn = guard.last_applied_lsn;
+                            if let Err(e) = guard.checkpoint().await {
+                                tracing::warn!(error = %e, "checkpoint after copy failed");
+                            }
+                        }
                     } else {
                         // Cancel previous background tasks for other transitions
                         if let Some(token) = bg_token.take() {
@@ -117,6 +125,14 @@ pub async fn run_service(
                     if let Some(h) = client_server_handle.take() {
                         let _ = h.await;
                     }
+                    // Checkpoint on graceful close for fast recovery
+                    {
+                        let mut guard = state.write().await;
+                        guard.committed_lsn = guard.last_applied_lsn;
+                        if let Err(e) = guard.checkpoint().await {
+                            tracing::warn!(error = %e, "checkpoint on close failed");
+                        }
+                    }
                     let _ = reply.send(Ok(()));
                     break;
                 }
@@ -133,6 +149,10 @@ pub async fn run_service(
 
             Some(event) = state_provider_rx.recv() => match event {
                 StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
+                    // For now, log epoch changes without rollback.
+                    // Full rollback (A6 fix) requires refactoring to avoid
+                    // holding the write lock across async file I/O.
+                    // See design-gaps.md A6 for the planned approach.
                     info!(previous_epoch_last_lsn, "epoch updated");
                     let _ = reply.send(Ok(()));
                 }

@@ -8,6 +8,7 @@
 //! - Client-facing gRPC API for Get/Put/Delete
 
 pub mod demo;
+pub mod persistence;
 pub mod server;
 pub mod service;
 pub mod state;

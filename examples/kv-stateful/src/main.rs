@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +29,10 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:0")]
     client_bind: String,
 
+    /// Data directory for persistent state.
+    #[arg(long, default_value = "/var/lib/kv-stateful/data")]
+    data_dir: PathBuf,
+
     /// Run in demo mode: simulates operator + client for quick testing.
     #[arg(long)]
     demo: bool,
@@ -49,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let control_address = bundle.control_address.clone();
     let shutdown = bundle.runtime.shutdown_token();
-    let state: SharedState = Arc::new(RwLock::new(KvState::new()));
+    let state: SharedState = Arc::new(RwLock::new(KvState::open(args.data_dir).await?));
 
     info!(
         control = %control_address,

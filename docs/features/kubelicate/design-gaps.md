@@ -328,14 +328,22 @@ StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
    only committed WAL entries. Uncommitted ops never reach user state
    because the WAL is the source of truth for replay.
 
-**Recommendation:** Option 2 for safety (user never sees uncommitted
-ops), with Option 3 as the WAL-based complement. Option 2 changes the
-secondary ACK semantics:
-- Current: ACK = "user applied + acknowledged"
-- New: ACK = "WAL persisted" (fast), user apply happens after commit
+**Recommendation:** Two complementary approaches for different contexts:
 
-This aligns with Option C in `wal-persistence.md` — the two-level ACK
-model where WAL ACK gates quorum, and user apply happens after commit.
+- **Option 1 (user-side rollback):** For apps that can implement rollback
+  — e.g., KV stores that persist via snapshot + WAL and can reload from
+  a known-committed snapshot. The KV example app uses this approach. See
+  `kv-stateful-design.md` § UpdateEpoch Rollback. Requires cancelling
+  drain tasks before rollback to avoid races.
+
+- **Option 2 (defer dispatch until committed):** The framework-level
+  solution for apps that can't implement rollback. Would require changes
+  to `SecondaryReceiver` — defer dispatch to user's `OperationStream`
+  until the primary confirms the op is committed. Changes ACK semantics:
+  - Current: ACK = "user applied + acknowledged"
+  - New: ACK = "WAL persisted" (fast), user apply happens after commit
+  This aligns with Option C in `wal-persistence.md` — the two-level ACK
+  model. Deferred to future framework WAL work.
 
 ---
 

@@ -137,7 +137,15 @@ impl ClusterApi for KvClusterApi {
 
         let control_address = bundle.control_address.clone();
         let data_address = bundle.data_address.clone();
-        let state: SharedState = Arc::new(RwLock::new(KvState::new()));
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join("kv-test").join(format!(
+            "reconciler-{}-{}-{}",
+            replica_id,
+            std::process::id(),
+            n
+        ));
+        let state: SharedState = Arc::new(RwLock::new(KvState::open(data_dir).await.unwrap()));
 
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();

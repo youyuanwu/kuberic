@@ -55,7 +55,7 @@ async fn test_operator_single_replica_kv() {
 }
 
 /// Operator-driven test: write, delete, overwrite, verify final state.
-#[tokio::test]
+#[test_log::test(tokio::test)]
 #[serial]
 async fn test_operator_kv_crud_operations() {
     let pod = KvPod::start(10).await;
