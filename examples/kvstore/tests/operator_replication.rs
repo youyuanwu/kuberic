@@ -4,8 +4,8 @@ use std::time::Duration;
 use kubelicate_core::driver::PartitionDriver;
 use serial_test::serial;
 
-use kv_stateful::proto;
-use kv_stateful::testing::{KvPod, connect_kv_client, wait_for_state_count};
+use kvstore::proto;
+use kvstore::testing::{KvPod, connect_kv_client, wait_for_state_count};
 
 /// Operator-driven test: write on primary WHILE add_replica is copying state
 /// to a new secondary. The PrimarySender should buffer these ops and replay

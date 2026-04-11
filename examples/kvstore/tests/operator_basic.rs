@@ -1,8 +1,8 @@
 use kubelicate_core::driver::{PartitionDriver, ReplicaHandle};
 use serial_test::serial;
 
-use kv_stateful::proto;
-use kv_stateful::testing::{KvPod, connect_kv_client, wait_for_state_count};
+use kvstore::proto;
+use kvstore::testing::{KvPod, connect_kv_client, wait_for_state_count};
 
 /// Operator-driven test: PartitionDriver creates a single-replica partition,
 /// KV client writes data, verifies reads.

@@ -14,7 +14,7 @@ Clients (gRPC)
     │
     ▼
 ┌──────────────────────────────────────────────────────┐
-│                    kv-stateful Pod                     │
+│                    kvstore Pod                     │
 │                                                        │
 │  ┌──────────────┐    ┌─────────────────────────────┐  │
 │  │  PodRuntime   │    │  KV Service (user app)      │  │
@@ -150,7 +150,7 @@ OperationStream → `drain_stream` → `apply_op()` (in-memory + WAL) →
 ## File Structure
 
 ```
-examples/kv-stateful/
+examples/kvstore/
 ├── Cargo.toml
 ├── build.rs
 ├── proto/kvstore.proto           # Client API: Get/Put/Delete

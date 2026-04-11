@@ -11,7 +11,7 @@ copy-based replica building, and epoch-based fencing.
 ```bash
 cargo check                                    # fast type check
 cargo clippy --all-targets                     # lint (must be zero warnings)
-cargo test -p kubelicate-core -p kv-stateful   # run all meaningful tests
+cargo test -p kubelicate-core -p kvstore   # run all meaningful tests
 cargo fmt                                      # format before committing
 ```
 
@@ -37,7 +37,7 @@ kubelicate-core/         Core replication framework
     server.rs            ControlServer — gRPC control plane
   handles.rs             PartitionState, StateReplicatorHandle, PartitionHandle
   types.rs               Epoch, Role, Lsn, ReplicaInfo, etc.
-examples/kv-stateful/    Example KV store app using the framework
+examples/kvstore/    Example KV store app using the framework
   src/testing.rs         Shared test utilities (KvPod, connect_kv_client)
   tests/                 Integration tests (operator_basic, failover, replication, reconciler)
 ```

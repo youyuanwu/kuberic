@@ -4,7 +4,7 @@ members = [
   "apps/xcontrollers",
   "apps/xdata-app",
   "apps/xdata-operator",
-  "examples/kv-stateful",
+  "examples/kvstore",
   "kubelicate-core",
   "kubelicate-data",
   "kubelicate-operator",

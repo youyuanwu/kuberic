@@ -267,7 +267,7 @@ is correct for MVP and small datasets. All tests pass with it.
 
 **Severity:** ✅ Resolved (KV app rollback + B5 committed_lsn propagation)
 **Affects:** `SecondaryReceiver`, user services, `StateProviderEvent`
-**Files:** `secondary.rs`, `events.rs`, kv-stateful `service.rs`
+**Files:** `secondary.rs`, `events.rs`, kvstore `service.rs`
 
 **What was fixed:**
 
@@ -421,7 +421,7 @@ promoted to `ActiveSecondary`), so there's no partial-state corruption.
 - The retry path already handles it: the secondary's `GetCopyContext`
   callback can report its current LSN, and the primary's `GetCopyState`
   can produce only the delta. This is an application-level concern
-  (the kv-stateful example currently always sends full state, but
+  (the kvstore example currently always sends full state, but
   the protocol supports incremental).
 
 **Remaining improvement — streaming instead of materializing:**

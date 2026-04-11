@@ -4,7 +4,7 @@ High-level design for a Service Fabric–inspired stateful replication system
 running on Kubernetes. The operator acts as the Failover Manager; user
 application pods run an in-process replicator that reacts to operator signals.
 
-**Implementation:** `kubelicate-core`, `kubelicate-operator`, `kv-stateful` example.
+**Implementation:** `kubelicate-core`, `kubelicate-operator`, `kvstore` example.
 See [Status & Roadmap](kubelicate/status.md) for LOC counts and
 [Testing](kubelicate/testing.md) for test coverage.
 
@@ -22,7 +22,7 @@ See [Status & Roadmap](kubelicate/status.md) for LOC counts and
 | [Testing](kubelicate/testing.md) | Test layers (4), infrastructure, what's tested vs not, how to run |
 | [Design Gaps](kubelicate/design-gaps.md) | 27 identified gaps: protocol safety (5), operational resilience (5), correctness (3), implementation-only (14) |
 | [Failure Scenarios](operator-failure-scenarios.md) | 9 failure scenarios with detection + recovery design |
-| [KV Store Example](kv-stateful-design.md) | KV store example design and test listing |
+| [KV Store Example](kvstore-design.md) | KV store example design and test listing |
 
 ### Background References
 

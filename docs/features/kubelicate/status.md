@@ -141,7 +141,7 @@ kubelicate-operator/
 │   ├── reconciler.rs                # Reconcile loop (Pending→Creating→Healthy→FailingOver→Switchover)
 │   └── tests.rs                     # Mock reconciler tests
 
-examples/kv-stateful/
+examples/kvstore/
 ├── src/
 │   ├── lib.rs                       # Module declarations
 │   ├── main.rs                      # Binary entry point
@@ -167,5 +167,5 @@ examples/kv-stateful/
 - `docs/features/kubelicate/operator.md` — Operator design
 - `docs/features/kubelicate/user-api.md` — User application model
 - `docs/features/kubelicate/status.md` — Status and roadmap (this doc)
-- `docs/features/kv-stateful-design.md` — KV store example design
+- `docs/features/kvstore-design.md` — KV store example design
 - `docs/features/operator-failure-scenarios.md` — Failure scenarios + recovery

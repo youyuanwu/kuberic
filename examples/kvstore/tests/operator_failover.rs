@@ -3,8 +3,8 @@ use std::time::Duration;
 use kubelicate_core::driver::{PartitionDriver, ReplicaHandle};
 use serial_test::serial;
 
-use kv_stateful::proto;
-use kv_stateful::testing::{KvPod, connect_kv_client};
+use kvstore::proto;
+use kvstore::testing::{KvPod, connect_kv_client};
 
 /// Operator-driven test: 3-replica partition, write on primary, verify via
 /// KV client, then failover and verify new primary works.

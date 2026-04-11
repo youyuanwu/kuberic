@@ -17,9 +17,9 @@ use kubelicate_operator::cluster_api::ClusterApi;
 use kubelicate_operator::crd::{KubelicateSet, KubelicateSetSpec, KubelicateSetStatus, Phase};
 use kubelicate_operator::reconciler::{ReconcilerState, reconcile_set};
 
-use kv_stateful::proto;
-use kv_stateful::service;
-use kv_stateful::state::{KvState, SharedState};
+use kvstore::proto;
+use kvstore::service;
+use kvstore::state::{KvState, SharedState};
 
 struct LivePod {
     control_address: String,

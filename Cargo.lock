@@ -1219,7 +1219,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kv-stateful"
+name = "kvstore"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1229,7 +1229,7 @@ dependencies = [
  "kube",
  "kubelicate-core",
  "kubelicate-operator",
- "kv-stateful",
+ "kvstore",
  "prost",
  "serde",
  "serde_json",

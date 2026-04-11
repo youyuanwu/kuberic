@@ -121,7 +121,7 @@ Also tests the reconciler state machine end-to-end.
 
 ### Operator-Driven Tests
 
-**File:** `examples/kv-stateful/src/tests.rs` — 8 tests
+**File:** `examples/kvstore/src/tests.rs` — 8 tests
 
 | Test | What It Validates |
 |------|-------------------|
@@ -139,7 +139,7 @@ Also tests the reconciler state machine end-to-end.
 
 ### Reconciler E2E Tests
 
-**File:** `examples/kv-stateful/src/reconciler_tests.rs` — 4 tests
+**File:** `examples/kvstore/src/reconciler_tests.rs` — 4 tests
 
 Test the full reconciler state machine driving real pods. `KvClusterApi`
 implements `ClusterApi` by spawning real `PodRuntime` + KV service pods.
@@ -207,13 +207,13 @@ impl ClusterApi for KvClusterApi {
 
 ```bash
 # All tests
-cargo test -p kubelicate-core -p kv-stateful
+cargo test -p kubelicate-core -p kvstore
 
 # Core crate only
 cargo test -p kubelicate-core
 
 # KV example only
-cargo test -p kv-stateful
+cargo test -p kvstore
 
 # Specific test
 cargo test test_driver_failover
@@ -394,7 +394,7 @@ restarted pod — the old handle is dead.
 **Current (checkpoint-only persistence):** The KV service recovers
 from the last checkpoint (snapshot + WAL replay). State from graceful
 shutdown or copy completion is preserved. State from a crash between
-checkpoints is lost (no per-op WAL yet — see `kv-stateful-design.md`
+checkpoints is lost (no per-op WAL yet — see `kvstore-design.md`
 Implementation Status for the deadlock blocker).
 
 **With per-op WAL (future):** All acknowledged ops survive crashes.
