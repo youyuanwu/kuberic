@@ -1,0 +1,27 @@
+# Service Fabric Stateful Service Architecture
+
+A detailed study of how Azure Service Fabric achieves high availability and
+failover for stateful services — covering the system architecture, the
+replicator protocol, reconfiguration phases, and the Rust API surface from
+[service-fabric-rs](https://github.com/Azure/service-fabric-rs).
+
+Source code reference: `build/service-fabric/` (depth-1 clone).
+
+---
+
+## Documents
+
+| Document | Contents |
+|----------|----------|
+| [Architecture and Concepts](architecture.md) | System architecture, key concepts (partitions, replicas, epochs), replica roles and lifecycle |
+| [Replication Protocol](replication-protocol.md) | Replicator protocol (copy/replication streams, LSN tracking), quorum mechanics, building new replicas, scale-down |
+| [Failover and Recovery](failover.md) | Failover reconfiguration, switchover (swap primary), epoch-based fencing, failure detection, quorum loss and data loss |
+| [State Management and Persistence](state-management.md) | Reliable Collections, V1 vs V2 replicator architecture, IStateProvider vs IStateProvider2, shared/dedicated log (Windows vs Linux), ReadStatus/WriteStatus |
+| [API Surface and References](references.md) | Rust API bindings (service-fabric-rs), comparison with CloudNativePG, key source code references |
+
+## Related Kubelicate Documents
+
+- [Kubelicate Replication Protocols](../../features/kubelicate/protocols.md)
+- [Design Gaps](../../features/kubelicate/design-gaps.md)
+- [WAL Persistence Design (Future)](../../features/future/wal-persistence.md)
+- [CloudNativePG Architecture](../cloudnative-pg-architecture.md)

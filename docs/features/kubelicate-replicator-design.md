@@ -28,7 +28,7 @@ See [Status & Roadmap](kubelicate/status.md) for LOC counts and
 
 | Document | Contents |
 |----------|----------|
-| [SF Architecture](../background/service-fabric-stateful-failover.md) | SF replicator, failover, switchover, epochs, quorum, data loss, Rust API |
+| [SF Architecture](../background/service-fabric/README.md) | SF replicator, failover, switchover, epochs, quorum, data loss, Rust API |
 | [CNPG Architecture](../background/cloudnative-pg-architecture.md) | CNPG operator, failover, fencing, failure scenarios, instance manager |
 
 ---

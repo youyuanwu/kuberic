@@ -160,7 +160,7 @@ examples/kv-stateful/
 
 ## Documentation Index
 
-- `docs/background/service-fabric-stateful-failover.md` — SF architecture study
+- `docs/background/service-fabric/README.md` — SF architecture study
 - `docs/background/cloudnative-pg-architecture.md` — CNPG architecture study
 - `docs/features/kubelicate-replicator-design.md` — Main design (this doc's parent)
 - `docs/features/kubelicate/protocols.md` — Replication protocols

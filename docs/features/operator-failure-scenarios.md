@@ -468,7 +468,7 @@ waits) from **data loss** (explicit FM decision: committed ops may be
 irrecoverable). Quorum loss may recover without data loss if replicas
 come back before `QuorumLossWaitDuration` expires.
 
-See `docs/background/service-fabric-stateful-failover.md` §Quorum Loss
+See `docs/background/service-fabric/failover.md` §Quorum Loss
 and Data Loss for the full SF protocol.
 
 #### Case 1: Primary alive, quorum lost

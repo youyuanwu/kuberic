@@ -63,7 +63,7 @@ examples/kv-stateful/    Example KV store app using the framework
 - `docs/features/kubelicate/` — main design (protocols, operator, user-api, status)
 - `docs/features/kubelicate/design-gaps.md` — tracked gaps with SF source analysis
 - `docs/features/kubelicate/testing.md` — test strategy and layers
-- `docs/background/service-fabric-stateful-failover.md` — SF architecture reference
+- `docs/background/service-fabric/` — SF architecture reference (split into architecture, replication, failover, state-management, references)
 - `docs/background/cloudnative-pg-architecture.md` — CNPG comparison
 - `docs/features/operator-failure-scenarios.md` — failure handling designs
 - `build/service-fabric/` — SF C++ source (depth-1 clone, for reference)
