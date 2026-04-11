@@ -5,7 +5,7 @@ use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tracing::{info, warn};
 
 use crate::error::KubelicateError;
-use crate::events::{ReplicateRequest, ReplicatorControlEvent};
+use crate::events::{ReplicateRequest, ReplicatorControlEvent, StateProviderEvent};
 use crate::handles::PartitionState;
 use crate::replicator::primary::PrimarySender;
 use crate::replicator::queue::ReplicationQueue;
@@ -34,6 +34,7 @@ impl WalReplicatorActor {
         mut control_rx: mpsc::Receiver<ReplicatorControlEvent>,
         mut data_rx: mpsc::Receiver<ReplicateRequest>,
         state: Arc<PartitionState>,
+        state_provider_tx: mpsc::UnboundedSender<StateProviderEvent>,
     ) {
         let mut role = Role::None;
         let mut epoch = Epoch::default();
@@ -109,8 +110,28 @@ impl WalReplicatorActor {
                                 ?new_epoch,
                                 "updating epoch"
                             );
+                            // Update local epoch first
                             epoch = new_epoch;
-                            let _ = reply.send(Ok(()));
+
+                            // Forward to state provider (inline — must complete before next event)
+                            let prev_lsn = state.committed_lsn();
+                            let (sp_tx, sp_rx) = tokio::sync::oneshot::channel();
+                            if state_provider_tx.send(StateProviderEvent::UpdateEpoch {
+                                epoch: new_epoch,
+                                previous_epoch_last_lsn: prev_lsn,
+                                reply: sp_tx,
+                            }).is_err() {
+                                let _ = reply.send(Err(KubelicateError::Closed));
+                                continue;
+                            }
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(30), sp_rx
+                            ).await {
+                                Ok(Ok(result)) => { let _ = reply.send(result); }
+                                Ok(Err(_)) => { let _ = reply.send(Err(KubelicateError::Closed)); }
+                                Err(_) => { let _ = reply.send(Err(KubelicateError::Internal(
+                                    "state provider UpdateEpoch timeout".into()))); }
+                            }
                         }
                         ReplicatorControlEvent::UpdateCatchUpConfiguration {
                             current,
@@ -234,14 +255,24 @@ impl WalReplicatorActor {
                             quorum_tracker.lock().await.wait_for_catch_up(mode, reply);
                         }
                         ReplicatorControlEvent::BuildReplica { replica, reply } => {
-                            // No-op with replication queue design — pending ops
-                            // are replayed at add_secondary time from the queue.
+                            // Replication queue ops are replayed at add_secondary time.
+                            // Spawn the copy protocol as a background task.
                             info!(
                                 replica_id = replica.id,
                                 queue_len = replication_queue.len(),
-                                "BuildReplica: queue has ops for replay at connect time"
+                                "BuildReplica: spawning copy task"
                             );
-                            let _ = reply.send(Ok(()));
+                            let sp_tx = state_provider_tx.clone();
+                            let st = state.clone();
+                            tokio::spawn(async move {
+                                let result = crate::replicator::copy::run_build_replica_copy(
+                                    replica,
+                                    sp_tx,
+                                    st,
+                                    std::time::Duration::from_secs(30),
+                                ).await;
+                                let _ = reply.send(result);
+                            });
                         }
                         ReplicatorControlEvent::RemoveReplica { replica_id, reply } => {
                             if let Some(sender) = &mut primary_sender {
@@ -250,7 +281,30 @@ impl WalReplicatorActor {
                             let _ = reply.send(Ok(()));
                         }
                         ReplicatorControlEvent::OnDataLoss { reply } => {
-                            let _ = reply.send(Ok(DataLossAction::None));
+                            // Forward to state provider, convert bool → DataLossAction
+                            let (sp_tx, sp_rx) = tokio::sync::oneshot::channel();
+                            if state_provider_tx.send(StateProviderEvent::OnDataLoss {
+                                reply: sp_tx,
+                            }).is_err() {
+                                let _ = reply.send(Err(KubelicateError::Closed));
+                                continue;
+                            }
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(30), sp_rx
+                            ).await {
+                                Ok(Ok(Ok(state_changed))) => {
+                                    let action = if state_changed {
+                                        DataLossAction::StateChanged
+                                    } else {
+                                        DataLossAction::None
+                                    };
+                                    let _ = reply.send(Ok(action));
+                                }
+                                Ok(Ok(Err(e))) => { let _ = reply.send(Err(e)); }
+                                Ok(Err(_)) => { let _ = reply.send(Err(KubelicateError::Closed)); }
+                                Err(_) => { let _ = reply.send(Err(KubelicateError::Internal(
+                                    "state provider OnDataLoss timeout".into()))); }
+                            }
                         }
                     }
                 }

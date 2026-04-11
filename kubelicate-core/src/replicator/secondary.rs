@@ -32,7 +32,7 @@ pub struct SecondaryReceiver {
     /// Sender for copy stream data. Primary pushes copy data here during build.
     copy_stream_tx: Option<Mutex<Option<mpsc::Sender<Operation>>>>,
     /// State provider channel for GetCopyContext callback.
-    state_provider_tx: Option<mpsc::Sender<StateProviderEvent>>,
+    state_provider_tx: Option<mpsc::UnboundedSender<StateProviderEvent>>,
 }
 
 pub struct SecondaryState {
@@ -144,7 +144,7 @@ impl SecondaryReceiver {
         partition_state: Arc<crate::handles::PartitionState>,
         operation_tx: mpsc::Sender<Operation>,
         copy_stream_tx: mpsc::Sender<Operation>,
-        state_provider_tx: mpsc::Sender<StateProviderEvent>,
+        state_provider_tx: mpsc::UnboundedSender<StateProviderEvent>,
     ) -> Self {
         Self {
             state,
@@ -248,7 +248,6 @@ impl ReplicatorData for SecondaryReceiver {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         sp_tx
             .send(StateProviderEvent::GetCopyContext { reply: reply_tx })
-            .await
             .map_err(|_| Status::internal("state provider closed"))?;
 
         let mut stream = reply_rx

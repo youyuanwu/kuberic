@@ -1,4 +1,5 @@
 pub mod actor;
+pub(crate) mod copy;
 pub mod primary;
 pub mod queue;
 pub mod quorum;
@@ -28,8 +29,6 @@ pub struct ReplicatorHandle {
     /// - set_status_for_role() — access status fencing (synchronous)
     /// - GetStatus — read current_progress, committed_lsn
     state: Arc<PartitionState>,
-    /// State provider channel — needed for copy protocol (BuildReplica).
-    state_provider_tx: mpsc::Sender<StateProviderEvent>,
     /// Data plane address (for operator registration).
     data_address: String,
     /// Shutdown token for immediate abort.
@@ -40,14 +39,12 @@ impl ReplicatorHandle {
     pub fn new(
         control_tx: mpsc::Sender<ReplicatorControlEvent>,
         state: Arc<PartitionState>,
-        state_provider_tx: mpsc::Sender<StateProviderEvent>,
         data_address: String,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
             control_tx,
             state,
-            state_provider_tx,
             data_address,
             shutdown,
         }
@@ -76,11 +73,6 @@ impl ReplicatorHandle {
         &self.state
     }
 
-    /// State provider channel — for copy protocol (BuildReplica).
-    pub fn state_provider_tx(&self) -> &mpsc::Sender<StateProviderEvent> {
-        &self.state_provider_tx
-    }
-
     /// Data plane address for operator registration.
     pub fn data_address(&self) -> &str {
         &self.data_address
@@ -107,8 +99,6 @@ pub struct ServiceContext {
     pub copy_stream: Option<OperationStream>,
     /// Replication stream (secondary, during catchup). None on primary.
     pub replication_stream: Option<OperationStream>,
-    /// State provider events (UpdateEpoch, GetCopy*, OnDataLoss).
-    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,15 +147,13 @@ impl WalReplicator {
         replica_id: ReplicaId,
         data_bind: &str,
         fault_tx: mpsc::Sender<FaultType>,
+        state_provider_tx: mpsc::UnboundedSender<StateProviderEvent>,
     ) -> Result<(ReplicatorHandle, ServiceContext)> {
         let (control_tx, control_rx) = mpsc::channel(16);
         let (data_tx, data_rx) = mpsc::channel::<ReplicateRequest>(256);
         let state = Arc::new(PartitionState::new());
         let secondary_state = Arc::new(SecondaryState::new());
         let shutdown = CancellationToken::new();
-
-        // State provider channel (replicator → user)
-        let (state_provider_tx, state_provider_rx) = mpsc::channel(16);
 
         // Replication + copy streams
         let (repl_op_tx, repl_op_rx) = mpsc::channel(256);
@@ -198,31 +186,26 @@ impl WalReplicator {
                 .await;
         });
 
-        // Replicator actor (unchanged)
+        // Replicator actor — receives state_provider_tx for forwarding
         let actor = WalReplicatorActor::new(replica_id);
         let state_cp = state.clone();
+        let sp_tx = state_provider_tx.clone();
         tokio::spawn(async move {
-            actor.run(control_rx, data_rx, state_cp).await;
+            actor.run(control_rx, data_rx, state_cp, sp_tx).await;
         });
 
         // Build handles
         let partition = Arc::new(PartitionHandle::new(state.clone(), fault_tx));
         let replicator_write = StateReplicatorHandle::new(data_tx, state.clone());
 
-        let runtime_handle = ReplicatorHandle::new(
-            control_tx,
-            state.clone(),
-            state_provider_tx,
-            data_address,
-            shutdown,
-        );
+        let runtime_handle =
+            ReplicatorHandle::new(control_tx, state.clone(), data_address, shutdown);
 
         let user_handles = ServiceContext {
             replicator: replicator_write,
             partition,
             copy_stream: Some(copy_stream),
             replication_stream: Some(replication_stream),
-            state_provider_rx,
         };
 
         Ok((runtime_handle, user_handles))

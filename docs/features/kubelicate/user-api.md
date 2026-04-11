@@ -1,20 +1,24 @@
 # Kubelicate: User Application Model
 
 Event-based API for building stateful services on Kubelicate. The user
-creates the replicator at Open time, keeps `ServiceContext` handles,
-and interacts with the replicator via `StateReplicatorHandle`.
+creates the state provider channel and replicator at Open time, keeps
+`ServiceContext` handles, and interacts with the replicator via
+`StateReplicatorHandle`.
 
 > Part of the [Kubelicate Design](../kubelicate-replicator-design.md).
 > Separation design: [Runtime–Replicator Separation](implemented/runtime-replicator-separation.md).
+> State provider design: [State Provider Separation](implemented/state-provider-separation.md).
 
 ---
 
 ## Overview
 
 The runtime delivers `LifecycleEvent` on an mpsc channel. The critical
-event is **Open**, where the user creates the replicator and returns a
-`ReplicatorHandle` to the runtime. The user keeps `ServiceContext` with
-the write handle, partition, streams, and state provider channel.
+event is **Open**, where the user creates the state provider channel and
+replicator, passes the state provider sender to the replicator, and returns
+a `ReplicatorHandle` to the runtime. The user keeps `ServiceContext` with
+the write handle, partition, and streams. State provider events arrive on
+the user-created unbounded channel.
 
 ---
 
@@ -23,9 +27,10 @@ the write handle, partition, streams, and state provider channel.
 ```
 Runtime ──── LifecycleEvent::Open { ctx: OpenContext } ────► User
                                                                │
-                                                    1. WalReplicator::create(...)
-                                                    2. Keep ServiceContext
-                                                    3. Return ReplicatorHandle
+                                                    1. Create unbounded state provider channel
+                                                    2. WalReplicator::create(..., sp_tx)
+                                                    3. Keep ServiceContext + sp_rx
+                                                    4. Return ReplicatorHandle
                                                                │
 Runtime ◄──── Ok(ReplicatorHandle) ────────────────────────────┘
 ```
@@ -79,17 +84,34 @@ pub struct ServiceContext {
     pub partition: Arc<PartitionHandle>,
     pub copy_stream: Option<OperationStream>,
     pub replication_stream: Option<OperationStream>,
-    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
 }
 ```
+
+> **Note:** `ServiceContext` does not contain `state_provider_rx` — the user
+> creates the state provider channel before calling `WalReplicator::create()`
+> and keeps the receiver directly. Operation streams remain in `ServiceContext`
+> because they are replicator outputs (data flowing to the user).
 
 ---
 
 ## State Provider Callbacks
 
-Delivered on `ServiceContext.state_provider_rx`. These are sent by the
-replicator (not the runtime) when it needs cooperation from the user's
-state. The user handles them in a `tokio::select!` alongside lifecycle.
+The user creates an unbounded state provider channel and passes the sender
+to `WalReplicator::create()`. The replicator sends events when it needs
+cooperation from the user's state. The user handles them in a
+`tokio::select!` alongside lifecycle events, or in a dedicated handler
+function.
+
+```rust
+// User creates the channel
+let (sp_tx, sp_rx) = mpsc::unbounded_channel::<StateProviderEvent>();
+
+// User passes sender to replicator
+let (handle, svc_ctx) = WalReplicator::create(
+    ctx.replica_id, &ctx.data_bind, ctx.fault_tx.clone(), sp_tx,
+).await?;
+// User keeps sp_rx, handles events in their event loop
+```
 
 ```rust
 pub enum StateProviderEvent {
@@ -128,12 +150,15 @@ async fn run_service(
 
             Some(event) = lifecycle_rx.recv() => match event {
                 LifecycleEvent::Open { ctx, reply } => {
-                    // Create replicator, keep handles
+                    // User creates state provider channel
+                    let (sp_tx, sp_rx) = mpsc::unbounded_channel();
+                    // User creates replicator, passes sp_tx
                     let (handle, svc_ctx) = WalReplicator::create(
                         ctx.replica_id, &ctx.data_bind, ctx.fault_tx.clone(),
+                        sp_tx,
                     ).await.unwrap();
                     replicator = Some(svc_ctx.replicator);
-                    state_provider_rx = Some(svc_ctx.state_provider_rx);
+                    state_provider_rx = Some(sp_rx);
                     // ... store partition, streams, token ...
                     let _ = reply.send(Ok(handle));
                 }
@@ -153,24 +178,34 @@ async fn run_service(
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
-            } => match event {
-                StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
-                    rollback_uncommitted(previous_epoch_last_lsn);
-                    let _ = reply.send(Ok(()));
-                }
-                // ... handle other state provider events ...
-                _ => {}
+            } => {
+                handle_state_provider_event(event, &state).await;
             },
 
             else => break,
         }
     }
 }
+
+/// State provider handler — standalone function, easy to swap for
+/// different state provider implementations.
+async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedState) {
+    match event {
+        StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
+            rollback_uncommitted(previous_epoch_last_lsn);
+            let _ = reply.send(Ok(()));
+        }
+        // ... handle other state provider events ...
+        _ => {}
+    }
+}
 ```
 
-**Key difference from old API:** The user no longer receives handles
-passively — they create the replicator in the Open handler and choose
-which implementation to use.
+**Key patterns:**
+- The user creates the state provider channel and passes the sender to the replicator
+- State provider events are handled in a standalone function (`handle_state_provider_event`)
+- The replicator forwards `UpdateEpoch`/`OnDataLoss` from the runtime through the state provider channel
+- The copy protocol runs entirely inside the replicator (not the runtime)
 
 ---
 

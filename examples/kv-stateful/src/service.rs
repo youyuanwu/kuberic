@@ -9,6 +9,110 @@ use tracing::info;
 use crate::server::run_client_server;
 use crate::state::{KvOp, SharedState, drain_stream};
 
+/// Handle a single state provider event.
+///
+/// This is the KV service's "state provider" — the replicator calls these
+/// during copy, catchup, and reconfiguration. Matches SF's IStateProvider.
+async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedState) {
+    match event {
+        StateProviderEvent::UpdateEpoch {
+            previous_epoch_last_lsn,
+            reply,
+            ..
+        } => {
+            // A6: Rollback uncommitted ops on epoch change.
+            let current_lsn = state.read().await.last_applied_lsn;
+            if previous_epoch_last_lsn > 0 && previous_epoch_last_lsn < current_lsn {
+                info!(
+                    previous_epoch_last_lsn,
+                    current_lsn, "epoch updated — rolling back uncommitted ops"
+                );
+                if let Err(e) = state
+                    .write()
+                    .await
+                    .rollback_to(previous_epoch_last_lsn)
+                    .await
+                {
+                    tracing::warn!(error = %e, "rollback failed");
+                }
+            } else {
+                info!(previous_epoch_last_lsn, current_lsn, "epoch updated");
+            }
+            let _ = reply.send(Ok(()));
+        }
+        StateProviderEvent::GetLastCommittedLsn { reply } => {
+            let lsn = state.read().await.last_applied_lsn;
+            info!(lsn, "reporting last committed LSN");
+            let _ = reply.send(Ok(lsn));
+        }
+        StateProviderEvent::GetCopyContext { reply } => {
+            let lsn = state.read().await.last_applied_lsn;
+            let (tx, stream) = OperationStream::channel(1);
+            let data = Bytes::from(lsn.to_string());
+            let _ = tx.send(Operation::new(0, data, None)).await;
+            drop(tx);
+            info!(lsn, "sent copy context");
+            let _ = reply.send(Ok(stream));
+        }
+        StateProviderEvent::GetCopyState {
+            up_to_lsn,
+            mut copy_context,
+            reply,
+        } => {
+            // Spawn to background — state serialization can be slow
+            // for large datasets and must not block the event loop.
+            let st = state.clone();
+            tokio::spawn(async move {
+                let peer_lsn = if let Some(op) = copy_context.get_operation().await {
+                    String::from_utf8_lossy(&op.data)
+                        .parse::<i64>()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+
+                info!(peer_lsn, up_to_lsn, "producing copy state");
+
+                let (snapshot, current_lsn): (Vec<(String, String)>, i64) = {
+                    let guard = st.read().await;
+                    let lsn = guard.last_applied_lsn;
+                    if peer_lsn < lsn {
+                        let data: Vec<_> = guard
+                            .data
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        (data, lsn)
+                    } else {
+                        (Vec::new(), lsn)
+                    }
+                };
+
+                let (tx, stream) = OperationStream::channel(64);
+                let _ = reply.send(Ok(stream));
+
+                for (k, v) in snapshot {
+                    let op = KvOp::Put { key: k, value: v };
+                    let data = Bytes::from(serde_json::to_vec(&op).unwrap());
+                    if tx
+                        .send(Operation::new(current_lsn, data, None))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                drop(tx);
+                info!("copy state produced");
+            });
+        }
+        StateProviderEvent::OnDataLoss { reply } => {
+            info!("data loss reported, accepting state as-is");
+            let _ = reply.send(Ok(false));
+        }
+    }
+}
+
 /// Main service event loop. Processes lifecycle and state provider events
 /// with biased select (lifecycle takes priority).
 ///
@@ -21,7 +125,7 @@ pub async fn run_service(
 ) {
     let mut partition = None;
     let mut replicator: Option<StateReplicatorHandle> = None;
-    let mut state_provider_rx: Option<mpsc::Receiver<StateProviderEvent>> = None;
+    let mut state_provider_rx: Option<mpsc::UnboundedReceiver<StateProviderEvent>> = None;
     let mut copy_stream: Option<OperationStream> = None;
     let mut replication_stream: Option<OperationStream> = None;
     let mut token: Option<CancellationToken> = None;
@@ -39,18 +143,21 @@ pub async fn run_service(
             Some(event) = lifecycle_rx.recv() => match event {
                 LifecycleEvent::Open { ctx, reply } => {
                     info!("service opened — creating replicator");
-                    // User creates the replicator and returns the handle
+                    // User creates the state provider channel
+                    let (sp_tx, sp_rx) = mpsc::unbounded_channel();
+                    // User creates the replicator, passes state_provider_tx
                     match WalReplicator::create(
                         ctx.replica_id,
                         &ctx.data_bind,
                         ctx.fault_tx.clone(),
+                        sp_tx,
                     ).await {
                         Ok((handle, handles)) => {
                             partition = Some(handles.partition);
                             replicator = Some(handles.replicator);
                             copy_stream = handles.copy_stream;
                             replication_stream = handles.replication_stream;
-                            state_provider_rx = Some(handles.state_provider_rx);
+                            state_provider_rx = Some(sp_rx);
                             token = Some(ctx.token);
                             let _ = reply.send(Ok(handle));
                         }
@@ -170,91 +277,8 @@ pub async fn run_service(
                     Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
-            } => match event {
-                StateProviderEvent::UpdateEpoch { previous_epoch_last_lsn, reply, .. } => {
-                    // A6: Rollback uncommitted ops on epoch change.
-                    // Only rollback when previous_epoch_last_lsn is meaningful
-                    // (non-zero, from B5 committed_lsn propagation) and less than
-                    // what we've applied.
-                    //
-                    // Do NOT cancel drain tasks — the replication stream continues
-                    // delivering new items from the new primary. Cancelling would
-                    // kill the ACK pipeline and hang the new primary's replicate().
-                    let current_lsn = state.read().await.last_applied_lsn;
-                    if previous_epoch_last_lsn > 0 && previous_epoch_last_lsn < current_lsn {
-                        info!(previous_epoch_last_lsn, current_lsn, "epoch updated — rolling back uncommitted ops");
-                        if let Err(e) = state.write().await.rollback_to(previous_epoch_last_lsn).await {
-                            tracing::warn!(error = %e, "rollback failed");
-                        }
-                    } else {
-                        info!(previous_epoch_last_lsn, current_lsn, "epoch updated");
-                    }
-                    let _ = reply.send(Ok(()));
-                }
-                StateProviderEvent::GetLastCommittedLsn { reply } => {
-                    let lsn = state.read().await.last_applied_lsn;
-                    info!(lsn, "reporting last committed LSN");
-                    let _ = reply.send(Ok(lsn));
-                }
-                StateProviderEvent::GetCopyContext { reply } => {
-                    // Fast — just send current LSN. Safe to run inline.
-                    let lsn = state.read().await.last_applied_lsn;
-                    let (tx, stream) = OperationStream::channel(1);
-                    let data = Bytes::from(lsn.to_string());
-                    let _ = tx.send(Operation::new(0, data, None)).await;
-                    drop(tx);
-                    info!(lsn, "sent copy context");
-                    let _ = reply.send(Ok(stream));
-                }
-                StateProviderEvent::GetCopyState { up_to_lsn, mut copy_context, reply } => {
-                    // Spawn to background — state serialization can be slow
-                    // for large datasets and must not block the event loop.
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        let peer_lsn = if let Some(op) = copy_context.get_operation().await {
-                            String::from_utf8_lossy(&op.data).parse::<i64>().unwrap_or(0)
-                        } else {
-                            0
-                        };
-
-                        info!(peer_lsn, up_to_lsn, "producing copy state");
-
-                        // Collect state snapshot under read lock, then drop
-                        // the lock BEFORE sending. This avoids deadlock: the
-                        // drain task needs write lock to apply replication ops,
-                        // and tx.send() can block if the receiver is slow.
-                        let (snapshot, current_lsn): (Vec<(String, String)>, i64) = {
-                            let guard = st.read().await;
-                            let lsn = guard.last_applied_lsn;
-                            if peer_lsn < lsn {
-                                let data: Vec<_> = guard.data.iter()
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect();
-                                (data, lsn)
-                            } else {
-                                (Vec::new(), lsn)
-                            }
-                        };
-
-                        let (tx, stream) = OperationStream::channel(64);
-                        // Reply with the stream immediately
-                        let _ = reply.send(Ok(stream));
-
-                        for (k, v) in snapshot {
-                            let op = KvOp::Put { key: k, value: v };
-                            let data = Bytes::from(serde_json::to_vec(&op).unwrap());
-                            if tx.send(Operation::new(current_lsn, data, None)).await.is_err() {
-                                break;
-                            }
-                        }
-                        drop(tx);
-                        info!("copy state produced");
-                    });
-                }
-                StateProviderEvent::OnDataLoss { reply } => {
-                    info!("data loss reported, accepting state as-is");
-                    let _ = reply.send(Ok(false));
-                }
+            } => {
+                handle_state_provider_event(event, &state).await;
             },
 
             else => break,

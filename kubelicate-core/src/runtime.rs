@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::error::{KubelicateError, Result};
-use crate::events::{LifecycleEvent, ReplicateRequest, ReplicatorControlEvent, StateProviderEvent};
+use crate::events::{LifecycleEvent, ReplicateRequest, ReplicatorControlEvent};
 use crate::handles::{PartitionHandle, PartitionState, StateReplicatorHandle};
 use crate::types::{AccessStatus, CancellationToken, Epoch, FaultType, OpenMode, Role};
 
@@ -19,7 +19,6 @@ const DEFAULT_FAULT_BUFFER: usize = 4;
 /// enforces promotion/demotion ordering, and delivers events to the user.
 pub struct KubelicateRuntime {
     lifecycle_tx: mpsc::Sender<LifecycleEvent>,
-    state_provider_tx: mpsc::Sender<StateProviderEvent>,
     control_tx: mpsc::Sender<ReplicatorControlEvent>,
     #[allow(dead_code)]
     data_tx: mpsc::Sender<ReplicateRequest>,
@@ -66,7 +65,6 @@ impl KubelicateRuntimeBuilder {
         let (data_tx, data_rx) = mpsc::channel(self.data_buffer);
         let state = Arc::new(PartitionState::new());
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(self.service_buffer);
-        let (state_provider_tx, state_provider_rx) = mpsc::channel(self.service_buffer);
         let (fault_tx, fault_rx) = mpsc::channel(DEFAULT_FAULT_BUFFER);
 
         let partition = Arc::new(PartitionHandle::new(state.clone(), fault_tx));
@@ -74,7 +72,6 @@ impl KubelicateRuntimeBuilder {
 
         let runtime = KubelicateRuntime {
             lifecycle_tx,
-            state_provider_tx,
             control_tx,
             data_tx,
             state: state.clone(),
@@ -88,7 +85,6 @@ impl KubelicateRuntimeBuilder {
             replicator_control_rx: control_rx,
             replicator_data_rx: data_rx,
             lifecycle_rx,
-            state_provider_rx,
             partition,
             replicator_handle,
             state,
@@ -98,13 +94,12 @@ impl KubelicateRuntimeBuilder {
 
 /// Everything produced by the builder. The caller spawns the replicator actor
 /// with `replicator_control_rx` + `replicator_data_rx`, and runs the user
-/// service event loop with `lifecycle_rx` + `state_provider_rx`.
+/// service event loop with `lifecycle_rx`.
 pub struct RuntimeBundle {
     pub runtime: KubelicateRuntime,
     pub replicator_control_rx: mpsc::Receiver<ReplicatorControlEvent>,
     pub replicator_data_rx: mpsc::Receiver<ReplicateRequest>,
     pub lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
-    pub state_provider_rx: mpsc::Receiver<StateProviderEvent>,
     pub partition: Arc<PartitionHandle>,
     pub replicator_handle: StateReplicatorHandle,
     pub state: Arc<PartitionState>,
@@ -161,38 +156,6 @@ impl KubelicateRuntime {
             Err(_) => {
                 warn!("lifecycle event reply timed out");
                 Err(KubelicateError::Internal("lifecycle reply timeout".into()))
-            }
-        }
-    }
-
-    /// Send a state provider event to the user and await the reply with timeout.
-    #[allow(dead_code)]
-    async fn send_state_provider<T>(
-        &self,
-        make_event: impl FnOnce(oneshot::Sender<Result<T>>) -> StateProviderEvent,
-    ) -> Result<T> {
-        let (tx, rx) = oneshot::channel();
-        let event = make_event(tx);
-
-        match tokio::time::timeout(self.reply_timeout, self.state_provider_tx.send(event)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(KubelicateError::Closed),
-            Err(_) => {
-                warn!("state_provider event channel send timed out");
-                return Err(KubelicateError::Internal(
-                    "state_provider event send timeout".into(),
-                ));
-            }
-        }
-
-        match tokio::time::timeout(self.reply_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(KubelicateError::Closed),
-            Err(_) => {
-                warn!("state_provider event reply timed out");
-                Err(KubelicateError::Internal(
-                    "state_provider reply timeout".into(),
-                ))
             }
         }
     }
@@ -425,7 +388,6 @@ mod tests {
         let _partition = bundle.partition.clone();
         let runtime = bundle.runtime;
         let mut lifecycle_rx = bundle.lifecycle_rx;
-        let mut _state_provider_rx = bundle.state_provider_rx;
 
         // Spawn the noop replicator actor
         let repl_state = state.clone();
@@ -453,7 +415,6 @@ mod tests {
                         let dummy_handle = crate::replicator::ReplicatorHandle::new(
                             mpsc::channel(1).0,
                             Arc::new(PartitionState::new()),
-                            mpsc::channel(1).0,
                             String::new(),
                             CancellationToken::new(),
                         );
@@ -566,7 +527,6 @@ mod tests {
 
         // Spawn minimal user lifecycle loop
         let mut lifecycle_rx = bundle.lifecycle_rx;
-        let _state_provider_rx = bundle.state_provider_rx;
         let _user_handle = tokio::spawn(async move {
             while let Some(event) = lifecycle_rx.recv().await {
                 match event {
@@ -574,7 +534,6 @@ mod tests {
                         let dummy_handle = crate::replicator::ReplicatorHandle::new(
                             mpsc::channel(1).0,
                             Arc::new(PartitionState::new()),
-                            mpsc::channel(1).0,
                             String::new(),
                             CancellationToken::new(),
                         );
@@ -627,7 +586,6 @@ mod tests {
         });
 
         let mut lifecycle_rx = bundle.lifecycle_rx;
-        let _state_provider_rx = bundle.state_provider_rx;
         let user_handle = tokio::spawn(async move {
             while let Some(event) = lifecycle_rx.recv().await {
                 if let LifecycleEvent::Abort = event {

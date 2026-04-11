@@ -928,8 +928,10 @@ pub mod testing {
             // Start replicator actor
             let actor = WalReplicatorActor::new(id);
             let state_cp = state.clone();
+            // In-process replicas create a dummy state_provider_tx (not used in tests)
+            let (sp_tx, _sp_rx) = mpsc::unbounded_channel();
             let actor_handle = tokio::spawn(async move {
-                actor.run(control_rx, data_rx, state_cp).await;
+                actor.run(control_rx, data_rx, state_cp, sp_tx).await;
             });
 
             Ok(Self {
