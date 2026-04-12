@@ -10,8 +10,10 @@ tokio.workspace = true
 kubelicate-data.workspace = true
 kubelicate-shared.workspace = true
 tonic.workspace = true
+prost.workspace = true
 kube.workspace = true
 k8s-openapi.workspace = true
 test-log.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+kvstore = { path = "../examples/kvstore" }

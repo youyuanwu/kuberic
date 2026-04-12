@@ -1,39 +1,46 @@
-/// Test kvstore deployed in KinD: write via kubectl exec + grpcurl.
-/// Uses kubectl exec to run a gRPC call from inside the cluster,
-/// bypassing port-forward (which fails in WSL2/KinD).
+/// Test kvstore deployed in KinD: write and read via gRPC client over NodePort.
 #[tokio::test]
 #[test_log::test]
 async fn test_kvstore_k8s_write_read() {
     crate::test_utils::ensure_kvstore_deployed().await;
 
-    // Use the kvstore-rw service ClusterIP to connect from within the cluster.
-    // We exec into the operator pod (which has network access to services)
-    // and use a raw gRPC health-check-like approach.
-    //
-    // For a proper write/read test, we'd need grpcurl or a test binary
-    // inside the cluster. For now, verify the service endpoint is reachable
-    // from inside the cluster via the operator pod.
-    let result = crate::test_utils::run_kubectl_cmd(&[
-        "exec",
-        "-n",
-        "xedio",
-        "deploy/kubelicate-operator",
-        "--",
-        "sh",
-        "-c",
-        "echo | nc -w2 kvstore-rw.xedio.svc.cluster.local 8080; echo exit:$?",
-    ])
-    .await;
+    // Apply NodePort service overlay for dev access (port 30090)
+    let repo_root = crate::test_utils::get_repo_root();
+    let nodeport_path = repo_root
+        .join("examples")
+        .join("kvstore")
+        .join("deploy")
+        .join("nodeport-svc.yaml");
+    crate::test_utils::kubectl_apply(&nodeport_path).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // nc may not be available in the operator image — that's OK.
-    // The primary validation is the status test below. This test is
-    // a best-effort connectivity check.
-    if let Err(e) = result {
-        tracing::warn!(
-            "in-cluster connectivity check failed (nc not available): {}",
-            e
-        );
-    }
+    // Connect via NodePort
+    let mut client =
+        kvstore::proto::kv_store_client::KvStoreClient::connect("http://127.0.0.1:30090")
+            .await
+            .expect("failed to connect via NodePort 30090");
+
+    // Put a key
+    let put_resp = client
+        .put(kvstore::proto::PutRequest {
+            key: "test-k8s-key".into(),
+            value: "test-k8s-value".into(),
+        })
+        .await
+        .expect("Put failed");
+    tracing::info!(lsn = put_resp.into_inner().lsn, "Put succeeded");
+
+    // Get the key back
+    let get_resp = client
+        .get(kvstore::proto::GetRequest {
+            key: "test-k8s-key".into(),
+        })
+        .await
+        .expect("Get failed");
+    let inner = get_resp.into_inner();
+    assert!(inner.found, "key should be found");
+    assert_eq!(inner.value, "test-k8s-value", "value mismatch");
+    tracing::info!("Put/Get round-trip succeeded via NodePort 30090");
 }
 
 /// Test kvstore KubelicateSet status shows Healthy with 3 replicas.

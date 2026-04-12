@@ -1212,6 +1212,8 @@ dependencies = [
  "kube",
  "kubelicate-data",
  "kubelicate-shared",
+ "kvstore",
+ "prost",
  "serde_json",
  "test-log",
  "tokio",
