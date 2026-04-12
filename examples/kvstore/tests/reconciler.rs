@@ -699,6 +699,9 @@ async fn test_reconciler_scale_up() {
     reconcile_set(&set, &api, &state).await.unwrap();
     assert_eq!(api.pods.lock().unwrap().len(), 3);
 
+    // PVCs should also scale up
+    assert_eq!(api.pvcs.lock().unwrap().len(), 3);
+
     // Mark new pods ready
     api.mark_all_pods_ready();
 
@@ -763,6 +766,9 @@ async fn test_reconciler_scale_down() {
     // Scale down: change spec to 1 replica
     let set = make_set("myapp", 1, Some(status.clone()));
     reconcile_set(&set, &api, &state).await.unwrap();
+
+    // PVCs retained after scale-down (pod deleted, PVC kept)
+    assert_eq!(api.pvcs.lock().unwrap().len(), 3);
 
     // Driver should have fewer replicas
     {

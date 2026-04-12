@@ -191,8 +191,8 @@ pub async fn reconcile_set(
             if actual < desired {
                 info!(name, actual, desired, "scale-up: creating pods");
                 for i in actual..desired {
-                    let pod = build_pod(set, &namespace, i as i32);
-                    api.create_pod(&namespace, &pod).await?;
+                    ensure_pvc(api, set, &namespace, i as i32).await?;
+                    ensure_pod(api, set, &namespace, i as i32).await?;
                 }
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
             }
