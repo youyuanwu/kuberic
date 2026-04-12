@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package sqlitestore.v1;
+
+service SqliteStore {
+  // Execute a write statement (INSERT/UPDATE/DELETE/CREATE/etc.).
+  // Primary only. Returns affected rows and last insert rowid.
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Execute a read query (SELECT).
+  // Primary only. Returns column names and rows.
+  rpc Query(QueryRequest) returns (QueryResponse);
+
+  // Execute multiple statements in a transaction.
+  // Primary only. All succeed or all fail.
+  rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
+}
+
+message ExecuteRequest {
+  string sql = 1;
+  repeated Value params = 2;
+}
+
+message ExecuteResponse {
+  int64 rows_affected = 1;
+  int64 last_insert_rowid = 2;
+  int64 lsn = 3;
+}
+
+message QueryRequest {
+  string sql = 1;
+  repeated Value params = 2;
+}
+
+message QueryResponse {
+  repeated string columns = 1;
+  repeated Row rows = 2;
+}
+
+message Row {
+  repeated Value values = 1;
+}
+
+message Value {
+  oneof kind {
+    int64 integer_value = 1;
+    double real_value = 2;
+    string text_value = 3;
+    bytes blob_value = 4;
+  }
+  bool is_null = 5;
+}
+
+message ExecuteBatchRequest {
+  repeated string statements = 1;
+}
+
+message ExecuteBatchResponse {
+  repeated int64 rows_affected = 1;
+  int64 lsn = 2;
+}

@@ -1,0 +1,342 @@
+//! Lifecycle + StateProvider event loop for the SQLite service.
+//!
+//! Same two-channel pattern as kvstore: LifecycleEvent + StateProviderEvent.
+
+use bytes::Bytes;
+use kubelicate_core::events::{LifecycleEvent, StateProviderEvent};
+use kubelicate_core::handles::StateReplicatorHandle;
+use kubelicate_core::replicator::WalReplicator;
+use kubelicate_core::types::{CancellationToken, Operation, OperationStream, Role};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::frames::WalFrameSet;
+use crate::server::run_client_server;
+use crate::state::SharedState;
+
+/// Handle a single state provider event.
+async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedState) {
+    match event {
+        StateProviderEvent::UpdateEpoch {
+            previous_epoch_last_lsn,
+            reply,
+            ..
+        } => {
+            let current_lsn = state.lock().await.last_applied_lsn;
+            if previous_epoch_last_lsn > 0 && previous_epoch_last_lsn < current_lsn {
+                info!(
+                    previous_epoch_last_lsn,
+                    current_lsn, "epoch updated — rolling back"
+                );
+                if let Err(e) = state
+                    .lock()
+                    .await
+                    .rollback_to(previous_epoch_last_lsn)
+                    .await
+                {
+                    warn!(error = %e, "rollback failed");
+                }
+            } else {
+                info!(previous_epoch_last_lsn, current_lsn, "epoch updated");
+            }
+            let _ = reply.send(Ok(()));
+        }
+        StateProviderEvent::GetLastCommittedLsn { reply } => {
+            let lsn = state.lock().await.committed_lsn;
+            info!(lsn, "reporting last committed LSN");
+            let _ = reply.send(Ok(lsn));
+        }
+        StateProviderEvent::GetCopyContext { reply } => {
+            let lsn = state.lock().await.committed_lsn;
+            let (tx, stream) = OperationStream::channel(1);
+            let data = Bytes::from(lsn.to_string());
+            let _ = tx.send(Operation::new(0, data, None)).await;
+            drop(tx);
+            info!(lsn, "sent copy context");
+            let _ = reply.send(Ok(stream));
+        }
+        StateProviderEvent::GetCopyState {
+            up_to_lsn,
+            mut copy_context,
+            reply,
+        } => {
+            let peer_lsn = if let Some(op) = copy_context.get_operation().await {
+                String::from_utf8_lossy(&op.data)
+                    .parse::<i64>()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            info!(peer_lsn, up_to_lsn, "producing copy state (DB snapshot)");
+
+            let snapshot = match state.lock().await.snapshot_db() {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(error = %e, "failed to snapshot DB");
+                    let _ =
+                        reply.send(Err(kubelicate_core::KubelicateError::Internal(Box::new(e))));
+                    return;
+                }
+            };
+
+            let current_lsn = state.lock().await.last_applied_lsn;
+            let (tx, stream) = OperationStream::channel(64);
+            let _ = reply.send(Ok(stream));
+
+            // Send snapshot in background (doesn't need state)
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Operation::new(current_lsn, Bytes::from(snapshot), None))
+                    .await;
+                drop(tx);
+                info!("copy state produced");
+            });
+        }
+        StateProviderEvent::OnDataLoss { reply } => {
+            info!("data loss reported, accepting state as-is");
+            let _ = reply.send(Ok(false));
+        }
+    }
+}
+
+/// Drain a copy or replication stream for the secondary.
+async fn drain_stream(
+    state: SharedState,
+    mut stream: OperationStream,
+    token: CancellationToken,
+    label: &'static str,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => {
+                info!(label, "stream drain cancelled");
+                break;
+            }
+            item = stream.get_operation() => {
+                let Some(op) = item else { break };
+                let lsn = op.lsn;
+
+                if label == "copy" {
+                    // Copy stream: full DB snapshot
+                    let mut st = state.lock().await;
+                    if let Err(e) = st.restore_from_snapshot(&op.data).await {
+                        warn!(error = %e, "failed to restore snapshot");
+                        continue;
+                    }
+                    st.last_applied_lsn = lsn;
+                    st.committed_lsn = lsn;
+                    info!(lsn, "restored DB from copy stream");
+                    op.acknowledge();
+                } else {
+                    // Replication stream: WalFrameSet
+                    match serde_json::from_slice::<WalFrameSet>(&op.data) {
+                        Ok(frame_set) => {
+                            if !frame_set.verify_checksum() {
+                                warn!(lsn, "checksum mismatch, not acknowledging");
+                                continue;
+                            }
+                            let mut st = state.lock().await;
+                            if let Err(e) = st.persist_frame(lsn, &frame_set).await {
+                                warn!(lsn, error = %e, "frame persist failed, not acknowledging");
+                                continue;
+                            }
+                            op.acknowledge();
+                        }
+                        Err(e) => {
+                            warn!(lsn, error = %e, "failed to deserialize WalFrameSet");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    info!(label, "stream drained");
+}
+
+/// Main service event loop.
+pub async fn run_service(
+    mut lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
+    state: SharedState,
+    client_bind: String,
+) {
+    let mut partition = None;
+    let mut replicator: Option<StateReplicatorHandle> = None;
+    let mut state_provider_rx: Option<mpsc::UnboundedReceiver<StateProviderEvent>> = None;
+    let mut copy_stream: Option<OperationStream> = None;
+    let mut replication_stream: Option<OperationStream> = None;
+    let mut token: Option<CancellationToken> = None;
+    let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut bg_token: Option<CancellationToken> = None;
+    let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut client_server_shutdown: Option<CancellationToken> = None;
+
+    info!("sqlite service started, waiting for events");
+
+    loop {
+        tokio::select! {
+            biased;
+
+            Some(event) = lifecycle_rx.recv() => match event {
+                LifecycleEvent::Open { ctx, reply } => {
+                    info!("service opened — creating replicator");
+                    let (sp_tx, sp_rx) = mpsc::unbounded_channel();
+                    match WalReplicator::create(
+                        ctx.replica_id,
+                        &ctx.data_bind,
+                        ctx.fault_tx.clone(),
+                        sp_tx,
+                    ).await {
+                        Ok((handle, handles)) => {
+                            partition = Some(handles.partition);
+                            replicator = Some(handles.replicator);
+                            copy_stream = handles.copy_stream;
+                            replication_stream = handles.replication_stream;
+                            state_provider_rx = Some(sp_rx);
+                            token = Some(ctx.token);
+                            let _ = reply.send(Ok(handle));
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to create replicator");
+                            let _ = reply.send(Err(e));
+                        }
+                    }
+                }
+                LifecycleEvent::ChangeRole { new_role, reply } => {
+                    info!(?new_role, "role changed");
+
+                    if new_role == Role::ActiveSecondary {
+                        // Let copy drain finish
+                        for h in bg_handles.drain(..) {
+                            let _ = h.await;
+                        }
+                        // Apply committed frames after copy
+                        {
+                            let st = state.lock().await;
+                            let lsn = st.last_applied_lsn;
+                            drop(st);
+                            let mut st = state.lock().await;
+                            st.committed_lsn = lsn;
+                            if let Err(e) = crate::framelog::FrameLog::save_meta(
+                                &st.data_dir,
+                                &crate::framelog::FrameLogMeta { committed_lsn: lsn },
+                            ).await {
+                                warn!(error = %e, "meta save after copy failed");
+                            }
+                        }
+                    } else {
+                        if let Some(t) = bg_token.take() {
+                            t.cancel();
+                        }
+                        for h in bg_handles.drain(..) {
+                            let _ = h.await;
+                        }
+                    }
+
+                    let t = CancellationToken::new();
+                    bg_token = Some(t.clone());
+
+                    match new_role {
+                        Role::IdleSecondary => {
+                            // Open frame log for secondary
+                            {
+                                let mut st = state.lock().await;
+                                if let Err(e) = st.open_frame_log().await {
+                                    warn!(error = %e, "failed to open frame log");
+                                }
+                            }
+                            if let Some(cs) = copy_stream.take() {
+                                let st = state.clone();
+                                bg_handles.push(tokio::spawn(
+                                    drain_stream(st, cs, t.clone(), "copy"),
+                                ));
+                            }
+                        }
+                        Role::ActiveSecondary => {
+                            if let Some(rs) = replication_stream.take() {
+                                let st = state.clone();
+                                bg_handles.push(tokio::spawn(
+                                    drain_stream(st, rs, t.clone(), "replication"),
+                                ));
+                            }
+                        }
+                        Role::Primary => {
+                            // Apply any unapplied frames from frame log before opening as primary
+                            {
+                                let mut st = state.lock().await;
+                                let lsn = st.last_applied_lsn;
+                                if let Err(e) = st.apply_committed_frames(lsn).await {
+                                    warn!(error = %e, "applying frames before promotion failed");
+                                }
+                                if let Err(e) = st.open_as_primary() {
+                                    warn!(error = %e, "failed to open as primary");
+                                }
+                            }
+                            if client_server_handle.is_none() {
+                                let srv_state = state.clone();
+                                let p = partition.as_ref().unwrap().clone();
+                                let r = replicator.as_ref().unwrap().clone();
+                                let srv_token = token.as_ref().unwrap().clone();
+                                let shutdown = CancellationToken::new();
+                                let shutdown_cp = shutdown.clone();
+                                let bind = client_bind.clone();
+
+                                client_server_shutdown = Some(shutdown);
+                                client_server_handle = Some(tokio::spawn(async move {
+                                    run_client_server(
+                                        bind, srv_state, p, r,
+                                        srv_token, shutdown_cp,
+                                    ).await;
+                                }));
+                            }
+                        }
+                        Role::None => {}
+                    }
+
+                    let _ = reply.send(Ok(String::new()));
+                }
+                LifecycleEvent::Close { reply } => {
+                    info!("service closing");
+                    if let Some(token) = bg_token.take() {
+                        token.cancel();
+                    }
+                    for h in bg_handles.drain(..) {
+                        let _ = h.await;
+                    }
+                    if let Some(shutdown) = client_server_shutdown.take() {
+                        shutdown.cancel();
+                    }
+                    if let Some(h) = client_server_handle.take() {
+                        let _ = h.await;
+                    }
+                    state.lock().await.close();
+                    let _ = reply.send(Ok(()));
+                    break;
+                }
+                LifecycleEvent::Abort => {
+                    if let Some(token) = bg_token.take() {
+                        token.cancel();
+                    }
+                    if let Some(shutdown) = client_server_shutdown.take() {
+                        shutdown.cancel();
+                    }
+                    state.lock().await.close();
+                    break;
+                }
+            },
+
+            Some(event) = async {
+                match state_provider_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                handle_state_provider_event(event, &state).await;
+            },
+
+            else => break,
+        }
+    }
+    info!("sqlite service exited");
+}

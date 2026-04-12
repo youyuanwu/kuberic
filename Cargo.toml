@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "examples/kvstore",
+  "examples/sqlite",
   "kubelicate-core",
   "kubelicate-operator",
   "kubelicate-tests",

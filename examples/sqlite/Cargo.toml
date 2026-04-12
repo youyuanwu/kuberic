@@ -1,0 +1,40 @@
+[package]
+name = "sqlite-replicated"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+testing = []
+
+[[bin]]
+name = "sqlite-replicated"
+path = "src/main.rs"
+
+[dependencies]
+kubelicate-core = { path = "../../kubelicate-core" }
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tonic-prost.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+crc32fast = "1"
+
+[dev-dependencies]
+test-log.workspace = true
+sqlite-replicated = { path = ".", features = ["testing"] }
+kubelicate-operator = { path = "../../kubelicate-operator" }
+k8s-openapi.workspace = true
+kube.workspace = true
+async-trait.workspace = true
+serial_test = "3.4.0"
+
+[build-dependencies]
+tonic-prost-build.workspace = true

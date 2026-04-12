@@ -11,12 +11,12 @@ copy-based replica building, and epoch-based fencing.
 ```bash
 cargo check                                    # fast type check
 cargo clippy --all-targets                     # lint (must be zero warnings)
-cargo test -p kubelicate-core -p kvstore   # run all meaningful tests
+cargo test -p kubelicate-core -p kvstore -p sqlite-replicated   # run all meaningful tests
 cargo fmt                                      # format before committing
 ```
 
 - The `kubelicate-tests` crate requires a K8s cluster — skip it in local dev.
-- All kvstore tests use `#[serial]` (port contention).
+- All kvstore and sqlite tests use `#[serial]` (port contention).
 - The build buffer replay test (`operator_replication.rs`) takes ~7s (500+200 entries).
 
 ## Architecture
@@ -40,6 +40,9 @@ kubelicate-core/         Core replication framework
 examples/kvstore/    Example KV store app using the framework
   src/testing.rs         Shared test utilities (KvPod, connect_kv_client)
   tests/                 Integration tests (operator_basic, failover, replication, reconciler)
+examples/sqlite/     Example replicated SQLite DB using the framework
+  src/testing.rs         Test utilities (SqlitePod, connect_sqlite_client)
+  tests/                 Integration tests (operator_basic, failover, replication)
 ```
 
 ## Key Design Patterns
@@ -65,6 +68,7 @@ examples/kvstore/    Example KV store app using the framework
 - `docs/features/kubelicate/testing.md` — test strategy and layers
 - `docs/background/service-fabric/` — SF architecture reference (split into architecture, replication, failover, state-management, references)
 - `docs/background/cloudnative-pg-architecture.md` — CNPG comparison
+- `docs/features/sqlite/` — replicated SQLite design (WAL frame shipping, persist-then-ACK)
 - `docs/features/operator-failure-scenarios.md` — failure handling designs
 - `build/service-fabric/` — SF C++ source (depth-1 clone, for reference)
 
