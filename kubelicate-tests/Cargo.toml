@@ -7,8 +7,6 @@ edition = "2024"
 
 [dev-dependencies]
 tokio.workspace = true
-kubelicate-data.workspace = true
-kubelicate-shared.workspace = true
 tonic.workspace = true
 prost.workspace = true
 kube.workspace = true
@@ -16,4 +14,8 @@ k8s-openapi.workspace = true
 test-log.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
+kube-lease-manager = "0.11.1"
+kube-leader-election = "0.43.0"
+rand.workspace = true
+tokio-util = "0.7"
 kvstore = { path = "../examples/kvstore" }

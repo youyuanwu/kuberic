@@ -1,23 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-  "apps/xcontrollers",
-  "apps/xdata-app",
-  "apps/xdata-operator",
   "examples/kvstore",
   "kubelicate-core",
-  "kubelicate-data",
   "kubelicate-operator",
-
-  "kubelicate-shared",
   "kubelicate-tests",
 ]
 
 [workspace.dependencies]
-mssf-com = { version = "0.6" }
-mssf-core = "0.6"
-mssf-pal = "0.5"
-mssf-util = "0.6"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
@@ -32,9 +22,7 @@ prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-prost = "0.14"
 tracing-subscriber = "0.3"
-kube-leader-election = "0.43.0"
 kube = { version = "3", features = ["runtime", "derive"] }
-kube-lease-manager = "0.11.1"
 k8s-openapi = { version = "0.27", features = ["latest", "schemars"] }
 rand = "0.10"
 schemars = "1"
@@ -43,9 +31,3 @@ test-log = { version = "0.2", default-features = false, features = ["trace"] }
 # example deps
 anyhow = "1"
 thiserror = "2"
-serde_yaml = "0.9"
-
-kubelicate-data = { path = "kubelicate-data" }
-kubelicate-shared = { path = "kubelicate-shared" }
-kubelicate-tests = { path = "kubelicate-tests" }
-kubelicate-app = { path = "apps/kubelicate-app" }

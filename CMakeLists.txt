@@ -40,7 +40,5 @@ add_custom_target(build_rust_bins
     VERBATIM
 )
 
-add_subdirectory(apps/xdata-app)
-add_subdirectory(apps/xdata-operator)
 add_subdirectory(kubelicate-operator)
 add_subdirectory(examples/kvstore)
