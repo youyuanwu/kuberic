@@ -1212,6 +1212,7 @@ dependencies = [
  "kube",
  "kubelicate-data",
  "kubelicate-shared",
+ "serde_json",
  "test-log",
  "tokio",
  "tonic",

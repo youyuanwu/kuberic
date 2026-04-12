@@ -2,6 +2,9 @@
 mod tests;
 
 #[cfg(test)]
+mod kvstore_k8s;
+
+#[cfg(test)]
 pub mod test_utils {
 
     /// Get the root directory of the repository
@@ -253,5 +256,166 @@ pub mod test_utils {
     #[test_log::test]
     async fn test_ensure_xdata_app_deployed() {
         ensure_test_env_deployed().await;
+    }
+
+    // -- Kubelicate operator helpers --
+
+    pub async fn ensure_kubelicate_operator_deployed() {
+        static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        INIT.get_or_init(async || {
+            ensure_kubelicate_operator_deployed_internal().await;
+        })
+        .await;
+    }
+
+    async fn ensure_kubelicate_operator_deployed_internal() {
+        let client = kube::Client::try_default()
+            .await
+            .expect("Failed to create k8s client");
+        let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
+            kube::Api::namespaced(client.clone(), kubelicate_shared::NAME_XEDIO);
+        let name = "kubelicate-operator";
+        match deployments.get(name).await {
+            Ok(_) => {
+                tracing::info!("kubelicate-operator already deployed");
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                tracing::info!("kubelicate-operator not found, deploying...");
+                let repo_root = get_repo_root();
+                let path = repo_root
+                    .join("kubelicate-operator")
+                    .join("deploy")
+                    .join("deployment.yaml");
+                kubectl_apply(&path).await;
+                wait_deployment_replica_ready(kubelicate_shared::NAME_XEDIO, name, 1, 120)
+                    .await
+                    .expect("kubelicate-operator failed to become ready");
+                tracing::info!("kubelicate-operator deployed");
+            }
+            Err(e) => panic!("Failed to get deployment: {}", e),
+        }
+    }
+
+    pub async fn ensure_kvstore_deployed() {
+        static INIT: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+        INIT.get_or_init(async || {
+            ensure_kubelicate_operator_deployed().await;
+            ensure_kvstore_deployed_internal().await;
+        })
+        .await;
+    }
+
+    async fn ensure_kvstore_deployed_internal() {
+        tracing::info!("Ensuring kvstore KubelicateSet is deployed...");
+        let repo_root = get_repo_root();
+        let path = repo_root
+            .join("examples")
+            .join("kvstore")
+            .join("deploy")
+            .join("kubelicateset.yaml");
+        kubectl_apply(&path).await;
+
+        // Wait for pods to be ready
+        wait_pods_ready(
+            kubelicate_shared::NAME_XEDIO,
+            "kubelicate.io/set=kvstore",
+            3,
+            120,
+        )
+        .await
+        .expect("kvstore pods failed to become ready");
+        tracing::info!("kvstore deployed and ready");
+    }
+
+    pub async fn wait_pods_ready(
+        namespace: &str,
+        label_selector: &str,
+        expected: usize,
+        timeout_seconds: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = kube::Client::try_default().await?;
+        let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+            kube::Api::namespaced(client, namespace);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+
+        loop {
+            let params = kube::api::ListParams::default().labels(label_selector);
+            let list = pods.list(&params).await?;
+            let ready_count = list
+                .items
+                .iter()
+                .filter(|p| {
+                    p.status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_ref())
+                        .map(|c| {
+                            c.iter()
+                                .any(|cond| cond.type_ == "Ready" && cond.status == "True")
+                        })
+                        .unwrap_or(false)
+                })
+                .count();
+
+            if ready_count >= expected {
+                return Ok(());
+            }
+
+            if std::time::Instant::now() > deadline {
+                return Err(format!(
+                    "timeout: {}/{} pods ready for selector {}",
+                    ready_count, expected, label_selector
+                )
+                .into());
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    }
+
+    /// Start a port-forward to a K8s service, returns (child, local_port).
+    pub async fn port_forward_svc(
+        namespace: &str,
+        svc: &str,
+        remote_port: u16,
+    ) -> (tokio::process::Child, u16) {
+        use tokio::io::AsyncBufReadExt;
+
+        let mut child = tokio::process::Command::new("kubectl")
+            .args([
+                "port-forward",
+                "-n",
+                namespace,
+                &format!("svc/{svc}"),
+                &format!(":{remote_port}"),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kubectl port-forward");
+
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut line = String::new();
+
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("port-forward timed out");
+        read_result.unwrap();
+
+        // Parse port from "Forwarding from 127.0.0.1:<port> -> <remote>"
+        // or "Forwarding from [::1]:<port> -> <remote>"
+        let port: u16 = line
+            .split("127.0.0.1:")
+            .nth(1)
+            .or_else(|| line.rsplit("]:").next().filter(|_| line.contains("[::1]")))
+            .and_then(|s| s.split_whitespace().next())
+            .expect("failed to parse port from kubectl output")
+            .parse()
+            .expect("port is not a number");
+
+        (child, port)
     }
 }
