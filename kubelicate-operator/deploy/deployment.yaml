@@ -1,0 +1,212 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: xedio
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: kubelicatesets.kubelicate.io
+spec:
+  group: kubelicate.io
+  names:
+    kind: KubelicateSet
+    listKind: KubelicateSetList
+    plural: kubelicatesets
+    shortNames:
+    - kls
+    singular: kubelicateset
+  scope: Namespaced
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              replicas:
+                type: integer
+                default: 3
+                minimum: 1
+                maximum: 10
+              minReplicas:
+                type: integer
+                default: 2
+              image:
+                type: string
+              failoverDelay:
+                type: integer
+                default: 0
+              switchoverDelay:
+                type: integer
+                default: 3600
+              port:
+                type: integer
+                default: 8080
+              controlPort:
+                type: integer
+                default: 9090
+              dataPort:
+                type: integer
+                default: 9091
+              storage:
+                type: string
+                default: "256Mi"
+              pvcRetentionPolicy:
+                type: string
+                default: Delete
+                enum:
+                - Delete
+                - Retain
+          status:
+            type: object
+            properties:
+              epoch:
+                type: object
+                properties:
+                  dataLossNumber:
+                    type: integer
+                  configurationNumber:
+                    type: integer
+              currentPrimary:
+                type: string
+              targetPrimary:
+                type: string
+              phase:
+                type: string
+              reconfigurationPhase:
+                type: string
+              readyReplicas:
+                type: integer
+              replicas:
+                type: integer
+              primaryFailingSince:
+                type: string
+              members:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    id:
+                      type: integer
+                    role:
+                      type: string
+                    currentProgress:
+                      type: integer
+                    healthy:
+                      type: boolean
+                    controlAddress:
+                      type: string
+                    dataAddress:
+                      type: string
+    subresources:
+      status: {}
+    additionalPrinterColumns:
+    - name: Replicas
+      type: integer
+      jsonPath: .spec.replicas
+    - name: Ready
+      type: integer
+      jsonPath: .status.readyReplicas
+    - name: Phase
+      type: string
+      jsonPath: .status.phase
+    - name: Primary
+      type: string
+      jsonPath: .status.currentPrimary
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubelicate-operator
+  namespace: xedio
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubelicate-operator
+rules:
+- apiGroups: ["kubelicate.io"]
+  resources: ["kubelicatesets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["kubelicate.io"]
+  resources: ["kubelicatesets/status"]
+  verbs: ["get", "update", "patch"]
+- apiGroups: ["kubelicate.io"]
+  resources: ["kubelicatesets/finalizers"]
+  verbs: ["update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubelicate-operator
+subjects:
+- kind: ServiceAccount
+  name: kubelicate-operator
+  namespace: xedio
+roleRef:
+  kind: ClusterRole
+  name: kubelicate-operator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubelicate-operator
+  namespace: xedio
+  labels:
+    app: kubelicate-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubelicate-operator
+  template:
+    metadata:
+      labels:
+        app: kubelicate-operator
+    spec:
+      serviceAccountName: kubelicate-operator
+      containers:
+      - name: operator
+        image: localhost/kubelicate-operator:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: RUST_LOG
+          value: "info"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL

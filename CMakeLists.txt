@@ -22,7 +22,7 @@ endif()
 
 add_custom_target(create-kind-cluster
     COMMAND ${KIND_EXE} create cluster --name kind 
-        --config=apps/xdata-app/deploy/kind/kind-config.yaml
+        --config=deploy/kind-config.yaml
         --kubeconfig ~/.kube/config
     COMMAND ${KIND_EXE} export kubeconfig --name kind --kubeconfig ~/.kube/config
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -42,3 +42,5 @@ add_custom_target(build_rust_bins
 
 add_subdirectory(apps/xdata-app)
 add_subdirectory(apps/xdata-operator)
+add_subdirectory(kubelicate-operator)
+add_subdirectory(examples/kvstore)

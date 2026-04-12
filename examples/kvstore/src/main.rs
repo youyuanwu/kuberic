@@ -14,19 +14,19 @@ use kvstore::state::{KvState, SharedState};
 #[command(name = "kvstore", about = "Replicated key-value store example")]
 struct Args {
     /// Replica ID for this instance.
-    #[arg(long, default_value = "1")]
+    #[arg(long, env = "KUBELICATE_REPLICA_ID", default_value = "1")]
     replica_id: i64,
 
     /// Bind address for the gRPC control server (operator → pod).
-    #[arg(long, default_value = "127.0.0.1:0")]
+    #[arg(long, env = "KUBELICATE_CONTROL_BIND", default_value = "127.0.0.1:0")]
     control_bind: String,
 
     /// Bind address for the gRPC data server (primary → secondary replication).
-    #[arg(long, default_value = "127.0.0.1:0")]
+    #[arg(long, env = "KUBELICATE_DATA_BIND", default_value = "127.0.0.1:0")]
     data_bind: String,
 
     /// Bind address for the client-facing KV gRPC server.
-    #[arg(long, default_value = "127.0.0.1:0")]
+    #[arg(long, env = "KUBELICATE_CLIENT_BIND", default_value = "127.0.0.1:0")]
     client_bind: String,
 
     /// Data directory for persistent state.
@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
-    info!("=== KV-Stateful: Replicated Key-Value Store ===");
+    info!("=== KVStore: Replicated Key-Value Store ===");
 
     let bundle = PodRuntime::builder(args.replica_id)
         .reply_timeout(Duration::from_secs(10))

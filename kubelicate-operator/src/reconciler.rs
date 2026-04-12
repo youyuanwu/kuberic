@@ -574,6 +574,21 @@ fn build_pod(set: &KubelicateSet, namespace: &str, index: i32) -> Pod {
             ..Default::default()
         },
         k8s_openapi::api::core::v1::EnvVar {
+            name: "KUBELICATE_CONTROL_BIND".into(),
+            value: Some(format!("0.0.0.0:{}", set.spec.control_port)),
+            ..Default::default()
+        },
+        k8s_openapi::api::core::v1::EnvVar {
+            name: "KUBELICATE_DATA_BIND".into(),
+            value: Some(format!("0.0.0.0:{}", set.spec.data_port)),
+            ..Default::default()
+        },
+        k8s_openapi::api::core::v1::EnvVar {
+            name: "KUBELICATE_CLIENT_BIND".into(),
+            value: Some(format!("0.0.0.0:{}", set.spec.port)),
+            ..Default::default()
+        },
+        k8s_openapi::api::core::v1::EnvVar {
             name: "RUST_LOG".into(),
             value: Some("info".into()),
             ..Default::default()
@@ -592,6 +607,7 @@ fn build_pod(set: &KubelicateSet, namespace: &str, index: i32) -> Pod {
             containers: vec![Container {
                 name: "app".into(),
                 image: Some(set.spec.image.clone()),
+                image_pull_policy: Some("IfNotPresent".into()),
                 ports: Some(vec![
                     ContainerPort {
                         container_port: set.spec.port,
