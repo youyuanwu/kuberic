@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, PodCondition, PodStatus, Service};
 use kube::api::ObjectMeta;
 use serial_test::serial;
 use tokio::sync::RwLock;
@@ -14,7 +14,9 @@ use kubelicate_core::pod::PodRuntime;
 use kubelicate_core::types::ReplicaId;
 
 use kubelicate_operator::cluster_api::ClusterApi;
-use kubelicate_operator::crd::{KubelicateSet, KubelicateSetSpec, KubelicateSetStatus, Phase};
+use kubelicate_operator::crd::{
+    KubelicateSet, KubelicateSetSpec, KubelicateSetStatus, Phase, PvcRetentionPolicy,
+};
 use kubelicate_operator::reconciler::{ReconcilerState, reconcile_set};
 
 use kvstore::proto;
@@ -36,6 +38,8 @@ struct KvClusterApi {
     pods: Mutex<Vec<Pod>>,
     live_pods: Mutex<HashMap<String, LivePod>>,
     statuses: Mutex<Vec<KubelicateSetStatus>>,
+    pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
+    services: Mutex<HashMap<String, Service>>,
 }
 
 impl KvClusterApi {
@@ -44,6 +48,8 @@ impl KvClusterApi {
             pods: Mutex::new(Vec::new()),
             live_pods: Mutex::new(HashMap::new()),
             statuses: Mutex::new(Vec::new()),
+            pvcs: Mutex::new(HashMap::new()),
+            services: Mutex::new(HashMap::new()),
         }
     }
 
@@ -116,11 +122,23 @@ impl ClusterApi for KvClusterApi {
 
     async fn create_pod(&self, _ns: &str, pod: &Pod) -> Result<(), String> {
         let pod_name = pod.metadata.name.as_deref().unwrap().to_string();
+
+        // Idempotent: skip if pod already exists
+        {
+            let pods = self.pods.lock().unwrap();
+            if pods
+                .iter()
+                .any(|p| p.metadata.name.as_deref() == Some(pod_name.as_str()))
+            {
+                return Ok(());
+            }
+        }
+
         let replica_id: i64 = pod
             .metadata
             .labels
             .as_ref()
-            .and_then(|l| l.get("kubelicate.io/replica-id"))
+            .and_then(|l| l.get("kubelicate.io/pod-index"))
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0)
             + 1;
@@ -234,6 +252,58 @@ impl ClusterApi for KvClusterApi {
 
         Ok(Box::new(handle))
     }
+
+    async fn get_pvc(&self, _ns: &str, name: &str) -> Result<PersistentVolumeClaim, String> {
+        self.pvcs
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("pvc {} not found", name))
+    }
+
+    async fn create_pvc(&self, _ns: &str, pvc: &PersistentVolumeClaim) -> Result<(), String> {
+        let name = pvc.metadata.name.as_deref().unwrap().to_string();
+        self.pvcs
+            .lock()
+            .unwrap()
+            .entry(name)
+            .or_insert_with(|| pvc.clone());
+        Ok(())
+    }
+
+    async fn list_pvcs(&self, _ns: &str, _sel: &str) -> Result<Vec<PersistentVolumeClaim>, String> {
+        Ok(self.pvcs.lock().unwrap().values().cloned().collect())
+    }
+
+    async fn delete_pvc(&self, _ns: &str, name: &str) -> Result<(), String> {
+        self.pvcs.lock().unwrap().remove(name);
+        Ok(())
+    }
+
+    async fn get_service(&self, _ns: &str, name: &str) -> Result<Service, String> {
+        self.services
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("service {} not found", name))
+    }
+
+    async fn create_service(&self, _ns: &str, svc: &Service) -> Result<(), String> {
+        let name = svc.metadata.name.as_deref().unwrap().to_string();
+        self.services
+            .lock()
+            .unwrap()
+            .entry(name)
+            .or_insert_with(|| svc.clone());
+        Ok(())
+    }
+
+    async fn delete_service(&self, _ns: &str, name: &str) -> Result<(), String> {
+        self.services.lock().unwrap().remove(name);
+        Ok(())
+    }
 }
 
 fn make_set(name: &str, replicas: i32, status: Option<KubelicateSetStatus>) -> KubelicateSet {
@@ -253,6 +323,8 @@ fn make_set(name: &str, replicas: i32, status: Option<KubelicateSetStatus>) -> K
             port: 8080,
             control_port: 9090,
             data_port: 9091,
+            storage: "256Mi".to_string(),
+            pvc_retention_policy: PvcRetentionPolicy::Delete,
         },
         status,
     }
@@ -282,6 +354,18 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
     let set = make_set("myapp", 3, None);
     reconcile_set(&set, &api, &state).await.unwrap();
     assert_eq!(api.pods.lock().unwrap().len(), 3);
+
+    // Verify PVCs created alongside pods
+    assert_eq!(api.pvcs.lock().unwrap().len(), 3);
+    assert!(api.pvcs.lock().unwrap().contains_key("myapp-0-data"));
+    assert!(api.pvcs.lock().unwrap().contains_key("myapp-1-data"));
+    assert!(api.pvcs.lock().unwrap().contains_key("myapp-2-data"));
+
+    // Verify services created (rw, ro, r)
+    assert_eq!(api.services.lock().unwrap().len(), 3);
+    assert!(api.services.lock().unwrap().contains_key("myapp-rw"));
+    assert!(api.services.lock().unwrap().contains_key("myapp-ro"));
+    assert!(api.services.lock().unwrap().contains_key("myapp-r"));
 
     // Mark pods ready
     api.mark_all_pods_ready();
@@ -827,4 +911,25 @@ async fn test_reconciler_double_failover() {
         resp.get_ref().found,
         "data from second epoch should survive"
     );
+}
+
+/// Verify idempotent creation: reconciling Pending twice doesn't create duplicate PVCs.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_reconciler_idempotent_creation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    let set = make_set("idempotent", 3, None);
+
+    // First reconcile: Pending → Creating
+    reconcile_set(&set, &api, &state).await.unwrap();
+    assert_eq!(api.pods.lock().unwrap().len(), 3);
+    assert_eq!(api.pvcs.lock().unwrap().len(), 3);
+
+    // Second reconcile at Pending — should not duplicate
+    reconcile_set(&set, &api, &state).await.unwrap();
+    assert_eq!(api.pods.lock().unwrap().len(), 3);
+    assert_eq!(api.pvcs.lock().unwrap().len(), 3);
+    assert_eq!(api.services.lock().unwrap().len(), 3);
 }

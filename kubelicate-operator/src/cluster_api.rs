@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
 
 use kubelicate_core::driver::ReplicaHandle;
 use kubelicate_core::types::ReplicaId;
@@ -44,6 +44,35 @@ pub trait ClusterApi: Send + Sync {
         pod: &Pod,
         spec: &KubelicateSetSpec,
     ) -> Result<Box<dyn ReplicaHandle>, String>;
+
+    // -- PVC management --
+
+    /// Get a PVC by name.
+    async fn get_pvc(&self, namespace: &str, name: &str) -> Result<PersistentVolumeClaim, String>;
+
+    /// Create a PVC.
+    async fn create_pvc(&self, namespace: &str, pvc: &PersistentVolumeClaim) -> Result<(), String>;
+
+    /// List PVCs matching the label selector.
+    async fn list_pvcs(
+        &self,
+        namespace: &str,
+        selector: &str,
+    ) -> Result<Vec<PersistentVolumeClaim>, String>;
+
+    /// Delete a PVC by name.
+    async fn delete_pvc(&self, namespace: &str, name: &str) -> Result<(), String>;
+
+    // -- Service management --
+
+    /// Get a Service by name.
+    async fn get_service(&self, namespace: &str, name: &str) -> Result<Service, String>;
+
+    /// Create a Service.
+    async fn create_service(&self, namespace: &str, svc: &Service) -> Result<(), String>;
+
+    /// Delete a Service by name.
+    async fn delete_service(&self, namespace: &str, name: &str) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,5 +177,68 @@ impl ClusterApi for KubeClusterApi {
         .map_err(|e| e.to_string())?;
 
         Ok(Box::new(handle))
+    }
+
+    async fn get_pvc(&self, namespace: &str, name: &str) -> Result<PersistentVolumeClaim, String> {
+        let api: kube::Api<PersistentVolumeClaim> =
+            kube::Api::namespaced(self.client.clone(), namespace);
+        api.get(name).await.map_err(|e| e.to_string())
+    }
+
+    async fn create_pvc(&self, namespace: &str, pvc: &PersistentVolumeClaim) -> Result<(), String> {
+        let api: kube::Api<PersistentVolumeClaim> =
+            kube::Api::namespaced(self.client.clone(), namespace);
+        match api.create(&kube::api::PostParams::default(), pvc).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(()), // already exists
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn list_pvcs(
+        &self,
+        namespace: &str,
+        selector: &str,
+    ) -> Result<Vec<PersistentVolumeClaim>, String> {
+        let api: kube::Api<PersistentVolumeClaim> =
+            kube::Api::namespaced(self.client.clone(), namespace);
+        let params = kube::api::ListParams::default().labels(selector);
+        api.list(&params)
+            .await
+            .map(|list| list.items)
+            .map_err(|e| e.to_string())
+    }
+
+    async fn delete_pvc(&self, namespace: &str, name: &str) -> Result<(), String> {
+        let api: kube::Api<PersistentVolumeClaim> =
+            kube::Api::namespaced(self.client.clone(), namespace);
+        match api.delete(name, &kube::api::DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn get_service(&self, namespace: &str, name: &str) -> Result<Service, String> {
+        let api: kube::Api<Service> = kube::Api::namespaced(self.client.clone(), namespace);
+        api.get(name).await.map_err(|e| e.to_string())
+    }
+
+    async fn create_service(&self, namespace: &str, svc: &Service) -> Result<(), String> {
+        let api: kube::Api<Service> = kube::Api::namespaced(self.client.clone(), namespace);
+        match api.create(&kube::api::PostParams::default(), svc).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(()), // already exists
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn delete_service(&self, namespace: &str, name: &str) -> Result<(), String> {
+        let api: kube::Api<Service> = kube::Api::namespaced(self.client.clone(), namespace);
+        match api.delete(name, &kube::api::DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }

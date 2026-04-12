@@ -1,7 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{
+    Container, ContainerPort, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec,
+    Probe, Service, ServicePort, ServiceSpec, TCPSocketAction, VolumeResourceRequirements,
+};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -59,7 +64,8 @@ pub async fn reconcile_set(
 
     match current_phase {
         Phase::Pending => {
-            info!(name, "creating partition pods");
+            info!(name, "creating partition pods and services");
+            create_services(api, set, &namespace).await?;
             create_pods(api, set, &namespace).await?;
             let status = KubelicateSetStatus {
                 phase: Phase::Creating,
@@ -202,7 +208,7 @@ pub async fn reconcile_set(
                             .metadata
                             .labels
                             .as_ref()
-                            .and_then(|l| l.get("kubelicate.io/replica-id"))
+                            .and_then(|l| l.get("kubelicate.io/pod-index"))
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(0)
                             + 1; // labels are 0-indexed, IDs are 1-indexed
@@ -373,7 +379,7 @@ pub async fn reconcile_set(
                         p.metadata
                             .labels
                             .as_ref()
-                            .and_then(|l| l.get("kubelicate.io/replica-id"))
+                            .and_then(|l| l.get("kubelicate.io/pod-index"))
                             .and_then(|v| v.parse::<i64>().ok())
                             .map(|idx| idx + 1)
                     });
@@ -456,7 +462,7 @@ fn build_member_status(pods: &[Pod], spec: &KubelicateSetSpec) -> Vec<MemberStat
                 .cloned()
                 .unwrap_or_default();
             let id: i64 = labels
-                .and_then(|l| l.get("kubelicate.io/replica-id"))
+                .and_then(|l| l.get("kubelicate.io/pod-index"))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             let pod_ip = pod
@@ -485,48 +491,260 @@ async fn create_pods(
     namespace: &str,
 ) -> Result<(), String> {
     for i in 0..set.spec.replicas {
-        let pod = build_pod(set, namespace, i);
-        api.create_pod(namespace, &pod).await?;
+        ensure_pvc(api, set, namespace, i).await?;
+        ensure_pod(api, set, namespace, i).await?;
     }
     Ok(())
+}
+
+async fn ensure_pvc(
+    api: &dyn ClusterApi,
+    set: &KubelicateSet,
+    namespace: &str,
+    index: i32,
+) -> Result<(), String> {
+    let name = format!("{}-{}-data", set.name_any(), index);
+    if api.get_pvc(namespace, &name).await.is_ok() {
+        return Ok(());
+    }
+    let pvc = build_pvc(set, namespace, index);
+    api.create_pvc(namespace, &pvc).await
+}
+
+async fn ensure_pod(
+    api: &dyn ClusterApi,
+    set: &KubelicateSet,
+    namespace: &str,
+    index: i32,
+) -> Result<(), String> {
+    let pod = build_pod(set, namespace, index);
+    // create_pod is already idempotent (409 → Ok)
+    api.create_pod(namespace, &pod).await
 }
 
 fn build_pod(set: &KubelicateSet, namespace: &str, index: i32) -> Pod {
     let name = format!("{}-{}", set.name_any(), index);
     let set_name = set.name_any();
     let role = if index == 0 { "primary" } else { "secondary" };
+    let replica_id = (index + 1).to_string();
 
-    serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": name,
-            "namespace": namespace,
-            "labels": {
-                "kubelicate.io/set": set_name,
-                "kubelicate.io/role": role,
-                "kubelicate.io/replica-id": index.to_string()
-            },
-            "ownerReferences": [{
-                "apiVersion": "kubelicate.io/v1",
-                "kind": "KubelicateSet",
-                "name": set_name,
-                "uid": set.metadata.uid.as_deref().unwrap_or(""),
-                "controller": true,
-                "blockOwnerDeletion": true
-            }]
-        },
-        "spec": {
-            "containers": [{
-                "name": "app",
-                "image": set.spec.image,
-                "ports": [
-                    { "containerPort": set.spec.port, "name": "app" },
-                    { "containerPort": set.spec.control_port, "name": "control" },
-                    { "containerPort": set.spec.data_port, "name": "data" }
-                ]
-            }]
-        }
+    let mut labels = BTreeMap::new();
+    labels.insert("kubelicate.io/set".into(), set_name.clone());
+    labels.insert("kubelicate.io/role".into(), role.into());
+    labels.insert("kubelicate.io/pod-index".into(), index.to_string());
+
+    let owner_ref = serde_json::from_value(serde_json::json!({
+        "apiVersion": "kubelicate.io/v1",
+        "kind": "KubelicateSet",
+        "name": set_name,
+        "uid": set.metadata.uid.as_deref().unwrap_or(""),
+        "controller": true,
+        "blockOwnerDeletion": true
     }))
-    .expect("valid pod json")
+    .expect("valid owner reference");
+
+    let readiness_probe = Probe {
+        tcp_socket: Some(TCPSocketAction {
+            port: IntOrString::Int(set.spec.control_port),
+            ..Default::default()
+        }),
+        initial_delay_seconds: Some(5),
+        period_seconds: Some(5),
+        timeout_seconds: Some(3),
+        failure_threshold: Some(2),
+        ..Default::default()
+    };
+
+    let liveness_probe = Probe {
+        tcp_socket: Some(TCPSocketAction {
+            port: IntOrString::Int(set.spec.control_port),
+            ..Default::default()
+        }),
+        initial_delay_seconds: Some(10),
+        period_seconds: Some(10),
+        timeout_seconds: Some(5),
+        failure_threshold: Some(3),
+        ..Default::default()
+    };
+
+    let env = vec![
+        k8s_openapi::api::core::v1::EnvVar {
+            name: "KUBELICATE_REPLICA_ID".into(),
+            value: Some(replica_id),
+            ..Default::default()
+        },
+        k8s_openapi::api::core::v1::EnvVar {
+            name: "RUST_LOG".into(),
+            value: Some("info".into()),
+            ..Default::default()
+        },
+    ];
+
+    Pod {
+        metadata: kube::api::ObjectMeta {
+            name: Some(name),
+            namespace: Some(namespace.into()),
+            labels: Some(labels),
+            owner_references: Some(vec![owner_ref]),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "app".into(),
+                image: Some(set.spec.image.clone()),
+                ports: Some(vec![
+                    ContainerPort {
+                        container_port: set.spec.port,
+                        name: Some("app".into()),
+                        ..Default::default()
+                    },
+                    ContainerPort {
+                        container_port: set.spec.control_port,
+                        name: Some("control".into()),
+                        ..Default::default()
+                    },
+                    ContainerPort {
+                        container_port: set.spec.data_port,
+                        name: Some("data".into()),
+                        ..Default::default()
+                    },
+                ]),
+                env: Some(env),
+                readiness_probe: Some(readiness_probe),
+                liveness_probe: Some(liveness_probe),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn build_pvc(set: &KubelicateSet, namespace: &str, index: i32) -> PersistentVolumeClaim {
+    let name = format!("{}-{}-data", set.name_any(), index);
+    let set_name = set.name_any();
+
+    let mut labels = BTreeMap::new();
+    labels.insert("kubelicate.io/set".into(), set_name);
+    labels.insert("kubelicate.io/pod-index".into(), index.to_string());
+
+    let mut requests = BTreeMap::new();
+    requests.insert("storage".into(), Quantity(set.spec.storage.clone()));
+
+    PersistentVolumeClaim {
+        metadata: kube::api::ObjectMeta {
+            name: Some(name),
+            namespace: Some(namespace.into()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".into()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+async fn create_services(
+    api: &dyn ClusterApi,
+    set: &KubelicateSet,
+    namespace: &str,
+) -> Result<(), String> {
+    let set_name = set.name_any();
+
+    // -rw: routes to primary only
+    let mut rw_selector = BTreeMap::new();
+    rw_selector.insert("kubelicate.io/set".into(), set_name.clone());
+    rw_selector.insert("kubelicate.io/role".into(), "primary".into());
+    api.create_service(
+        namespace,
+        &build_service(
+            &set_name,
+            namespace,
+            &format!("{}-rw", set_name),
+            rw_selector,
+            &set.spec,
+        ),
+    )
+    .await?;
+
+    // -ro: routes to secondaries only
+    let mut ro_selector = BTreeMap::new();
+    ro_selector.insert("kubelicate.io/set".into(), set_name.clone());
+    ro_selector.insert("kubelicate.io/role".into(), "secondary".into());
+    api.create_service(
+        namespace,
+        &build_service(
+            &set_name,
+            namespace,
+            &format!("{}-ro", set_name),
+            ro_selector,
+            &set.spec,
+        ),
+    )
+    .await?;
+
+    // -r: routes to all pods
+    let mut r_selector = BTreeMap::new();
+    r_selector.insert("kubelicate.io/set".into(), set_name.clone());
+    api.create_service(
+        namespace,
+        &build_service(
+            &set_name,
+            namespace,
+            &format!("{}-r", set_name),
+            r_selector,
+            &set.spec,
+        ),
+    )
+    .await?;
+
+    Ok(())
+}
+
+fn build_service(
+    set_name: &str,
+    namespace: &str,
+    name: &str,
+    selector: BTreeMap<String, String>,
+    spec: &KubelicateSetSpec,
+) -> Service {
+    let mut labels = BTreeMap::new();
+    labels.insert("kubelicate.io/set".into(), set_name.into());
+
+    Service {
+        metadata: kube::api::ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(selector),
+            ports: Some(vec![
+                ServicePort {
+                    port: spec.port,
+                    name: Some("app".into()),
+                    ..Default::default()
+                },
+                ServicePort {
+                    port: spec.control_port,
+                    name: Some("control".into()),
+                    ..Default::default()
+                },
+                ServicePort {
+                    port: spec.data_port,
+                    name: Some("data".into()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }

@@ -46,6 +46,14 @@ pub struct KubelicateSetSpec {
     /// Port for the gRPC data server (pod ↔ pod replication).
     #[serde(default = "default_data_port")]
     pub data_port: i32,
+
+    /// Storage size per pod PVC (e.g. "256Mi").
+    #[serde(default = "default_storage")]
+    pub storage: String,
+
+    /// PVC retention policy on CR deletion: Delete (default) or Retain.
+    #[serde(default)]
+    pub pvc_retention_policy: PvcRetentionPolicy,
 }
 
 /// Status of the KubelicateSet.
@@ -159,4 +167,18 @@ fn default_control_port() -> i32 {
 
 fn default_data_port() -> i32 {
     9091
+}
+
+fn default_storage() -> String {
+    "256Mi".to_string()
+}
+
+/// PVC retention policy when the KubelicateSet CR is deleted.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
+pub enum PvcRetentionPolicy {
+    /// Delete PVCs when the KubelicateSet is deleted.
+    #[default]
+    Delete,
+    /// Retain PVCs for manual recovery.
+    Retain,
 }

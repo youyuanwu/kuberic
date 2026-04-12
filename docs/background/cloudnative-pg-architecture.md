@@ -143,6 +143,22 @@ each reconciliation it:
 7. Evaluates failover/switchover conditions
 8. Updates `Cluster.Status` with optimistic locking (`pkg/resources/status/patch.go`)
 
+### Operator → Pod Communication
+
+The operator connects to instance managers using **`pod.Status.PodIP`** from
+the Kubernetes API, not DNS or service names:
+
+```go
+// pkg/management/postgres/webserver/client/remote/instance.go
+statusURL := url.Build(scheme, pod.Status.PodIP, url.PathPgStatus, url.StatusPort)
+// → https://<pod-ip>:8000/pg/status
+```
+
+All operator→pod HTTP calls (status polling, backup triggers, config updates,
+pg_controldata reads) use this pattern. The instance manager listens on port
+8000 inside each pod. Pods do not self-report their addresses — the operator
+reads pod IPs from the Kubernetes API on every reconcile.
+
 ### Status Management
 
 Status updates use an **optimistic-locking patch pattern**:
