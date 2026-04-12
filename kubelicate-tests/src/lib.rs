@@ -129,7 +129,56 @@ pub mod test_utils {
         wait_pods_ready(NS_XEDIO, "kubelicate.io/set=kvstore", 3, 120)
             .await
             .expect("kvstore pods failed to become ready");
-        tracing::info!("kvstore deployed and ready");
+
+        // Wait for operator to reconcile status to Healthy
+        wait_kubelicateset_healthy(NS_XEDIO, "kvstore", 60)
+            .await
+            .expect("kvstore KubelicateSet failed to reach Healthy phase");
+        tracing::info!("kvstore deployed and healthy");
+    }
+
+    pub async fn wait_kubelicateset_healthy(
+        namespace: &str,
+        name: &str,
+        timeout_seconds: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let client = kube::Client::try_default().await?;
+        let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
+            client,
+            namespace,
+            &kube::discovery::ApiResource {
+                group: "kubelicate.io".into(),
+                version: "v1".into(),
+                kind: "KubelicateSet".into(),
+                api_version: "kubelicate.io/v1".into(),
+                plural: "kubelicatesets".into(),
+            },
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
+
+        loop {
+            let obj = api.get(name).await?;
+            let phase = obj
+                .data
+                .get("status")
+                .and_then(|s| s.get("phase"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if phase == "Healthy" {
+                return Ok(());
+            }
+
+            if std::time::Instant::now() > deadline {
+                return Err(format!(
+                    "timeout: KubelicateSet {} phase is {}, expected Healthy",
+                    name, phase
+                )
+                .into());
+            }
+            tracing::debug!(name, phase, "waiting for Healthy...");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
     }
 
     pub async fn wait_pods_ready(
