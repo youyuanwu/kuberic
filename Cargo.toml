@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "examples/kvstore",
+  "examples/postgres",
   "examples/sqlite",
   "kuberic-core",
   "kuberic-operator",
@@ -41,6 +42,8 @@ clap = { version = "4", features = ["derive", "env"] }
 rusqlite = { version = "0.39", features = ["bundled", "hooks"] }
 crc32fast = "1"
 serial_test = "3.4.0"
+tokio-postgres = "0.7"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 kube-lease-manager = "0.11.1"
 kube-leader-election = "0.43.0"
+whoami = "2"

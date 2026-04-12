@@ -1,0 +1,28 @@
+[package]
+name = "postgres-replicated"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+testing = []
+
+[[bin]]
+name = "postgres-replicated"
+path = "src/main.rs"
+
+[dependencies]
+kuberic-core = { path = "../../kuberic-core" }
+tokio.workspace = true
+tokio-postgres.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+clap.workspace = true
+thiserror.workspace = true
+whoami.workspace = true
+
+[dev-dependencies]
+test-log.workspace = true
+postgres-replicated = { path = ".", features = ["testing"] }
+serial_test.workspace = true
