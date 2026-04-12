@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use kubelicate_core::handles::{PartitionHandle, StateReplicatorHandle};
-use kubelicate_core::types::{AccessStatus, CancellationToken};
+use kuberic_core::handles::{PartitionHandle, StateReplicatorHandle};
+use kuberic_core::types::{AccessStatus, CancellationToken};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 

@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use kubelicate_core::events::{LifecycleEvent, StateProviderEvent};
-use kubelicate_core::handles::StateReplicatorHandle;
-use kubelicate_core::replicator::WalReplicator;
-use kubelicate_core::types::{CancellationToken, Operation, OperationStream, Role};
+use kuberic_core::events::{LifecycleEvent, StateProviderEvent};
+use kuberic_core::handles::StateReplicatorHandle;
+use kuberic_core::replicator::WalReplicator;
+use kuberic_core::types::{CancellationToken, Operation, OperationStream, Role};
 use tokio::sync::mpsc;
 use tracing::info;
 

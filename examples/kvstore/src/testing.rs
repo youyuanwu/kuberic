@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kubelicate_core::grpc::handle::GrpcReplicaHandle;
-use kubelicate_core::pod::PodRuntime;
+use kuberic_core::grpc::handle::GrpcReplicaHandle;
+use kuberic_core::pod::PodRuntime;
 use tokio::sync::RwLock;
 
 use crate::state::{KvState, SharedState};

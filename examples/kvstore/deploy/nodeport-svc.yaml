@@ -7,12 +7,12 @@ metadata:
   name: kvstore-rw
   namespace: xedio
   labels:
-    kubelicate.io/set: kvstore
+    kuberic.io/set: kvstore
 spec:
   type: NodePort
   selector:
-    kubelicate.io/set: kvstore
-    kubelicate.io/role: primary
+    kuberic.io/set: kvstore
+    kuberic.io/role: primary
   ports:
     - name: app
       port: 8080

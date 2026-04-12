@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use kubelicate_core::pod::PodRuntime;
-use kubelicate_core::types::CancellationToken;
+use kuberic_core::pod::PodRuntime;
+use kuberic_core::types::CancellationToken;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -14,19 +14,19 @@ use kvstore::state::{KvState, SharedState};
 #[command(name = "kvstore", about = "Replicated key-value store example")]
 struct Args {
     /// Replica ID for this instance.
-    #[arg(long, env = "KUBELICATE_REPLICA_ID", default_value = "1")]
+    #[arg(long, env = "KUBERIC_REPLICA_ID", default_value = "1")]
     replica_id: i64,
 
     /// Bind address for the gRPC control server (operator → pod).
-    #[arg(long, env = "KUBELICATE_CONTROL_BIND", default_value = "127.0.0.1:0")]
+    #[arg(long, env = "KUBERIC_CONTROL_BIND", default_value = "127.0.0.1:0")]
     control_bind: String,
 
     /// Bind address for the gRPC data server (primary → secondary replication).
-    #[arg(long, env = "KUBELICATE_DATA_BIND", default_value = "127.0.0.1:0")]
+    #[arg(long, env = "KUBERIC_DATA_BIND", default_value = "127.0.0.1:0")]
     data_bind: String,
 
     /// Bind address for the client-facing KV gRPC server.
-    #[arg(long, env = "KUBELICATE_CLIENT_BIND", default_value = "127.0.0.1:0")]
+    #[arg(long, env = "KUBERIC_CLIENT_BIND", default_value = "127.0.0.1:0")]
     client_bind: String,
 
     /// Data directory for persistent state.

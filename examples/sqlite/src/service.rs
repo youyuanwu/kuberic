@@ -3,10 +3,10 @@
 //! Same two-channel pattern as kvstore: LifecycleEvent + StateProviderEvent.
 
 use bytes::Bytes;
-use kubelicate_core::events::{LifecycleEvent, StateProviderEvent};
-use kubelicate_core::handles::StateReplicatorHandle;
-use kubelicate_core::replicator::WalReplicator;
-use kubelicate_core::types::{CancellationToken, Operation, OperationStream, Role};
+use kuberic_core::events::{LifecycleEvent, StateProviderEvent};
+use kuberic_core::handles::StateReplicatorHandle;
+use kuberic_core::replicator::WalReplicator;
+use kuberic_core::types::{CancellationToken, Operation, OperationStream, Role};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -80,13 +80,12 @@ async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedSt
                 Ok(Ok(data)) => data,
                 Ok(Err(e)) => {
                     warn!(error = %e, "failed to snapshot DB");
-                    let _ =
-                        reply.send(Err(kubelicate_core::KubelicateError::Internal(Box::new(e))));
+                    let _ = reply.send(Err(kuberic_core::KubericError::Internal(Box::new(e))));
                     return;
                 }
                 Err(e) => {
                     warn!(error = %e, "snapshot task panicked");
-                    let _ = reply.send(Err(kubelicate_core::KubelicateError::Internal(Box::new(
+                    let _ = reply.send(Err(kuberic_core::KubericError::Internal(Box::new(
                         std::io::Error::other(format!("snapshot task panicked: {e}")),
                     ))));
                     return;

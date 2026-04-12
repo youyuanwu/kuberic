@@ -1,6 +1,6 @@
 # KVStore: Replicated Key-Value Store Example
 
-Example application demonstrating kubelicate-core's full replication protocol.
+Example application demonstrating kuberic-core's full replication protocol.
 A gRPC key-value store that replicates writes via quorum, serves reads from
 local state, handles copy/replication streams on secondaries, and implements
 all StateProvider callbacks.
@@ -31,8 +31,8 @@ Clients (gRPC)
 ```
 
 **Three gRPC servers per pod:**
-1. **Control** (kubelicate internal) — operator → PodRuntime
-2. **Data** (kubelicate internal) — primary → secondary replication
+1. **Control** (kuberic internal) — operator → PodRuntime
+2. **Data** (kuberic internal) — primary → secondary replication
 3. **Client** (user-facing) — clients → KV store reads/writes
 
 ---
@@ -128,7 +128,7 @@ Wrapped in `Arc<RwLock<KvState>>` and shared between:
 | **GetLastCommittedLsn** | Return `state.last_applied_lsn` |
 | **GetCopyContext** | Send secondary's `last_applied_lsn` as copy context |
 | **GetCopyState** | Read peer LSN, produce full HashMap as `KvOp::Put` ops. Drops read lock before sending to avoid blocking drains |
-| **UpdateEpoch** | If `previous_epoch_last_lsn > 0` and `< current_lsn`: cancel drains, `rollback_to(previous_epoch_last_lsn)`. See [A6 gap](kubelicate/design-gaps.md) |
+| **UpdateEpoch** | If `previous_epoch_last_lsn > 0` and `< current_lsn`: cancel drains, `rollback_to(previous_epoch_last_lsn)`. See [A6 gap](kuberic/design-gaps.md) |
 | **OnDataLoss** | Accept state as-is (return `false`) |
 
 ---

@@ -1,6 +1,6 @@
-//! SQLite: Replicated SQLite on Kubelicate
+//! SQLite: Replicated SQLite on Kuberic
 //!
-//! A stateful SQLite database using kubelicate-core's PodRuntime.
+//! A stateful SQLite database using kuberic-core's PodRuntime.
 //! Demonstrates WAL frame shipping replication:
 //! - Primary captures WAL frames after each commit
 //! - Secondary persists frames to frames.log, applies on commit

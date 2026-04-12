@@ -11,7 +11,7 @@ name = "sqlite-replicated"
 path = "src/main.rs"
 
 [dependencies]
-kubelicate-core = { path = "../../kubelicate-core" }
+kuberic-core = { path = "../../kuberic-core" }
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-stream.workspace = true
@@ -30,7 +30,7 @@ crc32fast = "1"
 [dev-dependencies]
 test-log.workspace = true
 sqlite-replicated = { path = ".", features = ["testing"] }
-kubelicate-operator = { path = "../../kubelicate-operator" }
+kuberic-operator = { path = "../../kuberic-operator" }
 k8s-openapi.workspace = true
 kube.workspace = true
 async-trait.workspace = true

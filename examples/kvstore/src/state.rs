@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kubelicate_core::types::{CancellationToken, Lsn, OperationStream};
+use kuberic_core::types::{CancellationToken, Lsn, OperationStream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::RwLock;

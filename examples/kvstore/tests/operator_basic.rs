@@ -1,4 +1,4 @@
-use kubelicate_core::driver::{PartitionDriver, ReplicaHandle};
+use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
 use serial_test::serial;
 
 use kvstore::proto;

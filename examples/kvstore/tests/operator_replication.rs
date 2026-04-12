@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kubelicate_core::driver::PartitionDriver;
+use kuberic_core::driver::PartitionDriver;
 use serial_test::serial;
 
 use kvstore::proto;

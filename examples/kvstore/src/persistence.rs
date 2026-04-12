@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, warn};
 
 use crate::state::{KvOp, KvState};
-use kubelicate_core::types::Lsn;
+use kuberic_core::types::Lsn;
 
 /// A single WAL entry: one operation at one LSN.
 #[derive(Serialize, Deserialize)]

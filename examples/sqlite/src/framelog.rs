@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
 use crate::frames::WalFrameSet;
-use kubelicate_core::types::Lsn;
+use kuberic_core::types::Lsn;
 
 /// Persisted metadata for crash recovery.
 #[derive(Serialize, Deserialize, Debug, Default)]

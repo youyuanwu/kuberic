@@ -19,9 +19,9 @@ Source code reference: `build/service-fabric/` (depth-1 clone).
 | [State Management and Persistence](state-management.md) | Reliable Collections, V1 vs V2 replicator architecture, IStateProvider vs IStateProvider2, shared/dedicated log (Windows vs Linux), ReadStatus/WriteStatus |
 | [API Surface and References](references.md) | Rust API bindings (service-fabric-rs), comparison with CloudNativePG, key source code references |
 
-## Related Kubelicate Documents
+## Related Kuberic Documents
 
-- [Kubelicate Replication Protocols](../../features/kubelicate/protocols.md)
-- [Design Gaps](../../features/kubelicate/design-gaps.md)
+- [Kuberic Replication Protocols](../../features/kuberic/protocols.md)
+- [Design Gaps](../../features/kuberic/design-gaps.md)
 - [WAL Persistence Design (Future)](../../features/future/wal-persistence.md)
 - [CloudNativePG Architecture](../cloudnative-pg-architecture.md)

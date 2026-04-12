@@ -1,4 +1,4 @@
-# Kubelicate Operator: Failure Scenarios and Recovery
+# Kuberic Operator: Failure Scenarios and Recovery
 
 How the operator reconciler detects and handles various failure modes.
 Design informed by CNPG patterns (see `docs/background/cloudnative-pg-architecture.md`).
@@ -444,7 +444,7 @@ affinity:
       podAffinityTerm:
         labelSelector:
           matchLabels:
-            kubelicate.io/set: {set_name}
+            kuberic.io/set: {set_name}
         topologyKey: kubernetes.io/hostname
 ```
 
@@ -548,14 +548,14 @@ CNPG reconstructs cluster topology from PVC annotations. We don't use
 PVCs (in-memory replicator), so we reconstruct from CRD status + pod list.
 
 ```
-Operator restart — first reconcile per KubelicateSet:
+Operator restart — first reconcile per KubericSet:
   │
   ├─ Read CRD status:
   │    epoch, currentPrimary, targetPrimary, phase
   │    instanceNames, instanceStates
   │    currentConfiguration, previousConfiguration
   │
-  ├─ List pods with label kubelicate.io/set={name}:
+  ├─ List pods with label kuberic.io/set={name}:
   │    For each pod:
   │      Create GrpcReplicaHandle (connect to control gRPC port)
   │      Call GetStatus to verify pod identity + role

@@ -1,9 +1,9 @@
-# Kubelicate: WAL Persistent Storage Design
+# Kuberic: WAL Persistent Storage Design
 
-Design for adding durable Write-Ahead Log (WAL) storage to the Kubelicate
+Design for adding durable Write-Ahead Log (WAL) storage to the Kuberic
 replicator, enabling crash recovery without full replica rebuilds.
 
-> Part of the [Kubelicate Design](../kubelicate-replicator-design.md).
+> Part of the [Kuberic Design](../kuberic-replicator-design.md).
 > Related: [Protocols](protocols.md), [Design Gaps](design-gaps.md),
 > [SF Architecture](../../background/service-fabric/README.md)
 
@@ -67,7 +67,7 @@ OnDataLoss()                       — "quorum lost, accept data loss?"
 The user receives raw opaque bytes on the operation stream and is
 fully responsible for parsing, applying, persisting, and acknowledging.
 
-**This is what Kubelicate currently models** — our `LifecycleEvent` +
+**This is what Kuberic currently models** — our `LifecycleEvent` +
 `StateProviderEvent` channels map to `IStatefulServiceReplica` +
 `IStateProvider`.
 
@@ -146,7 +146,7 @@ V2 shared/dedicated log (platform-specific):
   Linux:   user-space sparse files, per-partition (more I/O overhead)
 ```
 
-### What This Means for Kubelicate
+### What This Means for Kuberic
 
 We currently model **V1** — which is correct for our `IStateProvider`-
 style API. But V1's weakness is that every pod restart requires full
@@ -590,7 +590,7 @@ This is how PostgreSQL and etcd work. Defer to V2.
 /// WAL persistence configuration per partition.
 pub struct WalConfig {
     /// WAL storage directory. Each partition gets a subdirectory.
-    /// Default: /var/lib/kubelicate/wal/<partition-id>/
+    /// Default: /var/lib/kuberic/wal/<partition-id>/
     pub wal_dir: PathBuf,
 
     /// Maximum segment file size before rotation.
@@ -821,7 +821,7 @@ entries per txn — which is actually desirable for group commit (Phase 4).
 | SF V2 | Shared/dedicated log | Heavy (16+ methods) | Checkpoint + replay |
 | etcd | Per-node WAL | N/A (built-in KV) | Snapshot + replay |
 | PG | WAL segments | N/A (built-in SQL) | Checkpoint + replay |
-| **Kubelicate (Option C)** | **Per-partition redb** | **Simple (V1-style)** | **WAL replay** |
+| **Kuberic (Option C)** | **Per-partition redb** | **Simple (V1-style)** | **WAL replay** |
 
 All production systems persist the log before ACK. Our current
 in-memory-only model (V1-style) is appropriate for development but

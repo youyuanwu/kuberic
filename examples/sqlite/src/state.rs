@@ -7,7 +7,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kubelicate_core::types::Lsn;
+use kuberic_core::types::Lsn;
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};

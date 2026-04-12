@@ -8,8 +8,8 @@ use crate::proto;
 
 /// Simulate an operator: Open → Idle → Active → Primary.
 pub async fn simulate_operator(control_address: String) {
-    use kubelicate_core::proto::replicator_control_client::ReplicatorControlClient;
-    use kubelicate_core::proto::*;
+    use kuberic_core::proto::replicator_control_client::ReplicatorControlClient;
+    use kuberic_core::proto::*;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -122,8 +122,8 @@ pub async fn run_demo_client(client_bind: String) {
 
 /// Demote and close the replica.
 pub async fn demo_close(control_address: String) {
-    use kubelicate_core::proto::replicator_control_client::ReplicatorControlClient;
-    use kubelicate_core::proto::*;
+    use kuberic_core::proto::replicator_control_client::ReplicatorControlClient;
+    use kuberic_core::proto::*;
 
     let mut client = ReplicatorControlClient::connect(control_address)
         .await

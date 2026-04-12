@@ -1,6 +1,6 @@
-# SQLite: Replicated SQLite on Kubelicate
+# SQLite: Replicated SQLite on Kuberic
 
-A replicated SQLite database running on kubelicate-core. The primary
+A replicated SQLite database running on kuberic-core. The primary
 accepts SQL reads and writes, ships WAL frames to secondaries via the
 replication protocol. Secondaries exist for failover — they maintain a
 durable copy of the database but do not serve client queries.
@@ -10,12 +10,12 @@ durable copy of the database but do not serve client queries.
 ## Goals
 
 1. Full SQL interface — clients issue arbitrary SQL (reads + writes)
-2. Primary ships SQLite WAL frames to secondaries via kubelicate quorum
+2. Primary ships SQLite WAL frames to secondaries via kuberic quorum
 3. Secondaries maintain a durable copy for failover (no client reads)
 4. Survive pod restarts — secondary catches up via copy (full DB snapshot)
    or WAL replay (incremental)
-5. Leverage existing kubelicate-core lifecycle, replication, and failover
-6. Zero consensus layer — kubelicate's quorum replication IS the consensus
+5. Leverage existing kuberic-core lifecycle, replication, and failover
+6. Zero consensus layer — kuberic's quorum replication IS the consensus
 
 ## Non-Goals
 
@@ -36,9 +36,9 @@ durable copy of the database but do not serve client queries.
 | VFS-level | mvSQLite, Verneuil | Pages via custom VFS | Not required | Full control but massive complexity |
 | WAL backup | Litestream | WAL frames to S3 | N/A | Simple but async-only, no live replicas |
 
-### Our Approach: WAL Frame Shipping via Kubelicate Quorum
+### Our Approach: WAL Frame Shipping via Kuberic Quorum
 
-We take the **LiteFS page-level concept** but use kubelicate's existing
+We take the **LiteFS page-level concept** but use kuberic's existing
 quorum replication instead of HTTP, and intercept at the **application
 layer** (WAL file reads after commit) instead of FUSE.
 
@@ -46,10 +46,10 @@ layer** (WAL file reads after commit) instead of FUSE.
 |--------|------------|
 | Replication unit | WAL frames (committed transaction pages) |
 | Interception | Read WAL file after commit |
-| Consensus | Kubelicate quorum replication (not Raft) |
+| Consensus | Kuberic quorum replication (not Raft) |
 | Determinism | Not required — shipping pages, not statements |
 | Copy/rebuild | Full DB file snapshot via GetCopyState |
-| Failover | Kubelicate operator handles promotion |
+| Failover | Kuberic operator handles promotion |
 
 ---
 

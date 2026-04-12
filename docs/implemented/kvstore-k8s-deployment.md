@@ -1,6 +1,6 @@
 # KVStore Kubernetes Deployment
 
-Deploy the kvstore example as a KubelicateSet in KinD, matching the
+Deploy the kvstore example as a KubericSet in KinD, matching the
 existing xdata-app deployment pattern.
 
 ## Current State
@@ -14,11 +14,11 @@ CMake targets → cargo build → docker build → kind load → kubectl apply
 Components:
 - **xdata-operator**: Deployment (1 replica) watching `XdataApp` CRD
 - **xdata-app**: StatefulSet (3 replicas) managed by the operator
-- **kubelicate-operator**: Deployment (1 replica) watching `KubelicateSet` CRD
-- **kvstore**: 3 bare Pods managed by kubelicate-operator
+- **kuberic-operator**: Deployment (1 replica) watching `KubericSet` CRD
+- **kvstore**: 3 bare Pods managed by kuberic-operator
 - **kind-config.yaml**: NodePort mappings 30081–30083 (xdata), 30090 (kvstore)
 
-The kubelicate-operator creates bare Pods (not StatefulSets) and manages
+The kuberic-operator creates bare Pods (not StatefulSets) and manages
 three ports per pod: app (8080), control (9090), data (9091).
 
 ## Architecture
@@ -28,7 +28,7 @@ three ports per pod: app (8080), control (9090), data (9091).
 │  KinD Cluster                                        │
 │                                                      │
 │  ┌──────────────────────┐                            │
-│  │ kubelicate-operator   │ watches KubelicateSet      │
+│  │ kuberic-operator   │ watches KubericSet      │
 │  │ (Deployment, 1 pod)  │ creates pods + services    │
 │  └──────┬───────────────┘                            │
 │         │ gRPC control (9090)                        │
@@ -73,16 +73,16 @@ EXPOSE 8080 9090 9091
 CMD ["/app/kvstore"]
 ```
 
-### 2. KubelicateSet CRD manifests
+### 2. KubericSet CRD manifests
 
-The kubelicate-operator already has a `KubelicateSet` CRD and reconciler
+The kuberic-operator already has a `KubericSet` CRD and reconciler
 that creates pods with the right ports. We only need an example CR.
 
-**`examples/kvstore/deploy/kubelicateset.yaml`**:
+**`examples/kvstore/deploy/kubericset.yaml`**:
 
 ```yaml
-apiVersion: kubelicate.io/v1
-kind: KubelicateSet
+apiVersion: kuberic.io/v1
+kind: KubericSet
 metadata:
   name: kvstore
   namespace: xedio
@@ -132,13 +132,13 @@ add_custom_target(kvstore-image ALL
 
 add_custom_target(kvstore-deploy
     COMMAND kubectl apply
-        -f examples/kvstore/deploy/kubelicateset.yaml
+        -f examples/kvstore/deploy/kubericset.yaml
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
 add_custom_target(kvstore-delete
     COMMAND kubectl delete
-        -f examples/kvstore/deploy/kubelicateset.yaml
+        -f examples/kvstore/deploy/kubericset.yaml
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 ```
@@ -148,7 +148,7 @@ Root `CMakeLists.txt` gets: `add_subdirectory(examples/kvstore)`.
 ### 5. CI changes — `.github/workflows/CI.yml`
 
 Update the kind config path (or keep shared). Add kvstore image build
-alongside xdata images. The kubelicate-tests crate can use the same
+alongside xdata images. The kuberic-tests crate can use the same
 `ensure_*_deployed()` pattern for kvstore.
 
 ## kvstore Binary Configuration
@@ -159,18 +159,18 @@ compatibility with in-process tests.
 
 | Env Var | Container Value | Default | Purpose |
 |---------|----------------|---------|---------|
-| `KUBELICATE_CONTROL_BIND` | `0.0.0.0:9090` | `127.0.0.1:0` | Operator reaches pod via pod IP |
-| `KUBELICATE_DATA_BIND` | `0.0.0.0:9091` | `127.0.0.1:0` | Peer pods reach each other |
-| `KUBELICATE_CLIENT_BIND` | `0.0.0.0:8080` | `127.0.0.1:0` | Clients reach via Service |
-| `KUBELICATE_REPLICA_ID` | `<pod_index + 1>` | `1` | 1-based replica ID |
+| `KUBERIC_CONTROL_BIND` | `0.0.0.0:9090` | `127.0.0.1:0` | Operator reaches pod via pod IP |
+| `KUBERIC_DATA_BIND` | `0.0.0.0:9091` | `127.0.0.1:0` | Peer pods reach each other |
+| `KUBERIC_CLIENT_BIND` | `0.0.0.0:8080` | `127.0.0.1:0` | Clients reach via Service |
+| `KUBERIC_REPLICA_ID` | `<pod_index + 1>` | `1` | 1-based replica ID |
 
 The `build_pod()` function in the reconciler sets these env vars in the
 container spec. The kvstore binary uses clap `env` attribute for seamless
 env var / CLI arg integration.
 
-**Replica ID convention**: `KUBELICATE_REPLICA_ID` is **1-based** (matching
+**Replica ID convention**: `KUBERIC_REPLICA_ID` is **1-based** (matching
 the driver's `ReplicaId = pod_index + 1`). The pod label
-`kubelicate.io/pod-index` is 0-based (for PVC/pod naming).
+`kuberic.io/pod-index` is 0-based (for PVC/pod naming).
 
 ## Services (CNPG Pattern)
 
@@ -181,9 +181,9 @@ automatically re-routes traffic on failover.
 ### Pod Labels
 
 ```
-kubelicate.io/set: kvstore
-kubelicate.io/role: primary | secondary
-kubelicate.io/pod-index: "0" | "1" | "2"
+kuberic.io/set: kvstore
+kuberic.io/role: primary | secondary
+kuberic.io/pod-index: "0" | "1" | "2"
 ```
 
 On failover/switchover, labels are updated in a specific order:
@@ -197,9 +197,9 @@ This ensures the `-rw` service always has at least one endpoint.
 
 | Service | Selector | Routes To |
 |---------|----------|-----------|
-| `kvstore-rw` | `kubelicate.io/set=kvstore, kubelicate.io/role=primary` | Primary only |
-| `kvstore-ro` | `kubelicate.io/set=kvstore, kubelicate.io/role=secondary` | Secondaries only |
-| `kvstore-r` | `kubelicate.io/set=kvstore` | All pods |
+| `kvstore-rw` | `kuberic.io/set=kvstore, kuberic.io/role=primary` | Primary only |
+| `kvstore-ro` | `kuberic.io/set=kvstore, kuberic.io/role=secondary` | Secondaries only |
+| `kvstore-r` | `kuberic.io/set=kvstore` | All pods |
 
 All are ClusterIP services (no NodePort). Port mappings:
 - Port 8080 → client gRPC
@@ -258,13 +258,13 @@ PVCs use labels (no `ownerReferences`) to prevent cascade deletion:
 metadata:
   name: kvstore-0-data
   labels:
-    kubelicate.io/set: kvstore
-    kubelicate.io/pod-index: "0"
+    kuberic.io/set: kvstore
+    kuberic.io/pod-index: "0"
 spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
-      storage: 256Mi  # from KubelicateSetSpec.storage
+      storage: 256Mi  # from KubericSetSpec.storage
 ```
 
 ### CRD Fields
@@ -308,15 +308,15 @@ cmake --build build --target create-kind-cluster
 cmake --build build --target all
   → builds rust binaries
   → builds kvstore docker image
-  → builds kubelicate-operator docker image
+  → builds kuberic-operator docker image
   → loads both into kind
 
 # Deploy
-cmake --build build --target kubelicate-operator-deploy
+cmake --build build --target kuberic-operator-deploy
 cmake --build build --target kvstore-deploy
 
 # Verify
-kubectl get kubelicatesets -n xedio
+kubectl get kubericsets -n xedio
 kubectl get pods -n xedio
 ```
 
@@ -337,7 +337,7 @@ Implemented in two PRs:
 ### PR 2: KVStore K8s Deployment (done)
 
 - kvstore Dockerfile + CMake targets
-- kubelicate-operator Dockerfile + manifests (CRD, RBAC, Deployment)
+- kuberic-operator Dockerfile + manifests (CRD, RBAC, Deployment)
 - Binary env var support via clap `env` attribute
 - KinD config consolidated at `deploy/kind-config.yaml` with NodePort mappings
 - NodePort service overlay for dev/test access (port 30090)
@@ -345,7 +345,7 @@ Implemented in two PRs:
 
 ## Open Questions
 
-1. **Operator CRD extensions**: Should `KubelicateSetSpec` grow fields
+1. **Operator CRD extensions**: Should `KubericSetSpec` grow fields
    for `env`/custom volume mounts, or keep it minimal?
 
 2. ~~**RWO volume fencing**~~: Deferred to multi-node support.

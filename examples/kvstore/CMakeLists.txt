@@ -7,11 +7,11 @@ add_custom_target(kvstore-image ALL
 )
 
 add_custom_target(kvstore-deploy
-    COMMAND kubectl apply -f examples/kvstore/deploy/kubelicateset.yaml
+    COMMAND kubectl apply -f examples/kvstore/deploy/kubericset.yaml
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )
 
 add_custom_target(kvstore-delete
-    COMMAND kubectl delete -f examples/kvstore/deploy/kubelicateset.yaml
+    COMMAND kubectl delete -f examples/kvstore/deploy/kubericset.yaml
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 )

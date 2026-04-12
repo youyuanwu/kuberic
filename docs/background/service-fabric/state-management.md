@@ -60,7 +60,7 @@ SF has **two distinct replicators** with different persistence models:
 - `hasPersistedState` flag controls whether it waits for user `acknowledge()`
 - Volatile services: auto-ACK (no disk writes anywhere)
 - Persisted services: defers ACK until user calls `acknowledge()`
-- **This is what Kubelicate models**
+- **This is what Kuberic models**
 
 **V2 Transactional Replicator** (`data/txnreplicator/`) — powers Reliable Collections:
 - Wraps V1 replicator and adds its own `LoggingReplicator` + `PhysicalLogWriter`
@@ -104,7 +104,7 @@ the V1 Replicator. The V1 Replicator has no log of its own on either
 platform. Custom services using V1 directly (with `IStateProvider`)
 handle their own persistence regardless of OS.
 
-**Relevance to Kubelicate:** Since we model V1, the Windows/Linux
+**Relevance to Kuberic:** Since we model V1, the Windows/Linux
 logging difference doesn't affect us. Our Option C (framework WAL)
 is conceptually similar to what V2 does — adding a replicator-level
 log — but much simpler: per-partition file, no shared log, no kernel
@@ -129,7 +129,7 @@ partition → ReplicatorFactory.CreateReplicator()
 ```
 This is the documented public API. The user provides an `IStateProvider`
 and receives raw operation bytes on the replication/copy streams. The
-user is fully responsible for persistence. This is what Kubelicate models.
+user is fully responsible for persistence. This is what Kuberic models.
 
 **`CreateTransactionalReplicator(factory, dataLossHandler, ...)` — V2 path:**
 ```
@@ -242,7 +242,7 @@ handle everything. V2 is like building a storage engine plugin for
 PostgreSQL — you implement storage access methods, the framework handles
 WAL, transactions, and recovery.
 
-**Relevance to Kubelicate:** We model V1's `IStateProvider` contract
+**Relevance to Kuberic:** We model V1's `IStateProvider` contract
 (our `LifecycleEvent` + `StateProviderEvent` channels). Our WAL design
 (Option C) adds V2-like log persistence at the replicator level without
 requiring users to adopt the full V2 checkpoint/apply/unlock contract.
@@ -254,7 +254,7 @@ requiring users to adopt the full V2 checkpoint/apply/unlock contract.
 Below Reliable Collections sits a lower-level contract between the **Fabric
 Replicator** (system-provided) and the **State Provider** (user/system-
 implemented). Understanding this layer is critical for building custom
-replication — it's the interface our kubelicate design is modeled after.
+replication — it's the interface our kuberic design is modeled after.
 
 **Source:** `service-fabric-apps-rs/crates/libs/mssf-ext/src/traits.rs`,
 Microsoft documentation for `IStateReplicator` and `IStateProvider`.

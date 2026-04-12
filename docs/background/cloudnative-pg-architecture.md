@@ -1172,9 +1172,9 @@ which is a signal for immediate investigation.
 
 ---
 
-### Summary: CNPG Failure Handling vs. Kubelicate
+### Summary: CNPG Failure Handling vs. Kuberic
 
-| Aspect | CNPG | Kubelicate (Current) |
+| Aspect | CNPG | Kuberic (Current) |
 |--------|------|---------------------|
 | **Primary detection** | HTTP status poll + liveness probe | gRPC `GetStatus` (primary only) |
 | **Secondary detection** | Immediate via pod watches | ❌ Not implemented |

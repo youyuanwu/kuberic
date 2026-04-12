@@ -1,6 +1,6 @@
 //! KVStore: Replicated Key-Value Store
 //!
-//! A stateful key-value store using kubelicate-core's PodRuntime.
+//! A stateful key-value store using kuberic-core's PodRuntime.
 //! Demonstrates the full replication protocol:
 //! - Primary replicates writes via `replicate()`
 //! - Secondary drains copy_stream and replication_stream

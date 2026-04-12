@@ -1,4 +1,4 @@
-# Copilot Instructions — Kubelicate (xedio)
+# Copilot Instructions — Kuberic (xedio)
 
 ## What This Is
 
@@ -11,19 +11,19 @@ copy-based replica building, and epoch-based fencing.
 ```bash
 cargo check                                    # fast type check
 cargo clippy --all-targets                     # lint (must be zero warnings)
-cargo test -p kubelicate-core -p kvstore -p sqlite-replicated   # run all meaningful tests
+cargo test -p kuberic-core -p kvstore -p sqlite-replicated   # run all meaningful tests
 cargo fmt                                      # format before committing
 ```
 
-- The `kubelicate-tests` crate requires a K8s cluster — skip it in local dev.
+- The `kuberic-tests` crate requires a K8s cluster — skip it in local dev.
 - All kvstore and sqlite tests use `#[serial]` (port contention).
 - The build buffer replay test (`operator_replication.rs`) takes ~7s (500+200 entries).
 
 ## Architecture
 
 ```
-kubelicate-operator/     K8s operator (reconciler, CRD, ClusterApi)
-kubelicate-core/         Core replication framework
+kuberic-operator/     K8s operator (reconciler, CRD, ClusterApi)
+kuberic-core/         Core replication framework
   driver.rs              PartitionDriver — SF RA equivalent, orchestrates lifecycle
   pod.rs                 PodRuntime — per-pod runtime, hosts replicator + user service
   replicator/
@@ -63,9 +63,9 @@ examples/sqlite/     Example replicated SQLite DB using the framework
 
 ## Design Documents
 
-- `docs/features/kubelicate/` — main design (protocols, operator, user-api, status)
-- `docs/features/kubelicate/design-gaps.md` — tracked gaps with SF source analysis
-- `docs/features/kubelicate/testing.md` — test strategy and layers
+- `docs/features/kuberic/` — main design (protocols, operator, user-api, status)
+- `docs/features/kuberic/design-gaps.md` — tracked gaps with SF source analysis
+- `docs/features/kuberic/testing.md` — test strategy and layers
 - `docs/background/service-fabric/` — SF architecture reference (split into architecture, replication, failover, state-management, references)
 - `docs/background/cloudnative-pg-architecture.md` — CNPG comparison
 - `docs/features/sqlite/` — replicated SQLite design (WAL frame shipping, persist-then-ACK)

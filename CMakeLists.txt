@@ -40,5 +40,5 @@ add_custom_target(build_rust_bins
     VERBATIM
 )
 
-add_subdirectory(kubelicate-operator)
+add_subdirectory(kuberic-operator)
 add_subdirectory(examples/kvstore)

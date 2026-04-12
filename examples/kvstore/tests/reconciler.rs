@@ -8,16 +8,16 @@ use kube::api::ObjectMeta;
 use serial_test::serial;
 use tokio::sync::RwLock;
 
-use kubelicate_core::driver::ReplicaHandle;
-use kubelicate_core::grpc::handle::GrpcReplicaHandle;
-use kubelicate_core::pod::PodRuntime;
-use kubelicate_core::types::ReplicaId;
+use kuberic_core::driver::ReplicaHandle;
+use kuberic_core::grpc::handle::GrpcReplicaHandle;
+use kuberic_core::pod::PodRuntime;
+use kuberic_core::types::ReplicaId;
 
-use kubelicate_operator::cluster_api::ClusterApi;
-use kubelicate_operator::crd::{
-    KubelicateSet, KubelicateSetSpec, KubelicateSetStatus, Phase, PvcRetentionPolicy,
+use kuberic_operator::cluster_api::ClusterApi;
+use kuberic_operator::crd::{
+    KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
 };
-use kubelicate_operator::reconciler::{ReconcilerState, reconcile_set};
+use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
 use kvstore::proto;
 use kvstore::service;
@@ -37,7 +37,7 @@ struct LivePod {
 struct KvClusterApi {
     pods: Mutex<Vec<Pod>>,
     live_pods: Mutex<HashMap<String, LivePod>>,
-    statuses: Mutex<Vec<KubelicateSetStatus>>,
+    statuses: Mutex<Vec<KubericSetStatus>>,
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
 }
@@ -101,7 +101,7 @@ impl KvClusterApi {
         }
     }
 
-    fn last_status(&self) -> Option<KubelicateSetStatus> {
+    fn last_status(&self) -> Option<KubericSetStatus> {
         self.statuses.lock().unwrap().last().cloned()
     }
 
@@ -138,7 +138,7 @@ impl ClusterApi for KvClusterApi {
             .metadata
             .labels
             .as_ref()
-            .and_then(|l| l.get("kubelicate.io/pod-index"))
+            .and_then(|l| l.get("kuberic.io/pod-index"))
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0)
             + 1;
@@ -225,7 +225,7 @@ impl ClusterApi for KvClusterApi {
         &self,
         _ns: &str,
         _name: &str,
-        status: &KubelicateSetStatus,
+        status: &KubericSetStatus,
     ) -> Result<(), String> {
         self.statuses.lock().unwrap().push(status.clone());
         Ok(())
@@ -235,7 +235,7 @@ impl ClusterApi for KvClusterApi {
         &self,
         replica_id: ReplicaId,
         pod: &Pod,
-        _spec: &KubelicateSetSpec,
+        _spec: &KubericSetSpec,
     ) -> Result<Box<dyn ReplicaHandle>, String> {
         let pod_name = pod.metadata.name.as_deref().unwrap();
         let (control_addr, data_addr) = {
@@ -306,15 +306,15 @@ impl ClusterApi for KvClusterApi {
     }
 }
 
-fn make_set(name: &str, replicas: i32, status: Option<KubelicateSetStatus>) -> KubelicateSet {
-    KubelicateSet {
+fn make_set(name: &str, replicas: i32, status: Option<KubericSetStatus>) -> KubericSet {
+    KubericSet {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some("default".to_string()),
             uid: Some("test-uid".to_string()),
             ..Default::default()
         },
-        spec: KubelicateSetSpec {
+        spec: KubericSetSpec {
             replicas,
             min_replicas: 1,
             image: "test:latest".to_string(),
@@ -393,7 +393,7 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
     let set = make_set(
         "myapp",
         3,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Creating,
             ..Default::default()
         }),
@@ -444,7 +444,7 @@ async fn test_reconciler_switchover() {
     let set = make_set(
         "myapp",
         3,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Creating,
             ..Default::default()
         }),
@@ -478,7 +478,7 @@ async fn test_reconciler_switchover() {
     let set = make_set(
         "myapp",
         3,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Healthy,
             current_primary: Some(original_primary.clone()),
             target_primary: Some(target_name.clone()),
@@ -554,7 +554,7 @@ async fn test_reconciler_creating_waits_for_ready() {
     let set = make_set(
         "myapp",
         3,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Creating,
             ..Default::default()
         }),
@@ -565,7 +565,7 @@ async fn test_reconciler_creating_waits_for_ready() {
     assert!(
         matches!(
             result,
-            kubelicate_operator::reconciler::ReconcileAction::Requeue(_)
+            kuberic_operator::reconciler::ReconcileAction::Requeue(_)
         ),
         "should requeue when pods not ready"
     );
@@ -591,7 +591,7 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
     let set = make_set(
         "myapp",
         3,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Creating,
             ..Default::default()
         }),
@@ -691,7 +691,7 @@ async fn test_reconciler_scale_up() {
     let set = make_set(
         "myapp",
         1,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Creating,
             ..Default::default()
         }),
@@ -761,7 +761,7 @@ async fn test_reconciler_scale_down() {
     let set = make_set(
         "myapp",
         3,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Creating,
             ..Default::default()
         }),
@@ -829,7 +829,7 @@ async fn test_reconciler_double_failover() {
     let set = make_set(
         "myapp",
         3,
-        Some(KubelicateSetStatus {
+        Some(KubericSetStatus {
             phase: Phase::Creating,
             ..Default::default()
         }),
