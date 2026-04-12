@@ -5,6 +5,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::config::PgConfig;
+
 use kuberic_core::types::FaultType;
 
 /// Manages a PostgreSQL instance as a child process.
@@ -17,15 +19,18 @@ pub struct PgInstanceManager {
     pg_bin: PathBuf,
     port: u16,
     child: Mutex<Option<Child>>,
+    config: PgConfig,
 }
 
 impl PgInstanceManager {
     pub fn new(data_dir: PathBuf, pg_bin: PathBuf, port: u16) -> Self {
+        let config = PgConfig::new(port, &data_dir);
         Self {
             data_dir,
             pg_bin,
             port,
             child: Mutex::new(None),
+            config,
         }
     }
 
@@ -35,6 +40,12 @@ impl PgInstanceManager {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Host address PG listens on for TCP connections.
+    /// For local tests: 127.0.0.1. For K8s: pod IP (configurable).
+    pub fn listen_host(&self) -> &str {
+        "127.0.0.1"
     }
 
     /// Socket directory — same as data_dir for test isolation.
@@ -73,7 +84,7 @@ impl PgInstanceManager {
         }
 
         // Write required config
-        self.write_config().await?;
+        self.config.write_initial(&self.data_dir).await?;
 
         tracing::info!(
             data_dir = %self.data_dir.display(),
@@ -83,59 +94,9 @@ impl PgInstanceManager {
         Ok(())
     }
 
-    /// Write required postgresql.conf settings.
-    async fn write_config(&self) -> Result<(), PgError> {
-        let conf_path = self.data_dir.join("postgresql.conf");
-        let extra = format!(
-            "\n\
-            # kuberic required settings\n\
-            port = {port}\n\
-            unix_socket_directories = '{socket_dir}'\n\
-            wal_log_hints = on\n\
-            hot_standby = on\n\
-            synchronous_commit = on\n\
-            logging_collector = off\n\
-            listen_addresses = '*'\n\
-            wal_level = replica\n\
-            max_wal_senders = 10\n\
-            max_replication_slots = 10\n\
-            ",
-            port = self.port,
-            socket_dir = self.data_dir.display(),
-        );
-
-        tokio::fs::write(
-            &conf_path,
-            format!(
-                "{}\n{extra}",
-                tokio::fs::read_to_string(&conf_path)
-                    .await
-                    .unwrap_or_default()
-            ),
-        )
-        .await
-        .map_err(|e| PgError::Process(format!("write config: {e}")))?;
-
-        // Allow replication connections in pg_hba.conf
-        let hba_path = self.data_dir.join("pg_hba.conf");
-        let hba_extra = "\n\
-            # kuberic: allow replication connections\n\
-            local   replication     all                     trust\n\
-            host    replication     all     127.0.0.1/32    trust\n\
-            host    replication     all     ::1/128         trust\n\
-            host    replication     all     0.0.0.0/0       trust\n\
-            host    all             all     0.0.0.0/0       trust\n\
-        ";
-
-        let mut hba = tokio::fs::read_to_string(&hba_path)
-            .await
-            .unwrap_or_default();
-        hba.push_str(hba_extra);
-        tokio::fs::write(&hba_path, hba)
-            .await
-            .map_err(|e| PgError::Process(format!("write pg_hba.conf: {e}")))?;
-
-        Ok(())
+    /// Access the PgConfig for post-clone patching.
+    pub fn config(&self) -> &PgConfig {
+        &self.config
     }
 
     /// Start PostgreSQL. Pipes stdout/stderr through tracing.
@@ -198,7 +159,14 @@ impl PgInstanceManager {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 let status = Command::new(pg_bin.join("pg_isready"))
-                    .args(["-h", &data_dir.to_string_lossy(), "-p", &port.to_string()])
+                    .args([
+                        "-h",
+                        &data_dir.to_string_lossy(),
+                        "-p",
+                        &port.to_string(),
+                        "-d",
+                        "postgres",
+                    ])
                     .output()
                     .await;
                 match status {

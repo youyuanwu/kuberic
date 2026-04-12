@@ -28,6 +28,7 @@ pub fn create_pg_replicator(
     let shutdown = CancellationToken::new();
 
     let shutdown_token = shutdown.clone();
+    let self_instance = instance.clone();
     tokio::spawn(async move {
         let mut current_role = Role::None;
 
@@ -63,33 +64,95 @@ pub fn create_pg_replicator(
                     tracing::info!(
                         replica_id = replica.id,
                         addr = %replica.replicator_address,
-                        "BuildReplica requested"
+                        "BuildReplica: calling CloneFrom on secondary"
                     );
-                    // The secondary adapter handles pg_basebackup.
-                    // For the primary adapter, this is a no-op — the secondary
-                    // pulls data via pg_basebackup directly from PG.
-                    let _ = reply.send(Ok(()));
+                    // Connect to secondary's PgDataService and tell it
+                    // to pg_basebackup from us (the primary).
+                    // Primary PG listens on 0.0.0.0:port — secondary needs
+                    // a routable address. For local tests, use 127.0.0.1.
+                    // For K8s, this would be the pod IP.
+                    let primary_host = instance.listen_host().to_string();
+                    let primary_port = instance.port();
+                    let secondary_addr = replica.replicator_address.clone();
+                    let result = async {
+                        use crate::proto::pg_data_service_client::PgDataServiceClient;
+                        let mut client = PgDataServiceClient::connect(secondary_addr)
+                            .await
+                            .map_err(|e| {
+                                kuberic_core::KubericError::Internal(
+                                    format!("connect to secondary data service: {e}").into(),
+                                )
+                            })?;
+                        let resp = client
+                            .clone_from(crate::proto::CloneFromRequest {
+                                primary_host,
+                                primary_port: primary_port as u32,
+                                replica_id: replica.id,
+                            })
+                            .await
+                            .map_err(|e| {
+                                kuberic_core::KubericError::Internal(
+                                    format!("CloneFrom RPC: {e}").into(),
+                                )
+                            })?;
+                        let resp = resp.into_inner();
+                        if resp.success {
+                            Ok(())
+                        } else {
+                            Err(kuberic_core::KubericError::Internal(
+                                format!("CloneFrom failed: {}", resp.error).into(),
+                            ))
+                        }
+                    }
+                    .await;
+                    let _ = reply.send(result);
                 }
 
-                ReplicatorControlEvent::UpdateCatchUpConfiguration { reply, .. } => {
-                    // TODO: update synchronous_standby_names
-                    let _ = reply.send(Ok(()));
+                ReplicatorControlEvent::UpdateCatchUpConfiguration { current, reply, .. } => {
+                    // 1. Reconfigure secondaries to point to this primary
+                    let primary_host = self_instance.listen_host().to_string();
+                    let primary_port = self_instance.port() as u32;
+                    for member in &current.members {
+                        let addr = member.replicator_address.clone();
+                        if let Err(e) =
+                            reconfigure_secondary(&addr, &primary_host, primary_port).await
+                        {
+                            tracing::warn!(
+                                replica_id = member.id,
+                                "reconfigure standby failed (will retry): {}",
+                                e
+                            );
+                        }
+                    }
+
+                    // 2. Configure synchronous_standby_names
+                    let result = configure_sync_standbys(&self_instance, &current.members).await;
+                    let _ = reply.send(result);
                 }
 
-                ReplicatorControlEvent::UpdateCurrentConfiguration { reply, .. } => {
-                    // TODO: finalize synchronous_standby_names
-                    let _ = reply.send(Ok(()));
+                ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply, .. } => {
+                    // Finalize sync standby config (same logic)
+                    let result = configure_sync_standbys(&self_instance, &current.members).await;
+                    let _ = reply.send(result);
                 }
 
                 ReplicatorControlEvent::WaitForCatchUpQuorum { reply, .. } => {
-                    // TODO: poll pg_stat_replication until replicas caught up.
-                    // For now, reply immediately (safe for basic tests without
-                    // replication).
-                    let _ = reply.send(Ok(()));
+                    // Poll pg_stat_replication until all sync standbys
+                    // have flush_lsn >= current WAL LSN
+                    let inst = self_instance.clone();
+                    tokio::spawn(async move {
+                        let result = wait_for_catchup(&inst).await;
+                        let _ = reply.send(result);
+                    });
                 }
 
-                ReplicatorControlEvent::RemoveReplica { reply, .. } => {
-                    // TODO: remove from synchronous_standby_names
+                ReplicatorControlEvent::RemoveReplica {
+                    replica_id, reply, ..
+                } => {
+                    tracing::info!(replica_id, "RemoveReplica");
+                    // Replication slot cleanup could go here.
+                    // synchronous_standby_names is updated by the next
+                    // UpdateCurrentConfiguration call.
                     let _ = reply.send(Ok(()));
                 }
 
@@ -98,14 +161,19 @@ pub fn create_pg_replicator(
                 }
 
                 ReplicatorControlEvent::Close { reply } => {
-                    tracing::info!("PgReplicatorAdapter: Close");
-                    // PG stop is handled by the service layer in LifecycleEvent::Close
+                    tracing::info!("PgReplicatorAdapter: Close — stopping PG");
+                    if let Err(e) = self_instance.stop().await {
+                        tracing::warn!("PG stop on close: {}", e);
+                    }
                     shutdown_token.cancel();
                     let _ = reply.send(Ok(()));
                 }
 
                 ReplicatorControlEvent::Abort => {
-                    tracing::info!("PgReplicatorAdapter: Abort");
+                    tracing::info!("PgReplicatorAdapter: Abort — stopping PG");
+                    if let Err(e) = self_instance.stop().await {
+                        tracing::warn!("PG stop on abort: {}", e);
+                    }
                     shutdown_token.cancel();
                 }
             }
@@ -146,12 +214,141 @@ async fn handle_change_role(
         }
 
         Role::None => {
-            tracing::info!("ChangeRole → None: stopping PG");
+            tracing::info!("ChangeRole → None: demotion (PG stopped on Close)");
             monitor.set_role(Role::None);
-            // Stop PG entirely to prevent split-brain
-            // (Clone instance to get &mut for stop — in practice,
-            // the service layer handles PG lifecycle)
             Ok(())
         }
     }
+}
+
+/// Reconfigure a secondary to stream from a new primary.
+async fn reconfigure_secondary(
+    secondary_addr: &str,
+    primary_host: &str,
+    primary_port: u32,
+) -> Result<()> {
+    use crate::proto::pg_data_service_client::PgDataServiceClient;
+
+    let mut client = PgDataServiceClient::connect(secondary_addr.to_string())
+        .await
+        .map_err(|e| {
+            kuberic_core::KubericError::Internal(
+                format!("connect to secondary for reconfigure: {e}").into(),
+            )
+        })?;
+
+    let resp = client
+        .reconfigure_standby(crate::proto::ReconfigureStandbyRequest {
+            primary_host: primary_host.to_string(),
+            primary_port,
+        })
+        .await
+        .map_err(|e| {
+            kuberic_core::KubericError::Internal(format!("ReconfigureStandby RPC: {e}").into())
+        })?;
+
+    let resp = resp.into_inner();
+    if resp.success {
+        Ok(())
+    } else {
+        Err(kuberic_core::KubericError::Internal(
+            format!("ReconfigureStandby failed: {}", resp.error).into(),
+        ))
+    }
+}
+
+/// Configure synchronous_standby_names from the replica set members.
+/// Uses naming convention: application_name = kuberic_{replica_id}
+async fn configure_sync_standbys(
+    instance: &Arc<PgInstanceManager>,
+    members: &[kuberic_core::types::ReplicaInfo],
+) -> Result<()> {
+    let standby_names: Vec<String> = members
+        .iter()
+        .filter(|r| r.role == Role::ActiveSecondary || r.role == Role::IdleSecondary)
+        .map(|r| format!("kuberic_{}", r.id))
+        .collect();
+
+    if standby_names.is_empty() {
+        tracing::debug!("no sync standbys to configure");
+        return Ok(());
+    }
+
+    let (client, _conn) = instance.connect().await.map_err(|e| {
+        kuberic_core::KubericError::Internal(format!("connect for sync config: {e}").into())
+    })?;
+
+    // ANY 1 — at least one standby must ACK
+    let names = standby_names.join(", ");
+    let sql = format!("ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 ({names})'");
+    client.execute(&sql, &[]).await.map_err(|e| {
+        kuberic_core::KubericError::Internal(format!("set synchronous_standby_names: {e}").into())
+    })?;
+    client
+        .execute("SELECT pg_reload_conf()", &[])
+        .await
+        .map_err(|e| kuberic_core::KubericError::Internal(format!("pg_reload_conf: {e}").into()))?;
+
+    tracing::info!(standbys = ?standby_names, "configured synchronous_standby_names");
+    Ok(())
+}
+
+/// Wait for all sync standbys to catch up to current WAL LSN.
+/// Polls pg_stat_replication every 500ms, timeout after 30s.
+async fn wait_for_catchup(instance: &Arc<PgInstanceManager>) -> Result<()> {
+    let (client, _conn) = instance.connect().await.map_err(|e| {
+        kuberic_core::KubericError::Internal(format!("connect for catchup: {e}").into())
+    })?;
+
+    // Record target LSN
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .map_err(|e| {
+            kuberic_core::KubericError::Internal(format!("current_wal_lsn: {e}").into())
+        })?;
+    let target_str: &str = row.get(0);
+    let target_lsn = crate::monitor::parse_pg_lsn(target_str)
+        .map_err(|e| kuberic_core::KubericError::Internal(format!("parse LSN: {e}").into()))?;
+
+    tracing::info!(target_lsn, "waiting for standbys to catch up");
+
+    for _ in 0..60 {
+        // Check if all sync standbys have flush_lsn >= target
+        let rows = client
+            .query(
+                "SELECT application_name, flush_lsn::text \
+                 FROM pg_stat_replication \
+                 WHERE sync_state IN ('sync', 'quorum')",
+                &[],
+            )
+            .await
+            .map_err(|e| {
+                kuberic_core::KubericError::Internal(format!("pg_stat_replication: {e}").into())
+            })?;
+
+        if rows.is_empty() {
+            // No sync standbys yet — wait
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+
+        let all_caught_up = rows.iter().all(|row| {
+            let flush_str: Option<&str> = row.get(1);
+            flush_str
+                .and_then(|s| crate::monitor::parse_pg_lsn(s).ok())
+                .is_some_and(|lsn| lsn >= target_lsn)
+        });
+
+        if all_caught_up {
+            tracing::info!("all standbys caught up");
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    Err(kuberic_core::KubericError::Internal(
+        "WaitForCatchUpQuorum timeout (30s)".into(),
+    ))
 }

@@ -1,5 +1,5 @@
 use postgres_replicated::instance::PgInstanceManager;
-use postgres_replicated::testing::{cleanup_data_dir, find_pg_bin, temp_data_dir};
+use postgres_replicated::testing::{allocate_port, cleanup_data_dir, find_pg_bin, temp_data_dir};
 use serial_test::serial;
 use test_log::test;
 use tokio::sync::mpsc;
@@ -11,7 +11,7 @@ async fn test_instance_lifecycle() {
     let data_dir = temp_data_dir("lifecycle");
     let (fault_tx, _fault_rx) = mpsc::channel(1);
 
-    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15432);
+    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, allocate_port().await);
 
     // initdb
     instance.init_db().await.expect("initdb should succeed");
@@ -115,7 +115,7 @@ async fn test_lsn_query() {
     let data_dir = temp_data_dir("lsn");
     let (fault_tx, _fault_rx) = mpsc::channel(1);
 
-    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15434);
+    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, allocate_port().await);
     instance.init_db().await.unwrap();
     instance.start(fault_tx).await.unwrap();
 

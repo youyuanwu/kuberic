@@ -132,7 +132,7 @@ Instead, write fencing uses **PostgreSQL's native mechanisms**:
 | Kuberic Event | PG Fencing Action | Effect on Clients |
 |---------------|-------------------|-------------------|
 | Write revocation (switchover start) | `ALTER SYSTEM SET default_transaction_read_only = on` + `pg_reload_conf()` | Existing connections get `ERROR: cannot execute ... in a read-only transaction` on next write |
-| ChangeRole(None) — demotion | Shut down PostgreSQL | All connections dropped |
+| ChangeRole(None) — demotion | No PG action (PG stopped on Close) | — |
 | Epoch fence (zombie primary) | Shut down PG → `pg_rewind` → restart as standby | Connections dropped, PG restarts read-only |
 | ChangeRole(Primary) — promotion | `pg_ctl promote` (PG writable by default) | New connections can write |
 
@@ -634,24 +634,15 @@ ChangeRole { role: ActiveSecondary }
 ```
 ChangeRole { role: None }
   │
-  ├─ Stop client gRPC server (if primary)
-  ├─ Stop PostgreSQL (pg_ctl stop -m fast)
-  │   └─ Critical: PG must be fully stopped to prevent split-brain.
-  │      A running PG with default_transaction_read_only is insufficient —
-  │      it can still act as a replication source on the old timeline.
   ├─ Set write_status → NotPrimary
-  ├─ Data directory is PRESERVED (not deleted)
-  │   └─ Demoted primary needs data_dir for pg_rewind to rejoin later
-  │   └─ Data deletion happens only on Close (scale-down / pod removal)
+  ├─ PG keeps running (stopped on Close, not here)
   └─ Reply OK
 ```
 
-**Data lifecycle**: ChangeRole(None) signals permanent removal — the
-replica is being decommissioned. Close follows to clean up:
-- **ChangeRole(None) → Close**: Data directory is deleted.
-- **Close (from any other role)**: Graceful shutdown for restart. Data
-  directory is preserved. The replica will be reopened with
-  `OpenMode::Existing` and resume from where it left off.
+**Data lifecycle**: ChangeRole(None) marks the role. Close does cleanup:
+- **ChangeRole(None) → Close**: PG stopped. Data directory deleted.
+- **Close (from any other role)**: PG stopped. Data directory preserved.
+  The replica will be reopened with `OpenMode::Existing`.
 
 ### Copy Protocol — pg_basebackup
 

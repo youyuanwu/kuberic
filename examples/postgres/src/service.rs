@@ -6,6 +6,7 @@ use kuberic_core::types::Role;
 use tokio::sync::mpsc;
 
 use crate::adapter::create_pg_replicator;
+use crate::data_service::start_data_server;
 use crate::instance::PgInstanceManager;
 use crate::monitor::PgMonitor;
 
@@ -20,6 +21,7 @@ pub async fn run_service(
 ) {
     let mut _monitor: Option<Arc<PgMonitor>> = None;
     let mut _monitor_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut _data_server_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     tracing::info!("pg service started, waiting for events");
 
@@ -38,8 +40,23 @@ pub async fn run_service(
                     mon_clone.run(mon_token).await;
                 }));
 
-                // Build data address from the bind address
-                let data_address = format!("http://localhost:{}", instance.port());
+                // Start PgDataService on data_bind (app-to-app coordination)
+                let data_address =
+                    match start_data_server(&ctx.data_bind, instance.clone(), ctx.fault_tx.clone())
+                        .await
+                    {
+                        Ok((addr, handle)) => {
+                            _data_server_handle = Some(handle);
+                            addr
+                        }
+                        Err(e) => {
+                            tracing::error!("failed to start data server: {}", e);
+                            let _ = reply.send(Err(kuberic_core::KubericError::Internal(
+                                format!("data server: {e}").into(),
+                            )));
+                            continue;
+                        }
+                    };
 
                 // Create adapter → ReplicatorHandle
                 let handle =
@@ -54,8 +71,6 @@ pub async fn run_service(
 
                 match new_role {
                     Role::Primary => {
-                        // Promotion is handled by the adapter's ChangeRole handler.
-                        // The service just reports the listening address.
                         let addr = format!("localhost:{}", instance.port());
                         let _ = reply.send(Ok(addr));
                     }
@@ -66,13 +81,16 @@ pub async fn run_service(
             }
 
             LifecycleEvent::Close { reply } => {
-                tracing::info!("Close: stopping PG service");
-                // Monitor stops via cancellation token (dropped with the runtime)
+                tracing::info!("Close: PG service shutting down");
+                // PG stop is handled by adapter's Close handler
                 let _ = reply.send(Ok(()));
+                break;
             }
 
             LifecycleEvent::Abort => {
-                tracing::info!("Abort: emergency shutdown");
+                tracing::info!("Abort: PG service emergency shutdown");
+                // PG stop is handled by adapter's Abort handler
+                break;
             }
         }
     }

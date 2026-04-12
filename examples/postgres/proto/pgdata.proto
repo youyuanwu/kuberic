@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package pgdata.v1;
+
+// App-to-app data service for PostgreSQL replication coordination.
+// Runs on each pod's data_bind address. The primary calls CloneFrom
+// on the secondary during BuildReplica to trigger pg_basebackup.
+service PgDataService {
+  // Primary calls this on the secondary during BuildReplica.
+  // Secondary runs pg_basebackup from the given primary address,
+  // configures standby.signal, and starts PG.
+  rpc CloneFrom(CloneFromRequest) returns (CloneFromResponse);
+
+  // Primary calls this on secondaries after failover to update
+  // primary_conninfo to point to the new primary. Restarts PG.
+  rpc ReconfigureStandby(ReconfigureStandbyRequest) returns (ReconfigureStandbyResponse);
+}
+
+message CloneFromRequest {
+  string primary_host = 1;
+  uint32 primary_port = 2;
+  int64 replica_id = 3;
+}
+
+message CloneFromResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ReconfigureStandbyRequest {
+  string primary_host = 1;
+  uint32 primary_port = 2;
+}
+
+message ReconfigureStandbyResponse {
+  bool success = 1;
+  string error = 2;
+}

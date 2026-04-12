@@ -15,14 +15,22 @@ path = "src/main.rs"
 kuberic-core = { path = "../../kuberic-core" }
 tokio.workspace = true
 tokio-postgres.workspace = true
+tokio-stream.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 whoami.workspace = true
+tonic.workspace = true
+prost.workspace = true
+tonic-prost.workspace = true
 
 [dev-dependencies]
 test-log.workspace = true
 postgres-replicated = { path = ".", features = ["testing"] }
 serial_test.workspace = true
+kuberic-operator = { path = "../../kuberic-operator" }
+
+[build-dependencies]
+tonic-prost-build.workspace = true
