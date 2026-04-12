@@ -129,8 +129,8 @@ Clients (SQL over gRPC)
 │  │ control gRPC ◄┤    │  ┌────────────────────────┐  │    │
 │  │ data gRPC    ◄┤    │  │  SQLite DB (WAL mode)  │  │    │
 │  │               │    │  │  + WAL hook callback    │  │    │
-│  │ lifecycle_rx ─┼───►│  └────────────────────────┘  │    │
-│  │ state_prov_rx─┼───►│                              │    │
+│  │ lifecycle_tx ─┼───►│  └────────────────────────┘  │    │
+│  │ state_prov_tx─┼───►│                              │    │
 │  └──────────────┘    │  client gRPC ◄── Clients     │    │
 │                       └──────────────────────────────┘    │
 └──────────────────────────────────────────────────────────┘
@@ -234,6 +234,12 @@ struct WalFrame {
     data: Vec<u8>,  // page_size bytes (typically 4096)
 }
 ```
+
+**Serialization:** WalFrameSet is serialized via `serde_json` (matching
+kvstore's approach). The replication channel transmits `Bytes` — the
+service serializes with `serde_json::to_vec()` and deserializes on
+receive. This is simple and debuggable; binary formats can be adopted
+later if throughput requires it.
 
 We do NOT ship raw WAL bytes (which include SQLite-specific salts and
 checksums tied to the WAL file identity). Instead we extract the
@@ -379,15 +385,30 @@ queries.
 
 ## Lifecycle Integration
 
+The SQLite service follows the same two-channel pattern as kvstore:
+- **`LifecycleEvent` channel** — Open, ChangeRole, Close, Abort
+- **`StateProviderEvent` channel** — UpdateEpoch, GetCopyContext, GetCopyState, GetLastCommittedLsn, OnDataLoss
+
+### LifecycleEvent Handling
+
 | Event | Action |
 |-------|--------|
-| **Open** | Open/create frames.log + meta.json. Create data dir |
+| **Open** | Create data dir, open/create frames.log + meta.json. Return `ReplicatorHandle` |
 | **ChangeRole(IdleSecondary)** | Drain copy stream — receive full DB snapshot, write to file |
 | **ChangeRole(ActiveSecondary)** | Drain replication stream — persist frames to log, ACK, apply on commit |
 | **ChangeRole(Primary)** | Open SQLite DB in WAL mode (single connection). Register WAL hook. Disable auto-checkpoint. Start client gRPC server |
-| **UpdateEpoch** | Truncate frames.log beyond `previous_epoch_last_lsn`. DB file is untouched (only committed pages applied). If `previous_epoch_last_lsn < persisted committed_lsn`, request full copy rebuild |
 | **Close** | Apply any remaining committed frames. Checkpoint SQLite WAL (primary). Persist committed_lsn. Close connections |
-| **Abort** | Cancel drain tasks. Close file handles. No checkpoint, no cleanup |
+| **Abort** | Cancel drain tasks. Close file handles. No checkpoint |
+
+### StateProviderEvent Handling
+
+| Event | Action |
+|-------|--------|
+| **UpdateEpoch** | Truncate frames.log beyond `previous_epoch_last_lsn`. DB file is untouched (only committed pages applied). If `previous_epoch_last_lsn < persisted committed_lsn`, request full copy rebuild via `OnDataLoss` |
+| **GetLastCommittedLsn** | Return persisted committed_lsn from meta.json |
+| **GetCopyContext** | (Secondary) Send current committed_lsn as copy context |
+| **GetCopyState** | (Primary) Pause WAL hook, snapshot DB via `sqlite3_backup`, record copy_lsn, stream chunks, resume WAL hook |
+| **OnDataLoss** | Return `true` if state changed (data rolled back) |
 
 ### Checkpoint Strategy
 
@@ -542,6 +563,87 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 | Checkpoint | Atomic JSON snapshot | SQLite PASSIVE checkpoint |
 | Secondary reads | No | No |
 | Complexity | Low (~500 lines) | Medium (~1500 lines estimated) |
+
+---
+
+## Test Plan
+
+Tests follow kvstore's pattern: in-process pods with real gRPC using
+`SqlitePod` helper (analogous to `KvPod`). All tests use `#[serial]`
+(port contention).
+
+### Core Replication Tests
+
+1. **test_single_write_replicates** — Primary: `CREATE TABLE + INSERT`.
+   Verify secondary receives WalFrameSet and applies pages to DB file.
+   Read secondary's DB directly (not via gRPC) to confirm data.
+
+2. **test_multi_page_transaction** — Primary: single transaction that
+   modifies many pages (bulk INSERT). Verify WalFrameSet contains
+   multiple frames, all applied atomically on secondary.
+
+3. **test_read_after_write** — Primary: `INSERT` then `SELECT` via
+   client gRPC. Verify result matches. Basic round-trip.
+
+4. **test_schema_changes_replicate** — Primary: `CREATE TABLE`,
+   `ALTER TABLE ADD COLUMN`, `CREATE INDEX`. Verify secondary DB has
+   identical schema (DDL is just page-level changes).
+
+### Failover Tests
+
+5. **test_failover_data_survives** — Write data on primary, trigger
+   failover (remove primary from driver). New primary should serve
+   the same data via `SELECT`.
+
+6. **test_failover_uncommitted_lost** — Write data, crash primary
+   before `replicate()` completes (simulate by not calling replicate).
+   After failover, new primary should NOT have the uncommitted data.
+
+### Copy Protocol Tests
+
+7. **test_copy_full_rebuild** — Start 2-pod cluster, write data on
+   primary. Add 3rd pod (idle secondary). Verify full DB snapshot
+   transferred via GetCopyState and new secondary has all data.
+
+8. **test_copy_then_incremental** — After copy completes, write more
+   data on primary. Verify new secondary receives incremental
+   WalFrameSets (not another full copy).
+
+### Rollback / Epoch Tests
+
+9. **test_update_epoch_truncates_frames_log** — Secondary has
+   persisted but uncommitted frames. Send UpdateEpoch with
+   `previous_epoch_last_lsn` below those frames. Verify frames.log
+   truncated, DB file unaffected.
+
+10. **test_update_epoch_past_committed_triggers_rebuild** — Secondary
+    has committed and applied frames. Send UpdateEpoch with
+    `previous_epoch_last_lsn` below committed_lsn. Verify service
+    signals data loss (OnDataLoss returns true) and requests full copy.
+
+### Crash Recovery Tests
+
+11. **test_secondary_crash_recovery** — Secondary persists frames to
+    frames.log, crash (kill process), restart. Verify committed_lsn
+    recovered from meta.json, committed frames re-applied to DB,
+    uncommitted frames discarded.
+
+### Client API Tests
+
+12. **test_execute_insert_update_delete** — Full CRUD via gRPC
+    Execute/Query. Verify affected rows, last_insert_rowid.
+
+13. **test_execute_batch_transaction** — Multiple statements in
+    ExecuteBatch. Verify atomicity (all or nothing on error).
+
+14. **test_query_returns_rows** — SELECT with multiple rows. Verify
+    structured response format.
+
+### Checkpoint Tests
+
+15. **test_checkpoint_after_commit** — Write data, verify WAL grows.
+    After committed_lsn advances, trigger checkpoint. Verify WAL
+    shrinks and data persists in main DB file.
 
 ---
 
