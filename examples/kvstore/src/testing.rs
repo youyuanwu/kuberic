@@ -1,4 +1,4 @@
-//! Test utilities for the KV-Stateful example.
+//! Test utilities for the kvstore example.
 //! Compiled under `#[cfg(test)]` or `feature = "testing"`.
 
 use std::path::PathBuf;

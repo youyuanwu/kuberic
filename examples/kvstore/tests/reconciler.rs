@@ -343,6 +343,25 @@ async fn connect_kv(
     unreachable!()
 }
 
+/// Retry a Get call — the client gRPC service may not be registered yet
+/// after a role transition (returns Unimplemented until ready).
+async fn retry_get(
+    client: &mut proto::kv_store_client::KvStoreClient<tonic::transport::Channel>,
+    key: &str,
+) -> tonic::Response<proto::GetResponse> {
+    for attempt in 0..30 {
+        match client.get(proto::GetRequest { key: key.into() }).await {
+            Ok(resp) => return resp,
+            Err(e) if attempt < 29 => {
+                tracing::debug!(attempt, error = %e, "Get retry");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("Get({}) failed after retries: {}", key, e),
+        }
+    }
+    unreachable!()
+}
+
 /// Full reconciler test: Pending → Creating → Healthy → write KV data.
 #[test_log::test(tokio::test)]
 #[serial]
@@ -895,24 +914,15 @@ async fn test_reconciler_double_failover() {
     assert_ne!(third_primary, first_primary);
     assert_ne!(third_primary, second_primary);
 
-    // Third primary should have data from both epochs
+    // Third primary should have data from both epochs.
+    // Retry Get — the client gRPC server may not be ready immediately after promotion.
     let addr3 = api.client_address(&third_primary).unwrap();
     let mut kv3 = connect_kv(&addr3).await;
 
-    let resp = kv3
-        .get(proto::GetRequest {
-            key: "epoch-1".into(),
-        })
-        .await
-        .unwrap();
+    let resp = retry_get(&mut kv3, "epoch-1").await;
     assert!(resp.get_ref().found, "data from first epoch should survive");
 
-    let resp = kv3
-        .get(proto::GetRequest {
-            key: "epoch-2".into(),
-        })
-        .await
-        .unwrap();
+    let resp = retry_get(&mut kv3, "epoch-2").await;
     assert!(
         resp.get_ref().found,
         "data from second epoch should survive"

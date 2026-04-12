@@ -1,4 +1,4 @@
-//! KV-Stateful: Replicated Key-Value Store
+//! KVStore: Replicated Key-Value Store
 //!
 //! A stateful key-value store using kubelicate-core's PodRuntime.
 //! Demonstrates the full replication protocol:

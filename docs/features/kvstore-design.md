@@ -1,4 +1,4 @@
-# KV-Stateful: Replicated Key-Value Store Example
+# KVStore: Replicated Key-Value Store Example
 
 Example application demonstrating kubelicate-core's full replication protocol.
 A gRPC key-value store that replicates writes via quorum, serves reads from

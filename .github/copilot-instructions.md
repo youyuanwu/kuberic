@@ -16,7 +16,7 @@ cargo fmt                                      # format before committing
 ```
 
 - The `kubelicate-tests` crate requires a K8s cluster — skip it in local dev.
-- All KV-stateful tests use `#[serial]` (port contention).
+- All kvstore tests use `#[serial]` (port contention).
 - The build buffer replay test (`operator_replication.rs`) takes ~7s (500+200 entries).
 
 ## Architecture

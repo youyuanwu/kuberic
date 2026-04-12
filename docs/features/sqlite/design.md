@@ -1,4 +1,4 @@
-# SQLite-Stateful: Replicated SQLite on Kubelicate
+# SQLite: Replicated SQLite on Kubelicate
 
 A replicated SQLite database running on kubelicate-core. The primary
 accepts SQL reads and writes, ships WAL frames to secondaries via the
@@ -19,7 +19,7 @@ durable copy of the database but do not serve client queries.
 
 ## Non-Goals
 
-- Multi-writer / multi-primary (single primary, same as KV app)
+- Multi-writer / multi-primary (single primary, same as kvstore)
 - Sharding across partitions (single partition = single SQLite DB)
 - Custom VFS implementation (use standard SQLite WAL mode, intercept
   at the application layer)
@@ -121,7 +121,7 @@ Clients (SQL over gRPC)
     │
     ▼
 ┌──────────────────────────────────────────────────────────┐
-│                  sqlite-stateful Pod                      │
+│                  sqlite Pod                            │
 │                                                           │
 │  ┌──────────────┐    ┌──────────────────────────────┐    │
 │  │  PodRuntime   │    │  SQLite Service (user app)    │    │
@@ -263,7 +263,7 @@ On the primary, after each committed transaction:
 the transaction locally. This means the primary has data that
 secondaries may not yet have. If the primary crashes before
 `replicate()` completes, this locally-committed data is lost on
-failover (the new primary won't have it). This inverts the KV app's
+failover (the new primary won't have it). This inverts the kvstore's
 replicate-then-apply ordering. It is an inherent limitation of
 using `sqlite3_wal_hook` — SQLite does not offer a pre-commit hook
 that allows blocking on external I/O. See Known Problems.
@@ -337,7 +337,7 @@ For `GetCopyState` (new replica or full rebuild):
 1. Primary pauses WAL hook processing (queue incoming writes)
 2. Primary calls `sqlite3_backup_init()` to create a consistent snapshot
 3. Records the current LSN as `copy_lsn` in `PartitionState::copy_lsn_map`
-   — this is the boundary for replication queue replay (same as KV app's
+   — this is the boundary for replication queue replay (same as kvstore's
    C0 fix)
 4. Streams the entire DB file as chunks via the copy stream
 5. Resumes WAL hook processing
@@ -371,7 +371,7 @@ service SqliteStore {
 ```
 
 All client operations go through the primary. The client gRPC server
-is only started on the primary (same as KV app). Secondaries exist
+is only started on the primary (same as kvstore). Secondaries exist
 solely for failover — they maintain a durable copy but don't serve
 queries.
 
@@ -458,7 +458,7 @@ data but fewer actually do.
 
 Persisting to `frames.log` + fsync before ACK ensures that a crash
 after ACK can always recover the data by replaying the log. This is
-the same durability guarantee as the KV app's per-op WAL writes.
+the same durability guarantee as the kvstore's per-op WAL writes.
 
 ---
 
@@ -500,7 +500,7 @@ WAL recovery handles any incomplete transactions automatically.
 ## File Structure
 
 ```
-examples/sqlite-stateful/
+examples/sqlite/
 ├── Cargo.toml
 ├── build.rs
 ├── proto/sqlitestore.proto        # Client API: Execute/Query
@@ -529,10 +529,10 @@ rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 
 ---
 
-## Comparison with KV-Stateful
+## Comparison with KVStore
 
-| Aspect | KV-Stateful | SQLite-Stateful |
-|--------|-------------|-----------------|
+| Aspect | KVStore | SQLite |
+|--------|---------|--------|
 | Data model | HashMap<String, String> | Full SQL (tables, indexes, etc.) |
 | Replication unit | Serialized KvOp (Put/Delete) | WalFrameSet (page-level) |
 | Determinism requirement | N/A (operations are deterministic) | None (page-level shipping) |
@@ -576,7 +576,7 @@ design. They are documented for awareness and future mitigation.
 
 `sqlite3_wal_hook` fires AFTER SQLite has committed the transaction
 locally. This means `replicate()` runs after local commit, inverting
-the KV app's replicate-then-apply ordering.
+the kvstore's replicate-then-apply ordering.
 
 **Impact:** If the primary crashes between local commit and quorum
 confirmation, locally-committed data is lost on failover. From the

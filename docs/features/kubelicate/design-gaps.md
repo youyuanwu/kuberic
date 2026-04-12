@@ -290,8 +290,8 @@ callback tells the user service to truncate state beyond
 **Future framework-level option (defer dispatch until committed):**
 For apps that can't implement rollback (e.g., SQLite where page
 overwrites are destructive), the framework could defer dispatch to
-user's `OperationStream` until committed. This is the SQLite-stateful
-app's design — see `docs/features/sqlite-stateful/design.md`.
+user's `OperationStream` until committed. This is the SQLite
+app's design — see `docs/features/sqlite/design.md`.
 
 ---
 
