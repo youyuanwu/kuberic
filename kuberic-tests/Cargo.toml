@@ -1,7 +1,8 @@
 [package]
 name = "kuberic-tests"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+publish = false
 
 [dependencies]
 
@@ -14,8 +15,8 @@ k8s-openapi.workspace = true
 test-log.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
-kube-lease-manager = "0.11.1"
-kube-leader-election = "0.43.0"
+kube-lease-manager.workspace = true
+kube-leader-election.workspace = true
 rand.workspace = true
-tokio-util = "0.7"
+tokio-util.workspace = true
 kvstore = { path = "../examples/kvstore" }

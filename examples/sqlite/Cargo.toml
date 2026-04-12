@@ -1,7 +1,8 @@
 [package]
 name = "sqlite-replicated"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+publish = false
 
 [features]
 testing = []
@@ -23,9 +24,9 @@ prost.workspace = true
 tonic-prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-clap = { version = "4", features = ["derive", "env"] }
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
-crc32fast = "1"
+clap.workspace = true
+rusqlite.workspace = true
+crc32fast.workspace = true
 
 [dev-dependencies]
 test-log.workspace = true
@@ -34,7 +35,7 @@ kuberic-operator = { path = "../../kuberic-operator" }
 k8s-openapi.workspace = true
 kube.workspace = true
 async-trait.workspace = true
-serial_test = "3.4.0"
+serial_test.workspace = true
 
 [build-dependencies]
 tonic-prost-build.workspace = true
