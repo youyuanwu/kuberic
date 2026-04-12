@@ -53,10 +53,13 @@ pub fn create_pg_replicator(
                 }
 
                 ReplicatorControlEvent::UpdateEpoch { reply, .. } => {
-                    // Epoch change on secondaries. If this replica has diverged
-                    // WAL (was a zombie primary), pg_rewind would be needed.
-                    // For now, reply OK — pg_rewind is triggered by the service
-                    // layer when it detects divergence.
+                    // Epoch change on secondaries. The secondary doesn't need
+                    // to check for WAL divergence here — if it was a zombie
+                    // primary, the operator already removed it from the replica
+                    // set. Surviving secondaries get ReconfigureStandby via
+                    // UpdateCatchUpConfiguration to reconnect to the new primary.
+                    // PG handles timeline following automatically.
+                    tracing::info!("UpdateEpoch received");
                     let _ = reply.send(Ok(()));
                 }
 

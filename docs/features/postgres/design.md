@@ -73,7 +73,7 @@ PostgreSQL already provides all of this:
 | Quorum | QuorumTracker counts ACKs | `synchronous_standby_names ANY N` |
 | Copy/rebuild | GetCopyState → user snapshot | `pg_basebackup` (adapter-direct) |
 | Catchup | ReplicationQueue replay | Replication slots + WAL retention |
-| Rollback | UpdateEpoch → truncate | `pg_rewind` |
+| Rollback | UpdateEpoch → user truncates | No-op (secondaries reconnect via ReconfigureStandby) |
 
 Using WalReplicator for PostgreSQL would mean:
 1. Parsing PG's binary WAL format (complex, version-dependent)
@@ -720,44 +720,19 @@ full), the secondary cleans up the partial data directory and replies
 translates this to an error on the `BuildReplica` reply channel. The
 operator retries with backoff or marks the replica as failed.
 
-### Epoch Handling — pg_rewind
+### Epoch Handling
 
-When the epoch changes (e.g., after failover), a demoted primary has
-WAL that diverged from the new timeline. PostgreSQL's `pg_rewind` handles
-this:
+`UpdateEpoch` is sent to surviving secondaries after failover. For PG,
+this is a **no-op** — no pg_rewind or divergence check needed:
 
-```
-ReplicatorControlEvent::UpdateEpoch { epoch }
-  │
-  ├─ Query PG for current LSN
-  │   └─ Current LSN > previous_epoch_last_lsn?
-  │   └─ Yes: this replica has diverged WAL (was zombie primary)
-  │
-  ├─ Stop PostgreSQL
-  │
-  ├─ Attempt pg_rewind --target-pgdata=data_dir
-  │                     --source-server="host=new_primary ..."
-  │   │
-  │   ├─ Success: rewinds to fork point, replays correct timeline
-  │   │
-  │   └─ Failure (WAL recycled, precondition error):
-  │       ├─ Remove data directory
-  │       ├─ Report fault → operator triggers BuildReplica
-  │       └─ Replica re-joins as IdleSecondary for full pg_basebackup
-  │
-  ├─ Configure standby.signal + primary_conninfo
-  │
-  └─ Start PostgreSQL → streams from new primary
-```
-
-**pg_rewind prerequisites**: Requires `--data-checksums` (set at initdb)
-or `wal_log_hints = on` (runtime). Both are mandatory in the Required
-Configuration section above. If `pg_rewind` still fails (e.g., WAL
-recycled on new primary despite replication slots), the fallback is a
-full `pg_basebackup` rebuild.
-
-This mirrors CNPG's automatic rewind for demoted primaries, but triggered
-by kuberic's epoch mechanism instead of the operator's reconcile loop.
+- **Zombie primaries** are removed from the operator's replica set by
+  `failover()` — they never receive `UpdateEpoch`.
+- **Surviving secondaries** get `ReconfigureStandby` (via
+  `UpdateCatchUpConfiguration`) to reconnect to the new primary. PG
+  handles timeline following automatically when reconnected.
+- **pg_rewind** is only needed when a crashed former-primary rejoins,
+  which happens via `BuildReplica` → `CloneFrom` (full pg_basebackup),
+  not via `UpdateEpoch`.
 
 ### Failover Sequence
 
@@ -782,11 +757,11 @@ by kuberic's epoch mechanism instead of the operator's reconcile loop.
    └─ Stop PG entirely (pg_ctl stop -m fast)
    └─ Not just write revocation — PG must be fully stopped
 
-7. UpdateEpoch on remaining secondaries
-   └─ Secondaries with diverged WAL → pg_rewind (fallback: pg_basebackup)
+7. UpdateEpoch on remaining secondaries (no-op — secondaries already
+   reconnected via ReconfigureStandby in step 5's UpdateCatchUpConfig)
 
 8. Old primary eventually gets BuildReplica
-   └─ pg_rewind or pg_basebackup → rejoin as standby
+   └─ pg_basebackup → rejoin as standby
 ```
 
 ### Switchover Sequence
@@ -824,7 +799,7 @@ by kuberic's epoch mechanism instead of the operator's reconcile loop.
 | **Failover trigger** | HTTP health check failure | gRPC control plane failure |
 | **Candidate selection** | LSN-based (received, then replayed) | LSN-based (PartitionState.current_progress) |
 | **Promotion** | `pg_ctl promote` | `pg_ctl promote` |
-| **Demoted primary** | `pg_rewind` (automatic) | `pg_rewind` (via UpdateEpoch) |
+| **Demoted primary** | `pg_rewind` (automatic) | `pg_basebackup` (via BuildReplica/CloneFrom) |
 | **Fencing** | Annotation-based + self-fencing | Epoch-based (kuberic protocol) |
 | **Quorum** | PG `synchronous_standby_names` | PG `synchronous_standby_names` |
 | **Split-brain** | Operator detects multi-primary | Epoch fencing + PG sync commit fencing |
@@ -921,53 +896,31 @@ constructs a `ReplicatorHandle` using the existing struct.
 
 ### Phase 3: Robustness
 
-- Epoch fencing: UpdateEpoch triggers pg_rewind
-- Synchronous replication: configure sync standbys via kuberic
-- Quorum health: PgMonitor reports accurate committed_lsn
-- Crash recovery: secondary restart, automatic WAL catchup
+- ~~Epoch fencing: UpdateEpoch triggers pg_rewind~~ → Simplified: no-op.
+  Secondaries reconnect via ReconfigureStandby; old primaries rebuilt via
+  BuildReplica/CloneFrom (pg_basebackup).
+- ~~Synchronous replication~~ → Done in Phase 2 (synchronous_standby_names)
+- ~~Quorum health: committed_lsn~~ → Done in Phase 2 (PgMonitor flush_lsn)
+- ~~Crash recovery~~ → PG handles natively (tested via failover test)
 
 ---
 
 ## Design Decisions
 
-### DD-1: UpdateEpoch — deriving `previous_epoch_last_lsn`
+### ~~DD-1: UpdateEpoch~~ (Simplified)
 
-The `ReplicatorControlEvent::UpdateEpoch` carries only `epoch`, not
-`previous_epoch_last_lsn`. The `StateProviderEvent` version has it, but
-the PG adapter doesn't use StateProvider.
+Originally planned to detect WAL divergence and trigger pg_rewind in
+`UpdateEpoch`. Abandoned because:
+1. `ReplicatorControlEvent::UpdateEpoch` carries only `epoch`, not
+   `previous_epoch_last_lsn` — no divergence threshold available.
+2. Secondaries' `PartitionState.committed_lsn()` is always 0 (only
+   primary's PgMonitor sets it) — comparison is meaningless.
+3. Zombie primaries are removed by the operator — they never receive
+   `UpdateEpoch`.
+4. Surviving secondaries are reconnected via `ReconfigureStandby`.
 
-**Resolution**: The PG adapter queries PG directly for the current WAL
-position — not `PartitionState.committed_lsn()`, which can be up to 1s
-stale from PgMonitor polling. The WalReplicator can use PartitionState
-because it updates atomics synchronously on every ACK (zero staleness).
-For PG, we must query the real source:
-
-```rust
-ReplicatorControlEvent::UpdateEpoch { epoch, reply } => {
-    // Query PG directly for actual WAL position — don't trust
-    // stale PartitionState (up to 1s behind from PgMonitor polling)
-    let current_lsn = query_receive_lsn(&instance).await; // pg_last_wal_receive_lsn()
-    let prev_lsn = state.committed_lsn(); // operator's last known committed
-
-    if current_lsn > prev_lsn {
-        // This replica has diverged WAL — was zombie primary
-        tracing::info!(current_lsn, prev_lsn, "epoch change: pg_rewind needed");
-        instance.stop().await?;
-        if let Err(e) = instance.rewind(primary_host, primary_port).await {
-            // Fallback: full pg_basebackup rebuild
-            tracing::warn!("pg_rewind failed: {e}, triggering rebuild");
-            fault_tx.send(FaultType::Transient).await?;
-        }
-        instance.start(fault_tx.clone()).await?;
-    }
-    let _ = reply.send(Ok(()));
-}
-```
-
-**Note**: The adapter needs to know the current primary's address for
-`pg_rewind --source-server`. This is obtained from the most recent
-`UpdateCatchUpConfiguration`, which provides `ReplicaSetConfig.members`
-including the primary's `replicator_address`. The adapter stores this.
+`UpdateEpoch` is a no-op. Old primaries rejoin via `BuildReplica` →
+`CloneFrom` (full pg_basebackup).
 
 ### DD-2: Replica naming for `synchronous_standby_names`
 

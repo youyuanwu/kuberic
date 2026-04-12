@@ -113,6 +113,10 @@ impl PgMonitor {
             let flush_str: &str = row.get(0);
             let committed = parse_pg_lsn(flush_str)?;
             self.state.set_committed_lsn(committed);
+        } else {
+            // No sync standbys — single replica or async-only.
+            // All local writes are committed (no quorum needed).
+            self.state.set_committed_lsn(current_lsn);
         }
 
         Ok(())

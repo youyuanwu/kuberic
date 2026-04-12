@@ -20,6 +20,8 @@ jobs:
       with:
         toolchain: 1.94.1
         components: rustfmt, clippy
+
+    - uses: Swatinem/rust-cache@v2
     
     - uses: taiki-e/install-action@protoc
 
@@ -32,13 +34,16 @@ jobs:
         pg_config --version
 
     - name: Run cargo check
-      run: cargo check
+      run: cargo check --all-targets
 
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
     
     - name: Run cargo clippy
       run: cargo clippy --all-targets -- -D warnings
+
+    - name: Build all targets
+      run: cargo build --all-targets
 
     - name: Kubernetes KinD Cluster
       id: kind
