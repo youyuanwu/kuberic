@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::config::PgConfig;
 
-use kuberic_core::types::FaultType;
+use kuberic_core::types::{CancellationToken, FaultType};
 
 /// Manages a PostgreSQL instance as a child process.
 ///
@@ -20,6 +20,8 @@ pub struct PgInstanceManager {
     port: u16,
     child: Mutex<Option<Child>>,
     config: PgConfig,
+    /// Cancelled by stop() to signal health monitor to exit quietly.
+    shutdown: Mutex<CancellationToken>,
 }
 
 impl PgInstanceManager {
@@ -31,6 +33,7 @@ impl PgInstanceManager {
             port,
             child: Mutex::new(None),
             config,
+            shutdown: Mutex::new(CancellationToken::new()),
         }
     }
 
@@ -142,22 +145,27 @@ impl PgInstanceManager {
 
         *self.child.lock().await = Some(child);
 
+        // Fresh shutdown token for this run
+        let shutdown = CancellationToken::new();
+        *self.shutdown.lock().await = shutdown.clone();
+
         // Wait for PG to be ready
         self.wait_ready().await?;
 
-        // Spawn child process monitor (detect unexpected exit)
-        // We need to take the child temporarily to get its id, but
-        // the actual wait happens on a separate mechanism.
+        // Spawn health monitor — detects unexpected PG exit.
+        // Exits quietly when shutdown token is cancelled (intentional stop).
         let port = self.port;
-        let ft = fault_tx.clone();
+        let ft = fault_tx;
         let data_dir = self.data_dir.clone();
         let pg_bin = self.pg_bin.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            // Poll pg_isready to detect crash. The actual child.wait()
-            // can't be used because we store &mut child in self.
-            // Instead, use pg_isready as a health check loop.
+            let mut consecutive_failures: u32 = 0;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
                 let status = Command::new(pg_bin.join("pg_isready"))
                     .args([
                         "-h",
@@ -170,16 +178,21 @@ impl PgInstanceManager {
                     .output()
                     .await;
                 match status {
-                    Ok(output) if output.status.success() => continue,
-                    Ok(_) => {
-                        tracing::error!(port, "PostgreSQL is not ready (possible crash)");
-                        let _ = ft.send(FaultType::Permanent).await;
-                        break;
+                    Ok(output) if output.status.success() => {
+                        consecutive_failures = 0;
                     }
-                    Err(e) => {
-                        tracing::error!(port, "pg_isready failed: {}", e);
-                        let _ = ft.send(FaultType::Permanent).await;
-                        break;
+                    _ => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            // 3 consecutive failures — report crash
+                            tracing::error!(
+                                port,
+                                "PostgreSQL crashed (3 consecutive pg_isready failures)"
+                            );
+                            let _ = ft.send(FaultType::Permanent).await;
+                            break;
+                        }
+                        // Loop back — select! will check shutdown token
                     }
                 }
             }
@@ -198,6 +211,8 @@ impl PgInstanceManager {
                     &self.data_dir.to_string_lossy(),
                     "-p",
                     &self.port.to_string(),
+                    "-d",
+                    "postgres",
                 ])
                 .output()
                 .await
@@ -214,6 +229,9 @@ impl PgInstanceManager {
 
     /// Stop PostgreSQL (fast mode).
     pub async fn stop(&self) -> Result<(), PgError> {
+        // Signal health monitor to exit quietly before stopping PG
+        self.shutdown.lock().await.cancel();
+
         let output = Command::new(self.pg_bin.join("pg_ctl"))
             .args([
                 "stop",
@@ -338,7 +356,8 @@ impl PgInstanceManager {
 
         let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
-                tracing::error!("PG connection error: {}", e);
+                // Expected during shutdown — PG kills connections on pg_ctl stop
+                tracing::debug!("PG connection closed: {}", e);
             }
         });
 
@@ -348,6 +367,8 @@ impl PgInstanceManager {
 
 impl Drop for PgInstanceManager {
     fn drop(&mut self) {
+        // Cancel health monitor
+        self.shutdown.get_mut().cancel();
         if self.child.get_mut().is_some() {
             // Best-effort stop via pg_ctl (sync, can't await in drop)
             let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))

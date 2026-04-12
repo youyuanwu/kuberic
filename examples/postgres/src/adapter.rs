@@ -190,11 +190,25 @@ async fn handle_change_role(
 ) -> Result<()> {
     match role {
         Role::Primary => {
-            tracing::info!("ChangeRole → Primary: promoting");
-            // If PG is running as standby, promote it
-            if let Err(e) = instance.promote().await {
-                // Promotion fails if already primary — that's OK
-                tracing::warn!("promote attempt: {}", e);
+            // Only promote if currently in standby mode
+            let (client, _conn) = instance.connect().await.map_err(|e| {
+                kuberic_core::KubericError::Internal(format!("connect for role check: {e}").into())
+            })?;
+            let row = client
+                .query_one("SELECT pg_is_in_recovery()", &[])
+                .await
+                .map_err(|e| {
+                    kuberic_core::KubericError::Internal(format!("pg_is_in_recovery: {e}").into())
+                })?;
+            let in_recovery: bool = row.get(0);
+
+            if in_recovery {
+                tracing::info!("ChangeRole → Primary: promoting standby");
+                instance.promote().await.map_err(|e| {
+                    kuberic_core::KubericError::Internal(format!("promote: {e}").into())
+                })?;
+            } else {
+                tracing::info!("ChangeRole → Primary: already primary");
             }
             monitor.set_role(Role::Primary);
             Ok(())
