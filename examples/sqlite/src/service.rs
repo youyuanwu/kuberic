@@ -70,12 +70,25 @@ async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedSt
 
             info!(peer_lsn, up_to_lsn, "producing copy state (DB snapshot)");
 
-            let snapshot = match state.lock().await.snapshot_db() {
-                Ok(data) => data,
-                Err(e) => {
+            let st = state.clone();
+            let snapshot = match tokio::task::spawn_blocking(move || {
+                let state = st.blocking_lock();
+                state.snapshot_db()
+            })
+            .await
+            {
+                Ok(Ok(data)) => data,
+                Ok(Err(e)) => {
                     warn!(error = %e, "failed to snapshot DB");
                     let _ =
                         reply.send(Err(kubelicate_core::KubelicateError::Internal(Box::new(e))));
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "snapshot task panicked");
+                    let _ = reply.send(Err(kubelicate_core::KubelicateError::Internal(Box::new(
+                        std::io::Error::other(format!("snapshot task panicked: {e}")),
+                    ))));
                     return;
                 }
             };
@@ -262,16 +275,24 @@ pub async fn run_service(
                             }
                         }
                         Role::Primary => {
-                            // Apply any unapplied frames from frame log before opening as primary
+                            // Apply unapplied frames, then open SQLite as primary
                             {
                                 let mut st = state.lock().await;
                                 let lsn = st.last_applied_lsn;
                                 if let Err(e) = st.apply_committed_frames(lsn).await {
                                     warn!(error = %e, "applying frames before promotion failed");
                                 }
-                                if let Err(e) = st.open_as_primary() {
-                                    warn!(error = %e, "failed to open as primary");
-                                }
+                            }
+                            // open_as_primary is blocking (rusqlite) — use spawn_blocking
+                            let st = state.clone();
+                            if let Err(e) = tokio::task::spawn_blocking(move || {
+                                let mut st = st.blocking_lock();
+                                st.open_as_primary()
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+                            {
+                                warn!(error = %e, "failed to open as primary");
                             }
                             if client_server_handle.is_none() {
                                 let srv_state = state.clone();

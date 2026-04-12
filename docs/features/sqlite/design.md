@@ -348,6 +348,12 @@ All tests use `#[serial]` (port contention).
    a ~40MB `WalFrameSet`. Tonic's default gRPC limit is 4MB. May need
    `max_encoding_message_size` / `max_decoding_message_size` config.
 
+2. **Fault reporting on promotion failure:** If `open_as_primary` fails
+   (disk full, permissions), the service currently logs a warning but
+   continues — the client gRPC server starts with no connection and all
+   queries panic. Should report fault via `fault_tx` to trigger operator
+   failover/rebuild. Same applies to `apply_committed_frames` failure.
+
 ---
 
 ## Known Problems
@@ -377,6 +383,19 @@ is small (sub-millisecond on local commit to start of replicate).
 Client retry on timeout is safe because page-level replication is
 idempotent. On failover, the new primary has a consistent state —
 it just may be missing the last transaction from the old primary.
+This is **not corruption** — the new primary holds a valid prefix of
+the old primary's state, and the client never received a success
+response for the lost transaction.
+
+**VFS alternative:** A custom VFS could fix this by intercepting
+`xWrite()` calls to the WAL file, shipping pages to the replicator
+*before* letting SQLite flush locally (replicate-then-commit). This
+eliminates the timing window entirely. However, implementing a WAL-
+mode VFS requires ~2000 lines (vs ~100 for WAL file reads), including
+`xShmMap`/`xShmLock`/`xShmBarrier` for shared memory, and VFS bugs
+can silently corrupt the database. The current approach is the right
+trade-off for an example app; a production system would consider VFS
+or a purpose-built replication engine (e.g., dqlite).
 
 ### KP-2: Per-Commit Synchronous Replication Throughput
 

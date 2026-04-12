@@ -28,14 +28,17 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
 
         let req = request.into_inner();
         let params = convert_params(&req.params);
+        let sql = req.sql;
 
-        // Execute SQL (this commits the transaction internally)
-        let (rows_affected, last_insert_rowid) = {
-            let state = self.state.lock().await;
-            state
-                .execute_sql(&req.sql, &params)
-                .map_err(|e| Status::internal(format!("SQL error: {e}")))?
-        };
+        // Execute SQL on blocking thread (rusqlite is synchronous)
+        let state = self.state.clone();
+        let (rows_affected, last_insert_rowid) = tokio::task::spawn_blocking(move || {
+            let state = state.blocking_lock();
+            state.execute_sql(&sql, &params)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?
+        .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
 
         // Capture WAL frames and replicate
         let lsn = self.capture_and_replicate().await?;
@@ -56,11 +59,16 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
 
         let req = request.into_inner();
         let params = convert_params(&req.params);
+        let sql = req.sql;
 
-        let state = self.state.lock().await;
-        let (columns, rows) = state
-            .query_sql(&req.sql, &params)
-            .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
+        let state = self.state.clone();
+        let (columns, rows) = tokio::task::spawn_blocking(move || {
+            let state = state.blocking_lock();
+            state.query_sql(&sql, &params)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?
+        .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
 
         let proto_rows: Vec<proto::Row> = rows
             .into_iter()
@@ -82,17 +90,24 @@ impl proto::sqlite_store_server::SqliteStore for SqliteServer {
         self.check_write_access()?;
 
         let req = request.into_inner();
+        let statements = req.statements;
 
-        let rows_affected = {
-            let mut state = self.state.lock().await;
-            state
-                .execute_batch_sql(&req.statements)
-                .map_err(|e| Status::internal(format!("SQL error: {e}")))?
-        };
+        let state = self.state.clone();
+        let rows_affected = tokio::task::spawn_blocking(move || {
+            let mut state = state.blocking_lock();
+            state.execute_batch_sql(&statements)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?
+        .map_err(|e| Status::internal(format!("SQL error: {e}")))?;
 
         let lsn = self.capture_and_replicate().await?;
 
-        debug!(lsn, statements = req.statements.len(), "batch complete");
+        debug!(
+            lsn,
+            statements_count = rows_affected.len(),
+            "batch complete"
+        );
         Ok(Response::new(proto::ExecuteBatchResponse {
             rows_affected: rows_affected.into_iter().map(|r| r as i64).collect(),
             lsn,
@@ -128,12 +143,14 @@ impl SqliteServer {
 
     /// Capture WAL frames from the last write and replicate to secondaries.
     async fn capture_and_replicate(&self) -> Result<i64, Status> {
-        let frame_set = {
-            let mut state = self.state.lock().await;
-            state
-                .capture_wal_frames()
-                .map_err(|e| Status::internal(format!("WAL capture failed: {e}")))?
-        };
+        let state = self.state.clone();
+        let frame_set = tokio::task::spawn_blocking(move || {
+            let mut state = state.blocking_lock();
+            state.capture_wal_frames()
+        })
+        .await
+        .map_err(|e| Status::internal(format!("task join error: {e}")))?
+        .map_err(|e| Status::internal(format!("WAL capture failed: {e}")))?;
 
         if let Some(fs) = frame_set {
             let data = serde_json::to_vec(&fs)
