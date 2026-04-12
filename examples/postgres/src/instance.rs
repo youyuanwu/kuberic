@@ -3,7 +3,7 @@ use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 use kuberic_core::types::FaultType;
 
@@ -16,7 +16,7 @@ pub struct PgInstanceManager {
     data_dir: PathBuf,
     pg_bin: PathBuf,
     port: u16,
-    child: Option<Child>,
+    child: Mutex<Option<Child>>,
 }
 
 impl PgInstanceManager {
@@ -25,7 +25,7 @@ impl PgInstanceManager {
             data_dir,
             pg_bin,
             port,
-            child: None,
+            child: Mutex::new(None),
         }
     }
 
@@ -140,9 +140,12 @@ impl PgInstanceManager {
 
     /// Start PostgreSQL. Pipes stdout/stderr through tracing.
     /// Spawns a child process monitor that reports fault on unexpected exit.
-    pub async fn start(&mut self, fault_tx: mpsc::Sender<FaultType>) -> Result<(), PgError> {
-        if self.child.is_some() {
-            return Ok(()); // already running
+    pub async fn start(&self, fault_tx: mpsc::Sender<FaultType>) -> Result<(), PgError> {
+        {
+            let guard = self.child.lock().await;
+            if guard.is_some() {
+                return Ok(()); // already running
+            }
         }
 
         let mut child = Command::new(self.pg_bin.join("postgres"))
@@ -176,7 +179,7 @@ impl PgInstanceManager {
             }
         });
 
-        self.child = Some(child);
+        *self.child.lock().await = Some(child);
 
         // Wait for PG to be ready
         self.wait_ready().await?;
@@ -242,7 +245,7 @@ impl PgInstanceManager {
     }
 
     /// Stop PostgreSQL (fast mode).
-    pub async fn stop(&mut self) -> Result<(), PgError> {
+    pub async fn stop(&self) -> Result<(), PgError> {
         let output = Command::new(self.pg_bin.join("pg_ctl"))
             .args([
                 "stop",
@@ -265,7 +268,7 @@ impl PgInstanceManager {
         }
 
         // Reap child process if we have one
-        if let Some(mut child) = self.child.take() {
+        if let Some(mut child) = self.child.lock().await.take() {
             let _ = child.wait().await;
         }
 
@@ -377,7 +380,7 @@ impl PgInstanceManager {
 
 impl Drop for PgInstanceManager {
     fn drop(&mut self) {
-        if self.child.is_some() {
+        if self.child.get_mut().is_some() {
             // Best-effort stop via pg_ctl (sync, can't await in drop)
             let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))
                 .args([

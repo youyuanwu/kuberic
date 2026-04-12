@@ -11,7 +11,7 @@ async fn test_instance_lifecycle() {
     let data_dir = temp_data_dir("lifecycle");
     let (fault_tx, _fault_rx) = mpsc::channel(1);
 
-    let mut instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15432);
+    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15432);
 
     // initdb
     instance.init_db().await.expect("initdb should succeed");
@@ -72,7 +72,7 @@ async fn test_instance_restart() {
     let data_dir = temp_data_dir("restart");
     let (fault_tx, _fault_rx) = mpsc::channel(1);
 
-    let mut instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15433);
+    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15433);
     instance.init_db().await.unwrap();
     instance.start(fault_tx.clone()).await.unwrap();
 
@@ -115,7 +115,7 @@ async fn test_lsn_query() {
     let data_dir = temp_data_dir("lsn");
     let (fault_tx, _fault_rx) = mpsc::channel(1);
 
-    let mut instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15434);
+    let instance = PgInstanceManager::new(data_dir.clone(), pg_bin, 15434);
     instance.init_db().await.unwrap();
     instance.start(fault_tx).await.unwrap();
 

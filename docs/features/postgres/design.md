@@ -640,51 +640,94 @@ ChangeRole { role: None }
   │      A running PG with default_transaction_read_only is insufficient —
   │      it can still act as a replication source on the old timeline.
   ├─ Set write_status → NotPrimary
+  ├─ Data directory is PRESERVED (not deleted)
+  │   └─ Demoted primary needs data_dir for pg_rewind to rejoin later
+  │   └─ Data deletion happens only on Close (scale-down / pod removal)
   └─ Reply OK
 ```
 
+**Data lifecycle**: ChangeRole(None) signals permanent removal — the
+replica is being decommissioned. Close follows to clean up:
+- **ChangeRole(None) → Close**: Data directory is deleted.
+- **Close (from any other role)**: Graceful shutdown for restart. Data
+  directory is preserved. The replica will be reopened with
+  `OpenMode::Existing` and resume from where it left off.
+
 ### Copy Protocol — pg_basebackup
 
-When the operator builds a new replica, kuberic's copy protocol fires.
-Instead of streaming application-level snapshots, we delegate to
-`pg_basebackup`:
+When the operator builds a new replica, `BuildReplica` is sent to the
+**primary's** adapter (kuberic convention), with the secondary's
+`replicator_address`. In WalReplicator, the primary connects to the
+secondary's gRPC data server and pushes state. For PG, we use the same
+app-to-app `data_address` channel but with a PG-specific gRPC service.
+
+#### PgDataService — App-to-App Protocol
+
+Each PG pod runs a `PgDataService` gRPC server on `data_bind` (the same
+address that WalReplicator would use for `ReplicatorDataServer`). This
+keeps the existing two-address model:
+
+| Address | Owner | Purpose |
+|---------|-------|---------|
+| `control_bind` | ControlServer | Operator → pod lifecycle |
+| `data_bind` | PgDataService | Pod → pod (BuildReplica coordination) |
+
+```protobuf
+service PgDataService {
+    // Primary calls this on the secondary during BuildReplica.
+    // Secondary runs pg_basebackup from the given primary address,
+    // configures standby.signal, and starts PG.
+    rpc CloneFrom(CloneFromRequest) returns (CloneFromResponse);
+}
+
+message CloneFromRequest {
+    string primary_host = 1;
+    uint32 primary_port = 2;
+}
+
+message CloneFromResponse {
+    bool success = 1;
+    string error = 2;
+}
+```
+
+#### BuildReplica Flow
 
 ```
-Operator: BuildReplica(replica_info)
+Operator: add_replica(secondary_handle)
   │
-  ├─ PgReplicatorAdapter handles directly (no StateProvider):
-  │   │
-  │   ├─ Read replica_info → determine if fresh or diverged
-  │   │   (fresh = no data_dir, diverged = has data on old timeline)
-  │   │
-  │   ├─ If fresh: run pg_basebackup
-  │   │   └─ pg_basebackup -D data_dir -h primary_addr -p 5432
-  │   │
-  │   └─ If diverged timeline: run pg_rewind
-  │       └─ pg_rewind --target-pgdata=data_dir
-  │                    --source-server="host=primary ..."
+  ├─ 1. Open secondary → initdb + start PgDataService on data_bind
   │
-  ├─ Configure standby
-  │   └─ Create standby.signal
-  │   └─ Set primary_conninfo in postgresql.auto.conf
+  ├─ 2. ChangeRole(IdleSecondary) on secondary → reply immediately
   │
-  ├─ Start PostgreSQL on secondary
-  │   └─ PG automatically connects to primary, starts streaming
+  ├─ 3. BuildReplica(secondary_info) on PRIMARY
+  │      │
+  │      ├─ Primary adapter receives BuildReplica
+  │      │   └─ replica_info.replicator_address = secondary's data_bind
+  │      │
+  │      ├─ Primary connects to secondary's PgDataService
+  │      │   └─ Calls CloneFrom { primary_host, primary_port }
+  │      │
+  │      ├─ Secondary handles CloneFrom:
+  │      │   ├─ Stop PG, remove data_dir contents
+  │      │   ├─ pg_basebackup -D data_dir -h primary_host -p primary_port -R
+  │      │   │   (-R creates standby.signal + primary_conninfo)
+  │      │   ├─ Write kuberic config (socket_dir, port, etc.)
+  │      │   ├─ Start PG → auto-streams from primary
+  │      │   └─ Reply CloneFromResponse { success: true }
+  │      │
+  │      └─ Primary replies Ok on BuildReplica reply channel
   │
-  └─ Reply Ok on BuildReplica reply channel
+  ├─ 4. ChangeRole(ActiveSecondary) on secondary
+  │
+  └─ 5. Reconfigure quorum
 ```
 
-**Note**: Unlike kvstore/sqlite which use the StateProvider's
-GetCopyState/GetCopyContext to coordinate copy via OperationStream, the
-PG adapter handles BuildReplica entirely within the control event handler.
-`pg_basebackup` runs directly between PG instances — no OperationStream
-coordination needed.
-
-**Failure handling**: If `pg_basebackup` fails mid-transfer (network
-timeout, disk full), the secondary cleans up the partial data directory
-and replies with an error on the `BuildReplica` reply channel. The
-operator retries with backoff or marks the replica as failed after N
-attempts.
+**Failure handling**: If `pg_basebackup` fails (network timeout, disk
+full), the secondary cleans up the partial data directory and replies
+`CloneFromResponse { success: false, error: "..." }`. The primary
+translates this to an error on the `BuildReplica` reply channel. The
+operator retries with backoff or marks the replica as failed.
 
 ### Epoch Handling — pg_rewind
 
@@ -893,6 +936,121 @@ constructs a `ReplicatorHandle` using the existing struct.
 - Crash recovery: secondary restart, automatic WAL catchup
 
 ---
+
+## Design Decisions
+
+### DD-1: UpdateEpoch — deriving `previous_epoch_last_lsn`
+
+The `ReplicatorControlEvent::UpdateEpoch` carries only `epoch`, not
+`previous_epoch_last_lsn`. The `StateProviderEvent` version has it, but
+the PG adapter doesn't use StateProvider.
+
+**Resolution**: The PG adapter queries PG directly for the current WAL
+position — not `PartitionState.committed_lsn()`, which can be up to 1s
+stale from PgMonitor polling. The WalReplicator can use PartitionState
+because it updates atomics synchronously on every ACK (zero staleness).
+For PG, we must query the real source:
+
+```rust
+ReplicatorControlEvent::UpdateEpoch { epoch, reply } => {
+    // Query PG directly for actual WAL position — don't trust
+    // stale PartitionState (up to 1s behind from PgMonitor polling)
+    let current_lsn = query_receive_lsn(&instance).await; // pg_last_wal_receive_lsn()
+    let prev_lsn = state.committed_lsn(); // operator's last known committed
+
+    if current_lsn > prev_lsn {
+        // This replica has diverged WAL — was zombie primary
+        tracing::info!(current_lsn, prev_lsn, "epoch change: pg_rewind needed");
+        instance.stop().await?;
+        if let Err(e) = instance.rewind(primary_host, primary_port).await {
+            // Fallback: full pg_basebackup rebuild
+            tracing::warn!("pg_rewind failed: {e}, triggering rebuild");
+            fault_tx.send(FaultType::Transient).await?;
+        }
+        instance.start(fault_tx.clone()).await?;
+    }
+    let _ = reply.send(Ok(()));
+}
+```
+
+**Note**: The adapter needs to know the current primary's address for
+`pg_rewind --source-server`. This is obtained from the most recent
+`UpdateCatchUpConfiguration`, which provides `ReplicaSetConfig.members`
+including the primary's `replicator_address`. The adapter stores this.
+
+### DD-2: Replica naming for `synchronous_standby_names`
+
+PG's `synchronous_standby_names` uses `application_name` strings to
+identify standbys. kuberic uses `ReplicaId` (i64). We need a mapping.
+
+**Resolution**: Each PG standby connects with
+`application_name = 'kuberic_{replica_id}'` in its `primary_conninfo`.
+This is set automatically during `pg_basebackup -R` by appending to the
+generated `primary_conninfo`, or by writing `postgresql.auto.conf`
+after cloning.
+
+```
+primary_conninfo = 'host=primary port=5432 application_name=kuberic_2'
+```
+
+The `UpdateCatchUpConfiguration` handler maps `ReplicaSetConfig.members`
+to PG's format:
+
+```rust
+ReplicatorControlEvent::UpdateCatchUpConfiguration { current, reply, .. } => {
+    // Build synchronous_standby_names from replica IDs
+    let standby_names: Vec<String> = current.members.iter()
+        .filter(|r| r.id != self_replica_id && r.role != Role::None)
+        .map(|r| format!("kuberic_{}", r.id))
+        .collect();
+
+    let quorum = current.write_quorum.saturating_sub(1); // subtract self
+    if !standby_names.is_empty() && quorum > 0 {
+        let names = standby_names.join(", ");
+        let sql = format!(
+            "ALTER SYSTEM SET synchronous_standby_names = 'ANY {quorum} ({names})'"
+        );
+        client.execute(&sql, &[]).await?;
+        client.execute("SELECT pg_reload_conf()", &[]).await?;
+    }
+    // Also store primary address from members for future pg_rewind
+    let _ = reply.send(Ok(()));
+}
+```
+
+**Convention**: `kuberic_{replica_id}` is the application_name for all
+PG standbys. This is consistent, collision-free, and maps trivially
+between kuberic's numeric IDs and PG's string names.
+
+### DD-3: Epoch vs Timeline — Two-Layer Fencing
+
+kuberic's epoch and PG's timeline are orthogonal fencing mechanisms at
+different layers. They naturally align (each failover bumps both) but
+neither needs to be injected into the other.
+
+| Layer | Mechanism | What it fences |
+|-------|-----------|---------------|
+| kuberic (control plane) | Epoch `(dln, cn)` | Operator won't send commands to wrong-epoch replicas |
+| PG (data plane) | Timeline ID | PG rejects WAL from a different timeline |
+| PG (write plane) | `synchronous_commit` | Zombie primary's commits hang when standbys disconnect |
+
+**Why no injection**: PG has no GUC or extension point for custom
+fencing metadata. Timelines are incremented automatically on
+`pg_ctl promote` — they track the same events as kuberic epoch bumps
+but from the data layer's perspective.
+
+**Observability (Phase 3, optional)**: Store kuberic epoch in a PG
+metadata table for DBA debugging. Not required for correctness — the
+operator tracks epoch/role/LSN in its own state (PartitionDriver +
+PartitionState atomics + CRD status).
+
+```sql
+-- Optional: created in Phase 3 for debugging convenience
+CREATE TABLE IF NOT EXISTS kuberic_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+```
 
 ## Open Questions
 

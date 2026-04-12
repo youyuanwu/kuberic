@@ -700,6 +700,62 @@ GetCopyState {
 
 ---
 
+### C4. ChangeRole(None) Does Not Delete Data or Stop Client Server
+
+**Severity:** Bug
+**Affects:** kvstore (`service.rs:234`), sqlite (`service.rs:314`)
+**Status:** Open
+
+**Problem:** `ChangeRole(Role::None)` is a no-op in both kvstore and
+sqlite. It doesn't stop the client server (if primary) or delete
+persisted data. `Role::None` signals permanent removal — the replica is
+being decommissioned.
+
+When the operator calls `ChangeRole(None) → Close`, the `Close` handler
+stops background tasks and checkpoints, but it does not delete the
+data directory. This means:
+1. A demoted primary's client server stays running until `Close` —
+   clients can still send writes in the gap
+2. The data directory is never cleaned up by the application
+
+**Expected behavior:**
+- `ChangeRole(None)`: stop client server, cancel background tasks
+- `Close` (after `ChangeRole(None)`): delete data directory
+- `Close` (from any other role): preserve data directory (restart case,
+  will be reopened with `OpenMode::Existing`)
+
+**Fix:** In the `ChangeRole` handler, `Role::None` should stop the
+client server and cancel background tasks. In the `Close` handler,
+check the last role — if `None`, delete the data directory.
+
+```rust
+// In ChangeRole handler:
+Role::None => {
+    // Stop client server
+    if let Some(shutdown) = client_server_shutdown.take() {
+        shutdown.cancel();
+    }
+    if let Some(h) = client_server_handle.take() {
+        let _ = h.await;
+    }
+    // Cancel background drain tasks
+    if let Some(t) = bg_token.take() {
+        t.cancel();
+    }
+    for h in bg_handles.drain(..) {
+        let _ = h.await;
+    }
+}
+
+// In Close handler, after existing cleanup:
+if last_role == Role::None {
+    // Permanent removal — delete data
+    let _ = tokio::fs::remove_dir_all(&data_dir).await;
+}
+```
+
+---
+
 ## Category D: Already Designed — Implementation Only
 
 These items have complete designs in the existing docs. No additional
@@ -730,9 +786,9 @@ design work needed — just implementation.
 |----------|-------|-------------|
 | A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ✅** |
 | B: Operational Resilience (needs design) | 6 | B0 partially fixed (QuorumTracker timeout remaining), **B5 ✅**, B2 timeouts |
-| C: Correctness Refinements (needs design) | 4 | **C0 ✅ fixed**, C1 stale ACKs |
+| C: Correctness Refinements (needs design) | 5 | **C0 ✅ fixed**, C1 stale ACKs, **C4 ChangeRole(None) cleanup** |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
-| **Total** | **30** | |
+| **Total** | **31** | |
 
 **Recommended order:**
 1. B0 QuorumTracker timeout — prevents write hangs on dual stream failure

@@ -256,3 +256,4 @@ during rollback — the replication stream continues (matches SF).
 |---------|--------|-------|
 | `KvPod::crash()` / `restart()` | Designed | In testing.md. Now meaningful with per-op WAL writes |
 | B0: QuorumTracker timeout | Pre-existing gap | `replicate()` hangs forever if all secondaries die |
+| C4: ChangeRole(None) cleanup | Bug | No-op — should stop client server + delete data on Close. See `design-gaps.md` C4 |
