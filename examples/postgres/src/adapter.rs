@@ -118,7 +118,8 @@ pub fn create_pg_replicator(
                     for member in &current.members {
                         let addr = member.replicator_address.clone();
                         if let Err(e) =
-                            reconfigure_secondary(&addr, &primary_host, primary_port).await
+                            reconfigure_secondary(&addr, &primary_host, primary_port, member.id)
+                                .await
                         {
                             tracing::warn!(
                                 replica_id = member.id,
@@ -129,13 +130,23 @@ pub fn create_pg_replicator(
                     }
 
                     // 2. Configure synchronous_standby_names
-                    let result = configure_sync_standbys(&self_instance, &current.members).await;
+                    let result = configure_sync_standbys(
+                        &self_instance,
+                        &current.members,
+                        current.write_quorum,
+                    )
+                    .await;
                     let _ = reply.send(result);
                 }
 
                 ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply, .. } => {
                     // Finalize sync standby config (same logic)
-                    let result = configure_sync_standbys(&self_instance, &current.members).await;
+                    let result = configure_sync_standbys(
+                        &self_instance,
+                        &current.members,
+                        current.write_quorum,
+                    )
+                    .await;
                     let _ = reply.send(result);
                 }
 
@@ -243,6 +254,7 @@ async fn reconfigure_secondary(
     secondary_addr: &str,
     primary_host: &str,
     primary_port: u32,
+    replica_id: i64,
 ) -> Result<()> {
     use crate::proto::pg_data_service_client::PgDataServiceClient;
 
@@ -258,6 +270,7 @@ async fn reconfigure_secondary(
         .reconfigure_standby(crate::proto::ReconfigureStandbyRequest {
             primary_host: primary_host.to_string(),
             primary_port,
+            replica_id,
         })
         .await
         .map_err(|e| {
@@ -276,9 +289,11 @@ async fn reconfigure_secondary(
 
 /// Configure synchronous_standby_names from the replica set members.
 /// Uses naming convention: application_name = kuberic_{replica_id}
+/// Quorum derived from write_quorum (subtract 1 for the primary itself).
 async fn configure_sync_standbys(
     instance: &Arc<PgInstanceManager>,
     members: &[kuberic_core::types::ReplicaInfo],
+    write_quorum: u32,
 ) -> Result<()> {
     let standby_names: Vec<String> = members
         .iter()
@@ -295,9 +310,12 @@ async fn configure_sync_standbys(
         kuberic_core::KubericError::Internal(format!("connect for sync config: {e}").into())
     })?;
 
-    // ANY 1 — at least one standby must ACK
+    // Quorum = write_quorum - 1 (subtract the primary itself), minimum 1.
+    // E.g., 3-replica write_quorum=2 → ANY 1; 5-replica write_quorum=3 → ANY 2.
+    // SAFETY: r.id is i64 — kuberic_{i64} cannot contain SQL-special characters.
+    let quorum = write_quorum.saturating_sub(1).max(1);
     let names = standby_names.join(", ");
-    let sql = format!("ALTER SYSTEM SET synchronous_standby_names = 'ANY 1 ({names})'");
+    let sql = format!("ALTER SYSTEM SET synchronous_standby_names = 'ANY {quorum} ({names})'");
     client.execute(&sql, &[]).await.map_err(|e| {
         kuberic_core::KubericError::Internal(format!("set synchronous_standby_names: {e}").into())
     })?;

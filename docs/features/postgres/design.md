@@ -127,14 +127,102 @@ gRPC proxy intercepting queries. This means kuberic's
 `PartitionState.write_status()` cannot gate client writes at the
 application layer like kvstore/sqlite do.
 
+**How kvstore/sqlite fence writes**: `revoke_write_status()` sets an
+atomic (`AccessStatus::ReconfigurationPending`), and
+`StateReplicatorHandle::replicate()` checks this atomic before accepting
+data — returning `Err(ReconfigurationPending)` immediately. This works
+because all writes go through kuberic's WalReplicator data plane.
+
+**Why PG is different**: PG clients connect directly to PG's TCP port.
+Writes go through PG's native SQL engine, never touching kuberic's
+`replicate()` or `write_status()` atomic. The atomic is set but nobody
+checks it.
+
 Instead, write fencing uses **PostgreSQL's native mechanisms**:
 
 | Kuberic Event | PG Fencing Action | Effect on Clients |
 |---------------|-------------------|-------------------|
-| Write revocation (switchover start) | `ALTER SYSTEM SET default_transaction_read_only = on` + `pg_reload_conf()` | Existing connections get `ERROR: cannot execute ... in a read-only transaction` on next write |
-| ChangeRole(None) — demotion | No PG action (PG stopped on Close) | — |
-| Epoch fence (zombie primary) | Shut down PG → `pg_rewind` → restart as standby | Connections dropped, PG restarts read-only |
-| ChangeRole(Primary) — promotion | `pg_ctl promote` (PG writable by default) | New connections can write |
+| ChangeRole(ActiveSecondary) — demotion | `ALTER SYSTEM SET default_transaction_read_only = on` + `pg_reload_conf()` | New transactions get `ERROR: cannot execute ... in a read-only transaction` |
+| ReconfigureStandby — reconnect to new primary | Create `standby.signal` + restart as standby | PG is physically read-only (standby mode) |
+| Epoch fence (zombie primary) | Shut down PG → rejoin as standby via BuildReplica | Connections dropped |
+| ChangeRole(Primary) — promotion | `pg_ctl promote` + `ALTER SYSTEM SET default_transaction_read_only = off` + reload | Writable |
+
+**Implementation hook**: The adapter's `ChangeRole(ActiveSecondary)`
+handler is the demote signal. During switchover, the driver calls
+`revoke_write_status()` (atomic only) then immediately sends
+`ChangeRole(new_epoch, ActiveSecondary)` to the old primary's adapter.
+The adapter executes the PG-level fencing there:
+
+```rust
+// adapter.rs — handle_change_role
+Role::ActiveSecondary => {
+    // If demoting from Primary → fence writes at PG level
+    if current_role == Role::Primary {
+        if let Ok((client, _conn)) = instance.connect().await {
+            // Soft fence: new transactions default to read-only
+            let _ = client
+                .execute("ALTER SYSTEM SET default_transaction_read_only = on", &[])
+                .await;
+            let _ = client.execute("SELECT pg_reload_conf()", &[]).await;
+            info!("write fencing applied: default_transaction_read_only = on");
+        }
+    }
+    monitor.set_role(Role::ActiveSecondary);
+    Ok(())
+}
+```
+
+**Write fence lifecycle**:
+
+```
+Switchover timeline on old primary:
+
+1. revoke_write_status()
+   └─ atomic set to ReconfigurationPending (PG doesn't know yet)
+
+2. ChangeRole(ActiveSecondary)                    ← adapter fences here
+   └─ ALTER SYSTEM SET default_transaction_read_only = on
+   └─ pg_reload_conf()
+   └─ New transactions get read-only errors immediately
+
+3. UpdateCatchUpConfiguration
+   └─ ReconfigureStandby RPC arrives
+   └─ Create standby.signal (KP-3 fix)
+   └─ Rewrite primary_conninfo → new primary
+   └─ Restart PG as physical standby              ← hard fence
+```
+
+**Removing the fence on promotion**: When a standby is promoted to
+primary, `ChangeRole(Primary)` should also clear the fence:
+
+```rust
+Role::Primary => {
+    // ... promote logic ...
+    // Clear write fence if previously set
+    if let Ok((client, _conn)) = instance.connect().await {
+        let _ = client
+            .execute("ALTER SYSTEM SET default_transaction_read_only = off", &[])
+            .await;
+        let _ = client.execute("SELECT pg_reload_conf()", &[]).await;
+    }
+    monitor.set_role(Role::Primary);
+    Ok(())
+}
+```
+
+**Limitations of `default_transaction_read_only`**:
+
+- **Bypassable**: Clients can override with `SET SESSION
+  default_transaction_read_only = off` or `BEGIN READ WRITE`. This is a
+  known PG limitation — the setting is a default, not a restriction.
+- **Not instant for existing transactions**: In-flight write transactions
+  complete; only new transactions are affected.
+- **Adequate for kuberic's switchover window**: The window between
+  demotion and PG restart (ReconfigureStandby) is typically <2 seconds.
+  Combined with `synchronous_commit = on` (writes hang when standbys
+  disconnect), the risk of data divergence is minimal.
+- **Hard fence follows**: PG is restarted as a standby (physically
+  read-only) within seconds. The soft fence just buys time.
 
 **Client routing** uses a Kubernetes Service with label selectors:
 - **Read-write Service** (`-rw`): selects only the pod with
@@ -147,26 +235,6 @@ Clients connect to the Service DNS name (e.g.,
 `mydb-rw.namespace.svc:5432`). On failover, the operator relabels pods
 and the Service automatically routes to the new primary — no client-side
 discovery needed.
-
-**Fencing sequence during switchover**:
-
-```
-1. Operator: revoke_write_status() on old primary
-   └─ PgService: ALTER SYSTEM SET default_transaction_read_only = on
-   └─ PgService: SELECT pg_reload_conf()
-   └─ Effect: all new transactions are read-only (immediate)
-
-2. Operator: wait for in-flight writes to drain
-   └─ PgMonitor: poll pg_stat_activity for active write transactions
-   └─ Timeout: force terminate backends with pg_terminate_backend()
-
-3. Operator: ChangeRole(None) on old primary
-   └─ PgService: stop client traffic, update pod label role=none
-
-4. Operator: ChangeRole(Primary) on target
-   └─ PgService: pg_ctl promote, update pod label role=primary
-   └─ K8s Service routes to new primary automatically
-```
 
 **PartitionState still tracks access status** — PgMonitor updates
 `read_status` and `write_status` atomics based on PG's actual state
@@ -723,16 +791,51 @@ operator retries with backoff or marks the replica as failed.
 ### Epoch Handling
 
 `UpdateEpoch` is sent to surviving secondaries after failover. For PG,
-this is a **no-op** — no pg_rewind or divergence check needed:
+this is a **no-op** — no pg_rewind or divergence check needed.
+
+**Why no-op is correct (contrast with kvstore/sqlite)**:
+
+In the WalReplicator path, `UpdateEpoch` forwards to
+`StateProviderEvent::UpdateEpoch { epoch, previous_epoch_last_lsn }`.
+kvstore and sqlite use this to **rollback uncommitted ops** — operations
+that were applied locally (`current_lsn > previous_epoch_last_lsn`) but
+never quorum-committed by the old primary. Without rollback, the
+secondary would have divergent state.
+
+PG doesn't need this because:
+
+1. **PG handles divergence natively.** When a secondary reconnects to a
+   new primary (via `ReconfigureStandby`), PG's timeline following
+   mechanism automatically replays WAL from the fork point. No manual
+   rollback is possible or needed — PG's WAL receiver is the authority.
+
+2. **No in-memory state to rollback.** kvstore/sqlite have in-memory
+   ops applied by the user's `StateProvider`. PG's WAL replay is
+   entirely internal to the postgres process — the adapter has no
+   ops to undo.
+
+3. **`previous_epoch_last_lsn` doesn't map.** The framework's
+   `committed_lsn()` is observational (PgMonitor polls
+   `pg_stat_replication`), not the authoritative PG WAL boundary.
+   Rolling back to this value would be meaningless for PG.
+
+**What happens to each replica type during failover**:
 
 - **Zombie primaries** are removed from the operator's replica set by
   `failover()` — they never receive `UpdateEpoch`.
 - **Surviving secondaries** get `ReconfigureStandby` (via
   `UpdateCatchUpConfiguration`) to reconnect to the new primary. PG
   handles timeline following automatically when reconnected.
-- **pg_rewind** is only needed when a crashed former-primary rejoins,
-  which happens via `BuildReplica` → `CloneFrom` (full pg_basebackup),
-  not via `UpdateEpoch`.
+- **Demoted primaries** (switchover) get `ReconfigureStandby` which
+  detects `was_primary` and uses `pg_rewind` (fallback: `pg_basebackup`)
+  to handle timeline divergence.
+
+**Minor consideration**: PgMonitor's cached LSN values may be briefly
+stale after epoch change (from old timeline). LSNs are monotonic across
+PG timelines in practice (new timeline continues from fork point), so
+this doesn't affect failover candidate selection. A future optimization
+could reset `current_progress` to 0 in UpdateEpoch and let PgMonitor
+re-query on the next poll cycle.
 
 ### Failover Sequence
 
@@ -770,23 +873,54 @@ this is a **no-op** — no pg_rewind or divergence check needed:
 1. Operator initiates switchover to target replica
 
 2. Revoke write status on old primary
-   └─ ALTER SYSTEM SET default_transaction_read_only = on
-   └─ SELECT pg_reload_conf()
-   └─ Drain in-flight writes (poll pg_stat_activity, timeout → pg_terminate_backend)
+   └─ PartitionState atomic set (PG-level fencing is KP-4 future work)
 
-3. Wait for target to catch up
-   └─ PgMonitor: target's current_progress ≥ primary's committed_lsn
+3. ChangeRole(ActiveSecondary) on old primary
+   └─ Monitor role updated, PG still running
 
-4. ChangeRole(None) on old primary
-   └─ Stop client server
-   └─ Stop PostgreSQL (pg_ctl stop -m fast)
+4. ChangeRole(Primary) on target
+   └─ pg_ctl promote -w -t 60 (creates timeline N+1)
+   └─ Configure sync standbys
 
-5. ChangeRole(Primary) on target
-   └─ pg_ctl promote -w -t 60
-   └─ Start client server
+5. UpdateCatchUpConfiguration on new primary
+   └─ ReconfigureStandby on old primary:
+      - Detects was_primary (no standby.signal)
+      - Tries pg_rewind from new primary (fast — diverged pages only)
+      - If pg_rewind fails (WAL recycled): full pg_basebackup fallback
+      - Creates standby.signal, patches config, starts as standby
+   └─ ReconfigureStandby on other standbys:
+      - Rewrites primary_conninfo to new primary
+      - Restarts PG (timeline following automatic)
+   └─ Configures synchronous_standby_names (ANY {quorum})
 
-6. Old primary → pg_rewind (fallback: pg_basebackup) → rejoin as standby
+6. WaitForCatchUpQuorum on new primary
+   └─ Polls flush_lsn from pg_stat_replication until standbys caught up
+
+7. UpdateCurrentConfiguration (finalize)
 ```
+
+**Timeline divergence during switchover**: Between steps 3 and 5, the
+old primary's PG is still running and its background processes
+(checkpointer, stats) generate small WAL records on the old timeline.
+Other standbys connected to the old primary receive these records,
+pushing their recovery point past the fork point. When reconfigured to
+follow the new primary's timeline, they can't follow without rewinding.
+
+For the **old primary** (was_primary = true): `ReconfigureStandby`
+detects this and uses pg_rewind (or pg_basebackup fallback).
+
+For **other standbys**: The divergence is typically tiny (< 1 WAL
+segment from background PG activity). PG can usually follow the new
+timeline automatically because the divergence is within the same WAL
+segment that the new primary also has. In rare cases where the standby
+has truly diverged past the fork point, the restart will fail and the
+operator will rebuild via BuildReplica/CloneFrom on the next reconcile
+cycle.
+
+**Contrast with failover**: In failover, the old primary is dead — all
+standbys' WAL receivers disconnect immediately. Their recovery points
+stay at or before the fork point, so timeline following works cleanly
+without pg_rewind.
 
 ---
 
@@ -799,7 +933,7 @@ this is a **no-op** — no pg_rewind or divergence check needed:
 | **Failover trigger** | HTTP health check failure | gRPC control plane failure |
 | **Candidate selection** | LSN-based (received, then replayed) | LSN-based (PartitionState.current_progress) |
 | **Promotion** | `pg_ctl promote` | `pg_ctl promote` |
-| **Demoted primary** | `pg_rewind` (automatic) | `pg_basebackup` (via BuildReplica/CloneFrom) |
+| **Demoted primary** | `pg_rewind` (automatic) | `pg_rewind` first, `pg_basebackup` fallback (via ReconfigureStandby) |
 | **Fencing** | Annotation-based + self-fencing | Epoch-based (kuberic protocol) |
 | **Quorum** | PG `synchronous_standby_names` | PG `synchronous_standby_names` |
 | **Split-brain** | Operator detects multi-primary | Epoch fencing + PG sync commit fencing |
@@ -891,14 +1025,16 @@ constructs a `ReplicatorHandle` using the existing struct.
 - Streaming replication setup (primary_conninfo, standby.signal)
 - pg_basebackup for new replica builds (copy protocol)
 - Failover test: kill primary, verify promotion + data survival
-- Switchover test: graceful primary swap
-- pg_rewind for demoted primary rejoin
+- Switchover test: graceful primary swap with write fencing verification
+- ~~pg_rewind for demoted primary rejoin~~ → Done: ReconfigureStandby
+  detects demoted primary, tries pg_rewind first, falls back to
+  pg_basebackup
 
 ### Phase 3: Robustness
 
 - ~~Epoch fencing: UpdateEpoch triggers pg_rewind~~ → Simplified: no-op.
-  Secondaries reconnect via ReconfigureStandby; old primaries rebuilt via
-  BuildReplica/CloneFrom (pg_basebackup).
+  Secondaries reconnect via ReconfigureStandby; demoted primaries rejoin
+  via pg_rewind (fallback: pg_basebackup) in ReconfigureStandby.
 - ~~Synchronous replication~~ → Done in Phase 2 (synchronous_standby_names)
 - ~~Quorum health: committed_lsn~~ → Done in Phase 2 (PgMonitor flush_lsn)
 - ~~Crash recovery~~ → PG handles natively (tested via failover test)
@@ -1056,3 +1192,173 @@ to replay (e.g., after a crash-recovery scenario with many un-replayed
 WAL segments). The 60-second timeout in `ChangeRole(Primary)` may be
 insufficient. If promotion times out, the operator invokes switchover
 rollback (A3 pattern) and tries another candidate.
+
+### ~~KP-3: Demoted primary lacks `standby.signal` — dual-primary risk~~ (Fixed)
+
+**Severity**: ~~must-fix~~ → fixed
+
+After switchover, the old primary is demoted to `ActiveSecondary`.
+`ReconfigureStandby` rewrites `primary_conninfo` and restarts PG, but
+previously never created `standby.signal`. PG 12+ requires this file to
+start in standby mode — without it, the instance restarts as a
+read-write primary, creating a dual-primary split-brain.
+
+**Fix applied**: `ReconfigureStandby` now detects when the target was a
+primary (`standby.signal` didn't exist) and handles timeline divergence:
+1. Stop PG
+2. Try `pg_rewind` from new primary (fast — copies only diverged pages)
+3. If `pg_rewind` fails (WAL recycled, corruption): full `pg_basebackup`
+4. Create `standby.signal`, patch config, start as standby
+
+This matches CNPG's approach. In production with `wal_keep_size`
+configured, `pg_rewind` typically succeeds. In tests with aggressive WAL
+recycling, the fallback to `pg_basebackup` handles it correctly.
+
+### KP-4: PG-level write fencing not implemented
+
+**Severity**: ~~must-fix~~ should-fix (UX improvement, not correctness)
+
+The design specifies `ALTER SYSTEM SET default_transaction_read_only = on`
++ `pg_reload_conf()` during demotion (§Client Access & Write Fencing),
+but no implementation exists. The framework's `revoke_write_status()` only
+sets an in-memory atomic that PG clients never check.
+
+**Why not must-fix**: `synchronous_commit = on` (mandatory config) already
+provides correctness fencing — writes on the old primary hang because no
+standby ACKs them (standbys have disconnected or moved to the new primary's
+timeline). The `ReconfigureStandby` restart follows within seconds as a
+hard fence. Data never actually diverges; the worst case is a client
+seeing a commit timeout instead of an immediate read-only error.
+
+**Design** (see §Client Access & Write Fencing for full details):
+
+The adapter's `ChangeRole(ActiveSecondary)` handler is the implementation
+hook — it fires immediately after `revoke_write_status()` during
+switchover. When demoting from Primary:
+1. Connect to PG
+2. `ALTER SYSTEM SET default_transaction_read_only = on`
+3. `SELECT pg_reload_conf()`
+
+This provides a soft fence (new transactions default to read-only).
+The hard fence follows seconds later when `ReconfigureStandby` restarts
+PG as a physical standby (KP-3 fix).
+
+On promotion (`ChangeRole(Primary)`), clear the fence:
+`ALTER SYSTEM SET default_transaction_read_only = off` + reload.
+
+**Limitation**: `default_transaction_read_only` is bypassable by clients
+(`SET SESSION` / `BEGIN READ WRITE`). Acceptable for kuberic's switchover
+window (~2 seconds), combined with `synchronous_commit = on` which causes
+writes to hang when standbys disconnect.
+
+### KP-5: `start()` TOCTOU race — double PG launch possible
+
+**Severity**: ~~must-fix~~ should-fix (defensive hardening — not reachable in practice)
+
+`PgInstanceManager::start()` drops the `child` mutex guard after checking
+`is_some()`, spawns PG without the lock, then reacquires to store the
+child. Two concurrent callers can both pass the check and spawn two PG
+processes on the same data directory and port.
+
+**Practical risk**: Low. All callers (`CloneFrom`, `ReconfigureStandby`)
+call `stop()` first, so `is_some()` always returns false. The driver
+serializes all operations per-replica — concurrent RPCs to the same
+pod's PgDataService don't happen under normal operation. This is part
+of the broader KP-8 (unserialized concurrent mutation).
+
+**Fix**: Hold the `MutexGuard` across the entire `start()` body including
+spawn. `tokio::sync::Mutex` is designed to be held across `.await`.
+
+### ~~KP-6: `synchronous_standby_names` hardcodes `ANY 1`~~ (Fixed)
+
+**Severity**: ~~should-fix~~ → fixed
+
+`configure_sync_standbys` always set `ANY 1` regardless of
+`ReplicaSetConfig.write_quorum`. For a 5-replica set with `write_quorum=3`,
+PG should require `ANY 2` standby ACKs but only required 1.
+
+**Fix applied**: Derives quorum from `write_quorum`: `quorum =
+write_quorum.saturating_sub(1).max(1)`, then uses `ANY {quorum}`.
+Also added SAFETY comment for the `format!`-based SQL (SF-7).
+
+### KP-7: PgMonitor missing `fault_tx` — SQL failures unreported
+
+**Severity**: should-fix (low urgency — narrow edge case)
+
+Design specifies PgMonitor should have `fault_tx` and report
+`FaultType::Permanent` after 3 consecutive SQL failures. Implementation
+has no `fault_tx` field — SQL failures are silently dropped. Two
+overlapping health monitors exist: `PgInstanceManager` checks
+`pg_isready` (process-level, reports faults), `PgMonitor` checks SQL
+(application-level, silent).
+
+**Gap**: PG running but unable to execute SQL (corrupt catalog,
+max_connections) goes unreported. However, `pg_isready` catches most
+real failures (process death, socket unavailable). The gap is narrow:
+PG alive but SQL-broken is unusual — corrupt catalogs typically crash PG
+(caught by health monitor), and max_connections is unlikely in an
+example app. Stale `current_progress` would be noticed by the operator
+when values stop advancing.
+
+### KP-8: Concurrent PgDataService/adapter mutation unserialized
+
+**Severity**: ~~should-fix~~ consider (theoretical — not reachable in practice)
+
+`PgDataServiceImpl` and `PgReplicatorAdapter` both hold
+`Arc<PgInstanceManager>`. Multi-step operations (`CloneFrom`:
+stop→clear→backup→start; `ReconfigureStandby`: rewrite→stop→start) are
+not serialized against adapter control events (`ChangeRole`, `promote`).
+The `Mutex<Option<Child>>` serializes field access but not operational
+sequences.
+
+**Why low risk**: The RPCs are **cross-pod** — the primary's adapter
+calls `CloneFrom`/`ReconfigureStandby` on the **secondary's**
+PgDataService. The driver blocks on each operation (awaits reply before
+sending the next event). So the secondary's adapter never receives a
+control event while its PgDataService is mid-operation. Concurrent
+mutation requires an external actor calling RPCs directly, which doesn't
+happen under normal kuberic operation.
+
+**Fix (if needed)**: Route all PG mutations through the adapter's control
+channel, or add a top-level operation lock.
+
+### ~~KP-9: Zombie processes after PG crash~~ (Fixed)
+
+**Severity**: ~~should-fix~~ → fixed
+
+Design specified `child.wait()` for immediate crash detection.
+Implementation used `pg_isready` polling — 6+ second detection delay.
+After crash: (1) child process was a zombie (never reaped), (2) `child`
+field stayed `Some` so `start()` thought PG was running.
+
+**Fix applied**: Added a **process exit monitor** task alongside the
+existing `pg_isready` health monitor. The exit monitor polls
+`child.try_wait()` every 500ms — on unexpected exit (shutdown token
+not cancelled), it immediately reaps the child, clears the `child`
+field to `None`, and reports `FaultType::Permanent`. The `pg_isready`
+health monitor is retained as a complement (catches PG hung but process
+alive). Both monitors now check `shutdown.is_cancelled()` before
+reporting fault (also fixes KP-11).
+
+### KP-10: `rewrite_primary_conninfo` discards connection parameters
+
+**Severity**: should-fix
+
+Rebuilds `primary_conninfo` from scratch: `host={h} port={p}
+application_name={name}`. All other params from `pg_basebackup -R`
+(user, sslmode, channel_binding, etc.) are silently dropped. Breaks in
+any non-`trust` auth environment.
+
+**Fix**: Parse existing conninfo key=value pairs, replace only host/port/
+application_name, preserve the rest.
+
+### ~~KP-11: Health monitor false fault during intentional stop~~ (Fixed)
+
+**Severity**: ~~should-fix~~ → fixed (addressed as part of KP-9 fix)
+
+Race: monitor's `pg_isready` runs between shutdown token cancellation and
+pg_ctl stop completion. If already at 2 accumulated failures, the
+stop-induced failure triggered spurious `FaultType::Permanent`.
+
+**Fix applied**: Both monitors (exit monitor and pg_isready monitor) now
+check `shutdown.is_cancelled()` before sending `FaultType::Permanent`.

@@ -30,6 +30,7 @@ message CloneFromResponse {
 message ReconfigureStandbyRequest {
   string primary_host = 1;
   uint32 primary_port = 2;
+  int64 replica_id = 3;
 }
 
 message ReconfigureStandbyResponse {

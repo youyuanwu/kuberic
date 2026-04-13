@@ -106,33 +106,113 @@ impl PgDataService for PgDataServiceImpl {
             "ReconfigureStandby: updating primary_conninfo"
         );
 
-        // Update primary_conninfo in postgresql.auto.conf
-        if let Err(e) = crate::config::PgConfig::rewrite_primary_conninfo(
-            self.instance.data_dir(),
-            &req.primary_host,
-            req.primary_port,
-        )
-        .await
-        {
-            return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
-                success: false,
-                error: format!("rewrite primary_conninfo: {e}"),
-            }));
+        let signal_path = self.instance.data_dir().join("standby.signal");
+        let was_primary = !signal_path.exists();
+
+        if was_primary {
+            // This instance was a primary (no standby.signal) and has potentially
+            // diverged WAL past the new primary's fork point. Try pg_rewind first
+            // (fast — copies only diverged pages), fall back to full pg_basebackup.
+            tracing::info!("ReconfigureStandby: demoted primary — attempting pg_rewind");
+
+            if let Err(e) = self.instance.stop().await {
+                tracing::warn!("stop before rewind: {}", e);
+            }
+
+            // Try pg_rewind first (requires data checksums + wal_log_hints = on)
+            let rewind_result = self
+                .instance
+                .rewind(&req.primary_host, req.primary_port as u16)
+                .await;
+
+            if let Err(e) = &rewind_result {
+                tracing::warn!("pg_rewind failed, falling back to pg_basebackup: {}", e);
+
+                let data_dir = self.instance.data_dir().to_path_buf();
+                if let Err(e) = clear_data_dir(&data_dir).await {
+                    return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
+                        success: false,
+                        error: format!("clear data_dir for rebuild: {e}"),
+                    }));
+                }
+
+                if let Err(e) = self
+                    .instance
+                    .base_backup(&req.primary_host, req.primary_port as u16)
+                    .await
+                {
+                    let _ = clear_data_dir(&data_dir).await;
+                    return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
+                        success: false,
+                        error: format!("pg_basebackup fallback: {e}"),
+                    }));
+                }
+            }
+
+            // After rewind or basebackup: create standby.signal + patch config
+            let signal_path = self.instance.data_dir().join("standby.signal");
+            if !signal_path.exists() && tokio::fs::File::create(&signal_path).await.is_err() {
+                return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
+                    success: false,
+                    error: "create standby.signal".to_string(),
+                }));
+            }
+
+            // Patch config (fix port, socket_dir, application_name)
+            if let Err(e) = self
+                .instance
+                .config()
+                .patch_after_clone(self.instance.data_dir(), req.replica_id)
+                .await
+            {
+                return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
+                    success: false,
+                    error: format!("patch config after rejoin: {e}"),
+                }));
+            }
+
+            if let Err(e) = self.instance.start(self.fault_tx.clone()).await {
+                return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
+                    success: false,
+                    error: format!("start after rejoin: {e}"),
+                }));
+            }
+
+            let method = if rewind_result.is_ok() {
+                "pg_rewind"
+            } else {
+                "pg_basebackup"
+            };
+            tracing::info!(method, "ReconfigureStandby: rejoined as standby");
+        } else {
+            // Already a standby — just update primary_conninfo and restart.
+            // Timeline following should work since we haven't diverged.
+            if let Err(e) = crate::config::PgConfig::rewrite_primary_conninfo(
+                self.instance.data_dir(),
+                &req.primary_host,
+                req.primary_port,
+            )
+            .await
+            {
+                return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
+                    success: false,
+                    error: format!("rewrite primary_conninfo: {e}"),
+                }));
+            }
+
+            if let Err(e) = self.instance.stop().await {
+                tracing::warn!("stop for reconfigure: {}", e);
+            }
+            if let Err(e) = self.instance.start(self.fault_tx.clone()).await {
+                return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
+                    success: false,
+                    error: format!("restart after reconfigure: {e}"),
+                }));
+            }
+
+            tracing::info!("ReconfigureStandby: PG restarted with new primary");
         }
 
-        // Restart PG to pick up the new primary_conninfo
-        // (pg_reload_conf doesn't reload primary_conninfo — requires restart)
-        if let Err(e) = self.instance.stop().await {
-            tracing::warn!("stop for reconfigure: {}", e);
-        }
-        if let Err(e) = self.instance.start(self.fault_tx.clone()).await {
-            return Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
-                success: false,
-                error: format!("restart after reconfigure: {e}"),
-            }));
-        }
-
-        tracing::info!("ReconfigureStandby: PG restarted with new primary");
         Ok(Response::new(crate::proto::ReconfigureStandbyResponse {
             success: true,
             error: String::new(),

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -18,7 +19,7 @@ pub struct PgInstanceManager {
     data_dir: PathBuf,
     pg_bin: PathBuf,
     port: u16,
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
     config: PgConfig,
     /// Cancelled by stop() to signal health monitor to exit quietly.
     shutdown: Mutex<CancellationToken>,
@@ -31,7 +32,7 @@ impl PgInstanceManager {
             data_dir,
             pg_bin,
             port,
-            child: Mutex::new(None),
+            child: Arc::new(Mutex::new(None)),
             config,
             shutdown: Mutex::new(CancellationToken::new()),
         }
@@ -152,8 +153,53 @@ impl PgInstanceManager {
         // Wait for PG to be ready
         self.wait_ready().await?;
 
-        // Spawn health monitor — detects unexpected PG exit.
-        // Exits quietly when shutdown token is cancelled (intentional stop).
+        // Spawn process exit monitor — detects PG crash immediately via
+        // try_wait() and clears the child field (prevents stale state in
+        // start()). Also reports FaultType::Permanent unless shutdown was
+        // intentional (KP-9 fix).
+        {
+            let child_mutex = self.child.clone();
+            let exit_shutdown = shutdown.clone();
+            let exit_ft = fault_tx.clone();
+            let exit_port = self.port;
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = exit_shutdown.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                    }
+                    let mut guard = child_mutex.lock().await;
+                    if let Some(child) = guard.as_mut() {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                // PG exited — reap immediately
+                                guard.take();
+                                drop(guard);
+                                if !exit_shutdown.is_cancelled() {
+                                    tracing::error!(
+                                        port = exit_port,
+                                        ?status,
+                                        "PostgreSQL exited unexpectedly"
+                                    );
+                                    let _ = exit_ft.send(FaultType::Permanent).await;
+                                }
+                                break;
+                            }
+                            Ok(None) => {} // still running
+                            Err(e) => {
+                                tracing::warn!("try_wait error: {}", e);
+                            }
+                        }
+                    } else {
+                        // child was taken by stop() — exit quietly
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Spawn pg_isready health monitor — catches PG hung but process alive
+        // (complements the exit monitor above). Exits quietly on shutdown.
         let port = self.port;
         let ft = fault_tx;
         let data_dir = self.data_dir.clone();
@@ -184,15 +230,15 @@ impl PgInstanceManager {
                     _ => {
                         consecutive_failures += 1;
                         if consecutive_failures >= 3 {
-                            // 3 consecutive failures — report crash
-                            tracing::error!(
-                                port,
-                                "PostgreSQL crashed (3 consecutive pg_isready failures)"
-                            );
-                            let _ = ft.send(FaultType::Permanent).await;
+                            if !shutdown.is_cancelled() {
+                                tracing::error!(
+                                    port,
+                                    "PostgreSQL unresponsive (3 consecutive pg_isready failures)"
+                                );
+                                let _ = ft.send(FaultType::Permanent).await;
+                            }
                             break;
                         }
-                        // Loop back — select! will check shutdown token
                     }
                 }
             }
@@ -367,10 +413,23 @@ impl PgInstanceManager {
 
 impl Drop for PgInstanceManager {
     fn drop(&mut self) {
-        // Cancel health monitor
+        // Cancel health monitor + process exit monitor
         self.shutdown.get_mut().cancel();
-        if self.child.get_mut().is_some() {
-            // Best-effort stop via pg_ctl (sync, can't await in drop)
+        // Best-effort stop: check if child exists via try_lock
+        if let Ok(guard) = self.child.try_lock() {
+            if guard.is_some() {
+                let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))
+                    .args([
+                        "stop",
+                        "-D",
+                        &self.data_dir.to_string_lossy(),
+                        "-m",
+                        "immediate",
+                    ])
+                    .output();
+            }
+        } else {
+            // Lock held by exit monitor — still try to stop PG
             let _ = std::process::Command::new(self.pg_bin.join("pg_ctl"))
                 .args([
                     "stop",
