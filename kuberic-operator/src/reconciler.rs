@@ -149,17 +149,78 @@ pub async fn reconcile_set(
 
         Phase::Healthy => {
             let current_primary = set.status.as_ref().and_then(|s| s.current_primary.clone());
+            let desired = set.spec.replicas as usize;
+            let actual = pods.len();
+            let set_key = format!("{}/{}", namespace, name);
 
-            // Check if primary is healthy
-            if let Some(ref primary_name) = current_primary {
-                let primary_healthy = pods
-                    .iter()
-                    .find(|p| p.name_any() == *primary_name)
-                    .map(is_pod_ready)
-                    .unwrap_or(false);
+            // --- Replica health check (primary + secondaries) ---
+            // Probe all replicas via get_status to detect crashed/restarted pods.
+            // Must run BEFORE switchover — don't switchover to a stale target.
+            if let Some(driver) = state.drivers.lock().await.get_mut(&set_key) {
+                let current_epoch = driver.epoch();
+                let primary_id = driver.primary_id();
+                let replica_ids = driver.replica_ids();
 
-                if !primary_healthy {
-                    warn!(name, primary = %primary_name, "primary unhealthy, initiating failover");
+                let mut stale_ids: Vec<ReplicaId> = Vec::new();
+                let mut primary_stale = false;
+
+                for &replica_id in &replica_ids {
+                    if let Some(handle) = driver.handle(replica_id) {
+                        let is_stale = match handle.get_status().await {
+                            Ok(s) if s.epoch != current_epoch => {
+                                warn!(name, replica_id, ?current_epoch,
+                                    actual_epoch = ?s.epoch,
+                                    "replica epoch mismatch — pod restarted");
+                                true
+                            }
+                            Ok(s) if s.role == kuberic_core::types::Role::Unknown => {
+                                warn!(name, replica_id, "replica role=Unknown — pod restarted");
+                                true
+                            }
+                            Err(e) => {
+                                warn!(name, replica_id, error = %e,
+                                    "replica unreachable — stale handle");
+                                true
+                            }
+                            Ok(_) => false,
+                        };
+
+                        if is_stale {
+                            if Some(replica_id) == primary_id {
+                                primary_stale = true;
+                            } else {
+                                stale_ids.push(replica_id);
+                            }
+                        }
+                    }
+                }
+
+                // Also check K8s-level readiness for primary
+                if !primary_stale {
+                    if let Some(ref primary_name) = current_primary {
+                        let primary_ready = pods
+                            .iter()
+                            .find(|p| p.name_any() == *primary_name)
+                            .map(is_pod_ready)
+                            .unwrap_or(false);
+                        if !primary_ready {
+                            primary_stale = true;
+                        }
+                    }
+                }
+
+                // Primary stale → failover (takes priority over everything)
+                if primary_stale {
+                    warn!(name, "primary unhealthy, initiating failover");
+                    // Also remove any stale secondaries before failover
+                    for &id in &stale_ids {
+                        info!(
+                            name,
+                            replica_id = id,
+                            "removing stale secondary before failover"
+                        );
+                        driver.remove_replica_from_driver(id);
+                    }
                     let status = KubericSetStatus {
                         phase: Phase::FailingOver,
                         ..set.status.clone().unwrap_or_default()
@@ -167,9 +228,44 @@ pub async fn reconcile_set(
                     api.patch_set_status(&namespace, &name, &status).await?;
                     return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                 }
+
+                // Stale secondaries → remove and requeue
+                if !stale_ids.is_empty() {
+                    for &id in &stale_ids {
+                        info!(name, replica_id = id, "removing stale secondary handle");
+                        driver.remove_replica_from_driver(id);
+                    }
+                    let status = KubericSetStatus {
+                        ready_replicas: driver.replica_ids().len() as i32,
+                        replicas: pods.len() as i32,
+                        members: build_member_status(&pods, &set.spec),
+                        ..set.status.clone().unwrap_or_default()
+                    };
+                    api.patch_set_status(&namespace, &name, &status).await?;
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
+            } else {
+                // No driver — check primary readiness via K8s only (bootstrap path)
+                if let Some(ref primary_name) = current_primary {
+                    let primary_healthy = pods
+                        .iter()
+                        .find(|p| p.name_any() == *primary_name)
+                        .map(is_pod_ready)
+                        .unwrap_or(false);
+
+                    if !primary_healthy {
+                        warn!(name, primary = %primary_name, "primary unhealthy (no driver), initiating failover");
+                        let status = KubericSetStatus {
+                            phase: Phase::FailingOver,
+                            ..set.status.clone().unwrap_or_default()
+                        };
+                        api.patch_set_status(&namespace, &name, &status).await?;
+                        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                    }
+                }
             }
 
-            // Check if switchover requested (target_primary != current_primary)
+            // --- Switchover check (only when all replicas are healthy) ---
             let target_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
             if let (Some(current), Some(target)) = (&current_primary, &target_primary)
                 && current != target
@@ -182,10 +278,6 @@ pub async fn reconcile_set(
                 api.patch_set_status(&namespace, &name, &status).await?;
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
-
-            let desired = set.spec.replicas as usize;
-            let actual = pods.len();
-            let set_key = format!("{}/{}", namespace, name);
 
             // Scale-up: create missing pods
             if actual < desired {

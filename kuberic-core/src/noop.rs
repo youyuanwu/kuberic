@@ -22,7 +22,7 @@ impl NoopReplicator {
         mut data_rx: mpsc::Receiver<ReplicateRequest>,
         state: Arc<PartitionState>,
     ) {
-        let mut role = Role::None;
+        let mut role = Role::Unknown;
         let mut next_lsn: Lsn = 1;
 
         loop {

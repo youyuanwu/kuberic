@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ struct LivePod {
     control_address: String,
     data_address: String,
     client_address: String,
+    data_dir: PathBuf,
     #[allow(dead_code)]
     state: SharedState,
     _runtime_handle: tokio::task::JoinHandle<()>,
@@ -37,6 +39,8 @@ struct LivePod {
 struct KvClusterApi {
     pods: Mutex<Vec<Pod>>,
     live_pods: Mutex<HashMap<String, LivePod>>,
+    /// Preserved data dirs from crashed pods (simulates PVC survival).
+    data_dirs: Mutex<HashMap<String, PathBuf>>,
     statuses: Mutex<Vec<KubericSetStatus>>,
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
@@ -47,6 +51,7 @@ impl KvClusterApi {
         Self {
             pods: Mutex::new(Vec::new()),
             live_pods: Mutex::new(HashMap::new()),
+            data_dirs: Mutex::new(HashMap::new()),
             statuses: Mutex::new(Vec::new()),
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
@@ -112,6 +117,85 @@ impl KvClusterApi {
             .get(pod_name)
             .map(|lp| lp.client_address.clone())
     }
+
+    /// Simulate a pod crash. Aborts the PodRuntime and service tasks
+    /// (gRPC channels break immediately), marks the K8s Pod NotReady,
+    /// and removes the LivePod entry. Preserves data_dir (simulates PVC).
+    fn crash_pod(&self, pod_name: &str) {
+        if let Some(live) = self.live_pods.lock().unwrap().remove(pod_name) {
+            live._runtime_handle.abort();
+            live._service_handle.abort();
+            self.data_dirs
+                .lock()
+                .unwrap()
+                .insert(pod_name.to_string(), live.data_dir);
+        }
+        self.mark_pod_not_ready(pod_name);
+    }
+
+    /// Simulate K8s restarting a crashed pod. Creates a fresh
+    /// PodRuntime + KV service on new ports, reuses the same data_dir
+    /// (simulates PVC re-attach), and marks the pod Ready.
+    async fn restart_pod(&self, pod_name: &str) {
+        let replica_id: i64 = pod_name.rsplit('-').next().unwrap().parse::<i64>().unwrap() + 1;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let data_bind = format!("127.0.0.1:{}", data_port);
+        let data_address = format!("http://{}", data_bind);
+        drop(data_listener);
+
+        let bundle = PodRuntime::builder(replica_id)
+            .reply_timeout(Duration::from_secs(5))
+            .data_bind(data_bind)
+            .build()
+            .await
+            .unwrap();
+
+        let control_address = bundle.control_address.clone();
+
+        // Reuse data_dir from crashed pod (PVC re-attach)
+        let data_dir = self
+            .data_dirs
+            .lock()
+            .unwrap()
+            .remove(pod_name)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join("kv-test").join(format!(
+                    "restart-{}-{}",
+                    pod_name,
+                    std::process::id(),
+                ))
+            });
+        let state: SharedState =
+            Arc::new(RwLock::new(KvState::open(data_dir.clone()).await.unwrap()));
+
+        let runtime_handle = tokio::spawn(bundle.runtime.serve());
+        let st = state.clone();
+        let bind = client_address.clone();
+        let service_handle = tokio::spawn(service::run_service(bundle.lifecycle_rx, st, bind));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        self.live_pods.lock().unwrap().insert(
+            pod_name.to_string(),
+            LivePod {
+                control_address,
+                data_address,
+                client_address,
+                data_dir,
+                state,
+                _runtime_handle: runtime_handle,
+                _service_handle: service_handle,
+            },
+        );
+
+        self.mark_all_pods_ready();
+    }
 }
 
 #[async_trait]
@@ -170,7 +254,8 @@ impl ClusterApi for KvClusterApi {
             std::process::id(),
             n
         ));
-        let state: SharedState = Arc::new(RwLock::new(KvState::open(data_dir).await.unwrap()));
+        let state: SharedState =
+            Arc::new(RwLock::new(KvState::open(data_dir.clone()).await.unwrap()));
 
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
@@ -185,6 +270,7 @@ impl ClusterApi for KvClusterApi {
                 control_address,
                 data_address,
                 client_address,
+                data_dir,
                 state,
                 _runtime_handle: runtime_handle,
                 _service_handle: service_handle,
@@ -612,8 +698,8 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
     .await
     .unwrap();
 
-    // Mark primary as not ready (simulate pod crash)
-    api.mark_pod_not_ready(&primary_name);
+    // Crash primary (abrupt — abort tasks, gRPC breaks)
+    api.crash_pod(&primary_name);
 
     // Reconcile Healthy — should detect failure → FailingOver
     let set = make_set("myapp", 3, Some(status));
@@ -851,7 +937,7 @@ async fn test_reconciler_double_failover() {
     .unwrap();
 
     // --- First failover: primary fails ---
-    api.mark_pod_not_ready(&first_primary);
+    api.crash_pod(&first_primary);
 
     let set = make_set("myapp", 3, Some(status));
     reconcile_set(&set, &api, &state).await.unwrap();
@@ -877,33 +963,14 @@ async fn test_reconciler_double_failover() {
     .unwrap();
 
     // --- Second failover: new primary also fails ---
-    api.mark_pod_not_ready(&second_primary);
+    api.crash_pod(&second_primary);
 
+    // Reconcile Healthy: health check detects both dead replicas,
+    // removes stale secondaries, then transitions to FailingOver.
     let set = make_set("myapp", 3, Some(status));
     reconcile_set(&set, &api, &state).await.unwrap();
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::FailingOver);
-
-    // Remove the two dead replicas from the driver so failover
-    // doesn't select a dead candidate (A3 gap for failover).
-    {
-        let mut drivers = state.drivers.lock().await;
-        let driver = drivers.get_mut("default/myapp").unwrap();
-        let first_id: i64 = first_primary
-            .strip_prefix("myapp-")
-            .unwrap()
-            .parse::<i64>()
-            .unwrap()
-            + 1;
-        let second_id: i64 = second_primary
-            .strip_prefix("myapp-")
-            .unwrap()
-            .parse::<i64>()
-            .unwrap()
-            + 1;
-        driver.remove_replica_from_driver(first_id);
-        driver.remove_replica_from_driver(second_id);
-    }
 
     let set = make_set("myapp", 3, Some(status));
     reconcile_set(&set, &api, &state).await.unwrap();
@@ -948,4 +1015,107 @@ async fn test_reconciler_idempotent_creation() {
     assert_eq!(api.pods.lock().unwrap().len(), 3);
     assert_eq!(api.pvcs.lock().unwrap().len(), 3);
     assert_eq!(api.services.lock().unwrap().len(), 3);
+}
+
+/// Reconciler test: secondary crash_pod → detected by epoch-based health
+/// check → stale handle removed → restart_pod → re-integrated via scale-up.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_reconciler_secondary_crash_and_rejoin() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+
+    // Create and initialize the partition (Pending → Creating → Healthy)
+    let set = make_set("myapp", 3, None);
+    reconcile_set(&set, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubericSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+    let primary_name = status.current_primary.clone().unwrap();
+
+    // Write data on primary
+    let client_addr = api.client_address(&primary_name).unwrap();
+    let mut kv = connect_kv(&client_addr).await;
+    kv.put(proto::PutRequest {
+        key: "before-crash".into(),
+        value: "important".into(),
+    })
+    .await
+    .unwrap();
+
+    // Pick a secondary to crash (any non-primary pod)
+    let secondary_name = {
+        let pods = api.pods.lock().unwrap();
+        pods.iter()
+            .map(|p| p.metadata.name.clone().unwrap())
+            .find(|n| n != &primary_name)
+            .unwrap()
+    };
+
+    // Crash the secondary (high fidelity — abort tasks, gRPC breaks)
+    api.crash_pod(&secondary_name);
+
+    // Reconcile Healthy: epoch-based health check detects stale secondary
+    let status = api.last_status().unwrap();
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    // Driver should now have 2 replicas (stale handle removed)
+    {
+        let drivers = state.drivers.lock().await;
+        let driver = drivers.get("default/myapp").unwrap();
+        assert_eq!(
+            driver.replica_ids().len(),
+            2,
+            "stale secondary should be removed"
+        );
+    }
+
+    // Restart the pod (fresh PodRuntime, new ports)
+    api.restart_pod(&secondary_name).await;
+
+    // Reconcile Healthy: driver_count=2 < desired=3, re-adds via scale-up
+    let status = api.last_status().unwrap();
+    let set = make_set("myapp", 3, Some(status));
+    reconcile_set(&set, &api, &state).await.unwrap();
+
+    // Driver should be back to 3 replicas
+    {
+        let drivers = state.drivers.lock().await;
+        let driver = drivers.get("default/myapp").unwrap();
+        assert_eq!(
+            driver.replica_ids().len(),
+            3,
+            "restarted secondary should be re-added"
+        );
+    }
+
+    // Primary still works — write new data
+    kv.put(proto::PutRequest {
+        key: "after-rejoin".into(),
+        value: "recovered".into(),
+    })
+    .await
+    .unwrap();
+
+    // Verify data readable on primary
+    let resp = kv
+        .get(proto::GetRequest {
+            key: "before-crash".into(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().found);
+    assert_eq!(resp.get_ref().value, "important");
 }

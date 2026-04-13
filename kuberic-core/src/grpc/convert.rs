@@ -25,10 +25,11 @@ impl From<proto::EpochProto> for Epoch {
 impl From<Role> for proto::RoleProto {
     fn from(r: Role) -> Self {
         match r {
-            Role::None => proto::RoleProto::RoleNone,
+            Role::Unknown => proto::RoleProto::RoleUnknown,
             Role::Primary => proto::RoleProto::RolePrimary,
             Role::ActiveSecondary => proto::RoleProto::RoleActiveSecondary,
             Role::IdleSecondary => proto::RoleProto::RoleIdleSecondary,
+            Role::None => proto::RoleProto::RoleNone,
         }
     }
 }
@@ -36,10 +37,11 @@ impl From<Role> for proto::RoleProto {
 impl From<proto::RoleProto> for Role {
     fn from(r: proto::RoleProto) -> Self {
         match r {
-            proto::RoleProto::RoleNone => Role::None,
+            proto::RoleProto::RoleUnknown => Role::Unknown,
             proto::RoleProto::RolePrimary => Role::Primary,
             proto::RoleProto::RoleActiveSecondary => Role::ActiveSecondary,
             proto::RoleProto::RoleIdleSecondary => Role::IdleSecondary,
+            proto::RoleProto::RoleNone => Role::None,
         }
     }
 }
@@ -47,7 +49,7 @@ impl From<proto::RoleProto> for Role {
 impl From<i32> for Role {
     fn from(v: i32) -> Self {
         proto::RoleProto::try_from(v)
-            .unwrap_or(proto::RoleProto::RoleNone)
+            .unwrap_or(proto::RoleProto::RoleUnknown)
             .into()
     }
 }

@@ -177,7 +177,7 @@ impl PodRuntimeBuilder {
             replicator_handle: None,
             shutdown,
             reply_timeout: self.reply_timeout,
-            role: Role::None,
+            role: Role::Unknown,
             epoch: Epoch::default(),
             replica_id: self.replica_id,
             data_bind: self.data_bind,

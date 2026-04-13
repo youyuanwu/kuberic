@@ -67,6 +67,10 @@ impl SecondaryState {
         self.committed_lsn.store(lsn, Ordering::Release);
     }
 
+    pub fn epoch(&self) -> Epoch {
+        *self.current_epoch.lock().unwrap()
+    }
+
     pub fn update_epoch(&self, new_epoch: Epoch) {
         let mut epoch = self.current_epoch.lock().unwrap();
         *epoch = new_epoch;

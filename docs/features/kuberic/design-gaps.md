@@ -848,3 +848,49 @@ with a slow target, the window widens.
 **Fix:** After `revoke_write_status`, query old primary's
 `current_progress` and poll target's `current_progress` until it
 matches. Then proceed with demotion + promotion.
+
+### E3. Pod restart not detected — stale handle in driver
+
+**Severity:** ✅ Fixed
+**Affects:** Reconciler Healthy phase
+**File:** `kuberic-operator/src/reconciler.rs`
+
+When K8s restarts a container (crash, OOM kill, node eviction), the Pod
+stays Ready but the PodRuntime is virgin: `role = Unknown`,
+`epoch = (0,0)`. Without detection, the driver holds a stale handle
+to a blank runtime — replication breaks, quorum inflated, failover
+may select a blank pod.
+
+**Fix (implemented):**
+
+- Added `Role::Unknown` variant (`#[repr(u8)]` with `TryFrom<u8>`)
+  to distinguish "never assigned" from `Role::None` (explicit demotion).
+  Proto updated: `ROLE_UNKNOWN = 0`, `ROLE_NONE = 4`.
+
+- Added `ReplicaStatusInfo` struct and `get_status()` to `ReplicaHandle`
+  trait. `GrpcReplicaHandle` calls existing `GetStatus` RPC.
+  `InProcessReplicaHandle` reads from `AtomicU8` role field + shared state.
+
+- Reconciler Healthy phase probes ALL replicas (primary + secondaries)
+  via `get_status()` on every reconcile cycle. Detects:
+  - Epoch mismatch → stale (pod restarted)
+  - `Role::Unknown` → stale (virgin runtime)
+  - gRPC error → stale (pod dead)
+  Primary stale → FailingOver. Secondary stale → remove handle.
+  Runs before switchover check to prevent switchover to a dead target.
+
+- Added `KvClusterApi::crash_pod()` / `restart_pod()` mock methods.
+  `crash_pod` aborts tasks + preserves `data_dir` (PVC simulation).
+  `restart_pod` reuses saved `data_dir` (PVC re-attach).
+
+- Tests upgraded: `test_reconciler_detects_primary_failure_and_fails_over`
+  and `test_reconciler_double_failover` now use `crash_pod()` instead
+  of `mark_pod_not_ready()`. Double failover no longer needs manual
+  `remove_replica_from_driver` — health check handles it automatically.
+
+- New test: `test_reconciler_secondary_crash_and_rejoin` validates
+  secondary crash → health check removes stale handle → restart →
+  scale-up re-integrates.
+
+**Remaining:** Add `restart_count` to `MemberStatus` CRD for
+observability (complementary to epoch-based detection).

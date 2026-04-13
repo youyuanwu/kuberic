@@ -455,7 +455,7 @@ mod tests {
 
         // 2. ChangeRole to IdleSecondary
         runtime
-            .change_role(Epoch::new(0, 1), Role::IdleSecondary, Role::None)
+            .change_role(Epoch::new(0, 1), Role::IdleSecondary, Role::Unknown)
             .await
             .unwrap();
 

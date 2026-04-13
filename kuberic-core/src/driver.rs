@@ -6,7 +6,7 @@ use tracing::{info, warn};
 use crate::error::{KubericError, Result};
 use crate::types::{
     DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
-    ReplicaSetQuorumMode, ReplicaStatus, Role,
+    ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo, Role,
 };
 
 // ---------------------------------------------------------------------------
@@ -52,6 +52,11 @@ pub trait ReplicaHandle: Send + Sync {
 
     /// The gRPC address where this replica's replication server listens.
     fn replicator_address(&self) -> String;
+
+    /// Query the replica's current status directly from its PodRuntime.
+    /// Used by the reconciler to detect restarted pods (epoch mismatch,
+    /// role=None) and stale handles (transport errors).
+    async fn get_status(&self) -> Result<ReplicaStatusInfo>;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +159,7 @@ impl PartitionDriver {
                 id,
                 ReplicaState {
                     handle,
-                    role: Role::None,
+                    role: Role::Unknown,
                 },
             );
         }
@@ -722,7 +727,7 @@ impl PartitionDriver {
             replica_id,
             ReplicaState {
                 handle,
-                role: Role::None,
+                role: Role::Unknown,
             },
         );
 
@@ -881,7 +886,7 @@ pub mod testing {
     use crate::proto::replicator_data_server::ReplicatorDataServer;
     use crate::replicator::actor::WalReplicatorActor;
     use crate::replicator::secondary::{SecondaryReceiver, SecondaryState};
-    use crate::types::{AccessStatus, CancellationToken};
+    use crate::types::{AccessStatus, CancellationToken, ReplicaStatusInfo};
 
     /// In-process replica handle: wraps channels to a local replicator actor
     /// and a local gRPC secondary server.
@@ -893,6 +898,7 @@ pub mod testing {
         pub secondary_state: Arc<SecondaryState>,
         grpc_address: String,
         shutdown_token: CancellationToken,
+        role: std::sync::Mutex<Role>,
         _actor_handle: tokio::task::JoinHandle<()>,
         _grpc_handle: tokio::task::JoinHandle<()>,
     }
@@ -942,6 +948,7 @@ pub mod testing {
                 secondary_state,
                 grpc_address,
                 shutdown_token,
+                role: std::sync::Mutex::new(Role::Unknown),
                 _actor_handle: actor_handle,
                 _grpc_handle: grpc_handle,
             })
@@ -990,6 +997,7 @@ pub mod testing {
         }
 
         async fn change_role(&self, epoch: Epoch, role: Role) -> Result<()> {
+            *self.role.lock().unwrap() = role;
             self.secondary_state.update_epoch(epoch);
             self.send_control(|reply| ReplicatorControlEvent::ChangeRole { epoch, role, reply })
                 .await?;
@@ -1079,6 +1087,16 @@ pub mod testing {
 
         fn replicator_address(&self) -> String {
             self.grpc_address.clone()
+        }
+
+        async fn get_status(&self) -> Result<ReplicaStatusInfo> {
+            let role = *self.role.lock().unwrap();
+            Ok(ReplicaStatusInfo {
+                role,
+                epoch: self.secondary_state.epoch(),
+                current_progress: self.state.current_progress(),
+                healthy: true,
+            })
         }
     }
 

@@ -36,7 +36,7 @@ impl WalReplicatorActor {
         state: Arc<PartitionState>,
         state_provider_tx: mpsc::UnboundedSender<StateProviderEvent>,
     ) {
-        let mut role = Role::None;
+        let mut role = Role::Unknown;
         let mut epoch = Epoch::default();
         let mut next_lsn: Lsn = 1;
         let quorum_tracker = Arc::new(TokioMutex::new(QuorumTracker::new()));

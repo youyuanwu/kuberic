@@ -241,9 +241,9 @@ async fn handle_change_role(
             Ok(())
         }
 
-        Role::None => {
-            tracing::info!("ChangeRole → None: demotion (PG stopped on Close)");
-            monitor.set_role(Role::None);
+        Role::None | Role::Unknown => {
+            tracing::info!("ChangeRole → None/Unknown: demotion (PG stopped on Close)");
+            monitor.set_role(role);
             Ok(())
         }
     }

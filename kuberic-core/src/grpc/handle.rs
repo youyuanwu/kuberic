@@ -9,7 +9,7 @@ use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
     DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
-    ReplicaSetQuorumMode, Role,
+    ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
 };
 
 /// Implements `ReplicaHandle` by calling a remote pod's gRPC `ReplicatorControl` service.
@@ -206,5 +206,29 @@ impl ReplicaHandle for GrpcReplicaHandle {
 
     fn replicator_address(&self) -> String {
         self.data_address.clone()
+    }
+
+    async fn get_status(&self) -> Result<ReplicaStatusInfo> {
+        let mut client = self.client.clone();
+        let resp = client
+            .get_status(GetStatusRequest {})
+            .await
+            .map_err(Self::map_err)?;
+        let inner = resp.into_inner();
+        let epoch = inner.epoch.map(Epoch::from).unwrap_or(Epoch::new(0, 0));
+        let role = Role::from(inner.role);
+
+        // Update cached progress as side effect
+        self.current_progress
+            .store(inner.current_progress, Ordering::Release);
+        self.catch_up_capability
+            .store(inner.catch_up_capability, Ordering::Release);
+
+        Ok(ReplicaStatusInfo {
+            role,
+            epoch,
+            current_progress: inner.current_progress,
+            healthy: inner.healthy,
+        })
     }
 }

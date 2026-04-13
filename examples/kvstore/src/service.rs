@@ -231,7 +231,7 @@ pub async fn run_service(
                                 }));
                             }
                         }
-                        Role::None => {}
+                        Role::None | Role::Unknown => {}
                     }
 
                     let _ = reply.send(Ok(String::new()));

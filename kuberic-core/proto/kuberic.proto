@@ -9,10 +9,11 @@ message EpochProto {
 }
 
 enum RoleProto {
-    ROLE_NONE = 0;
+    ROLE_UNKNOWN = 0;
     ROLE_PRIMARY = 1;
     ROLE_ACTIVE_SECONDARY = 2;
     ROLE_IDLE_SECONDARY = 3;
+    ROLE_NONE = 4;
 }
 
 enum ReplicaStatusProto {

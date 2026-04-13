@@ -47,11 +47,30 @@ pub type Lsn = i64;
 pub type ReplicaId = i64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Role {
-    Primary,
-    ActiveSecondary,
-    IdleSecondary,
-    None,
+    /// Pod just started, never assigned a role.
+    Unknown = 0,
+    Primary = 1,
+    ActiveSecondary = 2,
+    IdleSecondary = 3,
+    /// Explicitly demoted — triggers Close/data removal.
+    None = 4,
+}
+
+impl TryFrom<u8> for Role {
+    type Error = u8;
+
+    fn try_from(v: u8) -> std::result::Result<Self, u8> {
+        match v {
+            0 => Ok(Role::Unknown),
+            1 => Ok(Role::Primary),
+            2 => Ok(Role::ActiveSecondary),
+            3 => Ok(Role::IdleSecondary),
+            4 => Ok(Role::None),
+            other => Err(other),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +132,20 @@ pub enum ReplicaSetQuorumMode {
     /// must individually catch up. Default mode used by PartitionDriver for
     /// all workflows (create, failover, switchover, restart).
     Write,
+}
+
+// ---------------------------------------------------------------------------
+// Replica status info (operator-facing health probe result)
+// ---------------------------------------------------------------------------
+
+/// Status returned by `ReplicaHandle::get_status()`. Used by the
+/// reconciler to detect restarted pods (epoch mismatch, role=None).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaStatusInfo {
+    pub role: Role,
+    pub epoch: Epoch,
+    pub current_progress: Lsn,
+    pub healthy: bool,
 }
 
 // ---------------------------------------------------------------------------

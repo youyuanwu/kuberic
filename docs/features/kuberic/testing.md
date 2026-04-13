@@ -312,356 +312,63 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 
 ## Simulating Pod Crash and Restart
 
-Testing crash and restart scenarios requires different strategies at
-different test layers. The key challenge: what state should a restarted
-pod have?
+### Crash Simulation APIs
 
-### Current Crash Simulation Methods
+| Layer | API | Behavior |
+|-------|-----|----------|
+| **Driver-level** | `KvPod::crash()` / `SqlitePod::crash()` | Aborts PodRuntime + service tasks. gRPC breaks immediately. Instance becomes unusable. |
+| **Driver-level** | `KvPod::restart(id)` / `SqlitePod::restart(id)` | Crash + start fresh pod on same `data_dir`. Returns new pod with new ports. |
+| **Reconciler-level** | `KvClusterApi::crash_pod(name)` | Aborts tasks, marks Pod NotReady, preserves `data_dir` in `data_dirs` map (PVC simulation). |
+| **Reconciler-level** | `KvClusterApi::restart_pod(name)` | Fresh PodRuntime on new ports, reuses saved `data_dir` (PVC re-attach), marks Ready. |
+| **Legacy (low fidelity)** | `handle.close()` | Graceful shutdown — not a real crash. |
+| **Legacy (low fidelity)** | `mark_pod_not_ready(name)` | Flips readiness flag but LivePod keeps running. |
 
-| Method | Fidelity | Used In |
-|--------|----------|---------|
-| `handle.close()` | Clean shutdown — sends Close to PodRuntime, drains gracefully. Not a real crash. | operator_failover tests |
-| `remove_replica_from_driver(id)` | Removes handle from driver tracking. Simulates operator detecting dead pod. Pod process may still be running. | failover-with-secondary-down test |
-| `mark_pod_not_ready(name)` | Sets pod readiness to false. Reconciler detects and triggers failover. Pod still running. | reconciler tests |
-| `drop(handle)` | Drops the ReplicaHandle. gRPC connections close. PodRuntime sees stream errors and eventually stops. Closest to a crash. | Not commonly used |
+### Reconciler Health Check (E3 fix)
 
-**Limitation:** None of these simulate a real crash-restart cycle where
-the pod comes back with fresh state. `restart_secondary()` does this
-for secondaries, but there's no equivalent for testing primary restart.
+The reconciler's Healthy phase probes ALL replicas via `get_status()`
+on every reconcile cycle. This detects:
 
-### Design: Crash-Restart Simulation
+- **Epoch mismatch** — pod restarted, reports `epoch = (0,0)` vs driver's current epoch
+- **Role = Unknown** — virgin PodRuntime, never received `ChangeRole`
+- **gRPC unreachable** — pod crashed, handle is dead
 
-A proper crash-restart test needs to model the full lifecycle:
+The health check runs before switchover processing, ensuring stale
+replicas are cleaned up before any reconfiguration. Stale secondaries
+are removed from the driver; a stale primary triggers FailingOver.
+The existing scale-up logic then re-adds the replica when the pod
+comes back Ready.
 
-```
-1. Pod is running (has state, replicator active, gRPC connected)
-2. Pod crashes (in-memory state lost — handles closed, gRPC streams broken)
-3. Time passes (operator detects, may trigger failover)
-4. Pod restarts (fresh PodRuntime, recovers from checkpoint, new gRPC addresses)
-5. Operator re-integrates (either as new secondary via add_replica,
-   or if primary crashed, failover happened and this rejoins as secondary)
-```
+See `design-gaps.md` E3 for the full design and `get_status` trait
+extension details.
 
-#### KvPod::crash() — Abrupt Termination
+### Test Patterns
 
-A `crash()` method that simulates sudden process death:
+**Pattern 1: Secondary crash-restart (driver-level)**
+Uses `restart_secondary()` — close + new pod + `add_replica`.
 
-```rust
-impl KvPod {
-    /// Simulate a pod crash. Aborts the PodRuntime and service without
-    /// graceful shutdown. All in-memory state is lost. gRPC connections
-    /// break with transport errors. The KvPod instance becomes unusable.
-    pub async fn crash(self) {
-        // Abort the runtime (no Close event, no drain)
-        self._runtime_handle.abort();
-        self._service_handle.abort();
-        // Drop all handles — gRPC channels break immediately
-        // State is dropped (simulating memory loss)
-    }
-}
-```
+**Pattern 2: Primary crash → failover → rejoin (driver-level)** ✅
+`test_primary_crash_failover_rejoin` in `operator_failover.rs`:
+crash primary, `failover()`, start new pod, `add_replica()`.
 
-Unlike `close()` (which sends Close events and waits for drain),
-`crash()` calls `abort()` — tasks are killed immediately. The driver's
-`GrpcReplicaHandle` will get transport errors on next RPC.
+**Pattern 3: Secondary crash → reconciler re-integration** ✅
+`test_reconciler_secondary_crash_and_rejoin` in `reconciler.rs`:
+`crash_pod()` → reconcile (health check removes stale handle) →
+`restart_pod()` → reconcile (scale-up re-adds).
 
-#### KvPod::restart() — Fresh Pod on Same ID
+**Pattern 4: Primary crash → reconciler failover** ✅
+`test_reconciler_detects_primary_failure_and_fails_over` and
+`test_reconciler_double_failover` in `reconciler.rs`: both use
+`crash_pod()` for high-fidelity simulation.
 
-A restart creates a brand new PodRuntime with empty state, as if K8s
-restarted the container:
+**Pattern 5: Simultaneous crash (quorum loss)**
+Blocked on B0 (QuorumTracker timeout).
 
-```rust
-impl KvPod {
-    /// Crash this pod and start a fresh one with the same replica ID.
-    /// Returns new KvPod that recovers from checkpoint (same data_dir).
-    pub async fn restart(self, id: i64) -> KvPod {
-        let dir = self.data_dir.clone();
-        self.crash().await;
-        // Small delay to simulate restart time
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // Same data_dir = recovers from checkpoint + WAL
-        KvPod::start_with_dir(id, dir, Duration::from_secs(5)).await
-    }
-}
-```
+**Pattern 6: Crash during switchover (A3 rollback)**
+`test_switchover_rollback_on_target_failure` uses `handle.close()`.
+Could be upgraded to `crash()` for higher fidelity.
 
-**Important:** The new pod has different gRPC addresses (new random
-ports). The operator must create a new `GrpcReplicaHandle` for the
-restarted pod — the old handle is dead.
+### Remaining Work
 
-#### What State Should a Restarted Pod Have?
-
-**Current (checkpoint-only persistence):** The KV service recovers
-from the last checkpoint (snapshot + WAL replay). State from graceful
-shutdown or copy completion is preserved. State from a crash between
-checkpoints is lost (no per-op WAL yet — see `kvstore-design.md`
-Implementation Status for the deadlock blocker).
-
-**With per-op WAL (future):** All acknowledged ops survive crashes.
-The PodRuntime reads its WAL on startup and recovers `last_lsn` and
-`epoch`. Reports these to the operator via `GetStatus`. Requires
-fixing the RwLock + async I/O deadlock first.
-
-#### Test Patterns for Crash-Restart
-
-**Pattern 1: Secondary crash-restart (existing)**
-
-Already implemented via `restart_secondary()`:
-```rust
-// Close old handle, create new KvPod, add_replica
-let new_pod = KvPod::start(old_id).await;
-let new_handle = new_pod.replica_handle(old_id).await;
-driver.restart_secondary(old_id, Box::new(new_handle)).await?;
-// → Primary sends copy stream → new secondary rebuilds state
-```
-
-**Pattern 2: Primary crash → failover → old primary rejoins**
-
-```rust
-// 1. Crash the primary
-let primary_pod = pods.remove(&primary_id);
-primary_pod.crash().await;
-
-// 2. Remove dead handle from driver (operator detects)
-driver.remove_replica_from_driver(primary_id);
-
-// 3. Failover to a secondary
-driver.failover().await?;
-let new_primary_id = driver.primary_id().unwrap();
-
-// 4. Old primary restarts as fresh pod
-let restarted = KvPod::start(primary_id).await;
-let handle = restarted.replica_handle(primary_id).await;
-
-// 5. Re-add as secondary (gets full copy from new primary)
-driver.add_replica(Box::new(handle)).await?;
-
-// 6. Verify: old primary's data rebuilt via copy protocol
-wait_for_state_count(&restarted.state, expected_count).await;
-```
-
-**Pattern 3: Primary crash → failover → verify no data loss**
-
-```rust
-// Write data, crash primary, failover, verify all committed
-// data survives on new primary. (test_reconciler_double_failover
-// already does this via mark_pod_not_ready)
-```
-
-**Pattern 4: Simultaneous crash (quorum loss)**
-
-```rust
-// Crash 2 of 3 pods → quorum lost → writes should hang/fail
-// (Requires QuorumTracker timeout — gap B0)
-```
-
-**Pattern 5: Crash during switchover (A3 rollback)**
-
-```rust
-// Start switchover, crash target before promotion completes
-// → Switchover should rollback, re-promote old primary
-// (test_switchover_rollback_on_target_failure already tests this
-//  via handle.close(), but crash() is more realistic)
-```
-
-#### Driver and Reconciler Integration
-
-**For driver-level tests:** The test manually calls `crash()`, then
-creates a new handle and calls `restart_secondary()` or `add_replica()`.
-
-**For reconciler-level tests:** The reconciler needs to detect the
-crashed pod (via `mark_pod_not_ready()` or `get_pod_status()`) and
-handle re-integration automatically. The `KvClusterApi` should:
-1. Detect crash via readiness check
-2. Delete old pod (K8s garbage collection equivalent)
-3. Create new pod (fresh KvPod)
-4. Create new handle (fresh GrpcReplicaHandle)
-
-This maps to reconciler states:
-```
-Healthy → pod crashes
-  → Reconciler detects NotReady
-  → If primary: FailingOver → Healthy (new primary)
-  → If secondary: Healthy (remove + re-add in same cycle)
-```
-
-#### Design: KvClusterApi crash_pod
-
-The current `mark_pod_not_ready` has a fidelity gap: it flips a flag
-but the old `LivePod` keeps running. gRPC channels remain valid, the
-replicator continues to drain ops, and the `create_replica_handle` call
-returns a handle to a pod that was never actually restarted. This means
-the reconciler failover tests never exercise handle reconnection or
-stale-handle detection.
-
-A higher-fidelity `crash_pod` would abort the `LivePod` tasks AND mark
-the K8s Pod NotReady:
-
-```rust
-impl KvClusterApi {
-    /// Simulate a pod crash. Aborts the PodRuntime and service tasks
-    /// (gRPC channels break immediately), marks the K8s Pod NotReady,
-    /// and removes the LivePod entry. The next `create_pod` for this
-    /// name will start a fresh process (simulating K8s restart).
-    fn crash_pod(&self, pod_name: &str) {
-        // 1. Abort live tasks (simulates process death)
-        if let Some(live) = self.live_pods.lock().unwrap().remove(pod_name) {
-            live._runtime_handle.abort();
-            live._service_handle.abort();
-        }
-
-        // 2. Mark K8s Pod NotReady (reconciler detects this)
-        self.mark_pod_not_ready(pod_name);
-    }
-
-    /// Simulate K8s restarting the crashed pod. Creates a fresh
-    /// PodRuntime + KV service on new ports, updates the LivePod
-    /// entry, and marks the K8s Pod Ready.
-    ///
-    /// In real K8s, this happens automatically — kubelet restarts
-    /// the container. In tests, the test calls this explicitly
-    /// after `crash_pod` to control timing.
-    async fn restart_pod(&self, pod_name: &str) {
-        // 1. Extract replica_id from pod name
-        let replica_id: i64 = pod_name
-            .rsplit('-')
-            .next()
-            .unwrap()
-            .parse::<i64>()
-            .unwrap()
-            + 1;
-
-        // 2. Start fresh PodRuntime + KV service (new ports)
-        //    Uses same data_dir pattern as create_pod (checkpoint recovery)
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await.unwrap();
-        let client_address = listener.local_addr().unwrap().to_string();
-        drop(listener);
-
-        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await.unwrap();
-        let data_port = data_listener.local_addr().unwrap().port();
-        let data_bind = format!("127.0.0.1:{}", data_port);
-        let data_address = format!("http://{}", data_bind);
-        drop(data_listener);
-
-        let bundle = PodRuntime::builder(replica_id)
-            .reply_timeout(Duration::from_secs(5))
-            .data_bind(data_bind)
-            .build()
-            .await
-            .unwrap();
-
-        let control_address = bundle.control_address.clone();
-        // New data_dir — fresh state, copy protocol rebuilds
-        let data_dir = std::env::temp_dir()
-            .join("kv-test")
-            .join(format!("restart-{}-{}", pod_name, std::process::id()));
-        let state: SharedState = Arc::new(
-            RwLock::new(KvState::open(data_dir).await.unwrap()),
-        );
-
-        let runtime_handle = tokio::spawn(bundle.runtime.serve());
-        let st = state.clone();
-        let bind = client_address.clone();
-        let service_handle = tokio::spawn(
-            service::run_service(bundle.lifecycle_rx, st, bind),
-        );
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // 3. Update LivePod entry (new addresses, new handles)
-        self.live_pods.lock().unwrap().insert(
-            pod_name.to_string(),
-            LivePod {
-                control_address,
-                data_address,
-                client_address,
-                state,
-                _runtime_handle: runtime_handle,
-                _service_handle: service_handle,
-            },
-        );
-
-        // 4. Mark K8s Pod Ready with new pod IP
-        self.mark_all_pods_ready(); // updates IP from live_pods
-    }
-}
-```
-
-**Key design points:**
-
-1. **Separation of crash and restart.** `crash_pod` aborts tasks and
-   marks NotReady. `restart_pod` creates a fresh process and marks
-   Ready. The test controls timing between them (can test "pod stays
-   dead" vs "pod restarts quickly").
-
-2. **New ports after restart.** The restarted pod binds new random
-   ports (like a real K8s pod restart). The reconciler must call
-   `create_replica_handle` to get a fresh `GrpcReplicaHandle` — the
-   old handle's gRPC channel is dead.
-
-3. **Fresh data_dir (no PVC).** Until PVC volume mounts are
-   implemented (RF-2), restarted pods get a fresh data_dir and must
-   rebuild via copy protocol. With PVC support, `restart_pod` would
-   reuse the original `data_dir` from `create_pod`.
-
-4. **`delete_pod` + `create_pod` vs `restart_pod`.** In real K8s, a
-   crashing container is restarted in-place (same Pod object, same
-   PVC mount). `restart_pod` models this. The reconciler's
-   `delete_pod` + `create_pod` models full pod replacement (scale
-   down + scale up). Both paths need testing.
-
-5. **Reconciler integration.** The reconciler already has the right
-   structure: Healthy detects NotReady → FailingOver → failover →
-   Healthy. The gap is that after failover, the reconciler doesn't
-   re-integrate the crashed pod. It needs a post-failover step:
-   detect the crashed pod is back (Ready), call
-   `restart_secondary()` or `add_replica()` on the driver with a
-   fresh handle.
-
-**Test pattern with `crash_pod`:**
-
-```rust
-// Setup: 3-replica healthy partition
-// ...
-
-// Crash primary (high fidelity — tasks abort, gRPC breaks)
-api.crash_pod(&primary_name);
-
-// Reconcile: detects NotReady → FailingOver
-let set = make_set("myapp", 3, Some(status));
-reconcile_set(&set, &api, &state).await.unwrap();
-assert_eq!(api.last_status().unwrap().phase, Phase::FailingOver);
-
-// Reconcile: runs failover → Healthy with new primary
-let status = api.last_status().unwrap();
-let set = make_set("myapp", 3, Some(status));
-reconcile_set(&set, &api, &state).await.unwrap();
-assert_eq!(api.last_status().unwrap().phase, Phase::Healthy);
-
-// K8s restarts the crashed pod (fresh process, new ports)
-api.restart_pod(&primary_name).await;
-
-// Reconcile: detects restarted pod, re-integrates as secondary
-// (requires reconciler enhancement — not yet implemented)
-let status = api.last_status().unwrap();
-let set = make_set("myapp", 3, Some(status));
-reconcile_set(&set, &api, &state).await.unwrap();
-
-// Verify: 3 healthy replicas again, data survived
-```
-
-**Prerequisite:** The reconciler's Healthy phase needs enhancement to
-detect pods that are Ready but not tracked in the driver (restarted
-pods). Currently it only checks for NotReady pods. This is related to
-RF-4 (driver reconstruction from pod status).
-
-#### Implementation Status
-
-1. ~~**`KvPod::crash()`**~~ — Done (`examples/kvstore/src/testing.rs`)
-2. ~~**Pattern 2 test**~~ — Done (`test_primary_crash_failover_rejoin` in `operator_failover.rs`)
-3. ~~**`KvPod::restart()`**~~ — Done (convenience wrapper, same file)
-4. ~~**`SqlitePod::crash()` / `restart()`**~~ — Done (`examples/sqlite/src/testing.rs`)
-5. **Pattern 4** — quorum loss (blocked on B0 QuorumTracker timeout)
-6. **WAL recovery tests** — blocked on Option C implementation
+- **Pattern 5** — quorum loss (blocked on B0 QuorumTracker timeout)
+- **WAL recovery tests** — blocked on Option C implementation
+- **`restartCount` tracking** — add to `MemberStatus` CRD for observability
