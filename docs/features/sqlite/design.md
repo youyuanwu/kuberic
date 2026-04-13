@@ -416,6 +416,24 @@ to complete decommissioning. Currently data is preserved regardless of
 role at close time. See `design-gaps.md` C4 for the full description
 and fix.
 
+### KP-4: `add_replica` / `restart_secondary` Always Forces Full Rebuild
+
+`add_replica` always uses `OpenMode::New` + full `build_replica` copy,
+even when the secondary's `data_dir` has valid persisted state (db.sqlite
++ frames.log) from a previous run. A pod restart with PVC-preserved data
+could skip the full DB snapshot copy and reattach using
+`OpenMode::Existing` — `SqliteState::open()` already handles loading
+from existing data (loads DB + replays frames.log).
+
+This becomes significant for rolling upgrades where the pod image
+changes but the data is preserved on PVC. Without a
+`reconnect_secondary` driver primitive, every upgrade copies the entire
+database — potentially minutes for large databases.
+
+See `rolling-upgrade-design.md` RF-1 for the full analysis and
+recommended fix (`reconnect_secondary` with `OpenMode::Existing` that
+skips `build_replica`).
+
 ---
 
 ## References

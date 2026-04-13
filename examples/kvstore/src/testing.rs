@@ -93,6 +93,25 @@ impl KvPod {
             .await
             .unwrap()
     }
+
+    /// Simulate a pod crash. Aborts the PodRuntime and service without
+    /// graceful shutdown. All in-memory state is lost. gRPC connections
+    /// break with transport errors. The KvPod instance becomes unusable.
+    pub async fn crash(self) {
+        self._runtime_handle.abort();
+        self._service_handle.abort();
+        // Drop all fields — gRPC channels break immediately, state lost
+    }
+
+    /// Crash this pod and start a fresh one with the same replica ID
+    /// and the same data directory. The new pod recovers from checkpoint.
+    /// Returns a new KvPod with fresh gRPC addresses.
+    pub async fn restart(self, id: i64) -> KvPod {
+        let dir = self.data_dir.clone();
+        self.crash().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        KvPod::start_with_dir(id, dir, Duration::from_secs(5)).await
+    }
 }
 
 /// Helper: connect a KV gRPC client with retries.

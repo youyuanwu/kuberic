@@ -188,6 +188,76 @@ added in a later SF version. Older replicators that can't mark specific
 replicas as `must_catch_up` must wait for ALL replicas to catch up instead —
 a stricter but correct alternative.
 
+### SwapPrimary Action Sequence (from source)
+
+The RA executes SwapPrimary as an ordered action list
+(`ReconfigurationAgentProxy.ActionListExecutorAsyncOperation.cpp`):
+
+```
+1. ReplicatorPreWriteStatusRevokeUpdateConfiguration
+   → UpdateConfiguration(PreWriteStatusRevokeCatchup)
+   → Configure replicator for pre-revoke catchup
+
+2. PreWriteStatusRevokeCatchup
+   → BeginWaitForCatchUpQuorum(WRITE_QUORUM)
+   → CATCHUP #1: target catches up BEFORE write revocation
+   → Feature-flagged: IsPreWriteStatusCatchupEnabled (FailoverConfig)
+   → When disabled: skips to step 3 (post-revoke catchup is the safety net)
+
+3. ChangeReplicaRole
+   → Old primary → ActiveSecondary (revokes write status)
+   → After this: UpdateReadAndWriteStatus re-evaluates access
+
+4. CatchupReplicaSetAll (CatchupDuringSwap)
+   → BeginWaitForCatchUpQuorum(WRITE_QUORUM or QUORUM_ALL)
+   → CATCHUP #2: final sync after write revocation
+   → Guarantees target has all committed data
+
+5. Phase4 Activate
+   → New primary promoted with new epoch
+```
+
+**Key insight**: `PreWriteStatusRevokeCatchup` was added later as an
+optimization (behind feature flag). The original SF design relied solely
+on the post-revoke catchup (#2). The pre-revoke catchup (#1) reduces
+the post-revoke catchup time by ensuring the target is already nearly
+caught up before writes are stopped — but #2 alone is sufficient for
+correctness.
+
+### Double Catchup — Official Rust Trait Documentation
+
+From the SF Rust bindings (`build/service-fabric-rs/.../stateful_traits.rs`,
+`wait_for_catch_up_quorum` doc comment, lines 198-208):
+
+> For swap primary case, double catchup feature is enabled by default.
+> SF can first call this api before initiating write status revocation.
+> SF then revoke write status, and call this again. This allows
+> replicator to catch up with write status granted to make necessary
+> writes for catch up. There is a chance that replicator takes forever
+> to complete this api with mode `ReplicaSetQuarumMode::All` since
+> client/user can keep writing and advancing the committed LSN, but
+> it most likely would not stall in mode `ReplicaSetQuarumMode::Write`.
+
+**Why `Write` mode is critical for the first catchup**: With `All` mode,
+every replica must catch up. Since clients are still writing during the
+first catchup, `committed_lsn` keeps advancing — a slow replica may
+never converge. `Write` mode only requires a quorum subset including
+the `must_catchup` replica (the swap target), so it converges even
+under active writes.
+
+The trait also documents the `must_catchup` semantics (lines 157-163):
+
+> The total number of replicas marked with must_catchup will not exceed
+> the write quorum. Secondary to be promoted to new primary is
+> guaranteed to have must_catchup set, i.e. it must catch up (have all
+> the data) to be promoted to new primary.
+
+**Implication for kuberic**: Kuberic's proposed fix (one catchup before
+demotion) matches SF's `PreWriteStatusRevokeCatchup`. Since kuberic's
+`revoke_write_status` is an atomic flag (no writes can sneak in between
+catchup and revoke), the post-revoke catchup (#2) is unnecessary —
+the pre-revoke catchup alone guarantees the target has all data.
+
 ---
 
 ## Epoch-Based Fencing

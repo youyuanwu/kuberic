@@ -799,3 +799,52 @@ design work needed — just implementation.
 6. B3 + B4 (reconnection, operation locking) — operational maturity
 7. B1 streaming improvement — large dataset support
 8. C1-C3 (refinements) — can be done alongside other work
+
+---
+
+## Category E: Rolling Upgrade Review Findings
+
+Discovered during SoT review of `rolling-upgrade-design.md`. Two are
+existing code bugs in `kuberic-core/src/driver.rs`.
+
+### E1. `add_replica` zombie on failure — stale replica in driver
+
+**Severity:** Should-fix (existing code bug)
+
+`add_replica` inserts into `self.replicas` at driver.rs:721 *before*
+fallible ops (`open`, `build_replica`, `change_role`). If any step fails,
+the zombie replica stays in the map with `Role::None` or `IdleSecondary`.
+
+On subsequent `failover()`:
+- Zombie counted in `total_count` → inflated `write_quorum`
+- Zombie listed as `ActiveSecondary` in quorum config (line 389 hardcodes
+  role) despite actually being `None`/`Idle`
+- In most cases (3+ healthy replicas), quorum is still met. Deadlock
+  occurs only if zombie inflation pushes `write_quorum` above the number
+  of actually-healthy replicas.
+
+**Fix:** Scopeguard pattern — remove from `self.replicas` on error. Or
+defer insertion until after `build_replica` succeeds.
+
+### E2. Switchover missing explicit double-catchup
+
+**Severity:** Should-fix (existing code bug, confirmed data loss window)
+
+`switchover()` has no catch-up step between `revoke_write_status` and
+`change_role(Primary)` on the target.
+
+**Confirmed scenario** (3-replica, P=1, S=2=target, S=3):
+1. Write W ACKed to client via P=1 + S=3 (quorum met)
+2. W in S=2's unbounded channel, drain task hasn't delivered yet
+3. `revoke_write_status()` blocks new writes
+4. `change_role(ActiveSecondary)` on P=1 calls `close_all()` — drops
+   unbounded senders, W lost from S=2's channel
+5. S=2 promoted as primary WITHOUT W
+6. W exists on S=3 (secondary) but not on primary S=2
+
+Window: microseconds to low milliseconds. Under high write throughput
+with a slow target, the window widens.
+
+**Fix:** After `revoke_write_status`, query old primary's
+`current_progress` and poll target's `current_progress` until it
+matches. Then proceed with demotion + promotion.

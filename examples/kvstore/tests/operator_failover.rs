@@ -507,3 +507,74 @@ async fn test_a3_switchover_rollback_on_target_failure() {
     // partition is recoverable (primary exists), not stuck
     // (no primary at all).
 }
+
+/// Crash the primary, failover to a secondary, then restart the old
+/// primary and rejoin it as a new secondary that rebuilds via copy.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_primary_crash_failover_rejoin() {
+    use kvstore::testing::wait_for_state_count;
+
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Write data on primary
+    let mut kv1 = connect_kv_client(&pod1.client_address).await;
+    for i in 1..=5 {
+        kv1.put(proto::PutRequest {
+            key: format!("k{i}"),
+            value: format!("v{i}"),
+        })
+        .await
+        .unwrap();
+    }
+
+    // Crash pod 1 (abrupt — no graceful shutdown)
+    let pod1_dir = pod1.data_dir.clone();
+    pod1.crash().await;
+
+    // Failover — removes dead primary internally and promotes a survivor
+    driver.failover(1).await.unwrap();
+    let new_primary_id = driver.primary_id().unwrap();
+    assert_ne!(new_primary_id, 1);
+
+    let new_primary_pod = if new_primary_id == 2 { &pod2 } else { &pod3 };
+
+    // New primary accepts writes
+    let mut kv2 = connect_kv_client(&new_primary_pod.client_address).await;
+    kv2.put(proto::PutRequest {
+        key: "post-crash".into(),
+        value: "alive".into(),
+    })
+    .await
+    .unwrap();
+
+    // Restart old primary as a fresh pod (same data_dir — simulates PVC)
+    let pod1_restarted = KvPod::start_with_dir(1, pod1_dir, Duration::from_secs(5)).await;
+    let h1_new = pod1_restarted.replica_handle(1).await;
+
+    // Re-add as secondary — gets full copy from new primary
+    driver.add_replica(Box::new(h1_new)).await.unwrap();
+
+    // Verify: restarted pod has all 6 entries (5 pre-crash + 1 post-crash)
+    wait_for_state_count(&pod1_restarted.state, 6).await;
+    {
+        let st = pod1_restarted.state.read().await;
+        assert_eq!(st.data.get("k3").unwrap(), "v3");
+        assert_eq!(st.data.get("post-crash").unwrap(), "alive");
+    }
+
+    driver.delete_partition().await.unwrap();
+}

@@ -90,6 +90,24 @@ impl SqlitePod {
             .await
             .unwrap()
     }
+
+    /// Simulate a pod crash. Aborts the PodRuntime and service without
+    /// graceful shutdown. All in-memory state is lost. gRPC connections
+    /// break with transport errors. The SqlitePod instance becomes unusable.
+    pub async fn crash(self) {
+        self._runtime_handle.abort();
+        self._service_handle.abort();
+    }
+
+    /// Crash this pod and start a fresh one with the same replica ID
+    /// and the same data directory. The new pod recovers from the DB file.
+    /// Returns a new SqlitePod with fresh gRPC addresses.
+    pub async fn restart(self, id: i64) -> SqlitePod {
+        let dir = self.data_dir.clone();
+        self.crash().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        SqlitePod::start_with_dir(id, dir, Duration::from_secs(5)).await
+    }
 }
 
 /// Helper: connect a SQLite gRPC client with retries.
