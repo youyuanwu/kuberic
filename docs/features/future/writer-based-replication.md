@@ -809,6 +809,43 @@ so secondaries can track quorum progress. In the Writer model:
 - Replicas use `committed_lsn` for GC and deferred application,
   exactly as they do today.
 
+##### Lagging committed_lsn on Writer Crash
+
+**Problem:** `committed_lsn` is piggybacked on the **next**
+`ReplicationItem` after the commit. If the Writer commits LSN=50
+(gets W ACKs) and crashes before sending LSN=51, no replica ever
+learns that `committed_lsn=50`. All replicas think
+`committed_lsn=49`. On epoch bump, replicas truncate LSN=50 — a
+committed op is lost.
+
+The existing leader-based system avoids this because the primary
+doesn't truncate its own ops, and the new primary is chosen by
+highest LSN. In the Writer system, all replicas truncate based on
+their local `committed_lsn`, which lags.
+
+**Fix:** The Writer reports `committed_lsn` to the coordinator on
+every commit (via the `WriterProgress` stream message, already
+designed — fire-and-forget on the open coordinator stream). The
+coordinator persists it in the CRD status. On epoch bump, the
+coordinator pushes the **authoritative** `committed_lsn` to replicas
+along with the new epoch:
+
+```protobuf
+message UpdateEpochRequest {
+    Epoch new_epoch = 1;
+    int64 authoritative_committed_lsn = 2;  // from coordinator
+}
+```
+
+Replicas truncate based on this value, not their local stale copy.
+The Writer should send `WriterProgress` **before** returning the LSN
+to the user, ensuring the coordinator always has a value ≥ what the
+user has seen. This is a fire-and-forget send on the already-open
+coordinator stream — negligible cost.
+
+See [peer-repair-replication.md](peer-repair-replication.md)
+for the full analysis with scenario traces and alternative options.
+
 #### 7. Replica Building (Copy + Catch-Up)
 
 Replica building is the most nuanced part of the Writer-based system
