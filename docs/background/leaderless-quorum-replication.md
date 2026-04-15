@@ -372,6 +372,65 @@ LinkedIn used `routing=client` for their Java services (the common
 case), and `routing=server` behind a hardware load balancer for
 non-Java clients or simple tooling.
 
+### Client State Model — No Persistent State
+
+A critical property of Voldemort's client-side routing: **the client
+holds no persistent state**. Everything is in-memory and
+reconstructable from servers.
+
+**Bootstrap sequence:**
+1. Client is configured with **bootstrap URLs** — addresses of any
+   Voldemort server nodes.
+2. On startup, client fetches `cluster.xml` (node topology, partition
+   assignments) and `stores.xml` (store configs including N/R/W) from
+   any bootstrap node via a metadata key lookup.
+3. Client builds the consistent hash ring in memory from `cluster.xml`.
+4. Client opens socket connections to all relevant nodes.
+5. If metadata becomes stale (server returns
+   `InvalidMetadataException`), the client re-bootstraps automatically
+   — re-fetches `cluster.xml` and `stores.xml`, rebuilds the ring,
+   reconnects. This happens transparently on the next retry.
+
+**What the client holds in memory:**
+
+| State | Persistent? | How recovered |
+|---|---|---|
+| Cluster topology (ring) | No | Re-fetch `cluster.xml` from any node |
+| Store configs (N/R/W) | No | Re-fetch `stores.xml` from any node |
+| Socket connection pool | No | Reconnect to nodes |
+| Failure detector state | No | Reset (assume all alive, re-probe) |
+| Vector clocks | No | Per-request: fetched on `get`, sent back on `put` |
+| Hinted handoff (slops) | No | Slops stored **server-side** on stand-in nodes |
+
+**Why no persistent state is needed:**
+- **No LSN assignment:** Voldemort uses vector clocks, which are
+  incremented by the **server** (the node receiving the write), not
+  the client. The client sends the current vector clock with each
+  `put`; the server increments its own counter in the clock.
+- **No replication queue:** The client sends to all N replicas in
+  parallel. There is no "buffer ops for replay to new replicas"
+  concept. If a node is down, the client writes a **slop** (hint) to
+  another live node (`PerformPutHintedHandoff`). The slop is stored
+  **server-side** — not in the client. Handoff is also server-side.
+- **No epoch/fencing:** There is no single-writer constraint. Any
+  client can write to any key at any time. Conflicts are resolved by
+  vector clocks at read time, not by preventing concurrent writes.
+- **No coordinator state:** The client is a stateless coordinator —
+  it routes, waits for quorum, and returns. No state carries over
+  between requests.
+
+**Client crash recovery:** If the client process crashes and
+restarts, it simply re-bootstraps from the bootstrap URLs. No state
+is lost because no client state was authoritative — the servers are
+the source of truth for data, versions, and topology. The new client
+instance is indistinguishable from the old one.
+
+This stateless client model is possible because Dynamo-family systems
+use **partial ordering** (vector clocks) rather than **total
+ordering** (sequential LSNs). Total ordering requires a centralized
+counter, which implies state. Partial ordering distributes version
+tracking to the servers, keeping the client stateless.
+
 ### Key Design Points (Summary)
 
 - **Consistent hashing** with configurable replication factor.

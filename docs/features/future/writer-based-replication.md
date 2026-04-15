@@ -210,6 +210,10 @@ pub struct Writer {
     replication_queue: ReplicationQueue,
     /// Bidirectional gRPC stream to coordinator
     config_stream: CoordinatorStream,
+    /// Assigned by coordinator, stored locally for reconnect identity
+    writer_id: String,
+    /// Opaque token from coordinator, included in every ReplicationItem
+    session_token: Bytes,
 }
 
 impl Writer {
@@ -246,9 +250,22 @@ service or an extra port on the operator). It bridges the Writer
 
 ```protobuf
 service Coordinator {
-    // Bidirectional stream: coordinator pushes config events,
-    // Writer reports status.
-    rpc WriterSession(stream WriterStatus) returns (stream ConfigEvent);
+    // Bidirectional stream: Writer sends connect + status,
+    // coordinator pushes config events.
+    rpc WriterSession(stream WriterMessage) returns (stream ConfigEvent);
+}
+
+message WriterMessage {
+    oneof message {
+        WriterConnect connect = 1;       // first message on stream open
+        WriterProgress progress = 2;     // periodic status report
+        WriterShutdown shutdown = 3;     // cooperative graceful shutdown
+    }
+}
+
+message WriterConnect {
+    string writer_id = 1;               // empty on first-ever connect
+    string partition_id = 2;            // which partition to write to
 }
 
 message ConfigEvent {
@@ -267,32 +284,158 @@ message ConfigUpdate {
     Epoch epoch = 1;
     ReplicaSet current_config = 2;        // CC — current members + write quorum
     ReplicaSet previous_config = 3;       // PC — non-empty during reconfiguration
+    string writer_id = 4;                 // assigned by coordinator
+    bytes session_token = 5;              // opaque token for replica authentication
 }
 
-message WriterStatus {
+message WriterProgress {
     int64 committed_lsn = 1;     // Writer's quorum-committed LSN
     int64 highest_lsn = 2;       // Writer's highest assigned LSN
     bool caught_up = 3;          // all pending ops committed + must_catch_up satisfied
     // (stream liveness doubles as heartbeat)
 }
+
+message WriterShutdown {
+    int64 committed_lsn = 1;     // final committed LSN at shutdown
+}
 ```
+
+##### Writer Identity and Authentication
+
+The Writer is an external client — the coordinator must know who it
+is and whether it's the same Writer reconnecting or a different one.
+
+**Writer ID:** An opaque UUID assigned by the coordinator on first
+connect. The Writer stores it locally and presents it on reconnect.
+
+```
+First connect:
+  Writer → Coordinator:  WriterConnect { writer_id: "" }
+  Coordinator:           Assigns writer_id = new UUID
+                         Stores in CRD status
+                         Sends ConfigUpdate { writer_id, session_token, ... }
+  Writer:                Stores writer_id locally
+
+Reconnect (same Writer):
+  Writer → Coordinator:  WriterConnect { writer_id: "<stored UUID>" }
+  Coordinator:           Matches against last known writer_id
+    + clean shutdown →   Same epoch, resume (no fencing)
+    + crash →            Bump writer_epoch (crash fencing)
+
+Takeover (different Writer):
+  Writer → Coordinator:  WriterConnect { writer_id: "" or unknown }
+  Coordinator:           No match → new Writer
+                         Bump writer_epoch, assign new writer_id
+                         Fence old Writer's stale writes
+```
+
+**Session token:** On each `ConfigUpdate`, the coordinator issues an
+opaque `session_token` (e.g., HMAC of `writer_id + writer_epoch +
+timestamp`, signed by the coordinator). The Writer includes this
+token in every `ReplicationItem`:
+
+```protobuf
+message ReplicationItem {
+    int64 data_loss_number = 1;
+    int64 writer_epoch = 2;
+    int64 lsn = 3;
+    bytes data = 4;
+    int64 committed_lsn = 5;
+    bytes session_token = 6;      // proves Writer identity to replicas
+}
+```
+
+Replicas receive the valid `session_token` from the coordinator via
+`update_epoch()` (the coordinator is in-cluster, trusted). On each
+incoming `ReplicationItem`, the replica validates:
+1. Epoch check: `(data_loss_number, writer_epoch) >= current` (ordering)
+2. Token check: `session_token == expected_token` (identity)
+
+A rogue client without a valid session token is rejected even if it
+guesses the correct epoch values. The token rotates on every
+`writer_epoch` bump, so a stolen token from an old Writer is
+invalidated when the epoch changes.
 
 **How it works:**
 
-1. Writer opens `WriterSession` stream to the coordinator on startup.
-2. Coordinator immediately pushes a `ConfigUpdate` with the current
-   epoch, replica set, and write quorum.
-3. Writer connects to all replicas and begins accepting `replicate()`
-   calls.
+1. Writer opens `WriterSession` stream and sends `WriterConnect`
+   with its stored `writer_id` (or empty on first connect).
+2. Coordinator validates identity (see above), assigns/confirms
+   `writer_id`, generates `session_token`, pushes `ConfigUpdate`.
+3. Writer stores `writer_id`, connects to all replicas, includes
+   `session_token` in every `ReplicationItem`.
 4. When the operator changes config (epoch bump, add/remove replica,
    build), the coordinator pushes the relevant `ConfigEvent`.
 5. Writer reacts: updates its connection pool, replays from queue for
    new replicas, adjusts quorum tracker.
-6. Writer periodically (and on each commit) sends `WriterStatus` back
-   — the coordinator forwards this to the operator / CRD status.
-7. **Liveness:** If the stream disconnects, the coordinator detects
-   Writer death. The operator can then allow a new Writer to take
-   over with a fresh epoch.
+6. Writer periodically (and on each commit) sends `WriterProgress`
+   back — the coordinator forwards this to the operator / CRD status.
+7. **Liveness:** If the stream disconnects without a prior
+   `WriterShutdown`, the coordinator treats it as a crash (see
+   Writer Lifecycle below).
+
+##### Writer Lifecycle Protocol
+
+The coordinator distinguishes three Writer restart scenarios based
+on whether a `WriterShutdown` message was received before disconnect:
+
+**Graceful shutdown → clean restart (no fencing):**
+
+```
+Writer                              Coordinator
+──────                              ───────────
+1. Drain in-flight ops
+   (wait for pending replicate() to complete)
+2. Send WriterShutdown{committed_lsn=X}  ──►
+                                    3. Record: "clean shutdown at LSN X"
+                                       No epoch bump, no update_epoch to replicas
+4. Close stream, exit process
+
+... later ...
+
+5. Writer reconnects  ──────────────►
+                                    6. Last shutdown was clean
+                                       Send ConfigUpdate with SAME writer_epoch
+                                       Resume LSN = committed_lsn + 1
+7. Writer resumes, no truncation
+```
+
+**Crash → fenced restart (epoch bump):**
+
+```
+Writer                              Coordinator
+──────                              ───────────
+1. Process crashes / network dies
+   (no WriterShutdown sent)
+                                    2. Stream disconnect detected
+                                       No WriterShutdown received
+                                       → treat as crash
+                                    3. Bump writer_epoch
+                                    4. Push update_epoch to all replicas
+                                       (replicas truncate uncommitted ops)
+                                    5. Record: "crashed, new writer_epoch=Y"
+
+... later ...
+
+6. Writer reconnects  ──────────────►
+                                    7. Last shutdown was crash
+                                       Send ConfigUpdate with NEW writer_epoch
+                                       Resume LSN = last known committed_lsn + 1
+8. Writer resumes with new epoch
+```
+
+**Takeover (different Writer connects while old is alive):**
+
+Same as crash — the coordinator cannot prove the old Writer is dead,
+so it bumps `writer_epoch` and fences. The old Writer's stale writes
+are rejected by replicas that have received the epoch bump.
+
+**Why no lease?** The cooperative protocol handles the graceful case
+(no unnecessary fencing), and crash fencing (immediate epoch bump)
+handles the crash case identically to the existing leader-based
+system's failover model. A lease would add recovery latency (must
+wait for expiry) without meaningful safety improvement, since
+eventual epoch fencing already ensures uncommitted ops are truncated.
 
 ##### Reconfiguration via Coordinator
 
@@ -409,11 +552,13 @@ service ReplicaData {
 ```
 
 Each replica:
-- Accepts `ReplicationItem` (containing epoch + LSN + data)
-- Validates epoch (fencing: rejects stale epochs)
-- **Authenticates the Writer** (mTLS or a per-session token issued by
-  the coordinator — epoch fencing alone is not sufficient because it
-  checks ordering, not identity)
+- Accepts `ReplicationItem` (containing epoch + LSN + data +
+  session_token)
+- Validates epoch (fencing: rejects stale `writer_epoch` or
+  `data_loss_number`)
+- **Validates session token** (identity: rejects items without a
+  valid token matching the one received from coordinator via
+  `update_epoch`)
 - Stores in local `ReplicationQueue` / WAL
 - Applies op to user state via `StateProvider`
 - Sends `ReplicationAck` back to the Writer
@@ -482,6 +627,12 @@ fn accept_item(&self, item: &ReplicationItem) -> Result<(), Status> {
     if item_epoch < my_epoch {
         return Err(Status::failed_precondition("stale epoch"));
     }
+
+    // Identity check: session token must match (received from coordinator)
+    if item.session_token != self.expected_session_token {
+        return Err(Status::unauthenticated("invalid session token"));
+    }
+
     // ... store op
 }
 ```
@@ -984,6 +1135,52 @@ infrequent config events — it adds no latency to the write path.
 
 ---
 
+## Applicability
+
+The Writer-based system requires that write operations produce a
+**self-contained, opaque replication payload** that any replica can
+apply independently. The Writer ships bytes — it never touches the
+data itself. This constraint determines which workloads fit.
+
+### Suitable Workloads
+
+| Workload | Why it works |
+|---|---|
+| **KV store** (kvstore example) | Write = serialized `KvOp::Put{key,value}`. Pure data blob. Writer ships it, each replica deserializes and applies independently. |
+| **Application-level state machine** | Write = serialized command/event. Replicas are deterministic state machines that apply commands in LSN order. |
+| **Event sourcing** | Write = domain event. Replicas append to their local event log. Projections are derived per-replica. |
+| **Document store** | Write = serialized document mutation. Each replica applies the mutation to its local store. |
+
+**Common trait:** The application computes the replication payload
+*before* calling `writer.replicate()`. No local state is needed at the
+Writer — the payload is complete and self-describing.
+
+### Unsuitable Workloads
+
+| Workload | Why it doesn't work |
+|---|---|
+| **Replicated SQLite** (sqlite example) | SQL execution is inseparable from the local DB file. WAL frames are captured by reading the local WAL *after* SQLite commits. The Writer would need to host the SQLite DB to execute SQL and capture frames — making it a primary in all but name. |
+| **Any page/WAL-level replication** | Replication payload (pages, WAL frames) is produced as a side effect of local storage engine operations. Cannot be separated from the data. |
+| **Workloads requiring local reads** | If the Writer must serve reads from the data it writes, it needs local state — defeating the "Writer has no data" principle. |
+
+### SQLite → Use Leader-Based System
+
+The existing `kuberic-operator` (leader-based, SF-style) is the
+correct choice for replicated SQLite and similar workloads where the
+write path is coupled to local storage. The primary hosts the SQLite
+DB, executes SQL, captures WAL frames, and replicates them. This
+coupling is inherent to SQLite's architecture, not a design limitation.
+
+### Decision Rule
+
+```
+Can the app produce the replication payload WITHOUT local state?
+  YES → Writer-based system (this design)
+  NO  → Leader-based system (kuberic-operator)
+```
+
+---
+
 ## Trade-Offs
 
 ### Advantages
@@ -1133,44 +1330,87 @@ replicas.
 Issues identified during design review (SoT premortem analysis) that
 require further design work before implementation.
 
-### KI-1: Dual-Writer Window During Takeover (must-fix)
+### KI-1: Dual-Writer Window During Takeover (inherited, not new)
 
 When the old Writer dies and a new one starts, there is a window
 where epoch propagation to replicas is not atomic. A partitioned-
 but-alive "zombie" Writer could still send items to replicas that
-haven't yet received the epoch bump. Epoch fencing is eventual, not
-immediate — there is no synchronous barrier.
+haven't yet received the epoch bump.
 
-**Potential solutions:**
-- **Lease-based fencing:** Writer must hold a time-limited lease from
-  the coordinator. Replicas check lease validity (via a coordinator
-  query or a lease token embedded in `ReplicationItem`). Expired
-  lease → reject writes. New Writer can only start after old lease
-  expires.
-- **Coordinator-delivered fence token:** On Writer takeover, the
-  coordinator pushes a unique fence token to all replicas via RPC
-  (in-cluster, fast). Replicas only accept items bearing the current
-  token. This is synchronous (coordinator waits for all replicas to
-  ACK the token) before allowing the new Writer to start.
+**This is not a new problem.** The existing leader-based system has
+the same window during failover: the operator bumps
+`configuration_number`, pushes the new epoch to secondaries
+best-effort (`driver.rs:369` — logs a warning and continues if
+`update_epoch` fails on a secondary), and promotes the new primary.
+There is a window where the old primary can still reach
+not-yet-bumped secondaries.
 
-### KI-2: Writer State Recovery (must-fix)
+The existing system accepts this because:
+- Epoch propagation is **in-cluster** (operator → replicas), so it's
+  fast (milliseconds)
+- Once a replica receives the epoch bump, it truncates uncommitted
+  ops from the old epoch (`secondary.rs:74-85`)
+- The old primary's writes to not-yet-bumped replicas are
+  **uncommitted** — they'll be truncated when the epoch arrives
+- No committed data is corrupted — only uncommitted in-flight ops
+  are at risk, and they're rolled back
+
+The Writer-based system inherits the same model — the coordinator
+pushes `update_epoch()` to replicas in-cluster (same path, same
+speed). The only difference is that an out-of-cluster Writer may
+stay alive longer than an in-cluster primary, but its stale writes
+are still uncommitted and will still be truncated.
+
+**Mitigated by the Writer Lifecycle Protocol** (see section 2,
+Coordinator): graceful shutdown sends `WriterShutdown` before
+disconnect, so the coordinator skips fencing on clean restarts.
+Crash restarts trigger immediate `writer_epoch` bump, same as the
+existing system's failover.
+
+**Lease considered and not adopted.** A lease would add crash
+recovery latency (must wait for expiry) without meaningful safety
+improvement — epoch fencing already truncates uncommitted ops.
+
+**Severity: consider** (inherited from existing system, not a new
+risk). Improvements (lease, synchronous fence token) would benefit
+both systems equally and can be designed as a shared enhancement.
+
+### KI-2: Writer State Recovery During Build (inherited, simple fix)
 
 The Writer's `ReplicationQueue` is in-memory. If the Writer crashes
 during a replica build, the queue is lost and the zero-gap invariant
-is broken for the in-progress build. The new Writer cannot replay
-gap ops because they no longer exist.
+is broken for the in-progress build.
 
-**Potential solutions:**
-- **Abort builds on Writer crash:** When the coordinator detects
-  Writer death during a build, it aborts the build and the new Writer
-  starts the build from scratch. Simple but wastes copy work.
-- **Writer-side WAL:** The Writer persists its queue to disk (or a
-  durable store). New Writer recovers the queue on startup. Adds
-  complexity and an I/O dependency to the Writer library.
-- **Replica-side queue:** Each replica retains received ops in its
-  local queue. The new Writer queries replicas for ops in the gap
-  range and serves them to the new replica. Distributes the state
-  but requires a new "query ops by range" RPC.
+**This is the same as the existing system.** Today's primary also has
+an in-memory `ReplicationQueue` (`queue.rs`). If the primary crashes
+during a build, the queue is lost. The existing system handles this
+by aborting the in-progress build: the operator detects primary
+failure, triggers failover, and the new primary restarts the build
+from scratch via `restart_secondary` → full `add_replica` (copy +
+build). The partially-built secondary is closed and rebuilt.
+
+**The Writer system does the same thing:**
+1. Writer crashes → coordinator detects stream disconnect
+2. Coordinator bumps `writer_epoch`, aborts any in-progress build
+3. New Writer connects, gets current config
+4. Operator restarts the build from scratch (new copy from a replica)
+
+**Why "abort and retry" is acceptable:**
+- Builds are infrequent (scale-up, pod restart)
+- A crash during a build is even rarer
+- Copy is the expensive part, and it's idempotent — restarting just
+  repeats the copy. No data corruption risk.
+- The alternative (Writer-side WAL or replica-side query) adds
+  significant complexity for a rare edge case
+
+**Severity downgraded to consider.** The existing system has lived
+with this behavior. The "abort builds on Writer crash" solution is
+the recommended approach — simple, matches existing behavior, no new
+infrastructure needed.
+
+The more complex solutions (Writer-side WAL, replica-side ops query)
+remain available as future optimizations if build frequency or build
+size makes retry unacceptable.
 
 ### KI-3: Read Path Design (should-fix)
 
@@ -1183,22 +1423,40 @@ undefined. Options to design:
 - Reads are documented as eventually consistent (simplest but may
   cause user confusion)
 
-### KI-4: Unbounded ReplicationQueue Growth (should-fix)
+### KI-4: Unbounded ReplicationQueue Growth (should-fix, simple mitigation)
 
 During a replica build with GC deferred (`BuildInProgress`), or when
 the coordinator is unreachable (no `BuildComplete` to resume GC), the
 Writer's in-memory queue grows without bound. Since the Writer is
 embedded in the user app, this can cause OOM in the user process.
 
-**Potential solutions:**
-- Queue size limit with backpressure: if queue exceeds a threshold,
-  `replicate()` blocks or returns an error until GC can proceed.
-- Build timeout: if `BuildComplete` doesn't arrive within a
-  configurable window, the Writer aborts the build and resumes GC.
-- Spill to disk: overflow queue entries to a temp file. Adds I/O
-  complexity.
+**The existing system has this too** — the primary's in-memory
+`ReplicationQueue` grows during builds. But the primary runs in a
+dedicated pod with Kubernetes resource limits, so OOM only kills the
+pod (which triggers failover). The Writer runs in the user's
+process, where OOM is more damaging.
 
-### KI-5: Zombie Writer Self-Fencing (should-fix)
+**Recommended mitigation: build timeout + queue size limit.**
+
+1. **Build timeout:** The Writer starts a timer on `BuildInProgress`.
+   If `BuildComplete` doesn't arrive within a configurable window
+   (e.g., 5 minutes), the Writer notifies the coordinator that the
+   build has timed out. The coordinator aborts the build and resumes
+   GC. The build can be retried later. This matches the existing
+   system's behavior — `build_replica` has a 30-second timeout
+   (`copy.rs:23`), and the operator can retry.
+
+2. **Queue size limit:** The Writer enforces a maximum queue size
+   (configurable, e.g., 10,000 ops or 100MB). If the limit is
+   reached during a build, `replicate()` returns an error
+   (`QueueFull`) rather than OOMing. The user app can decide whether
+   to retry, drop the write, or shut down cleanly. This is better
+   than a silent OOM crash.
+
+These are configuration options on the `Writer`, not protocol
+changes. The coordinator doesn't need to know about them.
+
+### KI-5: Zombie Writer Self-Fencing (should-fix, simple implementation)
 
 A partitioned Writer that can still reach replicas but not the
 coordinator has no mechanism to detect that it has been replaced. It
@@ -1206,10 +1464,50 @@ will continue sending items with the old epoch, which replicas will
 reject (assuming the epoch bump has propagated), but the Writer
 doesn't interpret epoch-rejection responses as "you've been replaced."
 
-**Potential solution:** Writer should interpret epoch-stale rejections
-from replicas as a signal to self-fence: pause writes, attempt to
-reconnect to coordinator, and if the coordinator confirms a newer
-Writer exists, shut down gracefully.
+**In practice, the zombie is already functionally dead.** Once W or
+more replicas reject its writes (stale epoch), `replicate()` can
+never get W ACKs — every call hangs or times out. The user app's
+writes are failing. The zombie just doesn't surface the reason
+clearly.
+
+**In the existing system,** the operator can kill a zombie primary
+via Kubernetes (delete the pod). The Writer is a user process outside
+the cluster — the operator can't kill it. So the Writer must
+self-fence.
+
+**Fix: epoch-stale error detection in the Writer library.**
+
+This is not a protocol change — it's error handling in the Writer's
+ACK processing path. When the Writer receives a `stale epoch`
+rejection from a replica:
+
+```rust
+// In Writer's ACK reader / response handler:
+match replica_response {
+    Err(status) if status.code() == Code::FailedPrecondition
+        && status.message().contains("stale epoch") => {
+        stale_count += 1;
+        if stale_count >= write_quorum {
+            // W replicas have rejected us — we've been replaced
+            self.self_fence();
+            // Notify user app: WriterReplaced error on all
+            // pending and future replicate() calls
+        }
+    }
+    ...
+}
+```
+
+The Writer transitions to a **fenced** state:
+1. All pending `replicate()` calls resolve with `WriterReplaced` error
+2. All future `replicate()` calls immediately return `WriterReplaced`
+3. Writer attempts to reconnect to coordinator for confirmation
+4. User app receives a clear, actionable error — not a mysterious
+   timeout
+
+**Severity: should-fix** but implementation is straightforward —
+purely client-side error handling, no protocol changes, no
+coordinator involvement.
 
 ---
 
