@@ -21,7 +21,8 @@ leader-based (Service Fabric-style) approach.
 6. [Common Techniques](#common-techniques)
 7. [Leader-Based vs. Leaderless — Comparison](#leader-based-vs-leaderless--comparison)
 8. [Implications for Kuberic](#implications-for-kuberic)
-9. [References](#references)
+9. [Why Leaderless Systems Avoid the committed_lsn Problem](#why-leaderless-systems-avoid-the-committed_lsn-problem)
+10. [References](#references)
 
 ---
 
@@ -504,6 +505,98 @@ divergent data. Catches issues that read repair and hinted handoff miss
 | **CRDTs** | Riak Data Types | Automatic merge, no conflicts | Limited to specific data structures |
 | **Application merge** | Dynamo (shopping cart) | Semantic correctness | Pushes complexity to app layer |
 
+#### Vector Clocks — How They Work
+
+A vector clock is a map of `{node → counter}`. Each write increments
+the writing node's counter. Two vector clocks are compared by their
+element-wise ordering:
+
+```
+{A:2, B:1} dominates {A:1, B:1}  → causal successor (v2 supersedes v1)
+{A:2, B:1} vs {A:1, B:2}         → concurrent (neither dominates) → CONFLICT
+```
+
+When a conflict exists, **both versions are stored as "siblings"** on
+the replicas. On read, the client receives ALL sibling versions and
+must merge them:
+
+```
+Step 1 — concurrent writes:
+  Client₁ writes key=X via Node A → version {A:1}, value="foo"
+  Client₂ writes key=X via Node B → version {B:1}, value="bar"
+  Neither knows about the other → concurrent → conflict
+
+Step 2 — read detects siblings:
+  Client reads from quorum (hits nodes with both versions)
+  Receives two siblings: {A:1}→"foo" and {B:1}→"bar"
+
+Step 3 — client resolves:
+  Application merges (e.g., union, pick latest, custom logic)
+  Writes back resolved value → version {A:1, B:1, C:1}→"merged"
+  This version dominates both siblings → conflict resolved
+```
+
+**Orphaned partial write handling:**
+
+```
+Client writes key=X to R₁ (succeeds) but not R₂, R₃ (network failure).
+Client receives error (< W ACKs). But R₁ has new version {A:1}→"new".
+R₂, R₃ still have old version {}→"old".
+
+No rollback occurs. R₁ keeps the orphaned write.
+
+Later read (quorum R=2, hits R₁ + R₂):
+  R₁ returns {A:1}→"new"
+  R₂ returns {}→"old"
+  Neither dominates → conflict → return BOTH as siblings
+  Client merges → writes back resolved value
+  Read-repair pushes resolved value to R₂
+
+The orphan persists until a read touches it and triggers resolution.
+```
+
+#### Last-Write-Wins (LWW) — How It Works
+
+Each write carries a **timestamp**. On conflict, highest timestamp
+wins automatically. No siblings, no client merge.
+
+```
+Client₁ writes key=X at t=100 → value="foo"
+Client₂ writes key=X at t=101 → value="bar"
+
+On read: timestamp 101 > 100 → "bar" wins. "foo" is silently discarded.
+```
+
+Simple but dangerous: if two clients write at the same millisecond
+(or clocks are skewed), one write is silently lost. No detection,
+no merge, no recovery. This is why Cassandra documents LWW as
+"last write wins, even if that's not what you wanted."
+
+#### Comparison
+
+| | Vector Clocks (Dynamo/Riak/Voldemort) | LWW (Cassandra) |
+|---|---|---|
+| Conflict detection | Precise (causal ordering) | None (timestamp = total order) |
+| On conflict | Return siblings, client merges | Latest timestamp wins silently |
+| Data loss risk | None (all versions preserved) | Yes (concurrent writes lost) |
+| Client complexity | High (must handle siblings) | None |
+| Orphaned writes | Become siblings, resolved on read | Survive if timestamp is highest, overwritten otherwise |
+
+#### Why These Strategies Don't Apply to Kuberic
+
+Both strategies require **eventual consistency** — the system accepts
+multiple coexisting versions and resolves later. Kuberic's model is
+**one version, total ordering, committed or rolled back.** There is
+no concept of "siblings" or "merge on read." The `StateProvider`
+trait applies ops sequentially via an ordered LSN stream — it cannot
+handle divergent versions.
+
+This is the fundamental architectural difference: Dynamo-family
+systems trade consistency for availability and resolve conflicts
+lazily (at read time). Kuberic trades availability for consistency
+and resolves conflicts eagerly (by fencing + rollback at write time).
+Each is correct for its design goals.
+
 ### 6. Gossip-Based Membership
 
 No master registry. Nodes periodically exchange state (ring membership,
@@ -590,6 +683,85 @@ Adding a leaderless mode would require:
   current leader-based mode, selected per-partition?
 - **Consistency model:** Should kuberic expose tunable R/W/N or just
   offer preset levels (ONE, QUORUM, ALL)?
+
+---
+
+## Why Leaderless Systems Avoid the committed_lsn Problem
+
+When exploring client-coordinated writes for kuberic (see the
+abandoned designs in `docs/features/future/writer-based-replication.md`
+and `docs/features/future/peer-repair-replication.md`), a fundamental
+correctness problem was discovered: if the writer is separated from
+the replicas, `committed_lsn` (which ops reached quorum) is known
+only to the writer. If the writer crashes, this information is lost,
+and replicas may roll back quorum-committed ops — data loss.
+
+**Dynamo-family systems (Voldemort, Cassandra, Riak) do not have this
+problem** because they never roll back anything:
+
+| Property | Kuberic (leader-based) | Dynamo / Voldemort / Cassandra |
+|---|---|---|
+| Consistency model | Strong (total ordering via LSNs) | Eventual (tunable quorum) |
+| Writer model | Single writer (primary or external Writer) | Multi-writer (any node accepts writes) |
+| Versioning | LSN sequence, one version per op | Vector clocks (Dynamo, Voldemort) or LWW timestamps (Cassandra) — multiple versions coexist |
+| On quorum write + writer crash | Replicas need `committed_lsn` to know what to keep vs roll back | **Data stays permanently** — no rollback exists |
+| On partial write (< W ACKs) + crash | Uncommitted ops must be rolled back (epoch bump) | Orphaned data **persists** on replicas that received it, resolved by vector clocks on next read |
+| Conflict resolution | Not needed (single writer = total order) | Read-time merge: vector clocks detect divergent versions, client or application resolves |
+
+### No Rollback, No Problem
+
+In Voldemort's client-coordinated write path
+(`PipelineRoutedStore.put()`):
+
+1. Client sends write to N nodes with a vector clock version
+2. W nodes ACK → client considers it committed
+3. If client crashes after quorum ACK → data stays on those W nodes,
+   **no coordinator rolls it back**, no epoch bump, no rollback
+4. If < W ACK → client returns error. But the data that reached some
+   nodes **stays**. Those "orphaned" writes become another version
+   tracked by vector clocks
+5. On next read, the client receives all divergent versions and
+   resolves the conflict (or the application does via read-repair)
+
+There is no `committed_lsn` because there is no concept of
+"committed vs uncommitted." Every write that reaches a replica
+persists. Conflicts are resolved at read time, not write time.
+
+### Why Kuberic Cannot Adopt This Model
+
+Kuberic targets **strong consistency with total ordering** — a write
+is either committed (quorum-ACKed, durable, visible) or rolled back
+(never happened). This requires:
+
+- **Epoch-based fencing:** On writer failure, bump the epoch and
+  roll back uncommitted ops to prevent stale writes from persisting
+- **Single source of truth:** The primary's local state (leader-based)
+  or an external `committed_lsn` store (writer-based) determines
+  what survives a crash
+
+The Dynamo model's "keep everything, resolve on read" approach is
+incompatible with this: it would allow explicitly-failed writes
+(client received `Err(NoWriteQuorum)`) to persist in the system,
+violating **response consistency** — the system's state after
+recovery would contradict what the client was told.
+
+### The Fundamental Trade-Off
+
+Separating the writer from replicas (client-coordinated writes)
+saves one network hop but loses the "primary as authority" property
+that makes the leader-based system correct without external state.
+Recovering this property costs either:
+
+- **A correctness window** (fire-and-forget `committed_lsn` to
+  coordinator — microsecond TCP buffer window)
+- **The latency that was saved** (acknowledged `committed_lsn` to
+  coordinator + etcd persistence)
+
+Dynamo-family systems avoid this trade-off entirely by giving up
+rollback. Kuberic's strong consistency requirement makes this
+trade-off unavoidable. The existing leader-based operator
+(`kuberic-operator`) — where the primary IS a replica — remains
+the optimal design for strong consistency with low write latency.
 
 ---
 
