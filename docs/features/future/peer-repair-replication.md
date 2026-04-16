@@ -1,5 +1,30 @@
 # Kuberic: Peer-Repair Replication
 
+> **Status: ABANDONED.** This design does not improve write latency —
+> the original motivation. Both peer-repair and writer-based designs
+> wait for W ACKs, yielding the same write latency. Writer-based
+> actually has better tail latency: it sends to all N and waits for
+> the W-th fastest ACK, naturally dodging slow replicas. Peer-repair
+> sends to exactly W and must wait for the slowest of that subset.
+>
+> Peer-repair's actual benefits (stateless Writer, reduced Writer
+> bandwidth) do not justify its costs: significantly higher replica
+> complexity (repair protocol, op store, GC coordination, 6 known
+> issues) and worse tail latency. The committed_lsn tracking
+> complexity (coordinator persistence, durability trade-offs) is
+> identical in both designs and cannot be avoided.
+>
+> The writer-based design (`writer-based-replication.md`) was also
+> subsequently abandoned — separating the Writer from replicas creates
+> a `committed_lsn` problem whose correct solution (coordinator +
+> etcd persistence) adds back the latency that was saved. The existing
+> leader-based operator (`kuberic-operator`) remains the optimal
+> design for write latency with correct semantics.
+>
+> The analysis below is preserved for reference.
+
+---
+
 Design for a replication system where the Writer sends writes to a
 quorum of replicas, and replicas **repair each other** to fill in
 missing data. The Writer's job ends once W replicas ACK.
@@ -658,11 +683,96 @@ Writer crash. This is a very small window (microseconds between
 quorum ACK and coordinator report) and may be acceptable for some
 workloads.
 
+##### Alternative Considered: Authority-Based Rollback (No committed_lsn)
+
+Instead of tracking `committed_lsn`, an alternative is to pick an
+**authority replica** on epoch bump and keep everything it has —
+the same approach used by the existing leader-based system
+(`driver.rs:340`: select new primary by highest LSN). Two variants
+were considered:
+
+**Option D: Max-LSN Authority (no pre-designation).**
+On Writer crash, coordinator queries all replicas for
+`received_lsn`, computes `authority_lsn = max(all survivors)`,
+pushes `update_epoch { authority_lsn }`. Replicas keep everything
+≤ `authority_lsn`. New Writer starts at `authority_lsn + 1`. No
+`committed_lsn` tracking, no CRD writes, no fire-and-forget
+window.
+
+**Option E: Designated Preferred Replica.**
+Coordinator designates one replica as "preferred." Writer always
+includes it in W. On failover, preferred's `received_lsn` is the
+authority. If preferred is also down, fall back to Option D.
+Simpler failover but adds a soft role and a hotspot.
+
+**Both options are rejected — they violate response consistency.**
+
+The authority approach keeps ALL ops up to the max LSN, including
+ops that never reached quorum. This conflates two semantically
+distinct cases:
+
+```
+Scenario A — committed, then replica + Writer crash:
+  Writer sends LSN=50 to R₁ and R₂ (W=2). Both ACK → committed.
+  Client receives Ok(50).
+  R₂ crashes, Writer crashes.
+  Survivors: R₁ has LSN=50, R₃ does not.
+  Authority says keep LSN=50 ← CORRECT (client saw success)
+
+Scenario B — uncommitted, then Writer crash:
+  Writer sends LSN=50 to R₁ only (W=2 needed, 1 ACK).
+  Client receives Err(NoWriteQuorum).
+  R₂ crashes (unrelated), Writer crashes.
+  Survivors: R₁ has LSN=50, R₃ does not.
+  Authority says keep LSN=50 ← WRONG (client was told write failed)
+```
+
+The coordinator sees **identical** replica state in both scenarios:
+one survivor with LSN=50, one without. The authority approach keeps
+LSN=50 in both cases. But in Scenario B, the client received a
+**definitive error** (`Err(NoWriteQuorum)`) — the system explicitly
+told the client the write did not succeed. Keeping the data after
+recovery makes the system state **inconsistent with the client's
+knowledge**.
+
+**Why the existing leader-based system avoids this problem:**
+
+In the existing leader-based kuberic (`PartitionDriver::failover`),
+the new primary is elected only when the old primary has **crashed**.
+The client's most recent interaction with the crashed primary is a
+**transport error** (connection lost) — the client does not know
+whether the in-flight operation succeeded or not. The operation is
+**in-doubt**, not explicitly failed. Kuberic is free to keep or
+discard in-doubt ops; the client has no expectation either way.
+
+The peer-repair Writer system is different: the Writer can return
+`Err(NoWriteQuorum)` to the client (a **definitive** response)
+and then crash afterward. The client knows the write failed. The
+system must honor this:
+
+| Client status | Existing leader-based | Peer-repair Writer |
+|---|---|---|
+| In-doubt (transport error) | Primary crash caused the error — the only case | Writer crash before responding |
+| Explicitly failed | N/A — primary stays alive after NoWriteQuorum | Writer returns Err, then crashes later |
+
+In the "explicitly failed" case, **response consistency** requires
+that the data is NOT present after recovery. The authority approach
+cannot guarantee this because it lacks the information to distinguish
+committed from uncommitted ops. Only the Writer (which counted ACKs)
+or a durable store the Writer reported to can provide this.
+
+**Conclusion:** `committed_lsn` tracking (Option A) is necessary for
+correctness. The complexity it introduces (coordinator persistence,
+fire-and-forget window, batching trade-off) is the cost of honoring
+response consistency. The authority-based approach (Options D/E) is
+simpler but sacrifices this property.
+
 **Recommendation: Option A (fire-and-forget).** The coordinator
 stream is already open, sending an extra progress message per commit
 is negligible, and it closes the correctness gap to a microsecond
-TCP buffer window. Option B is incorrect. Option C is acceptable
-only for workloads that tolerate rare data loss.
+TCP buffer window. Option B is incorrect. Options D and E violate
+response consistency. Option C is acceptable only for workloads that
+tolerate rare data loss.
 
 ### Replica Building
 

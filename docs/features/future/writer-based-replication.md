@@ -1,5 +1,40 @@
 # Kuberic: Writer-Based Replication
 
+> **Status: ABANDONED.** This design separates the Writer from the
+> replicas to eliminate the primary intermediary (1 hop instead of 2).
+> However, separating the Writer creates a fundamental correctness
+> problem: `committed_lsn` (which ops are quorum-committed) is known
+> only to the Writer. If the Writer crashes, this information is lost,
+> and replicas may roll back committed ops — data loss.
+>
+> The fix requires the Writer to externalize `committed_lsn` before
+> returning success to the client. Both options are unsatisfying:
+>
+> - **Fire-and-forget** (send `committed_lsn` to coordinator without
+>   waiting for ACK): The Writer can crash after returning `Ok` to the
+>   client but before the message reaches the coordinator (TCP buffer
+>   not flushed). Microsecond window, but a real **correctness hole** —
+>   a committed op can be rolled back.
+>
+> - **Strict** (wait for coordinator to persist `committed_lsn` to
+>   etcd before returning `Ok`): Adds coordinator RTT + etcd write
+>   latency (~1-5ms) to every write. Total latency is comparable to
+>   or **worse** than the existing 2-hop leader-based system, defeating
+>   the design's latency motivation.
+>
+> The root cause: the existing leader-based system gets correctness
+> for free because the primary IS a replica — its local state is
+> authoritative, no external `committed_lsn` tracking needed. Removing
+> the primary saves 1 hop but loses this property. Recovering it costs
+> exactly what was saved — either a correctness window or an extra hop.
+>
+> The existing leader-based operator (`kuberic-operator`) remains the
+> optimal design for write latency with correct semantics.
+>
+> The analysis below is preserved for reference.
+
+---
+
 Design for a **new** operator and control system that decouples the
 quorum coordination logic into a standalone **Writer** library. The
 Writer handles LSN assignment, fan-out to replicas, and quorum
@@ -843,8 +878,21 @@ to the user, ensuring the coordinator always has a value ≥ what the
 user has seen. This is a fire-and-forget send on the already-open
 coordinator stream — negligible cost.
 
+An alternative approach — picking an "authority" replica by highest
+LSN (the same technique the existing leader-based system uses for
+failover) — was considered and rejected. The authority approach
+keeps all ops on the highest-LSN survivor, including ops that the
+client was **explicitly told failed** (`Err(NoWriteQuorum)`). In the
+existing leader-based system, the primary crash IS the client error
+(in-doubt status), so keeping everything is valid. In the Writer
+system, the client can receive a definitive failure and THEN the
+Writer crashes — the system must honor that failure by not retaining
+the data.
+
 See [peer-repair-replication.md](peer-repair-replication.md)
-for the full analysis with scenario traces and alternative options.
+(abandoned — preserved for reference) for the full analysis with
+scenario traces, the authority-based alternative analysis, and the
+response-consistency argument.
 
 #### 7. Replica Building (Copy + Catch-Up)
 
