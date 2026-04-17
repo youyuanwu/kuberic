@@ -443,10 +443,11 @@ impl PartitionDriver {
     ///
     /// Matches SF's SwapPrimary reconfiguration:
     /// 1. Revoke write status on old primary (SF Phase 0: Demote)
-    /// 2. Demote old primary → ActiveSecondary
-    /// 3. Promote target → Primary (SF Phase 4: Activate)
-    /// 4. Distribute epoch to other secondaries (best-effort)
-    /// 5. Reconfigure quorum + catchup
+    /// 2. Wait for target to catch up (SF CatchupDuringSwap)
+    /// 3. Demote old primary → ActiveSecondary
+    /// 4. Promote target → Primary (SF Phase 4: Activate)
+    /// 5. Distribute epoch to other secondaries (best-effort)
+    /// 6. Reconfigure quorum + catchup
     pub async fn switchover(&mut self, target_id: ReplicaId) -> Result<()> {
         let old_primary_id = self.primary_id.ok_or(KubericError::NotPrimary)?;
 
@@ -474,14 +475,61 @@ impl PartitionDriver {
             .revoke_write_status()
             .await?;
 
-        // 2. Demote old primary → ActiveSecondary
+        // 2. E2 fix: wait for target to catch up before demotion.
+        // After revoke, the primary's LSN is frozen (no new writes). The
+        // drain tasks are still delivering in-flight items to secondaries.
+        // Poll until the target has received all data, then it's safe to
+        // demote (which triggers close_all on the replicator).
+        //
+        // This matches SF's CatchupDuringSwap — the post-revoke catchup
+        // that guarantees the target has all committed data before promotion.
+        // Use get_status for live progress (GrpcReplicaHandle caches progress)
+        let primary_lsn = match self.replicas[&old_primary_id].handle.get_status().await {
+            Ok(status) => status.current_progress,
+            Err(_) => self.replicas[&old_primary_id].handle.current_progress(),
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // Use get_status() to get live progress (not cached value)
+            let target_progress = match self.replicas[&target_id].handle.get_status().await {
+                Ok(status) => status.current_progress,
+                Err(_) => -1,
+            };
+            if target_progress >= primary_lsn {
+                info!(
+                    target_id,
+                    target_progress, primary_lsn, "target caught up — proceeding with demotion"
+                );
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                warn!(
+                    target_id,
+                    target_progress,
+                    primary_lsn,
+                    "switchover catchup timeout — aborting, restoring write status"
+                );
+                // Abort: re-grant write status on old primary
+                self.replicas[&old_primary_id]
+                    .handle
+                    .change_role(self.epoch, Role::Primary)
+                    .await
+                    .ok();
+                return Err(KubericError::Internal(
+                    "switchover catchup timeout — target did not catch up".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // 3. Demote old primary → ActiveSecondary
         self.replicas[&old_primary_id]
             .handle
             .change_role(new_epoch, Role::ActiveSecondary)
             .await?;
         self.replicas.get_mut(&old_primary_id).unwrap().role = Role::ActiveSecondary;
 
-        // 3. Promote target → Primary (SF Phase 4: Activate)
+        // 4. Promote target → Primary (SF Phase 4: Activate)
         // If this fails or times out, rollback: re-promote old primary
         // (SF AbortPhase0Demote + RevertConfiguration pattern).
         let promote_result = tokio::time::timeout(
@@ -515,10 +563,10 @@ impl PartitionDriver {
         self.replicas.get_mut(&target_id).unwrap().role = Role::Primary;
         self.primary_id = Some(target_id);
 
-        // 4. Distribute epoch to other secondaries (best-effort).
+        // 5. Distribute epoch to other secondaries (best-effort).
         // Unreachable secondaries are skipped — they'll be rebuilt later.
-        // The old primary already has the epoch from step 2 (change_role).
-        // The target already has it from step 3.
+        // The old primary already has the epoch from step 3 (change_role).
+        // The target already has it from step 4.
         for (&id, entry) in &self.replicas {
             if id != old_primary_id
                 && id != target_id
@@ -893,6 +941,7 @@ pub mod testing {
         grpc_address: String,
         shutdown_token: CancellationToken,
         role: std::sync::Mutex<Role>,
+        epoch: std::sync::Mutex<Epoch>,
         _actor_handle: tokio::task::JoinHandle<()>,
         _grpc_handle: tokio::task::JoinHandle<()>,
     }
@@ -943,6 +992,7 @@ pub mod testing {
                 grpc_address,
                 shutdown_token,
                 role: std::sync::Mutex::new(Role::Unknown),
+                epoch: std::sync::Mutex::new(Epoch::default()),
                 _actor_handle: actor_handle,
                 _grpc_handle: grpc_handle,
             })
@@ -992,7 +1042,10 @@ pub mod testing {
 
         async fn change_role(&self, epoch: Epoch, role: Role) -> Result<()> {
             *self.role.lock().unwrap() = role;
-            self.secondary_state.update_epoch(epoch);
+            *self.epoch.lock().unwrap() = epoch;
+            // Note: do NOT call secondary_state.update_epoch here — the production
+            // PodRuntime::handle_change_role does not update SecondaryState epoch.
+            // SecondaryState epoch is only updated via explicit update_epoch() calls.
             self.send_control(|reply| ReplicatorControlEvent::ChangeRole { epoch, role, reply })
                 .await?;
             // Mirror PodRuntime: set access status based on role
@@ -1010,6 +1063,7 @@ pub mod testing {
         }
 
         async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+            *self.epoch.lock().unwrap() = epoch;
             self.secondary_state.update_epoch(epoch);
             self.send_control(|reply| ReplicatorControlEvent::UpdateEpoch { epoch, reply })
                 .await
@@ -1085,9 +1139,10 @@ pub mod testing {
 
         async fn get_status(&self) -> Result<ReplicaStatusInfo> {
             let role = *self.role.lock().unwrap();
+            let epoch = *self.epoch.lock().unwrap();
             Ok(ReplicaStatusInfo {
                 role,
-                epoch: self.secondary_state.epoch(),
+                epoch,
                 current_progress: self.state.current_progress(),
                 healthy: true,
             })

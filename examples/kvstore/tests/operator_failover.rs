@@ -578,3 +578,78 @@ async fn test_primary_crash_failover_rejoin() {
 
     driver.delete_partition().await.unwrap();
 }
+
+/// **E2 regression test:** Switchover with concurrent writes preserves
+/// all committed data. The catchup loop in `switchover()` polls the
+/// target's `current_progress` via `get_status()` until it matches the
+/// primary's frozen LSN, ensuring no committed writes are lost when
+/// `close_all()` fires on demotion.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_e2_switchover_preserves_all_committed_writes() {
+    let pod1 = KvPod::start(1).await;
+    let pod2 = KvPod::start(2).await;
+    let pod3 = KvPod::start(3).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+    assert_eq!(driver.primary_id(), Some(1));
+
+    // Spawn concurrent writer — writes rapidly without pause
+    let addr = pod1.client_address.clone();
+    let writer = tokio::spawn(async move {
+        let mut client = connect_kv_client(&addr).await;
+        let mut committed_keys = Vec::new();
+        for i in 1..=500 {
+            match client
+                .put(proto::PutRequest {
+                    key: format!("k{i}"),
+                    value: format!("v{i}"),
+                })
+                .await
+            {
+                Ok(_) => committed_keys.push(format!("k{i}")),
+                Err(_) => break, // write revocation hit — stop
+            }
+        }
+        committed_keys
+    });
+
+    // Small delay to let some writes flow, then switchover while
+    // the writer is still active (writes + switchover race)
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    driver.switchover(2).await.unwrap();
+    assert_eq!(driver.primary_id(), Some(2));
+
+    // Collect committed keys (writer may have stopped early due to revoke)
+    let committed_keys = writer.await.unwrap();
+    let committed_count = committed_keys.len();
+    assert!(committed_count > 0, "at least some writes should succeed");
+
+    // Wait for replication to settle
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify: new primary has ALL committed entries
+    let state = pod2.state.read().await;
+    let mut missing = Vec::new();
+    for key in &committed_keys {
+        if !state.data.contains_key(key) {
+            missing.push(key.clone());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "E2 regression: new primary (pod 2) is missing {}/{} committed entries \
+         after switchover. Missing: {:?}",
+        missing.len(),
+        committed_count,
+        &missing[..missing.len().min(10)]
+    );
+}

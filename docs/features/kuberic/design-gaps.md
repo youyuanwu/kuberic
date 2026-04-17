@@ -824,12 +824,14 @@ with `Role::ActiveSecondary`. On error, the handle is simply dropped.
 **Test:** `test_add_replica_cleans_up_on_failure` — aborts a handle
 before `add_replica`, verifies the failed call leaves no zombie.
 
-### E2. Switchover missing explicit double-catchup
+### E2. Switchover missing catchup — ✅ Fixed
 
-**Severity:** Should-fix (existing code bug, confirmed data loss window)
+**Severity:** ✅ Resolved
+**Affects:** `PartitionDriver::switchover()`
+**File:** `kuberic-core/src/driver.rs`
 
-`switchover()` has no catch-up step between `revoke_write_status` and
-`change_role(Primary)` on the target.
+`switchover()` had no catch-up step between `revoke_write_status` and
+`change_role(ActiveSecondary)` on the old primary.
 
 **Confirmed scenario** (3-replica, P=1, S=2=target, S=3):
 1. Write W ACKed to client via P=1 + S=3 (quorum met)
@@ -843,9 +845,131 @@ before `add_replica`, verifies the failed call leaves no zombie.
 Window: microseconds to low milliseconds. Under high write throughput
 with a slow target, the window widens.
 
-**Fix:** After `revoke_write_status`, query old primary's
-`current_progress` and poll target's `current_progress` until it
-matches. Then proceed with demotion + promotion.
+#### What SF does (from C++ source)
+
+SF's `StatefulServiceDemoteToSecondary` action list
+(`ProxyActionsList.cpp:130-142`) runs **10 ordered steps**:
+
+```
+1. ReconfigurationStarting
+2. ReplicatorPreWriteStatusRevokeUpdateConfiguration
+      → configure replicator with must_catch_up on swap target
+3. PreWriteStatusRevokeCatchup             ← CATCHUP #1
+      → wait_for_catch_up_quorum(WRITE)
+      → writes still flowing (WriteStatus = Granted)
+4. UpdateEpoch
+5. ReplicatorUpdateCatchUpConfiguration
+6. CatchupReplicaSetAll (CatchupDuringSwap) ← CATCHUP #2
+      → wait_for_catch_up_quorum(WRITE or ALL)
+      → writes stopped (WriteStatus = TryAgain)
+7. UpdateReadWriteStatus                   ← write revocation HERE
+8. ChangeReplicatorRole                    ← demote replicator P→S
+9. ChangeReplicaRole                       ← demote user service P→S
+10. ReconfigurationEnding
+```
+
+The `ReadWriteStatusCalculator.cpp` state machine confirms the timing:
+
+| Reconfig phase | ReadStatus | WriteStatus |
+|---|---|---|
+| PreWriteStatusCatchup | Granted | **Granted** (writes flow) |
+| CatchupInProgress | Granted | **TryAgain** (writes stopped) |
+| CatchupCompleted | TryAgain | TryAgain |
+| TransitioningRole | NotPrimary | NotPrimary |
+
+Key: catchup #1 runs with writes granted, so the target gets nearly
+caught up while clients keep writing. Then writes are revoked and
+catchup #2 handles the final few ops. Only after both catchups does
+the role change happen.
+
+`PreWriteStatusRevokeCatchup` was added later as an optimization
+(behind `IsPreWriteStatusCatchupEnabled` feature flag). The original
+SF relied on catchup #2 alone — the post-revoke catchup is the safety
+net. Catchup #1 reduces the post-revoke window but is not required
+for correctness.
+
+#### Why kuberic doesn't follow SF's full sequence
+
+SF's double-catchup operates at the **replicator level** — the RA calls
+`wait_for_catch_up_quorum()` on the replicator, which blocks until the
+target's ACKed LSN reaches the required level. This requires:
+
+1. **The replicator is still running as primary** during both catchups.
+   SF doesn't demote the replicator until step 8 — after both catchups.
+2. **`must_catch_up`** semantics in the quorum tracker that specifically
+   target the swap secondary.
+3. **Separate replicator role and service role transitions** — SF
+   changes the replicator role and user service role in distinct steps.
+
+Kuberic's `change_role(ActiveSecondary)` is a single call that demotes
+the replicator AND triggers `close_all()` on the `PrimarySender` — there
+is no intermediate state where the replicator is demoted but connections
+are still alive. Once `close_all()` fires, any un-drained data in the
+unbounded channels is lost.
+
+#### Kuberic fix: poll target progress after revoke
+
+Since kuberic's replicator drain tasks run independently (tokio spawned
+tasks), ops already in the unbounded channels will drain to completion
+as long as the channels aren't dropped. The fix is to **wait for the
+target to catch up before demoting** — don't call `change_role` (which
+triggers `close_all`) until the target has received all data:
+
+```rust
+// 1. Revoke write status (atomic — no new writes accepted)
+revoke_write_status().await?;
+
+// 2. Wait for target to catch up (drain tasks still running)
+//    After revoke, LSN is frozen. Poll until target matches.
+let primary_lsn = self.replicas[&old_primary_id]
+    .handle.current_progress();
+let deadline = Instant::now() + Duration::from_secs(5);
+loop {
+    let target_progress = self.replicas[&target_id]
+        .handle.current_progress();
+    if target_progress >= primary_lsn { break; }
+    if Instant::now() > deadline {
+        // Abort: re-grant writes, return error
+        return Err(KubericError::Internal(
+            "switchover catchup timeout".into()));
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}
+
+// 3. Now safe to demote (target has all data)
+change_role(new_epoch, ActiveSecondary).await?;  // close_all() OK
+change_role(new_epoch, Primary).await?;          // promote target
+```
+
+This is simpler than SF's full sequence because:
+- No catchup #1 needed: kuberic's `revoke_write_status` is an atomic
+  flag set, and the drain tasks continue independently. By the time
+  we poll, most ops have already drained.
+- No `must_catch_up` quorum interaction needed: we poll a single
+  target's `current_progress`, not the full quorum tracker.
+- The window between revoke and the first poll is microseconds —
+  the drain tasks typically finish before the first poll iteration.
+
+**Fix (implemented):**
+
+- `switchover()` now polls target's `current_progress` via `get_status()`
+  after `revoke_write_status` and before `change_role(ActiveSecondary)`.
+  The loop polls every 10ms with a 5-second timeout. On timeout, the
+  switchover is aborted and write status restored on the old primary.
+
+- `SecondaryReceiver` now updates `PartitionState::current_progress`
+  when accepting replication items. Previously, only the primary actor
+  set `current_progress` — secondaries always reported 0. This made
+  `GetStatus` on a secondary return stale progress.
+
+- `InProcessReplicaHandle::change_role` no longer calls
+  `secondary_state.update_epoch()` — this was a test-infrastructure
+  divergence from the production `PodRuntime` path, which only updates
+  `SecondaryState` epoch via explicit `update_epoch()` calls. Added
+  local `epoch: Mutex<Epoch>` field for `get_status()` reporting.
+
+- Test: `test_e2_switchover_data_loss_without_catchup` verifies that
+  concurrent writes + immediate switchover preserves all committed data.
 
 ### E3. Pod restart not detected — stale handle in driver
 

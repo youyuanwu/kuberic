@@ -186,10 +186,15 @@ impl ReplicatorData for SecondaryReceiver {
                                 // Propagate committed_lsn to PartitionState (B5 fix).
                                 // This makes committed_lsn visible to PodRuntime's
                                 // handle_update_epoch for correct rollback boundaries.
-                                if let Some(ref ps) = partition_state
-                                    && item.committed_lsn > ps.committed_lsn()
-                                {
-                                    ps.set_committed_lsn(item.committed_lsn);
+                                if let Some(ref ps) = partition_state {
+                                    if item.committed_lsn > ps.committed_lsn() {
+                                        ps.set_committed_lsn(item.committed_lsn);
+                                    }
+                                    // Update current_progress so GetStatus reports
+                                    // secondary replication progress (E2 catchup fix).
+                                    if lsn > ps.current_progress() {
+                                        ps.set_current_progress(lsn);
+                                    }
                                 }
 
                                 if let Some(ref op_tx) = operation_tx {

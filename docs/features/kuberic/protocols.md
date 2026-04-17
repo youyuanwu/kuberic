@@ -378,12 +378,12 @@ Neither stream reconnects on failure:
 
 **During switchover (P→S on old primary):**
 
-| Phase | Read | Write |
-|---|---|---|
-| Pre-catchup | Granted | **Granted** (double-catchup) |
-| Write revoked | Granted | ReconfigPending |
-| Read revoked | ReconfigPending | ReconfigPending |
-| Role changed | NotPrimary | NotPrimary |
+| Phase | Read | Write | Notes |
+|---|---|---|---|
+| Pre-catchup | Granted | **Granted** | SF catchup #1 (target catches up while writes flow) |
+| Write revoked | Granted | ReconfigPending | `revoke_write_status()` — no new writes |
+| Post-revoke catchup | Granted | ReconfigPending | SF catchup #2 (final drain) — **kuberic: E2 not yet implemented** |
+| Role changed | NotPrimary | NotPrimary | `change_role(ActiveSecondary)` → `close_all()` |
 
 **Runtime owns status transitions** — the replicator only writes LSN values
 to `PartitionState`. See `pod.rs::set_status_for_role()`.

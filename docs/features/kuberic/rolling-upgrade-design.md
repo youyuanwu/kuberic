@@ -222,9 +222,11 @@ application.
 2. **Primary movement is mandatory**: SF always swaps primary off the
    upgrading node before proceeding. Kuberic should always switchover
    before upgrading the primary pod.
-3. **Double catchup before switchover**: SF's `SwapPrimary` does two
-   catchup rounds (with and without write status). Kuberic's
-   `switchover()` already implements this (SF Phase 0 + Phase 4).
+3. **Catchup before switchover**: SF's `SwapPrimary` does two catchup
+   rounds (with and without write status). Kuberic's `switchover()`
+   does NOT implement this yet — **E2 bug** in `design-gaps.md`.
+   Fix: poll target `current_progress` after `revoke_write_status`
+   before demotion.
 4. **Post-upgrade validation**: SF checks health after each node
    upgrade. Kuberic should verify the upgraded pod is healthy and
    replicating before proceeding.
