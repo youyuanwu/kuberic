@@ -179,6 +179,12 @@ pub fn create_pg_replicator(
                     if let Err(e) = self_instance.stop().await {
                         tracing::warn!("PG stop on close: {}", e);
                     }
+                    if current_role == Role::None {
+                        // Permanent removal — delete data directory
+                        let dir = self_instance.data_dir().to_path_buf();
+                        tracing::info!(?dir, "deleting data directory (decommissioned)");
+                        let _ = tokio::fs::remove_dir_all(&dir).await;
+                    }
                     shutdown_token.cancel();
                     let _ = reply.send(Ok(()));
                 }

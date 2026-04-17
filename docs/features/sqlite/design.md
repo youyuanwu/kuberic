@@ -408,13 +408,12 @@ would use group commit (batch multiple transactions' frames into
 one `replicate()` call) — this is a future optimization, not a
 design change.
 
-### KP-3: ChangeRole(None) Does Not Delete Data or Stop Client Server
+### KP-3: ChangeRole(None) Does Not Delete Data or Stop Client Server — ✅ Fixed
 
-`ChangeRole(Role::None)` is a no-op. It should stop the client server
-(if primary) and the subsequent `Close` should delete the data directory
-to complete decommissioning. Currently data is preserved regardless of
-role at close time. See `design-gaps.md` C4 for the full description
-and fix.
+`ChangeRole(Role::None)` now stops the client server immediately.
+`Close` after `ChangeRole(None)` deletes the data directory.
+`Close` from any other role preserves data for restart recovery.
+See `design-gaps.md` C4.
 
 ### KP-4: `add_replica` / `restart_secondary` Always Forces Full Rebuild
 

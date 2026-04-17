@@ -183,6 +183,7 @@ pub async fn run_service(
     let mut bg_token: Option<CancellationToken> = None;
     let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut client_server_shutdown: Option<CancellationToken> = None;
+    let mut last_role = Role::Unknown;
 
     info!("sqlite service started, waiting for events");
 
@@ -311,9 +312,19 @@ pub async fn run_service(
                                 }));
                             }
                         }
-                        Role::None | Role::Unknown => {}
+                        Role::None => {
+                            // Permanent removal — stop client server immediately
+                            if let Some(shutdown) = client_server_shutdown.take() {
+                                shutdown.cancel();
+                            }
+                            if let Some(h) = client_server_handle.take() {
+                                let _ = h.await;
+                            }
+                        }
+                        Role::Unknown => {}
                     }
 
+                    last_role = new_role;
                     let _ = reply.send(Ok(String::new()));
                 }
                 LifecycleEvent::Close { reply } => {
@@ -330,7 +341,13 @@ pub async fn run_service(
                     if let Some(h) = client_server_handle.take() {
                         let _ = h.await;
                     }
+                    let data_dir = state.lock().await.data_dir.clone();
                     state.lock().await.close();
+                    if last_role == Role::None {
+                        // Permanent removal — delete data directory
+                        info!(?data_dir, "deleting data directory (decommissioned)");
+                        let _ = tokio::fs::remove_dir_all(&data_dir).await;
+                    }
                     let _ = reply.send(Ok(()));
                     break;
                 }

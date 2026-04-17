@@ -133,6 +133,7 @@ pub async fn run_service(
     let mut bg_token: Option<CancellationToken> = None;
     let mut client_server_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut client_server_shutdown: Option<CancellationToken> = None;
+    let mut last_role = Role::Unknown;
 
     info!("kv service started, waiting for events");
 
@@ -231,9 +232,19 @@ pub async fn run_service(
                                 }));
                             }
                         }
-                        Role::None | Role::Unknown => {}
+                        Role::None => {
+                            // Permanent removal — stop client server immediately
+                            if let Some(shutdown) = client_server_shutdown.take() {
+                                shutdown.cancel();
+                            }
+                            if let Some(h) = client_server_handle.take() {
+                                let _ = h.await;
+                            }
+                        }
+                        Role::Unknown => {}
                     }
 
+                    last_role = new_role;
                     let _ = reply.send(Ok(String::new()));
                 }
                 LifecycleEvent::Close { reply } => {
@@ -250,8 +261,13 @@ pub async fn run_service(
                     if let Some(h) = client_server_handle.take() {
                         let _ = h.await;
                     }
-                    // Checkpoint on graceful close for fast recovery
-                    {
+                    if last_role == Role::None {
+                        // Permanent removal — delete data directory
+                        let dir = state.read().await.data_dir().to_path_buf();
+                        info!(?dir, "deleting data directory (decommissioned)");
+                        let _ = tokio::fs::remove_dir_all(&dir).await;
+                    } else {
+                        // Graceful close — checkpoint for fast recovery
                         let mut guard = state.write().await;
                         guard.committed_lsn = guard.last_applied_lsn;
                         if let Err(e) = guard.checkpoint().await {

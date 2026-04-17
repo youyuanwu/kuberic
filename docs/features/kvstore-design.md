@@ -256,5 +256,5 @@ during rollback — the replication stream continues (matches SF).
 |---------|--------|-------|
 | `KvPod::crash()` / `restart()` | Done | Abrupt abort — Pattern 2 test validates primary crash → failover → rejoin |
 | B0: QuorumTracker timeout | Pre-existing gap | `replicate()` hangs forever if all secondaries die |
-| C4: ChangeRole(None) cleanup | Bug | No-op — should stop client server + delete data on Close. See `design-gaps.md` C4 |
+| C4: ChangeRole(None) cleanup | ✅ Fixed | Stops client server on None, deletes data dir on Close. See `design-gaps.md` C4 |
 | `OpenMode::Existing` support | Gap | `KvState::open()` already loads snapshot + replays WAL from `data_dir`. But `add_replica` always uses `OpenMode::New` + full `build_replica` copy. A pod restart with PVC-preserved data could skip the copy and reattach via `OpenMode::Existing`. Requires new driver primitive (`reconnect_secondary`). See `rolling-upgrade-design.md` RF-1. |
