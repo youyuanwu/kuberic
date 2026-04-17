@@ -807,24 +807,22 @@ design work needed — just implementation.
 Discovered during SoT review of `rolling-upgrade-design.md`. Two are
 existing code bugs in `kuberic-core/src/driver.rs`.
 
-### E1. `add_replica` zombie on failure — stale replica in driver
+### E1. `add_replica` zombie on failure — ✅ Fixed
 
-**Severity:** Should-fix (existing code bug)
+**Severity:** ✅ Resolved
 
-`add_replica` inserts into `self.replicas` at driver.rs:721 *before*
-fallible ops (`open`, `build_replica`, `change_role`). If any step fails,
-the zombie replica stays in the map with `Role::None` or `IdleSecondary`.
+`add_replica` used to insert into `self.replicas` at driver.rs:721 *before*
+fallible ops (`open`, `build_replica`, `change_role`). If any step failed,
+the zombie replica stayed in the map — inflating quorum and blocking
+re-addition.
 
-On subsequent `failover()`:
-- Zombie counted in `total_count` → inflated `write_quorum`
-- Zombie listed as `ActiveSecondary` in quorum config (line 389 hardcodes
-  role) despite actually being `None`/`Idle`
-- In most cases (3+ healthy replicas), quorum is still met. Deadlock
-  occurs only if zombie inflation pushes `write_quorum` above the number
-  of actually-healthy replicas.
+**Fix:** Deferred insertion — the handle is held locally through all
+fallible ops (`open`, `update_epoch`, `change_role`, `build_replica`,
+promote). Only after all succeed is it inserted into `self.replicas`
+with `Role::ActiveSecondary`. On error, the handle is simply dropped.
 
-**Fix:** Scopeguard pattern — remove from `self.replicas` on error. Or
-defer insertion until after `build_replica` succeeds.
+**Test:** `test_add_replica_cleans_up_on_failure` — aborts a handle
+before `add_replica`, verifies the failed call leaves no zombie.
 
 ### E2. Switchover missing explicit double-catchup
 

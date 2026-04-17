@@ -722,24 +722,13 @@ impl PartitionDriver {
         let epoch = self.epoch;
         info!(replica_id, ?epoch, "adding replica");
 
-        // Store handle
-        self.replicas.insert(
-            replica_id,
-            ReplicaState {
-                handle,
-                role: Role::Unknown,
-            },
-        );
-
-        // 1. Open + set epoch + assign idle role
-        let h = &self.replicas[&replica_id].handle;
-        h.open(OpenMode::New).await?;
-        h.update_epoch(epoch).await?;
-        h.change_role(epoch, Role::IdleSecondary).await?;
-        self.replicas.get_mut(&replica_id).unwrap().role = Role::IdleSecondary;
+        // 1. Open + set epoch + assign idle role (fallible — don't insert yet)
+        handle.open(OpenMode::New).await?;
+        handle.update_epoch(epoch).await?;
+        handle.change_role(epoch, Role::IdleSecondary).await?;
 
         // 2. build_replica on primary (copies state via data plane)
-        let addr = self.replicas[&replica_id].handle.replicator_address();
+        let addr = handle.replicator_address();
         let replica_info = ReplicaInfo {
             id: replica_id,
             role: Role::IdleSecondary,
@@ -755,11 +744,16 @@ impl PartitionDriver {
             .await?;
 
         // 3. Promote idle → active
-        self.replicas[&replica_id]
-            .handle
-            .change_role(epoch, Role::ActiveSecondary)
-            .await?;
-        self.replicas.get_mut(&replica_id).unwrap().role = Role::ActiveSecondary;
+        handle.change_role(epoch, Role::ActiveSecondary).await?;
+
+        // All fallible ops succeeded — now insert into driver state
+        self.replicas.insert(
+            replica_id,
+            ReplicaState {
+                handle,
+                role: Role::ActiveSecondary,
+            },
+        );
 
         // 4. Reconfigure quorum (rebuild full config, must_catch_up on new replica)
         self.reconfigure_quorum(primary_id, Some(replica_id))
@@ -1107,5 +1101,41 @@ pub mod testing {
             handles.push(Box::new(InProcessReplicaHandle::spawn(i).await?));
         }
         Ok(handles)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::testing::{InProcessReplicaHandle, spawn_replicas};
+
+    /// E1: add_replica used to insert into self.replicas BEFORE fallible ops.
+    /// If open() failed, the zombie replica stayed in the map.
+    /// Fixed: insertion is deferred until all fallible ops succeed.
+    #[tokio::test]
+    async fn test_add_replica_cleans_up_on_failure() {
+        // 1. Set up a primary-only partition (no secondaries — build_replica
+        //    requires a real state provider which InProcessReplicaHandle lacks)
+        let handles = spawn_replicas(1).await.unwrap();
+        let mut driver = PartitionDriver::new();
+        driver.create_partition(handles).await.unwrap();
+        assert_eq!(driver.replica_ids().len(), 1);
+        assert_eq!(driver.primary_id(), Some(1));
+
+        // 2. Spawn replica 2, then abort it so its actor is dead
+        let handle2 = InProcessReplicaHandle::spawn(2).await.unwrap();
+        handle2.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 3. add_replica should fail (open() sends to a dead channel)
+        let result = driver.add_replica(Box::new(handle2)).await;
+        assert!(result.is_err(), "add_replica should fail on aborted handle");
+
+        // 4. FIXED: no zombie — replica 2 should NOT be in the map
+        assert!(
+            !driver.replica_ids().contains(&2),
+            "after fix: failed add_replica must not leave zombie in driver"
+        );
+        assert_eq!(driver.replica_ids().len(), 1, "only the primary remains");
     }
 }
