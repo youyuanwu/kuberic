@@ -689,12 +689,13 @@ Adding a leaderless mode would require:
 ## Why Leaderless Systems Avoid the committed_lsn Problem
 
 When exploring client-coordinated writes for kuberic (see the
-abandoned designs in `docs/features/future/writer-based-replication.md`
-and `docs/features/future/peer-repair-replication.md`), a fundamental
-correctness problem was discovered: if the writer is separated from
-the replicas, `committed_lsn` (which ops reached quorum) is known
-only to the writer. If the writer crashes, this information is lost,
-and replicas may roll back quorum-committed ops — data loss.
+designs in `docs/features/future/writer-based-replication.md`
+and `docs/features/future/peer-repair-replication.md`), a
+correctness problem was discovered: if the writer is separated
+from the replicas, `committed_lsn` (which ops reached quorum) is
+known only to the writer. If the writer crashes, this information
+is lost, and replicas may roll back quorum-committed ops — data
+loss.
 
 **Dynamo-family systems (Voldemort, Cassandra, Riak) do not have this
 problem** because they never roll back anything:
@@ -727,41 +728,76 @@ There is no `committed_lsn` because there is no concept of
 "committed vs uncommitted." Every write that reaches a replica
 persists. Conflicts are resolved at read time, not write time.
 
-### Why Kuberic Cannot Adopt This Model
+### Strong Consistency Requires Either Authority or Tracking
 
 Kuberic targets **strong consistency with total ordering** — a write
 is either committed (quorum-ACKed, durable, visible) or rolled back
-(never happened). This requires:
+(never happened). This requires either:
 
-- **Epoch-based fencing:** On writer failure, bump the epoch and
-  roll back uncommitted ops to prevent stale writes from persisting
-- **Single source of truth:** The primary's local state (leader-based)
-  or an external `committed_lsn` store (writer-based) determines
-  what survives a crash
+- **An authoritative replica** whose local state defines truth on
+  failover (the existing leader-based operator's primary), OR
+- **External tracking** of `committed_lsn` to disambiguate
+  committed from uncommitted ops after writer crash.
 
-The Dynamo model's "keep everything, resolve on read" approach is
-incompatible with this: it would allow explicitly-failed writes
-(client received `Err(NoWriteQuorum)`) to persist in the system,
-violating **response consistency** — the system's state after
-recovery would contradict what the client was told.
+The Dynamo model's "keep everything, resolve on read" approach
+relies on multi-version coexistence (siblings or LWW timestamps)
+and is incompatible with kuberic's single-version, totally-ordered
+model.
 
-### The Fundamental Trade-Off
+### Resolving the Separated-Writer Problem (In-Doubt Contract)
 
 Separating the writer from replicas (client-coordinated writes)
-saves one network hop but loses the "primary as authority" property
-that makes the leader-based system correct without external state.
-Recovering this property costs either:
+saves one network hop but loses the "primary as authority" property.
+Initially this appeared to require either:
 
 - **A correctness window** (fire-and-forget `committed_lsn` to
-  coordinator — microsecond TCP buffer window)
+  coordinator — microsecond TCP buffer window), OR
 - **The latency that was saved** (acknowledged `committed_lsn` to
   coordinator + etcd persistence)
 
-Dynamo-family systems avoid this trade-off entirely by giving up
-rollback. Kuberic's strong consistency requirement makes this
-trade-off unavoidable. The existing leader-based operator
-(`kuberic-operator`) — where the primary IS a replica — remains
-the optimal design for strong consistency with low write latency.
+A third option exists: the **In-Doubt Writer Contract** — the
+Writer's `replicate()` API has three explicit outcomes: `Ok(lsn)`,
+`PreSendFailure` (clean failure, no replica touched), or
+`InDoubt { lsn, .. }` (data may exist on some replicas, caller must
+use idempotency). The Writer never returns a "definitively failed"
+error after sending to replicas, so the response-consistency
+violation that previously made the simple authority approach
+(`max(received_lsn)`) incorrect cannot occur.
+
+Under this contract:
+
+- No `committed_lsn` tracking, no coordinator persistence, no
+  external store, no latency penalty.
+- On `InDoubt`, the Writer poisons itself (refuses subsequent
+  ops). The coordinator runs the authority recovery protocol and
+  starts a new Writer.
+- The trade shifts from **correctness vs latency** to
+  **Writer takeover frequency vs latency** — transient quorum
+  failures trigger a Writer takeover instead of being absorbed
+  silently.
+
+See `docs/features/future/writer-based-replication.md`
+("In-Doubt Writer Contract" section) for the full analysis. The
+key insight: Dynamo-family systems escape `committed_lsn` by
+giving up rollback; the in-doubt contract escapes it by giving up
+the "definitively failed" error variant — partial-failure outcomes
+are made explicit (and unambiguous) in the type system.
+
+### Comparison of Approaches to the committed_lsn Problem
+
+| Approach | Used by | Trade-off |
+|---|---|---|
+| Primary as authority | Leader-based (kuberic-operator, SF, Raft) | None — primary's local state is authoritative for free |
+| Multi-version, no rollback | Dynamo, Voldemort, Cassandra, Riak | Eventual consistency, conflict resolution on read |
+| External `committed_lsn` (acknowledged) | Hypothetical writer-based | Adds back the latency that was saved |
+| External `committed_lsn` (fire-and-forget) | Hypothetical writer-based | Microsecond correctness window |
+| In-doubt Writer + authority | Writer-based with in-doubt contract | More frequent Writer takeovers; caller must handle in-doubt with idempotency |
+
+Each approach is correct for its design goals. The in-doubt
+contract is the only known way to combine separated-writer
+architecture, strong consistency, and 1-hop write latency — at
+the cost of caller-side complexity (idempotency handling) and
+occasional Writer takeovers.
 
 ---
 

@@ -1,37 +1,40 @@
 # Kuberic: Writer-Based Replication
 
-> **Status: ABANDONED.** This design separates the Writer from the
-> replicas to eliminate the primary intermediary (1 hop instead of 2).
-> However, separating the Writer creates a fundamental correctness
-> problem: `committed_lsn` (which ops are quorum-committed) is known
-> only to the Writer. If the Writer crashes, this information is lost,
-> and replicas may roll back committed ops — data loss.
+> **Status: REVISITED.** This design was previously marked abandoned
+> due to a `committed_lsn` correctness flaw that appeared unsolvable
+> without external storage or extra latency. The flaw is now resolved
+> by adopting an **In-Doubt Writer Contract** (see "In-Doubt Writer
+> Contract" section below). Under this contract:
 >
-> The fix requires the Writer to externalize `committed_lsn` before
-> returning success to the client. Both options are unsatisfying:
+> - The `replicate()` API returns three explicit outcomes:
+>   `Ok(lsn)`, `Err(PreSendFailure(_))` (clean failure, no replica
+>   touched), or `Err(InDoubt { lsn, .. })` (data may exist on
+>   some replicas — caller must use idempotency).
+> - The Writer **never** returns a "definitively failed" error after
+>   sending to replicas. The `InDoubt` variant makes ambiguity
+>   explicit in the type system.
+> - On `InDoubt`, the Writer **poisons** itself (refuses subsequent
+>   ops with `WriterPoisoned`). The coordinator detects this, runs
+>   the simple **authority approach** (`max(received_lsn)` across
+>   surviving replicas, no `committed_lsn` tracking), and starts a
+>   new Writer.
+> - **No external store. No `committed_lsn` persistence. No latency
+>   penalty.** The 1-hop write path is preserved.
 >
-> - **Fire-and-forget** (send `committed_lsn` to coordinator without
->   waiting for ACK): The Writer can crash after returning `Ok` to the
->   client but before the message reaches the coordinator (TCP buffer
->   not flushed). Microsecond window, but a real **correctness hole** —
->   a committed op can be rolled back.
+> The trade-off shifts from **correctness vs latency** to
+> **Writer takeover frequency vs latency**: transient quorum failures
+> trigger a Writer takeover (poison + new instance) instead of
+> being absorbed silently.
 >
-> - **Strict** (wait for coordinator to persist `committed_lsn` to
->   etcd before returning `Ok`): Adds coordinator RTT + etcd write
->   latency (~1-5ms) to every write. Total latency is comparable to
->   or **worse** than the existing 2-hop leader-based system, defeating
->   the design's latency motivation.
+> The existing leader-based operator (`kuberic-operator`) remains
+> the choice when caller code cannot handle in-doubt outcomes or
+> Writer takeover overhead is unacceptable. The writer-based design
+> is now a viable alternative when latency matters more than
+> Writer-instance stability.
 >
-> The root cause: the existing leader-based system gets correctness
-> for free because the primary IS a replica — its local state is
-> authoritative, no external `committed_lsn` tracking needed. Removing
-> the primary saves 1 hop but loses this property. Recovering it costs
-> exactly what was saved — either a correctness window or an extra hop.
->
-> The existing leader-based operator (`kuberic-operator`) remains the
-> optimal design for write latency with correct semantics.
->
-> The analysis below is preserved for reference.
+> The analysis below is preserved. Note that the
+> "Lagging committed_lsn" section describes a problem that no
+> longer applies under the in-doubt contract.
 
 ---
 
@@ -889,10 +892,20 @@ system, the client can receive a definitive failure and THEN the
 Writer crashes — the system must honor that failure by not retaining
 the data.
 
-See [peer-repair-replication.md](peer-repair-replication.md)
-(abandoned — preserved for reference) for the full analysis with
-scenario traces, the authority-based alternative analysis, and the
-response-consistency argument.
+See [peer-repair-replication.md](peer-repair-replication.md) for the
+full analysis with scenario traces, the authority-based alternative
+analysis, and the response-consistency argument.
+
+**Note:** This entire subsection is superseded by the
+**In-Doubt Writer Contract** (later in this document). Under the
+in-doubt contract, the Writer's `replicate()` API returns explicit
+`InDoubt` errors when a quorum failure leaves the data state
+ambiguous, and the Writer poisons itself to prevent further ops
+until the coordinator runs the authority recovery protocol. This
+eliminates the response-consistency problem and allows the simple
+authority approach (`max(received_lsn)`) to replace all
+`committed_lsn` tracking — no coordinator persistence, no etcd
+writes, no latency penalty.
 
 #### 7. Replica Building (Copy + Catch-Up)
 
@@ -1263,6 +1276,319 @@ Can the app produce the replication payload WITHOUT local state?
   YES → Writer-based system (this design)
   NO  → Leader-based system (kuberic-operator)
 ```
+
+---
+
+## In-Doubt Writer Contract
+
+This section describes the contract that resolves the
+`committed_lsn` correctness flaw without external storage or extra
+latency. **The previous "Lagging committed_lsn" section (above)
+describes a problem that no longer applies under this contract.**
+
+### The Contract
+
+The Writer's `replicate()` API uses three error variants to make the
+ambiguity of partial-failure outcomes explicit in the type system:
+
+```rust
+pub enum ReplicateError {
+    /// Validation failed BEFORE any send. Data definitely not on any
+    /// replica. Caller can confidently treat this as a clean failure.
+    PreSendFailure(ValidationError),
+
+    /// Writer cannot determine the outcome of this op. Data MAY exist
+    /// on some replicas. After this, the Writer is poisoned — all
+    /// subsequent replicate() calls return WriterPoisoned. Caller MUST
+    /// treat the data as in-doubt: use idempotency, do NOT retry as new.
+    InDoubt {
+        lsn: Lsn,
+        partial_acks: u32,  // informational
+    },
+
+    /// Writer was previously poisoned by InDoubt and is no longer
+    /// accepting writes. Caller should reconnect — the coordinator
+    /// will start a new Writer with a new epoch.
+    WriterPoisoned,
+}
+```
+
+The key property: the Writer **never** returns an error that means
+"this op definitively failed and no replica has the data." That
+state would create response inconsistency (the data may persist on
+the replica that received it). Instead, the only ambiguous-failure
+variant is `InDoubt`, whose name and contract make clear that the
+data may exist.
+
+### When Does InDoubt Fire?
+
+Because kuberic uses **strict total ordering with single-writer
+semantics**, only one op is in-flight at a time (the next LSN cannot
+safely be assigned until the current op resolves). When the Writer
+cannot resolve the current op, the entire replication stream is
+blocked. `InDoubt` fires when:
+
+1. **Quorum unreachable, retries exhausted:** Writer sent the op,
+   got fewer than W ACKs, retried for a bounded duration (e.g.,
+   100-500ms), still didn't reach quorum.
+
+2. **Epoch staleness detected:** Writer learned (via coordinator
+   stream or replica reply) that another Writer was elected. The
+   in-flight op's fate now depends on the new Writer's authority
+   decision.
+
+3. **Coordinator unreachable for too long:** Writer cannot confirm
+   it still holds the current epoch. Cannot safely make further
+   progress.
+
+```rust
+pub async fn replicate(&self, data: Bytes) -> Result<Lsn, ReplicateError> {
+    if self.poisoned.load(Ordering::Acquire) {
+        return Err(WriterPoisoned);
+    }
+
+    // Pre-send validation (safe to fail cleanly)
+    if let Err(e) = self.validate(&data) {
+        return Err(ReplicateError::PreSendFailure(e));
+    }
+
+    let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
+
+    // Send + bounded retry loop
+    let deadline = Instant::now() + RETRY_TIMEOUT;
+    loop {
+        let acks = self.send_to_w(&data, lsn).await;
+        if acks >= self.write_quorum {
+            return Ok(lsn);
+        }
+        if self.is_epoch_stale().await {
+            return Err(self.poison(lsn, acks));
+        }
+        if Instant::now() >= deadline {
+            return Err(self.poison(lsn, acks));
+        }
+        tokio::time::sleep(RETRY_BACKOFF).await;
+    }
+}
+
+fn poison(&self, lsn: Lsn, partial_acks: u32) -> ReplicateError {
+    self.poisoned.store(true, Ordering::Release);
+    self.notify_coordinator_of_poison();  // optional: speed up takeover
+    ReplicateError::InDoubt { lsn, partial_acks }
+}
+```
+
+### Why the Writer Halts After InDoubt
+
+After `InDoubt`, the Writer is **poisoned** — it refuses all
+subsequent `replicate()` calls with `WriterPoisoned`. The next op
+is not sent. This is essential for correctness:
+
+- The in-doubt op (LSN=N) may or may not be on some replicas.
+- If the Writer were to proceed with LSN=N+1, replicas with LSN=N+1
+  would have a gap (missing N), creating non-contiguous logs.
+- The authority approach can handle gaps (peer-repair fills them,
+  coordinator queries on next failover), but it adds significant
+  complexity to replicas.
+- Halting is cleaner: the in-doubt op is resolved by the
+  **coordinator's epoch-bump + authority query**, then a new Writer
+  starts at `authority_lsn + 1` with a clean slate.
+
+This matches the existing leader-based system's pattern: when a
+primary cannot reach quorum, it gets demoted; the new primary's
+`max(received_lsn)` defines truth.
+
+### Why This Eliminates the Fatal Flaw
+
+The original flaw was **Scenario B**: the user is told
+`Err(NoWriteQuorum)`, but the data persists on the replica that
+received the op. Response consistency is violated because the
+system's post-recovery state (data present) contradicts what the
+user was told (write failed).
+
+Under the in-doubt contract, **Scenario B cannot occur**:
+
+- Writer cannot return a "definitively failed" error after sending
+  to replicas. It returns `InDoubt` (data may exist) or `Ok` (data
+  exists).
+- `InDoubt`'s type-level contract makes ambiguity explicit. A
+  caller cannot mistake it for a clean failure.
+- The system is free to keep or discard the in-doubt data; both
+  outcomes are response-consistent.
+
+### Authority-Based Recovery (No `committed_lsn` Tracking)
+
+With Scenario B eliminated, the previously-rejected **authority
+approach** becomes correct:
+
+```
+On Writer poisoning (coordinator detects via WriterPoisoned signal,
+stream disconnect, or epoch mismatch):
+  1. Coordinator queries surviving replicas for their received_lsn
+  2. authority_lsn = max(received_lsn across all survivors)
+  3. Push update_epoch { new_epoch, authority_lsn } to replicas
+  4. Replicas keep everything ≤ authority_lsn (no rollback below)
+  5. Coordinator starts a new Writer at authority_lsn + 1
+```
+
+This matches what the existing leader-based system does on
+failover (`driver.rs:340`: select new primary by highest LSN).
+The authority approach is correct under the in-doubt contract
+because:
+
+- If the user saw `Ok(lsn)`, the data must persist. Authority
+  preserves it (any survivor with the LSN keeps it). ✓
+- If the user got `InDoubt`, the data may or may not persist
+  depending on what reached replicas. Either outcome is
+  response-consistent. ✓
+- The user is **never** told "this write failed cleanly" while
+  data persists, because the in-doubt contract makes that state
+  unreachable.
+
+**No `committed_lsn` tracking. No coordinator persistence. No CRD
+writes. No fire-and-forget vs strict trade-off. No external store.**
+
+### Edge Case Verification
+
+| Scenario | Writer behavior | Result | Response-consistent? |
+|---|---|---|---|
+| W ACKs received | Return `Ok(lsn)` | Authority keeps op | ✓ User saw Ok |
+| Writer crashes after `Ok` returned | (process died before user saw response) | Authority keeps op | ✓ User in-doubt via transport error |
+| Partial ACKs (< W), retries exhausted | Return `InDoubt`, poison Writer | Authority keeps op on whoever has it | ✓ User explicitly told in-doubt |
+| Send fails to all replicas, retries exhausted | Return `InDoubt`, poison Writer | Authority sees no new LSN | ✓ User explicitly told in-doubt |
+| Epoch staleness detected mid-op | Return `InDoubt`, poison Writer | New Writer's authority handles it | ✓ User explicitly told in-doubt |
+| Caller invokes after poison | Return `WriterPoisoned` | No state change | ✓ Clean signal to reconnect |
+| Pre-send validation fails | Return `PreSendFailure` | No replica saw the op | ✓ User told clean failure |
+| All replicas dead | Return `InDoubt`, poison; quorum loss | Data loss recovery (existing protocol) | ✓ Same as existing system |
+
+### Caller Contract
+
+The user code must handle the three outcomes correctly:
+
+```rust
+match writer.replicate(data).await {
+    Ok(lsn) => {
+        // Data is durably committed at this LSN.
+    }
+    Err(ReplicateError::PreSendFailure(e)) => {
+        // Clean failure. Safe to handle as a normal error.
+    }
+    Err(ReplicateError::InDoubt { lsn, .. }) => {
+        // Data MAY have committed.
+        // - MUST NOT retry as a new write (would create duplicate).
+        // - SHOULD use idempotency tokens / client-provided keys.
+        // - MAY read back the data to verify (after new Writer comes up).
+        // - MAY propagate as in-doubt to upstream caller.
+        // Writer is now poisoned; no further ops will be accepted.
+    }
+    Err(ReplicateError::WriterPoisoned) => {
+        // Writer was poisoned by an earlier InDoubt.
+        // Reconnect to get a new Writer instance.
+    }
+}
+```
+
+This matches the standard distributed-systems pattern for in-doubt
+RPCs (database commit timeouts, gRPC `UNAVAILABLE` after submission,
+HTTP 504 after request body sent). The pattern is well-established
+in caller code that already deals with retries and idempotency.
+
+### Why Halt-on-Poison Instead of Process Exit?
+
+An earlier design considered `std::process::abort()` as the failure
+mode. The poison-and-return-error approach is strictly better:
+
+| Aspect | Process exit | Poison + `InDoubt` error |
+|---|---|---|
+| Correctness | ✓ Forced | ✓ Enforced via type contract |
+| Writer process stays up | ✗ Must restart | ✓ Stays alive |
+| User code can log / clean up | ✗ Killed mid-stack | ✓ Normal error path |
+| Caller has LSN information | ✗ None | ✓ `lsn` and `partial_acks` |
+| Coordinator notification | Via stream disconnect | Explicit `WriterPoisoned` notify |
+| Restart latency | Process restart (seconds) | Reconnect + new Writer (ms) |
+| Fits Rust idiom | ✗ Unusual | ✓ Standard `Result` |
+
+The correctness guarantee is the same: the Writer never produces
+"explicit failure with persistent data." The difference is that
+poisoning expresses this as state, not termination.
+
+### Cost: Availability Trade-Off (Reduced)
+
+The in-doubt contract trades **Writer availability** for **latency
++ correctness**, but more gracefully than process exit:
+
+| Aspect | Without contract | With in-doubt contract |
+|---|---|---|
+| Write latency (happy path) | 1 RTT | 1 RTT (unchanged) |
+| Correctness | Requires `committed_lsn` tracking | Free (authority approach) |
+| External store | etcd via CRD | None |
+| Writer process restarts | Normal (only on real crash) | Normal (Writer stays alive on InDoubt) |
+| Writer state transitions | None | Poisoned on InDoubt → new Writer takes over |
+| User-visible failures | Mix of `Err` and transport errors | Three explicit variants: clean, in-doubt, poisoned |
+
+The Writer doesn't crash on transient quorum miss — it returns
+`InDoubt`, gets replaced by a new Writer instance via coordinator
+takeover, and the user code transitions cleanly. Throughput is
+preserved because the user's process stays up; only the Writer
+abstraction restarts.
+
+### Mitigations to Reduce InDoubt Frequency
+
+- **Bounded retry within `replicate()`:** Before returning
+  `InDoubt`, retry for a short window (e.g., 100-500ms) to absorb
+  transient blips.
+- **Pre-flight checks:** Refuse to start a new op (return
+  `PreSendFailure`) when the coordinator reports < W replicas
+  reachable. This avoids sending an op that's predestined to be
+  in-doubt.
+- **Fast Writer takeover:** When the Writer poisons itself, it
+  notifies the coordinator immediately (separate from the user's
+  `replicate()` return). The coordinator can start the new Writer
+  before the user code finishes handling the `InDoubt` error.
+
+### Interaction with Coordinator and Epoch
+
+The in-doubt Writer simplifies coordinator interactions:
+
+- **No `WriterProgress` stream messages** for `committed_lsn`.
+- **No CRD status writes** for `committed_lsn`.
+- **New: `WriterPoisoned` notification** from Writer to coordinator
+  for fast takeover (optional — disconnect detection works as fallback).
+- **Coordinator's role on poison/disconnect:** query replicas for
+  `received_lsn`, push `update_epoch` with `authority_lsn`, start
+  new Writer instance.
+- **`update_epoch` RPC** carries `new_epoch` and `authority_lsn`
+  (max of replica `received_lsn` values), no `committed_lsn`.
+
+### Theoretical Foundation
+
+This is the **fail-stop failure model** applied to the Writer's
+output, expressed through the type system rather than process
+termination. A fail-stop component never produces incorrect output;
+the in-doubt contract achieves this by making "incorrect output"
+(definitive failure with persistent data) **unrepresentable** in
+the API.
+
+By forcing all ambiguous-failure outcomes into the explicit
+`InDoubt` variant, callers cannot accidentally mishandle them. The
+Writer halts after `InDoubt` not because it has crashed, but
+because there is no safe next action it can take without an
+external authority decision.
+
+The contract shifts the design space from
+**correctness vs latency** to
+**Writer takeover frequency vs latency**. Workloads that can
+tolerate occasional Writer takeovers (with appropriate idempotency
+in client code) get the latency benefit at full correctness.
+
+### When to Choose Each Design
+
+| Workload | Recommendation |
+|---|---|
+| Lowest write latency required, app handles in-doubt with idempotency | Writer-based with in-doubt contract |
+| Writer must stay logically up across transient failures (no takeover overhead acceptable) | Existing leader-based (`kuberic-operator`) |
+| Caller cannot be trusted to handle in-doubt correctly | Existing leader-based (returns `Err` cleanly with no ambiguous data state, because primary's local state is always authoritative) |
+| In-doubt + idempotent retry pattern already used | Writer-based with in-doubt contract |
 
 ---
 

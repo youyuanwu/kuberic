@@ -1,27 +1,33 @@
 # Kuberic: Peer-Repair Replication
 
-> **Status: ABANDONED.** This design does not improve write latency —
-> the original motivation. Both peer-repair and writer-based designs
-> wait for W ACKs, yielding the same write latency. Writer-based
-> actually has better tail latency: it sends to all N and waits for
-> the W-th fastest ACK, naturally dodging slow replicas. Peer-repair
-> sends to exactly W and must wait for the slowest of that subset.
+> **Status: REVISITED.** This design was previously marked abandoned
+> on two grounds: (1) no write latency improvement vs writer-based,
+> and (2) inheriting the same `committed_lsn` correctness flaw as
+> writer-based.
 >
-> Peer-repair's actual benefits (stateless Writer, reduced Writer
-> bandwidth) do not justify its costs: significantly higher replica
-> complexity (repair protocol, op store, GC coordination, 6 known
-> issues) and worse tail latency. The committed_lsn tracking
-> complexity (coordinator persistence, durability trade-offs) is
-> identical in both designs and cannot be avoided.
+> Ground (2) is now resolved: the **In-Doubt Writer Contract**
+> (see `writer-based-replication.md`) eliminates the `committed_lsn`
+> flaw without external storage or extra latency. The same contract
+> applies here — the Writer's `replicate()` API returns explicit
+> `InDoubt` errors when partial-failure outcomes are ambiguous, and
+> the Writer poisons itself to prevent further ops. The
+> **authority approach** (`max(received_lsn)` across surviving
+> replicas) replaces all `committed_lsn` tracking. The "Lagging
+> committed_lsn Problem" section below describes a problem that no
+> longer applies.
 >
-> The writer-based design (`writer-based-replication.md`) was also
-> subsequently abandoned — separating the Writer from replicas creates
-> a `committed_lsn` problem whose correct solution (coordinator +
-> etcd persistence) adds back the latency that was saved. The existing
-> leader-based operator (`kuberic-operator`) remains the optimal
-> design for write latency with correct semantics.
+> Ground (1) still stands: peer-repair sends to exactly W replicas
+> and must wait for the slowest of that subset, while writer-based
+> sends to all N and takes the W-th fastest ACK (better tail
+> latency). Peer-repair's actual benefits (stateless Writer,
+> reduced Writer bandwidth, self-healing replicas) may justify its
+> implementation complexity for some workloads, but it does not
+> reduce write latency.
 >
-> The analysis below is preserved for reference.
+> The analysis below is preserved. Sections that describe
+> `committed_lsn` propagation, coordinator-tracked `committed_lsn`,
+> and CRD persistence are obsolete under the in-doubt contract —
+> the authority approach replaces them entirely.
 
 ---
 
