@@ -791,13 +791,14 @@ are made explicit (and unambiguous) in the type system.
 | Multi-version, no rollback | Dynamo, Voldemort, Cassandra, Riak | Eventual consistency, conflict resolution on read |
 | External `committed_lsn` (acknowledged) | Hypothetical writer-based | Adds back the latency that was saved |
 | External `committed_lsn` (fire-and-forget) | Hypothetical writer-based | Microsecond correctness window |
-| In-doubt Writer + authority | Writer-based with in-doubt contract | More frequent Writer takeovers; caller must handle in-doubt with idempotency |
+| In-doubt Writer + fence-first authority | Writer-based with in-doubt contract | App-level restart on `InDoubt`; throughput capped at ~1/RTT (single-op-in-flight); 2 RTT failover (rare path) |
 
 Each approach is correct for its design goals. The in-doubt
 contract is the only known way to combine separated-writer
 architecture, strong consistency, and 1-hop write latency — at
-the cost of caller-side complexity (idempotency handling) and
-occasional Writer takeovers.
+the cost of app-level restart on `InDoubt`, throughput capped at
+~1/RTT per partition, and 2-RTT failover (fence-first-then-query
+authority recovery, mirroring SF `revoke_write_status`).
 
 ---
 

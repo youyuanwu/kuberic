@@ -1,36 +1,5 @@
 # Kuberic: Peer-Repair Replication
 
-> **Status: REVISITED.** This design was previously marked abandoned
-> on two grounds: (1) no write latency improvement vs writer-based,
-> and (2) inheriting the same `committed_lsn` correctness flaw as
-> writer-based.
->
-> Ground (2) is now resolved: the **In-Doubt Writer Contract**
-> (see `writer-based-replication.md`) eliminates the `committed_lsn`
-> flaw without external storage or extra latency. The same contract
-> applies here — the Writer's `replicate()` API returns explicit
-> `InDoubt` errors when partial-failure outcomes are ambiguous, and
-> the Writer poisons itself to prevent further ops. The
-> **authority approach** (`max(received_lsn)` across surviving
-> replicas) replaces all `committed_lsn` tracking. The "Lagging
-> committed_lsn Problem" section below describes a problem that no
-> longer applies.
->
-> Ground (1) still stands: peer-repair sends to exactly W replicas
-> and must wait for the slowest of that subset, while writer-based
-> sends to all N and takes the W-th fastest ACK (better tail
-> latency). Peer-repair's actual benefits (stateless Writer,
-> reduced Writer bandwidth, self-healing replicas) may justify its
-> implementation complexity for some workloads, but it does not
-> reduce write latency.
->
-> The analysis below is preserved. Sections that describe
-> `committed_lsn` propagation, coordinator-tracked `committed_lsn`,
-> and CRD persistence are obsolete under the in-doubt contract —
-> the authority approach replaces them entirely.
-
----
-
 Design for a replication system where the Writer sends writes to a
 quorum of replicas, and replicas **repair each other** to fill in
 missing data. The Writer's job ends once W replicas ACK.
@@ -42,7 +11,39 @@ This is a separate system from both the existing leader-based
 operator (`kuberic-operator`) and the Writer-based design
 (`writer-based-replication.md`).
 
-> **Scope:** Single writer only. Multi-writer extensions are out of
+> **Status:** Active design alternative. Shares the **API contract**
+> of the [In-Doubt Writer Contract](writer-based-replication.md#in-doubt-writer-contract):
+> - `Ok(lsn)` / `PreSendFailure` / `InDoubt` / `WriterPoisoned`
+> - Single-op-in-flight serialization (Writer caps throughput at
+>   ~1/RTT per partition)
+> - Replica durability contract (persisted mode required;
+>   `acknowledge()` after fsync)
+> - Recommended caller pattern: app restart on `InDoubt`
+>
+> However, peer-repair uses **different authority recovery
+> mechanics** than writer-based, because its W-of-N write path
+> creates inherent gaps **between `received_lsn` (highest contiguous
+> LSN) and `max_received_lsn` (highest LSN observed)**. Peer-repair
+> does NOT inherit "Replica Order Acceptance" from writer-based;
+> it has its own gap-tolerant recovery sketch (see
+> [Crash Recovery (Peer-Repair Variant)](#crash-recovery-peer-repair-variant)).
+> The full peer-repair recovery protocol is a follow-up work item.
+>
+> Authority recovery uses `max(max_received_lsn)` across fenced-
+> quorum replicas, plus a synchronous peer-repair sweep to close
+> gaps before declaring recovery complete. No `committed_lsn`
+> tracking, no per-commit external state.
+>
+> **Latency vs writer-based:** Peer-repair sends to exactly W
+> replicas and must wait for the slowest of that subset. Writer-based
+> sends to all N and takes the W-th fastest ACK (better tail latency).
+> Peer-repair's actual benefits are: stateless Writer (no
+> `ReplicationQueue`), reduced Writer bandwidth, and self-healing
+> replicas via background gossip. Choose peer-repair when these
+> benefits matter more than tail latency or recovery simplicity.
+
+> **Scope:** Single writer only. **In-cluster Writer topology only**
+> (matches writer-based scope). Multi-writer extensions are out of
 > scope.
 
 > Part of the [Kuberic Design](../kuberic-replicator-design.md).
@@ -251,13 +252,10 @@ Each replica runs a background repair loop:
 ```
 Every T seconds (e.g., 100ms):
   1. Pick a random peer replica
-  2. Send PeerRepairRequest { my_received_lsn, my_committed_lsn }
-  3. Peer responds with:
-     - peer_committed_lsn
-     - ops from my_received_lsn+1 to peer_committed_lsn
-       (ONLY committed ops — see Committed-Only Rule below)
+  2. Send PeerRepairRequest { my_received_lsn }
+  3. Peer responds with ops from my_received_lsn+1 to peer.received_lsn
   4. Apply received ops to local state
-  5. Update my received_lsn and committed_lsn
+  5. Update my received_lsn
 ```
 
 ```protobuf
@@ -268,24 +266,28 @@ service ReplicaPeerRepair {
 
 message PeerRepairRequest {
     int64 my_received_lsn = 1;     // requester's highest contiguous LSN
-    int64 my_committed_lsn = 2;    // requester's committed LSN
-    int64 writer_epoch = 3;        // requester's current writer_epoch
-    int64 data_loss_number = 4;    // requester's current data_loss_number
+    int64 writer_epoch = 2;        // requester's current writer_epoch
+    int64 data_loss_number = 3;    // requester's current data_loss_number
 }
 
 message PeerRepairResponse {
-    int64 peer_committed_lsn = 1;  // responder's committed LSN
-    repeated ReplicationItem ops = 2;  // committed ops the requester is missing
-    int64 writer_epoch = 3;        // responder's current writer_epoch
-    int64 data_loss_number = 4;    // responder's current data_loss_number
-    int64 peer_oldest_available_lsn = 5; // lowest LSN still in op store (for snapshot trigger)
+    repeated ReplicationItem ops = 1;  // ops the requester is missing
+    int64 writer_epoch = 2;        // responder's current writer_epoch
+    int64 data_loss_number = 3;    // responder's current data_loss_number
+    int64 peer_oldest_available_lsn = 4; // lowest LSN still in op store (for snapshot trigger)
 }
 ```
 
+Note: `committed_lsn` is **not** included in repair messages.
+Under the [In-Doubt Writer Contract](writer-based-replication.md#in-doubt-writer-contract),
+all received ops are preserved (authority approach uses
+`max(received_lsn)` across survivors), so replicas only need to
+exchange `received_lsn`.
+
 ##### Epoch-Aware Peer-Repair
 
-Replicas must validate epochs during repair to prevent
-stale-epoch peers from re-injecting rolled-back ops:
+Replicas must validate epochs during repair to ensure peers agree
+on the current generation:
 
 ```
 On receiving PeerRepairRequest:
@@ -299,111 +301,74 @@ On receiving PeerRepairRequest:
        (I need to re-sync with coordinator first)
 
   if epochs match:
-    → PROCEED: exchange committed ops normally
+    → PROCEED: exchange ops normally
 ```
 
 This prevents the scenario where a partitioned replica at
-`writer_epoch=1` re-injects rolled-back ops into a peer at
-`writer_epoch=2`. The stale peer's repair request is
-rejected, and it learns it needs to contact the coordinator for
-the current epoch before it can participate in repair.
+`writer_epoch=1` re-injects ops into a peer at `writer_epoch=2`.
+The stale peer's repair request is rejected, and it learns it
+needs to contact the coordinator for the current epoch before it
+can participate in repair.
 
-##### The Committed-Only Repair Rule
+##### Repair Propagates All Received Ops
 
-**Peer-repair must only propagate committed ops** — ops with
-LSN ≤ `committed_lsn`. Uncommitted ops (above `committed_lsn`)
-must NOT spread via peer-repair.
+Under the [In-Doubt Writer Contract](writer-based-replication.md#in-doubt-writer-contract),
+all ops a replica has received are preserved (the authority
+approach uses `max(received_lsn)` across surviving replicas on
+Writer takeover, keeping everything ≤ authority). Therefore peer-repair
+simply propagates **all** received ops:
 
 ```
 Repair response filter:
   Send ops WHERE lsn > requester_received_lsn
-             AND lsn <= my_committed_lsn
-
-  NOT: lsn <= my_received_lsn  ← WRONG (would spread uncommitted ops)
+             AND lsn <= my_received_lsn
+             AND epoch matches (already validated above)
 ```
 
-**Why this matters — the uncommitted op scenario:**
+There is no "committed-only" filter — whether an op was
+quorum-confirmed by the Writer doesn't matter for peer-repair.
+If the Writer poisons after sending only to one replica, the
+authority recovery protocol will preserve that op (or not, if no
+survivor has it). Either outcome is consistent with the user's
+in-doubt status.
 
-```
-N=3, W=2. Writer sends op LSN=50 to Replica₁ and Replica₂.
-
-Case A: Normal — both ACK, Writer commits.
-  committed_lsn = 50.
-  Replica₃ repairs from either peer, gets LSN=50. ✓
-
-Case B: Writer crashes after sending to Replica₁ only.
-  Replica₁ has LSN=50 (received, NOT committed — Writer never got W ACKs)
-  Replica₂ does NOT have LSN=50
-  Replica₃ does NOT have LSN=50
-  committed_lsn = 49 (last committed)
-
-  WITHOUT committed-only rule:
-    Replica₃ repairs with Replica₁
-    Replica₁ sends LSN=50 (it has it, received_lsn=50)
-    Replica₃ applies LSN=50
-    → Uncommitted op has spread! When new Writer starts and epoch
-      bumps, Replica₁ rolls back LSN=50 but Replica₃ now has it.
-      Divergent state. ✗
-
-  WITH committed-only rule:
-    Replica₃ repairs with Replica₁
-    Replica₁ responds with ops up to committed_lsn=49
-    LSN=50 is NOT sent (it's above committed_lsn)
-    Replica₃ stays at received_lsn=49 ✓
-    When epoch bumps, Replica₁ rolls back LSN=50. Clean. ✓
-```
-
-The rule ensures that peer-repair is safe even during Writer
-failure. Only quorum-confirmed ops propagate between replicas.
-Uncommitted ops remain isolated on the replicas that received them
-directly from the Writer, and are rolled back on epoch change.
-
-##### One-Replica-Surviving Scenario
+##### Surviving-Replica Scenario
 
 ```
 N=3, W=2. Writer sends LSN=50 to Replica₁ and Replica₂. Both ACK.
-committed_lsn = 50. Writer returns success to user.
+Writer returns Ok(50) to user.
 
 Replica₂ dies BEFORE repair to Replica₃.
 
 Surviving:
-  Replica₁: has LSN=50, committed_lsn=50
-  Replica₃: does NOT have LSN=50, committed_lsn=49
+  Replica₁: has LSN=50
+  Replica₃: does NOT have LSN=50
 
-Is the op safe? YES:
-  - It was quorum-committed (W=2 ACKed before Replica₂ died)
-  - committed_lsn=50 proves it was quorum-confirmed
-  - Replica₃ repairs with Replica₁
-  - Replica₁ sends LSN=50 (it's ≤ committed_lsn=50) ✓
-  - Replica₃ applies it
+The op is safe — Replica₃ repairs with Replica₁ and pulls LSN=50.
 
-No ambiguity — committed_lsn is the proof of quorum commitment.
-A single surviving copy of a committed op is sufficient because
-committed_lsn confirms it was quorum-confirmed at write time.
-The op doesn't need to exist on W replicas at repair time;
-it only needed W ACKs at write time.
-
-Compare with leader-based system: if the primary dies and only one
-secondary has the latest ops, failover promotes that secondary.
-The mechanism is different (promotion vs. peer-repair) but the
-invariant is the same: a committed op survives as long as ANY
-replica with that op survives.
+If the Writer crashes before repair completes, the coordinator
+runs authority recovery: max(received_lsn) = max(50, 49) = 50.
+Replicas keep everything ≤ 50. New Writer starts at 51.
+Result: LSN=50 preserved. ✓
 ```
+
+A single surviving copy of a committed op is sufficient: the
+authority approach + peer-repair ensures the op propagates to
+the rest of the cluster.
 
 ##### All-Copies-Lost Scenario (Data Loss)
 
 ```
 N=3, W=2. Writer sends LSN=50 to Replica₁ and Replica₂. Both ACK.
-committed_lsn = 50.
+Writer returns Ok(50) to user.
 
 Both Replica₁ AND Replica₂ die. Only Replica₃ survives.
-Replica₃ has committed_lsn=49, does NOT have LSN=50.
+Replica₃ does NOT have LSN=50.
 
 LSN=50 is LOST — no surviving replica has it.
-This is quorum loss → data loss — same as in any replication system.
+This is quorum loss → data loss — same as any replication system.
 Operator must bump data_loss_number and run data loss recovery
-(same protocol as Writer-based design: pick canonical survivor,
-call on_data_loss(), rebuild others from canonical).
+(pick canonical survivor, call on_data_loss(), rebuild others).
 ```
 
 This is identical to the leader-based system: if both the primary
@@ -414,22 +379,16 @@ F = N - W). It does not guarantee survival through F+1 failures.
 **Properties:**
 
 - **Convergence guaranteed:** As long as any two replicas can
-  eventually communicate, all replicas will converge to the same
-  committed state. This follows from epidemic algorithm theory —
-  pairwise random exchange converges in O(log N) rounds.
+  eventually communicate, all replicas converge to the same
+  state. This follows from epidemic algorithm theory — pairwise
+  random exchange converges in O(log N) rounds.
 - **Epoch-aware:** Peer-repair validates `writer_epoch` and
   `data_loss_number` on every exchange. Stale-epoch peers are
-  rejected, preventing re-injection of rolled-back ops.
-- **No uncommitted propagation:** The committed-only rule prevents
-  uncommitted ops from spreading, avoiding divergent state after
-  Writer crash.
-- **No coordinator involvement:** Peer-repair is peer-to-peer,
-  no central coordinator needed.
-- **Idempotent:** Receiving an op you already have is a no-op
-  (check LSN, skip if already applied).
-- **Bounded catch-up time:** For N=3 with 100ms repair
-  interval, a lagging replica catches up within ~200-300ms
-  (1-2 rounds of gossip).
+  rejected.
+- **No coordinator involvement:** Peer-repair is peer-to-peer.
+- **Idempotent:** Receiving an op you already have is a no-op.
+- **Bounded catch-up time:** For N=3 with 100ms repair interval,
+  a lagging replica catches up within ~200-300ms.
 
 ### Replica Data Model
 
@@ -442,12 +401,16 @@ struct ReplicaState {
     ops: BTreeMap<Lsn, Bytes>,
     /// Highest contiguous LSN received (no gaps below this)
     received_lsn: Lsn,
-    /// Highest committed LSN (from Writer via ReplicationItem)
-    committed_lsn: Lsn,
     /// Applied to user state up to this LSN
     applied_lsn: Lsn,
 }
 ```
+
+Note: replicas do **not** track `committed_lsn`. Under the
+in-doubt + authority approach, all received ops are preserved on
+Writer takeover (the authority is `max(received_lsn)` across
+survivors), so the distinction between "committed" and
+"received" is unnecessary at the replica level.
 
 **Ops retention:** Replicas retain ops in their local store for
 peer-repair. Ops are GC'd once all N replicas have confirmed
@@ -470,315 +433,88 @@ Same as the Writer-based design:
 
 No changes to the epoch design.
 
-### Committed LSN Propagation — The Lagging committed_lsn Problem
+### Crash Recovery (Peer-Repair Variant)
 
-The Writer piggybacks `committed_lsn` on each `ReplicationItem` —
-same as the Writer-based design. But now only W replicas receive it
-directly. The remaining N-W learn `committed_lsn` during
-peer-repair (the `PeerRepairResponse` includes `peer_committed_lsn`).
+Crash recovery for peer-repair shares the **API contract** of the
+[In-Doubt Writer Contract](writer-based-replication.md#in-doubt-writer-contract)
+— `Ok(lsn)` / `PreSendFailure` / `InDoubt` / `WriterPoisoned`,
+fail-stop semantics, app-restart caller pattern — but uses
+**different recovery mechanics** because peer-repair's write path
+is structurally different from writer-based:
 
-A replica takes the **max** of its own `committed_lsn` and any
-`peer_committed_lsn` received during repair.
+- Writer-based sends to ALL N replicas; replicas accept LSNs in
+  strict order; `received_lsn` is contiguous; authority can be
+  computed directly from `max(received_lsn)`.
+- Peer-repair sends to W replicas (a subset); the (N-W) skipped
+  replicas inherently lack those LSNs until peer-repair runs;
+  `received_lsn` cannot be strictly contiguous in steady state.
 
-##### The Problem: Piggybacked committed_lsn Lags by One Write
+This means peer-repair **cannot inherit** writer-based's "Replica
+Order Acceptance" property. Instead, peer-repair must define its
+own recovery semantics consistent with gappy `received_lsn`.
 
-`committed_lsn` is piggybacked on the **next** `ReplicationItem`
-after the commit — not on the item that was committed. If the Writer
-commits LSN=50 and then crashes before sending LSN=51, no replica
-ever learns that LSN=50 was committed:
+#### Peer-Repair Authority Recovery (Sketch — Detailed Design Pending)
 
-```
-Writer commits LSN=50 (W=2 ACKed). committed_lsn=50 internally.
-Writer crashes before sending LSN=51.
-No replica ever receives ReplicationItem with committed_lsn=50.
-
-All replicas think committed_lsn=49.
-
-Coordinator detects Writer crash, bumps writer_epoch.
-Coordinator pushes update_epoch to all replicas.
-Replicas roll back uncommitted ops above committed_lsn:
-  Replica₁: rolls back LSN=50 (above committed_lsn=49)  ← WRONG!
-  Replica₂: rolls back LSN=50 (above committed_lsn=49)  ← WRONG!
-
-LSN=50 was quorum-committed but rolled back by ALL replicas.
-DATA LOSS of a committed op. ✗
-```
-
-This is a **correctness bug**, not a performance issue. The root
-cause: `committed_lsn` is piggybacked on data items. If the Writer
-commits and crashes before the next write, the committed value is
-lost.
-
-##### Does the Existing Leader-Based System Have This Bug?
-
-**No** — because the primary doesn't roll back its own ops. After
-failover, the new primary is selected by **highest LSN** (not by
-`committed_lsn`). The new primary keeps everything it has.
-Secondaries roll back, but only ops that weren't confirmed by the
-new primary. The primary's local state is the source of truth.
-
-In the Writer/peer-repair system, there is no primary — all
-replicas roll back based on their local `committed_lsn`, which may
-lag the Writer's authoritative value.
-
-##### Fix: Coordinator Holds Authoritative committed_lsn
-
-The Writer must report `committed_lsn` to the coordinator on every
-commit (via the `WriterProgress` stream message). The coordinator
-persists it in the CRD status. On epoch bump (Writer crash), the
-coordinator pushes the authoritative `committed_lsn` to replicas
-along with the new epoch.
+A first-pass sketch — full design is a follow-up work item:
 
 ```
-Normal operation:
-  Writer commits LSN=50 → sends WriterProgress { committed_lsn=50 }
-  Coordinator stores committed_lsn=50 in CRD status
+On Writer poison/disconnect (coordinator detects):
 
-Writer crash:
-  Coordinator has committed_lsn=50 (from last WriterProgress)
-  Coordinator bumps writer_epoch
-  Coordinator pushes to all replicas:
-    update_epoch { new_epoch, authoritative_committed_lsn=50 }
-  Replicas roll back uncommitted ops above 50 (not above their local 49)
-  LSN=50 is preserved ✓
+  1. Coordinator advances recovery_generation + epoch in CRD
+     (same as writer-based)
+
+  2. Push FreezeWrites{generation, new_epoch} to all replicas;
+     wait for ≥W ACKs (fenced quorum). Each ACK carries
+     replica's (max_received_lsn, contiguous_received_lsn) pair —
+     the highest LSN observed and the highest contiguous prefix.
+
+  3. authority_lsn = max(max_received_lsn from fenced quorum).
+     This may be a "gappy" value — some replicas may not have
+     ops at every LSN ≤ authority_lsn.
+
+  4. Coordinator orchestrates a synchronous peer-repair sweep
+     among the fenced quorum: every replica must hold every
+     LSN ≤ authority_lsn before recovery completes. This is
+     analogous to "must_catch_up" in the existing leader-based
+     design's reconfiguration.
+
+  5. After the synchronous repair sweep completes:
+     Push UpdateEpoch{generation, new_epoch, authority_lsn}
+     (atomic truncate-above on receipt; same as writer-based).
+
+  6. Per-replica reconciliation for unfenced/lagging replicas
+     (same as writer-based, with snapshot+peer-repair build).
+
+  7. New Writer starts at authority_lsn + 1.
 ```
 
-**The `update_epoch` RPC must include `committed_lsn` from the
-coordinator.** Replicas use this value — not their local
-`committed_lsn` — for rollback on epoch change.
+**Key differences from writer-based recovery:**
+- Step 3: `max(max_received_lsn)` may include LSNs not present
+  on every fenced replica — peer-repair must close these gaps
+  during recovery.
+- Step 4: synchronous peer-repair sweep adds a recovery cost
+  proportional to gap size (typically small, since gaps reflect
+  one repair-interval worth of writes).
+- The authority approach still works because `Ok(lsn)` from the
+  Writer required W ACKs at write time; at least one fenced
+  replica has the op even if peer-repair hasn't propagated it
+  to all W yet.
 
-```protobuf
-message UpdateEpochRequest {
-    Epoch new_epoch = 1;
-    int64 authoritative_committed_lsn = 2;  // from coordinator, not local
-}
-```
+**Open design question:** In step 3, what if a fenced replica
+holds an op at LSN=K but no other fenced replica has it (Writer
+sent to {R1, R2}, both ACKed, R2 then crashed; R1 is in fenced
+quorum, R2 is not)? The op is committed (W ACKs at write time)
+but only one fenced replica has it. The synchronous repair sweep
+in step 4 must propagate it to the rest of the fenced quorum
+before authority recovery completes — this is the equivalent of
+the writer-based design's strict-order guarantee, but enforced
+during recovery rather than steady state.
 
-##### Remaining Race: Writer Commits But Crashes Before Reporting
-
-There is still a small window: the Writer commits LSN=50 (gets W
-ACKs) but crashes before sending `WriterProgress { committed_lsn=50 }`
-to the coordinator. The coordinator's last known `committed_lsn` is
-49.
-
-```
-Writer: register LSN=50 → gets W ACKs → committed_lsn=50
-Writer: crashes BEFORE sending WriterProgress
-Coordinator: committed_lsn=49
-
-Epoch bump: replicas roll back above 49
-LSN=50 lost ← still a problem
-```
-
-**This window is small but real.** Mitigation options:
-
-**Option A: Writer reports before returning to user (recommended).**
-The Writer sends `WriterProgress` to the coordinator before
-resolving the `replicate()` future to the user. This makes the
-coordinator's `committed_lsn` always ≥ what the user has seen:
-
-```rust
-pub async fn replicate(&self, data: Bytes) -> Result<Lsn> {
-    // ... send to W replicas, wait for W ACKs ...
-    // Report to coordinator BEFORE returning to user
-    self.coordinator.send(WriterProgress { committed_lsn: lsn }).await?;
-    Ok(lsn)
-}
-```
-
-**Latency impact depends on whether the send is fire-and-forget or
-acknowledged:**
-
-| Mode | Write latency | Remaining window |
-|---|---|---|
-| No report (current) | RTT(writer↔replica) | Full piggybacking lag |
-| Fire-and-forget | RTT(writer↔replica) | TCP buffer flush (~μs) |
-| Acknowledged | RTT(writer↔replica) + RTT(writer↔coordinator) | None |
-
-**Fire-and-forget (recommended default):** The send is non-blocking
-— a message pushed onto the already-open bidirectional gRPC stream.
-No round-trip, no waiting for the coordinator to ACK. Write latency
-is unchanged. The remaining window (TCP buffer not yet flushed when
-Writer crashes) is microseconds — acceptable for most workloads.
-
-**Acknowledged (opt-in for strict durability):** The Writer waits
-for the coordinator to confirm it persisted `committed_lsn`. This
-closes the window completely but adds one round-trip to the
-coordinator on every write — potentially doubling latency if the
-coordinator is in-cluster (~R + ~R = 2R). Available as a
-configuration option for workloads that need absolute zero data loss,
-similar to the `fsync` trade-off in databases.
-
-**Coordinator must persist `committed_lsn` durably.** The
-coordinator holds `committed_lsn` in memory from the Writer's
-stream, but must also persist it to survive coordinator crashes.
-The natural store is the **CRD status** (K8s API → etcd). If the
-coordinator crashes and restarts with only in-memory state, a
-subsequent Writer crash would leave the coordinator with
-`committed_lsn=0` — causing total rollback of all ops.
-
-However, writing to the K8s API on every commit is expensive
-(~1-5ms per API call). The coordinator should **batch** CRD writes:
-
-| Flush strategy | Coordinator crash window | CRD write load |
-|---|---|---|
-| Every commit | ~0 | ~1 API call per write (expensive) |
-| Every 50-100ms | Up to flush interval | ~10-20/sec (manageable) |
-| Every N commits | Up to N commits | Bounded |
-
-**Batching re-opens a correctness window:** If both the coordinator
-AND the Writer crash between CRD flushes, the persisted
-`committed_lsn` is stale. This is a double-crash scenario
-(coordinator + Writer) within a short window — rare but possible.
-
-This is the same trade-off every database faces: PostgreSQL's
-`synchronous_commit = on` (safe, slow) vs `off` (fast, small
-window). **The recommendation is a configurable durability level:**
-
-```
-durability_level:
-  relaxed:   # fire-and-forget + batched CRD flush (default)
-             # Window: coordinator crash within flush interval
-             # + Writer crash before next flush
-  strict:    # acknowledged + per-commit CRD write
-             # Window: none (fully durable)
-             # Cost: +1-5ms per write (etcd round-trip)
-```
-
-**Option B: Coordinator queries replicas on epoch bump (NOT correct).**
-Before rolling back, the coordinator asks all replicas for their
-`received_lsn`. The `max(received_lsn)` across all replicas would
-be used as `authoritative_committed_lsn`.
-
-Cost: adds one round-trip to the epoch-bump path (coordinator →
-all replicas → coordinator). This is the failover path, not the
-write path, so latency is acceptable.
-
-**However, Option B has a correctness issue.** If a replica crashes
-between ACKing the Writer and the coordinator's query, the
-coordinator cannot distinguish a committed op from an uncommitted
-partial write:
-
-```
-N=3, W=2. Writer sends LSN=50 to Replica₁ and Replica₂.
-Both ACK → committed. Writer crashes.
-Replica₂ also crashes.
-
-Coordinator queries survivors:
-  Replica₁: received_lsn=50
-  Replica₂: DEAD
-  Replica₃: received_lsn=48
-
-max(survivors) = 50. But was LSN=50 committed?
-  - If both ACKed before Replica₂ died → YES (committed)
-  - If Writer only sent to Replica₁ before crashing → NO (partial)
-
-The coordinator sees identical state in both cases:
-1 surviving replica with LSN=50. It CANNOT tell. ✗
-```
-
-The only source of truth for `committed_lsn` is the Writer itself
-(which counted the ACKs) or a durable store the Writer reported to.
-Replica `received_lsn` values alone are insufficient because they
-don't prove quorum was met — they only prove the replica received
-the op. **Option B is not recommended.**
-
-**Option C: Accept the window.** Document that ops committed by
-the Writer but not yet reported to the coordinator may be lost on
-Writer crash. This is a very small window (microseconds between
-quorum ACK and coordinator report) and may be acceptable for some
-workloads.
-
-##### Alternative Considered: Authority-Based Rollback (No committed_lsn)
-
-Instead of tracking `committed_lsn`, an alternative is to pick an
-**authority replica** on epoch bump and keep everything it has —
-the same approach used by the existing leader-based system
-(`driver.rs:340`: select new primary by highest LSN). Two variants
-were considered:
-
-**Option D: Max-LSN Authority (no pre-designation).**
-On Writer crash, coordinator queries all replicas for
-`received_lsn`, computes `authority_lsn = max(all survivors)`,
-pushes `update_epoch { authority_lsn }`. Replicas keep everything
-≤ `authority_lsn`. New Writer starts at `authority_lsn + 1`. No
-`committed_lsn` tracking, no CRD writes, no fire-and-forget
-window.
-
-**Option E: Designated Preferred Replica.**
-Coordinator designates one replica as "preferred." Writer always
-includes it in W. On failover, preferred's `received_lsn` is the
-authority. If preferred is also down, fall back to Option D.
-Simpler failover but adds a soft role and a hotspot.
-
-**Both options are rejected — they violate response consistency.**
-
-The authority approach keeps ALL ops up to the max LSN, including
-ops that never reached quorum. This conflates two semantically
-distinct cases:
-
-```
-Scenario A — committed, then replica + Writer crash:
-  Writer sends LSN=50 to R₁ and R₂ (W=2). Both ACK → committed.
-  Client receives Ok(50).
-  R₂ crashes, Writer crashes.
-  Survivors: R₁ has LSN=50, R₃ does not.
-  Authority says keep LSN=50 ← CORRECT (client saw success)
-
-Scenario B — uncommitted, then Writer crash:
-  Writer sends LSN=50 to R₁ only (W=2 needed, 1 ACK).
-  Client receives Err(NoWriteQuorum).
-  R₂ crashes (unrelated), Writer crashes.
-  Survivors: R₁ has LSN=50, R₃ does not.
-  Authority says keep LSN=50 ← WRONG (client was told write failed)
-```
-
-The coordinator sees **identical** replica state in both scenarios:
-one survivor with LSN=50, one without. The authority approach keeps
-LSN=50 in both cases. But in Scenario B, the client received a
-**definitive error** (`Err(NoWriteQuorum)`) — the system explicitly
-told the client the write did not succeed. Keeping the data after
-recovery makes the system state **inconsistent with the client's
-knowledge**.
-
-**Why the existing leader-based system avoids this problem:**
-
-In the existing leader-based kuberic (`PartitionDriver::failover`),
-the new primary is elected only when the old primary has **crashed**.
-The client's most recent interaction with the crashed primary is a
-**transport error** (connection lost) — the client does not know
-whether the in-flight operation succeeded or not. The operation is
-**in-doubt**, not explicitly failed. Kuberic is free to keep or
-discard in-doubt ops; the client has no expectation either way.
-
-The peer-repair Writer system is different: the Writer can return
-`Err(NoWriteQuorum)` to the client (a **definitive** response)
-and then crash afterward. The client knows the write failed. The
-system must honor this:
-
-| Client status | Existing leader-based | Peer-repair Writer |
-|---|---|---|
-| In-doubt (transport error) | Primary crash caused the error — the only case | Writer crash before responding |
-| Explicitly failed | N/A — primary stays alive after NoWriteQuorum | Writer returns Err, then crashes later |
-
-In the "explicitly failed" case, **response consistency** requires
-that the data is NOT present after recovery. The authority approach
-cannot guarantee this because it lacks the information to distinguish
-committed from uncommitted ops. Only the Writer (which counted ACKs)
-or a durable store the Writer reported to can provide this.
-
-**Conclusion:** `committed_lsn` tracking (Option A) is necessary for
-correctness. The complexity it introduces (coordinator persistence,
-fire-and-forget window, batching trade-off) is the cost of honoring
-response consistency. The authority-based approach (Options D/E) is
-simpler but sacrifices this property.
-
-**Recommendation: Option A (fire-and-forget).** The coordinator
-stream is already open, sending an extra progress message per commit
-is negligible, and it closes the correctness gap to a microsecond
-TCP buffer window. Option B is incorrect. Options D and E violate
-response consistency. Option C is acceptable only for workloads that
-tolerate rare data loss.
+**Status:** This sketch is preliminary. The full peer-repair
+authority recovery protocol — proving correctness, specifying
+the synchronous repair sweep semantics, and characterizing
+its latency cost — is a follow-up work item before peer-repair
+is implementation-ready.
 
 ### Replica Building
 
@@ -798,7 +534,7 @@ Operator                    Existing Replicas          New Replica
 ────────                    ─────────────────          ───────────
 1. Create new pod
 2. Pick snapshot source
-   (highest committed_lsn)
+   (highest received_lsn)
 
 3. Snapshot (copy protocol):
    Source replica ──────────────────────────────────►
@@ -835,26 +571,39 @@ rest.
 | Replica down longer than GC window | Snapshot required — peers have GC'd the gap |
 
 **GC must account for builds:** While a build is in progress, existing
-replicas must not GC below the snapshot source's `committed_lsn` at
+replicas must not GC below the snapshot source's `received_lsn` at
 snapshot time. The operator signals `BuildInProgress` to replicas (not
 the Writer — replicas manage their own GC). After the new replica
 catches up via peer-repair, `BuildComplete` resumes GC.
 
-### Writer Crash Recovery
+### Writer Takeover
 
-Writer crash is simpler than in the Writer-based design because the
-Writer has **no ReplicationQueue**:
+Writer takeover in peer-repair uses the **peer-repair-variant
+authority recovery** described above (see [Crash Recovery (Peer-Repair Variant)](#crash-recovery-peer-repair-variant)).
+Summary:
 
-1. Writer crashes
-2. Coordinator detects disconnect, bumps `writer_epoch`
-3. Replicas roll back uncommitted ops (same as before)
-4. New Writer connects, gets `committed_lsn` from coordinator
-5. Sets `next_lsn = committed_lsn + 1`
-6. Resumes writing
+1. Writer poisons (via `InDoubt`) or disconnects.
+2. Coordinator advances `recovery_generation` + epoch in CRD.
+3. Coordinator pushes `FreezeWrites` to all replicas; awaits ≥W
+   ACKs (fenced quorum). Each ACK carries replica's
+   `(max_received_lsn, contiguous_received_lsn)`.
+4. `authority_lsn = max(max_received_lsn from fenced quorum)`.
+5. Coordinator orchestrates synchronous peer-repair sweep among
+   the fenced quorum to close any gaps ≤ `authority_lsn`.
+6. Coordinator pushes `UpdateEpoch{generation, new_epoch,
+   authority_lsn}` to all replicas (atomic truncate-above).
+7. Per-replica reconciliation for unfenced/lagging replicas.
+8. New Writer connects, starts at `authority_lsn + 1`.
 
-No queue to recover, no build to abort. Replicas already have all
-committed ops (guaranteed by quorum). Peer-repair ensures any
-lagging replica catches up from peers.
+Compared to writer-based: peer-repair's recovery is more complex
+because of the synchronous repair sweep in step 5, but it does not
+require the Writer to maintain a `ReplicationQueue`. Trade-off:
+recovery latency proportional to gap size at recovery time vs.
+steady-state Writer memory.
+
+Update also reflects [Replica Durability Contract](writer-based-replication.md#replica-durability-contract)
+inheritance: persisted-mode is required; replicas MUST not ACK
+ops to the Writer or to peers until durably persisted.
 
 ---
 
@@ -867,9 +616,11 @@ lagging replica catches up from peers.
 | **Lagging replica catch-up** | Writer replays from queue | Replica pulls from peers |
 | **Replica building** | Copy protocol + queue replay via Writer | Copy protocol (snapshot) + peer-repair (delta), no Writer involvement |
 | **Writer crash impact** | Queue lost, build aborted | No impact (no queue) |
-| **Write latency** | Same (wait for W ACKs) | Same (wait for W ACKs) |
+| **Median write latency** | RTT to W-th-fastest of N (slow replicas naturally avoided) | RTT to slowest of W (no avoidance) |
+| **Tail write latency** | Better (fastest W-th of N) | Worse (slowest of W) |
+| **Recovery latency** | 2 RTT (fence + UpdateEpoch) | 2 RTT + synchronous peer-repair sweep (gap-fill cost proportional to repair-interval gap size) |
 | **Convergence latency** | Immediate (Writer sends to all) | Delayed (~100-300ms for N-W replicas) |
-| **Replica complexity** | Simple (receive + ACK) | Higher (repair loop + op storage) |
+| **Replica complexity** | Simple (receive + ACK + serve reads) | Higher (repair loop + op storage + read serving) |
 | **Network traffic** | Writer → all N (write path) | Writer → W (write) + replica ↔ replica (peer-repair) |
 | **Coordinator dependency** | High (build coordination) | Lower (no build coordination) |
 
@@ -931,29 +682,19 @@ lagging replica catches up from peers.
    generates continuous background traffic. 1s reduces traffic but
    increases staleness. Should this be configurable per-partition?
 
-2. **Op retention, GC, and rollback (resolved):** Two distinct
-   operations on replica op stores:
+2. **Op retention and GC:** Replicas retain ops in their local
+   store for peer-repair. Two distinct operations:
 
-   **GC (garbage collection):** Remove committed ops that all N
-   replicas have confirmed receipt of. The data is safe — it's been
-   applied to user state everywhere. This is routine cleanup to
-   bound memory usage. GC condition: `lsn <= min(peer_received_lsn)`
+   **GC (garbage collection):** Remove ops that all N replicas
+   have confirmed receipt of. This is routine cleanup to bound
+   memory usage. GC condition: `lsn <= min(peer_received_lsn)`
    across all replicas.
 
-   **Rollback (on epoch change):** Remove uncommitted ops that the
-   Writer sent but never quorum-committed. These are partial/stale
-   writes from a crashed Writer that should never have been applied.
-   Rollback condition: `discard ops WHERE lsn > authoritative_committed_lsn`.
-   Triggered by the coordinator on epoch bump via `update_epoch`.
-
-   **Peer-repaired ops are never rolled back.** The committed-only rule
-   guarantees that peer-repaired ops have `lsn <= committed_lsn`. Since
-   `authoritative_committed_lsn >= committed_lsn`, the rollback
-   rule never touches peer-repaired ops. No source tracking needed —
-   the math works out naturally:
-   - Peer-repaired ops: `lsn <= peer_committed_lsn <= authoritative` → preserved ✓
-   - Writer-direct committed ops: `lsn <= authoritative` → preserved ✓
-   - Writer-direct uncommitted ops: `lsn > authoritative` → rolled back ✓
+   **Authority-based truncation (on Writer takeover):** Replicas
+   keep everything ≤ `authority_lsn` (received from coordinator).
+   There is no rollback below authority — the
+   [In-Doubt Writer Contract](writer-based-replication.md#in-doubt-writer-contract)
+   ensures ops on any surviving replica are preserved.
 
 3. **Snapshot trigger (resolved):** A replica needs a snapshot when
    the ops it's missing have been **GC'd from all peers**. This is
@@ -962,20 +703,13 @@ lagging replica catches up from peers.
    During peer-repair, if a peer responds with ops starting at
    LSN X but the requester needs ops from LSN Y where Y < X (the
    peer has GC'd everything below X), peer-repair cannot fill
-   the gap. The peer signals this:
+   the gap. The peer signals this via
+   `peer_oldest_available_lsn` in `PeerRepairResponse`.
 
-   ```protobuf
-   message PeerRepairResponse {
-       int64 peer_committed_lsn = 1;
-       int64 peer_oldest_available_lsn = 2;  // lowest LSN still in op store
-       repeated ReplicationItem ops = 3;
-   }
-   ```
-
-   If `peer_oldest_available_lsn > my_received_lsn + 1`, the gap is
-   unrecoverable via peer-repair. The replica must request a
-   snapshot from this peer (or another). After applying the snapshot,
-   peer-repair resumes for the delta.
+   If `peer_oldest_available_lsn > my_received_lsn + 1`, the gap
+   is unrecoverable via peer-repair. The replica must request a
+   snapshot from this peer (or another). After applying the
+   snapshot, peer-repair resumes for the delta.
 
    **When this happens:**
    - Fresh replica (new pod): always needs snapshot
@@ -985,19 +719,15 @@ lagging replica catches up from peers.
    - Briefly-down replica: peer-repair suffices (peers still have
      the ops)
 
-4. **Read consistency:** Same as Writer-based design — reads from a
-   lagging replica may return stale data. Should the peer-repair
-   protocol include a "wait for LSN" mechanism?
+4. **Read consistency:** Reads from a lagging replica may return
+   stale data. Should the peer-repair protocol include a
+   "wait for LSN" mechanism?
 
-5. **Committed LSN propagation lag:** Only W replicas learn
-   `committed_lsn` directly. Others learn it during repair.
-   For deferred-apply workloads (like SQLite), this delay means
-   the N-W replicas defer application longer. Is this acceptable?
-
-6. **Merkle tree for corruption detection:** For the common case
+5. **Merkle tree for corruption detection:** For the common case
    (gap detection), LSN comparison is sufficient. Should replicas
    also maintain Merkle trees (like Riak AAE) for detecting silent
-   corruption? This adds storage and CPU overhead but catches bit rot.
+   corruption? This adds storage and CPU overhead but catches bit
+   rot.
 
 ---
 
@@ -1085,40 +815,26 @@ status. Replicas skip unreachable peers in GC watermark calculation.
 The coordinator can also detect partitions and trigger snapshot
 rebuilds for replicas that fall too far behind.
 
-### KI-3: Rollback of Already-Applied Ops (must-fix)
+### KI-3: Applied Ops Are Always Preserved (resolved by In-Doubt Contract)
 
 Once an op is applied to user state via `StateProvider` and
 `acknowledge()`d, it cannot be un-applied by the replication
-system. If an epoch change triggers rollback of an op that was
-already applied (because the replica received it directly from the
-Writer and applied it before learning it was uncommitted), the user
-state diverges from the op store.
+system. Under the [In-Doubt Writer Contract](writer-based-replication.md#in-doubt-writer-contract)
++ authority approach, applied ops are always preserved:
 
-**This is the same problem in the existing leader-based system** —
-today's secondaries apply ops via `OperationStream` before quorum
-is confirmed. The existing system handles it by choosing a new
-primary with the highest LSN (so applied ops are preserved).
+- The `authority_lsn` is `max(received_lsn)` across surviving
+  replicas.
+- Any op a replica has applied is in its `received_lsn` range.
+- Therefore `authority_lsn ≥ any applied op's LSN` on any
+  surviving replica.
+- Replicas keep everything ≤ `authority_lsn` — no rollback below.
 
-**In the peer-repair system:** The coordinator must ensure that
-`authoritative_committed_lsn` (used for rollback) is never below
-any op that has been applied and acknowledged by any replica.
-Option A (Writer reports `committed_lsn` before returning to user)
-ensures this — if the user hasn't seen the LSN, no replica has
-applied it yet.
+There is no rollback below `authority_lsn`, so applied ops are
+never un-applied. This is the same invariant the existing
+leader-based system maintains (via highest-LSN primary selection),
+expressed differently.
 
-### KI-4: Quiescent Writer Stalls committed_lsn (should-fix)
-
-If the Writer stops writing (no new ops), `committed_lsn` is never
-piggybacked on new items. Replicas that only received ops via
-peer-repair learn `committed_lsn` from peers, which also stalls.
-
-**Fix:** Writer sends periodic heartbeat to W replicas with just
-`committed_lsn` (no data). Or: the coordinator pushes
-`committed_lsn` to all replicas periodically. Not a correctness
-issue (peer-repair still works, just slower convergence) but
-affects deferred-apply workloads.
-
-### KI-5: W-Subset Selection Strategy (should-fix)
+### KI-4: W-Subset Selection Strategy (should-fix)
 
 If the Writer always picks the same W replicas (e.g., lowest-latency),
 some replicas never receive direct writes. Effects:
@@ -1130,7 +846,7 @@ some replicas never receive direct writes. Effects:
 **Fix:** Round-robin or random W-selection distributes writes evenly.
 The Writer should rotate which replicas are in each write's W-subset.
 
-### KI-6: New Replica Repair Loop Before Snapshot (should-fix)
+### KI-5: New Replica Repair Loop Before Snapshot (should-fix)
 
 A new replica starts its repair loop immediately on creation,
 before the operator initiates the snapshot. Early repair
