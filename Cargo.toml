@@ -39,7 +39,7 @@ thiserror = "2"
 anyhow = "1"
 rand = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
-rusqlite = { version = "0.39", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 crc32fast = "1"
 serial_test = "3.4.0"
 tokio-postgres = "0.7"
