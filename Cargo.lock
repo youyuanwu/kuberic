@@ -585,7 +585,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1155,6 +1155,18 @@ dependencies = [
 
 [[package]]
 name = "k8s-openapi"
+version = "0.27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51b326f5219dd55872a72c1b6ddd1b830b8334996c667449c29391d657d78d5e"
+dependencies = [
+ "base64",
+ "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "k8s-openapi"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c6922f6afe80418dd6019818af5d0d34584c371780ff09b9752370c25b4abb"
@@ -1172,7 +1184,7 @@ version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bb9108095346a7096d11feeaff419c75dddcac1b2f59acb38d7bf3d13c3e146"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "kube-core",
  "kube-derive",
@@ -1198,7 +1210,7 @@ dependencies = [
  "hyper-util",
  "jiff",
  "jsonpath-rust",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-core",
  "pem",
  "rustls",
@@ -1225,7 +1237,7 @@ dependencies = [
  "http",
  "jiff",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "schemars",
  "serde",
  "serde-value",
@@ -1254,7 +1266,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1c0fbeb1ff2aa855f0cab552655aa6e4a5ffc56aced22a81371bacd32fefcf8"
 dependencies = [
  "jiff",
- "k8s-openapi",
+ "k8s-openapi 0.27.1",
  "kube",
  "log",
  "serde",
@@ -1268,7 +1280,7 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bef0716ec7c48420690430e408c7f2579e4252962a33b29d36e53b4618afc33"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "rand",
  "thiserror 2.0.18",
@@ -1291,7 +1303,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hostname",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "parking_lot",
  "pin-project",
@@ -1326,7 +1338,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "kuberic-core",
  "schemars",
@@ -1343,7 +1355,7 @@ dependencies = [
 name = "kuberic-tests"
 version = "0.1.0"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "kube-leader-election",
  "kube-lease-manager",
@@ -1365,7 +1377,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "kuberic-core",
  "kuberic-operator",
@@ -2031,7 +2043,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2356,7 +2368,7 @@ dependencies = [
  "bytes",
  "clap",
  "crc32fast",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "kuberic-core",
  "kuberic-operator",
@@ -2436,10 +2448,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
