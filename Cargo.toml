@@ -41,7 +41,7 @@ rand = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 crc32fast = "1"
-serial_test = "3.4.0"
+serial_test = "4.0.1"
 tokio-postgres = "0.7"
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
 kube-lease-manager = "0.12.0"
