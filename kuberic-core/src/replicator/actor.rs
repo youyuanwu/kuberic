@@ -460,6 +460,7 @@ mod tests {
         }
 
         async fn register_write(&self) -> oneshot::Receiver<crate::Result<Lsn>> {
+            let expected_lsn = self.state.current_progress() + 1;
             let (reply, receiver) = oneshot::channel();
             self.data_tx
                 .send(ReplicateRequest {
@@ -469,7 +470,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            while self.state.current_progress() < 1 {
+            while self.state.current_progress() < expected_lsn {
                 tokio::task::yield_now().await;
             }
             receiver
@@ -533,6 +534,34 @@ mod tests {
             .await
             .unwrap();
         close_rx.await.unwrap().unwrap();
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oldest_write_expires_under_continuous_registration_wakeups() {
+        let timeout = Duration::from_millis(100);
+        let harness = ActorHarness::start(timeout).await;
+        let mut first_write_rx = harness.register_write().await;
+
+        // Keep registering work as the clock crosses the first write's
+        // deadline. Each registration notifies the scheduler, reproducing the
+        // wakeup traffic that must not starve expiration.
+        for _ in 0..100 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            drop(harness.register_write().await);
+        }
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            first_write_rx.try_recv(),
+            Ok(Err(KubericError::NoWriteQuorum))
+        ));
+
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
         harness.task.await.unwrap();
     }
 
