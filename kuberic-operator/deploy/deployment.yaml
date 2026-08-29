@@ -154,6 +154,271 @@ spec:
                     type: integer
                     format: uint32
                     minimum: 0
+              operation:
+                type: object
+                required:
+                - operationId
+                - executionId
+                - version
+                - kind
+                - phase
+                - previousSnapshot
+                - targetSnapshot
+                - oldPrimaryId
+                - targetPrimaryId
+                - nextSecondaryIndex
+                - phaseDeadlineUnixSeconds
+                properties:
+                  operationId:
+                    type: string
+                  executionId:
+                    type: string
+                  version:
+                    type: integer
+                    format: uint32
+                  kind:
+                    type: string
+                    enum:
+                    - switchover
+                  phase:
+                    type: string
+                    enum:
+                    - revoke
+                    - captureLsn
+                    - preCatchUp
+                    - demoteOldPrimary
+                    - promoteTarget
+                    - distributeEpoch
+                    - updateCatchUpConfiguration
+                    - waitForCatchUpQuorum
+                    - updateCurrentConfiguration
+                    - labelTargetPrimary
+                    - labelOldSecondary
+                    - finalize
+                    - restorePreviousConfiguration
+                    - compensatePromoteOldPrimary
+                    - compensateDistributeEpoch
+                    - compensateCatchUpConfiguration
+                    - compensateCurrentConfiguration
+                    - compensateLabelOldPrimary
+                    - compensateLabelTargetSecondary
+                    - compensateFinalize
+                    - completed
+                    - failed
+                    - poisoned
+                  previousSnapshot:
+                    type: object
+                    required:
+                    - epoch
+                    - primaryId
+                    - members
+                    - writeQuorum
+                    properties:
+                      epoch:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      primaryId:
+                        type: integer
+                        format: int64
+                      members:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                          - id
+                          - instanceId
+                          - role
+                          properties:
+                            id:
+                              type: integer
+                              format: int64
+                            instanceId:
+                              type: string
+                            role:
+                              type: string
+                              enum:
+                              - primary
+                              - activeSecondary
+                      writeQuorum:
+                        type: integer
+                        format: uint32
+                  targetSnapshot:
+                    type: object
+                    required:
+                    - epoch
+                    - primaryId
+                    - members
+                    - writeQuorum
+                    properties:
+                      epoch:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      primaryId:
+                        type: integer
+                        format: int64
+                      members:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                          - id
+                          - instanceId
+                          - role
+                          properties:
+                            id:
+                              type: integer
+                              format: int64
+                            instanceId:
+                              type: string
+                            role:
+                              type: string
+                              enum:
+                              - primary
+                              - activeSecondary
+                      writeQuorum:
+                        type: integer
+                        format: uint32
+                  oldPrimaryId:
+                    type: integer
+                    format: int64
+                  targetPrimaryId:
+                    type: integer
+                    format: int64
+                  frozenLsn:
+                    type: integer
+                    format: int64
+                  nextSecondaryIndex:
+                    type: integer
+                    format: uint32
+                  phaseDeadlineUnixSeconds:
+                    type: integer
+                    format: int64
+                  lastError:
+                    type: string
+                    maxLength: 512
+                  pendingAction:
+                    type: object
+                    required:
+                    - actionId
+                    - sequence
+                    - kind
+                    - targetId
+                    - targetInstanceId
+                    - expectedEpoch
+                    - desiredPostcondition
+                    - attempts
+                    - deadlineUnixSeconds
+                    properties:
+                      actionId:
+                        type: string
+                      sequence:
+                        type: integer
+                        format: uint32
+                      kind:
+                        type: string
+                        enum:
+                        - revokeWrite
+                        - demoteOldPrimary
+                        - promoteTarget
+                        - updateSecondaryEpoch
+                        - updateCatchUpConfiguration
+                        - waitForCatchUpQuorum
+                        - updateCurrentConfiguration
+                        - labelTargetPrimary
+                        - labelOldSecondary
+                        - restorePreviousConfiguration
+                        - compensatePromoteOldPrimary
+                        - compensateUpdateSecondaryEpoch
+                        - compensateCatchUpConfiguration
+                        - compensateCurrentConfiguration
+                        - compensateLabelOldPrimary
+                        - compensateLabelTargetSecondary
+                      targetId:
+                        type: integer
+                        format: int64
+                      targetInstanceId:
+                        type: string
+                      expectedEpoch:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      desiredPostcondition:
+                        type: object
+                        required:
+                        - kind
+                        properties:
+                          kind:
+                            type: string
+                            enum:
+                            - writeRevoked
+                            - role
+                            - epoch
+                            - catchUpConfiguration
+                            - catchUpQuorum
+                            - currentConfiguration
+                            - podRoleLabel
+                          role:
+                            type: string
+                            enum:
+                            - primary
+                            - activeSecondary
+                      attempts:
+                        type: integer
+                        format: uint32
+                      deadlineUnixSeconds:
+                        type: integer
+                        format: int64
+                      lastError:
+                        type: string
+                        maxLength: 512
+              conditions:
+                type: array
+                items:
+                  type: object
+                  required:
+                  - type
+                  - status
+                  - reason
+                  - message
+                  - lastTransitionTime
+                  properties:
+                    type:
+                      type: string
+                    status:
+                      type: string
+                    reason:
+                      type: string
+                    message:
+                      type: string
+                      maxLength: 512
+                    lastTransitionTime:
+                      type: string
     subresources:
       status: {}
     additionalPrinterColumns:

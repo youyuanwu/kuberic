@@ -35,6 +35,7 @@ pub trait ClusterApi: Send + Sync {
         namespace: &str,
         set_name: &str,
         status: &KubericSetStatus,
+        expected_resource_version: Option<&str>,
     ) -> Result<(), String>;
 
     /// Create a ReplicaHandle for a pod (gRPC or in-process).
@@ -138,10 +139,17 @@ impl ClusterApi for KubeClusterApi {
         namespace: &str,
         set_name: &str,
         status: &KubericSetStatus,
+        expected_resource_version: Option<&str>,
     ) -> Result<(), String> {
         let api: kube::Api<crate::crd::KubericSet> =
             kube::Api::namespaced(self.client.clone(), namespace);
-        let patch = serde_json::json!({ "status": status });
+        let patch = match expected_resource_version {
+            Some(resource_version) => serde_json::json!({
+                "metadata": { "resourceVersion": resource_version },
+                "status": status
+            }),
+            None => serde_json::json!({ "status": status }),
+        };
         api.patch_status(
             set_name,
             &kube::api::PatchParams::apply("kuberic-operator"),

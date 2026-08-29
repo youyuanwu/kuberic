@@ -5,9 +5,9 @@ use tracing::{info, warn};
 
 use crate::error::{KubericError, RecoveryError, Result};
 use crate::types::{
-    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
-    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo, Role,
-    StablePartitionSnapshot, StableReplicaSnapshot,
+    DataLossAction, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
+    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo,
+    Role, StablePartitionSnapshot, StableReplicaSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,6 +63,27 @@ pub trait ReplicaHandle: Send + Sync {
     /// Used by the reconciler to detect restarted pods (epoch mismatch,
     /// role=None) and stale handles (transport errors).
     async fn get_status(&self) -> Result<ReplicaStatusInfo>;
+
+    async fn execute_durable_action(
+        &self,
+        _action_id: &str,
+        action: DurableReplicaAction,
+    ) -> Result<()> {
+        match action {
+            DurableReplicaAction::RevokeWriteStatus => self.revoke_write_status().await,
+            DurableReplicaAction::ChangeRole { epoch, role } => self.change_role(epoch, role).await,
+            DurableReplicaAction::UpdateEpoch { epoch } => self.update_epoch(epoch).await,
+            DurableReplicaAction::UpdateCatchUpConfiguration { current, previous } => {
+                self.update_catch_up_configuration(current, previous).await
+            }
+            DurableReplicaAction::WaitForCatchUpQuorum { mode } => {
+                self.wait_for_catch_up_quorum(mode).await
+            }
+            DurableReplicaAction::UpdateCurrentConfiguration { current } => {
+                self.update_current_configuration(current).await
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1642,6 +1663,9 @@ pub mod testing {
                 epoch,
                 current_progress: self.state.current_progress(),
                 healthy: true,
+                write_status: self.state.write_status(),
+                configuration: None,
+                last_completed_action: None,
             })
         }
     }
@@ -1660,6 +1684,7 @@ pub mod testing {
 mod tests {
     use super::*;
     use crate::driver::testing::{InProcessReplicaHandle, spawn_replicas};
+    use crate::types::AccessStatus;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -1687,6 +1712,13 @@ mod tests {
                     epoch,
                     current_progress: id,
                     healthy: true,
+                    write_status: if role == Role::Primary {
+                        AccessStatus::Granted
+                    } else {
+                        AccessStatus::NotPrimary
+                    },
+                    configuration: None,
+                    last_completed_action: None,
                 },
                 operations,
             }

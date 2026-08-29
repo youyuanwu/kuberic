@@ -25,19 +25,29 @@ switchover, and scaling via `PartitionDriver`.
 - `reconfigurationPhase`
 - optional authoritative `stableSnapshot` with epoch, primary logical ID,
   complete member logical/incarnation identities and roles, and write quorum
+- optional compact versioned `operation` checkpoint for durable switchover,
+  including previous/target snapshots and one pending correlated action
 - `failingSinceTimestamp`, `quorumLossSince`
 - per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
 - `instanceNames`, `instanceStates`
 - `conditions`
 
-**Reconciliation:** Uses `PartitionDriver` with `GrpcReplicaHandle`
-(same driver as tests, different transport). A stable operation is complete
+**Reconciliation:** Stable workflows use `PartitionDriver` with
+`GrpcReplicaHandle` (same driver as tests, different transport). A stable
+operation is complete
 only after its resulting snapshot is persisted. Runtime mutation currently
 precedes that status patch. The live reconciler retains and retries a failed
 post-commit status write before selecting another action. If the operator
 process is also lost in that window, restart recovery rejects the stale
 snapshot instead of guessing. Creating also probes for an already-initialized
 runtime and refuses to replay `Open(New)`.
+
+Reconciler-driven switchover is the exception: it removes the process-local
+driver after persisting a versioned operation checkpoint, reconstructs fresh
+handles and observations on every reconcile, and advances one transition or
+activity at a time. Pending action intent is durable before RPC or pod-label
+mutation. Status patches include the observed Kubernetes `resourceVersion`;
+no lock is held across an activity.
 
 ---
 
@@ -136,8 +146,23 @@ Legacy resources without a snapshot, changed pod identities, and live state
 that is newer or otherwise inconsistent fail closed. Runtime health does not
 invalidate an otherwise consistent snapshot: recovery completes first, then
 the normal health/failover path runs. Recovery is intentionally limited to
-stable `Healthy` topology and does not resume an in-progress reconfiguration
-or recover restarted pod processes. See `operator-failure-scenarios.md` §8.
+stable `Healthy` topology. Durable `Switchover` resumes from
+`status.operation`; other in-progress reconfigurations and restarted pod
+processes remain unsupported. See `operator-failure-scenarios.md` §8.
+
+## Durable Switchover
+
+The internal durable layer separates pure observation/decision logic from
+side-effecting activities. Its compact checkpoint pins operation version,
+source and target stable snapshots, phase, frozen LSN, retry/deadline/error
+metadata, and at most one pending action. Each action identifies the exact
+replica ID, pod-UID incarnation, expected epoch, and desired postcondition.
+
+`GetStatus` exposes write access, canonical configuration state, and the last
+completed durable action ID/signature. Lost replies therefore resume by
+observation rather than blind RPC repetition. Target-promotion failure can
+durably restore the old primary; impossible or stale observations poison the
+operation without publishing a new stable snapshot.
 
 ---
 

@@ -192,6 +192,9 @@ pub struct ReplicaStatusInfo {
     pub epoch: Epoch,
     pub current_progress: Lsn,
     pub healthy: bool,
+    pub write_status: AccessStatus,
+    pub configuration: Option<ReplicaConfigurationStatus>,
+    pub last_completed_action: Option<DurableActionCompletion>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +224,125 @@ impl AccessStatus {
             _ => Self::NotPrimary,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaConfigurationMode {
+    CatchUp,
+    Current,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaConfigurationMemberStatus {
+    pub id: ReplicaId,
+    pub instance_id: ReplicaInstanceId,
+    pub role: Role,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaConfigurationStatus {
+    pub mode: ReplicaConfigurationMode,
+    pub members: Vec<ReplicaConfigurationMemberStatus>,
+    pub write_quorum: u32,
+}
+
+impl ReplicaConfigurationStatus {
+    pub fn from_config(mode: ReplicaConfigurationMode, config: &ReplicaSetConfig) -> Self {
+        let mut members = config
+            .members
+            .iter()
+            .map(|member| ReplicaConfigurationMemberStatus {
+                id: member.id,
+                instance_id: member.instance_id.clone(),
+                role: member.role,
+            })
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| member.id);
+        Self {
+            mode,
+            members,
+            write_quorum: config.write_quorum,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableActionCompletion {
+    pub action_id: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DurableReplicaAction {
+    RevokeWriteStatus,
+    ChangeRole {
+        epoch: Epoch,
+        role: Role,
+    },
+    UpdateEpoch {
+        epoch: Epoch,
+    },
+    UpdateCatchUpConfiguration {
+        current: ReplicaSetConfig,
+        previous: ReplicaSetConfig,
+    },
+    WaitForCatchUpQuorum {
+        mode: ReplicaSetQuorumMode,
+    },
+    UpdateCurrentConfiguration {
+        current: ReplicaSetConfig,
+    },
+}
+
+impl DurableReplicaAction {
+    pub fn signature(&self) -> String {
+        match self {
+            Self::RevokeWriteStatus => "revoke-write-status".to_string(),
+            Self::ChangeRole { epoch, role } => {
+                format!(
+                    "change-role:{:?}:{}:{}",
+                    role, epoch.data_loss_number, epoch.configuration_number
+                )
+            }
+            Self::UpdateEpoch { epoch } => format!(
+                "update-epoch:{}:{}",
+                epoch.data_loss_number, epoch.configuration_number
+            ),
+            Self::UpdateCatchUpConfiguration { current, previous } => format!(
+                "update-catch-up:{}:{}",
+                config_signature(current),
+                config_signature(previous)
+            ),
+            Self::WaitForCatchUpQuorum { mode } => {
+                format!("wait-for-catch-up:{mode:?}")
+            }
+            Self::UpdateCurrentConfiguration { current } => {
+                format!("update-current:{}", config_signature(current))
+            }
+        }
+    }
+}
+
+fn config_signature(config: &ReplicaSetConfig) -> String {
+    let mut members = config
+        .members
+        .iter()
+        .map(|member| {
+            format!(
+                "{}@{}:{:?}:{:?}:{}:{}:{}:{}",
+                member.id,
+                member.instance_id,
+                member.role,
+                member.status,
+                member.replicator_address,
+                member.current_progress,
+                member.catch_up_capability,
+                member.must_catch_up
+            )
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    format!("q{}[{}]", config.write_quorum, members.join(","))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,8 +8,9 @@ use crate::error::{KubericError, Result};
 use crate::events::{LifecycleEvent, ReplicatorControlEvent};
 use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
-    AccessStatus, CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
-    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    AccessStatus, CancellationToken, DataLossAction, DurableActionCompletion, DurableReplicaAction,
+    Epoch, Lsn, OpenMode, ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaId,
+    ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
 };
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -65,6 +66,11 @@ pub enum RuntimeCommand {
     RevokeWriteStatus {
         reply: oneshot::Sender<Result<()>>,
     },
+    ExecuteDurableAction {
+        action_id: String,
+        action: DurableReplicaAction,
+        reply: oneshot::Sender<Result<()>>,
+    },
     GetStatus {
         reply: oneshot::Sender<StatusInfo>,
     },
@@ -79,6 +85,9 @@ pub struct StatusInfo {
     pub catch_up_capability: Lsn,
     pub committed_lsn: Lsn,
     pub healthy: bool,
+    pub write_status: AccessStatus,
+    pub configuration: Option<ReplicaConfigurationStatus>,
+    pub last_completed_action: Option<DurableActionCompletion>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +105,8 @@ pub struct PodRuntime {
     replica_id: ReplicaId,
     instance_id: ReplicaInstanceId,
     data_bind: String,
+    configuration: Option<ReplicaConfigurationStatus>,
+    last_completed_action: Option<DurableActionCompletion>,
 }
 
 pub struct PodRuntimeBundle {
@@ -193,6 +204,8 @@ impl PodRuntimeBuilder {
             replica_id: self.replica_id,
             instance_id: self.instance_id,
             data_bind: self.data_bind,
+            configuration: None,
+            last_completed_action: None,
         };
 
         Ok(PodRuntimeBundle {
@@ -241,6 +254,10 @@ impl PodRuntime {
                     previous,
                     reply,
                 } => {
+                    let observed_configuration = ReplicaConfigurationStatus::from_config(
+                        ReplicaConfigurationMode::CatchUp,
+                        &current,
+                    );
                     let result = self
                         .send_replicator_control(|r| {
                             ReplicatorControlEvent::UpdateCatchUpConfiguration {
@@ -254,10 +271,15 @@ impl PodRuntime {
                         if let Some(handle) = &self.replicator_handle {
                             handle.state().set_write_status(AccessStatus::Granted);
                         }
+                        self.configuration = Some(observed_configuration);
                     }
                     let _ = reply.send(result);
                 }
                 RuntimeCommand::UpdateCurrentConfiguration { current, reply } => {
+                    let observed_configuration = ReplicaConfigurationStatus::from_config(
+                        ReplicaConfigurationMode::Current,
+                        &current,
+                    );
                     let result = self
                         .send_replicator_control(|r| {
                             ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply: r }
@@ -267,6 +289,7 @@ impl PodRuntime {
                         if let Some(handle) = &self.replicator_handle {
                             handle.state().set_write_status(AccessStatus::Granted);
                         }
+                        self.configuration = Some(observed_configuration);
                     }
                     let _ = reply.send(result);
                 }
@@ -315,6 +338,13 @@ impl PodRuntime {
                     }
                     let _ = reply.send(Ok(()));
                 }
+                RuntimeCommand::ExecuteDurableAction {
+                    action_id,
+                    action,
+                    reply,
+                } => {
+                    let _ = reply.send(self.handle_durable_action(action_id, action).await);
+                }
                 RuntimeCommand::GetStatus { reply } => {
                     let handle = self.replicator_handle.as_ref();
                     let _ = reply.send(StatusInfo {
@@ -325,6 +355,10 @@ impl PodRuntime {
                         catch_up_capability: handle.map_or(0, |h| h.state().catch_up_capability()),
                         committed_lsn: handle.map_or(0, |h| h.state().committed_lsn()),
                         healthy: handle.is_some(),
+                        write_status: handle
+                            .map_or(AccessStatus::NotPrimary, |h| h.state().write_status()),
+                        configuration: self.configuration.clone(),
+                        last_completed_action: self.last_completed_action.clone(),
                     });
                 }
             }
@@ -341,6 +375,89 @@ impl PodRuntime {
         self.replicator_handle
             .as_ref()
             .ok_or(KubericError::Internal("replicator not opened".into()))
+    }
+
+    async fn handle_durable_action(
+        &mut self,
+        action_id: String,
+        action: DurableReplicaAction,
+    ) -> Result<()> {
+        let signature = action.signature();
+        if let Some(completed) = &self.last_completed_action
+            && completed.action_id == action_id
+        {
+            if completed.signature == signature {
+                return Ok(());
+            }
+            return Err(KubericError::Internal(
+                format!("durable action ID {action_id} was reused with different input").into(),
+            ));
+        }
+
+        match action {
+            DurableReplicaAction::RevokeWriteStatus => {
+                let handle = self.require_handle()?;
+                handle
+                    .state()
+                    .set_write_status(AccessStatus::ReconfigurationPending);
+            }
+            DurableReplicaAction::ChangeRole { epoch, role } => {
+                self.require_handle()?;
+                self.handle_change_role(epoch, role).await?;
+            }
+            DurableReplicaAction::UpdateEpoch { epoch } => {
+                self.handle_update_epoch(epoch).await?;
+            }
+            DurableReplicaAction::UpdateCatchUpConfiguration { current, previous } => {
+                self.send_replicator_control(|reply| {
+                    ReplicatorControlEvent::UpdateCatchUpConfiguration {
+                        current: current.clone(),
+                        previous,
+                        reply,
+                    }
+                })
+                .await?;
+                if self.role == Role::Primary {
+                    self.require_handle()?
+                        .state()
+                        .set_write_status(AccessStatus::Granted);
+                }
+                self.configuration = Some(ReplicaConfigurationStatus::from_config(
+                    ReplicaConfigurationMode::CatchUp,
+                    &current,
+                ));
+            }
+            DurableReplicaAction::WaitForCatchUpQuorum { mode } => {
+                self.send_replicator_control(|reply| {
+                    ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply }
+                })
+                .await?;
+            }
+            DurableReplicaAction::UpdateCurrentConfiguration { current } => {
+                self.send_replicator_control(|reply| {
+                    ReplicatorControlEvent::UpdateCurrentConfiguration {
+                        current: current.clone(),
+                        reply,
+                    }
+                })
+                .await?;
+                if self.role == Role::Primary {
+                    self.require_handle()?
+                        .state()
+                        .set_write_status(AccessStatus::Granted);
+                }
+                self.configuration = Some(ReplicaConfigurationStatus::from_config(
+                    ReplicaConfigurationMode::Current,
+                    &current,
+                ));
+            }
+        }
+
+        self.last_completed_action = Some(DurableActionCompletion {
+            action_id,
+            signature,
+        });
+        Ok(())
     }
 
     async fn handle_open(&mut self, mode: OpenMode) -> Result<()> {
@@ -628,6 +745,51 @@ mod tests {
             })
             .await
             .unwrap();
+
+        let durable_revoke = crate::proto::ExecuteDurableActionRequest {
+            action_id: "operation:1:revoke".to_string(),
+            action: Some(
+                crate::proto::execute_durable_action_request::Action::RevokeWriteStatus(
+                    crate::proto::RevokeWriteStatusRequest {},
+                ),
+            ),
+        };
+        client
+            .execute_durable_action(durable_revoke.clone())
+            .await
+            .unwrap();
+        client.execute_durable_action(durable_revoke).await.unwrap();
+        let status = client
+            .get_status(crate::proto::GetStatusRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            status.write_status,
+            crate::proto::AccessStatusProto::AccessReconfigurationPending as i32
+        );
+        assert_eq!(status.last_completed_action_id, "operation:1:revoke");
+        assert_eq!(
+            status.last_completed_action_signature,
+            "revoke-write-status"
+        );
+
+        let reused = client
+            .execute_durable_action(crate::proto::ExecuteDurableActionRequest {
+                action_id: "operation:1:revoke".to_string(),
+                action: Some(
+                    crate::proto::execute_durable_action_request::Action::UpdateEpoch(
+                        crate::proto::UpdateEpochRequest {
+                            epoch: Some(crate::proto::EpochProto {
+                                data_loss_number: 0,
+                                configuration_number: 2,
+                            }),
+                        },
+                    ),
+                ),
+            })
+            .await;
+        assert!(reused.is_err());
 
         // Demote
         client

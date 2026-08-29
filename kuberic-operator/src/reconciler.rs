@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVarSource, ObjectFieldSelector, PersistentVolumeClaim,
@@ -17,8 +17,12 @@ use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, Role, StableParti
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
-    EpochStatus, KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus, Phase,
-    ReconfigurationPhase, StablePartitionSnapshotStatus,
+    DurableOperationPhase, EpochStatus, KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus,
+    Phase, ReconfigurationPhase, StablePartitionSnapshotStatus, StatusCondition,
+};
+use crate::durable::{
+    Decision, OperationObservations, ReplicaObservation, decide, fail_closed, operation_condition,
+    record_activity_error, start_switchover,
 };
 
 /// Shared state across reconciliation loops.
@@ -62,7 +66,17 @@ pub async fn reconcile_set(
     // or selecting any further health/topology action.
     let pending_status = { state.pending_statuses.lock().await.get(&set_key).cloned() };
     if let Some(pending) = pending_status {
-        api.patch_set_status(&namespace, &name, &pending).await?;
+        if set.status.as_ref() == Some(&pending) {
+            state.pending_statuses.lock().await.remove(&set_key);
+            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+        }
+        api.patch_set_status(
+            &namespace,
+            &name,
+            &pending,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await?;
         state.pending_statuses.lock().await.remove(&set_key);
         return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
     }
@@ -77,6 +91,23 @@ pub async fn reconcile_set(
         .as_ref()
         .map(|s| s.phase.clone())
         .unwrap_or_default();
+    if let Some(operation) = set
+        .status
+        .as_ref()
+        .and_then(|status| status.operation.as_ref())
+        && !matches!(
+            operation.phase,
+            DurableOperationPhase::Completed
+                | DurableOperationPhase::Failed
+                | DurableOperationPhase::Poisoned
+        )
+        && current_phase != Phase::Switchover
+    {
+        return Err(format!(
+            "active durable operation {} requires Switchover phase",
+            operation.operation_id
+        ));
+    }
 
     match current_phase {
         Phase::Pending => {
@@ -87,7 +118,16 @@ pub async fn reconcile_set(
                 phase: Phase::Creating,
                 ..Default::default()
             };
-            persist_committed_status(api, state, &set_key, &namespace, &name, &status).await?;
+            persist_committed_status(
+                api,
+                state,
+                &set_key,
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
             Ok(ReconcileAction::Requeue(Duration::from_secs(5)))
         }
 
@@ -183,10 +223,20 @@ pub async fn reconcile_set(
                 replicas: pods.len() as i32,
                 members,
                 stable_snapshot: Some(snapshot_status(&driver)?),
+                operation: None,
+                conditions: Vec::new(),
                 primary_failing_since: None,
             };
-            if let Err(error) =
-                persist_committed_status(api, state, &set_key, &namespace, &name, &status).await
+            if let Err(error) = persist_committed_status(
+                api,
+                state,
+                &set_key,
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await
             {
                 // Retain the completed driver so a retry cannot reopen the
                 // already-created runtimes. A process crash still loses this
@@ -334,8 +384,16 @@ pub async fn reconcile_set(
                         phase: Phase::FailingOver,
                         ..set.status.clone().unwrap_or_default()
                     };
-                    persist_committed_status(api, state, &set_key, &namespace, &name, &status)
-                        .await?;
+                    persist_committed_status(
+                        api,
+                        state,
+                        &set_key,
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
                     return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                 }
 
@@ -363,7 +421,13 @@ pub async fn reconcile_set(
                         members: build_member_status(&pods, &set.spec),
                         ..set.status.clone().unwrap_or_default()
                     };
-                    api.patch_set_status(&namespace, &name, &status).await?;
+                    api.patch_set_status(
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
                     return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                 }
             }
@@ -388,13 +452,30 @@ pub async fn reconcile_set(
                         "switchover target replica {target_id} is not in the committed driver topology"
                     ));
                 }
+                let previous_snapshot = snapshot_status(drivers.get(&set_key).unwrap())?;
                 drop(drivers);
                 info!(name, current = %current, target = %target, "switchover requested");
-                let status = KubericSetStatus {
+                let now = unix_seconds();
+                let operation = start_switchover(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    previous_snapshot,
+                    target_id,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
                     phase: Phase::Switchover,
+                    operation: Some(operation.clone()),
                     ..set.status.clone().unwrap_or_default()
                 };
-                api.patch_set_status(&namespace, &name, &status).await?;
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
@@ -454,7 +535,13 @@ pub async fn reconcile_set(
                                         ..set.status.clone().unwrap_or_default()
                                     };
                                     persist_committed_status(
-                                        api, state, &set_key, &namespace, &name, &status,
+                                        api,
+                                        state,
+                                        &set_key,
+                                        &namespace,
+                                        &name,
+                                        &status,
+                                        set.metadata.resource_version.as_deref(),
                                     )
                                     .await?;
                                 }
@@ -505,9 +592,16 @@ pub async fn reconcile_set(
                     };
                     // Delete the pod
                     let pod_name = format!("{}-{}", name, replica_id - 1);
-                    let persist_result =
-                        persist_committed_status(api, state, &set_key, &namespace, &name, &status)
-                            .await;
+                    let persist_result = persist_committed_status(
+                        api,
+                        state,
+                        &set_key,
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await;
                     let _ = api.delete_pod(&namespace, &pod_name).await;
                     persist_result?;
                 }
@@ -567,10 +661,20 @@ pub async fn reconcile_set(
                         replicas: pods.len() as i32,
                         members,
                         stable_snapshot: Some(snapshot_status(driver)?),
+                        operation: None,
+                        conditions: Vec::new(),
                         primary_failing_since: None,
                     };
-                    persist_committed_status(api, state, &set_key, &namespace, &name, &status)
-                        .await?;
+                    persist_committed_status(
+                        api,
+                        state,
+                        &set_key,
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
                 }
             } else {
                 warn!(name, "no driver state for failover, requeueing");
@@ -580,80 +684,7 @@ pub async fn reconcile_set(
         }
 
         Phase::Switchover => {
-            let mut drivers = state.drivers.lock().await;
-            let current_pods = checked_pods_by_id(&pods)?;
-
-            let target_primary_name = set
-                .status
-                .as_ref()
-                .and_then(|s| s.target_primary.clone())
-                .unwrap_or_default();
-
-            if let Some(driver) = drivers.get_mut(&set_key) {
-                validate_pod_handle_identities(driver, &current_pods, set.spec.replicas as usize)?;
-                let current_primary_name = driver
-                    .primary_id()
-                    .and_then(|id| pod_name_for_id(&current_pods, id))
-                    .ok_or_else(|| "driver primary has no current pod".to_string())?;
-                // Resolve target pod name → replica ID
-                let target_id: Option<ReplicaId> = current_pods
-                    .iter()
-                    .find(|(_, _, pod)| pod.name_any() == target_primary_name)
-                    .map(|(id, _, _)| *id);
-
-                if let Some(target_id) = target_id {
-                    if driver.handle(target_id).is_none() {
-                        return Err(format!(
-                            "switchover target replica {target_id} is not in the committed driver topology"
-                        ));
-                    }
-                    info!(name, target_id, target = %target_primary_name, "running driver switchover");
-                    driver
-                        .switchover(target_id)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    let epoch = driver.epoch();
-
-                    // Update labels
-                    let mut labels = BTreeMap::new();
-                    labels.insert("kuberic.io/role".to_string(), "primary".to_string());
-                    let _ = api
-                        .patch_pod_labels(&namespace, &target_primary_name, labels)
-                        .await;
-
-                    let mut labels = BTreeMap::new();
-                    labels.insert("kuberic.io/role".to_string(), "secondary".to_string());
-                    let _ = api
-                        .patch_pod_labels(&namespace, &current_primary_name, labels)
-                        .await;
-
-                    let members = build_member_status(&pods, &set.spec);
-                    let status = KubericSetStatus {
-                        epoch: EpochStatus {
-                            data_loss_number: epoch.data_loss_number,
-                            configuration_number: epoch.configuration_number,
-                        },
-                        current_primary: Some(target_primary_name.clone()),
-                        target_primary: Some(target_primary_name),
-                        phase: Phase::Healthy,
-                        reconfiguration_phase: ReconfigurationPhase::None,
-                        ready_replicas: ready_pods.len() as i32,
-                        replicas: pods.len() as i32,
-                        members,
-                        stable_snapshot: Some(snapshot_status(driver)?),
-                        primary_failing_since: None,
-                    };
-                    persist_committed_status(api, state, &set_key, &namespace, &name, &status)
-                        .await?;
-                } else {
-                    warn!(name, target = %target_primary_name, "switchover target not found");
-                }
-            } else {
-                warn!(name, "no driver state for switchover, requeueing");
-            }
-
-            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+            reconcile_durable_switchover(set, api, state, &pods, &ready_pods, &set_key).await
         }
 
         Phase::Deleting => Ok(ReconcileAction::Requeue(Duration::from_secs(10))),
@@ -666,6 +697,215 @@ pub async fn reconcile_set(
 
 type CurrentPod<'a> = (ReplicaId, ReplicaInstanceId, &'a Pod);
 
+async fn reconcile_durable_switchover(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+    ready_pods: &[&Pod],
+    set_key: &str,
+) -> Result<ReconcileAction, String> {
+    let name = set.name_any();
+    let namespace = set.namespace().unwrap_or_default();
+    let operation = set
+        .status
+        .as_ref()
+        .and_then(|status| status.operation.clone())
+        .ok_or_else(|| "Switchover phase has no durable operation checkpoint".to_string())?;
+    let current_pods = checked_pods_by_id(pods)?;
+
+    let identity_error = operation
+        .previous_snapshot
+        .members
+        .iter()
+        .find_map(
+            |member| match current_pods.iter().find(|(id, _, _)| *id == member.id) {
+                None => Some(format!(
+                    "durable operation replica {} has no current pod",
+                    member.id
+                )),
+                Some((_, instance_id, _)) if instance_id.as_str() != member.instance_id => {
+                    Some(format!(
+                        "durable operation replica {} incarnation changed",
+                        member.id
+                    ))
+                }
+                Some(_) => None,
+            },
+        );
+    if let Some(error) = identity_error {
+        let now = unix_seconds();
+        let failed = fail_closed(&operation, &error);
+        let mut status = set.status.clone().unwrap_or_default();
+        status.operation = Some(failed.clone());
+        set_operation_condition(&mut status, operation_condition(&failed, now));
+        api.patch_set_status(
+            &namespace,
+            &name,
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await?;
+        return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+    }
+
+    let mut handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::new();
+    let mut observations = OperationObservations::new();
+    for (replica_id, _, pod) in &current_pods {
+        if !operation
+            .previous_snapshot
+            .members
+            .iter()
+            .any(|member| member.id == *replica_id)
+        {
+            continue;
+        }
+        let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await else {
+            continue;
+        };
+        if let Ok(status) = handle.get_status().await {
+            observations.insert(
+                *replica_id,
+                ReplicaObservation {
+                    status,
+                    replicator_address: handle.replicator_address(),
+                    pod_name: pod.name_any(),
+                    pod_role_label: pod
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("kuberic.io/role"))
+                        .cloned(),
+                },
+            );
+        }
+        handles.insert(*replica_id, handle);
+    }
+
+    let now = unix_seconds();
+    let decision = match decide(&operation, &observations, now) {
+        Ok(decision) => decision,
+        Err(error) => {
+            let mut status = set.status.clone().unwrap_or_default();
+            set_operation_condition(
+                &mut status,
+                StatusCondition {
+                    type_: "DurableOperation".to_string(),
+                    status: "True".to_string(),
+                    reason: "IncompatibleOrInvalid".to_string(),
+                    message: error,
+                    last_transition_time: now.to_string(),
+                },
+            );
+            api.patch_set_status(
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+            return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+        }
+    };
+
+    match decision {
+        Decision::Persist(next_operation) => {
+            let mut status = set.status.clone().unwrap_or_default();
+            status.operation = Some(next_operation.clone());
+            set_operation_condition(&mut status, operation_condition(&next_operation, now));
+            api.patch_set_status(
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+        }
+        Decision::Execute {
+            target_id,
+            action_id,
+            action,
+        } => {
+            let result = match handles.get(&target_id) {
+                Some(handle) => handle.execute_durable_action(&action_id, action).await,
+                None => {
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
+            };
+            if let Err(error) = result {
+                let next_operation = record_activity_error(&operation, &error.to_string());
+                let mut status = set.status.clone().unwrap_or_default();
+                status.operation = Some(next_operation.clone());
+                set_operation_condition(&mut status, operation_condition(&next_operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+            }
+        }
+        Decision::PatchPodRole { target_id, role } => {
+            let Some(observation) = observations.get(&target_id) else {
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            };
+            let mut labels = BTreeMap::new();
+            labels.insert("kuberic.io/role".to_string(), role);
+            if let Err(error) = api
+                .patch_pod_labels(&namespace, &observation.pod_name, labels)
+                .await
+            {
+                let next_operation = record_activity_error(&operation, &error);
+                let mut status = set.status.clone().unwrap_or_default();
+                status.operation = Some(next_operation.clone());
+                set_operation_condition(&mut status, operation_condition(&next_operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+            }
+        }
+        Decision::Wait => {}
+        Decision::Complete {
+            operation,
+            snapshot,
+            compensated: _,
+        } => {
+            let primary_name = pod_name_for_id(&current_pods, snapshot.primary_id)
+                .ok_or_else(|| "completed snapshot primary has no current pod".to_string())?;
+            let mut status = set.status.clone().unwrap_or_default();
+            status.epoch = snapshot.epoch.clone();
+            status.current_primary = Some(primary_name.clone());
+            status.target_primary = Some(primary_name);
+            status.phase = Phase::Healthy;
+            status.reconfiguration_phase = ReconfigurationPhase::None;
+            status.ready_replicas = ready_pods.len() as i32;
+            status.replicas = pods.len() as i32;
+            status.members = build_member_status_for_snapshot(pods, &set.spec, &snapshot);
+            status.stable_snapshot = Some(snapshot);
+            status.operation = Some(operation.clone());
+            status.primary_failing_since = None;
+            set_operation_condition(&mut status, operation_condition(&operation, now));
+            persist_committed_status(
+                api,
+                state,
+                set_key,
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+        }
+    }
+
+    Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+}
+
 async fn persist_committed_status(
     api: &dyn ClusterApi,
     state: &ReconcilerState,
@@ -673,8 +913,12 @@ async fn persist_committed_status(
     namespace: &str,
     name: &str,
     status: &KubericSetStatus,
+    expected_resource_version: Option<&str>,
 ) -> Result<(), String> {
-    match api.patch_set_status(namespace, name, status).await {
+    match api
+        .patch_set_status(namespace, name, status, expected_resource_version)
+        .await
+    {
         Ok(()) => {
             state.pending_statuses.lock().await.remove(set_key);
             Ok(())
@@ -833,6 +1077,42 @@ fn build_member_status(pods: &[Pod], spec: &KubericSetSpec) -> Vec<MemberStatus>
             }
         })
         .collect()
+}
+
+fn build_member_status_for_snapshot(
+    pods: &[Pod],
+    spec: &KubericSetSpec,
+    snapshot: &StablePartitionSnapshotStatus,
+) -> Vec<MemberStatus> {
+    let mut members = build_member_status(pods, spec);
+    for member in &mut members {
+        if let Some(stable) = snapshot
+            .members
+            .iter()
+            .find(|stable| stable.id == member.id)
+        {
+            member.role = match stable.role {
+                crate::crd::StableReplicaRoleStatus::Primary => "primary",
+                crate::crd::StableReplicaRoleStatus::ActiveSecondary => "secondary",
+            }
+            .to_string();
+        }
+    }
+    members
+}
+
+fn set_operation_condition(status: &mut KubericSetStatus, condition: StatusCondition) {
+    status
+        .conditions
+        .retain(|existing| existing.type_ != condition.type_);
+    status.conditions.push(condition);
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 async fn create_pods(

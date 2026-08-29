@@ -8,8 +8,9 @@ use crate::error::{KubericError, Result};
 use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
-    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
-    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
+    DataLossAction, DurableActionCompletion, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId,
+    ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo,
+    Role,
 };
 
 /// Implements `ReplicaHandle` by calling a remote pod's gRPC `ReplicatorControl` service.
@@ -244,6 +245,72 @@ impl ReplicaHandle for GrpcReplicaHandle {
             epoch,
             current_progress: inner.current_progress,
             healthy: inner.healthy,
+            write_status: crate::types::AccessStatus::from(inner.write_status),
+            configuration: inner.configuration.map(Into::into),
+            last_completed_action: if inner.last_completed_action_id.is_empty() {
+                None
+            } else {
+                Some(DurableActionCompletion {
+                    action_id: inner.last_completed_action_id,
+                    signature: inner.last_completed_action_signature,
+                })
+            },
         })
+    }
+
+    async fn execute_durable_action(
+        &self,
+        action_id: &str,
+        action: DurableReplicaAction,
+    ) -> Result<()> {
+        let action = match action {
+            DurableReplicaAction::RevokeWriteStatus => {
+                execute_durable_action_request::Action::RevokeWriteStatus(
+                    RevokeWriteStatusRequest {},
+                )
+            }
+            DurableReplicaAction::ChangeRole { epoch, role } => {
+                execute_durable_action_request::Action::ChangeRole(ChangeRoleRequest {
+                    epoch: Some(epoch.into()),
+                    role: RoleProto::from(role) as i32,
+                })
+            }
+            DurableReplicaAction::UpdateEpoch { epoch } => {
+                execute_durable_action_request::Action::UpdateEpoch(UpdateEpochRequest {
+                    epoch: Some(epoch.into()),
+                })
+            }
+            DurableReplicaAction::UpdateCatchUpConfiguration { current, previous } => {
+                execute_durable_action_request::Action::UpdateCatchUpConfiguration(
+                    UpdateCatchUpConfigRequest {
+                        current: Some(current.into()),
+                        previous: Some(previous.into()),
+                    },
+                )
+            }
+            DurableReplicaAction::WaitForCatchUpQuorum { mode } => {
+                execute_durable_action_request::Action::WaitForCatchUpQuorum(
+                    WaitForCatchUpQuorumRequest {
+                        mode: QuorumModeProto::from(mode) as i32,
+                    },
+                )
+            }
+            DurableReplicaAction::UpdateCurrentConfiguration { current } => {
+                execute_durable_action_request::Action::UpdateCurrentConfiguration(
+                    UpdateCurrentConfigRequest {
+                        current: Some(current.into()),
+                    },
+                )
+            }
+        };
+        let mut client = self.client.clone();
+        client
+            .execute_durable_action(ExecuteDurableActionRequest {
+                action_id: action_id.to_string(),
+                action: Some(action),
+            })
+            .await
+            .map_err(Self::map_err)?;
+        Ok(())
     }
 }

@@ -100,6 +100,14 @@ pub struct KubericSetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stable_snapshot: Option<StablePartitionSnapshotStatus>,
 
+    /// Compact durable checkpoint for the current or most recent operation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<DurableOperationStatus>,
+
+    /// Kubernetes-style conditions describing durable operation state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<StatusCondition>,
+
     /// When the primary started failing (for failover delay).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_failing_since: Option<String>,
@@ -158,6 +166,134 @@ pub struct StableReplicaSnapshotStatus {
 pub enum StableReplicaRoleStatus {
     Primary,
     ActiveSecondary,
+}
+
+pub const DURABLE_OPERATION_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableOperationStatus {
+    pub operation_id: String,
+    pub execution_id: String,
+    pub version: u32,
+    pub kind: DurableOperationKind,
+    pub phase: DurableOperationPhase,
+    pub previous_snapshot: StablePartitionSnapshotStatus,
+    pub target_snapshot: StablePartitionSnapshotStatus,
+    pub old_primary_id: i64,
+    pub target_primary_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_lsn: Option<i64>,
+    #[serde(default)]
+    pub next_secondary_index: u32,
+    pub phase_deadline_unix_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_action: Option<PendingActionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DurableOperationKind {
+    Switchover,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DurableOperationPhase {
+    Revoke,
+    CaptureLsn,
+    PreCatchUp,
+    DemoteOldPrimary,
+    PromoteTarget,
+    DistributeEpoch,
+    UpdateCatchUpConfiguration,
+    WaitForCatchUpQuorum,
+    UpdateCurrentConfiguration,
+    LabelTargetPrimary,
+    LabelOldSecondary,
+    Finalize,
+    RestorePreviousConfiguration,
+    CompensatePromoteOldPrimary,
+    CompensateDistributeEpoch,
+    CompensateCatchUpConfiguration,
+    CompensateCurrentConfiguration,
+    CompensateLabelOldPrimary,
+    CompensateLabelTargetSecondary,
+    CompensateFinalize,
+    Completed,
+    Failed,
+    Poisoned,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingActionStatus {
+    pub action_id: String,
+    pub sequence: u32,
+    pub kind: DurableActionKind,
+    pub target_id: i64,
+    pub target_instance_id: String,
+    pub expected_epoch: EpochStatus,
+    pub desired_postcondition: DurablePostconditionStatus,
+    #[serde(default)]
+    pub attempts: u32,
+    pub deadline_unix_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DurableActionKind {
+    RevokeWrite,
+    DemoteOldPrimary,
+    PromoteTarget,
+    UpdateSecondaryEpoch,
+    UpdateCatchUpConfiguration,
+    WaitForCatchUpQuorum,
+    UpdateCurrentConfiguration,
+    LabelTargetPrimary,
+    LabelOldSecondary,
+    RestorePreviousConfiguration,
+    CompensatePromoteOldPrimary,
+    CompensateUpdateSecondaryEpoch,
+    CompensateCatchUpConfiguration,
+    CompensateCurrentConfiguration,
+    CompensateLabelOldPrimary,
+    CompensateLabelTargetSecondary,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DurablePostconditionStatus {
+    pub kind: DurablePostconditionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<StableReplicaRoleStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DurablePostconditionKind {
+    WriteRevoked,
+    Role,
+    Epoch,
+    CatchUpConfiguration,
+    CatchUpQuorum,
+    CurrentConfiguration,
+    PodRoleLabel,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusCondition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status: String,
+    pub reason: String,
+    pub message: String,
+    pub last_transition_time: String,
 }
 
 impl TryFrom<&StablePartitionSnapshotStatus> for StablePartitionSnapshot {
@@ -283,6 +419,8 @@ mod tests {
         let status: KubericSetStatus =
             serde_json::from_value(serde_json::json!({"phase": "Healthy"})).unwrap();
         assert!(status.stable_snapshot.is_none());
+        assert!(status.operation.is_none());
+        assert!(status.conditions.is_empty());
         assert!(
             serde_json::to_value(status)
                 .unwrap()

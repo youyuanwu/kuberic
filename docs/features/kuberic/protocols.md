@@ -49,27 +49,37 @@ rebuilt when they come back.
 
 ## Protocol: Switchover
 
-Planned primary change. Implemented in `PartitionDriver::switchover()`.
+Planned primary change has two callers. Direct tests may still invoke the
+monolithic `PartitionDriver::switchover()`. Reconciler-driven switchover uses a
+versioned compact checkpoint in `status.operation`.
 
 ```
-1. Revoke write status on old primary (SF Phase 0: Demote)
-   → New writes immediately rejected (ReconfigurationPending)
-   → In-flight writes continue to completion
-2. Demote old primary: change_role(new_epoch, ActiveSecondary)
-3. Promote target: change_role(new_epoch, Primary) (SF Phase 4: Activate)
-4. Distribute epoch to other secondaries (best-effort, skip unreachable)
-5. Reconfigure quorum: update_catch_up → wait_for_catch_up → update_current
+persist revoke intent → revoke writes
+observe frozen LSN → wait for target catch-up
+persist demote intent → demote old primary
+persist promote intent → promote target
+converge retained member epochs
+install catch-up config → wait write quorum → install current config
+converge routing labels
+publish stable snapshot
 ```
 
-**SF alignment:** Matches SF's SwapPrimary: Phase 0 (write revocation) →
-Phase 4 (activate new primary + epoch distribution). Epoch distributed
-AFTER promotion, not before. Unreachable secondaries don't block the
-switchover — they're skipped and rebuilt later.
+Every external activity has a deterministic action ID and is persisted before
+dispatch. A resumed reconcile observes first: a matching postcondition
+advances, a matching precondition permits dispatch/retry, and any impossible
+observation fails closed. The controller performs one status transition or one
+activity dispatch per reconcile and uses Kubernetes `resourceVersion` to
+exclude stale advancement.
 
-**No fence-before-promote:** The old primary's writes are revoked (step 1)
-before any other action. No new ops can enter the pipeline. In-flight ops
-complete and are failed by demotion (step 2). The epoch update after
-promotion (step 4) prevents a zombie primary from interfering later.
+If target promotion cannot be confirmed after old-primary demotion, the same
+checkpoint durably restores the old primary at the new epoch, converges member
+epochs/configuration and labels, then publishes the compensated stable
+snapshot. Unverifiable post-promotion convergence becomes `poisoned`; it never
+publishes a snapshot containing an old-epoch retained member.
+
+The internal runtime activity endpoint records only the most recent completed
+action ID/signature. This correlates a lost reply without introducing replay
+history or exactly-once claims.
 
 ---
 

@@ -14,14 +14,14 @@ use kuberic_core::error::Result as CoreResult;
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
 use kuberic_core::types::{
-    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
-    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
+    DataLossAction, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
+    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
 };
 
 use kuberic_operator::cluster_api::ClusterApi;
 use kuberic_operator::crd::{
-    KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
-    StableReplicaRoleStatus,
+    DurableActionKind, DurableOperationPhase, KubericSet, KubericSetSpec, KubericSetStatus, Phase,
+    PvcRetentionPolicy, StableReplicaRoleStatus,
 };
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
@@ -59,6 +59,8 @@ enum ControlOperation {
 struct ObservedHandle {
     inner: Box<dyn ReplicaHandle>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
+    fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
 }
 
 impl ObservedHandle {
@@ -162,6 +164,48 @@ impl ReplicaHandle for ObservedHandle {
         self.record(ControlOperation::GetStatus);
         self.inner.get_status().await
     }
+
+    async fn execute_durable_action(
+        &self,
+        action_id: &str,
+        action: DurableReplicaAction,
+    ) -> CoreResult<()> {
+        let operation = match &action {
+            DurableReplicaAction::RevokeWriteStatus => ControlOperation::RevokeWriteStatus,
+            DurableReplicaAction::ChangeRole { .. } => ControlOperation::ChangeRole,
+            DurableReplicaAction::UpdateEpoch { .. } => ControlOperation::UpdateEpoch,
+            DurableReplicaAction::UpdateCatchUpConfiguration { .. } => {
+                ControlOperation::UpdateCatchUpConfiguration
+            }
+            DurableReplicaAction::WaitForCatchUpQuorum { .. } => {
+                ControlOperation::WaitForCatchUpQuorum
+            }
+            DurableReplicaAction::UpdateCurrentConfiguration { .. } => {
+                ControlOperation::UpdateCurrentConfiguration
+            }
+        };
+        self.record(operation);
+        if self
+            .fail_before_next_durable_action
+            .lock()
+            .unwrap()
+            .as_ref()
+            == Some(&operation)
+        {
+            self.fail_before_next_durable_action.lock().unwrap().take();
+            return Err(kuberic_core::error::KubericError::Internal(
+                "injected activity failure".into(),
+            ));
+        }
+        self.inner.execute_durable_action(action_id, action).await?;
+        if self.fail_after_next_durable_action.lock().unwrap().as_ref() == Some(&operation) {
+            self.fail_after_next_durable_action.lock().unwrap().take();
+            return Err(kuberic_core::error::KubericError::Internal(
+                "injected lost activity reply".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Mock ClusterApi that starts real PodRuntime + KV service for each pod.
@@ -175,6 +219,9 @@ struct KvClusterApi {
     services: Mutex<HashMap<String, Service>>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     fail_next_status_patch: Mutex<bool>,
+    fail_next_status_conflict: Mutex<bool>,
+    fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
 }
 
 impl KvClusterApi {
@@ -188,6 +235,9 @@ impl KvClusterApi {
             services: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(Vec::new())),
             fail_next_status_patch: Mutex::new(false),
+            fail_next_status_conflict: Mutex::new(false),
+            fail_before_next_durable_action: Arc::new(Mutex::new(None)),
+            fail_after_next_durable_action: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -261,6 +311,18 @@ impl KvClusterApi {
 
     fn fail_next_status_patch(&self) {
         *self.fail_next_status_patch.lock().unwrap() = true;
+    }
+
+    fn fail_next_status_conflict(&self) {
+        *self.fail_next_status_conflict.lock().unwrap() = true;
+    }
+
+    fn fail_before_next_durable_action(&self, operation: ControlOperation) {
+        *self.fail_before_next_durable_action.lock().unwrap() = Some(operation);
+    }
+
+    fn fail_after_next_durable_action(&self, operation: ControlOperation) {
+        *self.fail_after_next_durable_action.lock().unwrap() = Some(operation);
     }
 
     /// Simulate a pod crash. Aborts the PodRuntime and service tasks
@@ -473,7 +535,11 @@ impl ClusterApi for KvClusterApi {
         _ns: &str,
         _name: &str,
         status: &KubericSetStatus,
+        _expected_resource_version: Option<&str>,
     ) -> Result<(), String> {
+        if std::mem::take(&mut *self.fail_next_status_conflict.lock().unwrap()) {
+            return Err("resource version conflict".to_string());
+        }
         if std::mem::take(&mut *self.fail_next_status_patch.lock().unwrap()) {
             return Err("injected status persistence failure".to_string());
         }
@@ -509,6 +575,8 @@ impl ClusterApi for KvClusterApi {
         Ok(Box::new(ObservedHandle {
             inner: Box::new(handle),
             operations: self.operations.clone(),
+            fail_before_next_durable_action: self.fail_before_next_durable_action.clone(),
+            fail_after_next_durable_action: self.fail_after_next_durable_action.clone(),
         }))
     }
 
@@ -657,6 +725,81 @@ async fn create_healthy_set(
         replicas as usize
     );
     status
+}
+
+async fn drive_switchover(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+) -> KubericSetStatus {
+    for _ in 0..80 {
+        reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
+            .await
+            .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            return status;
+        }
+    }
+    panic!("durable switchover did not reach a terminal healthy status");
+}
+
+async fn advance_until_pending_action(
+    api: &KvClusterApi,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+    kind: DurableActionKind,
+) -> KubericSetStatus {
+    for _ in 0..60 {
+        if status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.pending_action.as_ref())
+            .is_some_and(|action| action.kind == kind)
+        {
+            return status;
+        }
+
+        reconcile_set(
+            &make_set(name, replicas, Some(status.clone())),
+            api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    panic!("durable switchover did not reach pending action {kind:?}");
+}
+
+async fn live_replica_statuses(
+    api: &KvClusterApi,
+    set_name: &str,
+    replicas: i32,
+) -> Vec<ReplicaStatusInfo> {
+    let set = make_set(set_name, replicas, api.last_status());
+    let pods = api.pods.lock().unwrap().clone();
+    let mut statuses = Vec::new();
+    for pod in pods {
+        let replica_id = pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("kuberic.io/pod-index"))
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            + 1;
+        let handle = api
+            .create_replica_handle(replica_id, &pod, &set.spec)
+            .await
+            .unwrap();
+        statuses.push(handle.get_status().await.unwrap());
+    }
+    statuses
 }
 
 fn assert_status_reads_only(operations: &[ControlOperation]) {
@@ -811,14 +954,7 @@ async fn test_operator_restart_recovers_read_only_then_switches_and_scales() {
     .unwrap();
     let switching = api.last_status().unwrap();
     assert_eq!(switching.phase, Phase::Switchover);
-    reconcile_set(
-        &make_set("recover", 3, Some(switching)),
-        &api,
-        &recovered_state,
-    )
-    .await
-    .unwrap();
-    let switched = api.last_status().unwrap();
+    let switched = drive_switchover(&api, &recovered_state, "recover", 3, switching).await;
     assert_eq!(switched.current_primary.as_deref(), Some(target.as_str()));
     assert_eq!(
         switched.stable_snapshot.as_ref().unwrap().primary_id,
@@ -1303,10 +1439,7 @@ async fn test_reconciler_switchover() {
     assert_eq!(status.phase, Phase::Switchover);
 
     // Switchover → Healthy: execute the switchover
-    let set = make_set("myapp", 3, Some(status.clone()));
-    reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
+    let status = drive_switchover(&api, &state, "myapp", 3, status).await;
     assert_eq!(status.phase, Phase::Healthy);
     assert_eq!(
         status.current_primary.as_deref(),
@@ -1349,6 +1482,635 @@ async fn test_reconciler_switchover() {
         })
         .await;
     assert!(result.is_err(), "write to demoted primary should fail");
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_switchover_survives_state_loss_at_every_boundary() {
+    let api = KvClusterApi::new();
+    let initial_state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &initial_state, "durable-boundaries", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+
+    reconcile_set(
+        &make_set(
+            "durable-boundaries",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target.clone()),
+                ..status
+            }),
+        ),
+        &api,
+        &initial_state,
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    let operation_id = status.operation.as_ref().unwrap().operation_id.clone();
+    api.reset_operations();
+
+    for _ in 0..80 {
+        reconcile_set(
+            &make_set("durable-boundaries", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+    }
+
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(status.current_primary.as_deref(), Some(target.as_str()));
+    assert_eq!(
+        status.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Completed
+    );
+    assert_eq!(
+        status.operation.as_ref().unwrap().operation_id,
+        operation_id
+    );
+    assert_stable_snapshot(&api, &status, 3);
+    let live = live_replica_statuses(&api, "durable-boundaries", 3).await;
+    assert_eq!(
+        live.iter()
+            .filter(|status| status.role == Role::Primary)
+            .count(),
+        1
+    );
+    assert_eq!(
+        live.iter()
+            .filter(|status| status.write_status == kuberic_core::types::AccessStatus::Granted)
+            .count(),
+        1
+    );
+
+    let operations = api.operations();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::ChangeRole)
+            .count(),
+        2
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_switchover_observes_lost_promotion_reply_without_duplicate() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "durable-ambiguous", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "durable-ambiguous",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target.clone()),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let switching = advance_until_pending_action(
+        &api,
+        "durable-ambiguous",
+        3,
+        api.last_status().unwrap(),
+        DurableActionKind::PromoteTarget,
+    )
+    .await;
+
+    api.reset_operations();
+    api.fail_after_next_durable_action(ControlOperation::ChangeRole);
+    reconcile_set(
+        &make_set("durable-ambiguous", 3, Some(switching)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let after_lost_reply = api.last_status().unwrap();
+    assert_eq!(
+        after_lost_reply
+            .operation
+            .as_ref()
+            .unwrap()
+            .pending_action
+            .as_ref()
+            .unwrap()
+            .attempts,
+        1
+    );
+
+    let completed = drive_switchover(
+        &api,
+        &ReconcilerState::default(),
+        "durable-ambiguous",
+        3,
+        after_lost_reply,
+    )
+    .await;
+    assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::ChangeRole)
+            .count(),
+        1,
+        "the ambiguous target promotion must not be dispatched twice"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_switchover_observes_every_runtime_lost_reply_window() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "durable-all-ambiguous", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "durable-all-ambiguous",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target.clone()),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.reset_operations();
+    let mut status = api.last_status().unwrap();
+    let mut injected = Vec::new();
+
+    for _ in 0..100 {
+        if let Some(pending) = status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.pending_action.as_ref())
+            && pending.attempts == 0
+            && !injected.contains(&pending.kind)
+        {
+            let control = match pending.kind {
+                DurableActionKind::RevokeWrite => Some(ControlOperation::RevokeWriteStatus),
+                DurableActionKind::DemoteOldPrimary | DurableActionKind::PromoteTarget => {
+                    Some(ControlOperation::ChangeRole)
+                }
+                DurableActionKind::UpdateSecondaryEpoch => Some(ControlOperation::UpdateEpoch),
+                DurableActionKind::UpdateCatchUpConfiguration => {
+                    Some(ControlOperation::UpdateCatchUpConfiguration)
+                }
+                DurableActionKind::WaitForCatchUpQuorum => {
+                    Some(ControlOperation::WaitForCatchUpQuorum)
+                }
+                DurableActionKind::UpdateCurrentConfiguration => {
+                    Some(ControlOperation::UpdateCurrentConfiguration)
+                }
+                _ => None,
+            };
+            if let Some(control) = control {
+                api.fail_after_next_durable_action(control);
+                injected.push(pending.kind);
+            }
+        }
+
+        reconcile_set(
+            &make_set("durable-all-ambiguous", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+    }
+
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(status.current_primary.as_deref(), Some(target.as_str()));
+    for kind in [
+        DurableActionKind::RevokeWrite,
+        DurableActionKind::DemoteOldPrimary,
+        DurableActionKind::PromoteTarget,
+        DurableActionKind::UpdateSecondaryEpoch,
+        DurableActionKind::UpdateCatchUpConfiguration,
+        DurableActionKind::WaitForCatchUpQuorum,
+        DurableActionKind::UpdateCurrentConfiguration,
+    ] {
+        assert!(
+            injected.contains(&kind),
+            "missing lost-reply window {kind:?}"
+        );
+    }
+    let operations = api.operations();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::ChangeRole)
+            .count(),
+        2
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::UpdateEpoch)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::UpdateCatchUpConfiguration)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::WaitForCatchUpQuorum)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::UpdateCurrentConfiguration)
+            .count(),
+        1
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_switchover_compensates_failed_target_promotion() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "durable-compensate", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "durable-compensate",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let switching = advance_until_pending_action(
+        &api,
+        "durable-compensate",
+        3,
+        api.last_status().unwrap(),
+        DurableActionKind::PromoteTarget,
+    )
+    .await;
+
+    api.fail_before_next_durable_action(ControlOperation::ChangeRole);
+    reconcile_set(
+        &make_set("durable-compensate", 3, Some(switching)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let mut failed = api.last_status().unwrap();
+    failed
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("durable-compensate", 3, Some(failed)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+
+    let completed = drive_switchover(
+        &api,
+        &ReconcilerState::default(),
+        "durable-compensate",
+        3,
+        api.last_status().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        completed.current_primary.as_deref(),
+        Some(original_primary.as_str())
+    );
+    assert_eq!(
+        completed.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Failed
+    );
+    assert_stable_snapshot(&api, &completed, 3);
+
+    api.reset_operations();
+    reconcile_set(
+        &make_set("durable-compensate", 3, Some(completed)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_status_reads_only(&api.operations());
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_switchover_restores_writes_when_demotion_never_runs() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "durable-safe-abort", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let original_epoch = status.epoch.clone();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "durable-safe-abort",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let switching = advance_until_pending_action(
+        &api,
+        "durable-safe-abort",
+        3,
+        api.last_status().unwrap(),
+        DurableActionKind::DemoteOldPrimary,
+    )
+    .await;
+
+    api.fail_before_next_durable_action(ControlOperation::ChangeRole);
+    reconcile_set(
+        &make_set("durable-safe-abort", 3, Some(switching)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let mut failed = api.last_status().unwrap();
+    failed
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("durable-safe-abort", 3, Some(failed)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let completed = drive_switchover(
+        &api,
+        &ReconcilerState::default(),
+        "durable-safe-abort",
+        3,
+        api.last_status().unwrap(),
+    )
+    .await;
+    assert_eq!(
+        completed.current_primary.as_deref(),
+        Some(original_primary.as_str())
+    );
+    assert_eq!(completed.epoch, original_epoch);
+    assert_eq!(
+        completed.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Failed
+    );
+    let live = live_replica_statuses(&api, "durable-safe-abort", 3).await;
+    assert_eq!(
+        live.iter()
+            .filter(|status| status.write_status == kuberic_core::types::AccessStatus::Granted)
+            .count(),
+        1
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_switchover_conflict_and_invalid_checkpoint_do_not_mutate() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "durable-conflict", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+
+    api.reset_operations();
+    api.fail_next_status_conflict();
+    let result = reconcile_set(
+        &make_set(
+            "durable-conflict",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target.clone()),
+                ..status.clone()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await;
+    assert_eq!(result.err().as_deref(), Some("resource version conflict"));
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+    assert!(
+        state
+            .drivers
+            .lock()
+            .await
+            .contains_key("default/durable-conflict")
+    );
+
+    reconcile_set(
+        &make_set(
+            "durable-conflict",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut invalid = api.last_status().unwrap();
+    invalid.operation.as_mut().unwrap().version += 1;
+    api.reset_operations();
+    reconcile_set(
+        &make_set("durable-conflict", 3, Some(invalid)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_switchover_rejects_incarnation_drift_before_mutation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "durable-stale", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "durable-stale",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target.clone()),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let switching = api.last_status().unwrap();
+    api.pods
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|pod| pod.metadata.name.as_deref() == Some(target.as_str()))
+        .unwrap()
+        .metadata
+        .uid = Some("replacement-incarnation".to_string());
+
+    api.reset_operations();
+    reconcile_set(
+        &make_set("durable-stale", 3, Some(switching)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(api.operations().is_empty());
+    let poisoned = api.last_status().unwrap();
+    assert_eq!(
+        poisoned.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Poisoned
+    );
+    assert!(
+        poisoned
+            .operation
+            .as_ref()
+            .unwrap()
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("incarnation changed")
+    );
 }
 
 /// Reconciler test: Creating phase requeues when pods are not yet ready.
@@ -1906,9 +2668,7 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
     reconcile_set(&set, &api, &state).await.unwrap();
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::Switchover);
-    reconcile_set(&make_set("myapp", 3, Some(status)), &api, &state)
-        .await
-        .unwrap();
+    drive_switchover(&api, &state, "myapp", 3, status).await;
 
     let replacement_addr = api.client_address(&secondary_name).unwrap();
     let mut replacement = connect_kv(&replacement_addr).await;

@@ -543,7 +543,8 @@ time for replicas to recover without data loss).
 
 **Detection:** N/A — the operator itself restarts.
 
-**Current behavior:** ✅ Stable `Healthy` recovery is implemented. The CRD
+**Current behavior:** ✅ Stable `Healthy` and durable `Switchover` recovery are
+implemented. The CRD
 snapshot survives in etcd while current pod metadata and runtime status attest
 that it still describes the live partition.
 
@@ -581,9 +582,18 @@ action. If its process state is also lost, a subsequent recovery sees the old
 snapshot and fails closed. Creating probes runtime status and refuses to replay
 creation when replicas are already initialized.
 
-**Boundary:** This does not recover `Creating`, `FailingOver`, `Switchover`,
-mid-configuration state, or a restarted pod process. Those cases require a
-durable reconfiguration journal or a separate pod-state recovery protocol.
+During `Switchover`, `status.operation` is the authoritative compact
+checkpoint. It stores previous/target snapshots, the current phase, and one
+write-ahead correlated action. Each reconcile reconstructs fresh handles,
+observes role/epoch/incarnation/progress/write/configuration state, and either
+advances one checkpoint, dispatches one activity, waits, compensates, or
+poisons. Target-promotion failure restores the old primary when observations
+permit. Kubernetes `resourceVersion` rejects stale concurrent advancement.
+
+**Boundary:** This does not recover `Creating`, `FailingOver`, add/remove/
+rebuild, other mid-configuration paths, or a restarted pod process. Those
+cases require additional durable-operation migrations or a separate pod-state
+recovery protocol.
 
 ---
 

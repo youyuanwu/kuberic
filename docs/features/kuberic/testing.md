@@ -260,11 +260,11 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 | gRPC ordering violations | Protocol safety | A4 |
 | Build/catch-up stall detection | Operational | A5 |
 | gRPC handle reconnection after pod restart | Operational | B3 |
-| Concurrent reconciliation (race conditions) | Operational | B4 |
+| Concurrent reconciliation outside durable switchover | Operational | B4 |
 | QuorumTracker stale ACK cleanup | Correctness | C1 |
 | Zombie primary write rejection (epoch fencing on data plane) | Protocol safety | A2 |
 | Data loss protocol (on_data_loss triggered by operator) | Designed, not impl | D |
-| Mid-reconfiguration operator restart recovery | Stable-only recovery implemented; transition journaling still needs design | D |
+| Mid-reconfiguration recovery outside switchover | Stable + switchover recovery implemented; other operations need migration | D |
 | Secondary health detection | Designed, not impl | D |
 | Missing pod detection | Designed, not impl | D |
 | Network partition (pod Ready but gRPC unreachable) | Designed, not impl | D |
@@ -380,6 +380,15 @@ audits all control operations to prove recovery issues only `GetStatus`, then
 verifies continued writes, switchover, and scale-up. Companion tests cover
 recovered unhealthy-primary failover, legacy/mismatched snapshot rejection,
 post-recovery pod logical/incarnation drift, and unordered pod listing.
+
+**Pattern 8: Durable switchover boundary and ambiguity recovery** ✅
+`test_durable_switchover_survives_state_loss_at_every_boundary` discards
+`ReconcilerState` after every checkpoint/activity window. Companion tests
+inject a lost target-promotion reply, force target-promotion compensation,
+reject a stale pod incarnation, and reject a status resource-version conflict
+before mutation. Assertions cover deterministic single dispatch of unsafe role
+changes, terminal stable snapshot recovery, and unsupported checkpoint
+versions with no mutating RPC.
 
 ### Remaining Work
 

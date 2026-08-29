@@ -975,3 +975,19 @@ may select a blank pod.
 
 **Remaining:** Add `restart_count` to `MemberStatus` CRD for
 observability (complementary to epoch-based detection).
+
+### E4. Switchover state lost with operator process — ✅ Fixed
+
+**Affects:** Reconciler `Switchover` phase
+
+Reconciler-driven switchover now persists a compact versioned operation in CRD
+status. Each side effect has write-ahead intent, deterministic action identity,
+exact replica incarnation/epoch targeting, observable completion, bounded
+retry/deadline metadata, and resource-version-protected advancement.
+
+The operation durably covers write revocation, frozen-LSN catch-up, demotion,
+promotion, member epoch convergence, catch-up/current configuration, routing
+labels, stable snapshot persistence, and compensation to the old primary.
+Impossible or incompatible observations perform no runtime mutation and remain
+fail closed. Failover, add/remove/rebuild, and other operations retain their
+existing paths.
