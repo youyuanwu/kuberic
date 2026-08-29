@@ -259,6 +259,8 @@ impl QuorumTracker {
                 _ => KubericError::Internal(error.to_string().into()),
             }));
         }
+        self.catch_up_active = false;
+        self.catch_up_failed = false;
     }
 
     /// Number of pending (uncommitted) operations.
@@ -577,6 +579,8 @@ mod tests {
         assert!(matches!(result2, Err(KubericError::NotPrimary)));
 
         assert_eq!(tracker.pending_count(), 0);
+        assert!(!tracker.catch_up_active);
+        assert!(!tracker.catch_up_failed);
     }
 
     #[tokio::test]

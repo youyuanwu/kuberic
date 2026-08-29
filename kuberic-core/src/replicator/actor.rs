@@ -186,7 +186,11 @@ impl WalReplicatorActor {
                                 must_catch_up,
                                 member_progress,
                             );
-                            state.set_committed_lsn(quorum_tracker.lock().await.committed_lsn());
+                            let tracker_committed =
+                                quorum_tracker.lock().await.committed_lsn();
+                            state.set_committed_lsn(
+                                state.committed_lsn().max(tracker_committed),
+                            );
 
                             // Connect new secondaries and replay pending ops
                             if let Some(sender) = &mut primary_sender {
@@ -250,7 +254,11 @@ impl WalReplicatorActor {
                                 cc_members.clone(),
                                 current.write_quorum,
                             );
-                            state.set_committed_lsn(quorum_tracker.lock().await.committed_lsn());
+                            let tracker_committed =
+                                quorum_tracker.lock().await.committed_lsn();
+                            state.set_committed_lsn(
+                                state.committed_lsn().max(tracker_committed),
+                            );
 
                             if let Some(sender) = &mut primary_sender {
                                 let to_remove: Vec<ReplicaId> = sender
@@ -562,6 +570,51 @@ mod tests {
             first_write_rx.try_recv(),
             Ok(Err(KubericError::NoWriteQuorum))
         ));
+
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configuration_updates_do_not_regress_partition_committed_lsn() {
+        let harness = ActorHarness::start(Duration::from_secs(1)).await;
+        harness.state.set_committed_lsn(9);
+        let config = ReplicaSetConfig {
+            members: Vec::new(),
+            write_quorum: 1,
+        };
+
+        let (catch_up_tx, catch_up_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateCatchUpConfiguration {
+                current: config.clone(),
+                previous: ReplicaSetConfig {
+                    members: Vec::new(),
+                    write_quorum: 0,
+                },
+                reply: catch_up_tx,
+            })
+            .await
+            .unwrap();
+        catch_up_rx.await.unwrap().unwrap();
+        assert_eq!(harness.state.committed_lsn(), 9);
+
+        let (current_tx, current_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateCurrentConfiguration {
+                current: config,
+                reply: current_tx,
+            })
+            .await
+            .unwrap();
+        current_rx.await.unwrap().unwrap();
+        assert_eq!(harness.state.committed_lsn(), 9);
 
         harness
             .control_tx

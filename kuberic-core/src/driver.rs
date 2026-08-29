@@ -414,10 +414,21 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&new_primary_id]
+        if let Err(error) = self.replicas[&new_primary_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            // The role transition has already completed, so the surviving
+            // configuration is the only valid rollback target. End the failed
+            // catch-up attempt to keep future reconciles retryable.
+            self.replicas[&new_primary_id]
+                .handle
+                .update_current_configuration(new_config.clone())
+                .await?;
+            self.current_config = new_config;
+            return Err(error);
+        }
 
         self.replicas[&new_primary_id]
             .handle
@@ -618,10 +629,21 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&target_id]
+        if let Err(error) = self.replicas[&target_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            // Promotion already succeeded. Finalize the role-correct
+            // configuration to end the failed attempt before returning the
+            // catch-up error to the caller.
+            self.replicas[&target_id]
+                .handle
+                .update_current_configuration(new_config.clone())
+                .await?;
+            self.current_config = new_config;
+            return Err(error);
+        }
 
         self.replicas[&target_id]
             .handle
@@ -712,10 +734,17 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&primary_id]
+        if let Err(error) = self.replicas[&primary_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            self.replicas[&primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
+                .await?;
+            return Err(error);
+        }
 
         self.replicas[&primary_id]
             .handle
@@ -809,18 +838,6 @@ impl PartitionDriver {
             // could be built. Roll back both driver state and the primary's
             // dual configuration; otherwise the reconciler sees the replica
             // as present and cannot retry the failed scale-up.
-            if let Err(rollback_error) = self.replicas[&primary_id]
-                .handle
-                .update_current_configuration(self.current_config.clone())
-                .await
-            {
-                warn!(
-                    replica_id,
-                    error = %rollback_error,
-                    "failed to restore current configuration after add_replica failure"
-                );
-            }
-
             if let Some(replica) = self.replicas.remove(&replica_id) {
                 let _ = replica.handle.change_role(epoch, Role::None).await;
                 let _ = replica.handle.close().await;
@@ -917,10 +934,19 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&primary_id]
+        if let Err(error) = self.replicas[&primary_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            // Reconfiguration has not committed to driver state. Restore the
+            // last stable configuration so the caller/reconciler can retry.
+            self.replicas[&primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
+                .await?;
+            return Err(error);
+        }
 
         self.replicas[&primary_id]
             .handle
