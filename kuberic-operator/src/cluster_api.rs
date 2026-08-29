@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
 
 use kuberic_core::driver::ReplicaHandle;
-use kuberic_core::types::ReplicaId;
+use kuberic_core::types::{ReplicaId, ReplicaInstanceId};
 
 use crate::crd::{KubericSetSpec, KubericSetStatus};
 
@@ -164,12 +164,21 @@ impl ClusterApi for KubeClusterApi {
             .and_then(|s| s.pod_ip.as_ref())
             .cloned()
             .ok_or("pod has no IP")?;
+        let instance_id = pod
+            .metadata
+            .uid
+            .as_ref()
+            .filter(|uid| !uid.is_empty())
+            .cloned()
+            .map(ReplicaInstanceId::new)
+            .ok_or("pod has no UID")?;
 
         let control_addr = format!("http://{}:{}", pod_ip, spec.control_port);
         let data_addr = format!("http://{}:{}", pod_ip, spec.data_port);
 
         let handle = kuberic_core::grpc::handle::GrpcReplicaHandle::connect(
             replica_id,
+            instance_id,
             control_addr,
             data_addr,
         )

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use kuberic_core::pod::PodRuntime;
-use kuberic_core::types::CancellationToken;
+use kuberic_core::types::{CancellationToken, ReplicaInstanceId};
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -19,6 +19,10 @@ struct Args {
     /// Replica ID for this instance.
     #[arg(long, env = "KUBERIC_REPLICA_ID", default_value = "1")]
     replica_id: i64,
+
+    /// Incarnation ID for this concrete runtime process.
+    #[arg(long, env = "KUBERIC_REPLICA_INSTANCE_ID")]
+    replica_instance_id: Option<String>,
 
     /// Bind address for the gRPC control server (operator → pod).
     #[arg(long, env = "KUBERIC_CONTROL_BIND", default_value = "127.0.0.1:0")]
@@ -48,7 +52,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("=== SQLite: Replicated SQLite Database ===");
 
-    let bundle = PodRuntime::builder(args.replica_id)
+    let mut runtime = PodRuntime::builder(args.replica_id);
+    if let Some(instance_id) = args.replica_instance_id {
+        runtime = runtime.instance_id(ReplicaInstanceId::new(instance_id));
+    }
+    let bundle = runtime
         .reply_timeout(Duration::from_secs(10))
         .control_bind(args.control_bind)
         .data_bind(args.data_bind)

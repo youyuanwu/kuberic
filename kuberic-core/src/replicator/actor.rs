@@ -206,14 +206,19 @@ impl WalReplicatorActor {
                             state.advance_committed_lsn(tracker_committed);
 
                             // Connect new secondaries and replay pending ops
+                            let mut required_connection_error = None;
                             if let Some(sender) = &mut primary_sender {
                                 for member in &current.members {
                                     if member.id != self.replica_id
-                                        && !sender.has_connection(&member.id)
+                                        && !sender.has_connection(
+                                            &member.id,
+                                            &member.instance_id,
+                                        )
                                     {
                                         if let Err(e) = sender
                                             .add_secondary(
                                                 member.id,
+                                                member.instance_id.clone(),
                                                 member.replicator_address.clone(),
                                                 quorum_tracker.clone(),
                                                 state.clone(),
@@ -222,9 +227,14 @@ impl WalReplicatorActor {
                                         {
                                             warn!(
                                                 replica_id = member.id,
+                                                instance_id = %member.instance_id,
                                                 error = %e,
                                                 "failed to connect to secondary"
                                             );
+                                            if member.must_catch_up {
+                                                required_connection_error = Some(e);
+                                                break;
+                                            }
                                             continue;
                                         }
 
@@ -253,7 +263,11 @@ impl WalReplicatorActor {
                                 }
                             }
 
-                            let _ = reply.send(Ok(()));
+                            if let Some(error) = required_connection_error {
+                                let _ = reply.send(Err(error));
+                            } else {
+                                let _ = reply.send(Ok(()));
+                            }
                         }
                         ReplicatorControlEvent::UpdateCurrentConfiguration {
                             current,
@@ -278,7 +292,7 @@ impl WalReplicatorActor {
                                     .filter(|id| !cc_members.contains(id))
                                     .collect();
                                 for id in to_remove {
-                                    sender.remove_secondary(id);
+                                    sender.remove_secondary_by_id(id);
                                 }
                             }
 
@@ -314,9 +328,13 @@ impl WalReplicatorActor {
                                 let _ = reply.send(result);
                             });
                         }
-                        ReplicatorControlEvent::RemoveReplica { replica_id, reply } => {
+                        ReplicatorControlEvent::RemoveReplica {
+                            replica_id,
+                            instance_id,
+                            reply,
+                        } => {
                             if let Some(sender) = &mut primary_sender {
-                                sender.remove_secondary(replica_id);
+                                sender.remove_secondary(replica_id, &instance_id);
                             }
                             let _ = reply.send(Ok(()));
                         }
@@ -508,6 +526,7 @@ mod tests {
                 .into_iter()
                 .map(|id| ReplicaInfo {
                     id,
+                    instance_id: crate::types::ReplicaInstanceId::new(format!("actor-test-{id}")),
                     role: Role::ActiveSecondary,
                     status: ReplicaStatus::Up,
                     replicator_address: String::new(),

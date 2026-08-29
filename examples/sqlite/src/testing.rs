@@ -7,12 +7,14 @@ use std::time::Duration;
 
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
+use kuberic_core::types::ReplicaInstanceId;
 use tokio::sync::Mutex;
 
 use crate::state::{SharedState, SqliteState};
 
 /// A running SQLite pod: PodRuntime + SQLite service event loop.
 pub struct SqlitePod {
+    pub instance_id: ReplicaInstanceId,
     pub control_address: String,
     pub data_address: String,
     pub client_address: String,
@@ -43,6 +45,10 @@ impl SqlitePod {
 
     /// Start with a specific data directory (for restart tests).
     pub async fn start_with_dir(id: i64, data_dir: PathBuf, reply_timeout: Duration) -> Self {
+        static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let instance_id = ReplicaInstanceId::new(format!("sqlite-pod-{id}-{generation}"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap().to_string();
         drop(listener);
@@ -54,6 +60,7 @@ impl SqlitePod {
         drop(data_listener);
 
         let bundle = PodRuntime::builder(id)
+            .instance_id(instance_id.clone())
             .reply_timeout(reply_timeout)
             .data_bind(data_bind)
             .build()
@@ -74,6 +81,7 @@ impl SqlitePod {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         Self {
+            instance_id,
             control_address,
             data_address,
             client_address,
@@ -86,9 +94,14 @@ impl SqlitePod {
 
     /// Create a GrpcReplicaHandle for this pod.
     pub async fn replica_handle(&self, id: i64) -> GrpcReplicaHandle {
-        GrpcReplicaHandle::connect(id, self.control_address.clone(), self.data_address.clone())
-            .await
-            .unwrap()
+        GrpcReplicaHandle::connect(
+            id,
+            self.instance_id.clone(),
+            self.control_address.clone(),
+            self.data_address.clone(),
+        )
+        .await
+        .unwrap()
     }
 
     /// Simulate a pod crash. Aborts the PodRuntime and service without

@@ -1,6 +1,7 @@
 use crate::proto;
 use crate::types::{
-    Epoch, OpenMode, ReplicaInfo, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
+    Epoch, OpenMode, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode,
+    ReplicaStatus, Role,
 };
 
 // --- Epoch ---
@@ -116,6 +117,7 @@ impl From<ReplicaInfo> for proto::ReplicaInfoProto {
     fn from(r: ReplicaInfo) -> Self {
         proto::ReplicaInfoProto {
             id: r.id,
+            instance_id: r.instance_id.to_string(),
             role: proto::RoleProto::from(r.role) as i32,
             status: match r.status {
                 ReplicaStatus::Up => proto::ReplicaStatusProto::StatusUp as i32,
@@ -133,6 +135,7 @@ impl From<proto::ReplicaInfoProto> for ReplicaInfo {
     fn from(r: proto::ReplicaInfoProto) -> Self {
         ReplicaInfo {
             id: r.id,
+            instance_id: ReplicaInstanceId::new(r.instance_id),
             role: Role::from(r.role),
             status: if r.status == proto::ReplicaStatusProto::StatusUp as i32 {
                 ReplicaStatus::Up
@@ -164,5 +167,35 @@ impl From<proto::ReplicaSetConfigProto> for ReplicaSetConfig {
             members: c.members.into_iter().map(|r| r.into()).collect(),
             write_quorum: c.write_quorum,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replica_info_round_trip_preserves_incarnation() {
+        let original = ReplicaInfo {
+            id: 7,
+            instance_id: ReplicaInstanceId::new("pod-uid-7"),
+            role: Role::ActiveSecondary,
+            status: ReplicaStatus::Up,
+            replicator_address: "http://127.0.0.1:7007".into(),
+            current_progress: 42,
+            catch_up_capability: 40,
+            must_catch_up: true,
+        };
+
+        let round_trip = ReplicaInfo::from(proto::ReplicaInfoProto::from(original.clone()));
+
+        assert_eq!(round_trip.id, original.id);
+        assert_eq!(round_trip.instance_id, original.instance_id);
+        assert_eq!(round_trip.role, original.role);
+        assert_eq!(round_trip.status, original.status);
+        assert_eq!(round_trip.replicator_address, original.replicator_address);
+        assert_eq!(round_trip.current_progress, original.current_progress);
+        assert_eq!(round_trip.catch_up_capability, original.catch_up_capability);
+        assert_eq!(round_trip.must_catch_up, original.must_catch_up);
     }
 }

@@ -2,8 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec,
-    Probe, Service, ServicePort, ServiceSpec, TCPSocketAction, VolumeResourceRequirements,
+    Container, ContainerPort, EnvVarSource, ObjectFieldSelector, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, Pod, PodSpec, Probe, Service, ServicePort, ServiceSpec,
+    TCPSocketAction, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -167,6 +168,16 @@ pub async fn reconcile_set(
                 for &replica_id in &replica_ids {
                     if let Some(handle) = driver.handle(replica_id) {
                         let is_stale = match handle.get_status().await {
+                            Ok(s) if s.instance_id != handle.instance_id() => {
+                                warn!(
+                                    name,
+                                    replica_id,
+                                    expected_instance_id = %handle.instance_id(),
+                                    actual_instance_id = %s.instance_id,
+                                    "replica incarnation mismatch"
+                                );
+                                true
+                            }
                             Ok(s) if s.epoch != current_epoch => {
                                 warn!(name, replica_id, ?current_epoch,
                                     actual_epoch = ?s.epoch,
@@ -232,8 +243,20 @@ pub async fn reconcile_set(
                 // Stale secondaries → remove and requeue
                 if !stale_ids.is_empty() {
                     for &id in &stale_ids {
-                        info!(name, replica_id = id, "removing stale secondary handle");
-                        driver.remove_replica_from_driver(id);
+                        info!(
+                            name,
+                            replica_id = id,
+                            "retiring stale secondary incarnation"
+                        );
+                        if let Err(error) = driver.remove_stale_secondary(id).await {
+                            warn!(
+                                name,
+                                replica_id = id,
+                                error = %error,
+                                "failed to retire stale secondary incarnation"
+                            );
+                            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                        }
                     }
                     let status = KubericSetStatus {
                         ready_replicas: driver.replica_ids().len() as i32,
@@ -311,6 +334,7 @@ pub async fn reconcile_set(
                                 Ok(handle) => {
                                     if let Err(e) = driver.add_replica(handle).await {
                                         warn!(replica_id, error = %e, "failed to add replica");
+                                        api.delete_pod(&namespace, &pod_name).await?;
                                         return Ok(ReconcileAction::Requeue(Duration::from_secs(
                                             5,
                                         )));
@@ -556,7 +580,8 @@ fn build_member_status(pods: &[Pod], spec: &KubericSetSpec) -> Vec<MemberStatus>
             let id: i64 = labels
                 .and_then(|l| l.get("kuberic.io/pod-index"))
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
+                .unwrap_or(0)
+                + 1;
             let pod_ip = pod
                 .status
                 .as_ref()
@@ -567,6 +592,7 @@ fn build_member_status(pods: &[Pod], spec: &KubericSetSpec) -> Vec<MemberStatus>
             MemberStatus {
                 name,
                 id,
+                instance_id: pod.metadata.uid.clone().unwrap_or_default(),
                 role,
                 current_progress: 0,
                 healthy: is_pod_ready(pod),
@@ -663,6 +689,17 @@ fn build_pod(set: &KubericSet, namespace: &str, index: i32) -> Pod {
         k8s_openapi::api::core::v1::EnvVar {
             name: "KUBERIC_REPLICA_ID".into(),
             value: Some(replica_id),
+            ..Default::default()
+        },
+        k8s_openapi::api::core::v1::EnvVar {
+            name: "KUBERIC_REPLICA_INSTANCE_ID".into(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    api_version: Some("v1".into()),
+                    field_path: "metadata.uid".into(),
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         },
         k8s_openapi::api::core::v1::EnvVar {

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::fmt;
 
 pub type CancellationToken = tokio_util::sync::CancellationToken;
 
@@ -45,6 +46,29 @@ impl Ord for Epoch {
 
 pub type Lsn = i64;
 pub type ReplicaId = i64;
+
+/// Identifies one concrete runtime generation of a logical replica.
+///
+/// A replica ID remains stable when Kubernetes recreates a pod, while the
+/// incarnation changes to fence stale connections and control messages.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct ReplicaInstanceId(String);
+
+impl ReplicaInstanceId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ReplicaInstanceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -103,6 +127,7 @@ pub enum DataLossAction {
 #[derive(Debug, Clone)]
 pub struct ReplicaInfo {
     pub id: ReplicaId,
+    pub instance_id: ReplicaInstanceId,
     pub role: Role,
     pub status: ReplicaStatus,
     /// Data plane address (replication streams + copy protocol).
@@ -140,8 +165,9 @@ pub enum ReplicaSetQuorumMode {
 
 /// Status returned by `ReplicaHandle::get_status()`. Used by the
 /// reconciler to detect restarted pods (epoch mismatch, role=None).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaStatusInfo {
+    pub instance_id: ReplicaInstanceId,
     pub role: Role,
     pub epoch: Epoch,
     pub current_progress: Lsn,

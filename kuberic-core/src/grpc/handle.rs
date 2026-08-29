@@ -8,14 +8,15 @@ use crate::error::{KubericError, Result};
 use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
-    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
-    ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
+    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
+    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
 };
 
 /// Implements `ReplicaHandle` by calling a remote pod's gRPC `ReplicatorControl` service.
 /// Used by the operator to drive remote replicas.
 pub struct GrpcReplicaHandle {
     id: ReplicaId,
+    instance_id: ReplicaInstanceId,
     client: ReplicatorControlClient<Channel>,
     /// The data plane address (secondary gRPC server for replication streams).
     data_address: String,
@@ -26,6 +27,7 @@ pub struct GrpcReplicaHandle {
 impl GrpcReplicaHandle {
     pub async fn connect(
         id: ReplicaId,
+        instance_id: ReplicaInstanceId,
         control_address: String,
         data_address: String,
     ) -> Result<Self> {
@@ -38,6 +40,7 @@ impl GrpcReplicaHandle {
 
         Ok(Self {
             id,
+            instance_id,
             client: ReplicatorControlClient::new(channel),
             data_address,
             current_progress: AtomicI64::new(0),
@@ -66,6 +69,10 @@ impl GrpcReplicaHandle {
 impl ReplicaHandle for GrpcReplicaHandle {
     fn id(&self) -> ReplicaId {
         self.id
+    }
+
+    fn instance_id(&self) -> ReplicaInstanceId {
+        self.instance_id.clone()
     }
 
     async fn open(&self, mode: OpenMode) -> Result<()> {
@@ -186,10 +193,17 @@ impl ReplicaHandle for GrpcReplicaHandle {
         Ok(())
     }
 
-    async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
+    async fn remove_replica(
+        &self,
+        replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+    ) -> Result<()> {
         let mut client = self.client.clone();
         client
-            .remove_replica(RemoveReplicaRequest { replica_id })
+            .remove_replica(RemoveReplicaRequest {
+                replica_id,
+                instance_id: instance_id.to_string(),
+            })
             .await
             .map_err(Self::map_err)?;
         Ok(())
@@ -225,6 +239,7 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .store(inner.catch_up_capability, Ordering::Release);
 
         Ok(ReplicaStatusInfo {
+            instance_id: ReplicaInstanceId::new(inner.instance_id),
             role,
             epoch,
             current_progress: inner.current_progress,

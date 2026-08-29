@@ -39,6 +39,7 @@ message ReplicaInfoProto {
     int64 current_progress = 5;
     int64 catch_up_capability = 6;
     bool must_catch_up = 7;
+    string instance_id = 8;
 }
 
 message ReplicaSetConfigProto {
@@ -93,6 +94,7 @@ message GetStatusResponse {
     int64 catch_up_capability = 4;
     int64 committed_lsn = 5;
     bool healthy = 6;
+    string instance_id = 7;
 }
 
 message UpdateCatchUpConfigRequest {
@@ -118,6 +120,7 @@ message BuildReplicaResponse {}
 
 message RemoveReplicaRequest {
     int64 replica_id = 1;
+    string instance_id = 2;
 }
 message RemoveReplicaResponse {}
 

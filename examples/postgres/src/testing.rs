@@ -1,3 +1,4 @@
+use kuberic_core::types::ReplicaInstanceId;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,6 +62,7 @@ pub async fn allocate_port() -> u16 {
 /// A running PG pod: PodRuntime + PG service event loop + PG instance.
 /// Equivalent to KvPod but for PostgreSQL.
 pub struct PgPod {
+    pub instance_id: ReplicaInstanceId,
     pub control_address: String,
     pub data_address: String,
     pub instance: Arc<crate::instance::PgInstanceManager>,
@@ -78,6 +80,10 @@ impl PgPod {
         use tokio::sync::mpsc;
 
         let pg_bin = find_pg_bin();
+        static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let instance_id = ReplicaInstanceId::new(format!("postgres-pod-{id}-{generation}"));
         let port = allocate_port().await;
         let data_dir = temp_data_dir(&format!("pod-{id}-{port}"));
         let (fault_tx, _fault_rx) = mpsc::channel(1);
@@ -100,6 +106,7 @@ impl PgPod {
         drop(data_listener);
 
         let bundle = PodRuntime::builder(id)
+            .instance_id(instance_id.clone())
             .reply_timeout(Duration::from_secs(30))
             .data_bind(data_bind)
             .build()
@@ -115,6 +122,7 @@ impl PgPod {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         Self {
+            instance_id,
             control_address,
             data_address,
             instance,
@@ -128,6 +136,7 @@ impl PgPod {
     pub async fn replica_handle(&self, id: i64) -> kuberic_core::grpc::handle::GrpcReplicaHandle {
         kuberic_core::grpc::handle::GrpcReplicaHandle::connect(
             id,
+            self.instance_id.clone(),
             self.control_address.clone(),
             self.data_address.clone(),
         )
