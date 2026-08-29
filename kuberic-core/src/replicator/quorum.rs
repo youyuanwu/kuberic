@@ -40,12 +40,12 @@ pub struct QuorumTracker {
     catch_up_waiters: Vec<CatchUpWaiter>,
     /// Timeout applied independently to each operation and catch-up waiter.
     quorum_timeout: Duration,
-    /// Highest operation that expired after the current catch-up baseline.
+    /// Whether an operation expired during the active catch-up attempt.
     ///
-    /// This prevents removing an expired operation from making the active
-    /// catch-up attempt appear successful. A new catch-up configuration
-    /// establishes a new baseline and permits a retry.
-    last_expired_lsn: Lsn,
+    /// This prevents removing an expired operation from making catch-up appear
+    /// successful. A new catch-up configuration clears the marker and permits
+    /// a retry from its new baseline.
+    catch_up_failed: bool,
 }
 
 struct CatchUpWaiter {
@@ -82,7 +82,7 @@ impl QuorumTracker {
             catch_up_baseline_lsn: 0,
             catch_up_waiters: Vec::new(),
             quorum_timeout,
-            last_expired_lsn: 0,
+            catch_up_failed: false,
         }
     }
 
@@ -108,6 +108,7 @@ impl QuorumTracker {
         self.previous_write_quorum = previous_write_quorum;
         self.must_catch_up_ids = must_catch_up_ids;
         self.catch_up_baseline_lsn = self.highest_lsn;
+        self.catch_up_failed = false;
 
         // Seed ACK progress from operator-reported replica progress.
         // This accounts for data delivered via copy stream.
@@ -294,9 +295,12 @@ impl QuorumTracker {
             .filter_map(|(&lsn, op)| (op.deadline <= now).then_some(lsn))
             .collect();
 
+        if !expired_lsns.is_empty() {
+            self.catch_up_failed = true;
+        }
+
         for lsn in expired_lsns {
             if let Some(mut op) = self.pending.remove(&lsn) {
-                self.last_expired_lsn = self.last_expired_lsn.max(lsn);
                 if let Some(reply) = op.reply.take() {
                     let _ = reply.send(Err(KubericError::NoWriteQuorum));
                 }
@@ -353,7 +357,7 @@ impl QuorumTracker {
     }
 
     fn catch_up_attempt_failed(&self) -> bool {
-        self.last_expired_lsn > self.catch_up_baseline_lsn
+        self.catch_up_failed
     }
 
     // -----------------------------------------------------------------------
@@ -776,6 +780,43 @@ mod tests {
         let (retry_tx, retry_rx) = oneshot::channel();
         tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, retry_tx);
         assert!(retry_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_preexisting_operation_expiration_fails_catch_up_attempt() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (op_tx, op_rx) = oneshot::channel();
+        tracker.register(1, 1, op_tx);
+
+        // Establishing a catch-up baseline while the write is already pending
+        // must not hide that write if it subsequently expires.
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::new(),
+            0,
+            HashSet::new(),
+            HashMap::new(),
+        );
+        let (wait_tx, wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+
+        assert!(matches!(
+            op_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+        assert!(matches!(
+            wait_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

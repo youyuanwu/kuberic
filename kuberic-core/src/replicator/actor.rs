@@ -370,7 +370,11 @@ async fn run_expiration_scheduler(
     shutdown: CancellationToken,
 ) {
     loop {
-        let next_deadline = quorum_tracker.lock().await.next_deadline();
+        let next_deadline = {
+            let mut tracker = quorum_tracker.lock().await;
+            tracker.expire_due(tokio::time::Instant::now());
+            tracker.next_deadline()
+        };
         match next_deadline {
             Some(deadline) => {
                 tokio::select! {
@@ -516,6 +520,8 @@ mod tests {
             write_rx.await.unwrap(),
             Err(KubericError::NoWriteQuorum)
         ));
+        assert_eq!(harness.state.current_progress(), 1);
+        assert_eq!(harness.state.committed_lsn(), 0);
 
         reply.send(Ok(())).unwrap();
         epoch_rx.await.unwrap().unwrap();
