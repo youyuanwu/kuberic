@@ -539,8 +539,9 @@ quorum replicas may already have persisted the operation.
 
 Catch-up waiters also carry deadlines. They return `NoWriteQuorum` when their
 deadline expires or when an operation expires during the active catch-up
-attempt. A later `set_catch_up_configuration()` starts a new attempt and
-establishes a new baseline.
+attempt. Repeating `set_catch_up_configuration()` during the same attempt does
+not move the baseline or clear failure. `set_current_configuration()` ends the
+attempt; a later catch-up update then establishes a new baseline.
 
 `wait_for_catch_up()` registers a waiter. On every commit and every ACK,
 `notify_catch_up_waiters()` re-checks all waiters via `is_caught_up()`:

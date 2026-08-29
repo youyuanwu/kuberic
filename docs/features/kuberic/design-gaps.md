@@ -206,9 +206,10 @@ benefit since the driver is single-threaded per-partition.
    minutes to hours.
 
 2. **`wait_for_catch_up_quorum`** — blocks until the must_catch_up replica
-   ACKs all ops. B0 now bounds this wait and returns `NoWriteQuorum` when
-   acknowledgement progress stops, but a slow replica can still occupy the
-   operator synchronously until completion or the deadline.
+   ACKs all ops. B0 now applies a fixed deadline and returns
+   `NoWriteQuorum` if catch-up is incomplete when it expires, but a slow
+   replica can still occupy the operator synchronously until completion or
+   the deadline.
 
 Both have the same consequences:
 - **Reconciler stall** — blocked on `.await`, no health checks or
@@ -317,8 +318,9 @@ stream. When it breaks, detection is partial:
   An operation that has not reached quorum expires with `NoWriteQuorum`;
   late ACKs are harmless and later operations have independent deadlines.
 - Catch-up quorum waiters use the same bounded behavior. An expired operation
-  fails the active catch-up attempt; a later explicit configuration update can
-  establish a new retry baseline.
+  fails the active catch-up attempt. Duplicate catch-up updates preserve the
+  baseline; rollback/finalization must end the failed attempt before a later
+  retry establishes a new baseline.
 
 **No auto-reconnection (intentional, matching SF):**
 When a connection is removed, the secondary silently drops out of

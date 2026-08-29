@@ -33,7 +33,7 @@ Layer 1: Component unit tests
 
 Test individual components in isolation. Fast, deterministic.
 
-### QuorumTracker (`replicator/quorum.rs` — 14 tests)
+### QuorumTracker (`replicator/quorum.rs` — 16 tests)
 
 | Test | What It Validates |
 |------|-------------------|
@@ -46,7 +46,7 @@ Test individual components in isolation. Fast, deterministic.
 | `test_wait_catch_up_all_mode` | All mode: every member must ACK |
 | Timeout tests (3) | Operation expiration, ACK boundary, late ACK safety, independent later writes |
 | Catch-up timeout tests (3) | Waiter expiration, active-attempt failure and retry baseline |
-| `test_reconfiguration_does_not_reset_operation_deadline` | Pending deadline survives configuration changes |
+| Configuration safety tests (3) | Deadline preservation, duplicate catch-up safety, quorum-relaxation commit |
 
 **Infrastructure:** Direct `QuorumTracker` construction, no actors or gRPC.
 

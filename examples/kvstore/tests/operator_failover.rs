@@ -282,6 +282,13 @@ async fn test_b0_catch_up_timeout_preserves_error_and_allows_retry() {
         ],
         write_quorum: 2,
     };
+    // Explicitly end the failed dual-configuration attempt before starting a
+    // retry. Repeating set_catch_up_configuration alone must not move the
+    // baseline past a lagging required replica.
+    primary_control
+        .update_current_configuration(retry_config.clone())
+        .await
+        .unwrap();
     primary_control
         .update_catch_up_configuration(
             retry_config.clone(),

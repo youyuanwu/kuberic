@@ -186,6 +186,7 @@ impl WalReplicatorActor {
                                 must_catch_up,
                                 member_progress,
                             );
+                            state.set_committed_lsn(quorum_tracker.lock().await.committed_lsn());
 
                             // Connect new secondaries and replay pending ops
                             if let Some(sender) = &mut primary_sender {
@@ -249,6 +250,7 @@ impl WalReplicatorActor {
                                 cc_members.clone(),
                                 current.write_quorum,
                             );
+                            state.set_committed_lsn(quorum_tracker.lock().await.committed_lsn());
 
                             if let Some(sender) = &mut primary_sender {
                                 let to_remove: Vec<ReplicaId> = sender
@@ -328,8 +330,12 @@ impl WalReplicatorActor {
                     }
                 }
 
-                req = data_rx.recv(), if role == Role::Primary => {
+                req = data_rx.recv() => {
                     let Some(req) = req else { break };
+                    if role != Role::Primary {
+                        let _ = req.reply.send(Err(KubericError::NotPrimary));
+                        continue;
+                    }
                     let lsn = next_lsn;
                     next_lsn += 1;
 
@@ -586,6 +592,61 @@ mod tests {
             write_rx.await.unwrap(),
             Err(KubericError::NotPrimary)
         ));
+        drop(harness.control_tx);
+        drop(harness.data_tx);
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn demotion_rejects_write_already_queued_in_data_channel() {
+        let mut harness = ActorHarness::start(Duration::from_secs(1)).await;
+
+        // Hold the actor inside a control branch while both a write and the
+        // demotion are queued. The biased select must process demotion first,
+        // then drain the write with NotPrimary rather than stranding it.
+        let (epoch_tx, epoch_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateEpoch {
+                epoch: Epoch::new(1, 2),
+                reply: epoch_tx,
+            })
+            .await
+            .unwrap();
+        let event = harness.state_provider_rx.recv().await.unwrap();
+        let StateProviderEvent::UpdateEpoch { reply, .. } = event else {
+            panic!("expected UpdateEpoch");
+        };
+
+        let (write_tx, write_rx) = oneshot::channel();
+        harness
+            .data_tx
+            .send(ReplicateRequest {
+                data: Bytes::from_static(b"stale"),
+                reply: write_tx,
+            })
+            .await
+            .unwrap();
+        let (role_tx, role_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::ChangeRole {
+                epoch: Epoch::new(1, 3),
+                role: Role::ActiveSecondary,
+                reply: role_tx,
+            })
+            .await
+            .unwrap();
+
+        reply.send(Ok(())).unwrap();
+        epoch_rx.await.unwrap().unwrap();
+        role_rx.await.unwrap().unwrap();
+        assert!(matches!(
+            write_rx.await.unwrap(),
+            Err(KubericError::NotPrimary)
+        ));
+        assert_eq!(harness.state.current_progress(), 0);
+
         drop(harness.control_tx);
         drop(harness.data_tx);
         harness.task.await.unwrap();

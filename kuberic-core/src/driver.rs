@@ -804,8 +804,29 @@ impl PartitionDriver {
         );
 
         // 4. Reconfigure quorum (rebuild full config, must_catch_up on new replica)
-        self.reconfigure_quorum(primary_id, Some(replica_id))
-            .await?;
+        if let Err(error) = self.reconfigure_quorum(primary_id, Some(replica_id)).await {
+            // The handle was inserted before catch-up so the new configuration
+            // could be built. Roll back both driver state and the primary's
+            // dual configuration; otherwise the reconciler sees the replica
+            // as present and cannot retry the failed scale-up.
+            if let Err(rollback_error) = self.replicas[&primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
+                .await
+            {
+                warn!(
+                    replica_id,
+                    error = %rollback_error,
+                    "failed to restore current configuration after add_replica failure"
+                );
+            }
+
+            if let Some(replica) = self.replicas.remove(&replica_id) {
+                let _ = replica.handle.change_role(epoch, Role::None).await;
+                let _ = replica.handle.close().await;
+            }
+            return Err(error);
+        }
 
         info!(replica_id, "replica added");
         Ok(())
@@ -919,6 +940,7 @@ impl PartitionDriver {
 pub mod testing {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tokio::sync::{mpsc, oneshot};
     use tonic::transport::Server;
@@ -944,6 +966,9 @@ pub mod testing {
         epoch: std::sync::Mutex<Epoch>,
         _actor_handle: tokio::task::JoinHandle<()>,
         _grpc_handle: tokio::task::JoinHandle<()>,
+        bypass_build: AtomicBool,
+        bypass_update_epoch: AtomicBool,
+        fail_next_catch_up: AtomicBool,
     }
 
     impl InProcessReplicaHandle {
@@ -995,7 +1020,23 @@ pub mod testing {
                 epoch: std::sync::Mutex::new(Epoch::default()),
                 _actor_handle: actor_handle,
                 _grpc_handle: grpc_handle,
+                bypass_build: AtomicBool::new(false),
+                bypass_update_epoch: AtomicBool::new(false),
+                fail_next_catch_up: AtomicBool::new(false),
             })
+        }
+
+        /// Arrange for the next add-replica workflow driven through this
+        /// primary to reach the catch-up step and fail there.
+        #[cfg(test)]
+        pub fn inject_add_replica_catch_up_failure(&self) {
+            self.bypass_build.store(true, Ordering::Release);
+            self.fail_next_catch_up.store(true, Ordering::Release);
+        }
+
+        #[cfg(test)]
+        pub fn bypass_update_epoch_for_add_replica_test(&self) {
+            self.bypass_update_epoch.store(true, Ordering::Release);
         }
 
         async fn send_control(
@@ -1065,6 +1106,9 @@ pub mod testing {
         async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
             *self.epoch.lock().unwrap() = epoch;
             self.secondary_state.update_epoch(epoch);
+            if self.bypass_update_epoch.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.send_control(|reply| ReplicatorControlEvent::UpdateEpoch { epoch, reply })
                 .await
         }
@@ -1113,11 +1157,17 @@ pub mod testing {
         }
 
         async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+            if self.fail_next_catch_up.swap(false, Ordering::AcqRel) {
+                return Err(KubericError::NoWriteQuorum);
+            }
             self.send_control(|reply| ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply })
                 .await
         }
 
         async fn build_replica(&self, replica: ReplicaInfo) -> Result<()> {
+            if self.bypass_build.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.send_control(|reply| ReplicatorControlEvent::BuildReplica { replica, reply })
                 .await
         }
@@ -1192,5 +1242,38 @@ mod tests {
             "after fix: failed add_replica must not leave zombie in driver"
         );
         assert_eq!(driver.replica_ids().len(), 1, "only the primary remains");
+    }
+
+    #[tokio::test]
+    async fn test_add_replica_rolls_back_after_catch_up_failure() {
+        let primary = InProcessReplicaHandle::spawn(1).await.unwrap();
+        let writer = primary.state_replicator();
+        primary.inject_add_replica_catch_up_failure();
+
+        let mut driver = PartitionDriver::new();
+        driver
+            .create_partition(vec![Box::new(primary)])
+            .await
+            .unwrap();
+
+        let replica = InProcessReplicaHandle::spawn(2).await.unwrap();
+        replica.bypass_update_epoch_for_add_replica_test();
+        let result = driver.add_replica(Box::new(replica)).await;
+        assert!(
+            matches!(result, Err(KubericError::NoWriteQuorum)),
+            "unexpected add_replica result: {result:?}"
+        );
+        assert_eq!(driver.replica_ids(), vec![1]);
+
+        // Restoring the prior single-replica configuration clears the failed
+        // catch-up attempt and allows the primary to continue committing.
+        let lsn = writer
+            .replicate(
+                bytes::Bytes::from_static(b"after-rollback"),
+                crate::types::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lsn, 1);
     }
 }
