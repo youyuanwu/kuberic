@@ -180,8 +180,56 @@ impl StateReplicatorHandle {
             .map_err(|_| KubericError::Closed)?;
 
         tokio::select! {
+            biased;
             result = reply_rx => result.map_err(|_| KubericError::Closed)?,
             _ = token.cancelled() => Err(KubericError::Cancelled),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn granted_handle() -> (StateReplicatorHandle, mpsc::Receiver<ReplicateRequest>) {
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let state = Arc::new(PartitionState::new());
+        state.set_write_status(AccessStatus::Granted);
+        (StateReplicatorHandle::new(data_tx, state), data_rx)
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_reply_returns_cancelled() {
+        let (handle, mut data_rx) = granted_handle();
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let task = tokio::spawn(async move {
+            handle
+                .replicate(Bytes::from_static(b"test"), task_token)
+                .await
+        });
+
+        let _request = data_rx.recv().await.unwrap();
+        token.cancel();
+
+        assert!(matches!(task.await.unwrap(), Err(KubericError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn ready_reply_wins_over_simultaneous_cancellation() {
+        let (handle, mut data_rx) = granted_handle();
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let task = tokio::spawn(async move {
+            handle
+                .replicate(Bytes::from_static(b"test"), task_token)
+                .await
+        });
+
+        let request = data_rx.recv().await.unwrap();
+        request.reply.send(Ok(42)).unwrap();
+        token.cancel();
+
+        assert_eq!(task.await.unwrap().unwrap(), 42);
     }
 }
