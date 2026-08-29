@@ -22,6 +22,7 @@ use crate::types::{CancellationToken, FaultType, OpenMode, OperationStream, Repl
 /// Handle returned by the user to the runtime at Open.
 /// The runtime uses this to drive replicator lifecycle via control events.
 /// Contains shared PartitionState for synchronous access-status fencing.
+#[derive(Clone)]
 pub struct ReplicatorHandle {
     /// Send lifecycle/config commands to the replicator's event loop.
     control_tx: mpsc::Sender<ReplicatorControlEvent>,

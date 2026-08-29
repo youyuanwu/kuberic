@@ -989,5 +989,34 @@ The operation durably covers write revocation, frozen-LSN catch-up, demotion,
 promotion, member epoch convergence, catch-up/current configuration, routing
 labels, stable snapshot persistence, and compensation to the old primary.
 Impossible or incompatible observations perform no runtime mutation and remain
-fail closed. Failover, add/remove/rebuild, and other operations retain their
+fail closed. Failover, scale-down/remove, and other operations retain their
 existing paths.
+
+### E5. Replica add/rebuild state lost with operator process — ✅ Fixed
+
+**Affects:** Reconciler scale-up and stale-secondary rejoin
+
+Replica add and rebuild now use the same bounded CRD-backed durability model as
+switchover, with a separate explicit protocol state machine. The checkpoint
+keeps the previous stable snapshot, candidate logical/incarnation identity,
+target snapshot, phase, pending correlated action, and bounded
+retry/deadline/error metadata.
+
+Open, Close, role/epoch changes, BuildReplica, exact-incarnation RemoveReplica,
+catch-up/current configuration, and quorum wait use correlated runtime
+activities. BuildReplica reports scheduled/in-progress/completed/failed and
+deduplicates exact retry while copy is active. The stable snapshot changes only
+after current configuration commits.
+
+Stale-secondary rejoin removes the old exact primary connection before opening
+the replacement under the same logical ID. This follows Service Fabric's
+BuildIdleReplica instance checks and in-build tracking
+(`FailoverUnitProxy.ReplicatorBuildIdleReplicaAsyncOperation.cpp`): duplicate
+ready instances complete successfully, stale requests are rejected, and an
+older instance is removed before a newer build proceeds.
+
+Compensation is phase-aware: pre-configuration failures remove/demote/close/
+delete the candidate; failures after catch-up configuration restore the
+previous current configuration first; and observed target current configuration
+rolls forward to target snapshot publication. Scale-down/remove, creation,
+failover, and data-loss migration remain open.

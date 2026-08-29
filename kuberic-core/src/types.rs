@@ -195,6 +195,7 @@ pub struct ReplicaStatusInfo {
     pub write_status: AccessStatus,
     pub configuration: Option<ReplicaConfigurationStatus>,
     pub last_completed_action: Option<DurableActionCompletion>,
+    pub durable_action: Option<DurableActionObservation>,
 }
 
 // ---------------------------------------------------------------------------
@@ -272,8 +273,28 @@ pub struct DurableActionCompletion {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableActionState {
+    Scheduled,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableActionObservation {
+    pub action_id: String,
+    pub signature: String,
+    pub state: DurableActionState,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum DurableReplicaAction {
+    Open {
+        mode: OpenMode,
+    },
+    Close,
     RevokeWriteStatus,
     ChangeRole {
         epoch: Epoch,
@@ -292,11 +313,20 @@ pub enum DurableReplicaAction {
     UpdateCurrentConfiguration {
         current: ReplicaSetConfig,
     },
+    BuildReplica {
+        replica: ReplicaInfo,
+    },
+    RemoveReplica {
+        replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+    },
 }
 
 impl DurableReplicaAction {
     pub fn signature(&self) -> String {
         match self {
+            Self::Open { mode } => format!("open:{mode:?}"),
+            Self::Close => "close".to_string(),
             Self::RevokeWriteStatus => "revoke-write-status".to_string(),
             Self::ChangeRole { epoch, role } => {
                 format!(
@@ -319,6 +349,14 @@ impl DurableReplicaAction {
             Self::UpdateCurrentConfiguration { current } => {
                 format!("update-current:{}", config_signature(current))
             }
+            Self::BuildReplica { replica } => format!(
+                "build-replica:{}@{}:{:?}:{}",
+                replica.id, replica.instance_id, replica.role, replica.replicator_address
+            ),
+            Self::RemoveReplica {
+                replica_id,
+                instance_id,
+            } => format!("remove-replica:{replica_id}@{instance_id}"),
         }
     }
 }
@@ -329,14 +367,12 @@ fn config_signature(config: &ReplicaSetConfig) -> String {
         .iter()
         .map(|member| {
             format!(
-                "{}@{}:{:?}:{:?}:{}:{}:{}:{}",
+                "{}@{}:{:?}:{:?}:{}:{}",
                 member.id,
                 member.instance_id,
                 member.role,
                 member.status,
                 member.replicator_address,
-                member.current_progress,
-                member.catch_up_capability,
                 member.must_catch_up
             )
         })
@@ -423,5 +459,37 @@ impl OperationStream {
     pub fn channel(buffer: usize) -> (tokio::sync::mpsc::Sender<Operation>, Self) {
         let (tx, rx) = tokio::sync::mpsc::channel(buffer);
         (tx, Self { rx })
+    }
+}
+
+#[cfg(test)]
+mod durable_action_tests {
+    use super::*;
+
+    #[test]
+    fn durable_action_signatures_fence_build_and_remove_incarnations() {
+        let replica = ReplicaInfo {
+            id: 7,
+            instance_id: ReplicaInstanceId::new("new"),
+            role: Role::IdleSecondary,
+            status: ReplicaStatus::Up,
+            replicator_address: "http://replica".to_string(),
+            current_progress: -1,
+            catch_up_capability: -1,
+            must_catch_up: false,
+        };
+        let build = DurableReplicaAction::BuildReplica { replica };
+        let remove_old = DurableReplicaAction::RemoveReplica {
+            replica_id: 7,
+            instance_id: ReplicaInstanceId::new("old"),
+        };
+        let remove_new = DurableReplicaAction::RemoveReplica {
+            replica_id: 7,
+            instance_id: ReplicaInstanceId::new("new"),
+        };
+
+        assert_ne!(build.signature(), remove_old.signature());
+        assert_ne!(remove_old.signature(), remove_new.signature());
+        assert!(build.signature().contains("7@new"));
     }
 }

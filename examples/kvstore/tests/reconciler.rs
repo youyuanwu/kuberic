@@ -20,8 +20,8 @@ use kuberic_core::types::{
 
 use kuberic_operator::cluster_api::ClusterApi;
 use kuberic_operator::crd::{
-    DurableActionKind, DurableOperationPhase, KubericSet, KubericSetSpec, KubericSetStatus, Phase,
-    PvcRetentionPolicy, StableReplicaRoleStatus,
+    DurableActionKind, DurableAddMode, DurableOperationKind, DurableOperationPhase, KubericSet,
+    KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy, StableReplicaRoleStatus,
 };
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
@@ -171,6 +171,8 @@ impl ReplicaHandle for ObservedHandle {
         action: DurableReplicaAction,
     ) -> CoreResult<()> {
         let operation = match &action {
+            DurableReplicaAction::Open { .. } => ControlOperation::Open,
+            DurableReplicaAction::Close => ControlOperation::Close,
             DurableReplicaAction::RevokeWriteStatus => ControlOperation::RevokeWriteStatus,
             DurableReplicaAction::ChangeRole { .. } => ControlOperation::ChangeRole,
             DurableReplicaAction::UpdateEpoch { .. } => ControlOperation::UpdateEpoch,
@@ -183,6 +185,8 @@ impl ReplicaHandle for ObservedHandle {
             DurableReplicaAction::UpdateCurrentConfiguration { .. } => {
                 ControlOperation::UpdateCurrentConfiguration
             }
+            DurableReplicaAction::BuildReplica { .. } => ControlOperation::BuildReplica,
+            DurableReplicaAction::RemoveReplica { .. } => ControlOperation::RemoveReplica,
         };
         self.record(operation);
         if self
@@ -746,6 +750,34 @@ async fn drive_switchover(
     panic!("durable switchover did not reach a terminal healthy status");
 }
 
+async fn drive_add_replica(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+) -> KubericSetStatus {
+    for _ in 0..120 {
+        reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
+            .await
+            .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy
+            && status
+                .stable_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.members.len() == replicas as usize)
+        {
+            reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
+                .await
+                .unwrap();
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("durable replica add did not reach a terminal healthy status");
+}
+
 async fn advance_until_pending_action(
     api: &KvClusterApi,
     name: &str,
@@ -773,6 +805,115 @@ async fn advance_until_pending_action(
         status = api.last_status().unwrap();
     }
     panic!("durable switchover did not reach pending action {kind:?}");
+}
+
+async fn advance_add_until_phase(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+    phase: DurableOperationPhase,
+) -> KubericSetStatus {
+    for _ in 0..100 {
+        if status
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.phase == phase && operation.pending_action.is_none())
+        {
+            return status;
+        }
+        reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
+            .await
+            .unwrap();
+        status = api.last_status().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("durable add did not reach phase {phase:?}");
+}
+
+async fn drive_operation_to_healthy(
+    api: &KvClusterApi,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+) -> KubericSetStatus {
+    for _ in 0..120 {
+        reconcile_set(
+            &make_set(name, replicas, Some(status.clone())),
+            api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("durable operation did not return to Healthy: {status:?}");
+}
+
+fn control_for_add_action(kind: DurableActionKind) -> Option<ControlOperation> {
+    match kind {
+        DurableActionKind::RetireOldReplica | DurableActionKind::CompensateRemoveCandidate => {
+            Some(ControlOperation::RemoveReplica)
+        }
+        DurableActionKind::OpenCandidate => Some(ControlOperation::Open),
+        DurableActionKind::UpdateCandidateEpoch => Some(ControlOperation::UpdateEpoch),
+        DurableActionKind::AssignCandidateIdle
+        | DurableActionKind::AssignCandidateActive
+        | DurableActionKind::CompensateDemoteCandidate => Some(ControlOperation::ChangeRole),
+        DurableActionKind::BuildCandidate => Some(ControlOperation::BuildReplica),
+        DurableActionKind::AddCatchUpConfiguration => {
+            Some(ControlOperation::UpdateCatchUpConfiguration)
+        }
+        DurableActionKind::AddWaitForCatchUpQuorum => Some(ControlOperation::WaitForCatchUpQuorum),
+        DurableActionKind::AddCurrentConfiguration
+        | DurableActionKind::CompensateRestoreConfiguration => {
+            Some(ControlOperation::UpdateCurrentConfiguration)
+        }
+        DurableActionKind::CompensateCloseCandidate => Some(ControlOperation::Close),
+        _ => None,
+    }
+}
+
+async fn drive_operation_with_lost_replies(
+    api: &KvClusterApi,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+    expected: &[DurableActionKind],
+) -> (KubericSetStatus, Vec<DurableActionKind>) {
+    let mut injected = Vec::new();
+    for _ in 0..120 {
+        if let Some(pending) = status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.pending_action.as_ref())
+            && pending.attempts == 0
+            && expected.contains(&pending.kind)
+            && !injected.contains(&pending.kind)
+            && let Some(control) = control_for_add_action(pending.kind)
+        {
+            api.fail_after_next_durable_action(control);
+            injected.push(pending.kind);
+        }
+        reconcile_set(
+            &make_set(name, replicas, Some(status.clone())),
+            api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            return (status, injected);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("durable operation with lost replies did not return to Healthy");
 }
 
 async fn live_replica_statuses(
@@ -1020,10 +1161,14 @@ async fn test_operator_restart_recovers_read_only_then_switches_and_scales() {
     .expect("switchover to an uncommitted scale-up pod must fail");
     assert!(error.contains("not in the committed driver topology"));
     api.mark_all_pods_ready();
-    reconcile_set(&scale_request, &api, &recovered_state)
-        .await
-        .unwrap();
-    let scaled = api.last_status().unwrap();
+    let scaled = drive_add_replica(
+        &api,
+        &recovered_state,
+        "recover",
+        4,
+        api.last_status().unwrap(),
+    )
+    .await;
     assert_eq!(scaled.stable_snapshot.as_ref().unwrap().members.len(), 4);
     assert_eq!(scaled.stable_snapshot.as_ref().unwrap().write_quorum, 3);
 
@@ -1223,42 +1368,48 @@ async fn test_committed_topology_retries_status_before_another_mutation() {
     let state = ReconcilerState::default();
     let status = create_healthy_set(&api, &state, "persist-retry", 1).await;
 
-    // Create two scale-up pods, then fail persistence after the first one is
-    // committed to the runtime topology.
+    // Create two scale-up pods, then fail persistence after the first one's
+    // current configuration is committed.
     let scale_request = make_set("persist-retry", 3, Some(status.clone()));
     reconcile_set(&scale_request, &api, &state).await.unwrap();
     api.mark_all_pods_ready();
+    reconcile_set(&scale_request, &api, &state).await.unwrap();
+    let finalizing = advance_add_until_phase(
+        &api,
+        &state,
+        "persist-retry",
+        3,
+        api.last_status().unwrap(),
+        DurableOperationPhase::AddFinalize,
+    )
+    .await;
     api.fail_next_status_patch();
-    let error = reconcile_set(&scale_request, &api, &state)
-        .await
-        .err()
-        .expect("injected status persistence failure must be returned");
+    let error = reconcile_set(
+        &make_set("persist-retry", 3, Some(finalizing.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .err()
+    .expect("injected status persistence failure must be returned");
     assert_eq!(error, "injected status persistence failure");
-    {
-        let drivers = state.drivers.lock().await;
-        assert_eq!(drivers["default/persist-retry"].replica_ids().len(), 2);
-    }
 
     // The next reconcile retries only the pending status. It must not add the
     // third replica until the first committed add is durable.
     api.reset_operations();
-    reconcile_set(&scale_request, &api, &state).await.unwrap();
-    assert!(api.operations().is_empty());
-    let persisted_first_add = api.last_status().unwrap();
-    assert_stable_snapshot(&api, &persisted_first_add, 2);
-    {
-        let drivers = state.drivers.lock().await;
-        assert_eq!(drivers["default/persist-retry"].replica_ids().len(), 2);
-    }
-
     reconcile_set(
-        &make_set("persist-retry", 3, Some(persisted_first_add)),
+        &make_set("persist-retry", 3, Some(finalizing)),
         &api,
         &state,
     )
     .await
     .unwrap();
-    assert_stable_snapshot(&api, &api.last_status().unwrap(), 3);
+    assert!(api.operations().is_empty());
+    let persisted_first_add = api.last_status().unwrap();
+    assert_stable_snapshot(&api, &persisted_first_add, 2);
+
+    let completed = drive_add_replica(&api, &state, "persist-retry", 3, persisted_first_add).await;
+    assert_stable_snapshot(&api, &completed, 3);
 }
 
 #[test_log::test(tokio::test)]
@@ -2270,6 +2421,574 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
     }
 }
 
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_add_survives_state_loss_and_every_lost_runtime_reply() {
+    let api = KvClusterApi::new();
+    let initial_state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &initial_state, "durable-add", 1).await;
+    let previous_snapshot = previous.stable_snapshot.clone().unwrap();
+
+    reconcile_set(
+        &make_set("durable-add", 2, Some(previous.clone())),
+        &api,
+        &initial_state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set("durable-add", 2, Some(previous.clone())),
+        &api,
+        &initial_state,
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::AddingReplica);
+    assert_eq!(
+        status.operation.as_ref().unwrap().kind,
+        DurableOperationKind::AddReplica
+    );
+    assert_eq!(
+        status.operation.as_ref().unwrap().add_mode,
+        Some(DurableAddMode::ScaleUp)
+    );
+
+    api.reset_operations();
+    let mut injected = Vec::new();
+    for _ in 0..120 {
+        if let Some(pending) = status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.pending_action.as_ref())
+            && pending.attempts == 0
+            && !injected.contains(&pending.kind)
+        {
+            let control = control_for_add_action(pending.kind);
+            if let Some(control) = control {
+                api.fail_after_next_durable_action(control);
+                injected.push(pending.kind);
+            }
+        }
+
+        reconcile_set(
+            &make_set("durable-add", 2, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+        assert_eq!(
+            status.stable_snapshot.as_ref(),
+            Some(&previous_snapshot),
+            "stable snapshot changed before durable add completion"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(
+        status.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Completed
+    );
+    assert_stable_snapshot(&api, &status, 2);
+    for kind in [
+        DurableActionKind::OpenCandidate,
+        DurableActionKind::UpdateCandidateEpoch,
+        DurableActionKind::AssignCandidateIdle,
+        DurableActionKind::BuildCandidate,
+        DurableActionKind::AssignCandidateActive,
+        DurableActionKind::AddCatchUpConfiguration,
+        DurableActionKind::AddWaitForCatchUpQuorum,
+        DurableActionKind::AddCurrentConfiguration,
+    ] {
+        assert!(
+            injected.contains(&kind),
+            "missing lost-reply window {kind:?}"
+        );
+    }
+    let operations = api.operations();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::Open)
+            .count(),
+        1
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::BuildReplica)
+            .count(),
+        1,
+        "ambiguous build scheduling must not start a second copy"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::ChangeRole)
+            .count(),
+        2
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_rejoin_retires_old_incarnation_once() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "durable-rejoin", 3).await;
+    let primary = previous.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &primary)
+        .unwrap();
+    let old_instance = previous
+        .stable_snapshot
+        .as_ref()
+        .unwrap()
+        .members
+        .iter()
+        .find(|member| member.id == 2)
+        .map(|member| member.instance_id.clone())
+        .unwrap_or_else(|| {
+            previous
+                .stable_snapshot
+                .as_ref()
+                .unwrap()
+                .members
+                .iter()
+                .find(|member| member.id != previous.stable_snapshot.as_ref().unwrap().primary_id)
+                .unwrap()
+                .instance_id
+                .clone()
+        });
+
+    api.crash_pod(&target);
+    api.restart_pod(&target).await;
+    let replacement_instance = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(target.as_str()))
+        .unwrap()
+        .metadata
+        .uid
+        .clone()
+        .unwrap();
+    assert_ne!(old_instance, replacement_instance);
+
+    reconcile_set(
+        &make_set("durable-rejoin", 3, Some(previous.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::AddingReplica);
+    assert_eq!(
+        status.operation.as_ref().unwrap().add_mode,
+        Some(DurableAddMode::Rebuild)
+    );
+    assert_eq!(
+        status
+            .operation
+            .as_ref()
+            .unwrap()
+            .retired_instance_id
+            .as_deref(),
+        Some(old_instance.as_str())
+    );
+
+    status = advance_until_pending_action(
+        &api,
+        "durable-rejoin",
+        3,
+        status,
+        DurableActionKind::RetireOldReplica,
+    )
+    .await;
+    let retire_action_id = status
+        .operation
+        .as_ref()
+        .unwrap()
+        .pending_action
+        .as_ref()
+        .unwrap()
+        .action_id
+        .clone();
+    let target_replica_id = status
+        .operation
+        .as_ref()
+        .unwrap()
+        .target_replica_id
+        .unwrap();
+    api.reset_operations();
+    api.fail_after_next_durable_action(ControlOperation::RemoveReplica);
+    reconcile_set(
+        &make_set("durable-rejoin", 3, Some(status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let completed =
+        drive_operation_to_healthy(&api, "durable-rejoin", 3, api.last_status().unwrap()).await;
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RemoveReplica)
+            .count(),
+        1
+    );
+    assert!(
+        completed
+            .stable_snapshot
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.instance_id == replacement_instance)
+    );
+
+    let primary_id = completed.stable_snapshot.as_ref().unwrap().primary_id;
+    let primary_pod = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| {
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                .and_then(|index| index.parse::<i64>().ok())
+                .map(|index| index + 1)
+                == Some(primary_id)
+        })
+        .unwrap()
+        .clone();
+    let primary_handle = api
+        .create_replica_handle(
+            primary_id,
+            &primary_pod,
+            &make_set("durable-rejoin", 3, Some(completed.clone())).spec,
+        )
+        .await
+        .unwrap();
+    primary_handle
+        .execute_durable_action(
+            &retire_action_id,
+            DurableReplicaAction::RemoveReplica {
+                replica_id: target_replica_id,
+                instance_id: ReplicaInstanceId::new(old_instance),
+            },
+        )
+        .await
+        .unwrap();
+    let target_status = live_replica_statuses(&api, "durable-rejoin", 3)
+        .await
+        .into_iter()
+        .find(|status| status.instance_id.as_str() == replacement_instance)
+        .unwrap();
+    assert_eq!(target_status.role, Role::ActiveSecondary);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_rejoin_compensation_recreates_and_retries() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "rejoin-compensate", 3).await;
+    let previous_snapshot = previous.stable_snapshot.clone().unwrap();
+    let primary = previous.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &primary)
+        .unwrap();
+
+    api.crash_pod(&target);
+    api.restart_pod(&target).await;
+    reconcile_set(
+        &make_set("rejoin-compensate", 3, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut pending = advance_until_pending_action(
+        &api,
+        "rejoin-compensate",
+        3,
+        api.last_status().unwrap(),
+        DurableActionKind::OpenCandidate,
+    )
+    .await;
+    pending
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("rejoin-compensate", 3, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let compensated =
+        drive_operation_to_healthy(&api, "rejoin-compensate", 3, api.last_status().unwrap()).await;
+    assert_eq!(
+        compensated.stable_snapshot.as_ref(),
+        Some(&previous_snapshot)
+    );
+    assert_eq!(api.pods.lock().unwrap().len(), 2);
+
+    reconcile_set(
+        &make_set("rejoin-compensate", 3, Some(compensated.clone())),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(api.pods.lock().unwrap().len(), 3);
+    api.mark_all_pods_ready();
+    let completed = drive_add_replica(
+        &api,
+        &ReconcilerState::default(),
+        "rejoin-compensate",
+        3,
+        compensated,
+    )
+    .await;
+    assert_eq!(
+        completed.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Completed
+    );
+    assert_stable_snapshot(&api, &completed, 3);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_add_status_conflict_prevents_open() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "durable-add-conflict", 1).await;
+    reconcile_set(
+        &make_set("durable-add-conflict", 2, Some(previous.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set("durable-add-conflict", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let operation_started = api.last_status().unwrap();
+    assert_eq!(operation_started.phase, Phase::AddingReplica);
+    api.reset_operations();
+    api.fail_next_status_conflict();
+    let error = match reconcile_set(
+        &make_set("durable-add-conflict", 2, Some(operation_started)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("conflicting intent status must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "resource version conflict");
+    assert!(
+        !api.operations().contains(&ControlOperation::Open),
+        "candidate must not be opened before durable intent persists"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_add_compensates_before_and_during_configuration() {
+    async fn prepare(api: &KvClusterApi, state: &ReconcilerState, name: &str) -> KubericSetStatus {
+        let previous = create_healthy_set(api, state, name, 1).await;
+        reconcile_set(&make_set(name, 2, Some(previous.clone())), api, state)
+            .await
+            .unwrap();
+        api.mark_all_pods_ready();
+        reconcile_set(&make_set(name, 2, Some(previous)), api, state)
+            .await
+            .unwrap();
+        api.last_status().unwrap()
+    }
+
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = prepare(&api, &state, "add-preconfig-compensate").await;
+    let mut pending = advance_until_pending_action(
+        &api,
+        "add-preconfig-compensate",
+        2,
+        status,
+        DurableActionKind::BuildCandidate,
+    )
+    .await;
+    pending
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("add-preconfig-compensate", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let expected = [
+        DurableActionKind::CompensateRemoveCandidate,
+        DurableActionKind::CompensateDemoteCandidate,
+        DurableActionKind::CompensateCloseCandidate,
+    ];
+    let (compensated, injected) = drive_operation_with_lost_replies(
+        &api,
+        "add-preconfig-compensate",
+        2,
+        api.last_status().unwrap(),
+        &expected,
+    )
+    .await;
+    assert_eq!(injected, expected);
+    assert_eq!(
+        compensated.stable_snapshot.as_ref().unwrap().members.len(),
+        1
+    );
+    assert_eq!(
+        compensated.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Failed
+    );
+
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = prepare(&api, &state, "add-config-compensate").await;
+    let mut pending = advance_until_pending_action(
+        &api,
+        "add-config-compensate",
+        2,
+        status,
+        DurableActionKind::AddWaitForCatchUpQuorum,
+    )
+    .await;
+    pending
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("add-config-compensate", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let expected = [
+        DurableActionKind::CompensateRestoreConfiguration,
+        DurableActionKind::CompensateRemoveCandidate,
+        DurableActionKind::CompensateDemoteCandidate,
+        DurableActionKind::CompensateCloseCandidate,
+    ];
+    let (compensated, injected) = drive_operation_with_lost_replies(
+        &api,
+        "add-config-compensate",
+        2,
+        api.last_status().unwrap(),
+        &expected,
+    )
+    .await;
+    assert_eq!(injected, expected);
+    assert_eq!(
+        compensated.stable_snapshot.as_ref().unwrap().members.len(),
+        1
+    );
+    assert_eq!(
+        compensated.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Failed
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_add_rolls_forward_after_current_configuration_commit() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "add-roll-forward", 1).await;
+    reconcile_set(
+        &make_set("add-roll-forward", 2, Some(previous.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set("add-roll-forward", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "add-roll-forward",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::AddCurrentConfiguration,
+    )
+    .await;
+    api.fail_after_next_durable_action(ControlOperation::UpdateCurrentConfiguration);
+    reconcile_set(
+        &make_set("add-roll-forward", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let completed =
+        drive_operation_to_healthy(&api, "add-roll-forward", 2, api.last_status().unwrap()).await;
+    assert_eq!(
+        completed.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Completed
+    );
+    assert_stable_snapshot(&api, &completed, 2);
+}
+
 /// Reconciler test: Healthy phase detects spec.replicas > actual → scale-up.
 #[test_log::test(tokio::test)]
 #[serial]
@@ -2318,11 +3037,10 @@ async fn test_reconciler_scale_up() {
     // Mark new pods ready
     api.mark_all_pods_ready();
 
-    // Second reconcile adds new replicas to driver via add_replica
+    // Subsequent reconciles durably add one replica at a time.
     let status = api.last_status().unwrap();
-    let set = make_set("myapp", 3, Some(status));
-    reconcile_set(&set, &api, &state).await.unwrap();
-    assert_stable_snapshot(&api, &api.last_status().unwrap(), 3);
+    let status = drive_add_replica(&api, &state, "myapp", 3, status).await;
+    assert_stable_snapshot(&api, &status, 3);
 
     // Driver should have 3 replicas
     {
@@ -2582,14 +3300,15 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
     reconcile_set(&set, &api, &state).await.unwrap();
     assert_stable_snapshot(&api, &api.last_status().unwrap(), 3);
 
-    // Driver should now have 2 replicas (stale handle removed)
+    // The durable path preserves the previous stable driver/topology until a
+    // replacement incarnation is ready.
     {
         let drivers = state.drivers.lock().await;
         let driver = drivers.get("default/myapp").unwrap();
         assert_eq!(
             driver.replica_ids().len(),
-            2,
-            "stale secondary should be removed"
+            3,
+            "stale secondary remains represented until durable replacement starts"
         );
     }
 
@@ -2598,9 +3317,7 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
 
     // Reconcile Healthy: driver_count=2 < desired=3, re-adds via scale-up
     let status = api.last_status().unwrap();
-    let set = make_set("myapp", 3, Some(status));
-    reconcile_set(&set, &api, &state).await.unwrap();
-    let rejoined_status = api.last_status().unwrap();
+    let rejoined_status = drive_add_replica(&api, &state, "myapp", 3, status).await;
     assert_stable_snapshot(&api, &rejoined_status, 3);
     let replacement_uid = api
         .pods

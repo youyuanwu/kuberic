@@ -543,10 +543,10 @@ time for replicas to recover without data loss).
 
 **Detection:** N/A — the operator itself restarts.
 
-**Current behavior:** ✅ Stable `Healthy` and durable `Switchover` recovery are
-implemented. The CRD
-snapshot survives in etcd while current pod metadata and runtime status attest
-that it still describes the live partition.
+**Current behavior:** ✅ Stable `Healthy`, durable `Switchover`, and durable
+replica add/rebuild recovery are implemented. The CRD snapshot survives in etcd
+while current pod metadata and runtime status attest that it still describes
+the live partition.
 
 ```
 Operator restart — first reconcile per KubericSet:
@@ -582,18 +582,20 @@ action. If its process state is also lost, a subsequent recovery sees the old
 snapshot and fails closed. Creating probes runtime status and refuses to replay
 creation when replicas are already initialized.
 
-During `Switchover`, `status.operation` is the authoritative compact
-checkpoint. It stores previous/target snapshots, the current phase, and one
-write-ahead correlated action. Each reconcile reconstructs fresh handles,
-observes role/epoch/incarnation/progress/write/configuration state, and either
+During `Switchover` and `AddingReplica`, `status.operation` is the authoritative
+compact checkpoint. It stores previous/target snapshots, exact target
+incarnations, the current phase, and one write-ahead correlated action. Each
+reconcile reconstructs fresh handles, observes
+role/epoch/incarnation/progress/write/configuration/activity state, and either
 advances one checkpoint, dispatches one activity, waits, compensates, or
-poisons. Target-promotion failure restores the old primary when observations
-permit. Kubernetes `resourceVersion` rejects stale concurrent advancement.
+poisons. Add/rebuild observes long-running copy progress and restores the
+previous current configuration before candidate cleanup when catch-up had
+started. Kubernetes `resourceVersion` rejects stale concurrent advancement.
 
-**Boundary:** This does not recover `Creating`, `FailingOver`, add/remove/
-rebuild, other mid-configuration paths, or a restarted pod process. Those
-cases require additional durable-operation migrations or a separate pod-state
-recovery protocol.
+**Boundary:** This does not recover `Creating`, `FailingOver`, scale-down/
+remove, other mid-configuration paths, or continue an operation after its
+target incarnation changes. Those cases require additional durable-operation
+migrations or a separate pod-state recovery protocol.
 
 ---
 

@@ -17,12 +17,13 @@ use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, Role, StableParti
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
-    DurableOperationPhase, EpochStatus, KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus,
-    Phase, ReconfigurationPhase, StablePartitionSnapshotStatus, StatusCondition,
+    DurableAddMode, DurableOperationKind, DurableOperationPhase, EpochStatus, KubericSet,
+    KubericSetSpec, KubericSetStatus, MemberStatus, Phase, ReconfigurationPhase,
+    StablePartitionSnapshotStatus, StableReplicaRoleStatus, StatusCondition,
 };
 use crate::durable::{
-    Decision, OperationObservations, ReplicaObservation, decide, fail_closed, operation_condition,
-    record_activity_error, start_switchover,
+    Decision, OperationObservations, ReplicaObservation, decide, decide_add_replica, fail_closed,
+    operation_condition, record_activity_error, start_add_replica, start_switchover,
 };
 
 /// Shared state across reconciliation loops.
@@ -101,12 +102,17 @@ pub async fn reconcile_set(
                 | DurableOperationPhase::Failed
                 | DurableOperationPhase::Poisoned
         )
-        && current_phase != Phase::Switchover
     {
-        return Err(format!(
-            "active durable operation {} requires Switchover phase",
-            operation.operation_id
-        ));
+        let expected_phase = match operation.kind {
+            DurableOperationKind::Switchover => Phase::Switchover,
+            DurableOperationKind::AddReplica => Phase::AddingReplica,
+        };
+        if current_phase != expected_phase {
+            return Err(format!(
+                "active durable operation {} requires {expected_phase:?} phase",
+                operation.operation_id
+            ));
+        }
     }
 
     match current_phase {
@@ -256,122 +262,204 @@ pub async fn reconcile_set(
             let desired = set.spec.replicas as usize;
             let actual = pods.len();
             let current_pods = checked_pods_by_id(&pods)?;
+            let persisted_snapshot = set
+                .status
+                .as_ref()
+                .and_then(|status| status.stable_snapshot.as_ref())
+                .ok_or_else(|| {
+                    format!("cannot recover {namespace}/{name}: stable snapshot is absent")
+                })?;
+
+            // Ensure every desired ordinal exists before attempting stable
+            // recovery. This also recreates a candidate deleted by add/rebuild
+            // compensation while the previous stable snapshot remains intact.
+            if actual < desired {
+                info!(name, actual, desired, "scale-up: creating pods");
+                for i in 0..desired {
+                    ensure_pvc(api, set, &namespace, i as i32).await?;
+                    ensure_pod(api, set, &namespace, i as i32).await?;
+                }
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
+            }
+
+            // A replacement incarnation cannot be used to reconstruct the
+            // previous stable driver. Start its durable retirement/rejoin
+            // operation directly from the stable snapshot instead.
+            if let Some((target_id, target_instance, target_pod)) = persisted_snapshot
+                .members
+                .iter()
+                .filter(|member| member.role == StableReplicaRoleStatus::ActiveSecondary)
+                .find_map(|member| {
+                    current_pods
+                        .iter()
+                        .find(|(id, instance, pod)| {
+                            *id == member.id
+                                && instance.as_str() != member.instance_id
+                                && is_pod_ready(pod)
+                        })
+                        .map(|(id, instance, pod)| (*id, instance.clone(), *pod))
+                })
+            {
+                let now = unix_seconds();
+                let operation = start_add_replica(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    persisted_snapshot.clone(),
+                    target_id,
+                    target_instance.to_string(),
+                    target_pod.name_any(),
+                    DurableAddMode::Rebuild,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
+                    phase: Phase::AddingReplica,
+                    operation: Some(operation.clone()),
+                    ..set.status.clone().unwrap_or_default()
+                };
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
 
             // Rebuild process-local driver state before making any Healthy
             // health or topology decision. Legacy observational fields are
             // never used as recovery input.
-            {
-                let mut drivers = state.drivers.lock().await;
-                if !drivers.contains_key(&set_key) {
-                    let persisted = set
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.stable_snapshot.as_ref())
-                        .ok_or_else(|| {
-                            format!("cannot recover {namespace}/{name}: stable snapshot is absent")
-                        })?;
-                    let snapshot = StablePartitionSnapshot::try_from(persisted)
-                        .map_err(|error| format!("invalid stable snapshot: {error}"))?;
-                    let mut handles: Vec<Box<dyn ReplicaHandle>> = Vec::new();
-                    for (replica_id, _, pod) in &current_pods {
-                        handles.push(
-                            api.create_replica_handle(*replica_id, pod, &set.spec)
-                                .await
-                                .map_err(|error| {
-                                    format!(
-                                        "cannot construct recovery handle for replica {replica_id}: {error}"
-                                    )
-                                })?,
-                        );
+            let needs_recovery = !state.drivers.lock().await.contains_key(&set_key);
+            if needs_recovery {
+                let snapshot = StablePartitionSnapshot::try_from(persisted_snapshot)
+                    .map_err(|error| format!("invalid stable snapshot: {error}"))?;
+                let mut handles: Vec<Box<dyn ReplicaHandle>> = Vec::new();
+                for (replica_id, _, pod) in &current_pods {
+                    if !persisted_snapshot
+                        .members
+                        .iter()
+                        .any(|member| member.id == *replica_id)
+                    {
+                        continue;
                     }
-                    let driver = PartitionDriver::recover(snapshot, handles)
-                        .await
-                        .map_err(|error| format!("stable driver recovery failed: {error}"))?;
-                    drivers.insert(set_key.clone(), driver);
+                    handles.push(
+                        api.create_replica_handle(*replica_id, pod, &set.spec)
+                            .await
+                            .map_err(|error| {
+                                format!(
+                                    "cannot construct recovery handle for replica {replica_id}: {error}"
+                                )
+                            })?,
+                    );
                 }
-
+                let driver = PartitionDriver::recover(snapshot, handles)
+                    .await
+                    .map_err(|error| format!("stable driver recovery failed: {error}"))?;
+                state
+                    .drivers
+                    .lock()
+                    .await
+                    .entry(set_key.clone())
+                    .or_insert(driver);
+            }
+            {
+                let drivers = state.drivers.lock().await;
                 let driver = drivers.get(&set_key).unwrap();
                 validate_pod_handle_identities(driver, &current_pods, desired)?;
             }
 
-            let current_primary = {
+            let (current_primary_id, current_epoch, replica_ids) = {
                 let drivers = state.drivers.lock().await;
-                drivers
-                    .get(&set_key)
-                    .and_then(PartitionDriver::primary_id)
-                    .and_then(|primary_id| pod_name_for_id(&current_pods, primary_id))
+                let driver = drivers.get(&set_key).unwrap();
+                (driver.primary_id(), driver.epoch(), driver.replica_ids())
             };
+            let current_primary =
+                current_primary_id.and_then(|id| pod_name_for_id(&current_pods, id));
 
             // --- Replica health check (primary + secondaries) ---
             // Probe all replicas via get_status to detect crashed/restarted pods.
             // Must run BEFORE switchover — don't switchover to a stale target.
-            if let Some(driver) = state.drivers.lock().await.get_mut(&set_key) {
-                let current_epoch = driver.epoch();
-                let primary_id = driver.primary_id();
-                let replica_ids = driver.replica_ids();
-
-                let mut stale_ids: Vec<ReplicaId> = Vec::new();
-                let mut primary_stale = false;
-
-                for &replica_id in &replica_ids {
-                    if let Some(handle) = driver.handle(replica_id) {
-                        let is_stale = match handle.get_status().await {
-                            Ok(s) if s.instance_id != handle.instance_id() => {
-                                warn!(
-                                    name,
-                                    replica_id,
-                                    expected_instance_id = %handle.instance_id(),
-                                    actual_instance_id = %s.instance_id,
-                                    "replica incarnation mismatch"
-                                );
-                                true
-                            }
-                            Ok(s) if s.epoch != current_epoch => {
-                                warn!(name, replica_id, ?current_epoch,
-                                    actual_epoch = ?s.epoch,
-                                    "replica epoch mismatch — pod restarted");
-                                true
-                            }
-                            Ok(s) if s.role == kuberic_core::types::Role::Unknown => {
-                                warn!(name, replica_id, "replica role=Unknown — pod restarted");
-                                true
-                            }
-                            Err(e) => {
-                                warn!(name, replica_id, error = %e,
-                                    "replica unreachable — stale handle");
-                                true
-                            }
-                            Ok(_) => false,
-                        };
-
-                        if is_stale {
-                            if Some(replica_id) == primary_id {
-                                primary_stale = true;
-                            } else {
-                                stale_ids.push(replica_id);
-                            }
+            let mut stale_ids: Vec<ReplicaId> = Vec::new();
+            let mut primary_stale = false;
+            for &replica_id in &replica_ids {
+                let Some((_, expected_instance, pod)) =
+                    current_pods.iter().find(|(id, _, _)| *id == replica_id)
+                else {
+                    if Some(replica_id) == current_primary_id {
+                        primary_stale = true;
+                    } else {
+                        stale_ids.push(replica_id);
+                    }
+                    continue;
+                };
+                let is_stale = match api.create_replica_handle(replica_id, pod, &set.spec).await {
+                    Ok(handle) => match handle.get_status().await {
+                        Ok(s) if s.instance_id != *expected_instance => {
+                            warn!(
+                                name,
+                                replica_id,
+                                expected_instance_id = %expected_instance,
+                                actual_instance_id = %s.instance_id,
+                                "replica incarnation mismatch"
+                            );
+                            true
                         }
+                        Ok(s) if s.epoch != current_epoch => {
+                            warn!(name, replica_id, ?current_epoch,
+                                actual_epoch = ?s.epoch,
+                                "replica epoch mismatch — pod restarted");
+                            true
+                        }
+                        Ok(s) if s.role == kuberic_core::types::Role::Unknown => {
+                            warn!(name, replica_id, "replica role=Unknown — pod restarted");
+                            true
+                        }
+                        Err(e) => {
+                            warn!(name, replica_id, error = %e,
+                                "replica unreachable — stale handle");
+                            true
+                        }
+                        Ok(_) => false,
+                    },
+                    Err(error) => {
+                        warn!(
+                            name,
+                            replica_id,
+                            error = %error,
+                            "failed to construct health-check handle"
+                        );
+                        true
+                    }
+                };
+
+                if is_stale {
+                    if Some(replica_id) == current_primary_id {
+                        primary_stale = true;
+                    } else {
+                        stale_ids.push(replica_id);
                     }
                 }
+            }
 
-                // Also check K8s-level readiness for primary
-                if !primary_stale {
-                    if let Some(ref primary_name) = current_primary {
-                        let primary_ready = pods
-                            .iter()
-                            .find(|p| p.name_any() == *primary_name)
-                            .map(is_pod_ready)
-                            .unwrap_or(false);
-                        if !primary_ready {
-                            primary_stale = true;
-                        }
-                    }
+            // Also check K8s-level readiness for primary
+            if !primary_stale && let Some(ref primary_name) = current_primary {
+                let primary_ready = pods
+                    .iter()
+                    .find(|p| p.name_any() == *primary_name)
+                    .map(is_pod_ready)
+                    .unwrap_or(false);
+                if !primary_ready {
+                    primary_stale = true;
                 }
+            }
 
-                // Primary stale → failover (takes priority over everything)
-                if primary_stale {
-                    warn!(name, "primary unhealthy, initiating failover");
-                    // Also remove any stale secondaries before failover
+            // Primary stale → failover (takes priority over everything)
+            if primary_stale {
+                warn!(name, "primary unhealthy, initiating failover");
+                {
+                    let mut drivers = state.drivers.lock().await;
+                    let driver = drivers.get_mut(&set_key).unwrap();
                     for &id in &stale_ids {
                         info!(
                             name,
@@ -380,56 +468,34 @@ pub async fn reconcile_set(
                         );
                         driver.remove_replica_from_driver(id);
                     }
-                    let status = KubericSetStatus {
-                        phase: Phase::FailingOver,
-                        ..set.status.clone().unwrap_or_default()
-                    };
-                    persist_committed_status(
-                        api,
-                        state,
-                        &set_key,
-                        &namespace,
-                        &name,
-                        &status,
-                        set.metadata.resource_version.as_deref(),
-                    )
-                    .await?;
-                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                 }
+                let status = KubericSetStatus {
+                    phase: Phase::FailingOver,
+                    ..set.status.clone().unwrap_or_default()
+                };
+                persist_committed_status(
+                    api,
+                    state,
+                    &set_key,
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
 
-                // Stale secondaries → remove and requeue
-                if !stale_ids.is_empty() {
-                    for &id in &stale_ids {
-                        info!(
-                            name,
-                            replica_id = id,
-                            "retiring stale secondary incarnation"
-                        );
-                        if let Err(error) = driver.remove_stale_secondary(id).await {
-                            warn!(
-                                name,
-                                replica_id = id,
-                                error = %error,
-                                "failed to retire stale secondary incarnation"
-                            );
-                            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-                        }
-                    }
-                    let status = KubericSetStatus {
-                        ready_replicas: driver.replica_ids().len() as i32,
-                        replicas: pods.len() as i32,
-                        members: build_member_status(&pods, &set.spec),
-                        ..set.status.clone().unwrap_or_default()
-                    };
-                    api.patch_set_status(
-                        &namespace,
-                        &name,
-                        &status,
-                        set.metadata.resource_version.as_deref(),
-                    )
-                    .await?;
-                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-                }
+            // Keep the previous stable topology until Kubernetes exposes
+            // a ready replacement incarnation that can enter the durable
+            // rebuild protocol.
+            if !stale_ids.is_empty() {
+                warn!(
+                    name,
+                    stale_ids = ?stale_ids,
+                    "waiting for stale secondaries to be replaced before durable rejoin"
+                );
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
             // --- Switchover check (only when all replicas are healthy) ---
@@ -479,80 +545,43 @@ pub async fn reconcile_set(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
-            // Scale-up: create missing pods
-            if actual < desired {
-                info!(name, actual, desired, "scale-up: creating pods");
-                for i in actual..desired {
-                    ensure_pvc(api, set, &namespace, i as i32).await?;
-                    ensure_pod(api, set, &namespace, i as i32).await?;
-                }
-                return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
-            }
-
-            // Scale-up: add newly ready pods to the partition via driver
-            if let Some(driver) = state.drivers.lock().await.get_mut(&set_key) {
-                let driver_count = driver.replica_ids().len();
-                if driver_count < desired {
-                    // Find pods that are ready but not in the driver
-                    for pod in &ready_pods {
-                        let pod_name = pod.name_any();
-                        let replica_id = current_pods
-                            .iter()
-                            .find(|(_, _, current)| current.name_any() == pod_name)
-                            .map(|(id, _, _)| *id)
-                            .ok_or_else(|| {
-                                format!("ready pod {pod_name} has no validated logical identity")
-                            })?;
-
-                        if driver.handle(replica_id).is_none() {
-                            info!(name, pod = %pod_name, replica_id, "scale-up: adding replica to partition");
-                            match api.create_replica_handle(replica_id, pod, &set.spec).await {
-                                Ok(handle) => {
-                                    if let Err(e) = driver.add_replica(handle).await {
-                                        warn!(replica_id, error = %e, "failed to add replica");
-                                        api.delete_pod(&namespace, &pod_name).await?;
-                                        return Ok(ReconcileAction::Requeue(Duration::from_secs(
-                                            5,
-                                        )));
-                                    }
-                                    // Update label
-                                    let mut labels = BTreeMap::new();
-                                    labels.insert(
-                                        "kuberic.io/role".to_string(),
-                                        "secondary".to_string(),
-                                    );
-                                    let _ =
-                                        api.patch_pod_labels(&namespace, &pod_name, labels).await;
-
-                                    // Each successful add is a committed stable
-                                    // topology and must be durable before the
-                                    // next loop iteration mutates another.
-                                    let status = KubericSetStatus {
-                                        ready_replicas: driver.replica_ids().len() as i32,
-                                        replicas: pods.len() as i32,
-                                        members: build_member_status(&pods, &set.spec),
-                                        stable_snapshot: Some(snapshot_status(driver)?),
-                                        ..set.status.clone().unwrap_or_default()
-                                    };
-                                    persist_committed_status(
-                                        api,
-                                        state,
-                                        &set_key,
-                                        &namespace,
-                                        &name,
-                                        &status,
-                                        set.metadata.resource_version.as_deref(),
-                                    )
-                                    .await?;
-                                }
-                                Err(e) => {
-                                    warn!(pod = %pod_name, error = %e, "failed to create handle");
-                                    return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
-                                }
-                            }
-                        }
-                    }
-                }
+            // Scale-up: checkpoint exactly one ready pod before any runtime
+            // mutation. Later reconciles operate only from this checkpoint.
+            if persisted_snapshot.members.len() < desired
+                && let Some((replica_id, instance_id, pod)) =
+                    current_pods.iter().find(|(id, _, pod)| {
+                        is_pod_ready(pod)
+                            && !persisted_snapshot
+                                .members
+                                .iter()
+                                .any(|member| member.id == *id)
+                    })
+            {
+                let now = unix_seconds();
+                let operation = start_add_replica(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    persisted_snapshot.clone(),
+                    *replica_id,
+                    instance_id.to_string(),
+                    pod.name_any(),
+                    DurableAddMode::ScaleUp,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
+                    phase: Phase::AddingReplica,
+                    operation: Some(operation.clone()),
+                    ..set.status.clone().unwrap_or_default()
+                };
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
             // Scale-down: remove excess secondaries via driver, then delete pods
@@ -683,8 +712,8 @@ pub async fn reconcile_set(
             Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
         }
 
-        Phase::Switchover => {
-            reconcile_durable_switchover(set, api, state, &pods, &ready_pods, &set_key).await
+        Phase::Switchover | Phase::AddingReplica => {
+            reconcile_durable_operation(set, api, state, &pods, &ready_pods, &set_key).await
         }
 
         Phase::Deleting => Ok(ReconcileAction::Requeue(Duration::from_secs(10))),
@@ -697,7 +726,7 @@ pub async fn reconcile_set(
 
 type CurrentPod<'a> = (ReplicaId, ReplicaInstanceId, &'a Pod);
 
-async fn reconcile_durable_switchover(
+async fn reconcile_durable_operation(
     set: &KubericSet,
     api: &dyn ClusterApi,
     state: &ReconcilerState,
@@ -711,28 +740,34 @@ async fn reconcile_durable_switchover(
         .status
         .as_ref()
         .and_then(|status| status.operation.clone())
-        .ok_or_else(|| "Switchover phase has no durable operation checkpoint".to_string())?;
+        .ok_or_else(|| "durable operation phase has no checkpoint".to_string())?;
     let current_pods = checked_pods_by_id(pods)?;
 
-    let identity_error = operation
-        .previous_snapshot
-        .members
-        .iter()
-        .find_map(
-            |member| match current_pods.iter().find(|(id, _, _)| *id == member.id) {
-                None => Some(format!(
-                    "durable operation replica {} has no current pod",
+    let identity_members = match operation.kind {
+        DurableOperationKind::Switchover => operation.previous_snapshot.members.clone(),
+        DurableOperationKind::AddReplica => operation
+            .target_snapshot
+            .members
+            .iter()
+            .filter(|member| Some(member.id) != operation.target_replica_id)
+            .cloned()
+            .collect(),
+    };
+    let identity_error = identity_members.iter().find_map(|member| {
+        match current_pods.iter().find(|(id, _, _)| *id == member.id) {
+            None => Some(format!(
+                "durable operation replica {} has no current pod",
+                member.id
+            )),
+            Some((_, instance_id, _)) if instance_id.as_str() != member.instance_id => {
+                Some(format!(
+                    "durable operation replica {} incarnation changed",
                     member.id
-                )),
-                Some((_, instance_id, _)) if instance_id.as_str() != member.instance_id => {
-                    Some(format!(
-                        "durable operation replica {} incarnation changed",
-                        member.id
-                    ))
-                }
-                Some(_) => None,
-            },
-        );
+                ))
+            }
+            Some(_) => None,
+        }
+    });
     if let Some(error) = identity_error {
         let now = unix_seconds();
         let failed = fail_closed(&operation, &error);
@@ -753,7 +788,7 @@ async fn reconcile_durable_switchover(
     let mut observations = OperationObservations::new();
     for (replica_id, _, pod) in &current_pods {
         if !operation
-            .previous_snapshot
+            .target_snapshot
             .members
             .iter()
             .any(|member| member.id == *replica_id)
@@ -783,7 +818,11 @@ async fn reconcile_durable_switchover(
     }
 
     let now = unix_seconds();
-    let decision = match decide(&operation, &observations, now) {
+    let decision = match operation.kind {
+        DurableOperationKind::Switchover => decide(&operation, &observations, now),
+        DurableOperationKind::AddReplica => decide_add_replica(&operation, &observations, now),
+    };
+    let decision = match decision {
         Ok(decision) => decision,
         Err(error) => {
             let mut status = set.status.clone().unwrap_or_default();
@@ -869,6 +908,21 @@ async fn reconcile_durable_switchover(
                 .await?;
             }
         }
+        Decision::DeletePod { pod_name } => {
+            if let Err(error) = api.delete_pod(&namespace, &pod_name).await {
+                let next_operation = record_activity_error(&operation, &error);
+                let mut status = set.status.clone().unwrap_or_default();
+                status.operation = Some(next_operation.clone());
+                set_operation_condition(&mut status, operation_condition(&next_operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+            }
+        }
         Decision::Wait => {}
         Decision::Complete {
             operation,
@@ -900,6 +954,7 @@ async fn reconcile_durable_switchover(
                 set.metadata.resource_version.as_deref(),
             )
             .await?;
+            state.drivers.lock().await.remove(set_key);
         }
     }
 

@@ -180,6 +180,7 @@ spec:
                     type: string
                     enum:
                     - switchover
+                    - addReplica
                   phase:
                     type: string
                     enum:
@@ -203,6 +204,23 @@ spec:
                     - compensateLabelOldPrimary
                     - compensateLabelTargetSecondary
                     - compensateFinalize
+                    - retireOldReplica
+                    - openCandidate
+                    - updateCandidateEpoch
+                    - assignCandidateIdle
+                    - buildCandidate
+                    - assignCandidateActive
+                    - addCatchUpConfiguration
+                    - addWaitForCatchUpQuorum
+                    - addCurrentConfiguration
+                    - labelCandidateSecondary
+                    - addFinalize
+                    - compensateRestoreConfiguration
+                    - compensateRemoveCandidate
+                    - compensateDemoteCandidate
+                    - compensateCloseCandidate
+                    - compensateDeleteCandidate
+                    - addCompensateFinalize
                     - completed
                     - failed
                     - poisoned
@@ -302,6 +320,20 @@ spec:
                   targetPrimaryId:
                     type: integer
                     format: int64
+                  addMode:
+                    type: string
+                    enum:
+                    - scaleUp
+                    - rebuild
+                  targetReplicaId:
+                    type: integer
+                    format: int64
+                  targetInstanceId:
+                    type: string
+                  targetPodName:
+                    type: string
+                  retiredInstanceId:
+                    type: string
                   frozenLsn:
                     type: integer
                     format: int64
@@ -351,6 +383,21 @@ spec:
                         - compensateCurrentConfiguration
                         - compensateLabelOldPrimary
                         - compensateLabelTargetSecondary
+                        - retireOldReplica
+                        - openCandidate
+                        - updateCandidateEpoch
+                        - assignCandidateIdle
+                        - buildCandidate
+                        - assignCandidateActive
+                        - addCatchUpConfiguration
+                        - addWaitForCatchUpQuorum
+                        - addCurrentConfiguration
+                        - labelCandidateSecondary
+                        - compensateRestoreConfiguration
+                        - compensateRemoveCandidate
+                        - compensateDemoteCandidate
+                        - compensateCloseCandidate
+                        - compensateDeleteCandidate
                       targetId:
                         type: integer
                         format: int64
@@ -383,6 +430,11 @@ spec:
                             - catchUpQuorum
                             - currentConfiguration
                             - podRoleLabel
+                            - opened
+                            - buildCompleted
+                            - replicaRemoved
+                            - closed
+                            - podDeleted
                           role:
                             type: string
                             enum:

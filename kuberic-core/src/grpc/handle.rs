@@ -8,9 +8,9 @@ use crate::error::{KubericError, Result};
 use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
-    DataLossAction, DurableActionCompletion, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId,
-    ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo,
-    Role,
+    DataLossAction, DurableActionCompletion, DurableActionObservation, DurableActionState,
+    DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
+    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
 };
 
 /// Implements `ReplicaHandle` by calling a remote pod's gRPC `ReplicatorControl` service.
@@ -255,6 +255,32 @@ impl ReplicaHandle for GrpcReplicaHandle {
                     signature: inner.last_completed_action_signature,
                 })
             },
+            durable_action: if inner.durable_action_id.is_empty() {
+                None
+            } else {
+                let state = match DurableActionStateProto::try_from(inner.durable_action_state)
+                    .unwrap_or(DurableActionStateProto::DurableActionNone)
+                {
+                    DurableActionStateProto::DurableActionScheduled => {
+                        DurableActionState::Scheduled
+                    }
+                    DurableActionStateProto::DurableActionInProgress => {
+                        DurableActionState::InProgress
+                    }
+                    DurableActionStateProto::DurableActionCompleted => {
+                        DurableActionState::Completed
+                    }
+                    DurableActionStateProto::DurableActionFailed
+                    | DurableActionStateProto::DurableActionNone => DurableActionState::Failed,
+                };
+                Some(DurableActionObservation {
+                    action_id: inner.durable_action_id,
+                    signature: inner.durable_action_signature,
+                    state,
+                    error: (!inner.durable_action_error.is_empty())
+                        .then_some(inner.durable_action_error),
+                })
+            },
         })
     }
 
@@ -264,6 +290,14 @@ impl ReplicaHandle for GrpcReplicaHandle {
         action: DurableReplicaAction,
     ) -> Result<()> {
         let action = match action {
+            DurableReplicaAction::Open { mode } => {
+                execute_durable_action_request::Action::Open(OpenRequest {
+                    mode: OpenModeProto::from(mode) as i32,
+                })
+            }
+            DurableReplicaAction::Close => {
+                execute_durable_action_request::Action::Close(CloseRequest {})
+            }
             DurableReplicaAction::RevokeWriteStatus => {
                 execute_durable_action_request::Action::RevokeWriteStatus(
                     RevokeWriteStatusRequest {},
@@ -302,6 +336,18 @@ impl ReplicaHandle for GrpcReplicaHandle {
                     },
                 )
             }
+            DurableReplicaAction::BuildReplica { replica } => {
+                execute_durable_action_request::Action::BuildReplica(BuildReplicaRequest {
+                    replica: Some(replica.into()),
+                })
+            }
+            DurableReplicaAction::RemoveReplica {
+                replica_id,
+                instance_id,
+            } => execute_durable_action_request::Action::RemoveReplica(RemoveReplicaRequest {
+                replica_id,
+                instance_id: instance_id.to_string(),
+            }),
         };
         let mut client = self.client.clone();
         client

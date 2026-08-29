@@ -334,11 +334,11 @@ on every reconcile cycle. This detects:
 - **Role = Unknown** — virgin PodRuntime, never received `ChangeRole`
 - **gRPC unreachable** — pod crashed, handle is dead
 
-The health check runs before switchover processing, ensuring stale
-replicas are cleaned up before any reconfiguration. Stale secondaries
-are removed from the driver; a stale primary triggers FailingOver.
-The existing scale-up logic then re-adds the replica when the pod
-comes back Ready.
+The health check runs before switchover processing. A stale primary triggers
+FailingOver. A ready secondary with a new incarnation starts the durable
+replica-rejoin operation, which retires the old exact primary connection and
+rebuilds the replacement without changing the stable snapshot before current
+configuration commits.
 
 See `design-gaps.md` E3 for the full design and `get_status` trait
 extension details.
@@ -354,8 +354,8 @@ crash primary, `failover()`, start new pod, `add_replica()`.
 
 **Pattern 3: Secondary crash → reconciler re-integration** ✅
 `test_reconciler_secondary_crash_and_rejoin` in `reconciler.rs`:
-`crash_pod()` → reconcile (health check removes stale handle) →
-`restart_pod()` → reconcile (scale-up re-adds).
+`crash_pod()` → wait without mutating the stable topology →
+`restart_pod()` → durable retire/build/reconfigure.
 
 **Pattern 4: Primary crash → reconciler failover** ✅
 `test_reconciler_detects_primary_failure_and_fails_over` and
@@ -389,6 +389,14 @@ reject a stale pod incarnation, and reject a status resource-version conflict
 before mutation. Assertions cover deterministic single dispatch of unsafe role
 changes, terminal stable snapshot recovery, and unsupported checkpoint
 versions with no mutating RPC.
+
+**Pattern 9: Durable add/rejoin boundary and ambiguity recovery** ✅
+`test_durable_add_survives_state_loss_and_every_lost_runtime_reply` replaces
+controller state at every boundary and injects lost responses for Open,
+UpdateEpoch, both role changes, BuildReplica, catch-up/current configuration,
+and quorum wait. Companion tests cover exact old-incarnation retirement,
+status conflict before intent, pre-configuration and dual-configuration
+compensation, and roll-forward after current configuration commits.
 
 ### Remaining Work
 

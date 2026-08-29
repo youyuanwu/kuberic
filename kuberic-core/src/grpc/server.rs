@@ -111,6 +111,38 @@ impl ReplicatorControl for ControlServer {
                 .last_completed_action
                 .map(|action| action.signature)
                 .unwrap_or_default(),
+            durable_action_id: info
+                .durable_action
+                .as_ref()
+                .map(|action| action.action_id.clone())
+                .unwrap_or_default(),
+            durable_action_signature: info
+                .durable_action
+                .as_ref()
+                .map(|action| action.signature.clone())
+                .unwrap_or_default(),
+            durable_action_state: info
+                .durable_action
+                .as_ref()
+                .map(|action| match action.state {
+                    crate::types::DurableActionState::Scheduled => {
+                        crate::proto::DurableActionStateProto::DurableActionScheduled
+                    }
+                    crate::types::DurableActionState::InProgress => {
+                        crate::proto::DurableActionStateProto::DurableActionInProgress
+                    }
+                    crate::types::DurableActionState::Completed => {
+                        crate::proto::DurableActionStateProto::DurableActionCompleted
+                    }
+                    crate::types::DurableActionState::Failed => {
+                        crate::proto::DurableActionStateProto::DurableActionFailed
+                    }
+                } as i32)
+                .unwrap_or(crate::proto::DurableActionStateProto::DurableActionNone as i32),
+            durable_action_error: info
+                .durable_action
+                .and_then(|action| action.error)
+                .unwrap_or_default(),
         }))
     }
 
@@ -234,6 +266,23 @@ impl ReplicatorControl for ControlServer {
             Some(execute_durable_action_request::Action::UpdateCurrentConfiguration(request)) => {
                 DurableReplicaAction::UpdateCurrentConfiguration {
                     current: request.current.unwrap_or_default().into(),
+                }
+            }
+            Some(execute_durable_action_request::Action::Open(request)) => {
+                DurableReplicaAction::Open {
+                    mode: crate::types::OpenMode::from(request.mode),
+                }
+            }
+            Some(execute_durable_action_request::Action::Close(_)) => DurableReplicaAction::Close,
+            Some(execute_durable_action_request::Action::BuildReplica(request)) => {
+                DurableReplicaAction::BuildReplica {
+                    replica: request.replica.unwrap_or_default().into(),
+                }
+            }
+            Some(execute_durable_action_request::Action::RemoveReplica(request)) => {
+                DurableReplicaAction::RemoveReplica {
+                    replica_id: request.replica_id,
+                    instance_id: crate::types::ReplicaInstanceId::new(request.instance_id),
                 }
             }
             None => return Err(Status::invalid_argument("missing durable action")),

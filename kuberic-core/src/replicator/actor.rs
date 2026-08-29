@@ -323,7 +323,7 @@ impl WalReplicatorActor {
                                     replica,
                                     sp_tx,
                                     st,
-                                    std::time::Duration::from_secs(30),
+                                    std::time::Duration::from_secs(600),
                                 ).await;
                                 let _ = reply.send(result);
                             });

@@ -183,6 +183,16 @@ pub struct DurableOperationStatus {
     pub old_primary_id: i64,
     pub target_primary_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_mode: Option<DurableAddMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_replica_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_pod_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_instance_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub frozen_lsn: Option<i64>,
     #[serde(default)]
     pub next_secondary_index: u32,
@@ -197,6 +207,14 @@ pub struct DurableOperationStatus {
 #[serde(rename_all = "camelCase")]
 pub enum DurableOperationKind {
     Switchover,
+    AddReplica,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DurableAddMode {
+    ScaleUp,
+    Rebuild,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
@@ -222,6 +240,23 @@ pub enum DurableOperationPhase {
     CompensateLabelOldPrimary,
     CompensateLabelTargetSecondary,
     CompensateFinalize,
+    RetireOldReplica,
+    OpenCandidate,
+    UpdateCandidateEpoch,
+    AssignCandidateIdle,
+    BuildCandidate,
+    AssignCandidateActive,
+    AddCatchUpConfiguration,
+    AddWaitForCatchUpQuorum,
+    AddCurrentConfiguration,
+    LabelCandidateSecondary,
+    AddFinalize,
+    CompensateRestoreConfiguration,
+    CompensateRemoveCandidate,
+    CompensateDemoteCandidate,
+    CompensateCloseCandidate,
+    CompensateDeleteCandidate,
+    AddCompensateFinalize,
     Completed,
     Failed,
     Poisoned,
@@ -263,6 +298,21 @@ pub enum DurableActionKind {
     CompensateCurrentConfiguration,
     CompensateLabelOldPrimary,
     CompensateLabelTargetSecondary,
+    RetireOldReplica,
+    OpenCandidate,
+    UpdateCandidateEpoch,
+    AssignCandidateIdle,
+    BuildCandidate,
+    AssignCandidateActive,
+    AddCatchUpConfiguration,
+    AddWaitForCatchUpQuorum,
+    AddCurrentConfiguration,
+    LabelCandidateSecondary,
+    CompensateRestoreConfiguration,
+    CompensateRemoveCandidate,
+    CompensateDemoteCandidate,
+    CompensateCloseCandidate,
+    CompensateDeleteCandidate,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -283,6 +333,11 @@ pub enum DurablePostconditionKind {
     CatchUpQuorum,
     CurrentConfiguration,
     PodRoleLabel,
+    Opened,
+    BuildCompleted,
+    ReplicaRemoved,
+    Closed,
+    PodDeleted,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -464,6 +519,7 @@ pub enum Phase {
     Healthy,
     FailingOver,
     Switchover,
+    AddingReplica,
     Deleting,
 }
 
