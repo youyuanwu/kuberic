@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use kuberic_core::driver::ReplicaHandle;
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
-use kuberic_core::types::ReplicaId;
+use kuberic_core::types::{ReplicaId, ReplicaInstanceId};
 
 use kuberic_operator::cluster_api::ClusterApi;
 use kuberic_operator::crd::{
@@ -138,6 +138,10 @@ impl KvClusterApi {
     /// (simulates PVC re-attach), and marks the pod Ready.
     async fn restart_pod(&self, pod_name: &str) {
         let replica_id: i64 = pod_name.rsplit('-').next().unwrap().parse::<i64>().unwrap() + 1;
+        static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let instance_id = ReplicaInstanceId::new(format!("restarted-{pod_name}-{generation}"));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap().to_string();
@@ -150,6 +154,7 @@ impl KvClusterApi {
         drop(data_listener);
 
         let bundle = PodRuntime::builder(replica_id)
+            .instance_id(instance_id.clone())
             .reply_timeout(Duration::from_secs(5))
             .data_bind(data_bind)
             .build()
@@ -194,6 +199,13 @@ impl KvClusterApi {
             },
         );
 
+        let mut pods = self.pods.lock().unwrap();
+        let pod = pods
+            .iter_mut()
+            .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+            .unwrap();
+        pod.metadata.uid = Some(instance_id.to_string());
+        drop(pods);
         self.mark_all_pods_ready();
     }
 }
@@ -226,6 +238,9 @@ impl ClusterApi for KvClusterApi {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0)
             + 1;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let instance_id = ReplicaInstanceId::new(format!("reconciler-{replica_id}-{n}"));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap().to_string();
@@ -239,6 +254,7 @@ impl ClusterApi for KvClusterApi {
         drop(data_listener);
 
         let bundle = PodRuntime::builder(replica_id)
+            .instance_id(instance_id.clone())
             .reply_timeout(Duration::from_secs(5))
             .data_bind(data_bind)
             .build()
@@ -246,8 +262,6 @@ impl ClusterApi for KvClusterApi {
             .unwrap();
 
         let control_address = bundle.control_address.clone();
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data_dir = std::env::temp_dir().join("kv-test").join(format!(
             "reconciler-{}-{}-{}",
             replica_id,
@@ -277,7 +291,9 @@ impl ClusterApi for KvClusterApi {
             },
         );
 
-        self.pods.lock().unwrap().push(pod.clone());
+        let mut stored_pod = pod.clone();
+        stored_pod.metadata.uid = Some(instance_id.to_string());
+        self.pods.lock().unwrap().push(stored_pod);
         Ok(())
     }
 
@@ -332,7 +348,13 @@ impl ClusterApi for KvClusterApi {
             (lp.control_address.clone(), lp.data_address.clone())
         };
 
-        let handle = GrpcReplicaHandle::connect(replica_id, control_addr, data_addr)
+        let instance_id = pod
+            .metadata
+            .uid
+            .clone()
+            .map(ReplicaInstanceId::new)
+            .ok_or_else(|| format!("pod {pod_name} has no UID"))?;
+        let handle = GrpcReplicaHandle::connect(replica_id, instance_id, control_addr, data_addr)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -686,6 +708,24 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
 
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::Healthy);
+    assert!(
+        status
+            .members
+            .iter()
+            .all(|member| !member.instance_id.is_empty())
+    );
+    {
+        let drivers = state.drivers.lock().await;
+        let driver = drivers.get("default/myapp").unwrap();
+        for member in &status.members {
+            let handle = driver.handle(member.id).unwrap();
+            assert_eq!(member.instance_id, handle.instance_id().as_str());
+            assert_eq!(
+                handle.get_status().await.unwrap().instance_id,
+                handle.instance_id()
+            );
+        }
+    }
     let primary_name = status.current_primary.clone().unwrap();
 
     // Write data on primary before failure
@@ -1118,4 +1158,35 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
         .unwrap();
     assert!(resp.get_ref().found);
     assert_eq!(resp.get_ref().value, "important");
+
+    // Promote the replacement. Reading the post-rejoin write from it proves
+    // the primary replaced the old same-ID data-plane connection.
+    let status = api.last_status().unwrap();
+    let set = make_set(
+        "myapp",
+        3,
+        Some(KubericSetStatus {
+            phase: Phase::Healthy,
+            current_primary: Some(primary_name),
+            target_primary: Some(secondary_name.clone()),
+            ..status
+        }),
+    );
+    reconcile_set(&set, &api, &state).await.unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Switchover);
+    reconcile_set(&make_set("myapp", 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+
+    let replacement_addr = api.client_address(&secondary_name).unwrap();
+    let mut replacement = connect_kv(&replacement_addr).await;
+    let resp = replacement
+        .get(proto::GetRequest {
+            key: "after-rejoin".into(),
+        })
+        .await
+        .unwrap();
+    assert!(resp.get_ref().found);
+    assert_eq!(resp.get_ref().value, "recovered");
 }

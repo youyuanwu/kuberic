@@ -24,6 +24,7 @@ switchover, and scaling via `PartitionDriver`.
 - `epoch`, `currentPrimary`, `targetPrimary`, `phase`
 - `reconfigurationPhase`, `currentConfiguration`, `previousConfiguration`
 - `failingSinceTimestamp`, `quorumLossSince`
+- per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
 - `instanceNames`, `instanceStates`
 - `conditions`
 
@@ -97,6 +98,19 @@ Per-replica `grpc_failure_count` persisted in CRD status. Incremented
 on Unavailable/DeadlineExceeded, reset on success. When count reaches
 `spec.grpcFailureThreshold` (default 3), treat replica as unreachable
 even if pod shows Ready.
+
+### Replica Incarnations
+
+The stable replica ID is derived from the pod ordinal and survives pod
+recreation. Each concrete pod uses its Kubernetes UID as
+`ReplicaInstanceId`. Runtime status, driver handles, replica-set
+configurations, and CRD member status carry that incarnation.
+
+Health reconciliation compares the runtime-reported incarnation with the
+handle's expected pod UID. Before a stale secondary is removed from driver
+state, the driver sends a precise `(replica ID, incarnation)` removal to the
+primary. Re-adding the ordinal installs the new endpoint and cancels the old
+connection's drain and acknowledgement tasks.
 
 ---
 

@@ -5,8 +5,8 @@ use tracing::{info, warn};
 
 use crate::error::{KubericError, Result};
 use crate::types::{
-    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaSetConfig,
-    ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo, Role,
+    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
+    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo, Role,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,6 +19,7 @@ use crate::types::{
 #[async_trait]
 pub trait ReplicaHandle: Send + Sync {
     fn id(&self) -> ReplicaId;
+    fn instance_id(&self) -> ReplicaInstanceId;
 
     // Lifecycle
     async fn open(&self, mode: OpenMode) -> Result<()>;
@@ -43,7 +44,11 @@ pub trait ReplicaHandle: Send + Sync {
     async fn update_current_configuration(&self, current: ReplicaSetConfig) -> Result<()>;
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()>;
     async fn build_replica(&self, replica: ReplicaInfo) -> Result<()>;
-    async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()>;
+    async fn remove_replica(
+        &self,
+        replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+    ) -> Result<()>;
 
     /// Revoke write status before switchover demotion.
     /// Sets write_status = ReconfigurationPending so new writes are
@@ -216,6 +221,7 @@ impl PartitionDriver {
             let addr = self.replicas[&id].handle.replicator_address();
             let replica_info = ReplicaInfo {
                 id,
+                instance_id: self.replicas[&id].handle.instance_id(),
                 role: Role::IdleSecondary,
                 status: ReplicaStatus::Up,
                 replicator_address: addr,
@@ -247,6 +253,7 @@ impl PartitionDriver {
 
             config.members.push(ReplicaInfo {
                 id,
+                instance_id: self.replicas[&id].handle.instance_id(),
                 role: Role::ActiveSecondary,
                 status: ReplicaStatus::Up,
                 replicator_address: addr,
@@ -421,6 +428,7 @@ impl PartitionDriver {
                 let entry = &self.replicas[&id];
                 ReplicaInfo {
                     id,
+                    instance_id: entry.handle.instance_id(),
                     role: Role::ActiveSecondary,
                     status: ReplicaStatus::Up,
                     replicator_address: entry.handle.replicator_address(),
@@ -659,6 +667,7 @@ impl PartitionDriver {
                 let entry = &self.replicas[&id];
                 ReplicaInfo {
                     id,
+                    instance_id: entry.handle.instance_id(),
                     role: Role::ActiveSecondary,
                     status: ReplicaStatus::Up,
                     replicator_address: entry.handle.replicator_address(),
@@ -769,6 +778,7 @@ impl PartitionDriver {
                 let entry = &self.replicas[&id];
                 ReplicaInfo {
                     id,
+                    instance_id: entry.handle.instance_id(),
                     role: Role::ActiveSecondary,
                     status: ReplicaStatus::Up,
                     replicator_address: entry.handle.replicator_address(),
@@ -827,6 +837,38 @@ impl PartitionDriver {
     // Workflow: Add Replica (scale-up or rebuild)
     // -----------------------------------------------------------------------
 
+    /// Retire a stale secondary incarnation before its replacement is added.
+    ///
+    /// The stable configuration remains unchanged until `add_replica` installs
+    /// the replacement, but the primary-side connection is removed precisely
+    /// by incarnation so a delayed stale request cannot remove a newer pod.
+    pub async fn remove_stale_secondary(&mut self, secondary_id: ReplicaId) -> Result<()> {
+        let primary_id = self.primary_id.ok_or(KubericError::NotPrimary)?;
+        assert_ne!(
+            secondary_id, primary_id,
+            "cannot retire the primary as a stale secondary"
+        );
+        let instance_id = self
+            .replicas
+            .get(&secondary_id)
+            .unwrap_or_else(|| panic!("replica {secondary_id} not found"))
+            .handle
+            .instance_id();
+
+        self.replicas[&primary_id]
+            .handle
+            .remove_replica(secondary_id, instance_id.clone())
+            .await?;
+
+        self.replicas.remove(&secondary_id);
+        info!(
+            secondary_id,
+            instance_id = %instance_id,
+            "stale secondary incarnation retired"
+        );
+        Ok(())
+    }
+
     /// Add a new replica to the partition. The primary builds it via the
     /// copy protocol, then it joins the quorum configuration.
     ///
@@ -858,27 +900,35 @@ impl PartitionDriver {
 
         // 1. Open + set epoch + assign idle role (fallible — don't insert yet)
         handle.open(OpenMode::New).await?;
-        handle.update_epoch(epoch).await?;
-        handle.change_role(epoch, Role::IdleSecondary).await?;
+        let setup_result = async {
+            handle.update_epoch(epoch).await?;
+            handle.change_role(epoch, Role::IdleSecondary).await?;
 
-        // 2. build_replica on primary (copies state via data plane)
-        let addr = handle.replicator_address();
-        let replica_info = ReplicaInfo {
-            id: replica_id,
-            role: Role::IdleSecondary,
-            status: ReplicaStatus::Up,
-            replicator_address: addr,
-            current_progress: -1,
-            catch_up_capability: -1,
-            must_catch_up: false,
-        };
-        self.replicas[&primary_id]
-            .handle
-            .build_replica(replica_info)
-            .await?;
+            // 2. build_replica on primary (copies state via data plane)
+            let replica_info = ReplicaInfo {
+                id: replica_id,
+                instance_id: handle.instance_id(),
+                role: Role::IdleSecondary,
+                status: ReplicaStatus::Up,
+                replicator_address: handle.replicator_address(),
+                current_progress: -1,
+                catch_up_capability: -1,
+                must_catch_up: false,
+            };
+            self.replicas[&primary_id]
+                .handle
+                .build_replica(replica_info)
+                .await?;
 
-        // 3. Promote idle → active
-        handle.change_role(epoch, Role::ActiveSecondary).await?;
+            // 3. Promote idle → active
+            handle.change_role(epoch, Role::ActiveSecondary).await
+        }
+        .await;
+        if let Err(error) = setup_result {
+            let _ = handle.change_role(epoch, Role::None).await;
+            let _ = handle.close().await;
+            return Err(error);
+        }
 
         // All fallible ops succeeded — now insert into driver state
         self.replicas.insert(
@@ -896,6 +946,19 @@ impl PartitionDriver {
             // dual configuration; otherwise the reconciler sees the replica
             // as present and cannot retry the failed scale-up.
             if let Some(replica) = self.replicas.remove(&replica_id) {
+                let instance_id = replica.handle.instance_id();
+                if let Err(cleanup_error) = self.replicas[&primary_id]
+                    .handle
+                    .remove_replica(replica_id, instance_id.clone())
+                    .await
+                {
+                    warn!(
+                        replica_id,
+                        instance_id = %instance_id,
+                        error = %cleanup_error,
+                        "failed to remove replacement connection after add rollback"
+                    );
+                }
                 let _ = replica.handle.change_role(epoch, Role::None).await;
                 let _ = replica.handle.close().await;
             }
@@ -932,8 +995,9 @@ impl PartitionDriver {
         info!(secondary_id, "restarting secondary");
 
         // 1. Remove and close the old secondary (best effort — it may be
-        // dead). Keep the driver entry available for restoration if the
-        // replacement fails so a reconciler can retry the same replica ID.
+        // dead). Restore it only if the primary cannot remove its old
+        // connection; after replacement starts, restoring the old handle
+        // could diverge from the primary's installed incarnation.
         let old = self.replicas.remove(&secondary_id).unwrap();
         let _ = old.handle.close().await;
 
@@ -941,9 +1005,10 @@ impl PartitionDriver {
         // replacement. Restoring the stable configuration after a failed
         // attempt intentionally retains the member ID, so configuration
         // pruning alone cannot distinguish the old endpoint from the new one.
+        let old_instance_id = old.handle.instance_id();
         if let Err(error) = self.replicas[&primary_id]
             .handle
-            .remove_replica(secondary_id)
+            .remove_replica(secondary_id, old_instance_id)
             .await
         {
             self.replicas.insert(secondary_id, old);
@@ -952,10 +1017,7 @@ impl PartitionDriver {
 
         // 2. Add the replacement under the same ID.
         assert_eq!(new_handle.id(), secondary_id);
-        if let Err(error) = self.add_replica(new_handle).await {
-            self.replicas.insert(secondary_id, old);
-            return Err(error);
-        }
+        self.add_replica(new_handle).await?;
         Ok(())
     }
 
@@ -984,6 +1046,7 @@ impl PartitionDriver {
                 let entry = &self.replicas[&id];
                 ReplicaInfo {
                     id,
+                    instance_id: entry.handle.instance_id(),
                     role: Role::ActiveSecondary,
                     status: ReplicaStatus::Up,
                     replicator_address: entry.handle.replicator_address(),
@@ -999,10 +1062,17 @@ impl PartitionDriver {
             write_quorum,
         };
 
-        self.replicas[&primary_id]
+        if let Err(error) = self.replicas[&primary_id]
             .handle
             .update_catch_up_configuration(new_config.clone(), self.current_config.clone())
-            .await?;
+            .await
+        {
+            self.replicas[&primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
+                .await?;
+            return Err(error);
+        }
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -1054,6 +1124,7 @@ pub mod testing {
     /// and a local gRPC secondary server.
     pub struct InProcessReplicaHandle {
         id: ReplicaId,
+        instance_id: ReplicaInstanceId,
         control_tx: mpsc::Sender<ReplicatorControlEvent>,
         data_tx: mpsc::Sender<ReplicateRequest>,
         state: Arc<PartitionState>,
@@ -1072,6 +1143,9 @@ pub mod testing {
     impl InProcessReplicaHandle {
         /// Spawn a new in-process replica (actor + gRPC server).
         pub async fn spawn(id: ReplicaId) -> Result<Self> {
+            static NEXT_INSTANCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let generation = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed);
             let (control_tx, control_rx) = mpsc::channel(16);
             let (data_tx, data_rx) = mpsc::channel::<ReplicateRequest>(256);
             let state = Arc::new(PartitionState::new());
@@ -1108,6 +1182,7 @@ pub mod testing {
 
             Ok(Self {
                 id,
+                instance_id: ReplicaInstanceId::new(format!("in-process-{id}-{generation}")),
                 control_tx,
                 data_tx,
                 state,
@@ -1159,6 +1234,10 @@ pub mod testing {
     impl ReplicaHandle for InProcessReplicaHandle {
         fn id(&self) -> ReplicaId {
             self.id
+        }
+
+        fn instance_id(&self) -> ReplicaInstanceId {
+            self.instance_id.clone()
         }
 
         async fn open(&self, mode: OpenMode) -> Result<()> {
@@ -1279,9 +1358,17 @@ pub mod testing {
                 .await
         }
 
-        async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
-            self.send_control(|reply| ReplicatorControlEvent::RemoveReplica { replica_id, reply })
-                .await
+        async fn remove_replica(
+            &self,
+            replica_id: ReplicaId,
+            instance_id: ReplicaInstanceId,
+        ) -> Result<()> {
+            self.send_control(|reply| ReplicatorControlEvent::RemoveReplica {
+                replica_id,
+                instance_id,
+                reply,
+            })
+            .await
         }
 
         async fn revoke_write_status(&self) -> Result<()> {
@@ -1298,6 +1385,7 @@ pub mod testing {
             let role = *self.role.lock().unwrap();
             let epoch = *self.epoch.lock().unwrap();
             Ok(ReplicaStatusInfo {
+                instance_id: self.instance_id.clone(),
                 role,
                 epoch,
                 current_progress: self.state.current_progress(),

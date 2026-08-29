@@ -3,7 +3,7 @@ use std::time::Duration;
 use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
 use kuberic_core::error::KubericError;
 use kuberic_core::types::{
-    ReplicaInfo, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
+    ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 use serial_test::serial;
 
@@ -19,6 +19,7 @@ fn replica_info(
 ) -> ReplicaInfo {
     ReplicaInfo {
         id,
+        instance_id: ReplicaInstanceId::new(format!("test-{id}")),
         role,
         status: ReplicaStatus::Up,
         replicator_address: address.to_owned(),

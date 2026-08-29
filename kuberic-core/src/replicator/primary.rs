@@ -5,19 +5,21 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::proto::ReplicationItem;
 use crate::proto::replicator_data_client::ReplicatorDataClient;
 use crate::replicator::quorum::QuorumTracker;
-use crate::types::{Epoch, Lsn, ReplicaId};
+use crate::types::{CancellationToken, Epoch, Lsn, ReplicaId, ReplicaInstanceId};
 
 /// A connection to one secondary replica. Uses an unbounded channel so
 /// send_to_all never blocks the actor. A background drain task bridges
 /// the unbounded channel to the bounded gRPC stream.
 struct SecondaryConnection {
+    instance_id: ReplicaInstanceId,
     /// Unbounded sender — send_to_all writes here, never blocks
     item_tx: mpsc::UnboundedSender<ReplicationItem>,
+    cancellation: CancellationToken,
 }
 
 /// Primary-side replication sender. Manages connections to all configured
@@ -33,6 +35,7 @@ struct SecondaryConnection {
 /// at `add_secondary` time — no build buffers needed.
 pub struct PrimarySender {
     connections: HashMap<ReplicaId, SecondaryConnection>,
+    active_instances: Arc<std::sync::RwLock<HashMap<ReplicaId, ReplicaInstanceId>>>,
     #[allow(dead_code)]
     primary_id: ReplicaId,
     epoch: Epoch,
@@ -42,6 +45,7 @@ impl PrimarySender {
     pub fn new(primary_id: ReplicaId, epoch: Epoch) -> Self {
         Self {
             connections: HashMap::new(),
+            active_instances: Arc::new(std::sync::RwLock::new(HashMap::new())),
             primary_id,
             epoch,
         }
@@ -62,11 +66,12 @@ impl PrimarySender {
     pub async fn add_secondary(
         &mut self,
         replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
         address: String,
         quorum_tracker: Arc<tokio::sync::Mutex<QuorumTracker>>,
         partition_state: Arc<crate::handles::PartitionState>,
     ) -> crate::Result<()> {
-        if self.connections.contains_key(&replica_id) {
+        if self.has_connection(&replica_id, &instance_id) {
             return Ok(()); // already connected
         }
 
@@ -90,53 +95,106 @@ impl PrimarySender {
         let mut ack_stream = response.into_inner();
         let rid = replica_id;
 
-        // Spawn ACK reader
-        let ps = partition_state;
+        // Unbounded channel: send_to_all writes here (never blocks)
+        let (unbounded_tx, mut unbounded_rx) = mpsc::unbounded_channel::<ReplicationItem>();
+        let cancellation = CancellationToken::new();
+        self.install_connection(
+            replica_id,
+            SecondaryConnection {
+                instance_id: instance_id.clone(),
+                item_tx: unbounded_tx,
+                cancellation: cancellation.clone(),
+            },
+        );
+
+        // Spawn drain task: bridges unbounded → bounded gRPC stream.
+        // This task may block on grpc_tx.send() if the secondary is slow,
+        // but that only blocks THIS task, not the actor.
+        let drain_cancellation = cancellation.clone();
         tokio::spawn(async move {
-            while let Some(result) = ack_stream.next().await {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = drain_cancellation.cancelled() => break,
+                    item = unbounded_rx.recv() => {
+                        let Some(item) = item else {
+                            break;
+                        };
+                        let result = tokio::select! {
+                            biased;
+                            _ = drain_cancellation.cancelled() => break,
+                            result = grpc_tx.send(item) => result,
+                        };
+                        if result.is_err() {
+                            warn!(replica_id = rid, "gRPC stream closed, drain task exiting");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn ACK reader only after this incarnation is installed. Cancelling
+        // a replaced connection is prioritized over any buffered stale ACK.
+        let ps = partition_state;
+        let active_instances = self.active_instances.clone();
+        tokio::spawn(async move {
+            loop {
+                let result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    result = ack_stream.next() => result,
+                };
+                let Some(result) = result else {
+                    break;
+                };
                 match result {
                     Ok(ack) => {
-                        debug!(replica_id = rid, lsn = ack.lsn, "received ACK");
+                        debug!(
+                            replica_id = rid,
+                            instance_id = %instance_id,
+                            lsn = ack.lsn,
+                            "received ACK"
+                        );
                         let mut tracker = quorum_tracker.lock().await;
+                        let active = active_instances.read().unwrap();
+                        if active.get(&rid) != Some(&instance_id) {
+                            break;
+                        }
                         tracker.ack(ack.lsn, rid);
-                        // Update PartitionState so committed_lsn is always fresh,
-                        // even without a new data_rx item to trigger the read.
-                        // This fixes the off-by-one where the last op's committed_lsn
-                        // was never propagated because no subsequent op triggered
-                        // a PartitionState refresh.
                         ps.advance_committed_lsn(tracker.committed_lsn());
                     }
                     Err(e) => {
-                        warn!(replica_id = rid, error = %e, "ACK stream error");
+                        warn!(
+                            replica_id = rid,
+                            instance_id = %instance_id,
+                            error = %e,
+                            "ACK stream error"
+                        );
                         break;
                     }
                 }
             }
         });
 
-        // Unbounded channel: send_to_all writes here (never blocks)
-        let (unbounded_tx, mut unbounded_rx) = mpsc::unbounded_channel::<ReplicationItem>();
-
-        // Spawn drain task: bridges unbounded → bounded gRPC stream.
-        // This task may block on grpc_tx.send() if the secondary is slow,
-        // but that only blocks THIS task, not the actor.
-        tokio::spawn(async move {
-            while let Some(item) = unbounded_rx.recv().await {
-                if grpc_tx.send(item).await.is_err() {
-                    warn!(replica_id = rid, "gRPC stream closed, drain task exiting");
-                    break;
-                }
-            }
-        });
-
-        self.connections.insert(
-            replica_id,
-            SecondaryConnection {
-                item_tx: unbounded_tx,
-            },
-        );
-
         Ok(())
+    }
+
+    fn install_connection(&mut self, replica_id: ReplicaId, connection: SecondaryConnection) {
+        let new_instance_id = connection.instance_id.clone();
+        self.active_instances
+            .write()
+            .unwrap()
+            .insert(replica_id, new_instance_id.clone());
+        if let Some(old) = self.connections.insert(replica_id, connection) {
+            info!(
+                replica_id,
+                old_instance_id = %old.instance_id,
+                new_instance_id = %new_instance_id,
+                "replacing secondary incarnation"
+            );
+            old.cancellation.cancel();
+        }
     }
 
     /// Send a single item to a specific secondary (for replay from queue).
@@ -162,8 +220,33 @@ impl PrimarySender {
     }
 
     /// Remove a secondary connection.
-    pub fn remove_secondary(&mut self, replica_id: ReplicaId) {
-        self.connections.remove(&replica_id);
+    pub fn remove_secondary(
+        &mut self,
+        replica_id: ReplicaId,
+        instance_id: &ReplicaInstanceId,
+    ) -> bool {
+        let mut active_instances = self.active_instances.write().unwrap();
+        if active_instances.get(&replica_id) != Some(instance_id) {
+            warn!(
+                replica_id,
+                instance_id = %instance_id,
+                "ignoring removal for stale secondary incarnation"
+            );
+            return false;
+        }
+        active_instances.remove(&replica_id);
+        if let Some(connection) = self.connections.remove(&replica_id) {
+            connection.cancellation.cancel();
+        }
+        true
+    }
+
+    /// Remove whichever incarnation currently owns this logical replica ID.
+    pub fn remove_secondary_by_id(&mut self, replica_id: ReplicaId) {
+        self.active_instances.write().unwrap().remove(&replica_id);
+        if let Some(connection) = self.connections.remove(&replica_id) {
+            connection.cancellation.cancel();
+        }
     }
 
     /// Send an operation to all connected secondaries. Non-blocking —
@@ -188,7 +271,7 @@ impl PrimarySender {
             }
         }
         for rid in dead {
-            self.connections.remove(&rid);
+            self.remove_secondary_by_id(rid);
         }
     }
 
@@ -198,8 +281,10 @@ impl PrimarySender {
     }
 
     /// Check if a secondary is connected.
-    pub fn has_connection(&self, replica_id: &ReplicaId) -> bool {
-        self.connections.contains_key(replica_id)
+    pub fn has_connection(&self, replica_id: &ReplicaId, instance_id: &ReplicaInstanceId) -> bool {
+        self.connections
+            .get(replica_id)
+            .is_some_and(|connection| connection.instance_id == *instance_id)
     }
 
     /// Get all connected replica IDs.
@@ -209,6 +294,71 @@ impl PrimarySender {
 
     /// Close all connections.
     pub fn close_all(&mut self) {
-        self.connections.clear();
+        self.active_instances.write().unwrap().clear();
+        for connection in self.connections.drain().map(|(_, connection)| connection) {
+            connection.cancellation.cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_connection(
+        instance_id: &str,
+    ) -> (
+        SecondaryConnection,
+        CancellationToken,
+        mpsc::UnboundedReceiver<ReplicationItem>,
+    ) {
+        let (item_tx, item_rx) = mpsc::unbounded_channel();
+        let cancellation = CancellationToken::new();
+        (
+            SecondaryConnection {
+                instance_id: ReplicaInstanceId::new(instance_id),
+                item_tx,
+                cancellation: cancellation.clone(),
+            },
+            cancellation,
+            item_rx,
+        )
+    }
+
+    #[test]
+    fn installing_new_incarnation_retires_old_connection() {
+        let mut sender = PrimarySender::new(1, Epoch::default());
+        let (old, old_cancellation, mut old_items) = test_connection("old");
+        sender.install_connection(2, old);
+
+        let (new, new_cancellation, mut new_items) = test_connection("new");
+        sender.install_connection(2, new);
+
+        assert!(old_cancellation.is_cancelled());
+        assert!(!new_cancellation.is_cancelled());
+        assert!(sender.has_connection(&2, &ReplicaInstanceId::new("new")));
+        assert!(!sender.has_connection(&2, &ReplicaInstanceId::new("old")));
+        assert_eq!(
+            sender.active_instances.read().unwrap().get(&2),
+            Some(&ReplicaInstanceId::new("new"))
+        );
+
+        sender.send_to_one(2, 7, &bytes::Bytes::from_static(b"new"), 6);
+        assert_eq!(new_items.try_recv().unwrap().lsn, 7);
+        assert!(old_items.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_incarnation_removal_preserves_current_connection() {
+        let mut sender = PrimarySender::new(1, Epoch::default());
+        let (current, current_cancellation, _items) = test_connection("current");
+        sender.install_connection(2, current);
+
+        assert!(!sender.remove_secondary(2, &ReplicaInstanceId::new("old")));
+        assert!(sender.has_connection(&2, &ReplicaInstanceId::new("current")));
+        assert!(!current_cancellation.is_cancelled());
+
+        assert!(sender.remove_secondary(2, &ReplicaInstanceId::new("current")));
+        assert!(current_cancellation.is_cancelled());
     }
 }

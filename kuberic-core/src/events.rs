@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
     DataLossAction, Epoch, Lsn, OpenMode, OperationStream, ReplicaId, ReplicaInfo,
-    ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,7 @@ pub enum ReplicatorControlEvent {
     },
     RemoveReplica {
         replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
         reply: oneshot::Sender<Result<()>>,
     },
 }

@@ -124,14 +124,24 @@ an already-running partition.
 Replace a failed secondary. Implemented in `PartitionDriver::restart_secondary()`.
 
 ```
-1. Close old secondary handle
-2. remove_secondary (quorum reconfiguration)
-3. Operator deletes old Pod + creates new Pod
-4. Wait for Ready
-5. add_replica (full build from primary)
+1. Identify the old replica incarnation (Kubernetes Pod UID in production)
+2. Close the old secondary handle
+3. Remove the primary-side replication connection only when both the stable
+   replica ID and old incarnation match
+4. Operator deletes old Pod + creates new Pod
+5. Wait for Ready
+6. Add the new incarnation under the same stable replica ID
+7. add_replica (full build from primary)
 ```
 
-Delegates to `add_replica` after cleanup.
+Replica-set configuration and status carry both `ReplicaId` and
+`ReplicaInstanceId`. A new incarnation replaces any remaining primary-side
+connection for the same stable ID and cancels the old drain/ACK tasks. A
+delayed removal for the old incarnation is an idempotent no-op and cannot
+remove the replacement.
+
+The reconciler uses the same primary-side retirement operation when it detects
+a stale secondary before re-adding a recreated pod.
 
 ---
 

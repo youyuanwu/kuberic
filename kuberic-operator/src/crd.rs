@@ -111,6 +111,9 @@ pub struct MemberStatus {
     pub name: String,
     /// Replica ID.
     pub id: i64,
+    /// Kubernetes pod UID for this concrete replica incarnation.
+    #[serde(default)]
+    pub instance_id: String,
     /// Role: primary, active-secondary, idle-secondary, none.
     pub role: String,
     /// Current progress LSN.

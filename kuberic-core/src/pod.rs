@@ -9,7 +9,7 @@ use crate::events::{LifecycleEvent, ReplicatorControlEvent};
 use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
     AccessStatus, CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
-    ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
 };
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,6 +56,7 @@ pub enum RuntimeCommand {
     },
     RemoveReplica {
         replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
         reply: oneshot::Sender<Result<()>>,
     },
     OnDataLoss {
@@ -71,6 +72,7 @@ pub enum RuntimeCommand {
 
 /// Status info returned by GetStatus.
 pub struct StatusInfo {
+    pub instance_id: ReplicaInstanceId,
     pub role: Role,
     pub epoch: Epoch,
     pub current_progress: Lsn,
@@ -92,6 +94,7 @@ pub struct PodRuntime {
     role: Role,
     epoch: Epoch,
     replica_id: ReplicaId,
+    instance_id: ReplicaInstanceId,
     data_bind: String,
 }
 
@@ -103,6 +106,7 @@ pub struct PodRuntimeBundle {
 
 pub struct PodRuntimeBuilder {
     replica_id: ReplicaId,
+    instance_id: ReplicaInstanceId,
     reply_timeout: Duration,
     control_bind: String,
     data_bind: String,
@@ -110,12 +114,19 @@ pub struct PodRuntimeBuilder {
 
 impl PodRuntimeBuilder {
     pub fn new(replica_id: ReplicaId) -> Self {
+        let generation: u128 = rand::random();
         Self {
             replica_id,
+            instance_id: ReplicaInstanceId::new(format!("local-{replica_id}-{generation:032x}")),
             reply_timeout: DEFAULT_REPLY_TIMEOUT,
             control_bind: "127.0.0.1:0".to_string(),
             data_bind: "127.0.0.1:0".to_string(),
         }
+    }
+
+    pub fn instance_id(mut self, instance_id: ReplicaInstanceId) -> Self {
+        self.instance_id = instance_id;
+        self
     }
 
     pub fn reply_timeout(mut self, timeout: Duration) -> Self {
@@ -180,6 +191,7 @@ impl PodRuntimeBuilder {
             role: Role::Unknown,
             epoch: Epoch::default(),
             replica_id: self.replica_id,
+            instance_id: self.instance_id,
             data_bind: self.data_bind,
         };
 
@@ -277,10 +289,15 @@ impl PodRuntime {
                         .await,
                     );
                 }
-                RuntimeCommand::RemoveReplica { replica_id, reply } => {
+                RuntimeCommand::RemoveReplica {
+                    replica_id,
+                    instance_id,
+                    reply,
+                } => {
                     let _ = reply.send(
                         self.send_replicator_control(|r| ReplicatorControlEvent::RemoveReplica {
                             replica_id,
+                            instance_id,
                             reply: r,
                         })
                         .await,
@@ -301,6 +318,7 @@ impl PodRuntime {
                 RuntimeCommand::GetStatus { reply } => {
                     let handle = self.replicator_handle.as_ref();
                     let _ = reply.send(StatusInfo {
+                        instance_id: self.instance_id.clone(),
                         role: self.role,
                         epoch: self.epoch,
                         current_progress: handle.map_or(0, |h| h.state().current_progress()),

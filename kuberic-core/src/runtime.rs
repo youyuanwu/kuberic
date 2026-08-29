@@ -317,9 +317,17 @@ impl KubericRuntime {
             .await
     }
 
-    pub async fn remove_replica(&self, replica_id: crate::types::ReplicaId) -> Result<()> {
-        self.send_control(|reply| ReplicatorControlEvent::RemoveReplica { replica_id, reply })
-            .await
+    pub async fn remove_replica(
+        &self,
+        replica_id: crate::types::ReplicaId,
+        instance_id: crate::types::ReplicaInstanceId,
+    ) -> Result<()> {
+        self.send_control(|reply| ReplicatorControlEvent::RemoveReplica {
+            replica_id,
+            instance_id,
+            reply,
+        })
+        .await
     }
 
     pub async fn on_data_loss(&self) -> Result<crate::types::DataLossAction> {

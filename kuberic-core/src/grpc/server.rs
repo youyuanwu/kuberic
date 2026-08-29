@@ -5,7 +5,7 @@ use crate::error::KubericError;
 use crate::pod::RuntimeCommand;
 use crate::proto::replicator_control_server::ReplicatorControl;
 use crate::proto::*;
-use crate::types::{Epoch, Role};
+use crate::types::{Epoch, ReplicaInstanceId, Role};
 
 /// Control server that routes all commands through the PodRuntime's
 /// command channel. This ensures correct replicator/event ordering
@@ -99,6 +99,7 @@ impl ReplicatorControl for ControlServer {
             catch_up_capability: info.catch_up_capability,
             committed_lsn: info.committed_lsn,
             healthy: info.healthy,
+            instance_id: info.instance_id.to_string(),
         }))
     }
 
@@ -157,9 +158,13 @@ impl ReplicatorControl for ControlServer {
         &self,
         req: Request<RemoveReplicaRequest>,
     ) -> Result<Response<RemoveReplicaResponse>, Status> {
-        let replica_id = req.into_inner().replica_id;
-        self.send_cmd(|reply| RuntimeCommand::RemoveReplica { replica_id, reply })
-            .await?;
+        let inner = req.into_inner();
+        self.send_cmd(|reply| RuntimeCommand::RemoveReplica {
+            replica_id: inner.replica_id,
+            instance_id: ReplicaInstanceId::new(inner.instance_id),
+            reply,
+        })
+        .await?;
         Ok(Response::new(RemoveReplicaResponse {}))
     }
 
