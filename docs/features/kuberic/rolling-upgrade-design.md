@@ -768,21 +768,14 @@ defer insertion until after `build_replica` succeeds.
 
 **Sources**: assumptions
 
-`PartitionDriver` lives in heap memory (`Mutex<HashMap>`). Operator
-crash mid-upgrade = lost state, no recovery. CRD status fields are
-necessary but insufficient — the driver can't reconstruct handles,
-epoch, or quorum config from status alone.
+`PartitionDriver` lives in heap memory (`Mutex<HashMap>`), but stable
+`Healthy` state is now recoverable from the authoritative CRD
+`stableSnapshot`, current pod identities, and read-only runtime status.
 
-**This is a pre-existing gap** — not specific to upgrades. If the
-operator restarts while any partition is `Healthy`, it loses all driver
-state. Failover, switchover, and scale operations silently fail
-(reconciler logs `"no driver state"` and requeues forever). The only
-recovery today is to delete and recreate the partition.
-
-**Fix**: Implement driver reconstruction from running pods' gRPC status
-queries (probe all pods → discover roles/epochs → rebuild driver). This
-matches CNPG's approach (stateless reconciler, reconstructs each cycle).
-Should be implemented as a standalone fix before upgrade work.
+This does not resolve an operator crash mid-upgrade or mid-reconfiguration.
+If live epoch, role, incarnation, or membership differs from the last stable
+snapshot, recovery fails closed. Rolling upgrade design still needs durable
+transition checkpoints before it can safely resume an interrupted upgrade.
 
 ### Should-Fix
 

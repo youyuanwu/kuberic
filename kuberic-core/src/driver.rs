@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use crate::error::{KubericError, Result};
+use crate::error::{KubericError, RecoveryError, Result};
 use crate::types::{
     DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
     ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo, Role,
+    StablePartitionSnapshot, StableReplicaSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,257 @@ impl PartitionDriver {
 
     pub fn handle(&self, id: ReplicaId) -> Option<&dyn ReplicaHandle> {
         self.replicas.get(&id).map(|s| s.handle.as_ref())
+    }
+
+    /// Reconstruct a driver from the last durably committed stable snapshot.
+    ///
+    /// Recovery is deliberately read-only: every supplied handle is queried
+    /// with `get_status`, and no other handle operation is invoked.
+    pub async fn recover(
+        snapshot: StablePartitionSnapshot,
+        handles: Vec<Box<dyn ReplicaHandle>>,
+    ) -> Result<Self> {
+        if snapshot.members.is_empty() {
+            return Err(RecoveryError::EmptySnapshot.into());
+        }
+
+        let mut snapshot_by_id = HashMap::new();
+        let mut snapshot_instances = HashSet::new();
+        let mut primary_ids = Vec::new();
+        for member in &snapshot.members {
+            if snapshot_by_id.insert(member.id, member).is_some() {
+                return Err(RecoveryError::DuplicateReplicaId(member.id).into());
+            }
+            if !snapshot_instances.insert(member.instance_id.clone()) {
+                return Err(RecoveryError::DuplicateInstanceId(member.instance_id.clone()).into());
+            }
+            match member.role {
+                Role::Primary => primary_ids.push(member.id),
+                Role::ActiveSecondary => {}
+                role => {
+                    return Err(RecoveryError::UnsupportedStableRole {
+                        id: member.id,
+                        role,
+                    }
+                    .into());
+                }
+            }
+        }
+
+        if !snapshot_by_id.contains_key(&snapshot.primary_id) {
+            return Err(RecoveryError::PrimaryMissing(snapshot.primary_id).into());
+        }
+        if primary_ids.len() != 1 {
+            return Err(RecoveryError::InvalidPrimaryCount(primary_ids.len()).into());
+        }
+        if primary_ids[0] != snapshot.primary_id {
+            return Err(RecoveryError::ConflictingPrimary {
+                expected: snapshot.primary_id,
+                actual: primary_ids[0],
+            }
+            .into());
+        }
+
+        let expected_quorum = snapshot.members.len() as u32 / 2 + 1;
+        if snapshot.write_quorum != expected_quorum {
+            return Err(RecoveryError::InvalidWriteQuorum {
+                actual: snapshot.write_quorum,
+                expected: expected_quorum,
+                members: snapshot.members.len(),
+            }
+            .into());
+        }
+
+        let mut handles_by_id = HashMap::new();
+        let mut handle_instances = HashSet::new();
+        for handle in handles {
+            let id = handle.id();
+            let instance_id = handle.instance_id();
+            if handles_by_id.insert(id, handle).is_some() {
+                return Err(RecoveryError::DuplicateHandleId(id).into());
+            }
+            if !handle_instances.insert(instance_id.clone()) {
+                return Err(RecoveryError::DuplicateHandleInstanceId(instance_id).into());
+            }
+        }
+
+        for member in &snapshot.members {
+            let handle = handles_by_id
+                .get(&member.id)
+                .ok_or(RecoveryError::MissingHandle(member.id))?;
+            let actual = handle.instance_id();
+            if actual != member.instance_id {
+                return Err(RecoveryError::HandleInstanceMismatch {
+                    id: member.id,
+                    expected: member.instance_id.clone(),
+                    actual,
+                }
+                .into());
+            }
+        }
+        if let Some(extra) = handles_by_id
+            .keys()
+            .find(|id| !snapshot_by_id.contains_key(id))
+        {
+            return Err(RecoveryError::ExtraHandle(*extra).into());
+        }
+
+        let mut statuses = HashMap::new();
+        for member in &snapshot.members {
+            let status = handles_by_id[&member.id].get_status().await?;
+            if status.instance_id != member.instance_id {
+                return Err(RecoveryError::RuntimeInstanceMismatch {
+                    id: member.id,
+                    expected: member.instance_id.clone(),
+                    actual: status.instance_id,
+                }
+                .into());
+            }
+            if status.epoch != snapshot.epoch {
+                return Err(RecoveryError::EpochMismatch {
+                    id: member.id,
+                    expected: snapshot.epoch,
+                    actual: status.epoch,
+                }
+                .into());
+            }
+            if status.role != member.role {
+                return Err(RecoveryError::RuntimeRoleMismatch {
+                    id: member.id,
+                    expected: member.role,
+                    actual: status.role,
+                }
+                .into());
+            }
+            statuses.insert(member.id, status);
+        }
+
+        let mut replicas = HashMap::new();
+        for member in &snapshot.members {
+            replicas.insert(
+                member.id,
+                ReplicaState {
+                    handle: handles_by_id.remove(&member.id).unwrap(),
+                    role: member.role,
+                },
+            );
+        }
+
+        let members = snapshot
+            .members
+            .iter()
+            .filter(|member| member.id != snapshot.primary_id)
+            .map(|member| {
+                let handle = &replicas[&member.id].handle;
+                let status = &statuses[&member.id];
+                ReplicaInfo {
+                    id: member.id,
+                    instance_id: member.instance_id.clone(),
+                    role: member.role,
+                    status: if status.healthy {
+                        ReplicaStatus::Up
+                    } else {
+                        ReplicaStatus::Down
+                    },
+                    replicator_address: handle.replicator_address(),
+                    current_progress: status.current_progress,
+                    catch_up_capability: handle.catch_up_capability(),
+                    must_catch_up: false,
+                }
+            })
+            .collect();
+
+        Ok(Self {
+            replicas,
+            primary_id: Some(snapshot.primary_id),
+            epoch: snapshot.epoch,
+            current_config: ReplicaSetConfig {
+                members,
+                write_quorum: snapshot.write_quorum,
+            },
+        })
+    }
+
+    /// Return the complete durable snapshot for the driver's current committed
+    /// stable topology.
+    pub fn stable_snapshot(&self) -> Result<StablePartitionSnapshot> {
+        let primary_id = self.primary_id.ok_or_else(|| {
+            RecoveryError::InvalidConfiguration("driver has no primary".to_string())
+        })?;
+        let expected_quorum = self.replicas.len() as u32 / 2 + 1;
+        if self.current_config.write_quorum != expected_quorum {
+            return Err(RecoveryError::InvalidConfiguration(format!(
+                "write quorum {} does not match majority {}",
+                self.current_config.write_quorum, expected_quorum
+            ))
+            .into());
+        }
+
+        let configured: HashMap<ReplicaId, &ReplicaInfo> = self
+            .current_config
+            .members
+            .iter()
+            .map(|member| (member.id, member))
+            .collect();
+        if configured.len() != self.current_config.members.len()
+            || configured.len() + 1 != self.replicas.len()
+        {
+            return Err(RecoveryError::InvalidConfiguration(
+                "configured secondary membership does not match driver membership".to_string(),
+            )
+            .into());
+        }
+
+        let mut members = Vec::with_capacity(self.replicas.len());
+        for (&id, state) in &self.replicas {
+            let expected_role = if id == primary_id {
+                Role::Primary
+            } else {
+                Role::ActiveSecondary
+            };
+            if state.role != expected_role {
+                return Err(RecoveryError::InvalidConfiguration(format!(
+                    "replica {id} has role {:?}, expected {expected_role:?}",
+                    state.role
+                ))
+                .into());
+            }
+            if id == primary_id {
+                if configured.contains_key(&id) {
+                    return Err(RecoveryError::InvalidConfiguration(
+                        "primary appears in secondary configuration".to_string(),
+                    )
+                    .into());
+                }
+            } else {
+                let config_member = configured.get(&id).ok_or_else(|| {
+                    RecoveryError::InvalidConfiguration(format!(
+                        "replica {id} is missing from secondary configuration"
+                    ))
+                })?;
+                if config_member.instance_id != state.handle.instance_id()
+                    || config_member.role != Role::ActiveSecondary
+                {
+                    return Err(RecoveryError::InvalidConfiguration(format!(
+                        "replica {id} configuration identity or role differs from driver"
+                    ))
+                    .into());
+                }
+            }
+            members.push(StableReplicaSnapshot {
+                id,
+                instance_id: state.handle.instance_id(),
+                role: state.role,
+            });
+        }
+        members.sort_by_key(|member| member.id);
+
+        Ok(StablePartitionSnapshot {
+            epoch: self.epoch,
+            primary_id,
+            members,
+            write_quorum: self.current_config.write_quorum,
+        })
     }
 
     /// Remove a replica from the driver's tracking without notifying
@@ -1408,6 +1660,474 @@ pub mod testing {
 mod tests {
     use super::*;
     use crate::driver::testing::{InProcessReplicaHandle, spawn_replicas};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct RecoveryTestHandle {
+        id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+        status: ReplicaStatusInfo,
+        operations: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl RecoveryTestHandle {
+        fn new(
+            id: ReplicaId,
+            instance: &str,
+            role: Role,
+            epoch: Epoch,
+            operations: Arc<Mutex<Vec<&'static str>>>,
+        ) -> Self {
+            Self {
+                id,
+                instance_id: ReplicaInstanceId::new(instance),
+                status: ReplicaStatusInfo {
+                    instance_id: ReplicaInstanceId::new(instance),
+                    role,
+                    epoch,
+                    current_progress: id,
+                    healthy: true,
+                },
+                operations,
+            }
+        }
+
+        fn record(&self, operation: &'static str) {
+            self.operations.lock().unwrap().push(operation);
+        }
+    }
+
+    #[async_trait]
+    impl ReplicaHandle for RecoveryTestHandle {
+        fn id(&self) -> ReplicaId {
+            self.id
+        }
+
+        fn instance_id(&self) -> ReplicaInstanceId {
+            self.instance_id.clone()
+        }
+
+        async fn open(&self, _: OpenMode) -> Result<()> {
+            self.record("Open");
+            Ok(())
+        }
+
+        async fn close(&self) -> Result<()> {
+            self.record("Close");
+            Ok(())
+        }
+
+        fn abort(&self) {
+            self.record("Abort");
+        }
+
+        async fn change_role(&self, _: Epoch, _: Role) -> Result<()> {
+            self.record("ChangeRole");
+            Ok(())
+        }
+
+        async fn update_epoch(&self, _: Epoch) -> Result<()> {
+            self.record("UpdateEpoch");
+            Ok(())
+        }
+
+        fn current_progress(&self) -> Lsn {
+            self.status.current_progress
+        }
+
+        fn catch_up_capability(&self) -> Lsn {
+            self.status.current_progress
+        }
+
+        async fn on_data_loss(&self) -> Result<DataLossAction> {
+            self.record("OnDataLoss");
+            Ok(DataLossAction::None)
+        }
+
+        async fn update_catch_up_configuration(
+            &self,
+            _: ReplicaSetConfig,
+            _: ReplicaSetConfig,
+        ) -> Result<()> {
+            self.record("UpdateCatchUpConfiguration");
+            Ok(())
+        }
+
+        async fn update_current_configuration(&self, _: ReplicaSetConfig) -> Result<()> {
+            self.record("UpdateCurrentConfiguration");
+            Ok(())
+        }
+
+        async fn wait_for_catch_up_quorum(&self, _: ReplicaSetQuorumMode) -> Result<()> {
+            self.record("WaitForCatchUpQuorum");
+            Ok(())
+        }
+
+        async fn build_replica(&self, _: ReplicaInfo) -> Result<()> {
+            self.record("BuildReplica");
+            Ok(())
+        }
+
+        async fn remove_replica(&self, _: ReplicaId, _: ReplicaInstanceId) -> Result<()> {
+            self.record("RemoveReplica");
+            Ok(())
+        }
+
+        async fn revoke_write_status(&self) -> Result<()> {
+            self.record("RevokeWriteStatus");
+            Ok(())
+        }
+
+        fn replicator_address(&self) -> String {
+            format!("http://replica-{}", self.id)
+        }
+
+        async fn get_status(&self) -> Result<ReplicaStatusInfo> {
+            self.record("GetStatus");
+            Ok(self.status.clone())
+        }
+    }
+
+    fn recovery_snapshot() -> StablePartitionSnapshot {
+        StablePartitionSnapshot {
+            epoch: Epoch::new(4, 9),
+            primary_id: 1,
+            members: vec![
+                StableReplicaSnapshot {
+                    id: 1,
+                    instance_id: ReplicaInstanceId::new("one"),
+                    role: Role::Primary,
+                },
+                StableReplicaSnapshot {
+                    id: 2,
+                    instance_id: ReplicaInstanceId::new("two"),
+                    role: Role::ActiveSecondary,
+                },
+                StableReplicaSnapshot {
+                    id: 3,
+                    instance_id: ReplicaInstanceId::new("three"),
+                    role: Role::ActiveSecondary,
+                },
+            ],
+            write_quorum: 2,
+        }
+    }
+
+    fn recovery_handles(
+        snapshot: &StablePartitionSnapshot,
+        operations: Arc<Mutex<Vec<&'static str>>>,
+    ) -> Vec<Box<dyn ReplicaHandle>> {
+        snapshot
+            .members
+            .iter()
+            .map(|member| {
+                Box::new(RecoveryTestHandle::new(
+                    member.id,
+                    member.instance_id.as_str(),
+                    member.role,
+                    snapshot.epoch,
+                    operations.clone(),
+                )) as Box<dyn ReplicaHandle>
+            })
+            .collect()
+    }
+
+    fn assert_recovery_error(result: Result<PartitionDriver>, expected: RecoveryError) {
+        match result {
+            Err(KubericError::Recovery(actual)) => assert_eq!(actual, expected),
+            Err(other) => panic!("unexpected recovery error: {other}"),
+            Ok(_) => panic!("recovery unexpectedly succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_is_status_only_and_reconstructs_stable_state() {
+        let snapshot = recovery_snapshot();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let handles = recovery_handles(&snapshot, operations.clone());
+
+        let mut driver = PartitionDriver::recover(snapshot.clone(), handles)
+            .await
+            .unwrap();
+
+        assert_eq!(*operations.lock().unwrap(), vec!["GetStatus"; 3]);
+        assert_eq!(driver.primary_id(), Some(1));
+        assert_eq!(driver.epoch(), snapshot.epoch);
+        assert_eq!(driver.stable_snapshot().unwrap(), snapshot);
+
+        // Recovered state is operational input to subsequent stable workflows.
+        driver.switchover(2).await.unwrap();
+        assert_eq!(driver.primary_id(), Some(2));
+        assert_eq!(driver.epoch(), Epoch::new(4, 10));
+    }
+
+    #[tokio::test]
+    async fn recovery_accepts_unhealthy_runtime_status() {
+        let snapshot = recovery_snapshot();
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = recovery_handles(&snapshot, operations.clone());
+        let mut unhealthy = RecoveryTestHandle::new(
+            3,
+            "three",
+            Role::ActiveSecondary,
+            snapshot.epoch,
+            operations,
+        );
+        unhealthy.status.healthy = false;
+        handles[2] = Box::new(unhealthy);
+
+        let driver = PartitionDriver::recover(snapshot.clone(), handles)
+            .await
+            .unwrap();
+        assert_eq!(driver.stable_snapshot().unwrap(), snapshot);
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_snapshot_identity_and_configuration_errors_without_mutation() {
+        let cases: Vec<(StablePartitionSnapshot, RecoveryError)> = vec![
+            (
+                StablePartitionSnapshot {
+                    members: vec![],
+                    ..recovery_snapshot()
+                },
+                RecoveryError::EmptySnapshot,
+            ),
+            (
+                {
+                    let mut snapshot = recovery_snapshot();
+                    snapshot.members[1].id = 1;
+                    snapshot
+                },
+                RecoveryError::DuplicateReplicaId(1),
+            ),
+            (
+                {
+                    let mut snapshot = recovery_snapshot();
+                    snapshot.members[1].instance_id = ReplicaInstanceId::new("one");
+                    snapshot
+                },
+                RecoveryError::DuplicateInstanceId(ReplicaInstanceId::new("one")),
+            ),
+            (
+                {
+                    let mut snapshot = recovery_snapshot();
+                    snapshot.primary_id = 99;
+                    snapshot
+                },
+                RecoveryError::PrimaryMissing(99),
+            ),
+            (
+                {
+                    let mut snapshot = recovery_snapshot();
+                    snapshot.members[0].role = Role::ActiveSecondary;
+                    snapshot
+                },
+                RecoveryError::InvalidPrimaryCount(0),
+            ),
+            (
+                {
+                    let mut snapshot = recovery_snapshot();
+                    snapshot.members[0].role = Role::ActiveSecondary;
+                    snapshot.members[1].role = Role::Primary;
+                    snapshot
+                },
+                RecoveryError::ConflictingPrimary {
+                    expected: 1,
+                    actual: 2,
+                },
+            ),
+            (
+                {
+                    let mut snapshot = recovery_snapshot();
+                    snapshot.members[2].role = Role::IdleSecondary;
+                    snapshot
+                },
+                RecoveryError::UnsupportedStableRole {
+                    id: 3,
+                    role: Role::IdleSecondary,
+                },
+            ),
+            (
+                {
+                    let mut snapshot = recovery_snapshot();
+                    snapshot.write_quorum = 3;
+                    snapshot
+                },
+                RecoveryError::InvalidWriteQuorum {
+                    actual: 3,
+                    expected: 2,
+                    members: 3,
+                },
+            ),
+        ];
+
+        for (snapshot, expected) in cases {
+            let operations = Arc::new(Mutex::new(Vec::new()));
+            let handles = recovery_handles(&recovery_snapshot(), operations.clone());
+            assert_recovery_error(PartitionDriver::recover(snapshot, handles).await, expected);
+            assert!(
+                operations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|operation| *operation == "GetStatus"),
+                "rejected recovery invoked a mutating operation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_live_bijection_errors_without_mutation() {
+        let snapshot = recovery_snapshot();
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut missing = recovery_handles(&snapshot, operations.clone());
+        missing.pop();
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot.clone(), missing).await,
+            RecoveryError::MissingHandle(3),
+        );
+        assert!(operations.lock().unwrap().is_empty());
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut extra = recovery_handles(&snapshot, operations.clone());
+        extra.push(Box::new(RecoveryTestHandle::new(
+            4,
+            "four",
+            Role::ActiveSecondary,
+            snapshot.epoch,
+            operations.clone(),
+        )));
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot.clone(), extra).await,
+            RecoveryError::ExtraHandle(4),
+        );
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut duplicate_id = recovery_handles(&snapshot, operations.clone());
+        duplicate_id.push(Box::new(RecoveryTestHandle::new(
+            1,
+            "other",
+            Role::Primary,
+            snapshot.epoch,
+            operations.clone(),
+        )));
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot.clone(), duplicate_id).await,
+            RecoveryError::DuplicateHandleId(1),
+        );
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut duplicate_instance = recovery_handles(&snapshot, operations.clone());
+        duplicate_instance[1] = Box::new(RecoveryTestHandle::new(
+            2,
+            "one",
+            Role::ActiveSecondary,
+            snapshot.epoch,
+            operations.clone(),
+        ));
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot.clone(), duplicate_instance).await,
+            RecoveryError::DuplicateHandleInstanceId(ReplicaInstanceId::new("one")),
+        );
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut mismatch = recovery_handles(&snapshot, operations.clone());
+        mismatch[1] = Box::new(RecoveryTestHandle::new(
+            2,
+            "replacement",
+            Role::ActiveSecondary,
+            snapshot.epoch,
+            operations.clone(),
+        ));
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot, mismatch).await,
+            RecoveryError::HandleInstanceMismatch {
+                id: 2,
+                expected: ReplicaInstanceId::new("two"),
+                actual: ReplicaInstanceId::new("replacement"),
+            },
+        );
+        assert!(
+            operations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|operation| *operation == "GetStatus")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_runtime_attestation_errors_without_mutation() {
+        let snapshot = recovery_snapshot();
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = recovery_handles(&snapshot, operations.clone());
+        let mut stale = RecoveryTestHandle::new(
+            2,
+            "two",
+            Role::ActiveSecondary,
+            snapshot.epoch,
+            operations.clone(),
+        );
+        stale.status.instance_id = ReplicaInstanceId::new("stale");
+        handles[1] = Box::new(stale);
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot.clone(), handles).await,
+            RecoveryError::RuntimeInstanceMismatch {
+                id: 2,
+                expected: ReplicaInstanceId::new("two"),
+                actual: ReplicaInstanceId::new("stale"),
+            },
+        );
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = recovery_handles(&snapshot, operations.clone());
+        let mut wrong_epoch = RecoveryTestHandle::new(
+            2,
+            "two",
+            Role::ActiveSecondary,
+            snapshot.epoch,
+            operations.clone(),
+        );
+        wrong_epoch.status.epoch = Epoch::new(4, 8);
+        handles[1] = Box::new(wrong_epoch);
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot.clone(), handles).await,
+            RecoveryError::EpochMismatch {
+                id: 2,
+                expected: snapshot.epoch,
+                actual: Epoch::new(4, 8),
+            },
+        );
+
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = recovery_handles(&snapshot, operations.clone());
+        let wrong_role =
+            RecoveryTestHandle::new(2, "two", Role::Primary, snapshot.epoch, operations.clone());
+        handles[1] = Box::new(wrong_role);
+        assert_recovery_error(
+            PartitionDriver::recover(snapshot, handles).await,
+            RecoveryError::RuntimeRoleMismatch {
+                id: 2,
+                expected: Role::ActiveSecondary,
+                actual: Role::Primary,
+            },
+        );
+
+        let observed = operations.lock().unwrap();
+        assert!(observed.iter().all(|operation| *operation == "GetStatus"));
+    }
+
+    #[test]
+    fn stable_snapshot_rejects_incomplete_driver_configuration() {
+        assert_recovery_error(
+            PartitionDriver::new()
+                .stable_snapshot()
+                .map(|_| PartitionDriver::new()),
+            RecoveryError::InvalidConfiguration("driver has no primary".to_string()),
+        );
+    }
 
     /// E1: add_replica used to insert into self.replicas BEFORE fallible ops.
     /// If open() failed, the zombie replica stayed in the map.

@@ -1,4 +1,7 @@
 use kube::CustomResource;
+use kuberic_core::types::{
+    Epoch, ReplicaInstanceId, Role, StablePartitionSnapshot, StableReplicaSnapshot,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -92,6 +95,11 @@ pub struct KubericSetStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<MemberStatus>,
 
+    /// Last durably committed stable topology. This is the only authoritative
+    /// recovery input after operator process state is lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_snapshot: Option<StablePartitionSnapshotStatus>,
+
     /// When the primary started failing (for failover delay).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_failing_since: Option<String>,
@@ -124,6 +132,190 @@ pub struct MemberStatus {
     pub control_address: String,
     /// gRPC data address.
     pub data_address: String,
+}
+
+/// Schema-safe persisted form of the core stable partition snapshot.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StablePartitionSnapshotStatus {
+    pub epoch: EpochStatus,
+    pub primary_id: i64,
+    pub members: Vec<StableReplicaSnapshotStatus>,
+    pub write_quorum: u32,
+}
+
+/// Schema-safe persisted identity and stable role of one replica.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StableReplicaSnapshotStatus {
+    pub id: i64,
+    pub instance_id: String,
+    pub role: StableReplicaRoleStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum StableReplicaRoleStatus {
+    Primary,
+    ActiveSecondary,
+}
+
+impl TryFrom<&StablePartitionSnapshotStatus> for StablePartitionSnapshot {
+    type Error = String;
+
+    fn try_from(value: &StablePartitionSnapshotStatus) -> Result<Self, Self::Error> {
+        let members = value
+            .members
+            .iter()
+            .map(StableReplicaSnapshot::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            epoch: Epoch::new(
+                value.epoch.data_loss_number,
+                value.epoch.configuration_number,
+            ),
+            primary_id: value.primary_id,
+            members,
+            write_quorum: value.write_quorum,
+        })
+    }
+}
+
+impl TryFrom<&StableReplicaSnapshotStatus> for StableReplicaSnapshot {
+    type Error = String;
+
+    fn try_from(value: &StableReplicaSnapshotStatus) -> Result<Self, Self::Error> {
+        if value.instance_id.is_empty() {
+            return Err(format!(
+                "stable snapshot replica {} has an empty incarnation",
+                value.id
+            ));
+        }
+        Ok(Self {
+            id: value.id,
+            instance_id: ReplicaInstanceId::new(value.instance_id.clone()),
+            role: match value.role {
+                StableReplicaRoleStatus::Primary => Role::Primary,
+                StableReplicaRoleStatus::ActiveSecondary => Role::ActiveSecondary,
+            },
+        })
+    }
+}
+
+impl TryFrom<&StablePartitionSnapshot> for StablePartitionSnapshotStatus {
+    type Error = String;
+
+    fn try_from(value: &StablePartitionSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            epoch: EpochStatus {
+                data_loss_number: value.epoch.data_loss_number,
+                configuration_number: value.epoch.configuration_number,
+            },
+            primary_id: value.primary_id,
+            members: value
+                .members
+                .iter()
+                .map(StableReplicaSnapshotStatus::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            write_quorum: value.write_quorum,
+        })
+    }
+}
+
+impl TryFrom<&StableReplicaSnapshot> for StableReplicaSnapshotStatus {
+    type Error = String;
+
+    fn try_from(value: &StableReplicaSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value.id,
+            instance_id: value.instance_id.to_string(),
+            role: match value.role {
+                Role::Primary => StableReplicaRoleStatus::Primary,
+                Role::ActiveSecondary => StableReplicaRoleStatus::ActiveSecondary,
+                role => {
+                    return Err(format!(
+                        "replica {} has unsupported stable role {role:?}",
+                        value.id
+                    ));
+                }
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_snapshot_round_trips_without_changing_incarnations() {
+        let core = StablePartitionSnapshot {
+            epoch: Epoch::new(2, 7),
+            primary_id: 4,
+            members: vec![
+                StableReplicaSnapshot {
+                    id: 4,
+                    instance_id: ReplicaInstanceId::new("pod-uid/exact"),
+                    role: Role::Primary,
+                },
+                StableReplicaSnapshot {
+                    id: 8,
+                    instance_id: ReplicaInstanceId::new("another uid"),
+                    role: Role::ActiveSecondary,
+                },
+            ],
+            write_quorum: 2,
+        };
+
+        let persisted = StablePartitionSnapshotStatus::try_from(&core).unwrap();
+        let recovered = StablePartitionSnapshot::try_from(&persisted).unwrap();
+        assert_eq!(recovered, core);
+
+        let json = serde_json::to_value(&persisted).unwrap();
+        assert_eq!(json["primaryId"], 4);
+        assert_eq!(json["members"][0]["instanceId"], "pod-uid/exact");
+        assert_eq!(json["members"][0]["role"], "primary");
+        assert_eq!(json["members"][1]["role"], "activeSecondary");
+    }
+
+    #[test]
+    fn status_without_stable_snapshot_remains_backward_compatible() {
+        let status: KubericSetStatus =
+            serde_json::from_value(serde_json::json!({"phase": "Healthy"})).unwrap();
+        assert!(status.stable_snapshot.is_none());
+        assert!(
+            serde_json::to_value(status)
+                .unwrap()
+                .get("stableSnapshot")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_snapshot_rejects_empty_incarnation() {
+        let persisted = StableReplicaSnapshotStatus {
+            id: 1,
+            instance_id: String::new(),
+            role: StableReplicaRoleStatus::Primary,
+        };
+        assert_eq!(
+            StableReplicaSnapshot::try_from(&persisted).unwrap_err(),
+            "stable snapshot replica 1 has an empty incarnation"
+        );
+    }
+
+    #[test]
+    fn core_snapshot_rejects_unsupported_stable_role() {
+        let core = StableReplicaSnapshot {
+            id: 1,
+            instance_id: ReplicaInstanceId::new("one"),
+            role: Role::IdleSecondary,
+        };
+        assert_eq!(
+            StableReplicaSnapshotStatus::try_from(&core).unwrap_err(),
+            "replica 1 has unsupported stable role IdleSecondary"
+        );
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]

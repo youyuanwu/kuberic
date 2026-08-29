@@ -13,4 +13,4 @@ pub mod proto {
     tonic::include_proto!("kuberic.replication.v1");
 }
 
-pub use error::{KubericError, Result};
+pub use error::{KubericError, RecoveryError, Result};

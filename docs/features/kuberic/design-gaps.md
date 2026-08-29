@@ -156,19 +156,16 @@ surviving secondary can still provide write quorum.
 
 **Operator crash recovery (related):**
 
-If the operator crashes mid-switchover, no rollback happens. The
-`PartitionDriver` is in-memory only. On restart, the reconciler must
-reconstruct state from pod `GetStatus` queries:
-- Pod with `role=Primary` + highest epoch → that's the primary
-- No pod with `role=Primary` → treat as primary failure → failover
-- Pods with stale epochs → need rebuild
+Stable `Healthy` operator restart recovery is implemented from the
+authoritative `stableSnapshot`, current pod logical/incarnation identities,
+and runtime `GetStatus`. It does not trust live state to invent a topology and
+does not issue mutating RPCs during reconstruction.
 
-This "no primary → failover" pattern naturally handles mid-switchover
-crashes: the old primary was demoted, no new primary promoted, so the
-reconciler triggers failover and promotes the best available replica.
-
-The `PartitionDriver::recover()` method (D item, not yet implemented)
-would formalize this query-and-reconstruct pattern.
+Mid-switchover remains outside that stable-only contract. If runtime mutation
+has advanced beyond the last durably persisted stable snapshot, recovery
+rejects the epoch/role/topology mismatch. Resuming or rolling back such a
+transition requires a durable reconfiguration journal; it is not treated as a
+normal failover inferred from whichever live role happens to be visible.
 
 ---
 
@@ -718,7 +715,7 @@ decommissioned.
 
 ---
 
-## Category D: Already Designed — Implementation Only
+## Category D: Designed Capabilities and Remaining Implementation
 
 These items have complete designs in the existing docs. No additional
 design work needed — just implementation.
@@ -726,7 +723,7 @@ design work needed — just implementation.
 | Item | Design Location | Priority |
 |------|----------------|----------|
 | Data loss protocol (`on_data_loss()` + `data_loss_number`) | operator-failure-scenarios.md §1, §7 | P0 |
-| Operator restart recovery (`PartitionDriver::recover()`) | operator-failure-scenarios.md §8, A3 notes above | P0 |
+| Stable operator restart recovery (`PartitionDriver::recover()`) | operator-failure-scenarios.md §8, A3 notes above | ✅ Implemented |
 | Secondary health detection + replacement | operator-failure-scenarios.md §2 | P0 |
 | Missing pod detection | operator-failure-scenarios.md §3 | P0 |
 | gRPC failure tracking (per-replica counter) | operator-failure-scenarios.md §5 | P1 |
@@ -749,7 +746,7 @@ design work needed — just implementation.
 | A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ✅** |
 | B: Operational Resilience (needs design) | 6 | B0 bounded writes fixed (health reporting remains), **B5 ✅**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 5 | **C0 ✅ fixed**, C1 stale ACKs, **C4 ChangeRole(None) cleanup** |
-| D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
+| D: Designed capabilities | 14 | Stable operator restart recovery ✅; data loss remains |
 | **Total** | **31** | |
 
 **Recommended order:**
@@ -757,7 +754,7 @@ design work needed — just implementation.
 2. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
 3. B2 (short RPC timeouts) — prevents hangs on control-plane calls
 4. A3 failover candidate retry — failover resilience
-5. D items P0 (data loss, operator restart, secondary health)
+5. Remaining D items P0 (data loss, secondary health)
 6. B3 + B4 (reconnection, operation locking) — operational maturity
 7. B1 streaming improvement — large dataset support
 8. C1-C3 (refinements) — can be done alongside other work
