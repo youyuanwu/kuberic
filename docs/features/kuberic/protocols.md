@@ -491,6 +491,8 @@ struct QuorumTracker {
     replica_acked_lsn: HashMap<ReplicaId, Lsn>,  // per-replica highest ACKed LSN
     catch_up_baseline_lsn: Lsn,           // highest_lsn at set_catch_up time
     catch_up_waiters: Vec<CatchUpWaiter>,  // blocked wait_for_catch_up callers
+    quorum_timeout: Duration,              // per-operation/waiter deadline
+    catch_up_failed: bool,                 // active catch-up attempt saw expiry
 }
 ```
 
@@ -519,13 +521,29 @@ Primary calls replicate(data):
   │    │    NO  → keep waiting
   │    └─ After commit: try_commit_pending() checks if other ops can now commit
   │
-  └─ User's replicate() call resolves with Ok(lsn) or Err
+  ├─ Actor-owned scheduler expires the operation if its deadline arrives
+  │    ├─ Removes it from pending
+  │    ├─ Replies with Err(NoWriteQuorum)
+  │    └─ Marks the active catch-up attempt failed
+  │
+  └─ User's replicate() call resolves with Ok(lsn) or Err(NoWriteQuorum)
 ```
+
+The default quorum deadline is 5 seconds and can be overridden through
+`WalReplicatorOptions`. ACK and expiration processing share the tracker
+mutex. An ACK processed at or after its deadline cannot reverse a timeout.
+`NoWriteQuorum` means quorum was not observed by the deadline; fewer than
+quorum replicas may already have persisted the operation.
 
 ### Catch-Up Completion Check
 
 `wait_for_catch_up()` registers a waiter. On every commit and every ACK,
 `notify_catch_up_waiters()` re-checks all waiters via `is_caught_up()`:
+
+Catch-up waiters also carry deadlines. They return `NoWriteQuorum` when their
+deadline expires or when an operation expires during the active catch-up
+attempt. A later `set_catch_up_configuration()` starts a new attempt and
+establishes a new baseline.
 
 ```rust
 fn is_caught_up(mode) -> bool {

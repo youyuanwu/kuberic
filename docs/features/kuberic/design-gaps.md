@@ -300,7 +300,7 @@ hang, leak resources, or fail to recover.
 
 ### B0. Replication Stream Failure Goes Undetected
 
-**Severity:** 🟡 Medium (reduced — `send_to_all` cleanup already implemented)
+**Severity:** 🟡 Medium (reduced — write timeout and dead-send cleanup fixed)
 **Affects:** `PrimarySender`, `WalReplicatorActor`, operator reconciler
 **Files:** `primary.rs`, `actor.rs`, `reconciler.rs`
 
@@ -312,6 +312,12 @@ stream. When it breaks, detection is partial:
   `item_tx.send().is_err()`, logs a warning, and **removes the dead
   connection** from `PrimarySender::connections`. This was implemented
   during the non-blocking send work.
+- `QuorumTracker` gives every operation a deadline (5 seconds by default).
+  An operation that has not reached quorum expires with `NoWriteQuorum`;
+  late ACKs are harmless and later operations have independent deadlines.
+- Catch-up quorum waiters use the same bounded behavior. An expired operation
+  fails the active catch-up attempt; a later explicit configuration update can
+  establish a new retry baseline.
 
 **No auto-reconnection (intentional, matching SF):**
 When a connection is removed, the secondary silently drops out of
@@ -339,21 +345,11 @@ but its replication stream dead (e.g., network partition between pods).
    call (send fails → cleanup). So the gap is timing: between the ACK
    reader dying and the next write, the connection appears alive.
 
-2. **QuorumTracker has no per-operation timeout** — if ALL secondaries
-   die, `replicate()` hangs forever. With 3 replicas (quorum=2), losing
-   one secondary is fine (quorum still met). Losing both means writes
-   hang. In practice, the reconciler detects pod failures (NotReady) and
-   triggers failover before both streams die simultaneously.
-
-3. **Operator can't detect replication health** — pods can be Ready but
+2. **Operator can't detect replication health** — pods can be Ready but
    replication broken. `GetStatus` doesn't report replication stream
    status. The reconciler only checks pod readiness.
 
 **Remaining design (for production hardening):**
-
-- **Per-operation timeout in QuorumTracker:** `register()` should accept
-  a timeout. If quorum ACK doesn't arrive, fail with `NoWriteQuorum`
-  instead of hanging. This is the most important remaining fix.
 
 - **Replication health in GetStatus:** Add `connected_secondaries` count
   or per-replica replication status to the GetStatus response. The
@@ -749,13 +745,13 @@ design work needed — just implementation.
 | Category | Count | Top Priority |
 |----------|-------|-------------|
 | A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ✅** |
-| B: Operational Resilience (needs design) | 6 | B0 partially fixed (QuorumTracker timeout remaining), **B5 ✅**, B2 timeouts |
+| B: Operational Resilience (needs design) | 6 | B0 bounded writes fixed (health reporting remains), **B5 ✅**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 5 | **C0 ✅ fixed**, C1 stale ACKs, **C4 ChangeRole(None) cleanup** |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
 | **Total** | **31** | |
 
 **Recommended order:**
-1. B0 QuorumTracker timeout — prevents write hangs on dual stream failure
+1. **B0 QuorumTracker timeout ✅** — bounded writes and catch-up waits implemented; replication health reporting remains
 2. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
 3. B2 (short RPC timeouts) — prevents hangs on control-plane calls
 4. A3 failover candidate retry — failover resilience

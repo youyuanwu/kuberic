@@ -27,11 +27,17 @@ let (handle, handles) = WalReplicator::create(id, &data_bind, fault_tx, sp_tx).a
 op.acknowledge();
 ```
 
+Replication operations and catch-up quorum waits use a 5-second deadline by
+default and return `KubericError::NoWriteQuorum` when it expires. Services that
+need a different bound can use `WalReplicator::create_with_options` with
+`WalReplicatorOptions::new().quorum_timeout(duration)`.
+
 See [examples/kvstore](../examples/kvstore/) and [examples/sqlite](../examples/sqlite/) for complete implementations.
 
 ## Replication Model
 
 - **Primary** serializes operations, calls `replicator.replicate()`, blocks until write quorum ACKs
+- **Bounded quorum** fails a write or catch-up wait with `NoWriteQuorum` when its deadline expires
 - **Secondary** receives operations via gRPC data plane, persists, then acknowledges
 - **Copy protocol** builds new replicas from full snapshot + incremental replay
 - **Epoch fencing** rejects stale operations from old primaries after failover

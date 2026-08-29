@@ -113,6 +113,21 @@ let (handle, svc_ctx) = WalReplicator::create(
 // User keeps sp_rx, handles events in their event loop
 ```
 
+`WalReplicator::create()` applies a 5-second deadline independently to each
+replication operation and catch-up quorum wait. If quorum is not observed by
+then, the operation returns `KubericError::NoWriteQuorum`. To configure the
+bound, use:
+
+```rust
+let options = WalReplicatorOptions::new().quorum_timeout(Duration::from_secs(10));
+let (handle, svc_ctx) = WalReplicator::create_with_options(
+    ctx.replica_id, &ctx.data_bind, ctx.fault_tx.clone(), sp_tx, options,
+).await?;
+```
+
+The runtime control reply timeout is separate and should exceed the quorum
+deadline when remote catch-up callers need to observe `NoWriteQuorum`.
+
 ```rust
 pub enum StateProviderEvent {
     UpdateEpoch { epoch, previous_epoch_last_lsn, reply },
