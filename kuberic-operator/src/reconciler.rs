@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
@@ -13,24 +13,28 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
-use kuberic_core::types::ReplicaId;
+use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, Role, StablePartitionSnapshot};
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
     EpochStatus, KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus, Phase,
-    ReconfigurationPhase,
+    ReconfigurationPhase, StablePartitionSnapshotStatus,
 };
 
 /// Shared state across reconciliation loops.
 pub struct ReconcilerState {
     /// Per-set partition drivers, keyed by "{namespace}/{name}".
     pub drivers: Mutex<HashMap<String, PartitionDriver>>,
+    /// Stable statuses whose first persistence attempt failed after the
+    /// corresponding runtime topology had already committed.
+    pending_statuses: Mutex<HashMap<String, KubericSetStatus>>,
 }
 
 impl Default for ReconcilerState {
     fn default() -> Self {
         Self {
             drivers: Mutex::new(HashMap::new()),
+            pending_statuses: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -49,8 +53,19 @@ pub async fn reconcile_set(
 ) -> Result<ReconcileAction, String> {
     let name = set.name_any();
     let namespace = set.namespace().unwrap_or_default();
+    let set_key = format!("{}/{}", namespace, name);
 
     info!(name, namespace, "reconciling KubericSet");
+
+    // A topology operation is not complete until its stable snapshot is
+    // durable. Retry a failed post-commit status write before observing pods
+    // or selecting any further health/topology action.
+    let pending_status = { state.pending_statuses.lock().await.get(&set_key).cloned() };
+    if let Some(pending) = pending_status {
+        api.patch_set_status(&namespace, &name, &pending).await?;
+        state.pending_statuses.lock().await.remove(&set_key);
+        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+    }
 
     let label_selector = format!("kuberic.io/set={}", name);
     let pods = api.list_pods(&namespace, &label_selector).await?;
@@ -72,11 +87,17 @@ pub async fn reconcile_set(
                 phase: Phase::Creating,
                 ..Default::default()
             };
-            api.patch_set_status(&namespace, &name, &status).await?;
+            persist_committed_status(api, state, &set_key, &namespace, &name, &status).await?;
             Ok(ReconcileAction::Requeue(Duration::from_secs(5)))
         }
 
         Phase::Creating => {
+            if state.drivers.lock().await.contains_key(&set_key) {
+                // The runtime completed creation and its status was already
+                // persisted (or is about to become visible). Never replay
+                // creation against open replicas.
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
             let desired = set.spec.replicas as usize;
             if ready_pods.len() < desired {
                 info!(name, ready = ready_pods.len(), desired, "waiting for pods");
@@ -86,15 +107,39 @@ pub async fn reconcile_set(
             info!(name, "all pods ready, initializing partition via driver");
 
             // Create ReplicaHandles
+            let current_pods = checked_pods_by_id(&pods)?;
             let mut handles: Vec<Box<dyn ReplicaHandle>> = Vec::new();
-            for (idx, pod) in pods.iter().enumerate() {
-                let replica_id = idx as ReplicaId + 1;
+            for (replica_id, _, pod) in current_pods {
                 match api.create_replica_handle(replica_id, pod, &set.spec).await {
                     Ok(handle) => handles.push(handle),
                     Err(e) => {
                         warn!(pod = pod.name_any(), error = %e, "failed to create handle");
                         return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
                     }
+                }
+            }
+
+            // Creating-phase recovery is intentionally unsupported. Probe
+            // before any mutation so a process crash after runtime creation
+            // but before status persistence cannot replay Open/New.
+            for handle in &handles {
+                let status = handle.get_status().await.map_err(|error| {
+                    format!(
+                        "cannot verify pristine runtime for replica {} before creation: {error}",
+                        handle.id()
+                    )
+                })?;
+                if status.instance_id != handle.instance_id()
+                    || status.role != Role::Unknown
+                    || status.epoch != Epoch::default()
+                {
+                    return Err(format!(
+                        "refusing to replay creation for replica {}: runtime already has incarnation {}, role {:?}, epoch {:?}",
+                        handle.id(),
+                        status.instance_id,
+                        status.role,
+                        status.epoch
+                    ));
                 }
             }
 
@@ -137,22 +182,75 @@ pub async fn reconcile_set(
                 ready_replicas: ready_pods.len() as i32,
                 replicas: pods.len() as i32,
                 members,
+                stable_snapshot: Some(snapshot_status(&driver)?),
                 primary_failing_since: None,
             };
-            api.patch_set_status(&namespace, &name, &status).await?;
+            if let Err(error) =
+                persist_committed_status(api, state, &set_key, &namespace, &name, &status).await
+            {
+                // Retain the completed driver so a retry cannot reopen the
+                // already-created runtimes. A process crash still loses this
+                // state and correctly fails closed against the older status.
+                state.drivers.lock().await.insert(set_key, driver);
+                return Err(error);
+            }
 
-            // Store driver
-            let set_key = format!("{}/{}", namespace, name);
+            // Preserve the existing status-before-driver insertion ordering
+            // on the successful path.
             state.drivers.lock().await.insert(set_key, driver);
 
             Ok(ReconcileAction::Requeue(Duration::from_secs(30)))
         }
 
         Phase::Healthy => {
-            let current_primary = set.status.as_ref().and_then(|s| s.current_primary.clone());
             let desired = set.spec.replicas as usize;
             let actual = pods.len();
-            let set_key = format!("{}/{}", namespace, name);
+            let current_pods = checked_pods_by_id(&pods)?;
+
+            // Rebuild process-local driver state before making any Healthy
+            // health or topology decision. Legacy observational fields are
+            // never used as recovery input.
+            {
+                let mut drivers = state.drivers.lock().await;
+                if !drivers.contains_key(&set_key) {
+                    let persisted = set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.stable_snapshot.as_ref())
+                        .ok_or_else(|| {
+                            format!("cannot recover {namespace}/{name}: stable snapshot is absent")
+                        })?;
+                    let snapshot = StablePartitionSnapshot::try_from(persisted)
+                        .map_err(|error| format!("invalid stable snapshot: {error}"))?;
+                    let mut handles: Vec<Box<dyn ReplicaHandle>> = Vec::new();
+                    for (replica_id, _, pod) in &current_pods {
+                        handles.push(
+                            api.create_replica_handle(*replica_id, pod, &set.spec)
+                                .await
+                                .map_err(|error| {
+                                    format!(
+                                        "cannot construct recovery handle for replica {replica_id}: {error}"
+                                    )
+                                })?,
+                        );
+                    }
+                    let driver = PartitionDriver::recover(snapshot, handles)
+                        .await
+                        .map_err(|error| format!("stable driver recovery failed: {error}"))?;
+                    drivers.insert(set_key.clone(), driver);
+                }
+
+                let driver = drivers.get(&set_key).unwrap();
+                validate_pod_handle_identities(driver, &current_pods, desired)?;
+            }
+
+            let current_primary = {
+                let drivers = state.drivers.lock().await;
+                drivers
+                    .get(&set_key)
+                    .and_then(PartitionDriver::primary_id)
+                    .and_then(|primary_id| pod_name_for_id(&current_pods, primary_id))
+            };
 
             // --- Replica health check (primary + secondaries) ---
             // Probe all replicas via get_status to detect crashed/restarted pods.
@@ -236,7 +334,8 @@ pub async fn reconcile_set(
                         phase: Phase::FailingOver,
                         ..set.status.clone().unwrap_or_default()
                     };
-                    api.patch_set_status(&namespace, &name, &status).await?;
+                    persist_committed_status(api, state, &set_key, &namespace, &name, &status)
+                        .await?;
                     return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                 }
 
@@ -267,25 +366,6 @@ pub async fn reconcile_set(
                     api.patch_set_status(&namespace, &name, &status).await?;
                     return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                 }
-            } else {
-                // No driver — check primary readiness via K8s only (bootstrap path)
-                if let Some(ref primary_name) = current_primary {
-                    let primary_healthy = pods
-                        .iter()
-                        .find(|p| p.name_any() == *primary_name)
-                        .map(is_pod_ready)
-                        .unwrap_or(false);
-
-                    if !primary_healthy {
-                        warn!(name, primary = %primary_name, "primary unhealthy (no driver), initiating failover");
-                        let status = KubericSetStatus {
-                            phase: Phase::FailingOver,
-                            ..set.status.clone().unwrap_or_default()
-                        };
-                        api.patch_set_status(&namespace, &name, &status).await?;
-                        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-                    }
-                }
             }
 
             // --- Switchover check (only when all replicas are healthy) ---
@@ -293,6 +373,22 @@ pub async fn reconcile_set(
             if let (Some(current), Some(target)) = (&current_primary, &target_primary)
                 && current != target
             {
+                let target_id = current_pods
+                    .iter()
+                    .find(|(_, _, pod)| pod.name_any() == *target)
+                    .map(|(id, _, _)| *id)
+                    .ok_or_else(|| format!("switchover target pod {target} is not current"))?;
+                let drivers = state.drivers.lock().await;
+                if drivers
+                    .get(&set_key)
+                    .and_then(|driver| driver.handle(target_id))
+                    .is_none()
+                {
+                    return Err(format!(
+                        "switchover target replica {target_id} is not in the committed driver topology"
+                    ));
+                }
+                drop(drivers);
                 info!(name, current = %current, target = %target, "switchover requested");
                 let status = KubericSetStatus {
                     phase: Phase::Switchover,
@@ -319,14 +415,13 @@ pub async fn reconcile_set(
                     // Find pods that are ready but not in the driver
                     for pod in &ready_pods {
                         let pod_name = pod.name_any();
-                        let replica_id: ReplicaId = pod
-                            .metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|l| l.get("kuberic.io/pod-index"))
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(0)
-                            + 1; // labels are 0-indexed, IDs are 1-indexed
+                        let replica_id = current_pods
+                            .iter()
+                            .find(|(_, _, current)| current.name_any() == pod_name)
+                            .map(|(id, _, _)| *id)
+                            .ok_or_else(|| {
+                                format!("ready pod {pod_name} has no validated logical identity")
+                            })?;
 
                         if driver.handle(replica_id).is_none() {
                             info!(name, pod = %pod_name, replica_id, "scale-up: adding replica to partition");
@@ -347,6 +442,21 @@ pub async fn reconcile_set(
                                     );
                                     let _ =
                                         api.patch_pod_labels(&namespace, &pod_name, labels).await;
+
+                                    // Each successful add is a committed stable
+                                    // topology and must be durable before the
+                                    // next loop iteration mutates another.
+                                    let status = KubericSetStatus {
+                                        ready_replicas: driver.replica_ids().len() as i32,
+                                        replicas: pods.len() as i32,
+                                        members: build_member_status(&pods, &set.spec),
+                                        stable_snapshot: Some(snapshot_status(driver)?),
+                                        ..set.status.clone().unwrap_or_default()
+                                    };
+                                    persist_committed_status(
+                                        api, state, &set_key, &namespace, &name, &status,
+                                    )
+                                    .await?;
                                 }
                                 Err(e) => {
                                     warn!(pod = %pod_name, error = %e, "failed to create handle");
@@ -355,15 +465,6 @@ pub async fn reconcile_set(
                             }
                         }
                     }
-
-                    // Update status
-                    let status = KubericSetStatus {
-                        ready_replicas: driver.replica_ids().len() as i32,
-                        replicas: pods.len() as i32,
-                        members: build_member_status(&pods, &set.spec),
-                        ..set.status.clone().unwrap_or_default()
-                    };
-                    api.patch_set_status(&namespace, &name, &status).await?;
                 }
             }
 
@@ -393,36 +494,39 @@ pub async fn reconcile_set(
                         return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
                     }
 
+                    // Persist the committed removal before deleting the pod or
+                    // beginning another removal.
+                    let status = KubericSetStatus {
+                        ready_replicas: driver.replica_ids().len() as i32,
+                        replicas: driver.replica_ids().len() as i32,
+                        members: build_member_status(&pods, &set.spec),
+                        stable_snapshot: Some(snapshot_status(driver)?),
+                        ..set.status.clone().unwrap_or_default()
+                    };
                     // Delete the pod
                     let pod_name = format!("{}-{}", name, replica_id - 1);
+                    let persist_result =
+                        persist_committed_status(api, state, &set_key, &namespace, &name, &status)
+                            .await;
                     let _ = api.delete_pod(&namespace, &pod_name).await;
+                    persist_result?;
                 }
-
-                // Update status
-                let status = KubericSetStatus {
-                    ready_replicas: driver.replica_ids().len() as i32,
-                    replicas: driver.replica_ids().len() as i32,
-                    members: build_member_status(&pods, &set.spec),
-                    ..set.status.clone().unwrap_or_default()
-                };
-                api.patch_set_status(&namespace, &name, &status).await?;
             }
 
             Ok(ReconcileAction::Requeue(Duration::from_secs(30)))
         }
 
         Phase::FailingOver => {
-            let set_key = format!("{}/{}", namespace, name);
             let mut drivers = state.drivers.lock().await;
-
-            let current_primary_name = set
-                .status
-                .as_ref()
-                .and_then(|s| s.current_primary.clone())
-                .unwrap_or_default();
+            let current_pods = checked_pods_by_id(&pods)?;
 
             if let Some(driver) = drivers.get_mut(&set_key) {
+                validate_pod_handle_identities(driver, &current_pods, set.spec.replicas as usize)?;
                 if let Some(primary_id) = driver.primary_id() {
+                    let current_primary_name = pod_name_for_id(&current_pods, primary_id)
+                        .ok_or_else(|| {
+                            format!("current primary replica {primary_id} has no current pod")
+                        })?;
                     info!(name, primary_id, "running driver failover");
                     driver
                         .failover(primary_id)
@@ -430,7 +534,10 @@ pub async fn reconcile_set(
                         .map_err(|e| e.to_string())?;
 
                     let new_primary_id = driver.primary_id().unwrap();
-                    let new_primary_name = format!("{}-{}", name, new_primary_id - 1);
+                    let new_primary_name = pod_name_for_id(&current_pods, new_primary_id)
+                        .ok_or_else(|| {
+                            format!("new primary replica {new_primary_id} has no current pod")
+                        })?;
                     let epoch = driver.epoch();
 
                     // Update labels
@@ -459,9 +566,11 @@ pub async fn reconcile_set(
                         ready_replicas: ready_pods.len() as i32,
                         replicas: pods.len() as i32,
                         members,
+                        stable_snapshot: Some(snapshot_status(driver)?),
                         primary_failing_since: None,
                     };
-                    api.patch_set_status(&namespace, &name, &status).await?;
+                    persist_committed_status(api, state, &set_key, &namespace, &name, &status)
+                        .await?;
                 }
             } else {
                 warn!(name, "no driver state for failover, requeueing");
@@ -471,8 +580,8 @@ pub async fn reconcile_set(
         }
 
         Phase::Switchover => {
-            let set_key = format!("{}/{}", namespace, name);
             let mut drivers = state.drivers.lock().await;
+            let current_pods = checked_pods_by_id(&pods)?;
 
             let target_primary_name = set
                 .status
@@ -480,27 +589,24 @@ pub async fn reconcile_set(
                 .and_then(|s| s.target_primary.clone())
                 .unwrap_or_default();
 
-            let current_primary_name = set
-                .status
-                .as_ref()
-                .and_then(|s| s.current_primary.clone())
-                .unwrap_or_default();
-
             if let Some(driver) = drivers.get_mut(&set_key) {
+                validate_pod_handle_identities(driver, &current_pods, set.spec.replicas as usize)?;
+                let current_primary_name = driver
+                    .primary_id()
+                    .and_then(|id| pod_name_for_id(&current_pods, id))
+                    .ok_or_else(|| "driver primary has no current pod".to_string())?;
                 // Resolve target pod name → replica ID
-                let target_id: Option<ReplicaId> = pods
+                let target_id: Option<ReplicaId> = current_pods
                     .iter()
-                    .find(|p| p.name_any() == target_primary_name)
-                    .and_then(|p| {
-                        p.metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|l| l.get("kuberic.io/pod-index"))
-                            .and_then(|v| v.parse::<i64>().ok())
-                            .map(|idx| idx + 1)
-                    });
+                    .find(|(_, _, pod)| pod.name_any() == target_primary_name)
+                    .map(|(id, _, _)| *id);
 
                 if let Some(target_id) = target_id {
+                    if driver.handle(target_id).is_none() {
+                        return Err(format!(
+                            "switchover target replica {target_id} is not in the committed driver topology"
+                        ));
+                    }
                     info!(name, target_id, target = %target_primary_name, "running driver switchover");
                     driver
                         .switchover(target_id)
@@ -535,9 +641,11 @@ pub async fn reconcile_set(
                         ready_replicas: ready_pods.len() as i32,
                         replicas: pods.len() as i32,
                         members,
+                        stable_snapshot: Some(snapshot_status(driver)?),
                         primary_failing_since: None,
                     };
-                    api.patch_set_status(&namespace, &name, &status).await?;
+                    persist_committed_status(api, state, &set_key, &namespace, &name, &status)
+                        .await?;
                 } else {
                     warn!(name, target = %target_primary_name, "switchover target not found");
                 }
@@ -555,6 +663,130 @@ pub async fn reconcile_set(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+type CurrentPod<'a> = (ReplicaId, ReplicaInstanceId, &'a Pod);
+
+async fn persist_committed_status(
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    set_key: &str,
+    namespace: &str,
+    name: &str,
+    status: &KubericSetStatus,
+) -> Result<(), String> {
+    match api.patch_set_status(namespace, name, status).await {
+        Ok(()) => {
+            state.pending_statuses.lock().await.remove(set_key);
+            Ok(())
+        }
+        Err(error) => {
+            state
+                .pending_statuses
+                .lock()
+                .await
+                .insert(set_key.to_string(), status.clone());
+            Err(error)
+        }
+    }
+}
+
+/// Build the current logical/incarnation identity view from required pod
+/// metadata. Kubernetes list position is never an identity source.
+fn checked_pods_by_id(pods: &[Pod]) -> Result<Vec<CurrentPod<'_>>, String> {
+    let mut result = Vec::with_capacity(pods.len());
+    let mut ids = HashSet::new();
+    let mut instances = HashSet::new();
+    for pod in pods {
+        let pod_name = pod.name_any();
+        let index = pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("kuberic.io/pod-index"))
+            .ok_or_else(|| format!("pod {pod_name} has no kuberic.io/pod-index label"))?
+            .parse::<ReplicaId>()
+            .map_err(|error| {
+                format!("pod {pod_name} has invalid kuberic.io/pod-index label: {error}")
+            })?;
+        if index < 0 {
+            return Err(format!(
+                "pod {pod_name} has negative kuberic.io/pod-index label"
+            ));
+        }
+        let replica_id = index
+            .checked_add(1)
+            .ok_or_else(|| format!("pod {pod_name} has overflowing kuberic.io/pod-index label"))?;
+        if !ids.insert(replica_id) {
+            return Err(format!("duplicate pod logical replica ID {replica_id}"));
+        }
+        let instance_id = pod
+            .metadata
+            .uid
+            .as_ref()
+            .filter(|uid| !uid.is_empty())
+            .cloned()
+            .map(ReplicaInstanceId::new)
+            .ok_or_else(|| format!("pod {pod_name} has no UID"))?;
+        if !instances.insert(instance_id.clone()) {
+            return Err(format!("duplicate pod incarnation {instance_id}"));
+        }
+        result.push((replica_id, instance_id, pod));
+    }
+    result.sort_by_key(|(id, _, _)| *id);
+    Ok(result)
+}
+
+/// Before every Healthy topology decision, ensure current pod identities still
+/// attest the process-local handles. Extra identities are allowed only while
+/// the desired replica count is larger than the committed driver membership.
+fn validate_pod_handle_identities(
+    driver: &PartitionDriver,
+    current_pods: &[CurrentPod<'_>],
+    desired: usize,
+) -> Result<(), String> {
+    let driver_ids = driver.replica_ids();
+    for replica_id in &driver_ids {
+        let (_, current_instance, _) = current_pods
+            .iter()
+            .find(|(id, _, _)| id == replica_id)
+            .ok_or_else(|| format!("current pod for driver replica {replica_id} is missing"))?;
+        let handle = driver
+            .handle(*replica_id)
+            .ok_or_else(|| format!("driver handle {replica_id} is missing"))?;
+        let handle_instance = handle.instance_id();
+        if *current_instance != handle_instance {
+            return Err(format!(
+                "current pod incarnation drift for replica {replica_id}: driver {handle_instance}, pod {current_instance}"
+            ));
+        }
+    }
+
+    let extras: Vec<_> = current_pods
+        .iter()
+        .filter(|(id, _, _)| driver.handle(*id).is_none())
+        .map(|(id, _, _)| *id)
+        .collect();
+    if !extras.is_empty() && driver_ids.len() >= desired {
+        return Err(format!(
+            "current pod logical identities are not a bijection with driver handles; extra replicas: {extras:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn pod_name_for_id(current_pods: &[CurrentPod<'_>], id: ReplicaId) -> Option<String> {
+    current_pods
+        .iter()
+        .find(|(current_id, _, _)| *current_id == id)
+        .map(|(_, _, pod)| pod.name_any())
+}
+
+fn snapshot_status(driver: &PartitionDriver) -> Result<StablePartitionSnapshotStatus, String> {
+    let snapshot = driver
+        .stable_snapshot()
+        .map_err(|error| format!("cannot persist stable snapshot: {error}"))?;
+    StablePartitionSnapshotStatus::try_from(&snapshot)
+}
 
 fn is_pod_ready(pod: &Pod) -> bool {
     pod.status

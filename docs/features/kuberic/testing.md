@@ -264,7 +264,7 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 | QuorumTracker stale ACK cleanup | Correctness | C1 |
 | Zombie primary write rejection (epoch fencing on data plane) | Protocol safety | A2 |
 | Data loss protocol (on_data_loss triggered by operator) | Designed, not impl | D |
-| Operator restart recovery | Designed, not impl | D |
+| Mid-reconfiguration operator restart recovery | Stable-only recovery implemented; transition journaling still needs design | D |
 | Secondary health detection | Designed, not impl | D |
 | Missing pod detection | Designed, not impl | D |
 | Network partition (pod Ready but gRPC unreachable) | Designed, not impl | D |
@@ -372,6 +372,14 @@ an indefinite wait.
 **Pattern 6: Crash during switchover (A3 rollback)**
 `test_switchover_rollback_on_target_failure` uses `handle.close()`.
 Could be upgraded to `crash()` for higher fidelity.
+
+**Pattern 7: Operator process restart recovery** ✅
+`test_operator_restart_recovers_read_only_then_switches_and_scales` replaces
+only `ReconcilerState` while real pod runtimes and persisted status remain. It
+audits all control operations to prove recovery issues only `GetStatus`, then
+verifies continued writes, switchover, and scale-up. Companion tests cover
+recovered unhealthy-primary failover, legacy/mismatched snapshot rejection,
+post-recovery pod logical/incarnation drift, and unordered pod listing.
 
 ### Remaining Work
 

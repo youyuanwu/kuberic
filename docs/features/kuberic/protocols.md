@@ -145,6 +145,28 @@ a stale secondary before re-adding a recreated pod.
 
 ---
 
+## Protocol: Stable Operator Restart Recovery
+
+`status.stableSnapshot` is the sole authoritative recovery record. It contains
+the committed epoch, primary logical ID, every stable member's logical ID,
+pod-UID incarnation and typed role, and the majority write quorum. Addresses
+and clients are never persisted.
+
+On a `Healthy` reconcile with no process-local driver, the operator validates
+pod-index labels and UIDs, constructs current handles, and invokes
+`PartitionDriver::recover()`. Recovery calls `GetStatus` on each handle and
+requires exact incarnation, epoch, role, primary, membership, and quorum
+agreement before constructing driver state. Health is deliberately not a
+snapshot invariant; normal health/failover handling runs after reconstruction.
+
+No lifecycle, role, epoch, configuration, catch-up, build, removal, data-loss,
+or write-status RPC is legal during recovery. Missing legacy snapshots and
+all persisted/live mismatches fail closed. Recovery covers stable topology
+only; it does not infer state for an in-progress reconfiguration or reopen a
+restarted pod runtime.
+
+---
+
 ## Protocol: Scale-Down (Remove Secondary)
 
 Remove a replica from the partition. Implemented in

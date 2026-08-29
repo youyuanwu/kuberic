@@ -24,7 +24,7 @@ Implementation status, known gaps, and open questions.
 | Secondary health detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §2 |
 | Missing pod detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §3 |
 | gRPC failure tracking | ❌ Not implemented — K8s adaptation of SF federation heartbeats |
-| Operator restart recovery | ❌ Not implemented — designed, PartitionDriver::recover() |
+| Stable Healthy operator restart recovery | ✅ Implemented — authoritative status snapshot + read-only `PartitionDriver::recover()` |
 | Primary self-fencing (liveness probe) | ❌ Not implemented — K8s defense-in-depth (from CNPG) |
 | Node drain handling | ❌ Not implemented — K8s adaptation (analogous to SF PLB) |
 | CRD conditions (Ready, Degraded, Quorum) | ❌ Not implemented — K8s addition |
@@ -51,7 +51,8 @@ CNPG patterns we **adopted** (K8s-specific value-adds):
 3. gRPC failure tracking (replaces CNPG's HTTP failure tracking)
 4. Node drain detection with proactive switchover
 5. CRD conditions (Ready, Degraded, QuorumAvailable)
-6. Operator restart recovery from CRD status + pod list
+6. Stable Healthy operator restart recovery from `stableSnapshot`, current
+   pod identities, and runtime `GetStatus`
 7. Optional failover delay for environments with flappy probes
 
 CNPG patterns we **rejected** (conflict with SF model):
@@ -89,10 +90,9 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
    design: one partition per CRD.
 2. **Pod identity and PVC binding** — how to bind recreated pods to correct
    PVCs. Relevant for WAL persistence.
-3. **Operator state recovery** — reconstructing PartitionDriver from CRD
-   status after operator restart. Design in `operator-failure-scenarios.md` §8.
-   Needs `PartitionDriver::recover()` method. SF's FM is similarly stateless,
-   reconstructing from the FailoverUnit persistent state.
+3. **Mid-reconfiguration operator state recovery** — stable Healthy topology
+   is recoverable, but `Creating`, `FailingOver`, `Switchover`, and partial
+   configuration transitions still require durable checkpoint/journal design.
 4. **force_remove_secondary** — removing a dead replica from quorum when
    gRPC calls to it fail. SF has `RemoveFromCurrentConfiguration` (config-first
    removal) and `RemoveReplica` (cancel in-progress builds). We need both

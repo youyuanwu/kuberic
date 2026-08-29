@@ -45,7 +45,11 @@ reconstruct the operator's in-memory state after restart.
 
 Current fields:
 - `epoch`, `currentPrimary`, `targetPrimary`, `phase`
-- `currentConfiguration`, `previousConfiguration`
+- `stableSnapshot`: authoritative stable epoch, primary logical ID, complete
+  logical/incarnation member identities and roles, and write quorum
+
+`currentPrimary` and per-member status remain compatibility/observational
+output. They are not used to reconstruct topology.
 
 **New fields needed:**
 
@@ -539,63 +543,47 @@ time for replicas to recover without data loss).
 
 **Detection:** N/A — the operator itself restarts.
 
-**Current behavior:** On restart, the operator has no in-memory driver state.
-The CRD status persists in etcd, so the phase and epoch survive.
-
-**Design (informed by CNPG PVC-annotation recovery):**
-
-CNPG reconstructs cluster topology from PVC annotations. We don't use
-PVCs (in-memory replicator), so we reconstruct from CRD status + pod list.
+**Current behavior:** ✅ Stable `Healthy` recovery is implemented. The CRD
+snapshot survives in etcd while current pod metadata and runtime status attest
+that it still describes the live partition.
 
 ```
 Operator restart — first reconcile per KubericSet:
   │
-  ├─ Read CRD status:
-  │    epoch, currentPrimary, targetPrimary, phase
-  │    instanceNames, instanceStates
-  │    currentConfiguration, previousConfiguration
+  ├─ Require status.stableSnapshot:
+  │    stable epoch, primary ID, complete members/roles, write quorum
   │
   ├─ List pods with label kuberic.io/set={name}:
   │    For each pod:
-  │      Create GrpcReplicaHandle (connect to control gRPC port)
-  │      Call GetStatus to verify pod identity + role
+  │      Derive logical ID from the required pod-index label
+  │      Create GrpcReplicaHandle from current pod UID and addresses
   │
-  ├─ Reconstruct PartitionDriver:
-  │    driver = PartitionDriver::recover(epoch, handles, configuration)
-  │    Compare pod-reported roles vs CRD status
-  │    If mismatch: trust pod-reported state (it's the live truth)
+  ├─ PartitionDriver::recover(snapshot, handles):
+  │    Call only GetStatus
+  │    Validate logical/incarnation bijection, exact epoch and stable roles
+  │    Validate one primary, complete membership, and majority write quorum
+  │    Rebuild handles and current configuration without runtime mutation
   │
   ├─ Validate consistency:
-  │    If currentPrimary pod not found:
-  │      Transition to FailingOver
-  │    If targetPrimary != currentPrimary:
-  │      Resume interrupted switchover/failover
-  │    If phase was mid-operation (Creating, FailingOver, Switchover):
-  │      Restart the operation from a safe checkpoint
+  │    Any absent/duplicate/relabelled/reincarnated member → fail closed
+  │    Any runtime epoch/role/incarnation mismatch → fail closed
+  │    Runtime unhealthy but otherwise consistent → recover, then health logic
   │
   └─ Resume normal reconciliation
 ```
 
-**New method needed: `PartitionDriver::recover()`**
+`currentPrimary` is refreshed from recovered driver state and is not trusted
+as input. Legacy status without `stableSnapshot` is rejected. Stable topology
+changes persist a fresh snapshot; multi-member add/remove loops patch after
+each committed change. If runtime mutation succeeds but status persistence
+does not, the live operator retries that exact pending status before another
+action. If its process state is also lost, a subsequent recovery sees the old
+snapshot and fails closed. Creating probes runtime status and refuses to replay
+creation when replicas are already initialized.
 
-Reconstructs driver state from external inputs rather than building
-from scratch:
-
-```rust
-impl PartitionDriver {
-    pub fn recover(
-        epoch: Epoch,
-        primary_id: ReplicaId,
-        handles: HashMap<ReplicaId, Box<dyn ReplicaHandle>>,
-        current_config: Vec<ReplicaId>,
-        previous_config: Option<Vec<ReplicaId>>,
-    ) -> Self { ... }
-}
-```
-
-**Idempotency requirement:** All reconciler phases must be idempotent —
-safe to re-execute after crash. This is already true for most operations
-(CRD write-ahead pattern), but needs verification for mid-failover states.
+**Boundary:** This does not recover `Creating`, `FailingOver`, `Switchover`,
+mid-configuration state, or a restarted pod process. Those cases require a
+durable reconfiguration journal or a separate pod-state recovery protocol.
 
 ---
 
@@ -644,7 +632,7 @@ After failover completes:
 | P0 | Secondary not ready → replace | Medium | SF (FM detects + replaces) |
 | P0 | Pod deleted → detect + replace | Medium | SF (FM detects) + K8s pod mgmt |
 | P0 | Data loss failover (quorum lost) | Medium | **SF** (`on_data_loss()` protocol) |
-| P1 | Operator restart → recover driver | Large | SF (FM is stateless, uses persistent config) |
+| Done | Stable Healthy operator restart → recover driver | Implemented | SF (FM is stateless, uses persistent config) |
 | P1 | gRPC failure tracking | Medium | K8s adaptation (replaces SF federation heartbeats) |
 | P1 | Old primary cleanup after failover | Small | K8s addition |
 | P1 | CRD conditions (Ready, Degraded, Quorum) | Small | K8s addition (from CNPG) |

@@ -22,15 +22,22 @@ switchover, and scaling via `PartitionDriver`.
 
 **Status fields:**
 - `epoch`, `currentPrimary`, `targetPrimary`, `phase`
-- `reconfigurationPhase`, `currentConfiguration`, `previousConfiguration`
+- `reconfigurationPhase`
+- optional authoritative `stableSnapshot` with epoch, primary logical ID,
+  complete member logical/incarnation identities and roles, and write quorum
 - `failingSinceTimestamp`, `quorumLossSince`
 - per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
 - `instanceNames`, `instanceStates`
 - `conditions`
 
 **Reconciliation:** Uses `PartitionDriver` with `GrpcReplicaHandle`
-(same driver as tests, different transport). CRD status is the durable
-state machine — write-ahead pattern (CRD write before gRPC calls).
+(same driver as tests, different transport). A stable operation is complete
+only after its resulting snapshot is persisted. Runtime mutation currently
+precedes that status patch. The live reconciler retains and retries a failed
+post-commit status write before selecting another action. If the operator
+process is also lost in that window, restart recovery rejects the stale
+snapshot instead of guessing. Creating also probes for an already-initialized
+runtime and refuses to replay `Open(New)`.
 
 ---
 
@@ -116,9 +123,21 @@ connection's drain and acknowledgement tasks.
 
 ## Operator Restart Recovery
 
-On first reconcile after restart, reconstruct `PartitionDriver` from
-CRD status + pod list via `PartitionDriver::recover()`. See
-`operator-failure-scenarios.md` §8 for full design.
+On the first `Healthy` reconcile after process restart, the operator requires
+`status.stableSnapshot`, derives logical IDs from required pod-index labels,
+and creates handles from current pod UIDs and addresses. `PartitionDriver::
+recover()` calls only `GetStatus`, then requires an exact logical/incarnation
+bijection, epoch and stable-role agreement, one primary, complete membership,
+and the persisted majority write quorum.
+
+The snapshot is authoritative. `currentPrimary` remains compatibility output
+and is refreshed from recovered driver state; it is never recovery input.
+Legacy resources without a snapshot, changed pod identities, and live state
+that is newer or otherwise inconsistent fail closed. Runtime health does not
+invalidate an otherwise consistent snapshot: recovery completes first, then
+the normal health/failover path runs. Recovery is intentionally limited to
+stable `Healthy` topology and does not resume an in-progress reconfiguration
+or recover restarted pod processes. See `operator-failure-scenarios.md` §8.
 
 ---
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,13 +10,18 @@ use serial_test::serial;
 use tokio::sync::RwLock;
 
 use kuberic_core::driver::ReplicaHandle;
+use kuberic_core::error::Result as CoreResult;
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
-use kuberic_core::types::{ReplicaId, ReplicaInstanceId};
+use kuberic_core::types::{
+    DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
+    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
+};
 
 use kuberic_operator::cluster_api::ClusterApi;
 use kuberic_operator::crd::{
     KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
+    StableReplicaRoleStatus,
 };
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
@@ -35,6 +40,130 @@ struct LivePod {
     _service_handle: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlOperation {
+    Open,
+    Close,
+    ChangeRole,
+    UpdateEpoch,
+    UpdateCatchUpConfiguration,
+    UpdateCurrentConfiguration,
+    WaitForCatchUpQuorum,
+    BuildReplica,
+    RemoveReplica,
+    OnDataLoss,
+    RevokeWriteStatus,
+    GetStatus,
+}
+
+struct ObservedHandle {
+    inner: Box<dyn ReplicaHandle>,
+    operations: Arc<Mutex<Vec<ControlOperation>>>,
+}
+
+impl ObservedHandle {
+    fn record(&self, operation: ControlOperation) {
+        self.operations.lock().unwrap().push(operation);
+    }
+}
+
+#[async_trait]
+impl ReplicaHandle for ObservedHandle {
+    fn id(&self) -> ReplicaId {
+        self.inner.id()
+    }
+
+    fn instance_id(&self) -> ReplicaInstanceId {
+        self.inner.instance_id()
+    }
+
+    async fn open(&self, mode: OpenMode) -> CoreResult<()> {
+        self.record(ControlOperation::Open);
+        self.inner.open(mode).await
+    }
+
+    async fn close(&self) -> CoreResult<()> {
+        self.record(ControlOperation::Close);
+        self.inner.close().await
+    }
+
+    fn abort(&self) {
+        self.inner.abort();
+    }
+
+    async fn change_role(&self, epoch: Epoch, role: Role) -> CoreResult<()> {
+        self.record(ControlOperation::ChangeRole);
+        self.inner.change_role(epoch, role).await
+    }
+
+    async fn update_epoch(&self, epoch: Epoch) -> CoreResult<()> {
+        self.record(ControlOperation::UpdateEpoch);
+        self.inner.update_epoch(epoch).await
+    }
+
+    fn current_progress(&self) -> Lsn {
+        self.inner.current_progress()
+    }
+
+    fn catch_up_capability(&self) -> Lsn {
+        self.inner.catch_up_capability()
+    }
+
+    async fn on_data_loss(&self) -> CoreResult<DataLossAction> {
+        self.record(ControlOperation::OnDataLoss);
+        self.inner.on_data_loss().await
+    }
+
+    async fn update_catch_up_configuration(
+        &self,
+        current: ReplicaSetConfig,
+        previous: ReplicaSetConfig,
+    ) -> CoreResult<()> {
+        self.record(ControlOperation::UpdateCatchUpConfiguration);
+        self.inner
+            .update_catch_up_configuration(current, previous)
+            .await
+    }
+
+    async fn update_current_configuration(&self, current: ReplicaSetConfig) -> CoreResult<()> {
+        self.record(ControlOperation::UpdateCurrentConfiguration);
+        self.inner.update_current_configuration(current).await
+    }
+
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> CoreResult<()> {
+        self.record(ControlOperation::WaitForCatchUpQuorum);
+        self.inner.wait_for_catch_up_quorum(mode).await
+    }
+
+    async fn build_replica(&self, replica: ReplicaInfo) -> CoreResult<()> {
+        self.record(ControlOperation::BuildReplica);
+        self.inner.build_replica(replica).await
+    }
+
+    async fn remove_replica(
+        &self,
+        replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+    ) -> CoreResult<()> {
+        self.record(ControlOperation::RemoveReplica);
+        self.inner.remove_replica(replica_id, instance_id).await
+    }
+
+    async fn revoke_write_status(&self) -> CoreResult<()> {
+        self.record(ControlOperation::RevokeWriteStatus);
+        self.inner.revoke_write_status().await
+    }
+
+    fn replicator_address(&self) -> String {
+        self.inner.replicator_address()
+    }
+
+    async fn get_status(&self) -> CoreResult<ReplicaStatusInfo> {
+        self.record(ControlOperation::GetStatus);
+        self.inner.get_status().await
+    }
+}
+
 /// Mock ClusterApi that starts real PodRuntime + KV service for each pod.
 struct KvClusterApi {
     pods: Mutex<Vec<Pod>>,
@@ -44,6 +173,8 @@ struct KvClusterApi {
     statuses: Mutex<Vec<KubericSetStatus>>,
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
+    operations: Arc<Mutex<Vec<ControlOperation>>>,
+    fail_next_status_patch: Mutex<bool>,
 }
 
 impl KvClusterApi {
@@ -55,6 +186,8 @@ impl KvClusterApi {
             statuses: Mutex::new(Vec::new()),
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
+            operations: Arc::new(Mutex::new(Vec::new())),
+            fail_next_status_patch: Mutex::new(false),
         }
     }
 
@@ -116,6 +249,18 @@ impl KvClusterApi {
             .unwrap()
             .get(pod_name)
             .map(|lp| lp.client_address.clone())
+    }
+
+    fn reset_operations(&self) {
+        self.operations.lock().unwrap().clear();
+    }
+
+    fn operations(&self) -> Vec<ControlOperation> {
+        self.operations.lock().unwrap().clone()
+    }
+
+    fn fail_next_status_patch(&self) {
+        *self.fail_next_status_patch.lock().unwrap() = true;
     }
 
     /// Simulate a pod crash. Aborts the PodRuntime and service tasks
@@ -329,6 +474,9 @@ impl ClusterApi for KvClusterApi {
         _name: &str,
         status: &KubericSetStatus,
     ) -> Result<(), String> {
+        if std::mem::take(&mut *self.fail_next_status_patch.lock().unwrap()) {
+            return Err("injected status persistence failure".to_string());
+        }
         self.statuses.lock().unwrap().push(status.clone());
         Ok(())
     }
@@ -358,7 +506,10 @@ impl ClusterApi for KvClusterApi {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(Box::new(handle))
+        Ok(Box::new(ObservedHandle {
+            inner: Box::new(handle),
+            operations: self.operations.clone(),
+        }))
     }
 
     async fn get_pvc(&self, _ns: &str, name: &str) -> Result<PersistentVolumeClaim, String> {
@@ -470,6 +621,558 @@ async fn retry_get(
     unreachable!()
 }
 
+async fn create_healthy_set(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    name: &str,
+    replicas: i32,
+) -> KubericSetStatus {
+    reconcile_set(&make_set(name, replicas, None), api, state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            name,
+            replicas,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        api,
+        state,
+    )
+    .await
+    .unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(
+        status
+            .stable_snapshot
+            .as_ref()
+            .expect("creation must persist a stable snapshot")
+            .members
+            .len(),
+        replicas as usize
+    );
+    status
+}
+
+fn assert_status_reads_only(operations: &[ControlOperation]) {
+    assert!(
+        !operations.is_empty(),
+        "recovery should query at least one runtime status"
+    );
+    for forbidden in [
+        ControlOperation::Open,
+        ControlOperation::Close,
+        ControlOperation::ChangeRole,
+        ControlOperation::UpdateEpoch,
+        ControlOperation::UpdateCatchUpConfiguration,
+        ControlOperation::UpdateCurrentConfiguration,
+        ControlOperation::WaitForCatchUpQuorum,
+        ControlOperation::BuildReplica,
+        ControlOperation::RemoveReplica,
+        ControlOperation::OnDataLoss,
+        ControlOperation::RevokeWriteStatus,
+    ] {
+        assert!(
+            !operations.contains(&forbidden),
+            "recovery invoked mutating RPC {forbidden:?}: {operations:?}"
+        );
+    }
+
+    assert!(
+        operations
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+}
+
+fn assert_stable_snapshot(api: &KvClusterApi, status: &KubericSetStatus, member_count: usize) {
+    let snapshot = status
+        .stable_snapshot
+        .as_ref()
+        .expect("stable operation must persist a snapshot");
+    assert_eq!(snapshot.epoch, status.epoch);
+    assert_eq!(snapshot.members.len(), member_count);
+    assert_eq!(snapshot.write_quorum, member_count as u32 / 2 + 1);
+    assert_eq!(
+        snapshot
+            .members
+            .iter()
+            .filter(|member| member.role == StableReplicaRoleStatus::Primary)
+            .count(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .members
+            .iter()
+            .find(|member| member.role == StableReplicaRoleStatus::Primary)
+            .unwrap()
+            .id,
+        snapshot.primary_id
+    );
+
+    let pods = api.pods.lock().unwrap();
+    let mut member_ids = HashSet::new();
+    let mut member_instances = HashSet::new();
+    for member in &snapshot.members {
+        assert!(member_ids.insert(member.id), "duplicate snapshot member ID");
+        assert!(
+            member_instances.insert(member.instance_id.as_str()),
+            "duplicate snapshot member incarnation"
+        );
+        let pod = pods
+            .iter()
+            .find(|pod| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                    .and_then(|index| index.parse::<i64>().ok())
+                    .map(|index| index + 1)
+                    == Some(member.id)
+            })
+            .expect("every snapshot member must have a current pod");
+        assert_eq!(
+            member.instance_id,
+            pod.metadata.uid.as_deref().unwrap(),
+            "snapshot incarnation must exactly match current pod UID"
+        );
+        let expected_role = if member.id == snapshot.primary_id {
+            StableReplicaRoleStatus::Primary
+        } else {
+            StableReplicaRoleStatus::ActiveSecondary
+        };
+        assert_eq!(member.role, expected_role);
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_operator_restart_recovers_read_only_then_switches_and_scales() {
+    let api = KvClusterApi::new();
+    let initial_state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &initial_state, "recover", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+
+    let mut kv = connect_kv(&api.client_address(&original_primary).unwrap()).await;
+    kv.put(proto::PutRequest {
+        key: "before-restart".into(),
+        value: "durable".into(),
+    })
+    .await
+    .unwrap();
+
+    // Lose only operator process memory. Pods and their real runtimes remain.
+    let recovered_state = ReconcilerState::default();
+    api.reset_operations();
+    reconcile_set(
+        &make_set("recover", 3, Some(status.clone())),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .unwrap();
+    assert_status_reads_only(&api.operations());
+
+    // Recovery neither reopens nor changes the existing replicas.
+    kv.put(proto::PutRequest {
+        key: "after-restart".into(),
+        value: "still-open".into(),
+    })
+    .await
+    .unwrap();
+
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|pod_name| pod_name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "recover",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target.clone()),
+                ..status
+            }),
+        ),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .unwrap();
+    let switching = api.last_status().unwrap();
+    assert_eq!(switching.phase, Phase::Switchover);
+    reconcile_set(
+        &make_set("recover", 3, Some(switching)),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .unwrap();
+    let switched = api.last_status().unwrap();
+    assert_eq!(switched.current_primary.as_deref(), Some(target.as_str()));
+    assert_eq!(
+        switched.stable_snapshot.as_ref().unwrap().primary_id,
+        switched
+            .stable_snapshot
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .find(|member| member.instance_id
+                == api
+                    .pods
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|pod| pod.metadata.name.as_deref() == Some(target.as_str()))
+                    .unwrap()
+                    .metadata
+                    .uid
+                    .clone()
+                    .unwrap())
+            .unwrap()
+            .id
+    );
+
+    // First loop creates the fourth pod; the next commits and persists it.
+    let scale_request = make_set("recover", 4, Some(switched.clone()));
+    reconcile_set(&scale_request, &api, &recovered_state)
+        .await
+        .unwrap();
+    let uncommitted_target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| {
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                .map(String::as_str)
+                == Some("3")
+        })
+        .unwrap()
+        .metadata
+        .name
+        .clone()
+        .unwrap();
+    let error = reconcile_set(
+        &make_set(
+            "recover",
+            4,
+            Some(KubericSetStatus {
+                target_primary: Some(uncommitted_target),
+                ..switched.clone()
+            }),
+        ),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .err()
+    .expect("switchover to an uncommitted scale-up pod must fail");
+    assert!(error.contains("not in the committed driver topology"));
+    api.mark_all_pods_ready();
+    reconcile_set(&scale_request, &api, &recovered_state)
+        .await
+        .unwrap();
+    let scaled = api.last_status().unwrap();
+    assert_eq!(scaled.stable_snapshot.as_ref().unwrap().members.len(), 4);
+    assert_eq!(scaled.stable_snapshot.as_ref().unwrap().write_quorum, 3);
+
+    let mut new_primary = connect_kv(&api.client_address(&target).unwrap()).await;
+    new_primary
+        .put(proto::PutRequest {
+            key: "after-scale".into(),
+            value: "works".into(),
+        })
+        .await
+        .unwrap();
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_operator_restart_recovers_unhealthy_primary_then_fails_over() {
+    let api = KvClusterApi::new();
+    let initial_state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &initial_state, "recover-failover", 3).await;
+    let failed_primary = status.current_primary.clone().unwrap();
+    api.mark_pod_not_ready(&failed_primary);
+
+    let recovered_state = ReconcilerState::default();
+    api.reset_operations();
+    reconcile_set(
+        &make_set("recover-failover", 3, Some(status)),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .unwrap();
+    assert_status_reads_only(&api.operations());
+    let failing = api.last_status().unwrap();
+    assert_eq!(failing.phase, Phase::FailingOver);
+
+    reconcile_set(
+        &make_set("recover-failover", 3, Some(failing)),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .unwrap();
+    let recovered = api.last_status().unwrap();
+    assert_eq!(recovered.phase, Phase::Healthy);
+    assert_ne!(
+        recovered.current_primary.as_deref(),
+        Some(failed_primary.as_str())
+    );
+    assert_eq!(recovered.stable_snapshot.as_ref().unwrap().members.len(), 2);
+
+    let mut kv = connect_kv(
+        &api.client_address(recovered.current_primary.as_deref().unwrap())
+            .unwrap(),
+    )
+    .await;
+    kv.put(proto::PutRequest {
+        key: "recovered-failover".into(),
+        value: "works".into(),
+    })
+    .await
+    .unwrap();
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_recovery_rejects_legacy_and_persisted_live_mismatch_without_mutation() {
+    let api = KvClusterApi::new();
+    let initial_state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &initial_state, "reject-recovery", 3).await;
+    let status_count = api.statuses.lock().unwrap().len();
+
+    let mut legacy = status.clone();
+    legacy.stable_snapshot = None;
+    api.reset_operations();
+    let error = reconcile_set(
+        &make_set("reject-recovery", 3, Some(legacy)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .err()
+    .expect("legacy recovery should fail");
+    assert!(error.contains("stable snapshot is absent"));
+    assert!(api.operations().is_empty());
+    assert_eq!(api.statuses.lock().unwrap().len(), status_count);
+
+    let mut mismatched = status;
+    mismatched.stable_snapshot.as_mut().unwrap().members[0].instance_id =
+        "persisted-stale-incarnation".into();
+    api.reset_operations();
+    let error = reconcile_set(
+        &make_set("reject-recovery", 3, Some(mismatched)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .err()
+    .expect("mismatched recovery should fail");
+    assert!(error.contains("handle incarnation mismatch"));
+    assert!(api.operations().is_empty());
+    assert_eq!(api.statuses.lock().unwrap().len(), status_count);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_post_recovery_pod_identity_drift_is_rejected_before_rpc() {
+    let api = KvClusterApi::new();
+    let initial_state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &initial_state, "identity-drift", 3).await;
+    let recovered_state = ReconcilerState::default();
+    reconcile_set(
+        &make_set("identity-drift", 3, Some(status.clone())),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .unwrap();
+
+    {
+        let mut pods = api.pods.lock().unwrap();
+        pods[0]
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("kuberic.io/pod-index".into(), "9".into());
+    }
+    api.reset_operations();
+    let error = reconcile_set(
+        &make_set("identity-drift", 3, Some(status.clone())),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .err()
+    .expect("logical identity drift should fail");
+    assert!(error.contains("current pod for driver replica"));
+    assert!(api.operations().is_empty());
+
+    {
+        let mut pods = api.pods.lock().unwrap();
+        pods[0]
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("kuberic.io/pod-index".into(), "0".into());
+        pods[0].metadata.uid = Some("replacement-incarnation".into());
+    }
+    api.reset_operations();
+    let error = reconcile_set(
+        &make_set("identity-drift", 3, Some(status)),
+        &api,
+        &recovered_state,
+    )
+    .await
+    .err()
+    .expect("incarnation drift should fail");
+    assert!(error.contains("current pod incarnation drift"));
+    assert!(api.operations().is_empty());
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_creation_uses_pod_labels_when_list_is_unordered() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("unordered", 3, None), &api, &state)
+        .await
+        .unwrap();
+    api.pods.lock().unwrap().reverse();
+    api.mark_all_pods_ready();
+
+    reconcile_set(
+        &make_set(
+            "unordered",
+            3,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.current_primary.as_deref(), Some("unordered-0"));
+    assert_eq!(status.stable_snapshot.as_ref().unwrap().primary_id, 1);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_committed_topology_retries_status_before_another_mutation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "persist-retry", 1).await;
+
+    // Create two scale-up pods, then fail persistence after the first one is
+    // committed to the runtime topology.
+    let scale_request = make_set("persist-retry", 3, Some(status.clone()));
+    reconcile_set(&scale_request, &api, &state).await.unwrap();
+    api.mark_all_pods_ready();
+    api.fail_next_status_patch();
+    let error = reconcile_set(&scale_request, &api, &state)
+        .await
+        .err()
+        .expect("injected status persistence failure must be returned");
+    assert_eq!(error, "injected status persistence failure");
+    {
+        let drivers = state.drivers.lock().await;
+        assert_eq!(drivers["default/persist-retry"].replica_ids().len(), 2);
+    }
+
+    // The next reconcile retries only the pending status. It must not add the
+    // third replica until the first committed add is durable.
+    api.reset_operations();
+    reconcile_set(&scale_request, &api, &state).await.unwrap();
+    assert!(api.operations().is_empty());
+    let persisted_first_add = api.last_status().unwrap();
+    assert_stable_snapshot(&api, &persisted_first_add, 2);
+    {
+        let drivers = state.drivers.lock().await;
+        assert_eq!(drivers["default/persist-retry"].replica_ids().len(), 2);
+    }
+
+    reconcile_set(
+        &make_set("persist-retry", 3, Some(persisted_first_add)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    assert_stable_snapshot(&api, &api.last_status().unwrap(), 3);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_creation_status_retry_does_not_reopen_replicas() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-persist-retry", 1, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    let creating = make_set(
+        "create-persist-retry",
+        1,
+        Some(KubericSetStatus {
+            phase: Phase::Creating,
+            ..Default::default()
+        }),
+    );
+
+    api.fail_next_status_patch();
+    let error = reconcile_set(&creating, &api, &state)
+        .await
+        .err()
+        .expect("injected creation status failure must be returned");
+    assert_eq!(error, "injected status persistence failure");
+
+    // If the operator process is lost too, the new state has no pending
+    // status. Creating-phase preflight observes the already-open runtime and
+    // fails closed using GetStatus only.
+    api.reset_operations();
+    let error = reconcile_set(&creating, &api, &ReconcilerState::default())
+        .await
+        .err()
+        .expect("creation replay after process loss must fail closed");
+    assert!(error.contains("refusing to replay creation"));
+    assert_status_reads_only(&api.operations());
+
+    // With the original process state intact, retry only the durable status.
+    api.reset_operations();
+    reconcile_set(&creating, &api, &state).await.unwrap();
+    assert!(
+        api.operations().is_empty(),
+        "status retry must not replay Open or any creation RPC"
+    );
+    let recovered_status = api.last_status().unwrap();
+    assert_eq!(recovered_status.phase, Phase::Healthy);
+    assert_stable_snapshot(&api, &recovered_status, 1);
+}
+
 /// Full reconciler test: Pending → Creating → Healthy → write KV data.
 #[test_log::test(tokio::test)]
 #[serial]
@@ -511,6 +1214,7 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::Healthy);
     assert!(status.current_primary.is_some());
+    assert_stable_snapshot(&api, &status, 3);
 
     // Write via KV API on primary
     let primary_name = status.current_primary.unwrap();
@@ -608,6 +1312,7 @@ async fn test_reconciler_switchover() {
         status.current_primary.as_deref(),
         Some(target_name.as_str())
     );
+    assert_stable_snapshot(&api, &status, 3);
     assert_ne!(
         status.current_primary.as_deref(),
         Some(original_primary.as_str())
@@ -754,6 +1459,7 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
 
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::Healthy);
+    assert_stable_snapshot(&api, &status, 2);
 
     // New primary should be different from the crashed one
     let new_primary = status.current_primary.clone().unwrap();
@@ -854,6 +1560,7 @@ async fn test_reconciler_scale_up() {
     let status = api.last_status().unwrap();
     let set = make_set("myapp", 3, Some(status));
     reconcile_set(&set, &api, &state).await.unwrap();
+    assert_stable_snapshot(&api, &api.last_status().unwrap(), 3);
 
     // Driver should have 3 replicas
     {
@@ -911,6 +1618,7 @@ async fn test_reconciler_scale_down() {
     // Scale down: change spec to 1 replica
     let set = make_set("myapp", 1, Some(status.clone()));
     reconcile_set(&set, &api, &state).await.unwrap();
+    assert_stable_snapshot(&api, &api.last_status().unwrap(), 1);
 
     // PVCs retained after scale-down (pod deleted, PVC kept)
     assert_eq!(api.pvcs.lock().unwrap().len(), 3);
@@ -1110,6 +1818,7 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
     let status = api.last_status().unwrap();
     let set = make_set("myapp", 3, Some(status));
     reconcile_set(&set, &api, &state).await.unwrap();
+    assert_stable_snapshot(&api, &api.last_status().unwrap(), 3);
 
     // Driver should now have 2 replicas (stale handle removed)
     {
@@ -1129,6 +1838,28 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
     let status = api.last_status().unwrap();
     let set = make_set("myapp", 3, Some(status));
     reconcile_set(&set, &api, &state).await.unwrap();
+    let rejoined_status = api.last_status().unwrap();
+    assert_stable_snapshot(&api, &rejoined_status, 3);
+    let replacement_uid = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(secondary_name.as_str()))
+        .unwrap()
+        .metadata
+        .uid
+        .clone()
+        .unwrap();
+    assert!(
+        rejoined_status
+            .stable_snapshot
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.instance_id == replacement_uid)
+    );
 
     // Driver should be back to 3 replicas
     {

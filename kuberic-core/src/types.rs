@@ -97,6 +97,26 @@ impl TryFrom<u8> for Role {
     }
 }
 
+/// Durable description of one member in a committed stable partition.
+///
+/// Transport addresses and clients are deliberately excluded. They are
+/// reconstructed from current Kubernetes pods after an operator restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableReplicaSnapshot {
+    pub id: ReplicaId,
+    pub instance_id: ReplicaInstanceId,
+    pub role: Role,
+}
+
+/// Durable description of a complete committed partition topology.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StablePartitionSnapshot {
+    pub epoch: Epoch,
+    pub primary_id: ReplicaId,
+    pub members: Vec<StableReplicaSnapshot>,
+    pub write_quorum: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaStatus {
     Up,
