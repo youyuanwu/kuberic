@@ -28,6 +28,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
     
     - uses: taiki-e/install-action@protoc
+    - uses: taiki-e/install-action@just
 
     - name: Install PostgreSQL
       run: |
@@ -56,11 +57,8 @@ jobs:
         cluster_name: kind
         config: deploy/kind-config.yaml
 
-    - name: Cmake Configure
-      run: cmake -S . -B build
-
-    - name: Build Docker Image
-      run: cmake --build build --target all
+    - name: Build and load Docker images
+      run: just images
 
     - name: Run cargo test
       run: cargo test --all -- --nocapture

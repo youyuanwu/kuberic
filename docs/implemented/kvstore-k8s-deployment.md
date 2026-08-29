@@ -8,7 +8,7 @@ existing xdata-app deployment pattern.
 The xedio stack deploys to KinD via:
 
 ```
-CMake targets → cargo build → docker build → kind load → kubectl apply
+Just recipes → cargo build → docker build → kind load → kubectl apply
 ```
 
 Components:
@@ -118,32 +118,22 @@ nodes:
         hostPort: 30090
 ```
 
-### 4. CMake targets — `examples/kvstore/CMakeLists.txt`
+### 4. Just recipes — `justfile`
 
-```cmake
-add_custom_target(kvstore-image ALL
-    COMMAND docker build -t localhost/kvstore
+```just
+kvstore-image: build-rust-bins
+    docker build -t localhost/kvstore \
         -f examples/kvstore/deploy/Dockerfile .
-    COMMAND ${KIND_EXE} load docker-image localhost/kvstore:latest
-        --name kind
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    DEPENDS build_rust_bins
-)
+    kind load docker-image localhost/kvstore:latest --name kind
 
-add_custom_target(kvstore-deploy
-    COMMAND kubectl apply
-        -f examples/kvstore/deploy/kubericset.yaml
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
+kvstore-deploy:
+    kubectl apply -f examples/kvstore/deploy/kubericset.yaml
 
-add_custom_target(kvstore-delete
-    COMMAND kubectl delete
-        -f examples/kvstore/deploy/kubericset.yaml
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-)
+kvstore-delete:
+    kubectl delete -f examples/kvstore/deploy/kubericset.yaml
 ```
 
-Root `CMakeLists.txt` gets: `add_subdirectory(examples/kvstore)`.
+The root `justfile` also defines the Kind cluster and operator image recipes.
 
 ### 5. CI changes — `.github/workflows/CI.yml`
 
@@ -302,18 +292,18 @@ TCP probes on the control port (9090):
 
 ```
 # One-time setup
-cmake --build build --target create-kind-cluster
+just create-kind-cluster
 
 # Build and load images
-cmake --build build --target all
+just images
   → builds rust binaries
   → builds kvstore docker image
   → builds kuberic-operator docker image
   → loads both into kind
 
 # Deploy
-cmake --build build --target kuberic-operator-deploy
-cmake --build build --target kvstore-deploy
+just kuberic-operator-deploy
+just kvstore-deploy
 
 # Verify
 kubectl get kubericsets -n xedio
@@ -336,7 +326,7 @@ Implemented in two PRs:
 
 ### PR 2: KVStore K8s Deployment (done)
 
-- kvstore Dockerfile + CMake targets
+- kvstore Dockerfile + Just recipes
 - kuberic-operator Dockerfile + manifests (CRD, RBAC, Deployment)
 - Binary env var support via clap `env` attribute
 - KinD config consolidated at `deploy/kind-config.yaml` with NodePort mappings
