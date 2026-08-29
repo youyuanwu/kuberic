@@ -1,6 +1,7 @@
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
+use crate::error::KubericError;
 use crate::pod::RuntimeCommand;
 use crate::proto::replicator_control_server::ReplicatorControl;
 use crate::proto::*;
@@ -13,6 +14,13 @@ pub struct ControlServer {
     cmd_tx: mpsc::Sender<RuntimeCommand>,
     #[allow(dead_code)]
     replica_id: i64,
+}
+
+fn runtime_error_status(error: KubericError) -> Status {
+    match error {
+        KubericError::NoWriteQuorum => Status::unavailable(error.to_string()),
+        other => Status::internal(other.to_string()),
+    }
 }
 
 impl ControlServer {
@@ -31,7 +39,7 @@ impl ControlServer {
             .map_err(|_| Status::unavailable("runtime closed"))?;
         rx.await
             .map_err(|_| Status::unavailable("runtime closed"))?
-            .map_err(|e| Status::internal(e.to_string()))
+            .map_err(runtime_error_status)
     }
 }
 
@@ -174,5 +182,24 @@ impl ReplicatorControl for ControlServer {
         self.send_cmd(|reply| RuntimeCommand::RevokeWriteStatus { reply })
             .await?;
         Ok(Response::new(RevokeWriteStatusResponse {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_write_quorum_is_preserved_as_unavailable() {
+        let status = runtime_error_status(KubericError::NoWriteQuorum);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "no write quorum");
+    }
+
+    #[test]
+    fn unrelated_errors_keep_existing_internal_mapping() {
+        let status = runtime_error_status(KubericError::NotPrimary);
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "not primary");
     }
 }

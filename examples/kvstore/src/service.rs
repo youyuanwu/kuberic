@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use kuberic_core::events::{LifecycleEvent, StateProviderEvent};
 use kuberic_core::handles::StateReplicatorHandle;
-use kuberic_core::replicator::WalReplicator;
+use kuberic_core::replicator::{WalReplicator, WalReplicatorOptions};
 use kuberic_core::types::{CancellationToken, Operation, OperationStream, Role};
 use tokio::sync::mpsc;
 use tracing::info;
@@ -119,9 +119,25 @@ async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedSt
 /// In the new API, the user creates the replicator in the Open handler
 /// and returns a ReplicatorHandle to the runtime.
 pub async fn run_service(
+    lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
+    state: SharedState,
+    client_bind: String,
+) {
+    run_service_with_options(
+        lifecycle_rx,
+        state,
+        client_bind,
+        WalReplicatorOptions::default(),
+    )
+    .await;
+}
+
+/// Run the service with explicit WAL replicator options.
+pub async fn run_service_with_options(
     mut lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
     state: SharedState,
     client_bind: String,
+    replicator_options: WalReplicatorOptions,
 ) {
     let mut partition = None;
     let mut replicator: Option<StateReplicatorHandle> = None;
@@ -147,11 +163,12 @@ pub async fn run_service(
                     // User creates the state provider channel
                     let (sp_tx, sp_rx) = mpsc::unbounded_channel();
                     // User creates the replicator, passes state_provider_tx
-                    match WalReplicator::create(
+                    match WalReplicator::create_with_options(
                         ctx.replica_id,
                         &ctx.data_bind,
                         ctx.fault_tx.clone(),
                         sp_tx,
+                        replicator_options.clone(),
                     ).await {
                         Ok((handle, handles)) => {
                             partition = Some(handles.partition);

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
+use kuberic_core::replicator::WalReplicatorOptions;
 use tokio::sync::RwLock;
 
 use crate::state::{KvState, SharedState};
@@ -30,6 +31,28 @@ impl KvPod {
 
     /// Start with a custom reply timeout (for tests with heavy concurrent load).
     pub async fn start_with_timeout(id: i64, reply_timeout: Duration) -> Self {
+        Self::start_with_options(id, reply_timeout, WalReplicatorOptions::default()).await
+    }
+
+    /// Start with independent runtime reply and quorum timeouts.
+    pub async fn start_with_timeouts(
+        id: i64,
+        reply_timeout: Duration,
+        quorum_timeout: Duration,
+    ) -> Self {
+        Self::start_with_options(
+            id,
+            reply_timeout,
+            WalReplicatorOptions::new().quorum_timeout(quorum_timeout),
+        )
+        .await
+    }
+
+    async fn start_with_options(
+        id: i64,
+        reply_timeout: Duration,
+        replicator_options: WalReplicatorOptions,
+    ) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data_dir = std::env::temp_dir().join("kv-test").join(format!(
@@ -38,12 +61,27 @@ impl KvPod {
             std::process::id(),
             n
         ));
-        Self::start_with_dir(id, data_dir, reply_timeout).await
+        Self::start_with_dir_and_options(id, data_dir, reply_timeout, replicator_options).await
     }
 
     /// Start with a specific data directory (for restart tests).
     /// Pass a dir from a previous pod to exercise WAL recovery.
     pub async fn start_with_dir(id: i64, data_dir: PathBuf, reply_timeout: Duration) -> Self {
+        Self::start_with_dir_and_options(
+            id,
+            data_dir,
+            reply_timeout,
+            WalReplicatorOptions::default(),
+        )
+        .await
+    }
+
+    async fn start_with_dir_and_options(
+        id: i64,
+        data_dir: PathBuf,
+        reply_timeout: Duration,
+        replicator_options: WalReplicatorOptions,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap().to_string();
         drop(listener);
@@ -71,8 +109,12 @@ impl KvPod {
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle =
-            tokio::spawn(crate::service::run_service(bundle.lifecycle_rx, st, bind));
+        let service_handle = tokio::spawn(crate::service::run_service_with_options(
+            bundle.lifecycle_rx,
+            st,
+            bind,
+            replicator_options,
+        ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
