@@ -137,12 +137,13 @@ impl KvPod {
     }
 
     /// Simulate a pod crash. Aborts the PodRuntime and service without
-    /// graceful shutdown. All in-memory state is lost. gRPC connections
-    /// break with transport errors. The KvPod instance becomes unusable.
+    /// graceful shutdown. The KvPod instance becomes unusable, but tasks
+    /// independently spawned by the aborted owners can survive; use
+    /// `ReplicaHandle::close` when a test must stop replication ACKs.
     pub async fn crash(self) {
         self._runtime_handle.abort();
         self._service_handle.abort();
-        // Drop all fields — gRPC channels break immediately, state lost
+        // Drop the owned fields after aborting the two owner tasks.
     }
 
     /// Crash this pod and start a fresh one with the same replica ID

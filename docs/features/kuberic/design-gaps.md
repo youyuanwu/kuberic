@@ -206,8 +206,9 @@ benefit since the driver is single-threaded per-partition.
    minutes to hours.
 
 2. **`wait_for_catch_up_quorum`** — blocks until the must_catch_up replica
-   ACKs all ops. If the replica is slow (large backlog) or dead (stream
-   broke — see B0), this hangs forever.
+   ACKs all ops. B0 now bounds this wait and returns `NoWriteQuorum` when
+   acknowledgement progress stops, but a slow replica can still occupy the
+   operator synchronously until completion or the deadline.
 
 Both have the same consequences:
 - **Reconciler stall** — blocked on `.await`, no health checks or
@@ -236,7 +237,7 @@ The FM monitors overall health (via heartbeats), not build progress.
 ```
 Current (synchronous, blocking):
   operator ──BuildReplica RPC──► primary (blocks for hours) ──► response
-  operator ──WaitForCatchUp RPC──► primary (blocks forever) ──► response
+  operator ──WaitForCatchUp RPC──► primary (blocks until done/timeout) ──► response
 
 SF-aligned (fire-and-retry):
   operator ──BuildReplica RPC──► primary (returns immediately)

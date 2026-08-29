@@ -537,13 +537,13 @@ quorum replicas may already have persisted the operation.
 
 ### Catch-Up Completion Check
 
-`wait_for_catch_up()` registers a waiter. On every commit and every ACK,
-`notify_catch_up_waiters()` re-checks all waiters via `is_caught_up()`:
-
 Catch-up waiters also carry deadlines. They return `NoWriteQuorum` when their
 deadline expires or when an operation expires during the active catch-up
 attempt. A later `set_catch_up_configuration()` starts a new attempt and
 establishes a new baseline.
+
+`wait_for_catch_up()` registers a waiter. On every commit and every ACK,
+`notify_catch_up_waiters()` re-checks all waiters via `is_caught_up()`:
 
 ```rust
 fn is_caught_up(mode) -> bool {

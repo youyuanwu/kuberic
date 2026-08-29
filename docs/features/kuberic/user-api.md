@@ -128,6 +128,8 @@ let (handle, svc_ctx) = WalReplicator::create_with_options(
 The runtime control reply timeout is separate and should exceed the quorum
 deadline when remote catch-up callers need to observe `NoWriteQuorum`.
 
+The state provider callback surface remains:
+
 ```rust
 pub enum StateProviderEvent {
     UpdateEpoch { epoch, previous_epoch_last_lsn, reply },

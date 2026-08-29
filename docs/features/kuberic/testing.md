@@ -44,8 +44,8 @@ Test individual components in isolation. Fast, deterministic.
 | `test_fail_all` | Role change / close fails all pending operations |
 | `test_must_catch_up_enforcement` | Write mode: specific replica must individually ACK |
 | `test_wait_catch_up_all_mode` | All mode: every member must ACK |
-| Timeout tests (4) | Operation expiration, ACK boundary, late ACK safety, independent later writes |
-| Catch-up timeout tests (2) | Waiter expiration, active-attempt failure and retry baseline |
+| Timeout tests (3) | Operation expiration, ACK boundary, late ACK safety, independent later writes |
+| Catch-up timeout tests (3) | Waiter expiration, active-attempt failure and retry baseline |
 | `test_reconfiguration_does_not_reset_operation_deadline` | Pending deadline survives configuration changes |
 
 **Infrastructure:** Direct `QuorumTracker` construction, no actors or gRPC.
