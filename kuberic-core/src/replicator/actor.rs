@@ -203,9 +203,7 @@ impl WalReplicatorActor {
                             );
                             let tracker_committed =
                                 quorum_tracker.lock().await.committed_lsn();
-                            state.set_committed_lsn(
-                                state.committed_lsn().max(tracker_committed),
-                            );
+                            state.advance_committed_lsn(tracker_committed);
 
                             // Connect new secondaries and replay pending ops
                             if let Some(sender) = &mut primary_sender {
@@ -271,9 +269,7 @@ impl WalReplicatorActor {
                             );
                             let tracker_committed =
                                 quorum_tracker.lock().await.committed_lsn();
-                            state.set_committed_lsn(
-                                state.committed_lsn().max(tracker_committed),
-                            );
+                            state.advance_committed_lsn(tracker_committed);
 
                             if let Some(sender) = &mut primary_sender {
                                 let to_remove: Vec<ReplicaId> = sender
@@ -375,7 +371,7 @@ impl WalReplicatorActor {
                     // ACK reader, advancing committed_lsn further.
                     let committed = quorum_tracker.lock().await.committed_lsn();
                     state.set_current_progress(lsn);
-                    state.set_committed_lsn(committed);
+                    state.advance_committed_lsn(committed);
 
                     // Non-blocking: send_to_all uses unbounded channels.
                     // Include committed_lsn so secondaries can track commit progress.
@@ -691,6 +687,69 @@ mod tests {
         assert_eq!(write_rx.await.unwrap().unwrap(), 10);
         assert_eq!(state.current_progress(), 10);
         assert_eq!(state.committed_lsn(), 10);
+
+        control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promoted_primary_waits_for_configuration_before_committing() {
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (data_tx, data_rx) = mpsc::channel(16);
+        let (state_provider_tx, _state_provider_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(PartitionState::new());
+
+        let actor = WalReplicatorActor::with_quorum_timeout(1, Duration::from_secs(1));
+        let actor_state = state.clone();
+        let task = tokio::spawn(async move {
+            actor
+                .run(control_rx, data_rx, actor_state, state_provider_tx)
+                .await;
+        });
+
+        let (role_tx, role_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::ChangeRole {
+                epoch: Epoch::new(1, 1),
+                role: Role::Primary,
+                reply: role_tx,
+            })
+            .await
+            .unwrap();
+        role_rx.await.unwrap().unwrap();
+
+        let (write_tx, mut write_rx) = oneshot::channel();
+        data_tx
+            .send(ReplicateRequest {
+                data: Bytes::from_static(b"before-configuration"),
+                reply: write_tx,
+            })
+            .await
+            .unwrap();
+        while state.current_progress() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(write_rx.try_recv().is_err());
+        assert_eq!(state.committed_lsn(), 0);
+
+        let (config_tx, config_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::UpdateCurrentConfiguration {
+                current: ReplicaSetConfig {
+                    members: Vec::new(),
+                    write_quorum: 1,
+                },
+                reply: config_tx,
+            })
+            .await
+            .unwrap();
+        config_rx.await.unwrap().unwrap();
+
+        assert_eq!(write_rx.await.unwrap().unwrap(), 1);
+        assert_eq!(state.committed_lsn(), 1);
 
         control_tx
             .send(ReplicatorControlEvent::Abort)

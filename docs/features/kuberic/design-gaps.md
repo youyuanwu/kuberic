@@ -135,13 +135,13 @@ failure or timeout, the driver re-promotes the old primary via
 `change_role(new_epoch, Primary)` — matching SF's `RevertConfiguration()`
 pattern. The old primary becomes primary in the new epoch, which is safe.
 
-**Remaining:** After rollback, the quorum configuration is stale (still
-expects secondary ACKs from the old config). The reconciler must
-reconfigure the quorum on the next reconcile cycle. The partition is
-recoverable (primary exists) but writes hang until reconfigured.
+**Rollback completion:** The driver restores the last current configuration
+after re-promoting the old primary. This ends any partial catch-up attempt and
+re-grants writes when the surviving configuration can still reach quorum.
 
 **Test:** Close the switchover target before switchover → promotion fails
-→ verify old primary is re-promoted (primary_id restored).
+→ verify old primary is re-promoted, its configuration is restored, and a
+surviving secondary can still provide write quorum.
 
 **Design:**
 - **Switchover:** If target promotion fails, rollback:
@@ -344,9 +344,8 @@ but its replication stream dead (e.g., network partition between pods).
 
 1. **ACK reader exits silently** — the spawned ACK reader task
    (primary.rs:93) logs a warning and exits. No callback to the actor.
-   However, the dead connection IS removed on the next `send_to_all()`
-   call (send fails → cleanup). So the gap is timing: between the ACK
-   reader dying and the next write, the connection appears alive.
+   The independent request drain can remain open, so a later
+   `send_to_all()` is not guaranteed to discover the dead ACK path.
 
 2. **Operator can't detect replication health** — pods can be Ready but
    replication broken. `GetStatus` doesn't report replication stream
@@ -361,9 +360,9 @@ but its replication stream dead (e.g., network partition between pods).
   reports its health, the operator acts on it.
 
 - **ACK reader death notification** (nice-to-have): When the ACK reader
-  exits, notify the actor to proactively remove the connection. Currently
-  cleanup happens lazily on the next `send_to_all()`, which is fine for
-  most workloads.
+  exits, notify the actor to proactively remove the connection. Without that
+  signal the sender can continue to appear connected while acknowledgements
+  are no longer arriving.
 
 **SF failure detection model (for reference):**
 

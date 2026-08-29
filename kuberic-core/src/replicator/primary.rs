@@ -104,7 +104,7 @@ impl PrimarySender {
                         // This fixes the off-by-one where the last op's committed_lsn
                         // was never propagated because no subsequent op triggered
                         // a PartitionState refresh.
-                        ps.set_committed_lsn(tracker.committed_lsn());
+                        ps.advance_committed_lsn(tracker.committed_lsn());
                     }
                     Err(e) => {
                         warn!(replica_id = rid, error = %e, "ACK stream error");

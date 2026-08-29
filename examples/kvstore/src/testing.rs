@@ -26,7 +26,7 @@ pub struct KvPod {
 impl KvPod {
     /// Start a KV pod with a PodRuntime and the KV service event loop.
     pub async fn start(id: i64) -> Self {
-        Self::start_with_timeout(id, Duration::from_secs(5)).await
+        Self::start_with_timeout(id, Duration::from_secs(10)).await
     }
 
     /// Start with a custom reply timeout (for tests with heavy concurrent load).

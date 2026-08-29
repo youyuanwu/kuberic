@@ -719,13 +719,14 @@ async fn test_a3_switchover_rollback_on_target_failure() {
         "old primary should be re-promoted after rollback"
     );
 
-    // NOTE: Writing after rollback would hang because the quorum
-    // configuration still requires secondary ACKs but no secondaries
-    // are connected (fresh PrimarySender). In production, the
-    // reconciler would reconfigure the quorum after the failed
-    // switchover. This test verifies the rollback itself — the
-    // partition is recoverable (primary exists), not stuck
-    // (no primary at all).
+    // Rollback also restores the current configuration and write status.
+    // Pod 3 still supplies quorum, so the old primary must remain writable.
+    kv1.put(proto::PutRequest {
+        key: "after-rollback".into(),
+        value: "ok".into(),
+    })
+    .await
+    .unwrap();
 }
 
 /// Crash the primary, failover to a secondary, then restart the old

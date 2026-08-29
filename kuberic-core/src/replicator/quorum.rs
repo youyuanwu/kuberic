@@ -320,7 +320,7 @@ impl QuorumTracker {
             .filter_map(|(&lsn, op)| (op.deadline <= now).then_some(lsn))
             .collect();
 
-        if !expired_lsns.is_empty() {
+        if self.catch_up_active && !expired_lsns.is_empty() {
             self.catch_up_failed = true;
         }
 
@@ -390,11 +390,22 @@ impl QuorumTracker {
     // -----------------------------------------------------------------------
 
     fn is_quorum_met(&self, acked_by: &HashSet<ReplicaId>) -> bool {
+        // A zero quorum means the primary has not received a configuration
+        // yet. Do not let writes racing promotion commit against an empty
+        // replica set.
+        if self.current_write_quorum == 0 {
+            return false;
+        }
+
         let cc_met =
             self.count_acks_in_set(acked_by, &self.current_members) >= self.current_write_quorum;
 
         if self.previous_members.is_empty() {
             return cc_met;
+        }
+
+        if self.previous_write_quorum == 0 {
+            return false;
         }
 
         let pc_met =
@@ -460,6 +471,22 @@ impl Default for QuorumTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_unconfigured_quorum_does_not_commit() {
+        let mut tracker = QuorumTracker::new();
+        let (tx, mut rx) = oneshot::channel();
+
+        tracker.register(1, 1, tx);
+
+        assert_eq!(tracker.pending_count(), 1);
+        assert!(rx.try_recv().is_err());
+
+        tracker.set_current_configuration(HashSet::from([1]), 1);
+
+        assert_eq!(rx.await.unwrap().unwrap(), 1);
+        assert_eq!(tracker.committed_lsn(), 1);
+    }
 
     #[tokio::test]
     async fn test_single_replica_commits_immediately() {
@@ -682,6 +709,28 @@ mod tests {
         ));
         assert_eq!(tracker.pending_count(), 0);
         assert_eq!(tracker.committed_lsn(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_write_timeout_outside_catch_up_does_not_latch_failure() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (op_tx, op_rx) = oneshot::channel();
+        tracker.register(1, 1, op_tx);
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+        assert!(matches!(
+            op_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+
+        let (wait_tx, wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+        assert!(wait_rx.await.unwrap().is_ok());
     }
 
     #[tokio::test(start_paused = true)]

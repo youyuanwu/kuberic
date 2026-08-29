@@ -293,10 +293,15 @@ impl ReplicatorData for SecondaryReceiver {
 
         let mut inbound = request.into_inner();
         let mut count: i64 = 0;
+        let mut copy_progress: Option<Lsn> = None;
 
         while let Some(result) = inbound.next().await {
             match result {
                 Ok(item) => {
+                    copy_progress = Some(copy_progress.map_or(item.lsn, |lsn| lsn.max(item.lsn)));
+                    if item.is_boundary {
+                        continue;
+                    }
                     let op = Operation::new(item.lsn, bytes::Bytes::from(item.data), None);
                     if tx.send(op).await.is_err() {
                         warn!("copy stream receiver closed");
@@ -313,6 +318,10 @@ impl ReplicatorData for SecondaryReceiver {
 
         // Drop sender to signal end of copy stream
         drop(tx);
+        if let (Some(progress), Some(state)) = (copy_progress, &self.partition_state) {
+            state.set_current_progress(state.current_progress().max(progress));
+            state.set_committed_lsn(state.committed_lsn().max(progress));
+        }
         info!(count, "CopyStream: received all copy data");
 
         Ok(Response::new(CopyStreamResponse {

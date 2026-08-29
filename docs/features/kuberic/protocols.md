@@ -374,7 +374,8 @@ Neither stream reconnects on failure:
 |---|---|---|
 | GetLSN + Catchup | ReconfigPending | ReconfigPending |
 | Catchup done | **Granted** | ReconfigPending |
-| Activate done | Granted | **Granted** |
+| Activate done | Granted | ReconfigPending |
+| Configuration installed | Granted | **Granted** |
 
 **During switchover (P→S on old primary):**
 
@@ -386,7 +387,9 @@ Neither stream reconnects on failure:
 | Role changed | NotPrimary | NotPrimary | `change_role(ActiveSecondary)` → `close_all()` |
 
 **Runtime owns status transitions** — the replicator only writes LSN values
-to `PartitionState`. See `pod.rs::set_status_for_role()`.
+to `PartitionState`. Role transitions set the initial access state, and a
+successful catch-up/current configuration update grants primary writes. See
+`pod.rs::set_status_for_role()` and the configuration command handlers.
 
 ---
 

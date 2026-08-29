@@ -127,6 +127,19 @@ impl PartitionDriver {
         self.replicas.remove(&id).map(|s| s.handle)
     }
 
+    async fn abandon_failed_creation(&mut self) {
+        let replicas = std::mem::take(&mut self.replicas);
+        for entry in replicas.into_values() {
+            let _ = entry.handle.change_role(self.epoch, Role::None).await;
+            let _ = entry.handle.close().await;
+        }
+        self.primary_id = None;
+        self.current_config = ReplicaSetConfig {
+            members: Vec::new(),
+            write_quorum: 0,
+        };
+    }
+
     // -----------------------------------------------------------------------
     // Workflow: Create Partition
     // -----------------------------------------------------------------------
@@ -177,6 +190,19 @@ impl PartitionDriver {
         self.replicas.get_mut(&primary_id).unwrap().role = Role::Primary;
         self.primary_id = Some(primary_id);
 
+        // Install the initial primary-only configuration before exposing
+        // writes or building secondaries. A promoted actor starts
+        // unconfigured and must not treat quorum zero as success.
+        let mut config = ReplicaSetConfig {
+            members: vec![],
+            write_quorum: 1,
+        };
+        self.replicas[&primary_id]
+            .handle
+            .update_current_configuration(config.clone())
+            .await?;
+        self.current_config = config.clone();
+
         // 3. Secondaries → Idle
         for &id in &secondary_ids {
             let entry = &self.replicas[&id];
@@ -213,10 +239,6 @@ impl PartitionDriver {
         }
 
         // 6. Update configuration incrementally
-        let mut config = ReplicaSetConfig {
-            members: vec![],
-            write_quorum: 1,
-        };
         let mut ready_count: u32 = 1; // Primary
 
         for &id in &secondary_ids {
@@ -237,24 +259,32 @@ impl PartitionDriver {
 
             self.replicas[&primary_id]
                 .handle
-                .update_catch_up_configuration(config.clone(), prev_config)
+                .update_catch_up_configuration(config.clone(), prev_config.clone())
                 .await?;
 
             // Give gRPC connections time to establish (in-process only)
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            self.replicas[&primary_id]
+            if let Err(error) = self.replicas[&primary_id]
                 .handle
                 .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-                .await?;
+                .await
+            {
+                self.replicas[&primary_id]
+                    .handle
+                    .update_current_configuration(prev_config.clone())
+                    .await?;
+                self.current_config = prev_config;
+                self.abandon_failed_creation().await;
+                return Err(error);
+            }
 
             self.replicas[&primary_id]
                 .handle
                 .update_current_configuration(config.clone())
                 .await?;
+            self.current_config = config.clone();
         }
-
-        self.current_config = config;
 
         // Access status is set by each pod's PodRuntime during change_role()
 
@@ -529,8 +559,11 @@ impl PartitionDriver {
                 self.replicas[&old_primary_id]
                     .handle
                     .change_role(self.epoch, Role::Primary)
-                    .await
-                    .ok();
+                    .await?;
+                self.replicas[&old_primary_id]
+                    .handle
+                    .update_current_configuration(self.current_config.clone())
+                    .await?;
                 return Err(KubericError::Internal(
                     "switchover catchup timeout — target did not catch up".into(),
                 ));
@@ -898,17 +931,32 @@ impl PartitionDriver {
 
         info!(secondary_id, "restarting secondary");
 
-        // 1. Close old secondary (best effort — may be dead)
-        if let Some(old) = self.replicas.get(&secondary_id) {
-            let _ = old.handle.close().await;
+        // 1. Remove and close the old secondary (best effort — it may be
+        // dead). Keep the driver entry available for restoration if the
+        // replacement fails so a reconciler can retry the same replica ID.
+        let old = self.replicas.remove(&secondary_id).unwrap();
+        let _ = old.handle.close().await;
+
+        // Drop the primary's sender entry for this ID before connecting the
+        // replacement. Restoring the stable configuration after a failed
+        // attempt intentionally retains the member ID, so configuration
+        // pruning alone cannot distinguish the old endpoint from the new one.
+        if let Err(error) = self.replicas[&primary_id]
+            .handle
+            .remove_replica(secondary_id)
+            .await
+        {
+            self.replicas.insert(secondary_id, old);
+            return Err(error);
         }
 
-        // 2. Remove old handle, then add_replica with new one
-        self.replicas.remove(&secondary_id);
-
-        // Ensure new_handle has the same ID
+        // 2. Add the replacement under the same ID.
         assert_eq!(new_handle.id(), secondary_id);
-        self.add_replica(new_handle).await
+        if let Err(error) = self.add_replica(new_handle).await {
+            self.replicas.insert(secondary_id, old);
+            return Err(error);
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1143,7 +1191,8 @@ pub mod testing {
             match role {
                 Role::Primary => {
                     self.state.set_read_status(AccessStatus::Granted);
-                    self.state.set_write_status(AccessStatus::Granted);
+                    self.state
+                        .set_write_status(AccessStatus::ReconfigurationPending);
                 }
                 _ => {
                     self.state.set_read_status(AccessStatus::NotPrimary);
@@ -1194,7 +1243,11 @@ pub mod testing {
                 })
                 .await
                 .map_err(|_| KubericError::Closed)?;
-            rx.await.map_err(|_| KubericError::Closed)?
+            let result = rx.await.map_err(|_| KubericError::Closed)?;
+            if result.is_ok() && *self.role.lock().unwrap() == Role::Primary {
+                self.state.set_write_status(AccessStatus::Granted);
+            }
+            result
         }
 
         async fn update_current_configuration(&self, current: ReplicaSetConfig) -> Result<()> {
@@ -1203,7 +1256,11 @@ pub mod testing {
                 .send(ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply: tx })
                 .await
                 .map_err(|_| KubericError::Closed)?;
-            rx.await.map_err(|_| KubericError::Closed)?
+            let result = rx.await.map_err(|_| KubericError::Closed)?;
+            if result.is_ok() && *self.role.lock().unwrap() == Role::Primary {
+                self.state.set_write_status(AccessStatus::Granted);
+            }
+            result
         }
 
         async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {

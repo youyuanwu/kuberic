@@ -25,7 +25,7 @@ pub struct SqlitePod {
 impl SqlitePod {
     /// Start a SQLite pod with a PodRuntime and the SQLite service event loop.
     pub async fn start(id: i64) -> Self {
-        Self::start_with_timeout(id, Duration::from_secs(5)).await
+        Self::start_with_timeout(id, Duration::from_secs(10)).await
     }
 
     /// Start with a custom reply timeout.

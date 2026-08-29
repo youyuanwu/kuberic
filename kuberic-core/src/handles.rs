@@ -83,6 +83,15 @@ impl PartitionState {
     }
 
     pub fn set_committed_lsn(&self, lsn: Lsn) {
+        self.committed_lsn.store(lsn, Ordering::Release);
+    }
+
+    /// Publish commit progress from a source that may race another publisher.
+    ///
+    /// WAL primary paths use this to prevent an older actor observation from
+    /// overwriting a newer ACK-reader observation. Other state providers may
+    /// use `set_committed_lsn` when replacing the absolute observed value.
+    pub fn advance_committed_lsn(&self, lsn: Lsn) {
         self.committed_lsn.fetch_max(lsn, Ordering::AcqRel);
     }
 
@@ -190,6 +199,19 @@ impl StateReplicatorHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_lsn_supports_absolute_and_monotonic_publication() {
+        let state = PartitionState::new();
+
+        state.set_committed_lsn(9);
+        state.set_committed_lsn(4);
+        assert_eq!(state.committed_lsn(), 4);
+
+        state.advance_committed_lsn(8);
+        state.advance_committed_lsn(6);
+        assert_eq!(state.committed_lsn(), 8);
+    }
 
     fn granted_handle() -> (StateReplicatorHandle, mpsc::Receiver<ReplicateRequest>) {
         let (data_tx, data_rx) = mpsc::channel(1);

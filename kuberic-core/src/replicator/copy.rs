@@ -73,7 +73,10 @@ pub(crate) async fn run_build_replica_copy(
 
     let state_ops = collect_stream(state_stream).await;
 
-    let copy_lsn = state_ops.iter().map(|(lsn, _)| *lsn).max().unwrap_or(0);
+    // The state provider snapshot is authoritative through up_to_lsn even
+    // when it emits no operations because the secondary already has the
+    // requested state.
+    let copy_lsn = up_to_lsn;
     state.set_copy_lsn(replica.id, copy_lsn);
 
     info!(
@@ -81,13 +84,19 @@ pub(crate) async fn run_build_replica_copy(
         up_to_lsn, copy_lsn, "BuildReplica: got copy state from local StateProvider"
     );
 
-    let items: Vec<crate::proto::CopyItem> = state_ops
+    let mut items: Vec<crate::proto::CopyItem> = state_ops
         .into_iter()
         .map(|(lsn, data)| crate::proto::CopyItem {
             lsn,
             data: data.to_vec(),
+            is_boundary: false,
         })
         .collect();
+    items.push(crate::proto::CopyItem {
+        lsn: copy_lsn,
+        data: Vec::new(),
+        is_boundary: true,
+    });
 
     let item_stream = tokio_stream::iter(items);
     let resp = data_client

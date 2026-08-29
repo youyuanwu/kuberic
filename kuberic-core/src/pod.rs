@@ -229,24 +229,34 @@ impl PodRuntime {
                     previous,
                     reply,
                 } => {
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| {
+                    let result = self
+                        .send_replicator_control(|r| {
                             ReplicatorControlEvent::UpdateCatchUpConfiguration {
                                 current,
                                 previous,
                                 reply: r,
                             }
                         })
-                        .await,
-                    );
+                        .await;
+                    if result.is_ok() && self.role == Role::Primary {
+                        if let Some(handle) = &self.replicator_handle {
+                            handle.state().set_write_status(AccessStatus::Granted);
+                        }
+                    }
+                    let _ = reply.send(result);
                 }
                 RuntimeCommand::UpdateCurrentConfiguration { current, reply } => {
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| {
+                    let result = self
+                        .send_replicator_control(|r| {
                             ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply: r }
                         })
-                        .await,
-                    );
+                        .await;
+                    if result.is_ok() && self.role == Role::Primary {
+                        if let Some(handle) = &self.replicator_handle {
+                            handle.state().set_write_status(AccessStatus::Granted);
+                        }
+                    }
+                    let _ = reply.send(result);
                 }
                 RuntimeCommand::WaitForCatchUpQuorum { mode, reply } => {
                     let _ = reply.send(
@@ -479,7 +489,9 @@ impl PodRuntime {
             match role {
                 Role::Primary => {
                     handle.state().set_read_status(AccessStatus::Granted);
-                    handle.state().set_write_status(AccessStatus::Granted);
+                    handle
+                        .state()
+                        .set_write_status(AccessStatus::ReconfigurationPending);
                 }
                 _ => {
                     handle.state().set_read_status(AccessStatus::NotPrimary);
@@ -510,7 +522,6 @@ mod tests {
         // Spawn user event loop — creates replicator at Open
         let user_handle = tokio::spawn(async move {
             let mut replicator = None;
-            let mut replicated_lsns = vec![];
 
             while let Some(event) = lifecycle_rx.recv().await {
                 match event {
@@ -531,14 +542,13 @@ mod tests {
                     LifecycleEvent::ChangeRole { new_role, reply } => {
                         if new_role == Role::Primary {
                             let r = replicator.as_ref().unwrap();
-                            let lsn = r
+                            let result = r
                                 .replicate(
                                     bytes::Bytes::from("from-user"),
                                     CancellationToken::new(),
                                 )
-                                .await
-                                .unwrap();
-                            replicated_lsns.push(lsn);
+                                .await;
+                            assert!(matches!(result, Err(KubericError::ReconfigurationPending)));
                         }
                         let _ = reply.send(Ok(String::new()));
                     }
@@ -549,7 +559,6 @@ mod tests {
                     LifecycleEvent::Abort => break,
                 }
             }
-            replicated_lsns
         });
 
         // Spawn the runtime command loop
@@ -617,9 +626,7 @@ mod tests {
         // Close
         client.close(crate::proto::CloseRequest {}).await.unwrap();
 
-        let lsns = user_handle.await.unwrap();
-        assert_eq!(lsns.len(), 1);
-        assert_eq!(lsns[0], 1);
+        user_handle.await.unwrap();
 
         runtime_handle.await.unwrap();
     }

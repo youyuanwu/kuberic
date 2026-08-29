@@ -248,7 +248,10 @@ created at Open time (`ReplicatorHandle::data_address()`).
 | **Promotion** | None→Primary, Idle→Active, *→Primary | 1. Replicator  2. Status  3. User |
 | **Demotion** | P→S, Active→None, *→None | 1. Status  2. User  3. Replicator |
 
-On promotion, the replicator is ready before the user starts writing.
+On promotion, reads may start after the role callback, but writes return
+`ReconfigurationPending` until the runtime successfully installs the first
+catch-up or current configuration. This prevents a newly promoted actor from
+committing against an unconfigured zero quorum.
 On demotion, writes are fenced before the user is notified.
 
 ---
