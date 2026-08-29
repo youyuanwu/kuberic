@@ -95,6 +95,7 @@ impl WalReplicatorActor {
                             role: new_role,
                             reply,
                         } => {
+                            let was_primary = role == Role::Primary;
                             info!(
                                 replica_id = self.replica_id,
                                 ?new_role,
@@ -114,7 +115,21 @@ impl WalReplicatorActor {
                             role = new_role;
 
                             if role == Role::Primary {
-                                primary_sender = Some(PrimarySender::new(self.replica_id, epoch));
+                                if was_primary {
+                                    if let Some(sender) = &mut primary_sender {
+                                        sender.set_epoch(epoch);
+                                    }
+                                } else {
+                                    let current_progress = state.current_progress();
+                                    let committed_lsn = state.committed_lsn();
+                                    quorum_tracker
+                                        .lock()
+                                        .await
+                                        .seed_progress(current_progress, committed_lsn);
+                                    next_lsn = next_lsn.max(current_progress + 1);
+                                    primary_sender =
+                                        Some(PrimarySender::new(self.replica_id, epoch));
+                                }
                             }
 
                             let _ = reply.send(Ok(()));
@@ -622,6 +637,66 @@ mod tests {
             .await
             .unwrap();
         harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn promotion_seeds_progress_and_assigns_next_lsn() {
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (data_tx, data_rx) = mpsc::channel(16);
+        let (state_provider_tx, _state_provider_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(PartitionState::new());
+        state.set_current_progress(9);
+        state.set_committed_lsn(8);
+
+        let actor = WalReplicatorActor::with_quorum_timeout(1, Duration::from_secs(1));
+        let actor_state = state.clone();
+        let task = tokio::spawn(async move {
+            actor
+                .run(control_rx, data_rx, actor_state, state_provider_tx)
+                .await;
+        });
+
+        let (role_tx, role_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::ChangeRole {
+                epoch: Epoch::new(1, 1),
+                role: Role::Primary,
+                reply: role_tx,
+            })
+            .await
+            .unwrap();
+        role_rx.await.unwrap().unwrap();
+
+        let (config_tx, config_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::UpdateCurrentConfiguration {
+                current: ReplicaSetConfig {
+                    members: Vec::new(),
+                    write_quorum: 1,
+                },
+                reply: config_tx,
+            })
+            .await
+            .unwrap();
+        config_rx.await.unwrap().unwrap();
+
+        let (write_tx, write_rx) = oneshot::channel();
+        data_tx
+            .send(ReplicateRequest {
+                data: Bytes::from_static(b"after-promotion"),
+                reply: write_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(write_rx.await.unwrap().unwrap(), 10);
+        assert_eq!(state.current_progress(), 10);
+        assert_eq!(state.committed_lsn(), 10);
+
+        control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

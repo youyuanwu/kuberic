@@ -83,7 +83,7 @@ impl PartitionState {
     }
 
     pub fn set_committed_lsn(&self, lsn: Lsn) {
-        self.committed_lsn.store(lsn, Ordering::Release);
+        self.committed_lsn.fetch_max(lsn, Ordering::AcqRel);
     }
 
     /// Record the copy snapshot LSN for a replica being built.

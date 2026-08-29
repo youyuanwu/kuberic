@@ -96,6 +96,13 @@ impl QuorumTracker {
         self.committed_lsn
     }
 
+    /// Seed a newly promoted primary from progress already received while it
+    /// was a secondary.
+    pub fn seed_progress(&mut self, current_progress: Lsn, committed_lsn: Lsn) {
+        self.highest_lsn = self.highest_lsn.max(current_progress);
+        self.committed_lsn = self.committed_lsn.max(committed_lsn);
+    }
+
     /// Update to dual-config mode (during reconfiguration).
     /// Seeds `replica_acked_lsn` for must_catch_up replicas from their
     /// reported `current_progress` (the operator knows each replica's LSN).

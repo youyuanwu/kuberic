@@ -427,7 +427,12 @@ impl PartitionDriver {
                 .update_current_configuration(new_config.clone())
                 .await?;
             self.current_config = new_config;
-            return Err(error);
+            warn!(
+                new_primary = new_primary_id,
+                error = %error,
+                "failover catch-up timed out after promotion; finalized surviving configuration"
+            );
+            return Ok(());
         }
 
         self.replicas[&new_primary_id]
@@ -567,6 +572,20 @@ impl PartitionDriver {
                 .handle
                 .change_role(new_epoch, Role::Primary)
                 .await?;
+            self.replicas[&old_primary_id]
+                .handle
+                .update_catch_up_configuration(
+                    self.current_config.clone(),
+                    ReplicaSetConfig {
+                        members: Vec::new(),
+                        write_quorum: 0,
+                    },
+                )
+                .await?;
+            self.replicas[&old_primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
+                .await?;
             self.replicas.get_mut(&old_primary_id).unwrap().role = Role::Primary;
             self.primary_id = Some(old_primary_id);
             return Err(e);
@@ -642,7 +661,12 @@ impl PartitionDriver {
                 .update_current_configuration(new_config.clone())
                 .await?;
             self.current_config = new_config;
-            return Err(error);
+            warn!(
+                new_primary = target_id,
+                error = %error,
+                "switchover catch-up timed out after promotion; finalized role-correct configuration"
+            );
+            return Ok(());
         }
 
         self.replicas[&target_id]
