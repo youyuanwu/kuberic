@@ -31,6 +31,19 @@ enum OpenModeProto {
     OPEN_EXISTING = 1;
 }
 
+enum AccessStatusProto {
+    ACCESS_GRANTED = 0;
+    ACCESS_RECONFIGURATION_PENDING = 1;
+    ACCESS_NOT_PRIMARY = 2;
+    ACCESS_NO_WRITE_QUORUM = 3;
+}
+
+enum ReplicaConfigurationModeProto {
+    CONFIGURATION_NONE = 0;
+    CONFIGURATION_CATCH_UP = 1;
+    CONFIGURATION_CURRENT = 2;
+}
+
 message ReplicaInfoProto {
     int64 id = 1;
     RoleProto role = 2;
@@ -65,6 +78,7 @@ service ReplicatorControl {
     rpc RemoveReplica(RemoveReplicaRequest) returns (RemoveReplicaResponse);
     rpc OnDataLoss(OnDataLossRequest) returns (OnDataLossResponse);
     rpc RevokeWriteStatus(RevokeWriteStatusRequest) returns (RevokeWriteStatusResponse);
+    rpc ExecuteDurableAction(ExecuteDurableActionRequest) returns (ExecuteDurableActionResponse);
 }
 
 message OpenRequest {
@@ -95,6 +109,22 @@ message GetStatusResponse {
     int64 committed_lsn = 5;
     bool healthy = 6;
     string instance_id = 7;
+    AccessStatusProto write_status = 8;
+    ReplicaConfigurationStatusProto configuration = 9;
+    string last_completed_action_id = 10;
+    string last_completed_action_signature = 11;
+}
+
+message ReplicaConfigurationMemberStatusProto {
+    int64 id = 1;
+    string instance_id = 2;
+    RoleProto role = 3;
+}
+
+message ReplicaConfigurationStatusProto {
+    ReplicaConfigurationModeProto mode = 1;
+    repeated ReplicaConfigurationMemberStatusProto members = 2;
+    uint32 write_quorum = 3;
 }
 
 message UpdateCatchUpConfigRequest {
@@ -131,6 +161,19 @@ message OnDataLossResponse {
 
 message RevokeWriteStatusRequest {}
 message RevokeWriteStatusResponse {}
+
+message ExecuteDurableActionRequest {
+    string action_id = 1;
+    oneof action {
+        RevokeWriteStatusRequest revoke_write_status = 2;
+        ChangeRoleRequest change_role = 3;
+        UpdateEpochRequest update_epoch = 4;
+        UpdateCatchUpConfigRequest update_catch_up_configuration = 5;
+        WaitForCatchUpQuorumRequest wait_for_catch_up_quorum = 6;
+        UpdateCurrentConfigRequest update_current_configuration = 7;
+    }
+}
+message ExecuteDurableActionResponse {}
 
 // ---- Data plane: Pod ↔ Pod (replication + copy) ----
 

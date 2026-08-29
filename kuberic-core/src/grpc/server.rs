@@ -5,7 +5,7 @@ use crate::error::KubericError;
 use crate::pod::RuntimeCommand;
 use crate::proto::replicator_control_server::ReplicatorControl;
 use crate::proto::*;
-use crate::types::{Epoch, ReplicaInstanceId, Role};
+use crate::types::{DurableReplicaAction, Epoch, ReplicaInstanceId, Role};
 
 /// Control server that routes all commands through the PodRuntime's
 /// command channel. This ensures correct replicator/event ordering
@@ -100,6 +100,17 @@ impl ReplicatorControl for ControlServer {
             committed_lsn: info.committed_lsn,
             healthy: info.healthy,
             instance_id: info.instance_id.to_string(),
+            write_status: crate::proto::AccessStatusProto::from(info.write_status) as i32,
+            configuration: info.configuration.map(Into::into),
+            last_completed_action_id: info
+                .last_completed_action
+                .as_ref()
+                .map(|action| action.action_id.clone())
+                .unwrap_or_default(),
+            last_completed_action_signature: info
+                .last_completed_action
+                .map(|action| action.signature)
+                .unwrap_or_default(),
         }))
     }
 
@@ -187,6 +198,53 @@ impl ReplicatorControl for ControlServer {
         self.send_cmd(|reply| RuntimeCommand::RevokeWriteStatus { reply })
             .await?;
         Ok(Response::new(RevokeWriteStatusResponse {}))
+    }
+
+    async fn execute_durable_action(
+        &self,
+        req: Request<ExecuteDurableActionRequest>,
+    ) -> Result<Response<ExecuteDurableActionResponse>, Status> {
+        let inner = req.into_inner();
+        let action = match inner.action {
+            Some(execute_durable_action_request::Action::RevokeWriteStatus(_)) => {
+                DurableReplicaAction::RevokeWriteStatus
+            }
+            Some(execute_durable_action_request::Action::ChangeRole(request)) => {
+                DurableReplicaAction::ChangeRole {
+                    epoch: request.epoch.unwrap_or_default().into(),
+                    role: Role::from(request.role),
+                }
+            }
+            Some(execute_durable_action_request::Action::UpdateEpoch(request)) => {
+                DurableReplicaAction::UpdateEpoch {
+                    epoch: request.epoch.unwrap_or_default().into(),
+                }
+            }
+            Some(execute_durable_action_request::Action::UpdateCatchUpConfiguration(request)) => {
+                DurableReplicaAction::UpdateCatchUpConfiguration {
+                    current: request.current.unwrap_or_default().into(),
+                    previous: request.previous.unwrap_or_default().into(),
+                }
+            }
+            Some(execute_durable_action_request::Action::WaitForCatchUpQuorum(request)) => {
+                DurableReplicaAction::WaitForCatchUpQuorum {
+                    mode: crate::types::ReplicaSetQuorumMode::from(request.mode),
+                }
+            }
+            Some(execute_durable_action_request::Action::UpdateCurrentConfiguration(request)) => {
+                DurableReplicaAction::UpdateCurrentConfiguration {
+                    current: request.current.unwrap_or_default().into(),
+                }
+            }
+            None => return Err(Status::invalid_argument("missing durable action")),
+        };
+        self.send_cmd(|reply| RuntimeCommand::ExecuteDurableAction {
+            action_id: inner.action_id,
+            action,
+            reply,
+        })
+        .await?;
+        Ok(Response::new(ExecuteDurableActionResponse {}))
     }
 }
 

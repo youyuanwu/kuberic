@@ -1,7 +1,8 @@
 use crate::proto;
 use crate::types::{
-    Epoch, OpenMode, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode,
-    ReplicaStatus, Role,
+    AccessStatus, Epoch, OpenMode, ReplicaConfigurationMemberStatus, ReplicaConfigurationMode,
+    ReplicaConfigurationStatus, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
+    ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 
 // --- Epoch ---
@@ -111,6 +112,82 @@ impl From<i32> for ReplicaSetQuorumMode {
     }
 }
 
+impl From<AccessStatus> for proto::AccessStatusProto {
+    fn from(status: AccessStatus) -> Self {
+        match status {
+            AccessStatus::Granted => Self::AccessGranted,
+            AccessStatus::ReconfigurationPending => Self::AccessReconfigurationPending,
+            AccessStatus::NotPrimary => Self::AccessNotPrimary,
+            AccessStatus::NoWriteQuorum => Self::AccessNoWriteQuorum,
+        }
+    }
+}
+
+impl From<i32> for AccessStatus {
+    fn from(value: i32) -> Self {
+        match proto::AccessStatusProto::try_from(value)
+            .unwrap_or(proto::AccessStatusProto::AccessNotPrimary)
+        {
+            proto::AccessStatusProto::AccessGranted => Self::Granted,
+            proto::AccessStatusProto::AccessReconfigurationPending => Self::ReconfigurationPending,
+            proto::AccessStatusProto::AccessNotPrimary => Self::NotPrimary,
+            proto::AccessStatusProto::AccessNoWriteQuorum => Self::NoWriteQuorum,
+        }
+    }
+}
+
+impl From<ReplicaConfigurationStatus> for proto::ReplicaConfigurationStatusProto {
+    fn from(status: ReplicaConfigurationStatus) -> Self {
+        Self {
+            mode: match status.mode {
+                ReplicaConfigurationMode::CatchUp => {
+                    proto::ReplicaConfigurationModeProto::ConfigurationCatchUp as i32
+                }
+                ReplicaConfigurationMode::Current => {
+                    proto::ReplicaConfigurationModeProto::ConfigurationCurrent as i32
+                }
+            },
+            members: status
+                .members
+                .into_iter()
+                .map(|member| proto::ReplicaConfigurationMemberStatusProto {
+                    id: member.id,
+                    instance_id: member.instance_id.to_string(),
+                    role: proto::RoleProto::from(member.role) as i32,
+                })
+                .collect(),
+            write_quorum: status.write_quorum,
+        }
+    }
+}
+
+impl From<proto::ReplicaConfigurationStatusProto> for ReplicaConfigurationStatus {
+    fn from(status: proto::ReplicaConfigurationStatusProto) -> Self {
+        Self {
+            mode: match proto::ReplicaConfigurationModeProto::try_from(status.mode)
+                .unwrap_or(proto::ReplicaConfigurationModeProto::ConfigurationNone)
+            {
+                proto::ReplicaConfigurationModeProto::ConfigurationCatchUp => {
+                    ReplicaConfigurationMode::CatchUp
+                }
+                proto::ReplicaConfigurationModeProto::ConfigurationCurrent
+                | proto::ReplicaConfigurationModeProto::ConfigurationNone => {
+                    ReplicaConfigurationMode::Current
+                }
+            },
+            members: status
+                .members
+                .into_iter()
+                .map(|member| ReplicaConfigurationMemberStatus {
+                    id: member.id,
+                    instance_id: ReplicaInstanceId::new(member.instance_id),
+                    role: Role::from(member.role),
+                })
+                .collect(),
+            write_quorum: status.write_quorum,
+        }
+    }
+}
 // --- ReplicaInfo ---
 
 impl From<ReplicaInfo> for proto::ReplicaInfoProto {

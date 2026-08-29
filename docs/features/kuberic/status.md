@@ -25,6 +25,7 @@ Implementation status, known gaps, and open questions.
 | Missing pod detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §3 |
 | gRPC failure tracking | ❌ Not implemented — K8s adaptation of SF federation heartbeats |
 | Stable Healthy operator restart recovery | ✅ Implemented — authoritative status snapshot + read-only `PartitionDriver::recover()` |
+| Durable switchover restart recovery | ✅ Implemented — compact CRD operation checkpoint, correlated activities, compensation |
 | Primary self-fencing (liveness probe) | ❌ Not implemented — K8s defense-in-depth (from CNPG) |
 | Node drain handling | ❌ Not implemented — K8s adaptation (analogous to SF PLB) |
 | CRD conditions (Ready, Degraded, Quorum) | ❌ Not implemented — K8s addition |
@@ -90,9 +91,10 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
    design: one partition per CRD.
 2. **Pod identity and PVC binding** — how to bind recreated pods to correct
    PVCs. Relevant for WAL persistence.
-3. **Mid-reconfiguration operator state recovery** — stable Healthy topology
-   is recoverable, but `Creating`, `FailingOver`, `Switchover`, and partial
-   configuration transitions still require durable checkpoint/journal design.
+3. **Remaining mid-reconfiguration recovery** — stable Healthy topology and
+   reconciler-driven `Switchover` are recoverable. `Creating`, `FailingOver`,
+   add/remove/rebuild, and other partial configuration transitions still need
+   durable operation migration.
 4. **force_remove_secondary** — removing a dead replica from quorum when
    gRPC calls to it fail. SF has `RemoveFromCurrentConfiguration` (config-first
    removal) and `RemoveReplica` (cancel in-progress builds). We need both
