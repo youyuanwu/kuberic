@@ -21,9 +21,9 @@ async fn test_operator_build_buffer_replay() {
 
     // Start with 3 replicas — use longer reply timeout for concurrent load
     let timeout = Duration::from_secs(30);
-    let pod1 = KvPod::start_with_timeout(1, timeout).await;
-    let pod2 = KvPod::start_with_timeout(2, timeout).await;
-    let pod3 = KvPod::start_with_timeout(3, timeout).await;
+    let pod1 = KvPod::start_with_timeouts(1, timeout, timeout).await;
+    let pod2 = KvPod::start_with_timeouts(2, timeout, timeout).await;
+    let pod3 = KvPod::start_with_timeouts(3, timeout, timeout).await;
 
     let h1 = pod1.replica_handle(1).await;
     let h2 = pod2.replica_handle(2).await;
@@ -50,7 +50,7 @@ async fn test_operator_build_buffer_replay() {
     // Now add a 4th replica. Start writing in a background task FIRST
     // to ensure ops are in-flight during the copy. The PrimarySender
     // should buffer these via build_buffers and replay on connect.
-    let pod4 = KvPod::start_with_timeout(4, timeout).await;
+    let pod4 = KvPod::start_with_timeouts(4, timeout, timeout).await;
     let h4 = pod4.replica_handle(4).await;
 
     // Start continuous writes in background BEFORE add_replica.

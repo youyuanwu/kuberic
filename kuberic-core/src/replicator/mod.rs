@@ -128,7 +128,35 @@ use tonic::transport::Server;
 use crate::events::ReplicateRequest;
 use crate::proto::replicator_data_server::ReplicatorDataServer;
 use crate::replicator::actor::WalReplicatorActor;
+use crate::replicator::quorum::DEFAULT_QUORUM_TIMEOUT;
 use crate::replicator::secondary::{SecondaryReceiver, SecondaryState};
+
+/// Configuration for the WAL replicator.
+#[derive(Debug, Clone)]
+pub struct WalReplicatorOptions {
+    quorum_timeout: Duration,
+}
+
+impl WalReplicatorOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the deadline independently applied to replication operations and
+    /// catch-up quorum waits.
+    pub fn quorum_timeout(mut self, timeout: Duration) -> Self {
+        self.quorum_timeout = timeout;
+        self
+    }
+}
+
+impl Default for WalReplicatorOptions {
+    fn default() -> Self {
+        Self {
+            quorum_timeout: DEFAULT_QUORUM_TIMEOUT,
+        }
+    }
+}
 
 /// WAL-based quorum replicator factory.
 /// Creates the actor, data plane, streams, and returns handles.
@@ -148,6 +176,24 @@ impl WalReplicator {
         data_bind: &str,
         fault_tx: mpsc::Sender<FaultType>,
         state_provider_tx: mpsc::UnboundedSender<StateProviderEvent>,
+    ) -> Result<(ReplicatorHandle, ServiceContext)> {
+        Self::create_with_options(
+            replica_id,
+            data_bind,
+            fault_tx,
+            state_provider_tx,
+            WalReplicatorOptions::default(),
+        )
+        .await
+    }
+
+    /// Create a WAL replicator with explicit options.
+    pub async fn create_with_options(
+        replica_id: ReplicaId,
+        data_bind: &str,
+        fault_tx: mpsc::Sender<FaultType>,
+        state_provider_tx: mpsc::UnboundedSender<StateProviderEvent>,
+        options: WalReplicatorOptions,
     ) -> Result<(ReplicatorHandle, ServiceContext)> {
         let (control_tx, control_rx) = mpsc::channel(16);
         let (data_tx, data_rx) = mpsc::channel::<ReplicateRequest>(256);
@@ -187,7 +233,7 @@ impl WalReplicator {
         });
 
         // Replicator actor — receives state_provider_tx for forwarding
-        let actor = WalReplicatorActor::new(replica_id);
+        let actor = WalReplicatorActor::with_quorum_timeout(replica_id, options.quorum_timeout);
         let state_cp = state.clone();
         let sp_tx = state_provider_tx.clone();
         tokio::spawn(async move {

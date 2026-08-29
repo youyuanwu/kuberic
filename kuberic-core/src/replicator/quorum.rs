@@ -1,9 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 use crate::error::{KubericError, Result};
 use crate::types::{Lsn, ReplicaId};
+
+/// Default time allowed for an operation or catch-up waiter to reach quorum.
+pub const DEFAULT_QUORUM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Tracks pending operations waiting for quorum acknowledgment.
 ///
@@ -33,11 +38,25 @@ pub struct QuorumTracker {
     catch_up_baseline_lsn: Lsn,
     /// Waiters for catch-up quorum
     catch_up_waiters: Vec<CatchUpWaiter>,
+    /// Timeout applied independently to each operation and catch-up waiter.
+    quorum_timeout: Duration,
+    /// Whether an operation expired during the active catch-up attempt.
+    ///
+    /// This prevents removing an expired operation from making catch-up appear
+    /// successful. A new catch-up configuration clears the marker and permits
+    /// a retry from its new baseline.
+    catch_up_failed: bool,
+    /// Whether a catch-up configuration is active.
+    ///
+    /// Repeated catch-up updates must not move the baseline forward or clear a
+    /// failure. `set_current_configuration` explicitly ends the attempt.
+    catch_up_active: bool,
 }
 
 struct CatchUpWaiter {
     mode: crate::types::ReplicaSetQuorumMode,
     reply: oneshot::Sender<Result<()>>,
+    deadline: Instant,
 }
 
 struct PendingOp {
@@ -46,10 +65,15 @@ struct PendingOp {
     /// Completion channel — sent when quorum is met
     reply: Option<oneshot::Sender<Result<Lsn>>>,
     lsn: Lsn,
+    deadline: Instant,
 }
 
 impl QuorumTracker {
     pub fn new() -> Self {
+        Self::with_timeout(DEFAULT_QUORUM_TIMEOUT)
+    }
+
+    pub fn with_timeout(quorum_timeout: Duration) -> Self {
         Self {
             pending: HashMap::new(),
             current_members: HashSet::new(),
@@ -62,11 +86,21 @@ impl QuorumTracker {
             highest_lsn: 0,
             catch_up_baseline_lsn: 0,
             catch_up_waiters: Vec::new(),
+            quorum_timeout,
+            catch_up_failed: false,
+            catch_up_active: false,
         }
     }
 
     pub fn committed_lsn(&self) -> Lsn {
         self.committed_lsn
+    }
+
+    /// Seed a newly promoted primary from progress already received while it
+    /// was a secondary.
+    pub fn seed_progress(&mut self, current_progress: Lsn, committed_lsn: Lsn) {
+        self.highest_lsn = self.highest_lsn.max(current_progress);
+        self.committed_lsn = self.committed_lsn.max(committed_lsn);
     }
 
     /// Update to dual-config mode (during reconfiguration).
@@ -81,12 +115,17 @@ impl QuorumTracker {
         must_catch_up_ids: HashSet<ReplicaId>,
         member_progress: HashMap<ReplicaId, Lsn>,
     ) {
+        self.expire_due(Instant::now());
         self.current_members = current_members;
         self.current_write_quorum = current_write_quorum;
         self.previous_members = previous_members;
         self.previous_write_quorum = previous_write_quorum;
         self.must_catch_up_ids = must_catch_up_ids;
-        self.catch_up_baseline_lsn = self.highest_lsn;
+        if !self.catch_up_active {
+            self.catch_up_baseline_lsn = self.highest_lsn;
+            self.catch_up_failed = false;
+            self.catch_up_active = true;
+        }
 
         // Seed ACK progress from operator-reported replica progress.
         // This accounts for data delivered via copy stream.
@@ -100,6 +139,7 @@ impl QuorumTracker {
                 })
                 .or_insert(*progress);
         }
+        self.try_commit_pending();
         self.notify_catch_up_waiters();
     }
 
@@ -109,11 +149,16 @@ impl QuorumTracker {
         current_members: HashSet<ReplicaId>,
         current_write_quorum: u32,
     ) {
+        self.expire_due(Instant::now());
         self.current_members = current_members;
         self.current_write_quorum = current_write_quorum;
         self.previous_members.clear();
         self.previous_write_quorum = 0;
         self.must_catch_up_ids.clear();
+        self.catch_up_active = false;
+        self.catch_up_failed = false;
+        self.try_commit_pending();
+        self.notify_catch_up_waiters();
     }
 
     /// Register a new pending operation. The primary's own ACK is counted
@@ -145,6 +190,7 @@ impl QuorumTracker {
             acked_by,
             reply: Some(reply),
             lsn,
+            deadline: Instant::now() + self.quorum_timeout,
         };
 
         // Check if primary alone satisfies quorum (e.g., single replica)
@@ -163,6 +209,11 @@ impl QuorumTracker {
     /// Record an ACK from a secondary. If this causes quorum to be met,
     /// the operation is committed and the reply is sent.
     pub fn ack(&mut self, lsn: Lsn, replica_id: ReplicaId) {
+        // Deadline ordering is defined at tracker processing time. Expire due
+        // work first so an ACK processed at or after its deadline cannot
+        // revive an operation whose caller already received NoWriteQuorum.
+        self.expire_due(Instant::now());
+
         // Track per-replica progress
         self.replica_acked_lsn
             .entry(replica_id)
@@ -215,6 +266,8 @@ impl QuorumTracker {
                 _ => KubericError::Internal(error.to_string().into()),
             }));
         }
+        self.catch_up_active = false;
+        self.catch_up_failed = false;
     }
 
     /// Number of pending (uncommitted) operations.
@@ -234,10 +287,65 @@ impl QuorumTracker {
         mode: crate::types::ReplicaSetQuorumMode,
         reply: oneshot::Sender<Result<()>>,
     ) {
-        if self.is_caught_up(mode) {
+        if self.catch_up_attempt_failed() {
+            let _ = reply.send(Err(KubericError::NoWriteQuorum));
+        } else if self.is_caught_up(mode) {
             let _ = reply.send(Ok(()));
         } else {
-            self.catch_up_waiters.push(CatchUpWaiter { mode, reply });
+            self.catch_up_waiters.push(CatchUpWaiter {
+                mode,
+                reply,
+                deadline: Instant::now() + self.quorum_timeout,
+            });
+        }
+    }
+
+    /// Earliest pending operation or catch-up deadline.
+    ///
+    /// The actor-owned expiration scheduler uses this to sleep once for all
+    /// tracked work instead of spawning a task per operation.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.pending
+            .values()
+            .map(|op| op.deadline)
+            .chain(self.catch_up_waiters.iter().map(|waiter| waiter.deadline))
+            .min()
+    }
+
+    /// Fail all work whose deadline has elapsed.
+    pub fn expire_due(&mut self, now: Instant) {
+        let expired_lsns: Vec<Lsn> = self
+            .pending
+            .iter()
+            .filter_map(|(&lsn, op)| (op.deadline <= now).then_some(lsn))
+            .collect();
+
+        if self.catch_up_active && !expired_lsns.is_empty() {
+            self.catch_up_failed = true;
+        }
+
+        for lsn in expired_lsns {
+            if let Some(mut op) = self.pending.remove(&lsn) {
+                if let Some(reply) = op.reply.take() {
+                    let _ = reply.send(Err(KubericError::NoWriteQuorum));
+                }
+            }
+        }
+
+        if self.catch_up_waiters.is_empty() {
+            return;
+        }
+
+        let catch_up_attempt_failed = self.catch_up_attempt_failed();
+        let waiters = std::mem::take(&mut self.catch_up_waiters);
+        for waiter in waiters {
+            if catch_up_attempt_failed || waiter.deadline <= now {
+                let _ = waiter.reply.send(Err(KubericError::NoWriteQuorum));
+            } else if self.is_caught_up(waiter.mode) {
+                let _ = waiter.reply.send(Ok(()));
+            } else {
+                self.catch_up_waiters.push(waiter);
+            }
         }
     }
 
@@ -273,16 +381,31 @@ impl QuorumTracker {
         true
     }
 
+    fn catch_up_attempt_failed(&self) -> bool {
+        self.catch_up_failed
+    }
+
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
 
     fn is_quorum_met(&self, acked_by: &HashSet<ReplicaId>) -> bool {
+        // A zero quorum means the primary has not received a configuration
+        // yet. Do not let writes racing promotion commit against an empty
+        // replica set.
+        if self.current_write_quorum == 0 {
+            return false;
+        }
+
         let cc_met =
             self.count_acks_in_set(acked_by, &self.current_members) >= self.current_write_quorum;
 
         if self.previous_members.is_empty() {
             return cc_met;
+        }
+
+        if self.previous_write_quorum == 0 {
+            return false;
         }
 
         let pc_met =
@@ -314,7 +437,9 @@ impl QuorumTracker {
         }
         let waiters = std::mem::take(&mut self.catch_up_waiters);
         for waiter in waiters {
-            if self.is_caught_up(waiter.mode) {
+            if self.catch_up_attempt_failed() {
+                let _ = waiter.reply.send(Err(KubericError::NoWriteQuorum));
+            } else if self.is_caught_up(waiter.mode) {
                 let _ = waiter.reply.send(Ok(()));
             } else {
                 self.catch_up_waiters.push(waiter);
@@ -346,6 +471,22 @@ impl Default for QuorumTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_unconfigured_quorum_does_not_commit() {
+        let mut tracker = QuorumTracker::new();
+        let (tx, mut rx) = oneshot::channel();
+
+        tracker.register(1, 1, tx);
+
+        assert_eq!(tracker.pending_count(), 1);
+        assert!(rx.try_recv().is_err());
+
+        tracker.set_current_configuration(HashSet::from([1]), 1);
+
+        assert_eq!(rx.await.unwrap().unwrap(), 1);
+        assert_eq!(tracker.committed_lsn(), 1);
+    }
 
     #[tokio::test]
     async fn test_single_replica_commits_immediately() {
@@ -472,6 +613,8 @@ mod tests {
         assert!(matches!(result2, Err(KubericError::NotPrimary)));
 
         assert_eq!(tracker.pending_count(), 0);
+        assert!(!tracker.catch_up_active);
+        assert!(!tracker.catch_up_failed);
     }
 
     #[tokio::test]
@@ -539,5 +682,312 @@ mod tests {
         tracker.ack(1, 3);
         let result = wait_rx.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pending_operations_expire_with_no_write_quorum() {
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        tracker.register(1, 1, tx1);
+        tracker.register(2, 1, tx2);
+
+        assert_eq!(tracker.pending_count(), 2);
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+
+        assert!(matches!(
+            rx1.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+        assert!(matches!(
+            rx2.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+        assert_eq!(tracker.pending_count(), 0);
+        assert_eq!(tracker.committed_lsn(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_write_timeout_outside_catch_up_does_not_latch_failure() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (op_tx, op_rx) = oneshot::channel();
+        tracker.register(1, 1, op_tx);
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+        assert!(matches!(
+            op_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+
+        let (wait_tx, wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+        assert!(wait_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_ack_before_deadline_succeeds() {
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (tx, rx) = oneshot::channel();
+        tracker.register(1, 1, tx);
+        tokio::time::advance(timeout - Duration::from_millis(1)).await;
+        tracker.ack(1, 2);
+
+        assert_eq!(rx.await.unwrap().unwrap(), 1);
+        assert_eq!(tracker.committed_lsn(), 1);
+        assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_late_ack_is_harmless_and_later_write_is_independent() {
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (expired_tx, expired_rx) = oneshot::channel();
+        tracker.register(1, 1, expired_tx);
+        tokio::time::advance(timeout).await;
+        tracker.ack(1, 2);
+
+        assert!(matches!(
+            expired_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+        assert_eq!(tracker.committed_lsn(), 0);
+
+        let (next_tx, next_rx) = oneshot::channel();
+        tracker.register(2, 1, next_tx);
+        tracker.ack(2, 3);
+
+        assert_eq!(next_rx.await.unwrap().unwrap(), 2);
+        assert_eq!(tracker.committed_lsn(), 2);
+        assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_catch_up_waiter_expires() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::new(),
+            0,
+            HashSet::from([2]),
+            HashMap::from([(2, 0)]),
+        );
+
+        let (op_tx, op_rx) = oneshot::channel();
+        tracker.register(1, 1, op_tx);
+        tracker.ack(1, 3);
+        assert_eq!(op_rx.await.unwrap().unwrap(), 1);
+
+        let (wait_tx, wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+
+        assert!(matches!(
+            wait_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_operation_expiration_fails_active_catch_up_attempt() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::new(),
+            0,
+            HashSet::new(),
+            HashMap::new(),
+        );
+
+        let (op_tx, op_rx) = oneshot::channel();
+        tracker.register(1, 1, op_tx);
+        let (wait_tx, wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+
+        assert!(matches!(
+            op_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+        assert!(matches!(
+            wait_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+
+        let (same_attempt_tx, same_attempt_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, same_attempt_tx);
+        assert!(matches!(
+            same_attempt_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+
+        // Explicitly roll back/finalize the failed attempt before starting a
+        // new catch-up configuration and baseline.
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::new(),
+            0,
+            HashSet::new(),
+            HashMap::new(),
+        );
+        let (retry_tx, retry_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, retry_tx);
+        assert!(retry_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_preexisting_operation_expiration_fails_catch_up_attempt() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (op_tx, op_rx) = oneshot::channel();
+        tracker.register(1, 1, op_tx);
+
+        // Establishing a catch-up baseline while the write is already pending
+        // must not hide that write if it subsequently expires.
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::new(),
+            0,
+            HashSet::new(),
+            HashMap::new(),
+        );
+        let (wait_tx, wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+
+        assert!(matches!(
+            op_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+        assert!(matches!(
+            wait_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reconfiguration_does_not_reset_operation_deadline() {
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        tracker.set_current_configuration(HashSet::from([1, 2, 3]), 2);
+
+        let (tx, rx) = oneshot::channel();
+        tracker.register(1, 1, tx);
+        let original_deadline = tracker.next_deadline().unwrap();
+        tokio::time::advance(Duration::from_millis(50)).await;
+
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2, 3]),
+            2,
+            HashSet::from([1, 2]),
+            2,
+            HashSet::new(),
+            HashMap::new(),
+        );
+        assert_eq!(tracker.next_deadline(), Some(original_deadline));
+
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tracker.expire_due(Instant::now());
+        assert!(matches!(
+            rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_duplicate_catch_up_update_does_not_clear_failure() {
+        use crate::types::ReplicaSetQuorumMode;
+
+        let timeout = Duration::from_millis(100);
+        let mut tracker = QuorumTracker::with_timeout(timeout);
+        let current = HashSet::from([1, 2, 3]);
+
+        tracker.set_catch_up_configuration(
+            current.clone(),
+            2,
+            HashSet::new(),
+            0,
+            HashSet::from([2]),
+            HashMap::from([(2, 0)]),
+        );
+        let (op_tx, op_rx) = oneshot::channel();
+        tracker.register(1, 1, op_tx);
+        tokio::time::advance(timeout).await;
+        tracker.expire_due(Instant::now());
+        assert!(matches!(
+            op_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+
+        tracker.set_catch_up_configuration(
+            current,
+            2,
+            HashSet::new(),
+            0,
+            HashSet::from([2]),
+            HashMap::from([(2, 0)]),
+        );
+        let (wait_tx, wait_rx) = oneshot::channel();
+        tracker.wait_for_catch_up(ReplicaSetQuorumMode::Write, wait_tx);
+        assert!(matches!(
+            wait_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_configuration_relaxation_commits_pending_operation() {
+        let mut tracker = QuorumTracker::with_timeout(Duration::from_secs(1));
+        tracker.set_catch_up_configuration(
+            HashSet::from([1]),
+            1,
+            HashSet::from([1, 2]),
+            2,
+            HashSet::new(),
+            HashMap::new(),
+        );
+
+        let (tx, rx) = oneshot::channel();
+        tracker.register(1, 1, tx);
+        assert_eq!(tracker.pending_count(), 1);
+
+        tracker.set_current_configuration(HashSet::from([1]), 1);
+
+        assert_eq!(rx.await.unwrap().unwrap(), 1);
+        assert_eq!(tracker.committed_lsn(), 1);
+        assert_eq!(tracker.pending_count(), 0);
     }
 }

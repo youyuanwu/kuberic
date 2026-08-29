@@ -33,7 +33,7 @@ Layer 1: Component unit tests
 
 Test individual components in isolation. Fast, deterministic.
 
-### QuorumTracker (`replicator/quorum.rs` — 7 tests)
+### QuorumTracker (`replicator/quorum.rs` — 16 tests)
 
 | Test | What It Validates |
 |------|-------------------|
@@ -44,6 +44,9 @@ Test individual components in isolation. Fast, deterministic.
 | `test_fail_all` | Role change / close fails all pending operations |
 | `test_must_catch_up_enforcement` | Write mode: specific replica must individually ACK |
 | `test_wait_catch_up_all_mode` | All mode: every member must ACK |
+| Timeout tests (3) | Operation expiration, ACK boundary, late ACK safety, independent later writes |
+| Catch-up timeout tests (3) | Waiter expiration, active-attempt failure and retry baseline |
+| Configuration safety tests (3) | Deadline preservation, duplicate catch-up safety, quorum-relaxation commit |
 
 **Infrastructure:** Direct `QuorumTracker` construction, no actors or gRPC.
 
@@ -255,7 +258,6 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 | Partial update_epoch failure (some replicas fenced, others not) | Protocol safety | A1 |
 | Promotion failure after fencing | Protocol safety | A3 |
 | gRPC ordering violations | Protocol safety | A4 |
-| Replication stream death mid-operation | Operational | B0 |
 | Build/catch-up stall detection | Operational | A5 |
 | gRPC handle reconnection after pod restart | Operational | B3 |
 | Concurrent reconciliation (race conditions) | Operational | B4 |
@@ -316,11 +318,11 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 
 | Layer | API | Behavior |
 |-------|-----|----------|
-| **Driver-level** | `KvPod::crash()` / `SqlitePod::crash()` | Aborts PodRuntime + service tasks. gRPC breaks immediately. Instance becomes unusable. |
+| **Driver-level** | `KvPod::crash()` / `SqlitePod::crash()` | Aborts PodRuntime + service owner tasks. Useful for lifecycle tests, but independently spawned replication/drain tasks can survive; do not use it to inject ACK-path loss. |
 | **Driver-level** | `KvPod::restart(id)` / `SqlitePod::restart(id)` | Crash + start fresh pod on same `data_dir`. Returns new pod with new ports. |
 | **Reconciler-level** | `KvClusterApi::crash_pod(name)` | Aborts tasks, marks Pod NotReady, preserves `data_dir` in `data_dirs` map (PVC simulation). |
 | **Reconciler-level** | `KvClusterApi::restart_pod(name)` | Fresh PodRuntime on new ports, reuses saved `data_dir` (PVC re-attach), marks Ready. |
-| **Legacy (low fidelity)** | `handle.close()` | Graceful shutdown — not a real crash. |
+| **ACK-path failure** | `handle.close()` | Graceful shutdown, not a real crash, but deterministically stops persisted replication ACKs and is used for B0 quorum-loss coverage. |
 | **Legacy (low fidelity)** | `mark_pod_not_ready(name)` | Flips readiness flag but LivePod keeps running. |
 
 ### Reconciler Health Check (E3 fix)
@@ -360,8 +362,12 @@ crash primary, `failover()`, start new pod, `add_replica()`.
 `test_reconciler_double_failover` in `reconciler.rs`: both use
 `crash_pod()` for high-fidelity simulation.
 
-**Pattern 5: Simultaneous crash (quorum loss)**
-Blocked on B0 (QuorumTracker timeout).
+**Pattern 5: Simultaneous ACK-path loss (quorum loss)** ✅
+`test_b0_simultaneous_secondary_loss_returns_no_write_quorum` closes
+both secondary ACK paths and verifies that the write returns
+`NoWriteQuorum` within a bound. A companion test races an in-flight write
+with both closes and verifies success-before-loss or bounded failure, never
+an indefinite wait.
 
 **Pattern 6: Crash during switchover (A3 rollback)**
 `test_switchover_rollback_on_target_failure` uses `handle.close()`.
@@ -369,6 +375,5 @@ Could be upgraded to `crash()` for higher fidelity.
 
 ### Remaining Work
 
-- **Pattern 5** — quorum loss (blocked on B0 QuorumTracker timeout)
 - **WAL recovery tests** — blocked on Option C implementation
 - **`restartCount` tracking** — add to `MemberStatus` CRD for observability

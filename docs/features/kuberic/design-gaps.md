@@ -135,13 +135,13 @@ failure or timeout, the driver re-promotes the old primary via
 `change_role(new_epoch, Primary)` — matching SF's `RevertConfiguration()`
 pattern. The old primary becomes primary in the new epoch, which is safe.
 
-**Remaining:** After rollback, the quorum configuration is stale (still
-expects secondary ACKs from the old config). The reconciler must
-reconfigure the quorum on the next reconcile cycle. The partition is
-recoverable (primary exists) but writes hang until reconfigured.
+**Rollback completion:** The driver restores the last current configuration
+after re-promoting the old primary. This ends any partial catch-up attempt and
+re-grants writes when the surviving configuration can still reach quorum.
 
 **Test:** Close the switchover target before switchover → promotion fails
-→ verify old primary is re-promoted (primary_id restored).
+→ verify old primary is re-promoted, its configuration is restored, and a
+surviving secondary can still provide write quorum.
 
 **Design:**
 - **Switchover:** If target promotion fails, rollback:
@@ -206,8 +206,10 @@ benefit since the driver is single-threaded per-partition.
    minutes to hours.
 
 2. **`wait_for_catch_up_quorum`** — blocks until the must_catch_up replica
-   ACKs all ops. If the replica is slow (large backlog) or dead (stream
-   broke — see B0), this hangs forever.
+   ACKs all ops. B0 now applies a fixed deadline and returns
+   `NoWriteQuorum` if catch-up is incomplete when it expires, but a slow
+   replica can still occupy the operator synchronously until completion or
+   the deadline.
 
 Both have the same consequences:
 - **Reconciler stall** — blocked on `.await`, no health checks or
@@ -236,7 +238,7 @@ The FM monitors overall health (via heartbeats), not build progress.
 ```
 Current (synchronous, blocking):
   operator ──BuildReplica RPC──► primary (blocks for hours) ──► response
-  operator ──WaitForCatchUp RPC──► primary (blocks forever) ──► response
+  operator ──WaitForCatchUp RPC──► primary (blocks until done/timeout) ──► response
 
 SF-aligned (fire-and-retry):
   operator ──BuildReplica RPC──► primary (returns immediately)
@@ -300,7 +302,7 @@ hang, leak resources, or fail to recover.
 
 ### B0. Replication Stream Failure Goes Undetected
 
-**Severity:** 🟡 Medium (reduced — `send_to_all` cleanup already implemented)
+**Severity:** 🟡 Medium (reduced — write timeout and dead-send cleanup fixed)
 **Affects:** `PrimarySender`, `WalReplicatorActor`, operator reconciler
 **Files:** `primary.rs`, `actor.rs`, `reconciler.rs`
 
@@ -312,6 +314,13 @@ stream. When it breaks, detection is partial:
   `item_tx.send().is_err()`, logs a warning, and **removes the dead
   connection** from `PrimarySender::connections`. This was implemented
   during the non-blocking send work.
+- `QuorumTracker` gives every operation a deadline (5 seconds by default).
+  An operation that has not reached quorum expires with `NoWriteQuorum`;
+  late ACKs are harmless and later operations have independent deadlines.
+- Catch-up quorum waiters use the same bounded behavior. An expired operation
+  fails the active catch-up attempt. Duplicate catch-up updates preserve the
+  baseline; rollback/finalization must end the failed attempt before a later
+  retry establishes a new baseline.
 
 **No auto-reconnection (intentional, matching SF):**
 When a connection is removed, the secondary silently drops out of
@@ -335,25 +344,14 @@ but its replication stream dead (e.g., network partition between pods).
 
 1. **ACK reader exits silently** — the spawned ACK reader task
    (primary.rs:93) logs a warning and exits. No callback to the actor.
-   However, the dead connection IS removed on the next `send_to_all()`
-   call (send fails → cleanup). So the gap is timing: between the ACK
-   reader dying and the next write, the connection appears alive.
+   The independent request drain can remain open, so a later
+   `send_to_all()` is not guaranteed to discover the dead ACK path.
 
-2. **QuorumTracker has no per-operation timeout** — if ALL secondaries
-   die, `replicate()` hangs forever. With 3 replicas (quorum=2), losing
-   one secondary is fine (quorum still met). Losing both means writes
-   hang. In practice, the reconciler detects pod failures (NotReady) and
-   triggers failover before both streams die simultaneously.
-
-3. **Operator can't detect replication health** — pods can be Ready but
+2. **Operator can't detect replication health** — pods can be Ready but
    replication broken. `GetStatus` doesn't report replication stream
    status. The reconciler only checks pod readiness.
 
 **Remaining design (for production hardening):**
-
-- **Per-operation timeout in QuorumTracker:** `register()` should accept
-  a timeout. If quorum ACK doesn't arrive, fail with `NoWriteQuorum`
-  instead of hanging. This is the most important remaining fix.
 
 - **Replication health in GetStatus:** Add `connected_secondaries` count
   or per-replica replication status to the GetStatus response. The
@@ -362,9 +360,9 @@ but its replication stream dead (e.g., network partition between pods).
   reports its health, the operator acts on it.
 
 - **ACK reader death notification** (nice-to-have): When the ACK reader
-  exits, notify the actor to proactively remove the connection. Currently
-  cleanup happens lazily on the next `send_to_all()`, which is fine for
-  most workloads.
+  exits, notify the actor to proactively remove the connection. Without that
+  signal the sender can continue to appear connected while acknowledgements
+  are no longer arriving.
 
 **SF failure detection model (for reference):**
 
@@ -749,13 +747,13 @@ design work needed — just implementation.
 | Category | Count | Top Priority |
 |----------|-------|-------------|
 | A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ✅** |
-| B: Operational Resilience (needs design) | 6 | B0 partially fixed (QuorumTracker timeout remaining), **B5 ✅**, B2 timeouts |
+| B: Operational Resilience (needs design) | 6 | B0 bounded writes fixed (health reporting remains), **B5 ✅**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 5 | **C0 ✅ fixed**, C1 stale ACKs, **C4 ChangeRole(None) cleanup** |
 | D: Already Designed (implement only) | 14 | Data loss protocol, operator restart |
 | **Total** | **31** | |
 
 **Recommended order:**
-1. B0 QuorumTracker timeout — prevents write hangs on dual stream failure
+1. **B0 QuorumTracker timeout ✅** — bounded writes and catch-up waits implemented; replication health reporting remains
 2. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
 3. B2 (short RPC timeouts) — prevents hangs on control-plane calls
 4. A3 failover candidate retry — failover resilience

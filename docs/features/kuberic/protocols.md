@@ -374,7 +374,8 @@ Neither stream reconnects on failure:
 |---|---|---|
 | GetLSN + Catchup | ReconfigPending | ReconfigPending |
 | Catchup done | **Granted** | ReconfigPending |
-| Activate done | Granted | **Granted** |
+| Activate done | Granted | ReconfigPending |
+| Configuration installed | Granted | **Granted** |
 
 **During switchover (P→S on old primary):**
 
@@ -386,7 +387,9 @@ Neither stream reconnects on failure:
 | Role changed | NotPrimary | NotPrimary | `change_role(ActiveSecondary)` → `close_all()` |
 
 **Runtime owns status transitions** — the replicator only writes LSN values
-to `PartitionState`. See `pod.rs::set_status_for_role()`.
+to `PartitionState`. Role transitions set the initial access state, and a
+successful catch-up/current configuration update grants primary writes. See
+`pod.rs::set_status_for_role()` and the configuration command handlers.
 
 ---
 
@@ -491,6 +494,8 @@ struct QuorumTracker {
     replica_acked_lsn: HashMap<ReplicaId, Lsn>,  // per-replica highest ACKed LSN
     catch_up_baseline_lsn: Lsn,           // highest_lsn at set_catch_up time
     catch_up_waiters: Vec<CatchUpWaiter>,  // blocked wait_for_catch_up callers
+    quorum_timeout: Duration,              // per-operation/waiter deadline
+    catch_up_failed: bool,                 // active catch-up attempt saw expiry
 }
 ```
 
@@ -519,10 +524,27 @@ Primary calls replicate(data):
   │    │    NO  → keep waiting
   │    └─ After commit: try_commit_pending() checks if other ops can now commit
   │
-  └─ User's replicate() call resolves with Ok(lsn) or Err
+  ├─ Actor-owned scheduler expires the operation if its deadline arrives
+  │    ├─ Removes it from pending
+  │    ├─ Replies with Err(NoWriteQuorum)
+  │    └─ Marks the active catch-up attempt failed
+  │
+  └─ User's replicate() call resolves with Ok(lsn) or Err(NoWriteQuorum)
 ```
 
+The default quorum deadline is 5 seconds and can be overridden through
+`WalReplicatorOptions`. ACK and expiration processing share the tracker
+mutex. An ACK processed at or after its deadline cannot reverse a timeout.
+`NoWriteQuorum` means quorum was not observed by the deadline; fewer than
+quorum replicas may already have persisted the operation.
+
 ### Catch-Up Completion Check
+
+Catch-up waiters also carry deadlines. They return `NoWriteQuorum` when their
+deadline expires or when an operation expires during the active catch-up
+attempt. Repeating `set_catch_up_configuration()` during the same attempt does
+not move the baseline or clear failure. `set_current_configuration()` ends the
+attempt; a later catch-up update then establishes a new baseline.
 
 `wait_for_catch_up()` registers a waiter. On every commit and every ACK,
 `notify_catch_up_waiters()` re-checks all waiters via `is_caught_up()`:

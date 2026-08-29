@@ -1,10 +1,32 @@
 use std::time::Duration;
 
 use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
+use kuberic_core::error::KubericError;
+use kuberic_core::types::{
+    ReplicaInfo, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
+};
 use serial_test::serial;
 
 use kvstore::proto;
 use kvstore::testing::{KvPod, connect_kv_client};
+
+fn replica_info(
+    id: i64,
+    role: Role,
+    address: &str,
+    current_progress: i64,
+    must_catch_up: bool,
+) -> ReplicaInfo {
+    ReplicaInfo {
+        id,
+        role,
+        status: ReplicaStatus::Up,
+        replicator_address: address.to_owned(),
+        current_progress,
+        catch_up_capability: current_progress,
+        must_catch_up,
+    }
+}
 
 /// Operator-driven test: 3-replica partition, write on primary, verify via
 /// KV client, then failover and verify new primary works.
@@ -87,6 +109,204 @@ async fn test_operator_three_replica_failover() {
     assert_eq!(resp.get_ref().value, "survived");
 
     driver.delete_partition().await.unwrap();
+}
+
+/// B0: simultaneous loss of both secondary ACK paths must fail a write with
+/// NoWriteQuorum instead of leaving it pending forever.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_b0_simultaneous_secondary_loss_returns_no_write_quorum() {
+    let reply_timeout = Duration::from_secs(2);
+    let quorum_timeout = Duration::from_millis(200);
+    let pod1 = KvPod::start_with_timeouts(1, reply_timeout, quorum_timeout).await;
+    let pod2 = KvPod::start_with_timeouts(2, reply_timeout, quorum_timeout).await;
+    let pod3 = KvPod::start_with_timeouts(3, reply_timeout, quorum_timeout).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+    let h2_stop = pod2.replica_handle(2).await;
+    let h3_stop = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    kv.put(proto::PutRequest {
+        key: "healthy".into(),
+        value: "committed".into(),
+    })
+    .await
+    .unwrap();
+
+    let (secondary2, secondary3) = tokio::join!(h2_stop.close(), h3_stop.close());
+    secondary2.unwrap();
+    secondary3.unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        kv.put(proto::PutRequest {
+            key: "without-quorum".into(),
+            value: "must-not-hang".into(),
+        }),
+    )
+    .await
+    .expect("write exceeded outer test guard");
+    let status = result.expect_err("write unexpectedly reached quorum");
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert_eq!(status.message(), "no write quorum");
+}
+
+/// B0 race coverage: if secondary shutdown races an accepted write, success
+/// before loss and NoWriteQuorum after loss are both valid; hanging is not.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_b0_inflight_write_racing_secondary_loss_is_bounded() {
+    let reply_timeout = Duration::from_secs(2);
+    let quorum_timeout = Duration::from_millis(200);
+    let pod1 = KvPod::start_with_timeouts(1, reply_timeout, quorum_timeout).await;
+    let pod2 = KvPod::start_with_timeouts(2, reply_timeout, quorum_timeout).await;
+    let pod3 = KvPod::start_with_timeouts(3, reply_timeout, quorum_timeout).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+    let h2_stop = pod2.replica_handle(2).await;
+    let h3_stop = pod3.replica_handle(3).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    let write = tokio::time::timeout(
+        Duration::from_secs(2),
+        kv.put(proto::PutRequest {
+            key: "racing-write".into(),
+            value: "bounded".into(),
+        }),
+    );
+    let stop_secondaries = async {
+        tokio::task::yield_now().await;
+        let (secondary2, secondary3) = tokio::join!(h2_stop.close(), h3_stop.close());
+        secondary2.unwrap();
+        secondary3.unwrap();
+    };
+
+    let (write_result, ()) = tokio::join!(write, stop_secondaries);
+    match write_result.expect("write exceeded outer test guard") {
+        Ok(_) => {}
+        Err(status) => {
+            assert_eq!(status.code(), tonic::Code::Unavailable);
+            assert_eq!(status.message(), "no write quorum");
+        }
+    }
+}
+
+/// B0 catch-up coverage: a committed write can still leave a required replica
+/// behind. The remote catch-up call must preserve NoWriteQuorum and a later
+/// explicit configuration retry must not inherit the failed attempt.
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_b0_catch_up_timeout_preserves_error_and_allows_retry() {
+    let reply_timeout = Duration::from_secs(2);
+    let quorum_timeout = Duration::from_millis(200);
+    let pod1 = KvPod::start_with_timeouts(1, reply_timeout, quorum_timeout).await;
+    let pod2 = KvPod::start_with_timeouts(2, reply_timeout, quorum_timeout).await;
+    let pod3 = KvPod::start_with_timeouts(3, reply_timeout, quorum_timeout).await;
+
+    let h1 = pod1.replica_handle(1).await;
+    let h2 = pod2.replica_handle(2).await;
+    let h3 = pod3.replica_handle(3).await;
+    let primary_control = pod1.replica_handle(1).await;
+    let secondary2_stop = pod2.replica_handle(2).await;
+
+    let mut driver = PartitionDriver::new();
+    driver
+        .create_partition(vec![Box::new(h1), Box::new(h2), Box::new(h3)])
+        .await
+        .unwrap();
+
+    let mut kv = connect_kv_client(&pod1.client_address).await;
+    kv.put(proto::PutRequest {
+        key: "baseline".into(),
+        value: "one".into(),
+    })
+    .await
+    .unwrap();
+
+    secondary2_stop.close().await.unwrap();
+    let catch_up_config = ReplicaSetConfig {
+        members: vec![
+            replica_info(1, Role::Primary, &pod1.data_address, 1, false),
+            replica_info(2, Role::ActiveSecondary, &pod2.data_address, 1, true),
+            replica_info(3, Role::ActiveSecondary, &pod3.data_address, 1, false),
+        ],
+        write_quorum: 2,
+    };
+    primary_control
+        .update_catch_up_configuration(
+            catch_up_config,
+            ReplicaSetConfig {
+                members: Vec::new(),
+                write_quorum: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    kv.put(proto::PutRequest {
+        key: "replica-two-misses-this".into(),
+        value: "two".into(),
+    })
+    .await
+    .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        primary_control.wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write),
+    )
+    .await
+    .expect("catch-up exceeded outer test guard");
+    assert!(matches!(result, Err(KubericError::NoWriteQuorum)));
+
+    let retry_config = ReplicaSetConfig {
+        members: vec![
+            replica_info(1, Role::Primary, &pod1.data_address, 2, false),
+            replica_info(3, Role::ActiveSecondary, &pod3.data_address, 2, false),
+        ],
+        write_quorum: 2,
+    };
+    // Explicitly end the failed dual-configuration attempt before starting a
+    // retry. Repeating set_catch_up_configuration alone must not move the
+    // baseline past a lagging required replica.
+    primary_control
+        .update_current_configuration(retry_config.clone())
+        .await
+        .unwrap();
+    primary_control
+        .update_catch_up_configuration(
+            retry_config.clone(),
+            ReplicaSetConfig {
+                members: Vec::new(),
+                write_quorum: 0,
+            },
+        )
+        .await
+        .unwrap();
+    primary_control
+        .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
+        .await
+        .unwrap();
+    primary_control
+        .update_current_configuration(retry_config)
+        .await
+        .unwrap();
 }
 
 /// Operator-driven test: switchover from primary to a chosen secondary,
@@ -499,13 +719,14 @@ async fn test_a3_switchover_rollback_on_target_failure() {
         "old primary should be re-promoted after rollback"
     );
 
-    // NOTE: Writing after rollback would hang because the quorum
-    // configuration still requires secondary ACKs but no secondaries
-    // are connected (fresh PrimarySender). In production, the
-    // reconciler would reconfigure the quorum after the failed
-    // switchover. This test verifies the rollback itself — the
-    // partition is recoverable (primary exists), not stuck
-    // (no primary at all).
+    // Rollback also restores the current configuration and write status.
+    // Pod 3 still supplies quorum, so the old primary must remain writable.
+    kv1.put(proto::PutRequest {
+        key: "after-rollback".into(),
+        value: "ok".into(),
+    })
+    .await
+    .unwrap();
 }
 
 /// Crash the primary, failover to a secondary, then restart the old

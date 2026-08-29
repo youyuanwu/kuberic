@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::{Mutex as TokioMutex, mpsc};
+use tokio::sync::{Mutex as TokioMutex, Notify, mpsc};
 use tracing::{info, warn};
 
 use crate::error::KubericError;
@@ -9,8 +10,8 @@ use crate::events::{ReplicateRequest, ReplicatorControlEvent, StateProviderEvent
 use crate::handles::PartitionState;
 use crate::replicator::primary::PrimarySender;
 use crate::replicator::queue::ReplicationQueue;
-use crate::replicator::quorum::QuorumTracker;
-use crate::types::{DataLossAction, Epoch, Lsn, ReplicaId, Role};
+use crate::replicator::quorum::{DEFAULT_QUORUM_TIMEOUT, QuorumTracker};
+use crate::types::{CancellationToken, DataLossAction, Epoch, Lsn, ReplicaId, Role};
 
 /// The WalReplicator actor. Processes control and data events in a single
 /// loop with biased select (control has priority). The data path is
@@ -21,11 +22,19 @@ use crate::types::{DataLossAction, Epoch, Lsn, ReplicaId, Role};
 /// matching SF's ReplicationQueueManager pattern.
 pub struct WalReplicatorActor {
     replica_id: ReplicaId,
+    quorum_timeout: Duration,
 }
 
 impl WalReplicatorActor {
     pub fn new(replica_id: ReplicaId) -> Self {
-        Self { replica_id }
+        Self::with_quorum_timeout(replica_id, DEFAULT_QUORUM_TIMEOUT)
+    }
+
+    pub fn with_quorum_timeout(replica_id: ReplicaId, quorum_timeout: Duration) -> Self {
+        Self {
+            replica_id,
+            quorum_timeout,
+        }
     }
 
     #[allow(unused_assignments)]
@@ -39,7 +48,16 @@ impl WalReplicatorActor {
         let mut role = Role::Unknown;
         let mut epoch = Epoch::default();
         let mut next_lsn: Lsn = 1;
-        let quorum_tracker = Arc::new(TokioMutex::new(QuorumTracker::new()));
+        let quorum_tracker = Arc::new(TokioMutex::new(QuorumTracker::with_timeout(
+            self.quorum_timeout,
+        )));
+        let expiration_wakeup = Arc::new(Notify::new());
+        let expiration_shutdown = CancellationToken::new();
+        let expiration_task = tokio::spawn(run_expiration_scheduler(
+            quorum_tracker.clone(),
+            expiration_wakeup.clone(),
+            expiration_shutdown.clone(),
+        ));
         let mut primary_sender: Option<PrimarySender> = None;
         let mut replication_queue = ReplicationQueue::new();
 
@@ -77,6 +95,7 @@ impl WalReplicatorActor {
                             role: new_role,
                             reply,
                         } => {
+                            let was_primary = role == Role::Primary;
                             info!(
                                 replica_id = self.replica_id,
                                 ?new_role,
@@ -96,7 +115,21 @@ impl WalReplicatorActor {
                             role = new_role;
 
                             if role == Role::Primary {
-                                primary_sender = Some(PrimarySender::new(self.replica_id, epoch));
+                                if was_primary {
+                                    if let Some(sender) = &mut primary_sender {
+                                        sender.set_epoch(epoch);
+                                    }
+                                } else {
+                                    let current_progress = state.current_progress();
+                                    let committed_lsn = state.committed_lsn();
+                                    quorum_tracker
+                                        .lock()
+                                        .await
+                                        .seed_progress(current_progress, committed_lsn);
+                                    next_lsn = next_lsn.max(current_progress + 1);
+                                    primary_sender =
+                                        Some(PrimarySender::new(self.replica_id, epoch));
+                                }
                             }
 
                             let _ = reply.send(Ok(()));
@@ -168,6 +201,9 @@ impl WalReplicatorActor {
                                 must_catch_up,
                                 member_progress,
                             );
+                            let tracker_committed =
+                                quorum_tracker.lock().await.committed_lsn();
+                            state.advance_committed_lsn(tracker_committed);
 
                             // Connect new secondaries and replay pending ops
                             if let Some(sender) = &mut primary_sender {
@@ -231,6 +267,9 @@ impl WalReplicatorActor {
                                 cc_members.clone(),
                                 current.write_quorum,
                             );
+                            let tracker_committed =
+                                quorum_tracker.lock().await.committed_lsn();
+                            state.advance_committed_lsn(tracker_committed);
 
                             if let Some(sender) = &mut primary_sender {
                                 let to_remove: Vec<ReplicaId> = sender
@@ -253,6 +292,7 @@ impl WalReplicatorActor {
                         }
                         ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply } => {
                             quorum_tracker.lock().await.wait_for_catch_up(mode, reply);
+                            expiration_wakeup.notify_one();
                         }
                         ReplicatorControlEvent::BuildReplica { replica, reply } => {
                             // Replication queue ops are replayed at add_secondary time.
@@ -309,8 +349,12 @@ impl WalReplicatorActor {
                     }
                 }
 
-                req = data_rx.recv(), if role == Role::Primary => {
+                req = data_rx.recv() => {
                     let Some(req) = req else { break };
+                    if role != Role::Primary {
+                        let _ = req.reply.send(Err(KubericError::NotPrimary));
+                        continue;
+                    }
                     let lsn = next_lsn;
                     next_lsn += 1;
 
@@ -319,6 +363,7 @@ impl WalReplicatorActor {
 
                     // Register with quorum tracker (primary's own ACK counted)
                     quorum_tracker.lock().await.register(lsn, self.replica_id, req.reply);
+                    expiration_wakeup.notify_one();
 
                     // Read committed_lsn AFTER register — the registration may
                     // have triggered immediate commit (single replica case), and
@@ -326,7 +371,7 @@ impl WalReplicatorActor {
                     // ACK reader, advancing committed_lsn further.
                     let committed = quorum_tracker.lock().await.committed_lsn();
                     state.set_current_progress(lsn);
-                    state.set_committed_lsn(committed);
+                    state.advance_committed_lsn(committed);
 
                     // Non-blocking: send_to_all uses unbounded channels.
                     // Include committed_lsn so secondaries can track commit progress.
@@ -338,5 +383,491 @@ impl WalReplicatorActor {
                 else => break,
             }
         }
+
+        expiration_shutdown.cancel();
+        let _ = expiration_task.await;
+    }
+}
+
+async fn run_expiration_scheduler(
+    quorum_tracker: Arc<TokioMutex<QuorumTracker>>,
+    wakeup: Arc<Notify>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        let next_deadline = {
+            let mut tracker = quorum_tracker.lock().await;
+            tracker.expire_due(tokio::time::Instant::now());
+            tracker.next_deadline()
+        };
+        match next_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = wakeup.notified() => {}
+                    _ = tokio::time::sleep_until(deadline) => {
+                        quorum_tracker.lock().await.expire_due(tokio::time::Instant::now());
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = wakeup.notified() => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use tokio::sync::{mpsc, oneshot};
+
+    use crate::events::{ReplicateRequest, ReplicatorControlEvent, StateProviderEvent};
+    use crate::types::{Epoch, ReplicaInfo, ReplicaSetConfig, ReplicaStatus, Role};
+
+    struct ActorHarness {
+        control_tx: mpsc::Sender<ReplicatorControlEvent>,
+        data_tx: mpsc::Sender<ReplicateRequest>,
+        state: Arc<PartitionState>,
+        state_provider_rx: mpsc::UnboundedReceiver<StateProviderEvent>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl ActorHarness {
+        async fn start(timeout: Duration) -> Self {
+            let (control_tx, control_rx) = mpsc::channel(16);
+            let (data_tx, data_rx) = mpsc::channel(16);
+            let (state_provider_tx, state_provider_rx) = mpsc::unbounded_channel();
+            let state = Arc::new(PartitionState::new());
+
+            let actor = WalReplicatorActor::with_quorum_timeout(1, timeout);
+            let actor_state = state.clone();
+            let task = tokio::spawn(async move {
+                actor
+                    .run(control_rx, data_rx, actor_state, state_provider_tx)
+                    .await;
+            });
+
+            let (role_tx, role_rx) = oneshot::channel();
+            control_tx
+                .send(ReplicatorControlEvent::ChangeRole {
+                    epoch: Epoch::new(1, 1),
+                    role: Role::Primary,
+                    reply: role_tx,
+                })
+                .await
+                .unwrap();
+            role_rx.await.unwrap().unwrap();
+
+            let (config_tx, config_rx) = oneshot::channel();
+            control_tx
+                .send(ReplicatorControlEvent::UpdateCurrentConfiguration {
+                    current: three_replica_config(),
+                    reply: config_tx,
+                })
+                .await
+                .unwrap();
+            config_rx.await.unwrap().unwrap();
+
+            Self {
+                control_tx,
+                data_tx,
+                state,
+                state_provider_rx,
+                task,
+            }
+        }
+
+        async fn register_write(&self) -> oneshot::Receiver<crate::Result<Lsn>> {
+            let expected_lsn = self.state.current_progress() + 1;
+            let (reply, receiver) = oneshot::channel();
+            self.data_tx
+                .send(ReplicateRequest {
+                    data: Bytes::from_static(b"test"),
+                    reply,
+                })
+                .await
+                .unwrap();
+
+            while self.state.current_progress() < expected_lsn {
+                tokio::task::yield_now().await;
+            }
+            receiver
+        }
+    }
+
+    fn three_replica_config() -> ReplicaSetConfig {
+        ReplicaSetConfig {
+            members: [2, 3]
+                .into_iter()
+                .map(|id| ReplicaInfo {
+                    id,
+                    role: Role::ActiveSecondary,
+                    status: ReplicaStatus::Up,
+                    replicator_address: String::new(),
+                    current_progress: 0,
+                    catch_up_capability: 0,
+                    must_catch_up: false,
+                })
+                .collect(),
+            write_quorum: 2,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_expires_while_actor_waits_for_state_provider() {
+        let timeout = Duration::from_millis(100);
+        let mut harness = ActorHarness::start(timeout).await;
+        let write_rx = harness.register_write().await;
+
+        let (epoch_tx, epoch_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateEpoch {
+                epoch: Epoch::new(1, 2),
+                reply: epoch_tx,
+            })
+            .await
+            .unwrap();
+
+        let event = harness.state_provider_rx.recv().await.unwrap();
+        let StateProviderEvent::UpdateEpoch { reply, .. } = event else {
+            panic!("expected UpdateEpoch");
+        };
+
+        tokio::time::advance(timeout).await;
+        assert!(matches!(
+            write_rx.await.unwrap(),
+            Err(KubericError::NoWriteQuorum)
+        ));
+        assert_eq!(harness.state.current_progress(), 1);
+        assert_eq!(harness.state.committed_lsn(), 0);
+
+        reply.send(Ok(())).unwrap();
+        epoch_rx.await.unwrap().unwrap();
+
+        let (close_tx, close_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Close { reply: close_tx })
+            .await
+            .unwrap();
+        close_rx.await.unwrap().unwrap();
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oldest_write_expires_under_continuous_registration_wakeups() {
+        let timeout = Duration::from_millis(100);
+        let harness = ActorHarness::start(timeout).await;
+        let mut first_write_rx = harness.register_write().await;
+
+        // Keep registering work as the clock crosses the first write's
+        // deadline. Each registration notifies the scheduler, reproducing the
+        // wakeup traffic that must not starve expiration.
+        for _ in 0..100 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            drop(harness.register_write().await);
+        }
+        tokio::task::yield_now().await;
+
+        assert!(matches!(
+            first_write_rx.try_recv(),
+            Ok(Err(KubericError::NoWriteQuorum))
+        ));
+
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn configuration_updates_do_not_regress_partition_committed_lsn() {
+        let harness = ActorHarness::start(Duration::from_secs(1)).await;
+        harness.state.set_committed_lsn(9);
+        let config = ReplicaSetConfig {
+            members: Vec::new(),
+            write_quorum: 1,
+        };
+
+        let (catch_up_tx, catch_up_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateCatchUpConfiguration {
+                current: config.clone(),
+                previous: ReplicaSetConfig {
+                    members: Vec::new(),
+                    write_quorum: 0,
+                },
+                reply: catch_up_tx,
+            })
+            .await
+            .unwrap();
+        catch_up_rx.await.unwrap().unwrap();
+        assert_eq!(harness.state.committed_lsn(), 9);
+
+        let (current_tx, current_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateCurrentConfiguration {
+                current: config,
+                reply: current_tx,
+            })
+            .await
+            .unwrap();
+        current_rx.await.unwrap().unwrap();
+        assert_eq!(harness.state.committed_lsn(), 9);
+
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn promotion_seeds_progress_and_assigns_next_lsn() {
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (data_tx, data_rx) = mpsc::channel(16);
+        let (state_provider_tx, _state_provider_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(PartitionState::new());
+        state.set_current_progress(9);
+        state.set_committed_lsn(8);
+
+        let actor = WalReplicatorActor::with_quorum_timeout(1, Duration::from_secs(1));
+        let actor_state = state.clone();
+        let task = tokio::spawn(async move {
+            actor
+                .run(control_rx, data_rx, actor_state, state_provider_tx)
+                .await;
+        });
+
+        let (role_tx, role_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::ChangeRole {
+                epoch: Epoch::new(1, 1),
+                role: Role::Primary,
+                reply: role_tx,
+            })
+            .await
+            .unwrap();
+        role_rx.await.unwrap().unwrap();
+
+        let (config_tx, config_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::UpdateCurrentConfiguration {
+                current: ReplicaSetConfig {
+                    members: Vec::new(),
+                    write_quorum: 1,
+                },
+                reply: config_tx,
+            })
+            .await
+            .unwrap();
+        config_rx.await.unwrap().unwrap();
+
+        let (write_tx, write_rx) = oneshot::channel();
+        data_tx
+            .send(ReplicateRequest {
+                data: Bytes::from_static(b"after-promotion"),
+                reply: write_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(write_rx.await.unwrap().unwrap(), 10);
+        assert_eq!(state.current_progress(), 10);
+        assert_eq!(state.committed_lsn(), 10);
+
+        control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn promoted_primary_waits_for_configuration_before_committing() {
+        let (control_tx, control_rx) = mpsc::channel(16);
+        let (data_tx, data_rx) = mpsc::channel(16);
+        let (state_provider_tx, _state_provider_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(PartitionState::new());
+
+        let actor = WalReplicatorActor::with_quorum_timeout(1, Duration::from_secs(1));
+        let actor_state = state.clone();
+        let task = tokio::spawn(async move {
+            actor
+                .run(control_rx, data_rx, actor_state, state_provider_tx)
+                .await;
+        });
+
+        let (role_tx, role_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::ChangeRole {
+                epoch: Epoch::new(1, 1),
+                role: Role::Primary,
+                reply: role_tx,
+            })
+            .await
+            .unwrap();
+        role_rx.await.unwrap().unwrap();
+
+        let (write_tx, mut write_rx) = oneshot::channel();
+        data_tx
+            .send(ReplicateRequest {
+                data: Bytes::from_static(b"before-configuration"),
+                reply: write_tx,
+            })
+            .await
+            .unwrap();
+        while state.current_progress() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(write_rx.try_recv().is_err());
+        assert_eq!(state.committed_lsn(), 0);
+
+        let (config_tx, config_rx) = oneshot::channel();
+        control_tx
+            .send(ReplicatorControlEvent::UpdateCurrentConfiguration {
+                current: ReplicaSetConfig {
+                    members: Vec::new(),
+                    write_quorum: 1,
+                },
+                reply: config_tx,
+            })
+            .await
+            .unwrap();
+        config_rx.await.unwrap().unwrap();
+
+        assert_eq!(write_rx.await.unwrap().unwrap(), 1);
+        assert_eq!(state.committed_lsn(), 1);
+
+        control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn demotion_fails_pending_write_before_expiration() {
+        let harness = ActorHarness::start(Duration::from_secs(1)).await;
+        let write_rx = harness.register_write().await;
+
+        let (role_tx, role_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::ChangeRole {
+                epoch: Epoch::new(1, 2),
+                role: Role::ActiveSecondary,
+                reply: role_tx,
+            })
+            .await
+            .unwrap();
+        role_rx.await.unwrap().unwrap();
+
+        assert!(matches!(
+            write_rx.await.unwrap(),
+            Err(KubericError::NotPrimary)
+        ));
+        drop(harness.control_tx);
+        drop(harness.data_tx);
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn demotion_rejects_write_already_queued_in_data_channel() {
+        let mut harness = ActorHarness::start(Duration::from_secs(1)).await;
+
+        // Hold the actor inside a control branch while both a write and the
+        // demotion are queued. The biased select must process demotion first,
+        // then drain the write with NotPrimary rather than stranding it.
+        let (epoch_tx, epoch_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateEpoch {
+                epoch: Epoch::new(1, 2),
+                reply: epoch_tx,
+            })
+            .await
+            .unwrap();
+        let event = harness.state_provider_rx.recv().await.unwrap();
+        let StateProviderEvent::UpdateEpoch { reply, .. } = event else {
+            panic!("expected UpdateEpoch");
+        };
+
+        let (write_tx, write_rx) = oneshot::channel();
+        harness
+            .data_tx
+            .send(ReplicateRequest {
+                data: Bytes::from_static(b"stale"),
+                reply: write_tx,
+            })
+            .await
+            .unwrap();
+        let (role_tx, role_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::ChangeRole {
+                epoch: Epoch::new(1, 3),
+                role: Role::ActiveSecondary,
+                reply: role_tx,
+            })
+            .await
+            .unwrap();
+
+        reply.send(Ok(())).unwrap();
+        epoch_rx.await.unwrap().unwrap();
+        role_rx.await.unwrap().unwrap();
+        assert!(matches!(
+            write_rx.await.unwrap(),
+            Err(KubericError::NotPrimary)
+        ));
+        assert_eq!(harness.state.current_progress(), 0);
+
+        drop(harness.control_tx);
+        drop(harness.data_tx);
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_fails_pending_write_before_expiration() {
+        let harness = ActorHarness::start(Duration::from_secs(1)).await;
+        let write_rx = harness.register_write().await;
+
+        let (close_tx, close_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Close { reply: close_tx })
+            .await
+            .unwrap();
+        close_rx.await.unwrap().unwrap();
+
+        assert!(matches!(write_rx.await.unwrap(), Err(KubericError::Closed)));
+        harness.task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abort_fails_pending_write_before_expiration() {
+        let harness = ActorHarness::start(Duration::from_secs(1)).await;
+        let write_rx = harness.register_write().await;
+
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Abort)
+            .await
+            .unwrap();
+
+        assert!(matches!(write_rx.await.unwrap(), Err(KubericError::Closed)));
+        harness.task.await.unwrap();
     }
 }

@@ -172,6 +172,9 @@ message RawOperation {
 message CopyItem {
     int64 lsn = 1;
     bytes data = 2;
+    // Marks the authoritative snapshot boundary. Boundary items are protocol
+    // metadata and are not forwarded to the user copy stream.
+    bool is_boundary = 3;
 }
 
 message CopyStreamResponse {

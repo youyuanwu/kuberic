@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
+use kuberic_core::replicator::WalReplicatorOptions;
 use tokio::sync::RwLock;
 
 use crate::state::{KvState, SharedState};
@@ -25,11 +26,33 @@ pub struct KvPod {
 impl KvPod {
     /// Start a KV pod with a PodRuntime and the KV service event loop.
     pub async fn start(id: i64) -> Self {
-        Self::start_with_timeout(id, Duration::from_secs(5)).await
+        Self::start_with_timeout(id, Duration::from_secs(10)).await
     }
 
     /// Start with a custom reply timeout (for tests with heavy concurrent load).
     pub async fn start_with_timeout(id: i64, reply_timeout: Duration) -> Self {
+        Self::start_with_options(id, reply_timeout, WalReplicatorOptions::default()).await
+    }
+
+    /// Start with independent runtime reply and quorum timeouts.
+    pub async fn start_with_timeouts(
+        id: i64,
+        reply_timeout: Duration,
+        quorum_timeout: Duration,
+    ) -> Self {
+        Self::start_with_options(
+            id,
+            reply_timeout,
+            WalReplicatorOptions::new().quorum_timeout(quorum_timeout),
+        )
+        .await
+    }
+
+    async fn start_with_options(
+        id: i64,
+        reply_timeout: Duration,
+        replicator_options: WalReplicatorOptions,
+    ) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data_dir = std::env::temp_dir().join("kv-test").join(format!(
@@ -38,12 +61,27 @@ impl KvPod {
             std::process::id(),
             n
         ));
-        Self::start_with_dir(id, data_dir, reply_timeout).await
+        Self::start_with_dir_and_options(id, data_dir, reply_timeout, replicator_options).await
     }
 
     /// Start with a specific data directory (for restart tests).
     /// Pass a dir from a previous pod to exercise WAL recovery.
     pub async fn start_with_dir(id: i64, data_dir: PathBuf, reply_timeout: Duration) -> Self {
+        Self::start_with_dir_and_options(
+            id,
+            data_dir,
+            reply_timeout,
+            WalReplicatorOptions::default(),
+        )
+        .await
+    }
+
+    async fn start_with_dir_and_options(
+        id: i64,
+        data_dir: PathBuf,
+        reply_timeout: Duration,
+        replicator_options: WalReplicatorOptions,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client_address = listener.local_addr().unwrap().to_string();
         drop(listener);
@@ -71,8 +109,12 @@ impl KvPod {
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle =
-            tokio::spawn(crate::service::run_service(bundle.lifecycle_rx, st, bind));
+        let service_handle = tokio::spawn(crate::service::run_service_with_options(
+            bundle.lifecycle_rx,
+            st,
+            bind,
+            replicator_options,
+        ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -95,12 +137,13 @@ impl KvPod {
     }
 
     /// Simulate a pod crash. Aborts the PodRuntime and service without
-    /// graceful shutdown. All in-memory state is lost. gRPC connections
-    /// break with transport errors. The KvPod instance becomes unusable.
+    /// graceful shutdown. The KvPod instance becomes unusable, but tasks
+    /// independently spawned by the aborted owners can survive; use
+    /// `ReplicaHandle::close` when a test must stop replication ACKs.
     pub async fn crash(self) {
         self._runtime_handle.abort();
         self._service_handle.abort();
-        // Drop all fields — gRPC channels break immediately, state lost
+        // Drop the owned fields after aborting the two owner tasks.
     }
 
     /// Crash this pod and start a fresh one with the same replica ID

@@ -127,6 +127,19 @@ impl PartitionDriver {
         self.replicas.remove(&id).map(|s| s.handle)
     }
 
+    async fn abandon_failed_creation(&mut self) {
+        let replicas = std::mem::take(&mut self.replicas);
+        for entry in replicas.into_values() {
+            let _ = entry.handle.change_role(self.epoch, Role::None).await;
+            let _ = entry.handle.close().await;
+        }
+        self.primary_id = None;
+        self.current_config = ReplicaSetConfig {
+            members: Vec::new(),
+            write_quorum: 0,
+        };
+    }
+
     // -----------------------------------------------------------------------
     // Workflow: Create Partition
     // -----------------------------------------------------------------------
@@ -177,6 +190,19 @@ impl PartitionDriver {
         self.replicas.get_mut(&primary_id).unwrap().role = Role::Primary;
         self.primary_id = Some(primary_id);
 
+        // Install the initial primary-only configuration before exposing
+        // writes or building secondaries. A promoted actor starts
+        // unconfigured and must not treat quorum zero as success.
+        let mut config = ReplicaSetConfig {
+            members: vec![],
+            write_quorum: 1,
+        };
+        self.replicas[&primary_id]
+            .handle
+            .update_current_configuration(config.clone())
+            .await?;
+        self.current_config = config.clone();
+
         // 3. Secondaries → Idle
         for &id in &secondary_ids {
             let entry = &self.replicas[&id];
@@ -213,10 +239,6 @@ impl PartitionDriver {
         }
 
         // 6. Update configuration incrementally
-        let mut config = ReplicaSetConfig {
-            members: vec![],
-            write_quorum: 1,
-        };
         let mut ready_count: u32 = 1; // Primary
 
         for &id in &secondary_ids {
@@ -237,24 +259,32 @@ impl PartitionDriver {
 
             self.replicas[&primary_id]
                 .handle
-                .update_catch_up_configuration(config.clone(), prev_config)
+                .update_catch_up_configuration(config.clone(), prev_config.clone())
                 .await?;
 
             // Give gRPC connections time to establish (in-process only)
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            self.replicas[&primary_id]
+            if let Err(error) = self.replicas[&primary_id]
                 .handle
                 .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-                .await?;
+                .await
+            {
+                self.replicas[&primary_id]
+                    .handle
+                    .update_current_configuration(prev_config.clone())
+                    .await?;
+                self.current_config = prev_config;
+                self.abandon_failed_creation().await;
+                return Err(error);
+            }
 
             self.replicas[&primary_id]
                 .handle
                 .update_current_configuration(config.clone())
                 .await?;
+            self.current_config = config.clone();
         }
-
-        self.current_config = config;
 
         // Access status is set by each pod's PodRuntime during change_role()
 
@@ -414,10 +444,26 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&new_primary_id]
+        if let Err(error) = self.replicas[&new_primary_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            // The role transition has already completed, so the surviving
+            // configuration is the only valid rollback target. End the failed
+            // catch-up attempt to keep future reconciles retryable.
+            self.replicas[&new_primary_id]
+                .handle
+                .update_current_configuration(new_config.clone())
+                .await?;
+            self.current_config = new_config;
+            warn!(
+                new_primary = new_primary_id,
+                error = %error,
+                "failover catch-up timed out after promotion; finalized surviving configuration"
+            );
+            return Ok(());
+        }
 
         self.replicas[&new_primary_id]
             .handle
@@ -513,8 +559,11 @@ impl PartitionDriver {
                 self.replicas[&old_primary_id]
                     .handle
                     .change_role(self.epoch, Role::Primary)
-                    .await
-                    .ok();
+                    .await?;
+                self.replicas[&old_primary_id]
+                    .handle
+                    .update_current_configuration(self.current_config.clone())
+                    .await?;
                 return Err(KubericError::Internal(
                     "switchover catchup timeout — target did not catch up".into(),
                 ));
@@ -555,6 +604,20 @@ impl PartitionDriver {
             self.replicas[&old_primary_id]
                 .handle
                 .change_role(new_epoch, Role::Primary)
+                .await?;
+            self.replicas[&old_primary_id]
+                .handle
+                .update_catch_up_configuration(
+                    self.current_config.clone(),
+                    ReplicaSetConfig {
+                        members: Vec::new(),
+                        write_quorum: 0,
+                    },
+                )
+                .await?;
+            self.replicas[&old_primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
                 .await?;
             self.replicas.get_mut(&old_primary_id).unwrap().role = Role::Primary;
             self.primary_id = Some(old_primary_id);
@@ -618,10 +681,26 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&target_id]
+        if let Err(error) = self.replicas[&target_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            // Promotion already succeeded. Finalize the role-correct
+            // configuration to end the failed attempt before returning the
+            // catch-up error to the caller.
+            self.replicas[&target_id]
+                .handle
+                .update_current_configuration(new_config.clone())
+                .await?;
+            self.current_config = new_config;
+            warn!(
+                new_primary = target_id,
+                error = %error,
+                "switchover catch-up timed out after promotion; finalized role-correct configuration"
+            );
+            return Ok(());
+        }
 
         self.replicas[&target_id]
             .handle
@@ -712,10 +791,17 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&primary_id]
+        if let Err(error) = self.replicas[&primary_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            self.replicas[&primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
+                .await?;
+            return Err(error);
+        }
 
         self.replicas[&primary_id]
             .handle
@@ -804,8 +890,17 @@ impl PartitionDriver {
         );
 
         // 4. Reconfigure quorum (rebuild full config, must_catch_up on new replica)
-        self.reconfigure_quorum(primary_id, Some(replica_id))
-            .await?;
+        if let Err(error) = self.reconfigure_quorum(primary_id, Some(replica_id)).await {
+            // The handle was inserted before catch-up so the new configuration
+            // could be built. Roll back both driver state and the primary's
+            // dual configuration; otherwise the reconciler sees the replica
+            // as present and cannot retry the failed scale-up.
+            if let Some(replica) = self.replicas.remove(&replica_id) {
+                let _ = replica.handle.change_role(epoch, Role::None).await;
+                let _ = replica.handle.close().await;
+            }
+            return Err(error);
+        }
 
         info!(replica_id, "replica added");
         Ok(())
@@ -836,17 +931,32 @@ impl PartitionDriver {
 
         info!(secondary_id, "restarting secondary");
 
-        // 1. Close old secondary (best effort — may be dead)
-        if let Some(old) = self.replicas.get(&secondary_id) {
-            let _ = old.handle.close().await;
+        // 1. Remove and close the old secondary (best effort — it may be
+        // dead). Keep the driver entry available for restoration if the
+        // replacement fails so a reconciler can retry the same replica ID.
+        let old = self.replicas.remove(&secondary_id).unwrap();
+        let _ = old.handle.close().await;
+
+        // Drop the primary's sender entry for this ID before connecting the
+        // replacement. Restoring the stable configuration after a failed
+        // attempt intentionally retains the member ID, so configuration
+        // pruning alone cannot distinguish the old endpoint from the new one.
+        if let Err(error) = self.replicas[&primary_id]
+            .handle
+            .remove_replica(secondary_id)
+            .await
+        {
+            self.replicas.insert(secondary_id, old);
+            return Err(error);
         }
 
-        // 2. Remove old handle, then add_replica with new one
-        self.replicas.remove(&secondary_id);
-
-        // Ensure new_handle has the same ID
+        // 2. Add the replacement under the same ID.
         assert_eq!(new_handle.id(), secondary_id);
-        self.add_replica(new_handle).await
+        if let Err(error) = self.add_replica(new_handle).await {
+            self.replicas.insert(secondary_id, old);
+            return Err(error);
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -896,10 +1006,19 @@ impl PartitionDriver {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.replicas[&primary_id]
+        if let Err(error) = self.replicas[&primary_id]
             .handle
             .wait_for_catch_up_quorum(ReplicaSetQuorumMode::Write)
-            .await?;
+            .await
+        {
+            // Reconfiguration has not committed to driver state. Restore the
+            // last stable configuration so the caller/reconciler can retry.
+            self.replicas[&primary_id]
+                .handle
+                .update_current_configuration(self.current_config.clone())
+                .await?;
+            return Err(error);
+        }
 
         self.replicas[&primary_id]
             .handle
@@ -919,6 +1038,7 @@ impl PartitionDriver {
 pub mod testing {
     use super::*;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tokio::sync::{mpsc, oneshot};
     use tonic::transport::Server;
@@ -944,6 +1064,9 @@ pub mod testing {
         epoch: std::sync::Mutex<Epoch>,
         _actor_handle: tokio::task::JoinHandle<()>,
         _grpc_handle: tokio::task::JoinHandle<()>,
+        bypass_build: AtomicBool,
+        bypass_update_epoch: AtomicBool,
+        fail_next_catch_up: AtomicBool,
     }
 
     impl InProcessReplicaHandle {
@@ -995,7 +1118,23 @@ pub mod testing {
                 epoch: std::sync::Mutex::new(Epoch::default()),
                 _actor_handle: actor_handle,
                 _grpc_handle: grpc_handle,
+                bypass_build: AtomicBool::new(false),
+                bypass_update_epoch: AtomicBool::new(false),
+                fail_next_catch_up: AtomicBool::new(false),
             })
+        }
+
+        /// Arrange for the next add-replica workflow driven through this
+        /// primary to reach the catch-up step and fail there.
+        #[cfg(test)]
+        pub fn inject_add_replica_catch_up_failure(&self) {
+            self.bypass_build.store(true, Ordering::Release);
+            self.fail_next_catch_up.store(true, Ordering::Release);
+        }
+
+        #[cfg(test)]
+        pub fn bypass_update_epoch_for_add_replica_test(&self) {
+            self.bypass_update_epoch.store(true, Ordering::Release);
         }
 
         async fn send_control(
@@ -1052,7 +1191,8 @@ pub mod testing {
             match role {
                 Role::Primary => {
                     self.state.set_read_status(AccessStatus::Granted);
-                    self.state.set_write_status(AccessStatus::Granted);
+                    self.state
+                        .set_write_status(AccessStatus::ReconfigurationPending);
                 }
                 _ => {
                     self.state.set_read_status(AccessStatus::NotPrimary);
@@ -1065,6 +1205,9 @@ pub mod testing {
         async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
             *self.epoch.lock().unwrap() = epoch;
             self.secondary_state.update_epoch(epoch);
+            if self.bypass_update_epoch.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.send_control(|reply| ReplicatorControlEvent::UpdateEpoch { epoch, reply })
                 .await
         }
@@ -1100,7 +1243,11 @@ pub mod testing {
                 })
                 .await
                 .map_err(|_| KubericError::Closed)?;
-            rx.await.map_err(|_| KubericError::Closed)?
+            let result = rx.await.map_err(|_| KubericError::Closed)?;
+            if result.is_ok() && *self.role.lock().unwrap() == Role::Primary {
+                self.state.set_write_status(AccessStatus::Granted);
+            }
+            result
         }
 
         async fn update_current_configuration(&self, current: ReplicaSetConfig) -> Result<()> {
@@ -1109,15 +1256,25 @@ pub mod testing {
                 .send(ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply: tx })
                 .await
                 .map_err(|_| KubericError::Closed)?;
-            rx.await.map_err(|_| KubericError::Closed)?
+            let result = rx.await.map_err(|_| KubericError::Closed)?;
+            if result.is_ok() && *self.role.lock().unwrap() == Role::Primary {
+                self.state.set_write_status(AccessStatus::Granted);
+            }
+            result
         }
 
         async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+            if self.fail_next_catch_up.swap(false, Ordering::AcqRel) {
+                return Err(KubericError::NoWriteQuorum);
+            }
             self.send_control(|reply| ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply })
                 .await
         }
 
         async fn build_replica(&self, replica: ReplicaInfo) -> Result<()> {
+            if self.bypass_build.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.send_control(|reply| ReplicatorControlEvent::BuildReplica { replica, reply })
                 .await
         }
@@ -1192,5 +1349,38 @@ mod tests {
             "after fix: failed add_replica must not leave zombie in driver"
         );
         assert_eq!(driver.replica_ids().len(), 1, "only the primary remains");
+    }
+
+    #[tokio::test]
+    async fn test_add_replica_rolls_back_after_catch_up_failure() {
+        let primary = InProcessReplicaHandle::spawn(1).await.unwrap();
+        let writer = primary.state_replicator();
+        primary.inject_add_replica_catch_up_failure();
+
+        let mut driver = PartitionDriver::new();
+        driver
+            .create_partition(vec![Box::new(primary)])
+            .await
+            .unwrap();
+
+        let replica = InProcessReplicaHandle::spawn(2).await.unwrap();
+        replica.bypass_update_epoch_for_add_replica_test();
+        let result = driver.add_replica(Box::new(replica)).await;
+        assert!(
+            matches!(result, Err(KubericError::NoWriteQuorum)),
+            "unexpected add_replica result: {result:?}"
+        );
+        assert_eq!(driver.replica_ids(), vec![1]);
+
+        // Restoring the prior single-replica configuration clears the failed
+        // catch-up attempt and allows the primary to continue committing.
+        let lsn = writer
+            .replicate(
+                bytes::Bytes::from_static(b"after-rollback"),
+                crate::types::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lsn, 1);
     }
 }
