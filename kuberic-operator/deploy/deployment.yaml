@@ -162,7 +162,6 @@ spec:
                 - version
                 - kind
                 - phase
-                - previousSnapshot
                 - targetSnapshot
                 - oldPrimaryId
                 - targetPrimaryId
@@ -179,12 +178,35 @@ spec:
                   kind:
                     type: string
                     enum:
+                    - createPartition
                     - switchover
                     - addReplica
                     - removeReplica
                   phase:
                     type: string
                     enum:
+                    - createFenceRouting
+                    - createOpenPrimary
+                    - createPromotePrimary
+                    - createPrimaryCurrentConfiguration
+                    - createCommitPrimary
+                    - createOpenSecondary
+                    - createUpdateSecondaryEpoch
+                    - createAssignSecondaryIdle
+                    - createBuildSecondary
+                    - createAssignSecondaryActive
+                    - createCatchUpConfiguration
+                    - createWaitForCatchUpQuorum
+                    - createCurrentConfiguration
+                    - createCommitSecondary
+                    - createPublishRouting
+                    - createFinalize
+                    - createCompensateRestoreConfiguration
+                    - createCompensateRemoveCandidate
+                    - createCompensateDemoteCandidate
+                    - createCompensateCloseCandidate
+                    - createCompensateDeleteCandidate
+                    - createCompensateFinalize
                     - revoke
                     - captureLsn
                     - preCatchUp
@@ -280,6 +302,55 @@ spec:
                       writeQuorum:
                         type: integer
                         format: uint32
+                  committedSnapshot:
+                    type: object
+                    required:
+                    - epoch
+                    - primaryId
+                    - members
+                    - writeQuorum
+                    properties:
+                      epoch:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      primaryId:
+                        type: integer
+                        format: int64
+                      members:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                          - id
+                          - instanceId
+                          - role
+                          properties:
+                            id:
+                              type: integer
+                              format: int64
+                            instanceId:
+                              type: string
+                            role:
+                              type: string
+                              enum:
+                              - primary
+                              - activeSecondary
+                      writeQuorum:
+                        type: integer
+                        format: uint32
+                  minimumCommittedReplicas:
+                    type: integer
+                    format: uint32
+                    minimum: 1
                   targetSnapshot:
                     type: object
                     required:
@@ -385,6 +456,25 @@ spec:
                       kind:
                         type: string
                         enum:
+                        - createFencePod
+                        - createOpenPrimary
+                        - createPromotePrimary
+                        - createPrimaryCurrentConfiguration
+                        - createOpenSecondary
+                        - createUpdateSecondaryEpoch
+                        - createAssignSecondaryIdle
+                        - createBuildSecondary
+                        - createAssignSecondaryActive
+                        - createCatchUpConfiguration
+                        - createWaitForCatchUpQuorum
+                        - createCurrentConfiguration
+                        - createPublishPrimary
+                        - createPublishSecondary
+                        - createCompensateRestoreConfiguration
+                        - createCompensateRemoveCandidate
+                        - createCompensateDemoteCandidate
+                        - createCompensateCloseCandidate
+                        - createCompensateDeleteCandidate
                         - revokeWrite
                         - demoteOldPrimary
                         - promoteTarget

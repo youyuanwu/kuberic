@@ -103,8 +103,10 @@ pub fn start_remove_replica(
         target_pod_name: Some(target_request.pod_name),
         target_pod_uid: Some(target_request.pod_uid),
         retired_instance_id: None,
-        previous_snapshot: previous,
+        previous_snapshot: previous.into(),
         target_snapshot,
+        committed_snapshot: None,
+        minimum_committed_replicas: None,
         frozen_lsn: None,
         next_secondary_index: 0,
         phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
@@ -257,7 +259,7 @@ pub fn decide_remove_replica(
             failed.pending_action = None;
             Decision::Complete {
                 operation: failed,
-                snapshot: operation.previous_snapshot.clone(),
+                snapshot: operation.previous_snapshot.cloned().unwrap(),
                 compensated: true,
             }
         }
@@ -928,6 +930,9 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
     }
     if operation.kind != DurableOperationKind::RemoveReplica {
         return Err("operation kind is not remove-replica".to_string());
+    }
+    if operation.previous_snapshot.is_none() {
+        return Err("remove operation has no previous stable snapshot".to_string());
     }
     validate_snapshot(&operation.previous_snapshot)?;
     validate_snapshot(&operation.target_snapshot)?;

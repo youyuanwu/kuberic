@@ -532,10 +532,10 @@ time for replicas to recover without data loss).
 
 **Detection:** N/A — the operator itself restarts.
 
-**Current behavior:** ✅ Stable `Healthy`, durable `Switchover`, and durable
-replica add/rebuild recovery are implemented. The CRD snapshot survives in etcd
-while current pod metadata and runtime status attest that it still describes
-the live partition.
+**Current behavior:** ✅ Stable `Healthy`, durable `Creating`, durable
+`Switchover`, durable replica add/rebuild, and durable replica removal recovery
+are implemented. CRD snapshots/checkpoints survive in etcd while current pod
+metadata and runtime status attest the live topology and pending activity.
 
 ```
 Operator restart — first reconcile per KubericSet:
@@ -567,23 +567,29 @@ as input. Legacy status without `stableSnapshot` is rejected. Stable topology
 changes persist a fresh snapshot; multi-member add/remove loops patch after
 each committed change. If runtime mutation succeeds but status persistence
 does not, the live operator retries that exact pending status before another
-action. If its process state is also lost, a subsequent recovery sees the old
-snapshot and fails closed. Creating probes runtime status and refuses to replay
-creation when replicas are already initialized.
+action.
 
-During `Switchover` and `AddingReplica`, `status.operation` is the authoritative
-compact checkpoint. It stores previous/target snapshots, exact target
-incarnations, the current phase, and one write-ahead correlated action. Each
-reconcile reconstructs fresh handles, observes
+During `Creating`, `Switchover`, `AddingReplica`, and `RemovingReplica`,
+`status.operation` is the authoritative compact checkpoint. Creation records
+explicit no previous topology and an optional committed bootstrap snapshot;
+the other protocols record previous/target stable snapshots. Each operation
+stores exact target incarnations, current phase, and one write-ahead correlated
+action. Each reconcile reconstructs fresh handles, observes
 role/epoch/incarnation/progress/write/configuration/activity state, and either
 advances one checkpoint, dispatches one activity, waits, compensates, or
 poisons. Add/rebuild observes long-running copy progress and restores the
 previous current configuration before candidate cleanup when catch-up had
 started. Kubernetes `resourceVersion` rejects stale concurrent advancement.
 
-**Boundary:** This does not recover `Creating`, `FailingOver`, scale-down/
-remove, other mid-configuration paths, or continue an operation after its
-target incarnation changes. Those cases require additional durable-operation
+Creation commits primary-only and expanded partial bootstrap snapshots before
+starting later members. Pods remain on a non-serving bootstrap label until the
+complete target satisfies `minReplicas`; routing publication is itself
+checkpointed. Before the first commit, cleanup can restart from no topology.
+After a commit, creation preserves committed members and retries only the
+candidate. A changed committed-member incarnation fails closed.
+
+**Boundary:** This does not recover `FailingOver`, data-loss transitions, or a
+lost bootstrap primary. Those cases require additional durable-operation
 migrations or a separate pod-state recovery protocol.
 
 ---

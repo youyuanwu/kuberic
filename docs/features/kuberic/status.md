@@ -25,6 +25,7 @@ Implementation status, known gaps, and open questions.
 | Missing pod detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §3 |
 | gRPC failure tracking | ❌ Not implemented — K8s adaptation of SF federation heartbeats |
 | Stable Healthy operator restart recovery | ✅ Implemented — authoritative status snapshot + read-only `PartitionDriver::recover()` |
+| Durable initial partition creation | ✅ Implemented — explicit no-previous-topology checkpoint, partial committed bootstrap snapshots, gated routing |
 | Durable switchover restart recovery | ✅ Implemented — compact CRD operation checkpoint, correlated activities, compensation |
 | Durable scale-up and stale-secondary rejoin | ✅ Implemented — correlated lifecycle/build/configuration activities and phase-aware compensation |
 | Durable scale-down and stale/dead-secondary eviction | ✅ Implemented — config-first commit, exact connection cleanup, UID-fenced deletion |
@@ -94,9 +95,9 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 2. **Pod identity and PVC binding** — how to bind recreated pods to correct
    PVCs. Relevant for WAL persistence.
 3. **Remaining mid-reconfiguration recovery** — stable Healthy topology and
-   reconciler-driven switchover, add/rebuild, and removal are recoverable.
-   `Creating`, `FailingOver`, and other partial configuration transitions still
-   need durable operation migration.
+   reconciler-driven creation, switchover, add/rebuild, and removal are
+   recoverable. `FailingOver` and data-loss transitions still need durable
+   operation migration.
 4. **Data loss protocol integration** — the `on_data_loss()` callback exists
    in our user API but the operator never triggers it. Need to implement
    quorum loss detection and `data_loss_number` increment in the driver.

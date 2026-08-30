@@ -1017,8 +1017,8 @@ older instance is removed before a newer build proceeds.
 Compensation is phase-aware: pre-configuration failures remove/demote/close/
 delete the candidate; failures after catch-up configuration restore the
 previous current configuration first; and observed target current configuration
-rolls forward to target snapshot publication. Creation, failover, and
-data-loss migration remain open.
+rolls forward to target snapshot publication. Failover and data-loss migration
+remain open.
 
 ### E6. Replica removal state lost with operator process — ✅ Fixed
 
@@ -1040,3 +1040,31 @@ absence observable after ambiguous removal responses. Reachable targets are
 demoted and closed after membership commit; unreachable targets do not block
 progress. Kubernetes deletion uses the recorded UID precondition, so delayed
 cleanup cannot delete a same-name replacement pod.
+
+### E7. Initial creation state lost with operator process — ✅ Fixed
+
+**Affects:** Reconciler `Creating` phase
+
+Initial partition bootstrap now uses a creation-specific durable operation
+rather than the monolithic driver method. The checkpoint explicitly represents
+no previous topology, pins the sorted logical/incarnation target set and
+lowest-ID primary, and carries an optional committed bootstrap snapshot.
+
+Open(New), initial promotion, primary-only current configuration, secondary
+epoch/idle/build/active transitions, catch-up/current configuration, quorum
+wait, and routing-label publication are correlated activities. Primary-only
+and every expanded secondary current configuration are persisted as partial
+bootstrap authority before later work begins.
+
+All pods start with a non-serving bootstrap label. Serving labels are published
+only after the complete target satisfies `minReplicas`, then the complete
+stable snapshot becomes Healthy authority. Pre-primary-commit failure can
+clean up and restart from no topology; later failure preserves committed
+members and cleans only the current candidate. Replacement of a committed
+incarnation fails closed.
+
+This aligns with Service Fabric's AddPrimary duplicate/stale-instance handling
+and replication `CreateInitialPrimary` transition
+(`Failover/ra/ReconfigurationAgent.cpp`,
+`Replication/Replicator.ChangeRoleAsyncOperation.cpp`) while retaining
+Kuberic's explicit incremental configuration checkpoints.

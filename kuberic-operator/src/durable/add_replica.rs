@@ -126,8 +126,10 @@ pub fn start_add_replica(
         target_pod_name: Some(target_pod_name),
         target_pod_uid: None,
         retired_instance_id,
-        previous_snapshot: previous,
+        previous_snapshot: previous.into(),
         target_snapshot: target,
+        committed_snapshot: None,
+        minimum_committed_replicas: None,
         frozen_lsn: None,
         next_secondary_index: 0,
         phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
@@ -290,7 +292,7 @@ pub fn decide_add_replica(
             failed.phase = DurableOperationPhase::Failed;
             Decision::Complete {
                 operation: failed,
-                snapshot: operation.previous_snapshot.clone(),
+                snapshot: operation.previous_snapshot.cloned().unwrap(),
                 compensated: true,
             }
         }
@@ -1039,6 +1041,9 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
     }
     if operation.kind != DurableOperationKind::AddReplica {
         return Err("operation kind is not add-replica".to_string());
+    }
+    if operation.previous_snapshot.is_none() {
+        return Err("add operation has no previous stable snapshot".to_string());
     }
     validate_snapshot(&operation.previous_snapshot)?;
     validate_snapshot(&operation.target_snapshot)?;

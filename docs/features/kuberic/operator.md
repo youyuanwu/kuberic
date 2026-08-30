@@ -25,9 +25,10 @@ switchover, and scaling via `PartitionDriver`.
 - `reconfigurationPhase`
 - optional authoritative `stableSnapshot` with epoch, primary logical ID,
   complete member logical/incarnation identities and roles, and write quorum
-- optional compact versioned `operation` checkpoint for durable switchover,
-  replica add/rebuild, and configuration-first replica removal, including
-  previous/target snapshots and one pending correlated action
+- optional compact versioned `operation` checkpoint for durable creation,
+  switchover, replica add/rebuild, and configuration-first replica removal,
+  including optional previous/committed bootstrap topology, target snapshot,
+  and one pending correlated action
 - `failingSinceTimestamp`, `quorumLossSince`
 - per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
 - `instanceNames`, `instanceStates`
@@ -35,21 +36,17 @@ switchover, and scaling via `PartitionDriver`.
 
 **Reconciliation:** Stable workflows use `PartitionDriver` with
 `GrpcReplicaHandle` (same driver as tests, different transport). A stable
-operation is complete
-only after its resulting snapshot is persisted. Runtime mutation currently
-precedes that status patch. The live reconciler retains and retries a failed
-post-commit status write before selecting another action. If the operator
-process is also lost in that window, restart recovery rejects the stale
-snapshot instead of guessing. Creating also probes for an already-initialized
-runtime and refuses to replay `Open(New)`.
+operation is complete only after its resulting snapshot is persisted. Durable
+creation persists partial committed bootstrap topology after primary-only and
+each expanded current configuration, so process loss rolls forward from live
+committed authority instead of replaying `Open(New)`.
 
-Reconciler-driven switchover, replica add/rebuild, and replica removal remove
-the process-local driver after persisting a versioned operation checkpoint,
-reconstruct fresh handles and observations on every reconcile, and advance one
-transition or activity at a time. Pending action intent is durable before RPC,
-pod-label, or UID-fenced pod-delete mutation. Status patches include the
-observed Kubernetes `resourceVersion`; no lock is held across a durable
-activity.
+Reconciler-driven creation, switchover, replica add/rebuild, and replica
+removal persist a versioned operation checkpoint, reconstruct fresh handles
+and observations on every reconcile, and advance one transition or activity
+at a time. Pending action intent is durable before RPC, pod-label, or
+UID-fenced pod-delete mutation. Status patches include the observed Kubernetes
+`resourceVersion`; no lock is held across a durable activity.
 
 ---
 
@@ -58,7 +55,7 @@ activity.
 | Phase | Description |
 |-------|-------------|
 | `Pending` | CRD created, no pods yet |
-| `Creating` | Pods created, waiting for ready + partition initialization |
+| `Creating` | Durable initial bootstrap, partial topology commit, and routing publication |
 | `Healthy` | Normal operation — monitors health, handles scale, detects failures |
 | `FailingOver` | Primary failed, running failover protocol (incl. data loss path) |
 | `Switchover` | Planned primary change in progress |
@@ -149,9 +146,40 @@ and is refreshed from recovered driver state; it is never recovery input.
 Legacy resources without a snapshot, changed pod identities, and live state
 that is newer or otherwise inconsistent fail closed. Runtime health does not
 invalidate an otherwise consistent snapshot: recovery completes first, then
-the normal health/failover path runs. Recovery is intentionally limited to stable `Healthy` topology. Durable `Switchover`, `AddingReplica`, and `RemovingReplica` resume from
-`status.operation`; other in-progress reconfigurations remain unsupported. See
+the normal health/failover path runs. Stable recovery is intentionally limited to `Healthy` topology. Durable
+`Creating`, `Switchover`, `AddingReplica`, and `RemovingReplica` resume from
+`status.operation`; failover/data-loss migration remains unsupported. See
 `operator-failure-scenarios.md` §8.
+
+## Durable Partition Creation
+
+All initial pods are created with `kuberic.io/role=bootstrap`, which does not
+match the primary or secondary client Services. The durable operation first
+fences any pre-existing initial serving labels back to `bootstrap`. After every
+desired pod is ready, the operator validates pod-index-derived logical IDs and
+UIDs, sorts by logical ID, selects the lowest ID as initial primary, and
+persists a `CreatePartition` operation before runtime mutation.
+
+The operation explicitly has no previous stable topology. It records the full
+target and an optional committed bootstrap snapshot. Primary-only current
+configuration is committed and checkpointed first. Each secondary then runs
+Open(New), epoch update, idle role, build, active role, catch-up configuration,
+write-quorum wait, and current configuration; the expanded partial topology is
+persisted before the next secondary starts.
+
+Controller replacement observes runtime postconditions and correlated
+activity state. Committed members are never reopened or rebuilt. Failure
+before the first commit cleans up and restarts from no topology; later failures
+preserve committed members and clean up only the current candidate. Final
+routing labels are published one member per reconcile only after the complete
+target (and therefore `minReplicas`) is durably committed.
+
+The fencing iterator addresses the exact member at its persisted index, not
+the current runtime candidate field. Fence failure never schedules
+RemoveReplica, demotion, close, or deletion. Same-incarnation unavailability
+fails closed; an uncommitted replacement restarts with a new persisted target
+UID while retaining committed members. All compensation phases reject a target
+already present in the committed bootstrap snapshot.
 
 ## Durable Switchover
 
