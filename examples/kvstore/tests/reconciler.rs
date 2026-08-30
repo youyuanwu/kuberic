@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,6 +28,25 @@ use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 use kvstore::proto;
 use kvstore::service;
 use kvstore::state::{KvState, SharedState};
+
+async fn allocate_unique_address() -> String {
+    static ALLOCATED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+    loop {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let is_new = ALLOCATED_PORTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(port);
+        drop(listener);
+
+        if is_new {
+            return format!("127.0.0.1:{port}");
+        }
+    }
+}
 
 struct LivePod {
     control_address: String,
@@ -354,19 +373,15 @@ impl KvClusterApi {
         let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let instance_id = ReplicaInstanceId::new(format!("restarted-{pod_name}-{generation}"));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_address = listener.local_addr().unwrap().to_string();
-        drop(listener);
-
-        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let data_port = data_listener.local_addr().unwrap().port();
-        let data_bind = format!("127.0.0.1:{}", data_port);
+        let client_address = allocate_unique_address().await;
+        let data_bind = allocate_unique_address().await;
         let data_address = format!("http://{}", data_bind);
-        drop(data_listener);
+        let control_bind = allocate_unique_address().await;
 
         let bundle = PodRuntime::builder(replica_id)
             .instance_id(instance_id.clone())
             .reply_timeout(Duration::from_secs(5))
+            .control_bind(control_bind)
             .data_bind(data_bind)
             .build()
             .await
@@ -453,20 +468,17 @@ impl ClusterApi for KvClusterApi {
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let instance_id = ReplicaInstanceId::new(format!("reconciler-{replica_id}-{n}"));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_address = listener.local_addr().unwrap().to_string();
-        drop(listener);
+        let client_address = allocate_unique_address().await;
 
         // Pre-bind data plane port
-        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let data_port = data_listener.local_addr().unwrap().port();
-        let data_bind = format!("127.0.0.1:{}", data_port);
+        let data_bind = allocate_unique_address().await;
         let data_address = format!("http://{}", data_bind);
-        drop(data_listener);
+        let control_bind = allocate_unique_address().await;
 
         let bundle = PodRuntime::builder(replica_id)
             .instance_id(instance_id.clone())
             .reply_timeout(Duration::from_secs(5))
+            .control_bind(control_bind)
             .data_bind(data_bind)
             .build()
             .await

@@ -1,8 +1,9 @@
 //! Test utilities for the SQLite replicated example.
 //! Compiled under `#[cfg(test)]` or `feature = "testing"`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
@@ -11,6 +12,25 @@ use kuberic_core::types::ReplicaInstanceId;
 use tokio::sync::Mutex;
 
 use crate::state::{SharedState, SqliteState};
+
+async fn allocate_unique_address() -> String {
+    static ALLOCATED_PORTS: OnceLock<StdMutex<HashSet<u16>>> = OnceLock::new();
+
+    loop {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let is_new = ALLOCATED_PORTS
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(port);
+        drop(listener);
+
+        if is_new {
+            return format!("127.0.0.1:{port}");
+        }
+    }
+}
 
 /// A running SQLite pod: PodRuntime + SQLite service event loop.
 pub struct SqlitePod {
@@ -49,19 +69,15 @@ impl SqlitePod {
             std::sync::atomic::AtomicU64::new(1);
         let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let instance_id = ReplicaInstanceId::new(format!("sqlite-pod-{id}-{generation}"));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_address = listener.local_addr().unwrap().to_string();
-        drop(listener);
-
-        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let data_port = data_listener.local_addr().unwrap().port();
-        let data_bind = format!("127.0.0.1:{}", data_port);
+        let client_address = allocate_unique_address().await;
+        let data_bind = allocate_unique_address().await;
         let data_address = format!("http://{}", data_bind);
-        drop(data_listener);
+        let control_bind = allocate_unique_address().await;
 
         let bundle = PodRuntime::builder(id)
             .instance_id(instance_id.clone())
             .reply_timeout(reply_timeout)
+            .control_bind(control_bind)
             .data_bind(data_bind)
             .build()
             .await
