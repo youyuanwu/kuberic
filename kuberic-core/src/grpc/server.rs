@@ -143,6 +143,14 @@ impl ReplicatorControl for ControlServer {
                 .durable_action
                 .and_then(|action| action.error)
                 .unwrap_or_default(),
+            active_replica_connections: info
+                .active_replica_connections
+                .into_iter()
+                .map(|connection| ReplicaConnectionStatusProto {
+                    id: connection.id,
+                    instance_id: connection.instance_id.to_string(),
+                })
+                .collect(),
         }))
     }
 

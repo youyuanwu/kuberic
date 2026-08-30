@@ -25,9 +25,9 @@ switchover, and scaling via `PartitionDriver`.
 - `reconfigurationPhase`
 - optional authoritative `stableSnapshot` with epoch, primary logical ID,
   complete member logical/incarnation identities and roles, and write quorum
-- optional compact versioned `operation` checkpoint for durable switchover and
-  replica add/rebuild, including previous/target snapshots and one pending
-  correlated action
+- optional compact versioned `operation` checkpoint for durable switchover,
+  replica add/rebuild, and configuration-first replica removal, including
+  previous/target snapshots and one pending correlated action
 - `failingSinceTimestamp`, `quorumLossSince`
 - per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
 - `instanceNames`, `instanceStates`
@@ -43,12 +43,13 @@ process is also lost in that window, restart recovery rejects the stale
 snapshot instead of guessing. Creating also probes for an already-initialized
 runtime and refuses to replay `Open(New)`.
 
-Reconciler-driven switchover and replica add/rebuild remove the process-local
-driver after persisting a versioned operation checkpoint, reconstruct fresh
-handles and observations on every reconcile, and advance one transition or
-activity at a time. Pending action intent is durable before RPC, pod-label, or
-pod-delete mutation. Status patches include the observed Kubernetes
-`resourceVersion`; no lock is held across a durable activity.
+Reconciler-driven switchover, replica add/rebuild, and replica removal remove
+the process-local driver after persisting a versioned operation checkpoint,
+reconstruct fresh handles and observations on every reconcile, and advance one
+transition or activity at a time. Pending action intent is durable before RPC,
+pod-label, or UID-fenced pod-delete mutation. Status patches include the
+observed Kubernetes `resourceVersion`; no lock is held across a durable
+activity.
 
 ---
 
@@ -62,6 +63,7 @@ pod-delete mutation. Status patches include the observed Kubernetes
 | `FailingOver` | Primary failed, running failover protocol (incl. data loss path) |
 | `Switchover` | Planned primary change in progress |
 | `AddingReplica` | Durable scale-up or stale-secondary replacement in progress |
+| `RemovingReplica` | Durable healthy scale-down or stale/dead-secondary eviction in progress |
 
 Note: No `WaitingForQuorum` phase. Following SF's design, the system always
 makes progress during failover. If quorum is lost, the data loss protocol
@@ -85,17 +87,17 @@ Healthy phase:
   │    → If yes: → Switchover
   │
   ├─ 3. Secondary health check
-  │    All secondaries ready? gRPC reachable?
-  │    → If not (after replacementDelay): replace
+  │    Ready replacement incarnation? → durable rebuild
+  │    Old incarnation unreachable with retained quorum? → durable force-remove
   │
   ├─ 4. Missing pod detection
   │    driver.replica_ids() vs list_pods()
-  │    → If mismatch: force_remove + replace
+  │    → If replacement is ready: rebuild; otherwise durable force-remove
   │
   ├─ 5. Scale reconciliation
   │    spec.replicas vs current count
   │    → Scale up: create pods + add_replica
-  │    → Scale down: remove_secondary + delete pod
+  │    → Scale down: durable configuration-first removal
   │
   ├─ 6. Node drain detection
   │    Any pod's node unschedulable?
@@ -147,9 +149,8 @@ and is refreshed from recovered driver state; it is never recovery input.
 Legacy resources without a snapshot, changed pod identities, and live state
 that is newer or otherwise inconsistent fail closed. Runtime health does not
 invalidate an otherwise consistent snapshot: recovery completes first, then
-the normal health/failover path runs. Recovery is intentionally limited to stable `Healthy` topology. Durable
-`Switchover` and `AddingReplica` resume from `status.operation`; other
-in-progress reconfigurations remain unsupported. See
+the normal health/failover path runs. Recovery is intentionally limited to stable `Healthy` topology. Durable `Switchover`, `AddingReplica`, and `RemovingReplica` resume from
+`status.operation`; other in-progress reconfigurations remain unsupported. See
 `operator-failure-scenarios.md` §8.
 
 ## Durable Switchover

@@ -125,6 +125,12 @@ message GetStatusResponse {
     string durable_action_signature = 13;
     DurableActionStateProto durable_action_state = 14;
     string durable_action_error = 15;
+    repeated ReplicaConnectionStatusProto active_replica_connections = 16;
+}
+
+message ReplicaConnectionStatusProto {
+    int64 id = 1;
+    string instance_id = 2;
 }
 
 message ReplicaConfigurationMemberStatusProto {

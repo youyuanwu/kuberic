@@ -20,8 +20,9 @@ use kuberic_core::types::{
 
 use kuberic_operator::cluster_api::ClusterApi;
 use kuberic_operator::crd::{
-    DurableActionKind, DurableAddMode, DurableOperationKind, DurableOperationPhase, KubericSet,
-    KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy, StableReplicaRoleStatus,
+    DurableActionKind, DurableAddMode, DurableOperationKind, DurableOperationPhase,
+    DurableRemoveMode, KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
+    StableReplicaRoleStatus,
 };
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
@@ -520,11 +521,23 @@ impl ClusterApi for KvClusterApi {
         Ok(())
     }
 
-    async fn delete_pod(&self, _ns: &str, pod_name: &str) -> Result<(), String> {
-        self.pods
-            .lock()
-            .unwrap()
-            .retain(|p| p.metadata.name.as_deref() != Some(pod_name));
+    async fn delete_pod(
+        &self,
+        _ns: &str,
+        pod_name: &str,
+        expected_uid: &str,
+    ) -> Result<(), String> {
+        let mut pods = self.pods.lock().unwrap();
+        let Some(index) = pods
+            .iter()
+            .position(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+        else {
+            return Ok(());
+        };
+        if pods[index].metadata.uid.as_deref() != Some(expected_uid) {
+            return Err("pod UID precondition failed".to_string());
+        }
+        pods.remove(index);
         self.live_pods.lock().unwrap().remove(pod_name);
         Ok(())
     }
@@ -867,7 +880,7 @@ async fn drive_operation_to_healthy(
     panic!("durable operation did not return to Healthy: {status:?}");
 }
 
-fn control_for_add_action(kind: DurableActionKind) -> Option<ControlOperation> {
+fn control_for_action(kind: DurableActionKind) -> Option<ControlOperation> {
     match kind {
         DurableActionKind::RetireOldReplica | DurableActionKind::CompensateRemoveCandidate => {
             Some(ControlOperation::RemoveReplica)
@@ -887,6 +900,19 @@ fn control_for_add_action(kind: DurableActionKind) -> Option<ControlOperation> {
             Some(ControlOperation::UpdateCurrentConfiguration)
         }
         DurableActionKind::CompensateCloseCandidate => Some(ControlOperation::Close),
+        DurableActionKind::RemoveCatchUpConfiguration => {
+            Some(ControlOperation::UpdateCatchUpConfiguration)
+        }
+        DurableActionKind::RemoveWaitForCatchUpQuorum => {
+            Some(ControlOperation::WaitForCatchUpQuorum)
+        }
+        DurableActionKind::RemoveCurrentConfiguration
+        | DurableActionKind::RemoveCompensateConfiguration => {
+            Some(ControlOperation::UpdateCurrentConfiguration)
+        }
+        DurableActionKind::RemovePrimaryConnection => Some(ControlOperation::RemoveReplica),
+        DurableActionKind::RemoveDemoteTarget => Some(ControlOperation::ChangeRole),
+        DurableActionKind::RemoveCloseTarget => Some(ControlOperation::Close),
         _ => None,
     }
 }
@@ -907,7 +933,7 @@ async fn drive_operation_with_lost_replies(
             && pending.attempts == 0
             && expected.contains(&pending.kind)
             && !injected.contains(&pending.kind)
-            && let Some(control) = control_for_add_action(pending.kind)
+            && let Some(control) = control_for_action(pending.kind)
         {
             api.fail_after_next_durable_action(control);
             injected.push(pending.kind);
@@ -2477,7 +2503,7 @@ async fn test_durable_add_survives_state_loss_and_every_lost_runtime_reply() {
             && pending.attempts == 0
             && !injected.contains(&pending.kind)
         {
-            let control = control_for_add_action(pending.kind);
+            let control = control_for_action(pending.kind);
             if let Some(control) = control {
                 api.fail_after_next_durable_action(control);
                 injected.push(pending.kind);
@@ -3001,6 +3027,379 @@ async fn test_durable_add_rolls_forward_after_current_configuration_commit() {
     assert_stable_snapshot(&api, &completed, 2);
 }
 
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_remove_survives_state_loss_and_every_lost_runtime_reply() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "durable-remove", 3).await;
+    let previous_snapshot = previous.stable_snapshot.clone().unwrap();
+
+    reconcile_set(&make_set("durable-remove", 2, Some(previous)), &api, &state)
+        .await
+        .unwrap();
+    let mut status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::RemovingReplica);
+    assert_eq!(
+        status.operation.as_ref().unwrap().kind,
+        DurableOperationKind::RemoveReplica
+    );
+    assert_eq!(
+        status.operation.as_ref().unwrap().remove_mode,
+        Some(DurableRemoveMode::ScaleDown)
+    );
+
+    let expected = [
+        DurableActionKind::RemoveCatchUpConfiguration,
+        DurableActionKind::RemoveWaitForCatchUpQuorum,
+        DurableActionKind::RemoveCurrentConfiguration,
+        DurableActionKind::RemovePrimaryConnection,
+        DurableActionKind::RemoveDemoteTarget,
+        DurableActionKind::RemoveCloseTarget,
+    ];
+    let mut injected = Vec::new();
+    let mut persisted_phases = Vec::new();
+    let history_start = api.statuses.lock().unwrap().len();
+    api.reset_operations();
+
+    for _ in 0..160 {
+        let operation = status.operation.as_ref().unwrap();
+        if !persisted_phases.contains(&operation.phase) {
+            persisted_phases.push(operation.phase);
+        }
+        if let Some(pending) = operation.pending_action.as_ref()
+            && pending.attempts == 0
+            && expected.contains(&pending.kind)
+            && !injected.contains(&pending.kind)
+            && let Some(control) = control_for_action(pending.kind)
+        {
+            api.fail_after_next_durable_action(control);
+            injected.push(pending.kind);
+        }
+
+        reconcile_set(
+            &make_set("durable-remove", 2, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(
+        status.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Completed
+    );
+    assert_eq!(injected, expected);
+    assert_stable_snapshot(&api, &status, 2);
+    assert!(persisted_phases.contains(&DurableOperationPhase::RemoveCatchUpConfiguration));
+    assert!(persisted_phases.contains(&DurableOperationPhase::RemoveCurrentConfiguration));
+    assert!(persisted_phases.contains(&DurableOperationPhase::RemovePrimaryConnection));
+    assert!(persisted_phases.contains(&DurableOperationPhase::RemoveDeleteTarget));
+
+    let history = api.statuses.lock().unwrap();
+    let removal_history = &history[history_start..];
+    let first_reduced = removal_history
+        .iter()
+        .position(|entry| {
+            entry
+                .stable_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.members.len() == 2)
+        })
+        .expect("current configuration commit must persist the reduced snapshot");
+    assert!(
+        removal_history[..first_reduced]
+            .iter()
+            .all(|entry| entry.stable_snapshot.as_ref() == Some(&previous_snapshot))
+    );
+    assert_eq!(
+        removal_history[first_reduced]
+            .operation
+            .as_ref()
+            .unwrap()
+            .phase,
+        DurableOperationPhase::RemovePrimaryConnection
+    );
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RemoveReplica)
+            .count(),
+        1,
+        "exact old incarnation removal must not repeat after a lost reply"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_force_remove_unreachable_secondary_with_retained_quorum() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "force-remove", 3).await;
+    let primary = previous.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &primary)
+        .unwrap();
+    let target_uid = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(target.as_str()))
+        .unwrap()
+        .metadata
+        .uid
+        .clone()
+        .unwrap();
+    api.crash_pod(&target);
+
+    reconcile_set(&make_set("force-remove", 3, Some(previous)), &api, &state)
+        .await
+        .unwrap();
+    let started = api.last_status().unwrap();
+    assert_eq!(started.phase, Phase::RemovingReplica);
+    assert_eq!(
+        started.operation.as_ref().unwrap().remove_mode,
+        Some(DurableRemoveMode::Force)
+    );
+    assert_eq!(
+        started
+            .operation
+            .as_ref()
+            .unwrap()
+            .target_pod_uid
+            .as_deref(),
+        Some(target_uid.as_str())
+    );
+
+    let completed = drive_operation_to_healthy(&api, "force-remove", 3, started).await;
+    assert_stable_snapshot(&api, &completed, 2);
+    assert!(
+        api.pods
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|pod| pod.metadata.uid.as_deref() != Some(target_uid.as_str()))
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_remove_compensates_before_commit_and_rolls_forward_after_commit() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "remove-compensate", 3).await;
+    let previous_snapshot = previous.stable_snapshot.clone().unwrap();
+    reconcile_set(
+        &make_set("remove-compensate", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "remove-compensate",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::RemoveWaitForCatchUpQuorum,
+    )
+    .await;
+    api.fail_before_next_durable_action(ControlOperation::WaitForCatchUpQuorum);
+    reconcile_set(
+        &make_set("remove-compensate", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let mut failed = api.last_status().unwrap();
+    failed
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("remove-compensate", 2, Some(failed)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let compensated =
+        drive_operation_to_healthy(&api, "remove-compensate", 2, api.last_status().unwrap()).await;
+    assert_eq!(
+        compensated.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Failed
+    );
+    assert_eq!(
+        compensated.stable_snapshot.as_ref(),
+        Some(&previous_snapshot)
+    );
+
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "remove-roll-forward", 3).await;
+    reconcile_set(
+        &make_set("remove-roll-forward", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "remove-roll-forward",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::RemovePrimaryConnection,
+    )
+    .await;
+    assert_eq!(
+        pending.stable_snapshot.as_ref().unwrap().members.len(),
+        2,
+        "reduced snapshot must be durable before cleanup"
+    );
+    api.fail_before_next_durable_action(ControlOperation::RemoveReplica);
+    reconcile_set(
+        &make_set("remove-roll-forward", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let completed =
+        drive_operation_to_healthy(&api, "remove-roll-forward", 2, api.last_status().unwrap())
+            .await;
+    assert_eq!(
+        completed.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Completed
+    );
+    assert_stable_snapshot(&api, &completed, 2);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_uid_fenced_delete_and_remove_intent_conflict_are_mutation_free() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "remove-conflict", 3).await;
+    api.reset_operations();
+    api.fail_next_status_conflict();
+    let error = match reconcile_set(
+        &make_set("remove-conflict", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    {
+        Ok(_) => panic!("conflicting remove intent status must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "resource version conflict");
+    assert_status_reads_only(&api.operations());
+
+    let pod_name = api.pods.lock().unwrap()[0].metadata.name.clone().unwrap();
+    let old_uid = api.pods.lock().unwrap()[0].metadata.uid.clone().unwrap();
+    api.pods.lock().unwrap()[0].metadata.uid = Some("replacement-uid".to_string());
+    assert_eq!(
+        api.delete_pod("default", &pod_name, &old_uid)
+            .await
+            .unwrap_err(),
+        "pod UID precondition failed"
+    );
+    assert_eq!(
+        api.pods
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pod| pod.metadata.name.as_deref() == Some(pod_name.as_str()))
+            .unwrap()
+            .metadata
+            .uid
+            .as_deref(),
+        Some("replacement-uid")
+    );
+
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "remove-uid-race", 3).await;
+    let primary = previous.current_primary.clone().unwrap();
+    let target_name = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &primary)
+        .unwrap();
+    let old_uid = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(target_name.as_str()))
+        .unwrap()
+        .metadata
+        .uid
+        .clone()
+        .unwrap();
+    api.crash_pod(&target_name);
+    api.restart_pod(&target_name).await;
+    api.mark_pod_not_ready(&target_name);
+    let replacement_uid = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(target_name.as_str()))
+        .unwrap()
+        .metadata
+        .uid
+        .clone()
+        .unwrap();
+    assert_ne!(old_uid, replacement_uid);
+
+    reconcile_set(
+        &make_set("remove-uid-race", 3, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let completed =
+        drive_operation_to_healthy(&api, "remove-uid-race", 3, api.last_status().unwrap()).await;
+    assert_stable_snapshot(&api, &completed, 2);
+    assert_eq!(
+        api.pods
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pod| pod.metadata.name.as_deref() == Some(target_name.as_str()))
+            .unwrap()
+            .metadata
+            .uid
+            .as_deref(),
+        Some(replacement_uid.as_str()),
+        "old-incarnation cleanup deleted the replacement pod"
+    );
+}
+
 /// Reconciler test: Healthy phase detects spec.replicas > actual → scale-up.
 #[test_log::test(tokio::test)]
 #[serial]
@@ -3107,10 +3506,14 @@ async fn test_reconciler_scale_down() {
     .await
     .unwrap();
 
-    // Scale down: change spec to 1 replica
-    let set = make_set("myapp", 1, Some(status.clone()));
+    // Scale down: change spec to 2 replicas
+    let set = make_set("myapp", 2, Some(status.clone()));
     reconcile_set(&set, &api, &state).await.unwrap();
-    assert_stable_snapshot(&api, &api.last_status().unwrap(), 1);
+    let status = drive_operation_to_healthy(&api, "myapp", 2, api.last_status().unwrap()).await;
+    assert_stable_snapshot(&api, &status, 2);
+    reconcile_set(&make_set("myapp", 2, Some(status.clone())), &api, &state)
+        .await
+        .unwrap();
 
     // PVCs retained after scale-down (pod deleted, PVC kept)
     assert_eq!(api.pvcs.lock().unwrap().len(), 3);
@@ -3119,11 +3522,7 @@ async fn test_reconciler_scale_down() {
     {
         let drivers = state.drivers.lock().await;
         let driver = drivers.get("default/myapp").unwrap();
-        // Scale-down removes one at a time, may need multiple reconcile loops
-        assert!(
-            driver.replica_ids().len() < 3,
-            "should have removed at least one replica"
-        );
+        assert_eq!(driver.replica_ids().len(), 2);
     }
 
     // Primary still works
@@ -3306,28 +3705,11 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
     // Crash the secondary (high fidelity — abort tasks, gRPC breaks)
     api.crash_pod(&secondary_name);
 
-    // Reconcile Healthy: epoch-based health check detects stale secondary
-    let status = api.last_status().unwrap();
-    let set = make_set("myapp", 3, Some(status));
-    reconcile_set(&set, &api, &state).await.unwrap();
-    assert_stable_snapshot(&api, &api.last_status().unwrap(), 3);
-
-    // The durable path preserves the previous stable driver/topology until a
-    // replacement incarnation is ready.
-    {
-        let drivers = state.drivers.lock().await;
-        let driver = drivers.get("default/myapp").unwrap();
-        assert_eq!(
-            driver.replica_ids().len(),
-            3,
-            "stale secondary remains represented until durable replacement starts"
-        );
-    }
-
-    // Restart the pod (fresh PodRuntime, new ports)
+    // Restart before reconciliation. A ready replacement incarnation that is
+    // still required by desired capacity enters durable rebuild; an
+    // unreachable old incarnation is covered by the force-removal test.
     api.restart_pod(&secondary_name).await;
 
-    // Reconcile Healthy: driver_count=2 < desired=3, re-adds via scale-up
     let status = api.last_status().unwrap();
     let rejoined_status = drive_add_replica(&api, &state, "myapp", 3, status).await;
     assert_stable_snapshot(&api, &rejoined_status, 3);

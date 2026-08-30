@@ -120,9 +120,11 @@ pub fn start_add_replica(
         old_primary_id: previous.primary_id,
         target_primary_id: previous.primary_id,
         add_mode: Some(mode),
+        remove_mode: None,
         target_replica_id: Some(target_replica_id),
         target_instance_id: Some(target_instance_id),
         target_pod_name: Some(target_pod_name),
+        target_pod_uid: None,
         retired_instance_id,
         previous_snapshot: previous,
         target_snapshot: target,
@@ -345,6 +347,7 @@ fn decide_pending(
             if pending.kind == DurableActionKind::CompensateDeleteCandidate {
                 return Ok(Decision::DeletePod {
                     pod_name: target_pod_name(operation)?.to_string(),
+                    expected_uid: target_instance_id(operation)?.to_string(),
                 });
             }
             Ok(Decision::Execute {
@@ -1308,6 +1311,7 @@ mod tests {
                 configuration,
                 last_completed_action: None,
                 durable_action: None,
+                active_replica_connections: Vec::new(),
             },
             replicator_address: format!("http://{instance_id}"),
             pod_name: instance_id.to_string(),

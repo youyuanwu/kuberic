@@ -1100,7 +1100,21 @@ impl PartitionDriver {
 
         self.current_config = new_config;
 
-        // 2. Close the removed replica
+        // 2. Remove the exact old primary-side connection.
+        let removed_instance_id = self.replicas[&secondary_id].handle.instance_id();
+        if let Err(error) = self.replicas[&primary_id]
+            .handle
+            .remove_replica(secondary_id, removed_instance_id)
+            .await
+        {
+            warn!(
+                secondary_id,
+                error = %error,
+                "current configuration committed but exact connection cleanup failed"
+            );
+        }
+
+        // 3. Close the removed replica
         let removed = self.replicas.remove(&secondary_id).unwrap();
         let _ = removed.handle.change_role(self.epoch, Role::None).await;
         let _ = removed.handle.close().await;
@@ -1674,6 +1688,7 @@ pub mod testing {
                 configuration: None,
                 last_completed_action: None,
                 durable_action: None,
+                active_replica_connections: Vec::new(),
             })
         }
     }
@@ -1728,6 +1743,7 @@ mod tests {
                     configuration: None,
                     last_completed_action: None,
                     durable_action: None,
+                    active_replica_connections: Vec::new(),
                 },
                 operations,
             }

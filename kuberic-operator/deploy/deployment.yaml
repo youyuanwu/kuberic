@@ -181,6 +181,7 @@ spec:
                     enum:
                     - switchover
                     - addReplica
+                    - removeReplica
                   phase:
                     type: string
                     enum:
@@ -221,6 +222,16 @@ spec:
                     - compensateCloseCandidate
                     - compensateDeleteCandidate
                     - addCompensateFinalize
+                    - removeCatchUpConfiguration
+                    - removeWaitForCatchUpQuorum
+                    - removeCurrentConfiguration
+                    - removePrimaryConnection
+                    - removeDemoteTarget
+                    - removeCloseTarget
+                    - removeDeleteTarget
+                    - removeFinalize
+                    - removeCompensateConfiguration
+                    - removeCompensateFinalize
                     - completed
                     - failed
                     - poisoned
@@ -325,12 +336,19 @@ spec:
                     enum:
                     - scaleUp
                     - rebuild
+                  removeMode:
+                    type: string
+                    enum:
+                    - scaleDown
+                    - force
                   targetReplicaId:
                     type: integer
                     format: int64
                   targetInstanceId:
                     type: string
                   targetPodName:
+                    type: string
+                  targetPodUid:
                     type: string
                   retiredInstanceId:
                     type: string
@@ -398,6 +416,14 @@ spec:
                         - compensateDemoteCandidate
                         - compensateCloseCandidate
                         - compensateDeleteCandidate
+                        - removeCatchUpConfiguration
+                        - removeWaitForCatchUpQuorum
+                        - removeCurrentConfiguration
+                        - removePrimaryConnection
+                        - removeDemoteTarget
+                        - removeCloseTarget
+                        - removeDeleteTarget
+                        - removeCompensateConfiguration
                       targetId:
                         type: integer
                         format: int64

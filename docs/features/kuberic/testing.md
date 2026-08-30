@@ -354,8 +354,9 @@ crash primary, `failover()`, start new pod, `add_replica()`.
 
 **Pattern 3: Secondary crash → reconciler re-integration** ✅
 `test_reconciler_secondary_crash_and_rejoin` in `reconciler.rs`:
-`crash_pod()` → wait without mutating the stable topology →
-`restart_pod()` → durable retire/build/reconfigure.
+`crash_pod()` → `restart_pod()` before reconciliation → durable
+retire/build/reconfigure. If no ready replacement exists, the separate durable
+force-removal path commits reduced membership before cleanup.
 
 **Pattern 4: Primary crash → reconciler failover** ✅
 `test_reconciler_detects_primary_failure_and_fails_over` and
@@ -397,6 +398,15 @@ UpdateEpoch, both role changes, BuildReplica, catch-up/current configuration,
 and quorum wait. Companion tests cover exact old-incarnation retirement,
 status conflict before intent, pre-configuration and dual-configuration
 compensation, and roll-forward after current configuration commits.
+
+**Pattern 10: Durable removal boundary and fencing** ✅
+`test_durable_remove_survives_state_loss_and_every_lost_runtime_reply`
+replaces controller state at every persisted removal phase and injects lost
+responses for catch-up/current configuration, quorum wait, exact primary
+connection removal, demotion, and close. Companion tests cover healthy
+scale-down, unreachable force-removal, pre-commit configuration restoration,
+post-commit roll-forward, stable-snapshot commit ordering, conflict before
+intent, and same-name/new-UID deletion fencing.
 
 ### Remaining Work
 

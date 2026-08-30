@@ -135,6 +135,38 @@ starts a second copy.
 
 ---
 
+## Protocol: Remove Secondary
+
+Healthy scale-down and permanent stale/dead-secondary eviction use one durable
+`RemovingReplica` operation with `ScaleDown` or `Force` mode.
+
+```
+1. Validate a stable non-primary target, minReplicas, and retained old/target
+   quorum
+2. Persist previous and target snapshots plus exact runtime and pod UID
+3. update_catch_up_configuration(target, previous) on the primary
+4. wait_for_catch_up_quorum using the retained set
+5. update_current_configuration(target)
+6. Persist the target stable snapshot immediately after observing commit
+7. RemoveReplica(target ID, exact old incarnation) on the primary
+8. If the exact target is reachable: change_role(None), then Close
+9. Delete the pod with its exact Kubernetes UID precondition
+10. Complete cleanup and return to Healthy
+```
+
+Failures before step 5 restore the previous current configuration and previous
+stable snapshot. Once target current configuration is observed, reconciliation
+never republishes removed membership. Exact primary sender connections are
+observable in `GetStatus`, so lost removal responses resume from connection
+absence. Target lifecycle cleanup is conditional after membership commit; an
+unreachable target does not block removal.
+
+A ready replacement incarnation that is still required by desired capacity
+uses durable rebuild instead. An unreachable old incarnation with no ready
+replacement is force-removed; later scale-up can restore desired capacity.
+
+---
+
 ## Protocol: Restart Secondary
 
 Replace a failed secondary. Implemented in `PartitionDriver::restart_secondary()`.

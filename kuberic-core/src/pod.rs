@@ -92,6 +92,7 @@ pub struct StatusInfo {
     pub configuration: Option<ReplicaConfigurationStatus>,
     pub last_completed_action: Option<DurableActionCompletion>,
     pub durable_action: Option<DurableActionObservation>,
+    pub active_replica_connections: Vec<crate::types::ReplicaConnectionStatus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +374,8 @@ impl PodRuntime {
                         configuration: self.configuration.clone(),
                         last_completed_action,
                         durable_action,
+                        active_replica_connections: handle
+                            .map_or_else(Vec::new, |h| h.state().active_replica_connections()),
                     });
                 }
             }

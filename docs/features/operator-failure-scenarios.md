@@ -192,9 +192,11 @@ previous design (failover immediately). We should add
 
 **Detection:** Healthy phase checks ALL replicas for Ready status.
 
-**Current behavior:** ❌ Not implemented — secondary health is ignored.
+**Current behavior:** ✅ Implemented for stable secondaries. A ready
+replacement incarnation uses durable rebuild. An unreachable old incarnation
+uses durable force-removal when retained membership can satisfy quorum.
 
-**Design (informed by CNPG):**
+**Implemented flow:**
 
 CNPG detects secondary failures immediately via pod watches and recreates
 pods automatically. We should follow the same pattern, but with a grace
@@ -208,22 +210,17 @@ Healthy phase — secondary health check:
     │
     ├─ Pod Ready → OK, reset failure tracking
     │
-    ├─ Pod not ready:
-    │    ├─ If not_ready_since is None:
-    │    │    Record not_ready_since = now
-    │    │    Set condition Degraded=True
-    │    │    Requeue after 5s
-    │    │
-    │    ├─ If elapsed < replacementDelay (default 30s):
-    │    │    Requeue after 5s (give time to recover)
-    │    │
-    │    └─ If elapsed >= replacementDelay:
-    │         driver.remove_secondary(id, min_replicas)
-    │         Delete the pod
-    │         Create replacement pod
-    │         Wait for ready
-    │         driver.add_replica(new_handle)
-    │         Clear Degraded if all others healthy
+    ├─ Ready pod with new UID:
+    │    Durable rebuild under the same logical replica ID
+    │
+    └─ Missing/unreachable old UID:
+         Validate non-primary target, minReplicas, and retained quorum
+         Durable target/previous catch-up configuration
+         Wait retained quorum + commit reduced current configuration
+         Persist reduced stable snapshot
+         Remove exact old primary connection
+         Best-effort target demote/close
+         Delete old pod with UID precondition
     │
     └─ Pod missing → scenario 3
 ```
@@ -240,9 +237,10 @@ quorum), writes may hang waiting for ACK from a dead secondary. With
 **Detection:** Driver has a handle for a replica ID, but no matching pod
 exists in `list_pods()`.
 
-**Current behavior:** ❌ Not detected
+**Current behavior:** ✅ Stable missing secondaries are handled by the same
+durable force-removal protocol. Missing primaries still route to failover.
 
-**Design (informed by CNPG):**
+**Implemented flow:**
 
 CNPG detects missing pods by comparing expected instances (from CRD
 `instanceNames`) against actual pods. We do the same with `driver.replica_ids()`.
@@ -250,30 +248,21 @@ CNPG detects missing pods by comparing expected instances (from CRD
 ```
 Healthy phase — missing pod check:
   │
-  For each replica_id in driver.replica_ids():
-    Find matching pod by name pattern "{set_name}-{id-1}"
-    │
-    └─ Pod not found:
-         ├─ If replica is primary:
-         │    Transition to FailingOver (scenario 1 flow)
-         │
-         └─ If replica is secondary:
-              driver.force_remove_secondary(replica_id)
-                └─ Best-effort: try remove_secondary()
-                   On gRPC error: just drop the handle
-              Create replacement pod
-              Wait for ready
-              driver.add_replica(new_handle)
+  Compare stableSnapshot members with current pod logical IDs:
+      │
+      └─ Stable pod not found:
+           ├─ Primary → FailingOver
+           └─ Secondary → persist durable Force removal
+                target/previous configuration → retained quorum
+                → current configuration → reduced stable snapshot
+                → exact sender cleanup → UID-fenced pod cleanup
+                → later durable scale-up restores desired capacity
 ```
 
-**New method needed: `driver.force_remove_secondary()`**
-
-The current `remove_secondary()` calls `update_catch_up_configuration`
-and `wait_for_catch_up` on the replica being removed — which will fail
-if the pod is gone. `force_remove_secondary` should:
-1. Remove from current configuration (update all OTHER replicas)
-2. Drop the handle without calling close/change_role on the dead replica
-3. Continue with normal quorum reconfiguration on survivors
+The operator does not call a monolithic force-remove driver method. It
+persists the durable operation first, reconfigures the primary using retained
+replicas, and treats target lifecycle calls as conditional after membership
+commit.
 
 ---
 
@@ -652,7 +641,7 @@ After failover completes:
 | P2 | Primary self-fencing liveness probe | Medium | K8s addition (from CNPG isolation check) |
 | P2 | Node drain detection | Medium | K8s addition (from CNPG, analogous to SF PLB) |
 | P2 | Multi-primary detection | Small | K8s addition (epoch comparison) |
-| P2 | force_remove_secondary | Medium | SF (`RemoveReplica`, `RemoveFromCurrentConfiguration`) |
+| Done | Durable scale-down + force-remove secondary | Implemented | SF (`RemoveReplica`, `RemoveFromCurrentConfiguration`) |
 | P3 | CrashLoop retry capping | Small | K8s addition |
 | P3 | Pod anti-affinity in CRD | Small | K8s addition (analogous to SF fault domains) |
 
@@ -689,9 +678,9 @@ After failover completes:
           │        │      │       │                     │
           └────────┘      │       └─────────────────────┘
                           │
-                    scale-up: create pods + add_replica
-                    scale-down: remove_secondary + delete pod
-                    secondary health: replace unhealthy replicas
+                    scale-up: durable add
+                    scale-down: durable config-first remove
+                    secondary health: durable rebuild or force-remove
                     node drain: switchover primary off draining node
 ```
 

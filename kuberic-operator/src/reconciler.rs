@@ -17,13 +17,15 @@ use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, Role, StableParti
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
-    DurableAddMode, DurableOperationKind, DurableOperationPhase, EpochStatus, KubericSet,
-    KubericSetSpec, KubericSetStatus, MemberStatus, Phase, ReconfigurationPhase,
+    DurableAddMode, DurableOperationKind, DurableOperationPhase, DurableRemoveMode, EpochStatus,
+    KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus, Phase, ReconfigurationPhase,
     StablePartitionSnapshotStatus, StableReplicaRoleStatus, StatusCondition,
 };
 use crate::durable::{
-    Decision, OperationObservations, ReplicaObservation, decide, decide_add_replica, fail_closed,
-    operation_condition, record_activity_error, start_add_replica, start_switchover,
+    Decision, OperationObservations, OperationPodIdentities, RemoveReplicaTarget,
+    ReplicaObservation, decide, decide_add_replica, decide_remove_replica, fail_closed,
+    operation_condition, record_activity_error, start_add_replica, start_remove_replica,
+    start_switchover,
 };
 
 /// Shared state across reconciliation loops.
@@ -106,6 +108,7 @@ pub async fn reconcile_set(
         let expected_phase = match operation.kind {
             DurableOperationKind::Switchover => Phase::Switchover,
             DurableOperationKind::AddReplica => Phase::AddingReplica,
+            DurableOperationKind::RemoveReplica => Phase::RemovingReplica,
         };
         if current_phase != expected_phase {
             return Err(format!(
@@ -270,11 +273,21 @@ pub async fn reconcile_set(
                     format!("cannot recover {namespace}/{name}: stable snapshot is absent")
                 })?;
 
-            // Ensure every desired ordinal exists before attempting stable
-            // recovery. This also recreates a candidate deleted by add/rebuild
-            // compensation while the previous stable snapshot remains intact.
-            if actual < desired {
-                info!(name, actual, desired, "scale-up: creating pods");
+            // Rebuild compensation deletes the failed candidate while keeping
+            // the old stable identity. Recreate that ordinal so the durable
+            // rebuild can be attempted again instead of interpreting the
+            // intentional cleanup as permanent eviction.
+            if actual < desired
+                && set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.operation.as_ref())
+                    .is_some_and(|operation| {
+                        operation.kind == DurableOperationKind::AddReplica
+                            && operation.add_mode == Some(DurableAddMode::Rebuild)
+                            && operation.phase == DurableOperationPhase::Failed
+                    })
+            {
                 for i in 0..desired {
                     ensure_pvc(api, set, &namespace, i as i32).await?;
                     ensure_pod(api, set, &namespace, i as i32).await?;
@@ -282,24 +295,93 @@ pub async fn reconcile_set(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
             }
 
-            // A replacement incarnation cannot be used to reconstruct the
-            // previous stable driver. Start its durable retirement/rejoin
-            // operation directly from the stable snapshot instead.
-            if let Some((target_id, target_instance, target_pod)) = persisted_snapshot
+            // A missing stable secondary has no replacement incarnation to
+            // rebuild. Evict it durably before normal scale-up recreates
+            // desired capacity.
+            if let Some(target) = persisted_snapshot
+                .members
+                .iter()
+                .filter(|member| member.role == StableReplicaRoleStatus::ActiveSecondary)
+                .find(|member| !current_pods.iter().any(|(id, _, _)| *id == member.id))
+            {
+                let now = unix_seconds();
+                let operation = start_remove_replica(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    persisted_snapshot.clone(),
+                    RemoveReplicaTarget {
+                        replica_id: target.id,
+                        pod_name: format!("{}-{}", name, target.id - 1),
+                        pod_uid: target.instance_id.clone(),
+                    },
+                    DurableRemoveMode::Force,
+                    set.spec.min_replicas as usize,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
+                    phase: Phase::RemovingReplica,
+                    operation: Some(operation.clone()),
+                    ..set.status.clone().unwrap_or_default()
+                };
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+
+            // A replacement incarnation cannot reconstruct the previous
+            // stable driver. Rebuild it when ready; otherwise evict the old
+            // committed incarnation without deleting the replacement UID.
+            if let Some((target_id, target_instance, target_pod, old_instance)) = persisted_snapshot
                 .members
                 .iter()
                 .filter(|member| member.role == StableReplicaRoleStatus::ActiveSecondary)
                 .find_map(|member| {
                     current_pods
                         .iter()
-                        .find(|(id, instance, pod)| {
-                            *id == member.id
-                                && instance.as_str() != member.instance_id
-                                && is_pod_ready(pod)
+                        .find(|(id, instance, _)| {
+                            *id == member.id && instance.as_str() != member.instance_id
                         })
-                        .map(|(id, instance, pod)| (*id, instance.clone(), *pod))
+                        .map(|(id, instance, pod)| {
+                            (*id, instance.clone(), *pod, member.instance_id.clone())
+                        })
                 })
             {
+                if !is_pod_ready(target_pod) {
+                    let now = unix_seconds();
+                    let operation = start_remove_replica(
+                        set.metadata.uid.as_deref().unwrap_or(&set_key),
+                        persisted_snapshot.clone(),
+                        RemoveReplicaTarget {
+                            replica_id: target_id,
+                            pod_name: target_pod.name_any(),
+                            pod_uid: old_instance,
+                        },
+                        DurableRemoveMode::Force,
+                        set.spec.min_replicas as usize,
+                        now,
+                    )?;
+                    let mut status = KubericSetStatus {
+                        phase: Phase::RemovingReplica,
+                        operation: Some(operation.clone()),
+                        ..set.status.clone().unwrap_or_default()
+                    };
+                    set_operation_condition(&mut status, operation_condition(&operation, now));
+                    api.patch_set_status(
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
+                    state.drivers.lock().await.remove(&set_key);
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
                 let now = unix_seconds();
                 let operation = start_add_replica(
                     set.metadata.uid.as_deref().unwrap_or(&set_key),
@@ -325,6 +407,17 @@ pub async fn reconcile_set(
                 .await?;
                 state.drivers.lock().await.remove(&set_key);
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+
+            // Ensure every desired ordinal exists after missing committed
+            // members have been evicted and replacement incarnations handled.
+            if actual < desired {
+                info!(name, actual, desired, "scale-up: creating pods");
+                for i in 0..desired {
+                    ensure_pvc(api, set, &namespace, i as i32).await?;
+                    ensure_pod(api, set, &namespace, i as i32).await?;
+                }
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
             }
 
             // Rebuild process-local driver state before making any Healthy
@@ -486,15 +579,47 @@ pub async fn reconcile_set(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
-            // Keep the previous stable topology until Kubernetes exposes
-            // a ready replacement incarnation that can enter the durable
-            // rebuild protocol.
             if !stale_ids.is_empty() {
-                warn!(
-                    name,
-                    stale_ids = ?stale_ids,
-                    "waiting for stale secondaries to be replaced before durable rejoin"
-                );
+                let target_id = *stale_ids.iter().max().unwrap();
+                let target_member = persisted_snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.id == target_id)
+                    .ok_or_else(|| {
+                        format!("stale secondary {target_id} is absent from stable snapshot")
+                    })?;
+                let target_pod_name = current_pods
+                    .iter()
+                    .find(|(id, _, _)| *id == target_id)
+                    .map(|(_, _, pod)| pod.name_any())
+                    .unwrap_or_else(|| format!("{}-{}", name, target_id - 1));
+                let now = unix_seconds();
+                let operation = start_remove_replica(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    persisted_snapshot.clone(),
+                    RemoveReplicaTarget {
+                        replica_id: target_id,
+                        pod_name: target_pod_name,
+                        pod_uid: target_member.instance_id.clone(),
+                    },
+                    DurableRemoveMode::Force,
+                    set.spec.min_replicas as usize,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
+                    phase: Phase::RemovingReplica,
+                    operation: Some(operation.clone()),
+                    ..set.status.clone().unwrap_or_default()
+                };
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
@@ -584,56 +709,48 @@ pub async fn reconcile_set(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
-            // Scale-down: remove excess secondaries via driver, then delete pods
-            if actual > desired
-                && let Some(driver) = state.drivers.lock().await.get_mut(&set_key)
-            {
-                let primary_id = driver.primary_id();
-
-                // Pick the highest-ID secondary to remove (prefer newest)
-                let mut to_remove: Vec<ReplicaId> = driver
-                    .replica_ids()
-                    .into_iter()
-                    .filter(|id| Some(*id) != primary_id)
-                    .collect();
-                to_remove.sort();
-                to_remove.reverse(); // highest first
-
-                let remove_count = actual - desired;
-                for replica_id in to_remove.into_iter().take(remove_count) {
-                    info!(name, replica_id, "scale-down: removing secondary");
-                    if let Err(e) = driver
-                        .remove_secondary(replica_id, set.spec.min_replicas as usize)
-                        .await
-                    {
-                        warn!(replica_id, error = %e, "failed to remove secondary");
-                        return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
-                    }
-
-                    // Persist the committed removal before deleting the pod or
-                    // beginning another removal.
-                    let status = KubericSetStatus {
-                        ready_replicas: driver.replica_ids().len() as i32,
-                        replicas: driver.replica_ids().len() as i32,
-                        members: build_member_status(&pods, &set.spec),
-                        stable_snapshot: Some(snapshot_status(driver)?),
-                        ..set.status.clone().unwrap_or_default()
-                    };
-                    // Delete the pod
-                    let pod_name = format!("{}-{}", name, replica_id - 1);
-                    let persist_result = persist_committed_status(
-                        api,
-                        state,
-                        &set_key,
-                        &namespace,
-                        &name,
-                        &status,
-                        set.metadata.resource_version.as_deref(),
-                    )
-                    .await;
-                    let _ = api.delete_pod(&namespace, &pod_name).await;
-                    persist_result?;
-                }
+            // Scale-down: checkpoint one exact stable secondary before any
+            // runtime or Kubernetes mutation.
+            if persisted_snapshot.members.len() > desired {
+                let target = persisted_snapshot
+                    .members
+                    .iter()
+                    .filter(|member| member.id != persisted_snapshot.primary_id)
+                    .max_by_key(|member| member.id)
+                    .ok_or_else(|| "scale-down has no removable secondary".to_string())?;
+                let pod_name = current_pods
+                    .iter()
+                    .find(|(id, _, _)| *id == target.id)
+                    .map(|(_, _, pod)| pod.name_any())
+                    .unwrap_or_else(|| format!("{}-{}", name, target.id - 1));
+                let now = unix_seconds();
+                let operation = start_remove_replica(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    persisted_snapshot.clone(),
+                    RemoveReplicaTarget {
+                        replica_id: target.id,
+                        pod_name,
+                        pod_uid: target.instance_id.clone(),
+                    },
+                    DurableRemoveMode::ScaleDown,
+                    set.spec.min_replicas as usize,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
+                    phase: Phase::RemovingReplica,
+                    operation: Some(operation.clone()),
+                    ..set.status.clone().unwrap_or_default()
+                };
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
             Ok(ReconcileAction::Requeue(Duration::from_secs(30)))
@@ -712,7 +829,7 @@ pub async fn reconcile_set(
             Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
         }
 
-        Phase::Switchover | Phase::AddingReplica => {
+        Phase::Switchover | Phase::AddingReplica | Phase::RemovingReplica => {
             reconcile_durable_operation(set, api, state, &pods, &ready_pods, &set_key).await
         }
 
@@ -752,6 +869,7 @@ async fn reconcile_durable_operation(
             .filter(|member| Some(member.id) != operation.target_replica_id)
             .cloned()
             .collect(),
+        DurableOperationKind::RemoveReplica => operation.target_snapshot.members.clone(),
     };
     let identity_error = identity_members.iter().find_map(|member| {
         match current_pods.iter().find(|(id, _, _)| *id == member.id) {
@@ -786,13 +904,20 @@ async fn reconcile_durable_operation(
 
     let mut handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::new();
     let mut observations = OperationObservations::new();
-    for (replica_id, _, pod) in &current_pods {
-        if !operation
+    let pod_identities: OperationPodIdentities = current_pods
+        .iter()
+        .map(|(id, instance_id, _)| (*id, instance_id.to_string()))
+        .collect();
+    for (replica_id, instance_id, pod) in &current_pods {
+        let is_target_member = operation
             .target_snapshot
             .members
             .iter()
-            .any(|member| member.id == *replica_id)
-        {
+            .any(|member| member.id == *replica_id);
+        let is_exact_remove_target = operation.kind == DurableOperationKind::RemoveReplica
+            && operation.target_replica_id == Some(*replica_id)
+            && operation.target_instance_id.as_deref() == Some(instance_id.as_str());
+        if !is_target_member && !is_exact_remove_target {
             continue;
         }
         let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await else {
@@ -821,6 +946,9 @@ async fn reconcile_durable_operation(
     let decision = match operation.kind {
         DurableOperationKind::Switchover => decide(&operation, &observations, now),
         DurableOperationKind::AddReplica => decide_add_replica(&operation, &observations, now),
+        DurableOperationKind::RemoveReplica => {
+            decide_remove_replica(&operation, &observations, &pod_identities, now)
+        }
     };
     let decision = match decision {
         Ok(decision) => decision,
@@ -908,8 +1036,11 @@ async fn reconcile_durable_operation(
                 .await?;
             }
         }
-        Decision::DeletePod { pod_name } => {
-            if let Err(error) = api.delete_pod(&namespace, &pod_name).await {
+        Decision::DeletePod {
+            pod_name,
+            expected_uid,
+        } => {
+            if let Err(error) = api.delete_pod(&namespace, &pod_name, &expected_uid).await {
                 let next_operation = record_activity_error(&operation, &error);
                 let mut status = set.status.clone().unwrap_or_default();
                 status.operation = Some(next_operation.clone());
@@ -922,6 +1053,29 @@ async fn reconcile_durable_operation(
                 )
                 .await?;
             }
+        }
+        Decision::CommitSnapshot {
+            operation,
+            snapshot,
+        } => {
+            let mut status = set.status.clone().unwrap_or_default();
+            status.epoch = snapshot.epoch.clone();
+            status.ready_replicas = ready_pods.len() as i32;
+            status.replicas = pods.len() as i32;
+            status.members = build_member_status(pods, &set.spec);
+            status.stable_snapshot = Some(snapshot);
+            status.operation = Some(operation.clone());
+            set_operation_condition(&mut status, operation_condition(&operation, now));
+            persist_committed_status(
+                api,
+                state,
+                set_key,
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
         }
         Decision::Wait => {}
         Decision::Complete {

@@ -8,7 +8,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{KubericError, Result};
 use crate::events::ReplicateRequest;
-use crate::types::{AccessStatus, CancellationToken, FaultType, Lsn, ReplicaId};
+use crate::types::{
+    AccessStatus, CancellationToken, FaultType, Lsn, ReplicaConnectionStatus, ReplicaId,
+    ReplicaInstanceId,
+};
 
 // ---------------------------------------------------------------------------
 // PartitionState — shared atomics written by replicator, read by handles
@@ -28,6 +31,7 @@ pub struct PartitionState {
     catch_up_capability: AtomicI64,
     committed_lsn: AtomicI64,
     copy_lsn_map: Mutex<HashMap<ReplicaId, Lsn>>,
+    active_replica_connections: Mutex<HashMap<ReplicaId, ReplicaInstanceId>>,
 }
 
 impl PartitionState {
@@ -39,6 +43,7 @@ impl PartitionState {
             catch_up_capability: AtomicI64::new(0),
             committed_lsn: AtomicI64::new(0),
             copy_lsn_map: Mutex::new(HashMap::new()),
+            active_replica_connections: Mutex::new(HashMap::new()),
         }
     }
 
@@ -106,6 +111,28 @@ impl PartitionState {
     /// the precise replay boundary.
     pub fn take_copy_lsn(&self, replica_id: &ReplicaId) -> Option<Lsn> {
         self.copy_lsn_map.lock().unwrap().remove(replica_id)
+    }
+
+    pub fn set_active_replica_connections(
+        &self,
+        connections: HashMap<ReplicaId, ReplicaInstanceId>,
+    ) {
+        *self.active_replica_connections.lock().unwrap() = connections;
+    }
+
+    pub fn active_replica_connections(&self) -> Vec<ReplicaConnectionStatus> {
+        let mut connections = self
+            .active_replica_connections
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&id, instance_id)| ReplicaConnectionStatus {
+                id,
+                instance_id: instance_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        connections.sort_by_key(|connection| connection.id);
+        connections
     }
 }
 

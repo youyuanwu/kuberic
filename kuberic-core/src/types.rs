@@ -196,6 +196,13 @@ pub struct ReplicaStatusInfo {
     pub configuration: Option<ReplicaConfigurationStatus>,
     pub last_completed_action: Option<DurableActionCompletion>,
     pub durable_action: Option<DurableActionObservation>,
+    pub active_replica_connections: Vec<ReplicaConnectionStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaConnectionStatus {
+    pub id: ReplicaId,
+    pub instance_id: ReplicaInstanceId,
 }
 
 // ---------------------------------------------------------------------------
