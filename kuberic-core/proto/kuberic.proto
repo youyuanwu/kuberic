@@ -44,6 +44,14 @@ enum ReplicaConfigurationModeProto {
     CONFIGURATION_CURRENT = 2;
 }
 
+enum DurableActionStateProto {
+    DURABLE_ACTION_NONE = 0;
+    DURABLE_ACTION_SCHEDULED = 1;
+    DURABLE_ACTION_IN_PROGRESS = 2;
+    DURABLE_ACTION_COMPLETED = 3;
+    DURABLE_ACTION_FAILED = 4;
+}
+
 message ReplicaInfoProto {
     int64 id = 1;
     RoleProto role = 2;
@@ -113,6 +121,10 @@ message GetStatusResponse {
     ReplicaConfigurationStatusProto configuration = 9;
     string last_completed_action_id = 10;
     string last_completed_action_signature = 11;
+    string durable_action_id = 12;
+    string durable_action_signature = 13;
+    DurableActionStateProto durable_action_state = 14;
+    string durable_action_error = 15;
 }
 
 message ReplicaConfigurationMemberStatusProto {
@@ -171,6 +183,10 @@ message ExecuteDurableActionRequest {
         UpdateCatchUpConfigRequest update_catch_up_configuration = 5;
         WaitForCatchUpQuorumRequest wait_for_catch_up_quorum = 6;
         UpdateCurrentConfigRequest update_current_configuration = 7;
+        OpenRequest open = 8;
+        CloseRequest close = 9;
+        BuildReplicaRequest build_replica = 10;
+        RemoveReplicaRequest remove_replica = 11;
     }
 }
 message ExecuteDurableActionResponse {}

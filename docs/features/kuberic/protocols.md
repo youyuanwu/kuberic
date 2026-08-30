@@ -107,25 +107,31 @@ build → catch-up → finalize cycle.
 
 ## Protocol: Scale-Up (Add Replica)
 
-Add a new replica to a running partition. Implemented in
-`PartitionDriver::add_replica()`.
+Add a new replica to a running partition. Direct/in-process callers may use
+`PartitionDriver::add_replica()`. Operator reconciliation uses the durable
+`AddingReplica` operation.
 
 ```
 1. Operator creates new Pod + waits for Ready
 2. Operator creates GrpcReplicaHandle for the new pod
-3. driver.add_replica(handle):
-   a. Open replicator on new pod
-   b. change_role(IdleSecondary) + set epoch
-   c. build_replica (primary → idle, copy stream)
-   d. change_role(ActiveSecondary) — promote idle → active
-   e. update_catch_up_configuration (add to quorum)
-   f. wait_for_catch_up_quorum
-   g. update_current_configuration (finalize)
-4. Operator updates CRD status
+3. Persist previous/target snapshots, exact candidate identity, phase, and the
+   first pending action
+4. Execute one write-ahead correlated activity per reconcile:
+   a. Open(New)
+   b. update_epoch
+   c. change_role(IdleSecondary)
+   d. build_replica (primary → idle, copy stream)
+   e. change_role(ActiveSecondary)
+   f. update_catch_up_configuration with `must_catch_up`
+   g. wait_for_catch_up_quorum
+   h. update_current_configuration
+5. Label the candidate secondary and publish the target stable snapshot
 ```
 
-Same as create_partition steps 4a–4e, but for a single replica joining
-an already-running partition.
+The pod runtime records scheduled/in-progress/completed/failed state for the
+current correlated activity. `BuildReplica` runs in the background so status
+remains observable during a long copy, and exact duplicate delivery never
+starts a second copy.
 
 ---
 
@@ -150,8 +156,13 @@ connection for the same stable ID and cancels the old drain/ACK tasks. A
 delayed removal for the old incarnation is an idempotent no-op and cannot
 remove the replacement.
 
-The reconciler uses the same primary-side retirement operation when it detects
-a stale secondary before re-adding a recreated pod.
+The reconciler starts a durable rebuild after it sees a ready pod whose
+incarnation differs from the stable secondary. It first retires the old exact
+primary-side connection, then runs the durable add sequence under the same
+logical replica ID. Before catch-up configuration, compensation removes and
+closes the candidate. After catch-up begins it first restores the previous
+current configuration. Once target current configuration is observed,
+reconciliation rolls forward to target snapshot publication.
 
 ---
 

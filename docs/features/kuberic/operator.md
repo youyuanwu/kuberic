@@ -25,8 +25,9 @@ switchover, and scaling via `PartitionDriver`.
 - `reconfigurationPhase`
 - optional authoritative `stableSnapshot` with epoch, primary logical ID,
   complete member logical/incarnation identities and roles, and write quorum
-- optional compact versioned `operation` checkpoint for durable switchover,
-  including previous/target snapshots and one pending correlated action
+- optional compact versioned `operation` checkpoint for durable switchover and
+  replica add/rebuild, including previous/target snapshots and one pending
+  correlated action
 - `failingSinceTimestamp`, `quorumLossSince`
 - per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
 - `instanceNames`, `instanceStates`
@@ -42,12 +43,12 @@ process is also lost in that window, restart recovery rejects the stale
 snapshot instead of guessing. Creating also probes for an already-initialized
 runtime and refuses to replay `Open(New)`.
 
-Reconciler-driven switchover is the exception: it removes the process-local
-driver after persisting a versioned operation checkpoint, reconstructs fresh
-handles and observations on every reconcile, and advances one transition or
-activity at a time. Pending action intent is durable before RPC or pod-label
-mutation. Status patches include the observed Kubernetes `resourceVersion`;
-no lock is held across an activity.
+Reconciler-driven switchover and replica add/rebuild remove the process-local
+driver after persisting a versioned operation checkpoint, reconstruct fresh
+handles and observations on every reconcile, and advance one transition or
+activity at a time. Pending action intent is durable before RPC, pod-label, or
+pod-delete mutation. Status patches include the observed Kubernetes
+`resourceVersion`; no lock is held across a durable activity.
 
 ---
 
@@ -60,6 +61,7 @@ no lock is held across an activity.
 | `Healthy` | Normal operation — monitors health, handles scale, detects failures |
 | `FailingOver` | Primary failed, running failover protocol (incl. data loss path) |
 | `Switchover` | Planned primary change in progress |
+| `AddingReplica` | Durable scale-up or stale-secondary replacement in progress |
 
 Note: No `WaitingForQuorum` phase. Following SF's design, the system always
 makes progress during failover. If quorum is lost, the data loss protocol
@@ -145,10 +147,10 @@ and is refreshed from recovered driver state; it is never recovery input.
 Legacy resources without a snapshot, changed pod identities, and live state
 that is newer or otherwise inconsistent fail closed. Runtime health does not
 invalidate an otherwise consistent snapshot: recovery completes first, then
-the normal health/failover path runs. Recovery is intentionally limited to
-stable `Healthy` topology. Durable `Switchover` resumes from
-`status.operation`; other in-progress reconfigurations and restarted pod
-processes remain unsupported. See `operator-failure-scenarios.md` §8.
+the normal health/failover path runs. Recovery is intentionally limited to stable `Healthy` topology. Durable
+`Switchover` and `AddingReplica` resume from `status.operation`; other
+in-progress reconfigurations remain unsupported. See
+`operator-failure-scenarios.md` §8.
 
 ## Durable Switchover
 
@@ -158,22 +160,37 @@ source and target stable snapshots, phase, frozen LSN, retry/deadline/error
 metadata, and at most one pending action. Each action identifies the exact
 replica ID, pod-UID incarnation, expected epoch, and desired postcondition.
 
-`GetStatus` exposes write access, canonical configuration state, and the last
-completed durable action ID/signature. Lost replies therefore resume by
-observation rather than blind RPC repetition. Target-promotion failure can
-durably restore the old primary; impossible or stale observations poison the
-operation without publishing a new stable snapshot.
+`GetStatus` exposes write access, canonical configuration state, the last
+completed durable action, and the scheduled/in-progress/completed/failed state
+of the current durable activity. Lost replies therefore resume by observation
+rather than blind RPC repetition. Target-promotion failure can durably restore
+the old primary; impossible or stale observations poison the operation without
+publishing a new stable snapshot.
 
 ---
 
 ## Scale-Up Reconciliation
 
-When `spec.replicas > current pod count`:
+When `spec.replicas > current stable member count`:
 1. Create new Pod (with ownership labels)
 2. Wait for Pod Ready
-3. Connect `GrpcReplicaHandle` to new pod
-4. `driver.add_replica(handle)` — builds via copy stream, joins quorum
-5. Update CRD status with new configuration
+3. Persist a versioned add operation containing the previous stable snapshot
+   and the exact candidate pod UID
+4. Advance one correlated activity per reconcile:
+   Open(New) → UpdateEpoch → IdleSecondary → BuildReplica on the primary →
+   ActiveSecondary
+5. Install catch-up configuration with the candidate marked `must_catch_up`,
+   wait for write quorum, then install current configuration
+6. Update the candidate label and publish the target stable snapshot
+
+`BuildReplica` is scheduled asynchronously by the pod runtime. Status reports
+scheduled, in-progress, completed, or failed, so retries and controller
+replacement do not start a concurrent second copy.
+
+Stale-secondary replacement uses the same operation after first removing the
+old exact `(ReplicaId, ReplicaInstanceId)` connection from the primary. The
+previous stable snapshot remains unchanged until the replacement's current
+configuration commits.
 
 ---
 
@@ -208,5 +225,6 @@ Design follows SF's config-first approach (remove from quorum before closing):
 (newest). CNPG uses the same approach. SF uses PLB load balancing which
 is more sophisticated but unnecessary for our initial implementation.
 
-**All gRPC calls have timeouts** (default 30s). One reconfiguration at a
-time. Phases are idempotent (safe to re-execute after operator crash).
+**All gRPC calls have timeouts.** Ordinary control calls use the default 30s
+bound; durable BuildReplica allows a 10-minute copy window while remaining
+observable through GetStatus. One reconfiguration runs at a time.

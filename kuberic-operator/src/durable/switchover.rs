@@ -9,41 +9,12 @@ use kuberic_core::types::{
 use crate::crd::{
     DURABLE_OPERATION_VERSION, DurableActionKind, DurableOperationKind, DurableOperationPhase,
     DurableOperationStatus, DurablePostconditionKind, DurablePostconditionStatus, EpochStatus,
-    PendingActionStatus, StablePartitionSnapshotStatus, StableReplicaRoleStatus, StatusCondition,
+    PendingActionStatus, StablePartitionSnapshotStatus, StableReplicaRoleStatus,
 };
 
-pub const ACTION_DEADLINE_SECONDS: i64 = 5;
-const MAX_ERROR_LENGTH: usize = 512;
-
-#[derive(Debug)]
-pub struct ReplicaObservation {
-    pub status: ReplicaStatusInfo,
-    pub replicator_address: String,
-    pub pod_name: String,
-    pub pod_role_label: Option<String>,
-}
-
-pub type OperationObservations = BTreeMap<i64, ReplicaObservation>;
-
-#[derive(Debug)]
-pub enum Decision {
-    Persist(DurableOperationStatus),
-    Execute {
-        target_id: i64,
-        action_id: String,
-        action: DurableReplicaAction,
-    },
-    PatchPodRole {
-        target_id: i64,
-        role: String,
-    },
-    Wait,
-    Complete {
-        operation: DurableOperationStatus,
-        snapshot: StablePartitionSnapshotStatus,
-        compensated: bool,
-    },
-}
+use super::{ACTION_DEADLINE_SECONDS, Decision, OperationObservations, ReplicaObservation, poison};
+#[cfg(test)]
+use super::{MAX_ERROR_LENGTH, record_activity_error};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionObservation {
@@ -100,6 +71,11 @@ pub fn start_switchover(
         phase: DurableOperationPhase::Revoke,
         old_primary_id: previous.primary_id,
         target_primary_id,
+        add_mode: None,
+        target_replica_id: None,
+        target_instance_id: None,
+        target_pod_name: None,
+        retired_instance_id: None,
         previous_snapshot: previous,
         target_snapshot: target,
         frozen_lsn: None,
@@ -424,6 +400,10 @@ pub fn decide(
         DurableOperationPhase::Completed
         | DurableOperationPhase::Failed
         | DurableOperationPhase::Poisoned => Ok(Decision::Wait),
+        _ => Err(format!(
+            "phase {:?} is not valid for switchover",
+            operation.phase
+        )),
     }
 }
 
@@ -488,6 +468,7 @@ fn decide_pending(
                 DurableActionKind::CompensateLabelTargetSecondary => {
                     next.phase = DurableOperationPhase::CompensateFinalize;
                 }
+                _ => return Err("non-switchover action reached switchover decision".to_string()),
             }
             Ok(Decision::Persist(next))
         }
@@ -730,6 +711,7 @@ fn observe_action(
                 target_epoch,
             )
         }
+        _ => return Err("non-switchover action reached switchover observation".to_string()),
     };
     Ok(result)
 }
@@ -815,6 +797,7 @@ fn action_for(
         | DurableActionKind::CompensateLabelTargetSecondary => {
             return Err("pod label actions are executed by the cluster API".to_string());
         }
+        _ => return Err("non-switchover action reached switchover action mapping".to_string()),
     })
 }
 
@@ -846,6 +829,7 @@ fn pending_action(
         DurableActionKind::CompensateUpdateSecondaryEpoch => {
             compensation_epoch_distribution_ids(operation)[operation.next_secondary_index as usize]
         }
+        _ => return Err("non-switchover action cannot be scheduled".to_string()),
     };
     let member = operation
         .previous_snapshot
@@ -904,6 +888,7 @@ fn pending_action(
             kind: DurablePostconditionKind::PodRoleLabel,
             role: None,
         },
+        _ => return Err("non-switchover action has no switchover postcondition".to_string()),
     };
     Ok(PendingActionStatus {
         action_id: action_id(operation, sequence, kind),
@@ -930,24 +915,6 @@ fn with_pending(
     let mut next = operation.clone();
     next.pending_action = Some(pending);
     next
-}
-
-pub fn record_activity_error(
-    operation: &DurableOperationStatus,
-    error: &str,
-) -> DurableOperationStatus {
-    let mut next = operation.clone();
-    let bounded = bounded_error(error);
-    next.last_error = Some(bounded.clone());
-    if let Some(pending) = &mut next.pending_action {
-        pending.attempts = pending.attempts.saturating_add(1);
-        pending.last_error = Some(bounded);
-    }
-    next
-}
-
-pub fn fail_closed(operation: &DurableOperationStatus, error: &str) -> DurableOperationStatus {
-    poison(operation, error)
 }
 
 fn timeout_transition(
@@ -980,20 +947,9 @@ fn timeout_transition(
         | DurableActionKind::CompensateCurrentConfiguration => DurableOperationPhase::Poisoned,
         DurableActionKind::CompensateLabelOldPrimary
         | DurableActionKind::CompensateLabelTargetSecondary => DurableOperationPhase::Poisoned,
+        _ => DurableOperationPhase::Poisoned,
     };
     next
-}
-
-fn poison(operation: &DurableOperationStatus, message: &str) -> DurableOperationStatus {
-    let mut next = operation.clone();
-    next.phase = DurableOperationPhase::Poisoned;
-    next.pending_action = None;
-    next.last_error = Some(bounded_error(message));
-    next
-}
-
-fn bounded_error(error: &str) -> String {
-    error.chars().take(MAX_ERROR_LENGTH).collect()
 }
 
 fn exact_observation<'a>(
@@ -1302,44 +1258,6 @@ fn pod_role_action(kind: DurableActionKind) -> Option<&'static str> {
     }
 }
 
-pub fn operation_condition(operation: &DurableOperationStatus, now: i64) -> StatusCondition {
-    let (status, reason, message) = match operation.phase {
-        DurableOperationPhase::Completed => (
-            "False",
-            "Completed",
-            "durable switchover completed and stable topology was persisted",
-        ),
-        DurableOperationPhase::Failed => (
-            "False",
-            "CompensatedOrSafeFailure",
-            operation
-                .last_error
-                .as_deref()
-                .unwrap_or("durable switchover did not change the stable primary"),
-        ),
-        DurableOperationPhase::Poisoned => (
-            "True",
-            "Poisoned",
-            operation
-                .last_error
-                .as_deref()
-                .unwrap_or("durable switchover cannot advance safely"),
-        ),
-        _ => (
-            "True",
-            "Advancing",
-            "durable switchover is advancing one checkpoint at a time",
-        ),
-    };
-    StatusCondition {
-        type_: "DurableOperation".to_string(),
-        status: status.to_string(),
-        reason: reason.to_string(),
-        message: bounded_error(message),
-        last_transition_time: now.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1421,6 +1339,7 @@ mod tests {
                     write_status: AccessStatus::Granted,
                     configuration: None,
                     last_completed_action: None,
+                    durable_action: None,
                 },
                 replicator_address: "http://one".to_string(),
                 pod_name: "set-0".to_string(),

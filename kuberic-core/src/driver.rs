@@ -70,6 +70,8 @@ pub trait ReplicaHandle: Send + Sync {
         action: DurableReplicaAction,
     ) -> Result<()> {
         match action {
+            DurableReplicaAction::Open { mode } => self.open(mode).await,
+            DurableReplicaAction::Close => self.close().await,
             DurableReplicaAction::RevokeWriteStatus => self.revoke_write_status().await,
             DurableReplicaAction::ChangeRole { epoch, role } => self.change_role(epoch, role).await,
             DurableReplicaAction::UpdateEpoch { epoch } => self.update_epoch(epoch).await,
@@ -82,6 +84,11 @@ pub trait ReplicaHandle: Send + Sync {
             DurableReplicaAction::UpdateCurrentConfiguration { current } => {
                 self.update_current_configuration(current).await
             }
+            DurableReplicaAction::BuildReplica { replica } => self.build_replica(replica).await,
+            DurableReplicaAction::RemoveReplica {
+                replica_id,
+                instance_id,
+            } => self.remove_replica(replica_id, instance_id).await,
         }
     }
 }
@@ -1666,6 +1673,7 @@ pub mod testing {
                 write_status: self.state.write_status(),
                 configuration: None,
                 last_completed_action: None,
+                durable_action: None,
             })
         }
     }
@@ -1719,6 +1727,7 @@ mod tests {
                     },
                     configuration: None,
                     last_completed_action: None,
+                    durable_action: None,
                 },
                 operations,
             }

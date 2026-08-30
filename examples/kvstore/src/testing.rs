@@ -1,8 +1,9 @@
 //! Test utilities for the kvstore example.
 //! Compiled under `#[cfg(test)]` or `feature = "testing"`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
@@ -12,6 +13,25 @@ use kuberic_core::types::ReplicaInstanceId;
 use tokio::sync::RwLock;
 
 use crate::state::{KvState, SharedState};
+
+async fn allocate_unique_address() -> String {
+    static ALLOCATED_PORTS: OnceLock<StdMutex<HashSet<u16>>> = OnceLock::new();
+
+    loop {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let is_new = ALLOCATED_PORTS
+            .get_or_init(|| StdMutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(port);
+        drop(listener);
+
+        if is_new {
+            return format!("127.0.0.1:{port}");
+        }
+    }
+}
 
 /// A running KV pod: PodRuntime + KV service event loop.
 pub struct KvPod {
@@ -88,22 +108,19 @@ impl KvPod {
             std::sync::atomic::AtomicU64::new(1);
         let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let instance_id = ReplicaInstanceId::new(format!("kv-pod-{id}-{generation}"));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client_address = listener.local_addr().unwrap().to_string();
-        drop(listener);
+        let client_address = allocate_unique_address().await;
 
         // Pre-bind the data plane port so we know the address before Open.
         // The address is passed via OpenContext.data_bind, and WalReplicator::create()
         // binds to it inside the user's Open handler.
-        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let data_port = data_listener.local_addr().unwrap().port();
-        let data_bind = format!("127.0.0.1:{}", data_port);
+        let data_bind = allocate_unique_address().await;
         let data_address = format!("http://{}", data_bind);
-        drop(data_listener); // release — WalReplicator::create() will rebind
+        let control_bind = allocate_unique_address().await;
 
         let bundle = PodRuntime::builder(id)
             .instance_id(instance_id.clone())
             .reply_timeout(reply_timeout)
+            .control_bind(control_bind)
             .data_bind(data_bind)
             .build()
             .await

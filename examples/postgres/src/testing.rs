@@ -1,6 +1,7 @@
 use kuberic_core::types::ReplicaInstanceId;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Find the pg_bin directory from the system.
 pub fn find_pg_bin() -> PathBuf {
@@ -51,12 +52,24 @@ pub fn cleanup_data_dir(dir: &std::path::Path) {
 /// Allocate a free port by binding to port 0 and reading the OS-assigned port.
 /// Same approach as kvstore's data plane port allocation.
 pub async fn allocate_port() -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind to port 0");
-    let port = listener.local_addr().unwrap().port();
-    drop(listener); // release — PG will bind to this port
-    port
+    static ALLOCATED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+    loop {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind to port 0");
+        let port = listener.local_addr().unwrap().port();
+        let is_new = ALLOCATED_PORTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap()
+            .insert(port);
+        drop(listener);
+
+        if is_new {
+            return port;
+        }
+    }
 }
 
 /// A running PG pod: PodRuntime + PG service event loop + PG instance.
@@ -99,15 +112,16 @@ impl PgPod {
         instance.start(fault_tx).await.expect("start PG");
 
         // Pre-bind data plane port (PgDataService will bind here in Open)
-        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let data_port = data_listener.local_addr().unwrap().port();
+        let data_port = allocate_port().await;
         let data_bind = format!("127.0.0.1:{data_port}");
         let data_address = format!("http://{data_bind}");
-        drop(data_listener);
+        let control_port = allocate_port().await;
+        let control_bind = format!("127.0.0.1:{control_port}");
 
         let bundle = PodRuntime::builder(id)
             .instance_id(instance_id.clone())
             .reply_timeout(Duration::from_secs(30))
+            .control_bind(control_bind)
             .data_bind(data_bind)
             .build()
             .await
