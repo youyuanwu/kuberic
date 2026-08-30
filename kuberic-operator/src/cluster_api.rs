@@ -34,7 +34,7 @@ pub trait ClusterApi: Send + Sync {
         labels: BTreeMap<String, String>,
     ) -> Result<(), String>;
 
-    /// Patch the CRD status.
+    /// Replace the complete CRD status using optimistic resource-version fencing.
     async fn patch_set_status(
         &self,
         namespace: &str,
@@ -157,21 +157,24 @@ impl ClusterApi for KubeClusterApi {
     ) -> Result<(), String> {
         let api: kube::Api<crate::crd::KubericSet> =
             kube::Api::namespaced(self.client.clone(), namespace);
-        let patch = match expected_resource_version {
-            Some(resource_version) => serde_json::json!({
-                "metadata": { "resourceVersion": resource_version },
-                "status": status
-            }),
-            None => serde_json::json!({ "status": status }),
-        };
-        api.patch_status(
-            set_name,
-            &kube::api::PatchParams::apply("kuberic-operator"),
-            &kube::api::Patch::Merge(&patch),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        let mut current = api.get(set_name).await.map_err(|e| e.to_string())?;
+        if let Some(expected) = expected_resource_version
+            && current.metadata.resource_version.as_deref() != Some(expected)
+        {
+            return Err(format!(
+                "status resource version changed from {expected} to {}",
+                current
+                    .metadata
+                    .resource_version
+                    .as_deref()
+                    .unwrap_or("<none>")
+            ));
+        }
+        current.status = Some(status.clone());
+        api.replace_status(set_name, &kube::api::PostParams::default(), &current)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     async fn create_replica_handle(
