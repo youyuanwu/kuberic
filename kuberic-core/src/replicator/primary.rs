@@ -292,6 +292,10 @@ impl PrimarySender {
         self.connections.keys().cloned().collect()
     }
 
+    pub fn active_connections(&self) -> HashMap<ReplicaId, ReplicaInstanceId> {
+        self.active_instances.read().unwrap().clone()
+    }
+
     /// Close all connections.
     pub fn close_all(&mut self) {
         self.active_instances.write().unwrap().clear();

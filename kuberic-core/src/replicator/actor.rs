@@ -131,6 +131,12 @@ impl WalReplicatorActor {
                                         Some(PrimarySender::new(self.replica_id, epoch));
                                 }
                             }
+                            state.set_active_replica_connections(
+                                primary_sender
+                                    .as_ref()
+                                    .map(PrimarySender::active_connections)
+                                    .unwrap_or_default(),
+                            );
 
                             let _ = reply.send(Ok(()));
                         }
@@ -266,6 +272,12 @@ impl WalReplicatorActor {
                             if let Some(error) = required_connection_error {
                                 let _ = reply.send(Err(error));
                             } else {
+                                state.set_active_replica_connections(
+                                    primary_sender
+                                        .as_ref()
+                                        .map(PrimarySender::active_connections)
+                                        .unwrap_or_default(),
+                                );
                                 let _ = reply.send(Ok(()));
                             }
                         }
@@ -284,17 +296,6 @@ impl WalReplicatorActor {
                             let tracker_committed =
                                 quorum_tracker.lock().await.committed_lsn();
                             state.advance_committed_lsn(tracker_committed);
-
-                            if let Some(sender) = &mut primary_sender {
-                                let to_remove: Vec<ReplicaId> = sender
-                                    .connected_ids()
-                                    .into_iter()
-                                    .filter(|id| !cc_members.contains(id))
-                                    .collect();
-                                for id in to_remove {
-                                    sender.remove_secondary_by_id(id);
-                                }
-                            }
 
                             let _ = reply.send(Ok(()));
 
@@ -336,6 +337,12 @@ impl WalReplicatorActor {
                             if let Some(sender) = &mut primary_sender {
                                 sender.remove_secondary(replica_id, &instance_id);
                             }
+                            state.set_active_replica_connections(
+                                primary_sender
+                                    .as_ref()
+                                    .map(PrimarySender::active_connections)
+                                    .unwrap_or_default(),
+                            );
                             let _ = reply.send(Ok(()));
                         }
                         ReplicatorControlEvent::OnDataLoss { reply } => {
@@ -395,6 +402,7 @@ impl WalReplicatorActor {
                     // Include committed_lsn so secondaries can track commit progress.
                     if let Some(sender) = &mut primary_sender {
                         sender.send_to_all(lsn, &req.data, committed);
+                        state.set_active_replica_connections(sender.active_connections());
                     }
                 }
 

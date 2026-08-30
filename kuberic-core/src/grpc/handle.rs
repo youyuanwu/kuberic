@@ -9,8 +9,8 @@ use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
     DataLossAction, DurableActionCompletion, DurableActionObservation, DurableActionState,
-    DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
-    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
+    DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConnectionStatus, ReplicaId, ReplicaInfo,
+    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
 };
 
 /// Implements `ReplicaHandle` by calling a remote pod's gRPC `ReplicatorControl` service.
@@ -281,6 +281,14 @@ impl ReplicaHandle for GrpcReplicaHandle {
                         .then_some(inner.durable_action_error),
                 })
             },
+            active_replica_connections: inner
+                .active_replica_connections
+                .into_iter()
+                .map(|connection| ReplicaConnectionStatus {
+                    id: connection.id,
+                    instance_id: ReplicaInstanceId::new(connection.instance_id),
+                })
+                .collect(),
         })
     }
 

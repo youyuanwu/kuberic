@@ -185,11 +185,15 @@ pub struct DurableOperationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_mode: Option<DurableAddMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_mode: Option<DurableRemoveMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target_replica_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_pod_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_pod_uid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retired_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,6 +212,7 @@ pub struct DurableOperationStatus {
 pub enum DurableOperationKind {
     Switchover,
     AddReplica,
+    RemoveReplica,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
@@ -215,6 +220,13 @@ pub enum DurableOperationKind {
 pub enum DurableAddMode {
     ScaleUp,
     Rebuild,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DurableRemoveMode {
+    ScaleDown,
+    Force,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
@@ -257,6 +269,16 @@ pub enum DurableOperationPhase {
     CompensateCloseCandidate,
     CompensateDeleteCandidate,
     AddCompensateFinalize,
+    RemoveCatchUpConfiguration,
+    RemoveWaitForCatchUpQuorum,
+    RemoveCurrentConfiguration,
+    RemovePrimaryConnection,
+    RemoveDemoteTarget,
+    RemoveCloseTarget,
+    RemoveDeleteTarget,
+    RemoveFinalize,
+    RemoveCompensateConfiguration,
+    RemoveCompensateFinalize,
     Completed,
     Failed,
     Poisoned,
@@ -313,6 +335,14 @@ pub enum DurableActionKind {
     CompensateDemoteCandidate,
     CompensateCloseCandidate,
     CompensateDeleteCandidate,
+    RemoveCatchUpConfiguration,
+    RemoveWaitForCatchUpQuorum,
+    RemoveCurrentConfiguration,
+    RemovePrimaryConnection,
+    RemoveDemoteTarget,
+    RemoveCloseTarget,
+    RemoveDeleteTarget,
+    RemoveCompensateConfiguration,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -520,6 +550,7 @@ pub enum Phase {
     FailingOver,
     Switchover,
     AddingReplica,
+    RemovingReplica,
     Deleting,
 }
 

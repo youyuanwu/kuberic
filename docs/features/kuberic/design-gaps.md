@@ -724,11 +724,11 @@ design work needed — just implementation.
 |------|----------------|----------|
 | Data loss protocol (`on_data_loss()` + `data_loss_number`) | operator-failure-scenarios.md §1, §7 | P0 |
 | Stable operator restart recovery (`PartitionDriver::recover()`) | operator-failure-scenarios.md §8, A3 notes above | ✅ Implemented |
-| Secondary health detection + replacement | operator-failure-scenarios.md §2 | P0 |
-| Missing pod detection | operator-failure-scenarios.md §3 | P0 |
+| Secondary health detection + durable rebuild/eviction | operator-failure-scenarios.md §2 | ✅ Implemented |
+| Stable missing secondary detection | operator-failure-scenarios.md §3 | ✅ Implemented |
 | gRPC failure tracking (per-replica counter) | operator-failure-scenarios.md §5 | P1 |
 | Failover delay (`failingSinceTimestamp`) | operator-failure-scenarios.md §1 | P1 |
-| `force_remove_secondary` (error-tolerant removal) | operator-failure-scenarios.md §3 | P1 |
+| Durable error-tolerant secondary removal | operator-failure-scenarios.md §3 | ✅ Implemented |
 | CRD conditions (Ready, Degraded, QuorumAvailable) | operator-failure-scenarios.md | P1 |
 | Old primary cleanup after failover | operator-failure-scenarios.md §9 | P1 |
 | Primary self-fencing liveness probe | operator-failure-scenarios.md §5 | P2 |
@@ -989,8 +989,7 @@ The operation durably covers write revocation, frozen-LSN catch-up, demotion,
 promotion, member epoch convergence, catch-up/current configuration, routing
 labels, stable snapshot persistence, and compensation to the old primary.
 Impossible or incompatible observations perform no runtime mutation and remain
-fail closed. Failover, scale-down/remove, and other operations retain their
-existing paths.
+fail closed. Failover and other operations retain their existing paths.
 
 ### E5. Replica add/rebuild state lost with operator process — ✅ Fixed
 
@@ -1018,5 +1017,26 @@ older instance is removed before a newer build proceeds.
 Compensation is phase-aware: pre-configuration failures remove/demote/close/
 delete the candidate; failures after catch-up configuration restore the
 previous current configuration first; and observed target current configuration
-rolls forward to target snapshot publication. Scale-down/remove, creation,
-failover, and data-loss migration remain open.
+rolls forward to target snapshot publication. Creation, failover, and
+data-loss migration remain open.
+
+### E6. Replica removal state lost with operator process — ✅ Fixed
+
+**Affects:** Healthy scale-down and stale/dead-secondary eviction
+
+The operator now uses one durable configuration-first removal protocol with
+typed `ScaleDown` and `Force` modes. It persists previous and reduced target
+snapshots plus the exact target replica ID, runtime incarnation, pod name, and
+pod UID before activity.
+
+The primary installs target/previous catch-up configuration, waits for retained
+write quorum, and commits target current configuration. The reduced stable
+snapshot is persisted immediately when that commit is observed. Failures
+before commit restore the previous current configuration and snapshot;
+post-commit processing only rolls forward.
+
+`GetStatus` exposes exact primary sender connections, making old-incarnation
+absence observable after ambiguous removal responses. Reachable targets are
+demoted and closed after membership commit; unreachable targets do not block
+progress. Kubernetes deletion uses the recorded UID precondition, so delayed
+cleanup cannot delete a same-name replacement pod.

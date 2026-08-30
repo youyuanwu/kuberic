@@ -8,9 +8,11 @@ use crate::crd::{
 };
 
 mod add_replica;
+mod remove_replica;
 mod switchover;
 
 pub use add_replica::{decide_add_replica, start_add_replica};
+pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
 pub use switchover::{decide, start_switchover};
 
 pub const ACTION_DEADLINE_SECONDS: i64 = 5;
@@ -25,6 +27,7 @@ pub struct ReplicaObservation {
 }
 
 pub type OperationObservations = BTreeMap<i64, ReplicaObservation>;
+pub type OperationPodIdentities = BTreeMap<i64, String>;
 
 #[derive(Debug)]
 pub enum Decision {
@@ -40,6 +43,11 @@ pub enum Decision {
     },
     DeletePod {
         pod_name: String,
+        expected_uid: String,
+    },
+    CommitSnapshot {
+        operation: DurableOperationStatus,
+        snapshot: StablePartitionSnapshotStatus,
     },
     Wait,
     Complete {
@@ -83,6 +91,7 @@ pub fn operation_condition(operation: &DurableOperationStatus, now: i64) -> Stat
     let operation_name = match operation.kind {
         DurableOperationKind::Switchover => "switchover",
         DurableOperationKind::AddReplica => "replica add/rebuild",
+        DurableOperationKind::RemoveReplica => "replica removal",
     };
     let (status, reason, message) = match operation.phase {
         DurableOperationPhase::Completed => (
