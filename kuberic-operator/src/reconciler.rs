@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
-use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, Role, StablePartitionSnapshot};
+use kuberic_core::types::{ReplicaId, ReplicaInstanceId, StablePartitionSnapshot};
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
@@ -22,10 +22,10 @@ use crate::crd::{
     StablePartitionSnapshotStatus, StableReplicaRoleStatus, StatusCondition,
 };
 use crate::durable::{
-    Decision, OperationObservations, OperationPodIdentities, RemoveReplicaTarget,
-    ReplicaObservation, decide, decide_add_replica, decide_remove_replica, fail_closed,
-    operation_condition, record_activity_error, start_add_replica, start_remove_replica,
-    start_switchover,
+    CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
+    RemoveReplicaTarget, ReplicaObservation, decide, decide_add_replica, decide_create_partition,
+    decide_remove_replica, fail_closed, operation_condition, record_activity_error,
+    start_add_replica, start_create_partition, start_remove_replica, start_switchover,
 };
 
 /// Shared state across reconciliation loops.
@@ -106,6 +106,7 @@ pub async fn reconcile_set(
         )
     {
         let expected_phase = match operation.kind {
+            DurableOperationKind::CreatePartition => Phase::Creating,
             DurableOperationKind::Switchover => Phase::Switchover,
             DurableOperationKind::AddReplica => Phase::AddingReplica,
             DurableOperationKind::RemoveReplica => Phase::RemovingReplica,
@@ -141,124 +142,106 @@ pub async fn reconcile_set(
         }
 
         Phase::Creating => {
-            if state.drivers.lock().await.contains_key(&set_key) {
-                // The runtime completed creation and its status was already
-                // persisted (or is about to become visible). Never replay
-                // creation against open replicas.
-                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            if let Some(operation) = set
+                .status
+                .as_ref()
+                .and_then(|status| status.operation.as_ref())
+                .filter(|operation| operation.kind == DurableOperationKind::CreatePartition)
+            {
+                match operation.phase {
+                    DurableOperationPhase::Failed => {}
+                    DurableOperationPhase::Poisoned => {
+                        return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+                    }
+                    DurableOperationPhase::Completed => {
+                        return Err(
+                            "completed creation operation is inconsistent with Creating phase"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return reconcile_durable_operation(
+                            set,
+                            api,
+                            state,
+                            &pods,
+                            &ready_pods,
+                            &set_key,
+                        )
+                        .await;
+                    }
+                }
             }
             let desired = set.spec.replicas as usize;
+            if desired == 0 {
+                return Err("partition creation requires at least one replica".to_string());
+            }
+            if set.spec.min_replicas <= 0 || set.spec.min_replicas as usize > desired {
+                return Err(format!(
+                    "minReplicas must be between 1 and desired replicas ({desired})"
+                ));
+            }
+            if pods.len() < desired {
+                for index in 0..desired {
+                    ensure_pvc(api, set, &namespace, index as i32).await?;
+                    ensure_pod(api, set, &namespace, index as i32).await?;
+                }
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
+            }
             if ready_pods.len() < desired {
                 info!(name, ready = ready_pods.len(), desired, "waiting for pods");
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
             }
 
-            info!(name, "all pods ready, initializing partition via driver");
-
-            // Create ReplicaHandles
+            info!(
+                name,
+                "all pods ready, checkpointing durable partition creation"
+            );
             let current_pods = checked_pods_by_id(&pods)?;
-            let mut handles: Vec<Box<dyn ReplicaHandle>> = Vec::new();
-            for (replica_id, _, pod) in current_pods {
-                match api.create_replica_handle(replica_id, pod, &set.spec).await {
-                    Ok(handle) => handles.push(handle),
-                    Err(e) => {
-                        warn!(pod = pod.name_any(), error = %e, "failed to create handle");
-                        return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
-                    }
-                }
-            }
-
-            // Creating-phase recovery is intentionally unsupported. Probe
-            // before any mutation so a process crash after runtime creation
-            // but before status persistence cannot replay Open/New.
-            for handle in &handles {
-                let status = handle.get_status().await.map_err(|error| {
-                    format!(
-                        "cannot verify pristine runtime for replica {} before creation: {error}",
-                        handle.id()
-                    )
-                })?;
-                if status.instance_id != handle.instance_id()
-                    || status.role != Role::Unknown
-                    || status.epoch != Epoch::default()
-                {
-                    return Err(format!(
-                        "refusing to replay creation for replica {}: runtime already has incarnation {}, role {:?}, epoch {:?}",
-                        handle.id(),
-                        status.instance_id,
-                        status.role,
-                        status.epoch
-                    ));
-                }
-            }
-
-            // Run driver create_partition
-            let mut driver = PartitionDriver::new();
-            driver
-                .create_partition(handles)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Update pod labels
-            if let Some(primary_id) = driver.primary_id() {
-                for member_id in driver.replica_ids() {
-                    let pod_name = format!("{}-{}", name, member_id - 1);
-                    let role = if member_id == primary_id {
-                        "primary"
-                    } else {
-                        "secondary"
-                    };
-                    let mut labels = BTreeMap::new();
-                    labels.insert("kuberic.io/role".to_string(), role.to_string());
-                    let _ = api.patch_pod_labels(&namespace, &pod_name, labels).await;
-                }
-            }
-
-            // Update CRD status
-            let epoch = driver.epoch();
-            let primary_name = driver.primary_id().map(|id| format!("{}-{}", name, id - 1));
-            let members = build_member_status(&pods, &set.spec);
-
-            let status = KubericSetStatus {
-                epoch: EpochStatus {
-                    data_loss_number: epoch.data_loss_number,
-                    configuration_number: epoch.configuration_number,
-                },
-                current_primary: primary_name.clone(),
-                target_primary: primary_name,
-                phase: Phase::Healthy,
-                reconfiguration_phase: ReconfigurationPhase::None,
-                ready_replicas: ready_pods.len() as i32,
-                replicas: pods.len() as i32,
-                members,
-                stable_snapshot: Some(snapshot_status(&driver)?),
-                operation: None,
-                conditions: Vec::new(),
-                primary_failing_since: None,
+            validate_creation_ids(&current_pods, desired)?;
+            let targets = current_pods
+                .iter()
+                .map(|(replica_id, instance_id, pod)| CreatePartitionTarget {
+                    replica_id: *replica_id,
+                    instance_id: instance_id.to_string(),
+                    pod_name: pod.name_any(),
+                })
+                .collect();
+            let committed_snapshot = set
+                .status
+                .as_ref()
+                .and_then(|status| status.operation.as_ref())
+                .filter(|operation| {
+                    operation.kind == DurableOperationKind::CreatePartition
+                        && operation.phase == DurableOperationPhase::Failed
+                })
+                .and_then(|operation| operation.committed_snapshot.clone());
+            let now = unix_seconds();
+            let operation = start_create_partition(
+                set.metadata.uid.as_deref().unwrap_or(&set_key),
+                targets,
+                committed_snapshot,
+                set.spec.min_replicas as usize,
+                now,
+            )?;
+            let mut status = KubericSetStatus {
+                phase: Phase::Creating,
+                operation: Some(operation.clone()),
+                ..set.status.clone().unwrap_or_default()
             };
-            if let Err(error) = persist_committed_status(
-                api,
-                state,
-                &set_key,
+            status.stable_snapshot = None;
+            status.current_primary = None;
+            status.target_primary = None;
+            set_operation_condition(&mut status, operation_condition(&operation, now));
+            api.patch_set_status(
                 &namespace,
                 &name,
                 &status,
                 set.metadata.resource_version.as_deref(),
             )
-            .await
-            {
-                // Retain the completed driver so a retry cannot reopen the
-                // already-created runtimes. A process crash still loses this
-                // state and correctly fails closed against the older status.
-                state.drivers.lock().await.insert(set_key, driver);
-                return Err(error);
-            }
-
-            // Preserve the existing status-before-driver insertion ordering
-            // on the successful path.
-            state.drivers.lock().await.insert(set_key, driver);
-
-            Ok(ReconcileAction::Requeue(Duration::from_secs(30)))
+            .await?;
+            state.drivers.lock().await.remove(&set_key);
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
         }
 
         Phase::Healthy => {
@@ -858,9 +841,34 @@ async fn reconcile_durable_operation(
         .as_ref()
         .and_then(|status| status.operation.clone())
         .ok_or_else(|| "durable operation phase has no checkpoint".to_string())?;
+    if operation.kind != DurableOperationKind::CreatePartition
+        && operation.previous_snapshot.is_none()
+    {
+        let now = unix_seconds();
+        let failed = fail_closed(
+            &operation,
+            "durable topology operation has no previous stable snapshot",
+        );
+        let mut status = set.status.clone().unwrap_or_default();
+        status.operation = Some(failed.clone());
+        set_operation_condition(&mut status, operation_condition(&failed, now));
+        api.patch_set_status(
+            &namespace,
+            &name,
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await?;
+        return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+    }
     let current_pods = checked_pods_by_id(pods)?;
 
     let identity_members = match operation.kind {
+        DurableOperationKind::CreatePartition => operation
+            .committed_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.members.clone())
+            .unwrap_or_default(),
         DurableOperationKind::Switchover => operation.previous_snapshot.members.clone(),
         DurableOperationKind::AddReplica => operation
             .target_snapshot
@@ -944,6 +952,9 @@ async fn reconcile_durable_operation(
 
     let now = unix_seconds();
     let decision = match operation.kind {
+        DurableOperationKind::CreatePartition => {
+            decide_create_partition(&operation, &observations, &pod_identities, now)
+        }
         DurableOperationKind::Switchover => decide(&operation, &observations, now),
         DurableOperationKind::AddReplica => decide_add_replica(&operation, &observations, now),
         DurableOperationKind::RemoveReplica => {
@@ -1083,6 +1094,7 @@ async fn reconcile_durable_operation(
             snapshot,
             compensated: _,
         } => {
+            let recovery_snapshot = snapshot.clone();
             let primary_name = pod_name_for_id(&current_pods, snapshot.primary_id)
                 .ok_or_else(|| "completed snapshot primary has no current pod".to_string())?;
             let mut status = set.status.clone().unwrap_or_default();
@@ -1097,6 +1109,51 @@ async fn reconcile_durable_operation(
             status.stable_snapshot = Some(snapshot);
             status.operation = Some(operation.clone());
             status.primary_failing_since = None;
+            set_operation_condition(&mut status, operation_condition(&operation, now));
+            persist_committed_status(
+                api,
+                state,
+                set_key,
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+            if operation.kind == DurableOperationKind::CreatePartition {
+                let core_snapshot = StablePartitionSnapshot::try_from(&recovery_snapshot)
+                    .map_err(|error| format!("invalid completed creation snapshot: {error}"))?;
+                let mut recovery_handles = Vec::new();
+                for member in &recovery_snapshot.members {
+                    let handle = handles.remove(&member.id).ok_or_else(|| {
+                        format!(
+                            "completed creation member {} has no recovery handle",
+                            member.id
+                        )
+                    })?;
+                    recovery_handles.push(handle);
+                }
+                let driver = PartitionDriver::recover(core_snapshot, recovery_handles)
+                    .await
+                    .map_err(|error| {
+                        format!("completed creation driver recovery failed: {error}")
+                    })?;
+                state
+                    .drivers
+                    .lock()
+                    .await
+                    .insert(set_key.to_string(), driver);
+            } else {
+                state.drivers.lock().await.remove(set_key);
+            }
+        }
+        Decision::RestartCreation { operation } => {
+            let mut status = set.status.clone().unwrap_or_default();
+            status.phase = Phase::Creating;
+            status.operation = Some(operation.clone());
+            status.stable_snapshot = None;
+            status.current_primary = None;
+            status.target_primary = None;
             set_operation_condition(&mut status, operation_condition(&operation, now));
             persist_committed_status(
                 api,
@@ -1166,6 +1223,7 @@ fn checked_pods_by_id(pods: &[Pod]) -> Result<Vec<CurrentPod<'_>>, String> {
                 "pod {pod_name} has negative kuberic.io/pod-index label"
             ));
         }
+
         let replica_id = index
             .checked_add(1)
             .ok_or_else(|| format!("pod {pod_name} has overflowing kuberic.io/pod-index label"))?;
@@ -1187,6 +1245,24 @@ fn checked_pods_by_id(pods: &[Pod]) -> Result<Vec<CurrentPod<'_>>, String> {
     }
     result.sort_by_key(|(id, _, _)| *id);
     Ok(result)
+}
+
+fn validate_creation_ids(current_pods: &[CurrentPod<'_>], desired: usize) -> Result<(), String> {
+    if current_pods.len() != desired {
+        return Err(format!(
+            "partition creation expected {desired} pods but found {}",
+            current_pods.len()
+        ));
+    }
+    for (index, (replica_id, _, _)) in current_pods.iter().enumerate() {
+        let expected = index as i64 + 1;
+        if *replica_id != expected {
+            return Err(format!(
+                "partition creation expected logical replica ID {expected} but found {replica_id}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Before every Healthy topology decision, ensure current pod identities still
@@ -1364,12 +1440,11 @@ async fn ensure_pod(
 fn build_pod(set: &KubericSet, namespace: &str, index: i32) -> Pod {
     let name = format!("{}-{}", set.name_any(), index);
     let set_name = set.name_any();
-    let role = if index == 0 { "primary" } else { "secondary" };
     let replica_id = (index + 1).to_string();
 
     let mut labels = BTreeMap::new();
     labels.insert("kuberic.io/set".into(), set_name.clone());
-    labels.insert("kuberic.io/role".into(), role.into());
+    labels.insert("kuberic.io/role".into(), "bootstrap".into());
     labels.insert("kuberic.io/pod-index".into(), index.to_string());
 
     let owner_ref = serde_json::from_value(serde_json::json!({

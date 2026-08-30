@@ -8,10 +8,14 @@ use crate::crd::{
 };
 
 mod add_replica;
+mod create_partition;
 mod remove_replica;
 mod switchover;
 
 pub use add_replica::{decide_add_replica, start_add_replica};
+pub use create_partition::{
+    CreatePartitionTarget, decide_create_partition, start_create_partition,
+};
 pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
 pub use switchover::{decide, start_switchover};
 
@@ -55,6 +59,9 @@ pub enum Decision {
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
     },
+    RestartCreation {
+        operation: DurableOperationStatus,
+    },
 }
 
 pub fn record_activity_error(
@@ -89,6 +96,7 @@ pub(crate) fn bounded_error(error: &str) -> String {
 
 pub fn operation_condition(operation: &DurableOperationStatus, now: i64) -> StatusCondition {
     let operation_name = match operation.kind {
+        DurableOperationKind::CreatePartition => "partition creation",
         DurableOperationKind::Switchover => "switchover",
         DurableOperationKind::AddReplica => "replica add/rebuild",
         DurableOperationKind::RemoveReplica => "replica removal",

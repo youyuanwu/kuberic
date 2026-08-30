@@ -85,23 +85,50 @@ history or exactly-once claims.
 
 ## Protocol: Create Partition
 
-Full SF-style build workflow. Implemented in `PartitionDriver::create_partition()`.
+Reconciler-driven creation uses a durable `CreatePartition` checkpoint.
+Direct tests and non-operator consumers may still invoke
+`PartitionDriver::create_partition()`.
 
 ```
-1. Open all replicators
-2. Assign Primary role (replicator BEFORE status set)
-3. Assign IdleSecondary to others + set epoch on SecondaryState
-4. For each secondary:
-   a. build_replica (primary → idle, copy stream)
-   b. change_role(ActiveSecondary) — promote idle → active
-   c. update_catch_up_configuration (add to quorum)
-   d. wait_for_catch_up_quorum
-   e. update_current_configuration (finalize)
-5. Set access status: primary=Granted, secondaries=NotPrimary
+1. Validate pod-index IDs and pod UIDs; sort by logical ID
+2. Persist explicit no-previous-topology intent
+3. Open(New) and promote the lowest-ID replica
+4. Commit primary-only current configuration (write quorum 1)
+5. Persist the primary-only committed bootstrap snapshot
+6. For each remaining replica in ID order:
+   a. Open(New), update epoch, assign IdleSecondary
+   b. build_replica (primary → idle, copy stream)
+   c. change_role(ActiveSecondary)
+   d. install catch-up configuration and wait for write quorum
+   e. install current configuration
+   f. persist the expanded committed bootstrap snapshot
+7. Publish primary/secondary routing labels one member at a time
+8. Publish the complete stable snapshot and transition Healthy
 ```
 
-Configuration grows **one secondary at a time** — each goes through the full
-build → catch-up → finalize cycle.
+New pods use the non-serving `bootstrap` role label. A write-ahead fencing
+phase also converts pre-existing initial serving labels before Open(New), so
+the primary and secondary Services cannot route traffic during unsafe
+bootstrap. The durable operation stores an optional committed bootstrap
+snapshot; controller restart continues with the first uncommitted member and
+never reopens or rebuilds a committed member.
+
+Before primary-only configuration commits, failure cleanup may close/delete
+the candidate and restart from no topology. After any bootstrap topology
+commits, recovery rolls forward: configuration failure restores the committed
+current configuration, then cleanup removes only the current candidate. A
+changed committed-member incarnation poisons creation and defers to later
+recovery semantics.
+
+Routing fencing is label-only and never uses candidate runtime compensation.
+The pending fence action targets the exact indexed member. A same-incarnation
+pod that remains unavailable, or whose label cannot be fenced by deadline,
+fails closed. A missing or replacement uncommitted member restarts creation
+with a new target UID while preserving any committed prefix. Compensation is
+rejected if its target appears in the committed bootstrap snapshot.
+
+The direct driver workflow retains its existing SF-style ordering and grows
+configuration one secondary at a time.
 
 ---
 

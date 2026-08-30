@@ -78,8 +78,10 @@ pub fn start_switchover(
         target_pod_name: None,
         target_pod_uid: None,
         retired_instance_id: None,
-        previous_snapshot: previous,
+        previous_snapshot: previous.into(),
         target_snapshot: target,
+        committed_snapshot: None,
+        minimum_committed_replicas: None,
         frozen_lsn: None,
         next_secondary_index: 0,
         phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
@@ -106,7 +108,7 @@ pub fn decide(
         let previous_epoch = epoch(&operation.previous_snapshot.epoch);
         let target_epoch = epoch(&operation.target_snapshot.epoch);
         let snapshot = if old.status.role == Role::Primary && old.status.epoch == previous_epoch {
-            operation.previous_snapshot.clone()
+            operation.previous_snapshot.cloned().unwrap()
         } else if old.status.role == Role::Primary && old.status.epoch == target_epoch {
             compensation_snapshot(operation)
         } else {
@@ -1027,6 +1029,9 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
     if operation.kind != DurableOperationKind::Switchover {
         return Err("unsupported durable operation kind".to_string());
     }
+    if operation.previous_snapshot.is_none() {
+        return Err("switchover operation has no previous stable snapshot".to_string());
+    }
     validate_snapshot(&operation.previous_snapshot)?;
     validate_snapshot(&operation.target_snapshot)?;
     if operation.old_primary_id != operation.previous_snapshot.primary_id
@@ -1244,7 +1249,7 @@ fn config_for_snapshot(
 }
 
 fn compensation_snapshot(operation: &DurableOperationStatus) -> StablePartitionSnapshotStatus {
-    let mut snapshot = operation.previous_snapshot.clone();
+    let mut snapshot = operation.previous_snapshot.cloned().unwrap();
     snapshot.epoch = operation.target_snapshot.epoch.clone();
     snapshot
 }

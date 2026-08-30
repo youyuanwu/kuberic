@@ -4,6 +4,7 @@ use kuberic_core::types::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 
 /// KubericSet is the primary CRD for managing a stateful replica set.
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -161,6 +162,50 @@ pub struct StableReplicaSnapshotStatus {
     pub role: StableReplicaRoleStatus,
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
+#[serde(transparent)]
+pub struct OptionalStablePartitionSnapshotStatus(pub Option<StablePartitionSnapshotStatus>);
+
+impl OptionalStablePartitionSnapshotStatus {
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn as_ref(&self) -> Option<&StablePartitionSnapshotStatus> {
+        self.0.as_ref()
+    }
+
+    pub fn cloned(&self) -> Option<StablePartitionSnapshotStatus> {
+        self.0.clone()
+    }
+}
+
+impl From<Option<StablePartitionSnapshotStatus>> for OptionalStablePartitionSnapshotStatus {
+    fn from(value: Option<StablePartitionSnapshotStatus>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<StablePartitionSnapshotStatus> for OptionalStablePartitionSnapshotStatus {
+    fn from(value: StablePartitionSnapshotStatus) -> Self {
+        Self(Some(value))
+    }
+}
+
+impl Deref for OptionalStablePartitionSnapshotStatus {
+    type Target = StablePartitionSnapshotStatus;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("operation protocol requires a previous stable snapshot")
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum StableReplicaRoleStatus {
@@ -178,8 +223,17 @@ pub struct DurableOperationStatus {
     pub version: u32,
     pub kind: DurableOperationKind,
     pub phase: DurableOperationPhase,
-    pub previous_snapshot: StablePartitionSnapshotStatus,
+    #[serde(
+        default,
+        skip_serializing_if = "OptionalStablePartitionSnapshotStatus::is_none"
+    )]
+    #[schemars(with = "Option<StablePartitionSnapshotStatus>")]
+    pub previous_snapshot: OptionalStablePartitionSnapshotStatus,
     pub target_snapshot: StablePartitionSnapshotStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_snapshot: Option<StablePartitionSnapshotStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_committed_replicas: Option<u32>,
     pub old_primary_id: i64,
     pub target_primary_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +264,7 @@ pub struct DurableOperationStatus {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DurableOperationKind {
+    CreatePartition,
     Switchover,
     AddReplica,
     RemoveReplica,
@@ -232,6 +287,28 @@ pub enum DurableRemoveMode {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DurableOperationPhase {
+    CreateFenceRouting,
+    CreateOpenPrimary,
+    CreatePromotePrimary,
+    CreatePrimaryCurrentConfiguration,
+    CreateCommitPrimary,
+    CreateOpenSecondary,
+    CreateUpdateSecondaryEpoch,
+    CreateAssignSecondaryIdle,
+    CreateBuildSecondary,
+    CreateAssignSecondaryActive,
+    CreateCatchUpConfiguration,
+    CreateWaitForCatchUpQuorum,
+    CreateCurrentConfiguration,
+    CreateCommitSecondary,
+    CreatePublishRouting,
+    CreateFinalize,
+    CreateCompensateRestoreConfiguration,
+    CreateCompensateRemoveCandidate,
+    CreateCompensateDemoteCandidate,
+    CreateCompensateCloseCandidate,
+    CreateCompensateDeleteCandidate,
+    CreateCompensateFinalize,
     Revoke,
     CaptureLsn,
     PreCatchUp,
@@ -304,6 +381,25 @@ pub struct PendingActionStatus {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DurableActionKind {
+    CreateFencePod,
+    CreateOpenPrimary,
+    CreatePromotePrimary,
+    CreatePrimaryCurrentConfiguration,
+    CreateOpenSecondary,
+    CreateUpdateSecondaryEpoch,
+    CreateAssignSecondaryIdle,
+    CreateBuildSecondary,
+    CreateAssignSecondaryActive,
+    CreateCatchUpConfiguration,
+    CreateWaitForCatchUpQuorum,
+    CreateCurrentConfiguration,
+    CreatePublishPrimary,
+    CreatePublishSecondary,
+    CreateCompensateRestoreConfiguration,
+    CreateCompensateRemoveCandidate,
+    CreateCompensateDemoteCandidate,
+    CreateCompensateCloseCandidate,
+    CreateCompensateDeleteCandidate,
     RevokeWrite,
     DemoteOldPrimary,
     PromoteTarget,

@@ -14,8 +14,9 @@ use kuberic_core::error::Result as CoreResult;
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
 use kuberic_core::types::{
-    DataLossAction, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
-    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
+    DataLossAction, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConfigurationMode,
+    ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode,
+    ReplicaStatusInfo, Role,
 };
 
 use kuberic_operator::cluster_api::ClusterApi;
@@ -663,6 +664,15 @@ impl ClusterApi for KvClusterApi {
 }
 
 fn make_set(name: &str, replicas: i32, status: Option<KubericSetStatus>) -> KubericSet {
+    make_set_with_min(name, replicas, 1, status)
+}
+
+fn make_set_with_min(
+    name: &str,
+    replicas: i32,
+    min_replicas: i32,
+    status: Option<KubericSetStatus>,
+) -> KubericSet {
     KubericSet {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -672,7 +682,7 @@ fn make_set(name: &str, replicas: i32, status: Option<KubericSetStatus>) -> Kube
         },
         spec: KubericSetSpec {
             replicas,
-            min_replicas: 1,
+            min_replicas,
             image: "test:latest".to_string(),
             failover_delay: 0,
             switchover_delay: 3600,
@@ -742,7 +752,8 @@ async fn create_healthy_set(
     )
     .await
     .unwrap();
-    let status = api.last_status().unwrap();
+    let status =
+        drive_create_partition(api, state, name, replicas, api.last_status().unwrap()).await;
     assert_eq!(status.phase, Phase::Healthy);
     assert_eq!(
         status
@@ -754,6 +765,71 @@ async fn create_healthy_set(
         replicas as usize
     );
     status
+}
+
+async fn drive_create_partition(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    name: &str,
+    replicas: i32,
+    status: KubericSetStatus,
+) -> KubericSetStatus {
+    drive_create_partition_with_min(api, state, name, replicas, 1, status).await
+}
+
+async fn drive_create_partition_with_min(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    name: &str,
+    replicas: i32,
+    min_replicas: i32,
+    mut status: KubericSetStatus,
+) -> KubericSetStatus {
+    for _ in 0..180 {
+        if status.phase == Phase::Healthy {
+            return status;
+        }
+        reconcile_set(
+            &make_set_with_min(name, replicas, min_replicas, Some(status.clone())),
+            api,
+            state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("durable partition creation did not reach Healthy");
+}
+
+async fn advance_create_until_fence_target(
+    api: &KvClusterApi,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+    target_id: i64,
+) -> KubericSetStatus {
+    for _ in 0..40 {
+        if status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.pending_action.as_ref())
+            .is_some_and(|pending| {
+                pending.kind == DurableActionKind::CreateFencePod && pending.target_id == target_id
+            })
+        {
+            return status;
+        }
+        reconcile_set(
+            &make_set(name, replicas, Some(status.clone())),
+            api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    panic!("creation did not reach fence intent for replica {target_id}");
 }
 
 async fn drive_switchover(
@@ -882,6 +958,28 @@ async fn drive_operation_to_healthy(
 
 fn control_for_action(kind: DurableActionKind) -> Option<ControlOperation> {
     match kind {
+        DurableActionKind::CreateOpenPrimary | DurableActionKind::CreateOpenSecondary => {
+            Some(ControlOperation::Open)
+        }
+        DurableActionKind::CreatePromotePrimary
+        | DurableActionKind::CreateAssignSecondaryIdle
+        | DurableActionKind::CreateAssignSecondaryActive
+        | DurableActionKind::CreateCompensateDemoteCandidate => Some(ControlOperation::ChangeRole),
+        DurableActionKind::CreatePrimaryCurrentConfiguration
+        | DurableActionKind::CreateCurrentConfiguration
+        | DurableActionKind::CreateCompensateRestoreConfiguration => {
+            Some(ControlOperation::UpdateCurrentConfiguration)
+        }
+        DurableActionKind::CreateUpdateSecondaryEpoch => Some(ControlOperation::UpdateEpoch),
+        DurableActionKind::CreateBuildSecondary => Some(ControlOperation::BuildReplica),
+        DurableActionKind::CreateCatchUpConfiguration => {
+            Some(ControlOperation::UpdateCatchUpConfiguration)
+        }
+        DurableActionKind::CreateWaitForCatchUpQuorum => {
+            Some(ControlOperation::WaitForCatchUpQuorum)
+        }
+        DurableActionKind::CreateCompensateRemoveCandidate => Some(ControlOperation::RemoveReplica),
+        DurableActionKind::CreateCompensateCloseCandidate => Some(ControlOperation::Close),
         DurableActionKind::RetireOldReplica | DurableActionKind::CompensateRemoveCandidate => {
             Some(ControlOperation::RemoveReplica)
         }
@@ -1010,6 +1108,15 @@ fn assert_status_reads_only(operations: &[ControlOperation]) {
             .iter()
             .all(|operation| *operation == ControlOperation::GetStatus)
     );
+}
+
+fn reconcile_error(
+    result: Result<kuberic_operator::reconciler::ReconcileAction, String>,
+) -> String {
+    match result {
+        Ok(_) => panic!("reconcile unexpectedly succeeded"),
+        Err(error) => error,
+    }
 }
 
 fn assert_stable_snapshot(api: &KvClusterApi, status: &KubericSetStatus, member_count: usize) {
@@ -1394,7 +1501,8 @@ async fn test_creation_uses_pod_labels_when_list_is_unordered() {
     )
     .await
     .unwrap();
-    let status = api.last_status().unwrap();
+    let status =
+        drive_create_partition(&api, &state, "unordered", 3, api.last_status().unwrap()).await;
     assert_eq!(status.current_primary.as_deref(), Some("unordered-0"));
     assert_eq!(status.stable_snapshot.as_ref().unwrap().primary_id, 1);
 }
@@ -1474,27 +1582,26 @@ async fn test_creation_status_retry_does_not_reopen_replicas() {
         .err()
         .expect("injected creation status failure must be returned");
     assert_eq!(error, "injected status persistence failure");
+    assert!(
+        api.operations().is_empty(),
+        "failed creation-intent persistence must perform no runtime activity"
+    );
 
-    // If the operator process is lost too, the new state has no pending
-    // status. Creating-phase preflight observes the already-open runtime and
-    // fails closed using GetStatus only.
-    api.reset_operations();
-    let error = reconcile_set(&creating, &api, &ReconcilerState::default())
-        .await
-        .err()
-        .expect("creation replay after process loss must fail closed");
-    assert!(error.contains("refusing to replay creation"));
-    assert_status_reads_only(&api.operations());
-
-    // With the original process state intact, retry only the durable status.
+    // The original process retries only the pending creation-intent status.
     api.reset_operations();
     reconcile_set(&creating, &api, &state).await.unwrap();
     assert!(
         api.operations().is_empty(),
-        "status retry must not replay Open or any creation RPC"
+        "status retry must not execute Open or any creation RPC"
     );
-    let recovered_status = api.last_status().unwrap();
-    assert_eq!(recovered_status.phase, Phase::Healthy);
+    let recovered_status = drive_create_partition(
+        &api,
+        &state,
+        "create-persist-retry",
+        1,
+        api.last_status().unwrap(),
+    )
+    .await;
     assert_stable_snapshot(&api, &recovered_status, 1);
 }
 
@@ -1525,7 +1632,8 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
     // Mark pods ready
     api.mark_all_pods_ready();
 
-    // Creating → Healthy (initializes partition via driver)
+    // Creating checkpoints the durable operation, then each reconcile advances
+    // one transition or activity.
     let set = make_set(
         "myapp",
         3,
@@ -1536,7 +1644,7 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
     );
     reconcile_set(&set, &api, &state).await.unwrap();
 
-    let status = api.last_status().unwrap();
+    let status = drive_create_partition(&api, &state, "myapp", 3, api.last_status().unwrap()).await;
     assert_eq!(status.phase, Phase::Healthy);
     assert!(status.current_primary.is_some());
     assert_stable_snapshot(&api, &status, 3);
@@ -1565,6 +1673,1155 @@ async fn test_reconciler_creates_partition_and_serves_kv() {
     assert_eq!(resp.get_ref().value, "reconciler");
 }
 
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_survives_state_loss_and_every_lost_runtime_reply() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(
+        &make_set_with_min("durable-create", 3, 2, None),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    assert!(api.pods.lock().unwrap().iter().all(|pod| {
+        pod.metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("kuberic.io/role"))
+            .is_some_and(|role| role == "bootstrap")
+    }));
+
+    reconcile_set(
+        &make_set_with_min(
+            "durable-create",
+            3,
+            2,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    let mut injected_action_ids = HashSet::new();
+    let mut committed_sizes = Vec::new();
+
+    for _ in 0..260 {
+        if let Some(operation) = status.operation.as_ref() {
+            if let Some(snapshot) = operation.committed_snapshot.as_ref()
+                && committed_sizes.last().copied() != Some(snapshot.members.len())
+            {
+                committed_sizes.push(snapshot.members.len());
+            }
+            if operation
+                .committed_snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.members.len() < 2)
+            {
+                assert!(api.pods.lock().unwrap().iter().all(|pod| {
+                    pod.metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("kuberic.io/role"))
+                        .is_some_and(|role| role == "bootstrap")
+                }));
+            }
+            if let Some(pending) = operation.pending_action.as_ref()
+                && let Some(control) = control_for_action(pending.kind)
+                && injected_action_ids.insert(pending.action_id.clone())
+            {
+                api.fail_after_next_durable_action(control);
+            }
+        }
+
+        reconcile_set(
+            &make_set_with_min("durable-create", 3, 2, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+        assert!(
+            status.stable_snapshot.is_none(),
+            "partial bootstrap authority must remain inside the creation operation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(committed_sizes, vec![1, 2, 3]);
+    assert_eq!(injected_action_ids.len(), 19);
+    assert_stable_snapshot(&api, &status, 3);
+    let operations = api.operations();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::Open)
+            .count(),
+        3
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| **operation == ControlOperation::BuildReplica)
+            .count(),
+        2
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_status_conflict_prevents_first_open() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-conflict", 1, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    api.reset_operations();
+    api.fail_next_status_conflict();
+
+    let error = match reconcile_set(
+        &make_set(
+            "create-conflict",
+            1,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    {
+        Ok(_) => panic!("status conflict unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(error.contains("conflict"));
+    assert!(
+        api.operations().is_empty(),
+        "creation activity ran before intent was durably persisted"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_fences_legacy_serving_labels_before_open() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-fence-labels", 2, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    {
+        let mut pods = api.pods.lock().unwrap();
+        for pod in pods.iter_mut() {
+            let index = pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            pod.metadata.labels.as_mut().unwrap().insert(
+                "kuberic.io/role".to_string(),
+                if index == 0 { "primary" } else { "secondary" }.to_string(),
+            );
+        }
+    }
+    reconcile_set(
+        &make_set(
+            "create-fence-labels",
+            2,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.reset_operations();
+    let mut status = api.last_status().unwrap();
+    for _ in 0..20 {
+        if status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.pending_action.as_ref())
+            .is_some_and(|pending| pending.kind == DurableActionKind::CreateOpenPrimary)
+        {
+            break;
+        }
+        reconcile_set(
+            &make_set("create-fence-labels", 2, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    assert!(api.pods.lock().unwrap().iter().all(|pod| {
+        pod.metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("kuberic.io/role"))
+            .is_some_and(|role| role == "bootstrap")
+    }));
+    assert!(
+        !api.operations().contains(&ControlOperation::Open),
+        "runtime Open ran before legacy serving labels were fenced"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_unavailable_fence_target_fails_closed_before_commit() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-fence-missing", 2, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            "create-fence-missing",
+            2,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut pending = advance_create_until_fence_target(
+        &api,
+        "create-fence-missing",
+        2,
+        api.last_status().unwrap(),
+        2,
+    )
+    .await;
+    let target_name = "create-fence-missing-1";
+    api.crash_pod(target_name);
+    pending
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-fence-missing", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_status_reads_only(&api.operations());
+    let poisoned = api.last_status().unwrap();
+    assert_eq!(poisoned.phase, Phase::Creating);
+    assert_eq!(
+        poisoned.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Poisoned
+    );
+    assert!(
+        poisoned
+            .operation
+            .as_ref()
+            .unwrap()
+            .committed_snapshot
+            .is_none()
+    );
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-fence-missing", 2, Some(poisoned)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.operations().is_empty(),
+        "poisoned fence failure must not livelock or dispatch destructive activity"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_unavailable_fence_target_preserves_committed_primary() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-fence-partial", 2, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            "create-fence-partial",
+            2,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    for _ in 0..100 {
+        if status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.committed_snapshot.as_ref())
+            .is_some_and(|snapshot| snapshot.members.len() == 1)
+        {
+            break;
+        }
+        reconcile_set(
+            &make_set("create-fence-partial", 2, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    let committed = status
+        .operation
+        .as_ref()
+        .unwrap()
+        .committed_snapshot
+        .clone()
+        .unwrap();
+    status.operation.as_mut().unwrap().phase = DurableOperationPhase::Failed;
+    status.operation.as_mut().unwrap().pending_action = None;
+    reconcile_set(
+        &make_set("create-fence-partial", 2, Some(status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let pending = advance_create_until_fence_target(
+        &api,
+        "create-fence-partial",
+        2,
+        api.last_status().unwrap(),
+        2,
+    )
+    .await;
+    api.crash_pod("create-fence-partial-1");
+    let mut pending = pending;
+    pending
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-fence-partial", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_status_reads_only(&api.operations());
+    let poisoned = api.last_status().unwrap();
+    assert_eq!(
+        poisoned
+            .operation
+            .as_ref()
+            .unwrap()
+            .committed_snapshot
+            .as_ref(),
+        Some(&committed)
+    );
+    assert_eq!(
+        poisoned.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Poisoned
+    );
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-fence-partial", 2, Some(poisoned)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.operations().is_empty(),
+        "poisoned partial fence failure must not mutate the committed primary"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_fence_uid_replacement_restarts_with_new_identity() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-fence-replace", 2, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            "create-fence-replace",
+            2,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_create_until_fence_target(
+        &api,
+        "create-fence-replace",
+        2,
+        api.last_status().unwrap(),
+        2,
+    )
+    .await;
+    let original_operation_id = pending.operation.as_ref().unwrap().operation_id.clone();
+    let original_uid = pending.operation.as_ref().unwrap().target_snapshot.members[1]
+        .instance_id
+        .clone();
+    api.crash_pod("create-fence-replace-1");
+    api.restart_pod("create-fence-replace-1").await;
+    let replacement_uid = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some("create-fence-replace-1"))
+        .unwrap()
+        .metadata
+        .uid
+        .clone()
+        .unwrap();
+    assert_ne!(replacement_uid, original_uid);
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-fence-replace", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_status_reads_only(&api.operations());
+    let failed = api.last_status().unwrap();
+    assert_eq!(
+        failed.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Failed
+    );
+
+    reconcile_set(
+        &make_set("create-fence-replace", 2, Some(failed)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let restarted = api.last_status().unwrap();
+    let operation = restarted.operation.as_ref().unwrap();
+    assert_eq!(operation.phase, DurableOperationPhase::CreateFenceRouting);
+    assert_ne!(operation.operation_id, original_operation_id);
+    assert_eq!(
+        operation.target_snapshot.members[1].instance_id,
+        replacement_uid
+    );
+    assert_ne!(operation.phase, DurableOperationPhase::Poisoned);
+
+    let completed = drive_create_partition(
+        &api,
+        &ReconcilerState::default(),
+        "create-fence-replace",
+        2,
+        restarted,
+    )
+    .await;
+    assert_eq!(completed.phase, Phase::Healthy);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_one_two_three_replicas_and_routing_gate() {
+    for (name, replicas, min_replicas) in [
+        ("create-one", 1, 1),
+        ("create-two", 2, 2),
+        ("create-three", 3, 2),
+    ] {
+        let api = KvClusterApi::new();
+        let state = ReconcilerState::default();
+        reconcile_set(
+            &make_set_with_min(name, replicas, min_replicas, None),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        api.mark_all_pods_ready();
+        reconcile_set(
+            &make_set_with_min(
+                name,
+                replicas,
+                min_replicas,
+                Some(KubericSetStatus {
+                    phase: Phase::Creating,
+                    ..Default::default()
+                }),
+            ),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        let completed = drive_create_partition_with_min(
+            &api,
+            &state,
+            name,
+            replicas,
+            min_replicas,
+            api.last_status().unwrap(),
+        )
+        .await;
+        assert_stable_snapshot(&api, &completed, replicas as usize);
+
+        let mut committed_sizes = api
+            .statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|status| {
+                status
+                    .operation
+                    .as_ref()
+                    .filter(|operation| operation.kind == DurableOperationKind::CreatePartition)
+                    .and_then(|operation| operation.committed_snapshot.as_ref())
+                    .map(|snapshot| snapshot.members.len())
+            })
+            .collect::<Vec<_>>();
+        committed_sizes.sort_unstable();
+        committed_sizes.dedup();
+        assert_eq!(committed_sizes, (1..=replicas as usize).collect::<Vec<_>>());
+
+        {
+            let pods = api.pods.lock().unwrap();
+            for pod in pods.iter() {
+                let id = pod
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                    .unwrap()
+                    .parse::<i64>()
+                    .unwrap()
+                    + 1;
+                let role = pod
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kuberic.io/role"))
+                    .unwrap();
+                assert_eq!(
+                    role,
+                    if id == completed.stable_snapshot.as_ref().unwrap().primary_id {
+                        "primary"
+                    } else {
+                        "secondary"
+                    }
+                );
+            }
+        }
+
+        let live = live_replica_statuses(&api, name, replicas).await;
+        let snapshot = completed.stable_snapshot.as_ref().unwrap();
+        for member in &snapshot.members {
+            let observed = live
+                .iter()
+                .find(|status| status.instance_id.as_str() == member.instance_id)
+                .unwrap();
+            assert_eq!(
+                observed.role,
+                if member.id == snapshot.primary_id {
+                    Role::Primary
+                } else {
+                    Role::ActiveSecondary
+                }
+            );
+            assert_eq!(
+                observed.epoch,
+                Epoch::new(
+                    snapshot.epoch.data_loss_number,
+                    snapshot.epoch.configuration_number
+                )
+            );
+        }
+        let primary = live
+            .iter()
+            .find(|status| status.role == Role::Primary)
+            .unwrap();
+        let configuration = primary.configuration.as_ref().unwrap();
+        assert_eq!(configuration.mode, ReplicaConfigurationMode::Current);
+        assert_eq!(configuration.write_quorum, snapshot.write_quorum);
+        assert_eq!(
+            configuration
+                .members
+                .iter()
+                .map(|member| member.id)
+                .collect::<Vec<_>>(),
+            snapshot
+                .members
+                .iter()
+                .filter(|member| member.id != snapshot.primary_id)
+                .map(|member| member.id)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_candidate_replacement_rolls_forward_from_partial_commit() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-replace", 3, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            "create-replace",
+            3,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    for _ in 0..120 {
+        if status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.pending_action.as_ref())
+            .is_some_and(|pending| pending.kind == DurableActionKind::CreateBuildSecondary)
+        {
+            break;
+        }
+        reconcile_set(
+            &make_set("create-replace", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    let operation = status.operation.as_ref().unwrap();
+    assert_eq!(
+        operation.committed_snapshot.as_ref().unwrap().members.len(),
+        1
+    );
+    let candidate_name = operation.target_pod_name.clone().unwrap();
+    let old_uid = operation.target_instance_id.clone().unwrap();
+
+    api.fail_after_next_durable_action(ControlOperation::BuildReplica);
+    reconcile_set(
+        &make_set("create-replace", 3, Some(status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    api.crash_pod(&candidate_name);
+    api.restart_pod(&candidate_name).await;
+    api.mark_all_pods_ready();
+    let replacement_uid = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(candidate_name.as_str()))
+        .unwrap()
+        .metadata
+        .uid
+        .clone()
+        .unwrap();
+    assert_ne!(old_uid, replacement_uid);
+
+    let mut status = api.last_status().unwrap();
+    for _ in 0..260 {
+        reconcile_set(
+            &make_set("create-replace", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        api.mark_all_pods_ready();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status.phase, Phase::Healthy);
+    assert_stable_snapshot(&api, &status, 3);
+    assert!(
+        status
+            .stable_snapshot
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .any(|member| member.instance_id == replacement_uid)
+    );
+    assert!(
+        status
+            .stable_snapshot
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.instance_id != old_uid)
+    );
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::Open)
+            .count(),
+        4,
+        "the committed primary was not reopened; only the replacement added one Open"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_compensates_before_commit_and_preserves_partial_topology() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-precommit-failure", 1, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            "create-precommit-failure",
+            1,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "create-precommit-failure",
+        1,
+        api.last_status().unwrap(),
+        DurableActionKind::CreatePromotePrimary,
+    )
+    .await;
+    api.fail_before_next_durable_action(ControlOperation::ChangeRole);
+    reconcile_set(
+        &make_set("create-precommit-failure", 1, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let mut timed_out = api.last_status().unwrap();
+    timed_out
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("create-precommit-failure", 1, Some(timed_out)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    for _ in 0..180 {
+        reconcile_set(
+            &make_set("create-precommit-failure", 1, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        api.mark_all_pods_ready();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+    }
+    assert_eq!(status.phase, Phase::Healthy);
+    assert!(api.statuses.lock().unwrap().iter().any(|status| {
+        status.operation.as_ref().is_some_and(|operation| {
+            operation.kind == DurableOperationKind::CreatePartition
+                && operation.phase == DurableOperationPhase::Failed
+                && operation.committed_snapshot.is_none()
+        })
+    }));
+
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(
+        &make_set("create-postcommit-failure", 3, None),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            "create-postcommit-failure",
+            3,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "create-postcommit-failure",
+        3,
+        api.last_status().unwrap(),
+        DurableActionKind::CreateWaitForCatchUpQuorum,
+    )
+    .await;
+    api.fail_before_next_durable_action(ControlOperation::WaitForCatchUpQuorum);
+    reconcile_set(
+        &make_set("create-postcommit-failure", 3, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let mut timed_out = api.last_status().unwrap();
+    timed_out
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap()
+        .deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("create-postcommit-failure", 3, Some(timed_out)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    for _ in 0..260 {
+        reconcile_set(
+            &make_set("create-postcommit-failure", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        api.mark_all_pods_ready();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status.phase, Phase::Healthy);
+    assert!(api.statuses.lock().unwrap().iter().any(|status| {
+        status.operation.as_ref().is_some_and(|operation| {
+            operation.kind == DurableOperationKind::CreatePartition
+                && operation.phase == DurableOperationPhase::Failed
+                && operation
+                    .committed_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.members.len() == 1)
+        })
+    }));
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::Open)
+            .count(),
+        4,
+        "post-commit retry reopened only the failed secondary candidate"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_invalid_checkpoint_and_committed_replacement_fail_closed() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    reconcile_set(&make_set("create-invalid", 2, None), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set(
+            "create-invalid",
+            2,
+            Some(KubericSetStatus {
+                phase: Phase::Creating,
+                ..Default::default()
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut invalid = api.last_status().unwrap();
+    invalid.operation.as_mut().unwrap().version = u32::MAX;
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-invalid", 2, Some(invalid)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_status_reads_only(&api.operations());
+
+    let mut status = api
+        .statuses
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|status| {
+            status.operation.as_ref().is_some_and(|operation| {
+                operation.kind == DurableOperationKind::CreatePartition
+                    && operation.version != u32::MAX
+            })
+        })
+        .cloned()
+        .unwrap();
+    for _ in 0..80 {
+        if status
+            .operation
+            .as_ref()
+            .and_then(|operation| operation.committed_snapshot.as_ref())
+            .is_some_and(|snapshot| snapshot.members.len() == 1)
+        {
+            break;
+        }
+        reconcile_set(
+            &make_set("create-invalid", 2, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    let primary_name = status
+        .operation
+        .as_ref()
+        .unwrap()
+        .target_snapshot
+        .members
+        .first()
+        .map(|member| format!("create-invalid-{}", member.id - 1))
+        .unwrap();
+    api.crash_pod(&primary_name);
+    api.restart_pod(&primary_name).await;
+    api.mark_all_pods_ready();
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-invalid", 2, Some(status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(api.operations().is_empty());
+    assert_eq!(
+        api.last_status().unwrap().operation.as_ref().unwrap().phase,
+        DurableOperationPhase::Poisoned
+    );
+    let poisoned = api.last_status().unwrap();
+    api.reset_operations();
+    reconcile_set(
+        &make_set("create-invalid", 2, Some(poisoned)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.operations().is_empty(),
+        "poisoned creation must remain fail closed on later reconciles"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_create_rejects_missing_and_duplicate_ids_and_uids() {
+    async fn setup(name: &str) -> (KvClusterApi, ReconcilerState) {
+        let api = KvClusterApi::new();
+        let state = ReconcilerState::default();
+        reconcile_set(&make_set(name, 2, None), &api, &state)
+            .await
+            .unwrap();
+        api.mark_all_pods_ready();
+        api.reset_operations();
+        (api, state)
+    }
+
+    let (api, state) = setup("create-missing-id").await;
+    api.pods.lock().unwrap()[0]
+        .metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove("kuberic.io/pod-index");
+    assert!(
+        reconcile_error(
+            reconcile_set(
+                &make_set(
+                    "create-missing-id",
+                    2,
+                    Some(KubericSetStatus {
+                        phase: Phase::Creating,
+                        ..Default::default()
+                    })
+                ),
+                &api,
+                &state
+            )
+            .await
+        )
+        .contains("has no kuberic.io/pod-index")
+    );
+    assert!(api.operations().is_empty());
+
+    let (api, state) = setup("create-duplicate-id").await;
+    for pod in api.pods.lock().unwrap().iter_mut() {
+        pod.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("kuberic.io/pod-index".to_string(), "0".to_string());
+    }
+    assert!(
+        reconcile_error(
+            reconcile_set(
+                &make_set(
+                    "create-duplicate-id",
+                    2,
+                    Some(KubericSetStatus {
+                        phase: Phase::Creating,
+                        ..Default::default()
+                    })
+                ),
+                &api,
+                &state
+            )
+            .await
+        )
+        .contains("duplicate pod logical replica ID")
+    );
+    assert!(api.operations().is_empty());
+
+    let (api, state) = setup("create-missing-uid").await;
+    api.pods.lock().unwrap()[0].metadata.uid = None;
+    assert!(
+        reconcile_error(
+            reconcile_set(
+                &make_set(
+                    "create-missing-uid",
+                    2,
+                    Some(KubericSetStatus {
+                        phase: Phase::Creating,
+                        ..Default::default()
+                    })
+                ),
+                &api,
+                &state
+            )
+            .await
+        )
+        .contains("has no UID")
+    );
+    assert!(api.operations().is_empty());
+
+    let (api, state) = setup("create-duplicate-uid").await;
+    let uid = api.pods.lock().unwrap()[0].metadata.uid.clone();
+    api.pods.lock().unwrap()[1].metadata.uid = uid;
+    assert!(
+        reconcile_error(
+            reconcile_set(
+                &make_set(
+                    "create-duplicate-uid",
+                    2,
+                    Some(KubericSetStatus {
+                        phase: Phase::Creating,
+                        ..Default::default()
+                    })
+                ),
+                &api,
+                &state
+            )
+            .await
+        )
+        .contains("duplicate pod incarnation")
+    );
+    assert!(api.operations().is_empty());
+}
+
 /// Reconciler test: create partition → write data → switchover → write on new primary.
 #[test_log::test(tokio::test)]
 #[serial]
@@ -1588,7 +2845,7 @@ async fn test_reconciler_switchover() {
     );
     reconcile_set(&set, &api, &state).await.unwrap();
 
-    let status = api.last_status().unwrap();
+    let status = drive_create_partition(&api, &state, "myapp", 3, api.last_status().unwrap()).await;
     assert_eq!(status.phase, Phase::Healthy);
     let original_primary = status.current_primary.clone().unwrap();
 
@@ -2347,23 +3604,7 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
 
-    // Create and initialize the partition (Pending → Creating → Healthy)
-    let set = make_set("myapp", 3, None);
-    reconcile_set(&set, &api, &state).await.unwrap();
-    api.mark_all_pods_ready();
-
-    let set = make_set(
-        "myapp",
-        3,
-        Some(KubericSetStatus {
-            phase: Phase::Creating,
-            ..Default::default()
-        }),
-    );
-    reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = create_healthy_set(&api, &state, "myapp", 3).await;
     assert!(
         status
             .members
@@ -3407,23 +4648,7 @@ async fn test_reconciler_scale_up() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
 
-    // Create partition with 1 replica
-    let set = make_set("myapp", 1, None);
-    reconcile_set(&set, &api, &state).await.unwrap();
-    api.mark_all_pods_ready();
-
-    let set = make_set(
-        "myapp",
-        1,
-        Some(KubericSetStatus {
-            phase: Phase::Creating,
-            ..Default::default()
-        }),
-    );
-    reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = create_healthy_set(&api, &state, "myapp", 1).await;
     let primary_name = status.current_primary.clone().unwrap();
 
     // Write data on primary
@@ -3477,23 +4702,7 @@ async fn test_reconciler_scale_down() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
 
-    // Create partition with 3 replicas
-    let set = make_set("myapp", 3, None);
-    reconcile_set(&set, &api, &state).await.unwrap();
-    api.mark_all_pods_ready();
-
-    let set = make_set(
-        "myapp",
-        3,
-        Some(KubericSetStatus {
-            phase: Phase::Creating,
-            ..Default::default()
-        }),
-    );
-    reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = create_healthy_set(&api, &state, "myapp", 3).await;
 
     // Write data
     let primary_name = status.current_primary.clone().unwrap();
@@ -3546,23 +4755,7 @@ async fn test_reconciler_double_failover() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
 
-    // Create 3-replica partition → Healthy
-    let set = make_set("myapp", 3, None);
-    reconcile_set(&set, &api, &state).await.unwrap();
-    api.mark_all_pods_ready();
-
-    let set = make_set(
-        "myapp",
-        3,
-        Some(KubericSetStatus {
-            phase: Phase::Creating,
-            ..Default::default()
-        }),
-    );
-    reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = create_healthy_set(&api, &state, "myapp", 3).await;
     let first_primary = status.current_primary.clone().unwrap();
 
     // Write data
@@ -3664,23 +4857,7 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
 
-    // Create and initialize the partition (Pending → Creating → Healthy)
-    let set = make_set("myapp", 3, None);
-    reconcile_set(&set, &api, &state).await.unwrap();
-    api.mark_all_pods_ready();
-
-    let set = make_set(
-        "myapp",
-        3,
-        Some(KubericSetStatus {
-            phase: Phase::Creating,
-            ..Default::default()
-        }),
-    );
-    reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = create_healthy_set(&api, &state, "myapp", 3).await;
     let primary_name = status.current_primary.clone().unwrap();
 
     // Write data on primary

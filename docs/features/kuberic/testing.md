@@ -408,6 +408,18 @@ scale-down, unreachable force-removal, pre-commit configuration restoration,
 post-commit roll-forward, stable-snapshot commit ordering, conflict before
 intent, and same-name/new-UID deletion fencing.
 
+**Pattern 11: Durable creation bootstrap and routing gate** ✅
+`test_durable_create_survives_state_loss_and_every_lost_runtime_reply`
+replaces controller state at every creation boundary, injects a lost response
+for every correlated runtime activity instance, and verifies exact Open/build
+counts. Companion tests cover one/two/three replicas, partial majority
+snapshots, `minReplicas` routing gating, unordered pod lists, status conflict
+before intent, candidate replacement during build, pre-commit cleanup,
+post-commit roll-forward, invalid checkpoints, committed-member incarnation
+fencing, unavailable fence targets before/after primary-only commit,
+fence-intent UID replacement with a new operation identity, committed-target
+compensation rejection, and exact final live topology.
+
 ### Remaining Work
 
 - **WAL recovery tests** — blocked on Option C implementation
