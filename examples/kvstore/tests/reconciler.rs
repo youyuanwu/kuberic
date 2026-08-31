@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -14,9 +15,9 @@ use kuberic_core::error::Result as CoreResult;
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
 use kuberic_core::types::{
-    DataLossAction, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConfigurationMode,
-    ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode,
-    ReplicaStatusInfo, Role,
+    CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest, DataLossAction,
+    DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConfigurationMode, ReplicaId, ReplicaInfo,
+    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
 };
 
 use kuberic_operator::cluster_api::ClusterApi;
@@ -78,16 +79,49 @@ enum ControlOperation {
     GetStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchPath {
+    Legacy,
+    CorrelatedControlV1,
+}
+
 struct ObservedHandle {
     inner: Box<dyn ReplicaHandle>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    hide_agent_status: Arc<AtomicBool>,
+    dispatch_paths: Arc<Mutex<Vec<DispatchPath>>>,
 }
 
 impl ObservedHandle {
     fn record(&self, operation: ControlOperation) {
         self.operations.lock().unwrap().push(operation);
+    }
+
+    fn operation_for(action: &DurableReplicaAction) -> ControlOperation {
+        match action {
+            DurableReplicaAction::Open { .. } => ControlOperation::Open,
+            DurableReplicaAction::Close => ControlOperation::Close,
+            DurableReplicaAction::RevokeWriteStatus => ControlOperation::RevokeWriteStatus,
+            DurableReplicaAction::ChangeRole { .. } => ControlOperation::ChangeRole,
+            DurableReplicaAction::UpdateEpoch { .. } => ControlOperation::UpdateEpoch,
+            DurableReplicaAction::UpdateCatchUpConfiguration { .. } => {
+                ControlOperation::UpdateCatchUpConfiguration
+            }
+            DurableReplicaAction::WaitForCatchUpQuorum { .. } => {
+                ControlOperation::WaitForCatchUpQuorum
+            }
+            DurableReplicaAction::UpdateCurrentConfiguration { .. } => {
+                ControlOperation::UpdateCurrentConfiguration
+            }
+            DurableReplicaAction::BuildReplica { .. } => ControlOperation::BuildReplica,
+            DurableReplicaAction::RemoveReplica { .. } => ControlOperation::RemoveReplica,
+            DurableReplicaAction::OnDataLoss { .. } => ControlOperation::OnDataLoss,
+            DurableReplicaAction::RecordElectionConfiguration { .. } => {
+                ControlOperation::RecordElectionConfiguration
+            }
+        }
     }
 }
 
@@ -184,7 +218,11 @@ impl ReplicaHandle for ObservedHandle {
 
     async fn get_status(&self) -> CoreResult<ReplicaStatusInfo> {
         self.record(ControlOperation::GetStatus);
-        self.inner.get_status().await
+        let mut status = self.inner.get_status().await?;
+        if self.hide_agent_status.load(Ordering::Acquire) {
+            status.agent = None;
+        }
+        Ok(status)
     }
 
     async fn execute_durable_action(
@@ -192,28 +230,11 @@ impl ReplicaHandle for ObservedHandle {
         action_id: &str,
         action: DurableReplicaAction,
     ) -> CoreResult<()> {
-        let operation = match &action {
-            DurableReplicaAction::Open { .. } => ControlOperation::Open,
-            DurableReplicaAction::Close => ControlOperation::Close,
-            DurableReplicaAction::RevokeWriteStatus => ControlOperation::RevokeWriteStatus,
-            DurableReplicaAction::ChangeRole { .. } => ControlOperation::ChangeRole,
-            DurableReplicaAction::UpdateEpoch { .. } => ControlOperation::UpdateEpoch,
-            DurableReplicaAction::UpdateCatchUpConfiguration { .. } => {
-                ControlOperation::UpdateCatchUpConfiguration
-            }
-            DurableReplicaAction::WaitForCatchUpQuorum { .. } => {
-                ControlOperation::WaitForCatchUpQuorum
-            }
-            DurableReplicaAction::UpdateCurrentConfiguration { .. } => {
-                ControlOperation::UpdateCurrentConfiguration
-            }
-            DurableReplicaAction::BuildReplica { .. } => ControlOperation::BuildReplica,
-            DurableReplicaAction::RemoveReplica { .. } => ControlOperation::RemoveReplica,
-            DurableReplicaAction::OnDataLoss { .. } => ControlOperation::OnDataLoss,
-            DurableReplicaAction::RecordElectionConfiguration { .. } => {
-                ControlOperation::RecordElectionConfiguration
-            }
-        };
+        self.dispatch_paths
+            .lock()
+            .unwrap()
+            .push(DispatchPath::Legacy);
+        let operation = Self::operation_for(&action);
         self.record(operation);
         if self
             .fail_before_next_durable_action
@@ -236,6 +257,41 @@ impl ReplicaHandle for ObservedHandle {
         }
         Ok(())
     }
+
+    async fn execute_correlated_control_action(
+        &self,
+        request: CorrelatedControlActionRequest,
+    ) -> CoreResult<CorrelatedControlActionAcknowledgement> {
+        self.dispatch_paths
+            .lock()
+            .unwrap()
+            .push(DispatchPath::CorrelatedControlV1);
+        let operation = Self::operation_for(&request.action);
+        self.record(operation);
+        if self
+            .fail_before_next_durable_action
+            .lock()
+            .unwrap()
+            .as_ref()
+            == Some(&operation)
+        {
+            self.fail_before_next_durable_action.lock().unwrap().take();
+            return Err(kuberic_core::error::KubericError::Internal(
+                "injected activity failure".into(),
+            ));
+        }
+        let acknowledgement = self
+            .inner
+            .execute_correlated_control_action(request)
+            .await?;
+        if self.fail_after_next_durable_action.lock().unwrap().as_ref() == Some(&operation) {
+            self.fail_after_next_durable_action.lock().unwrap().take();
+            return Err(kuberic_core::error::KubericError::Internal(
+                "injected lost activity reply".into(),
+            ));
+        }
+        Ok(acknowledgement)
+    }
 }
 
 /// Mock ClusterApi that starts real PodRuntime + KV service for each pod.
@@ -253,6 +309,8 @@ struct KvClusterApi {
     fail_next_status_conflict: Mutex<bool>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    hide_agent_status: Arc<AtomicBool>,
+    dispatch_paths: Arc<Mutex<Vec<DispatchPath>>>,
     data_loss_behavior: service::DataLossBehavior,
 }
 
@@ -271,6 +329,8 @@ impl KvClusterApi {
             fail_next_status_conflict: Mutex::new(false),
             fail_before_next_durable_action: Arc::new(Mutex::new(None)),
             fail_after_next_durable_action: Arc::new(Mutex::new(None)),
+            hide_agent_status: Arc::new(AtomicBool::new(false)),
+            dispatch_paths: Arc::new(Mutex::new(Vec::new())),
             data_loss_behavior: service::DataLossBehavior::default(),
         }
     }
@@ -280,6 +340,14 @@ impl KvClusterApi {
             data_loss_behavior: behavior,
             ..Self::new()
         }
+    }
+
+    fn hide_agent_status(&self, hide: bool) {
+        self.hide_agent_status.store(hide, Ordering::Release);
+    }
+
+    fn dispatch_paths(&self) -> Vec<DispatchPath> {
+        self.dispatch_paths.lock().unwrap().clone()
     }
 
     fn mark_all_pods_ready(&self) {
@@ -346,6 +414,10 @@ impl KvClusterApi {
         self.operations.lock().unwrap().clear();
     }
 
+    fn reset_dispatch_paths(&self) {
+        self.dispatch_paths.lock().unwrap().clear();
+    }
+
     fn operations(&self) -> Vec<ControlOperation> {
         self.operations.lock().unwrap().clone()
     }
@@ -381,15 +453,36 @@ impl KvClusterApi {
         self.mark_pod_not_ready(pod_name);
     }
 
-    /// Simulate K8s restarting a crashed pod. Creates a fresh
-    /// PodRuntime + KV service on new ports, reuses the same data_dir
-    /// (simulates PVC re-attach), and marks the pod Ready.
+    /// Simulate replacement of a crashed Pod with a new Pod UID.
     async fn restart_pod(&self, pod_name: &str) {
-        let replica_id: i64 = pod_name.rsplit('-').next().unwrap().parse::<i64>().unwrap() + 1;
         static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let instance_id = ReplicaInstanceId::new(format!("restarted-{pod_name}-{generation}"));
+        self.restart_runtime(pod_name, instance_id, true).await;
+    }
+
+    /// Simulate a container/process restart inside the same Kubernetes Pod.
+    async fn restart_process_same_pod_uid(&self, pod_name: &str) {
+        let instance_id = self
+            .pods
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+            .and_then(|pod| pod.metadata.uid.clone())
+            .map(ReplicaInstanceId::new)
+            .expect("existing pod UID");
+        self.restart_runtime(pod_name, instance_id, false).await;
+    }
+
+    async fn restart_runtime(
+        &self,
+        pod_name: &str,
+        instance_id: ReplicaInstanceId,
+        replace_pod_uid: bool,
+    ) {
+        let replica_id: i64 = pod_name.rsplit('-').next().unwrap().parse::<i64>().unwrap() + 1;
 
         let client_address = allocate_unique_address().await;
         let data_bind = allocate_unique_address().await;
@@ -449,13 +542,14 @@ impl KvClusterApi {
             },
         );
 
-        let mut pods = self.pods.lock().unwrap();
-        let pod = pods
-            .iter_mut()
-            .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
-            .unwrap();
-        pod.metadata.uid = Some(instance_id.to_string());
-        drop(pods);
+        if replace_pod_uid {
+            let mut pods = self.pods.lock().unwrap();
+            let pod = pods
+                .iter_mut()
+                .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+                .unwrap();
+            pod.metadata.uid = Some(instance_id.to_string());
+        }
         self.mark_all_pods_ready();
     }
 }
@@ -638,6 +732,8 @@ impl ClusterApi for KvClusterApi {
             operations: self.operations.clone(),
             fail_before_next_durable_action: self.fail_before_next_durable_action.clone(),
             fail_after_next_durable_action: self.fail_after_next_durable_action.clone(),
+            hide_agent_status: self.hide_agent_status.clone(),
+            dispatch_paths: self.dispatch_paths.clone(),
         }))
     }
 
@@ -942,7 +1038,7 @@ async fn advance_until_pending_action(
             .operation
             .as_ref()
             .and_then(|operation| operation.pending_action.as_ref())
-            .is_some_and(|action| action.kind == kind)
+            .is_some_and(|action| action.kind == kind && action.dispatch_protocol.is_some())
         {
             return status;
         }
@@ -5622,4 +5718,192 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
         .unwrap();
     assert!(resp.get_ref().found);
     assert_eq!(resp.get_ref().value, "recovered");
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_same_pod_process_restart_changes_agent_generation_not_incarnation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "same-pod-restart", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    let secondary = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() != Some(primary.as_str()))
+        .cloned()
+        .unwrap();
+    let pod_name = secondary.metadata.name.clone().unwrap();
+    let pod_uid = secondary.metadata.uid.clone().unwrap();
+    let replica_id = secondary
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("kuberic.io/pod-index"))
+        .unwrap()
+        .parse::<i64>()
+        .unwrap()
+        + 1;
+    let set = make_set("same-pod-restart", 3, None);
+
+    let before = api
+        .create_replica_handle(replica_id, &secondary, &set.spec)
+        .await
+        .unwrap()
+        .get_status()
+        .await
+        .unwrap();
+    let before_generation = before.agent.unwrap().generation;
+    assert_eq!(before.instance_id.as_str(), pod_uid);
+
+    api.crash_pod(&pod_name);
+    api.restart_process_same_pod_uid(&pod_name).await;
+    let restarted_pod = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(pod_name.as_str()))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        restarted_pod.metadata.uid.as_deref(),
+        Some(pod_uid.as_str())
+    );
+
+    let after = api
+        .create_replica_handle(replica_id, &restarted_pod, &set.spec)
+        .await
+        .unwrap()
+        .get_status()
+        .await
+        .unwrap();
+    let after_agent = after.agent.unwrap();
+    assert_eq!(after.instance_id.as_str(), pod_uid);
+    assert_ne!(after_agent.generation, before_generation);
+    assert_eq!(after_agent.control_version.value(), 0);
+    assert!(after_agent.current_action.is_none());
+    assert!(after_agent.retained_terminal_actions.is_empty());
+
+    api.reset_operations();
+    reconcile_set(
+        &make_set("same-pod-restart", 3, Some(api.last_status().unwrap())),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let fail_closed = api.last_status().unwrap();
+    assert_eq!(fail_closed.phase, Phase::RemovingReplica);
+    let operation = fail_closed.operation.unwrap();
+    assert_eq!(operation.kind, DurableOperationKind::RemoveReplica);
+    assert_eq!(operation.target_replica_id, Some(replica_id));
+    assert_eq!(
+        operation.target_instance_id.as_deref(),
+        Some(pod_uid.as_str())
+    );
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus),
+        "operator restart must persist durable recovery intent before mutation"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_capability_less_pod_uses_legacy_shim_end_to_end() {
+    let api = KvClusterApi::new();
+    api.hide_agent_status(true);
+    let status =
+        create_healthy_set(&api, &ReconcilerState::default(), "legacy-control-peer", 1).await;
+    assert_eq!(status.phase, Phase::Healthy);
+    let paths = api.dispatch_paths();
+    assert!(!paths.is_empty());
+    assert!(paths.iter().all(|path| *path == DispatchPath::Legacy));
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_rollback_field_loss_reobserves_fences_before_dispatch() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "rollback-fences", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "rollback-fences",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut pending_status = advance_until_pending_action(
+        &api,
+        "rollback-fences",
+        3,
+        api.last_status().unwrap(),
+        DurableActionKind::PromoteTarget,
+    )
+    .await;
+    let pending = pending_status
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap();
+    let attempts = pending.attempts;
+    let deadline = pending.deadline_unix_seconds;
+    pending.dispatch_protocol = None;
+    pending.dispatch_agent_generation = None;
+    pending.dispatch_agent_control_version = None;
+    pending.dispatch_observed_runtime_epoch = None;
+
+    api.reset_operations();
+    api.reset_dispatch_paths();
+    reconcile_set(
+        &make_set("rollback-fences", 3, Some(pending_status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let refreshed = api.last_status().unwrap();
+    let pending = refreshed
+        .operation
+        .as_ref()
+        .unwrap()
+        .pending_action
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        pending.dispatch_protocol,
+        Some(kuberic_operator::crd::DispatchProtocolStatus::CorrelatedControlV1)
+    );
+    assert!(pending.dispatch_agent_generation.is_some());
+    assert_eq!(pending.attempts, attempts);
+    assert_eq!(pending.deadline_unix_seconds, deadline);
+    assert!(api.dispatch_paths().is_empty());
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
 }

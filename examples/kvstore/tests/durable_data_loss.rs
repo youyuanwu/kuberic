@@ -51,6 +51,13 @@ async fn durable_data_loss_is_correlated_and_observable() {
         .await
         .unwrap();
     let status = wait_for_terminal(&handle).await;
+    let agent = status.agent.as_ref().expect("replica-agent status");
+    assert!(
+        agent
+            .capabilities
+            .contains(&kuberic_core::types::ReplicaAgentCapability::CorrelatedControlActionV1)
+    );
+    assert_eq!(agent.retained_terminal_actions.len(), 1);
     let completion = status.last_completed_action.unwrap();
     assert_eq!(completion.action_id, "failover:data-loss");
     assert_eq!(

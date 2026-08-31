@@ -86,7 +86,7 @@ demotion's `fail_all()`.
 2. `ReplicaHandle` trait: `revoke_write_status()` method
 3. `GrpcReplicaHandle`: calls RPC
 4. `InProcessReplicaHandle`: sets `PartitionState` directly
-5. `PodRuntime`: `RuntimeCommand::RevokeWriteStatus` + handler
+5. `ReplicaAgent`: `AgentCommand::RevokeWriteStatus` → runtime effect handler
 6. `ControlServer`: gRPC handler
 7. `switchover()`: calls `revoke_write_status()` as step 1
 
@@ -1068,3 +1068,38 @@ and replication `CreateInitialPrimary` transition
 (`Failover/ra/ReconfigurationAgent.cpp`,
 `Replication/Replicator.ChangeRoleAsyncOperation.cpp`) while retaining
 Kuberic's explicit incremental configuration checkpoints.
+
+### E8. Pod runtime owns manager-protocol correlation — ✅ Fixed
+
+**Affects:** Control server, pod-local restart fencing, durable activity
+observation
+
+`ReplicaAgent` now sits between `ControlServer` and `PodRuntime`. It owns
+action ID/signature validation, active/terminal observations, duplicate replay,
+local mutation serialization, bounded errors/faults, and explicit
+replica-incarnation, process-generation, control-version, and runtime-epoch
+fences. `PodRuntime` owns effect ordering and exact completion only; it has no
+correlation ledger.
+
+This follows the Service Fabric ownership split rather than copying its storage
+model. RA routes FM messages through per-failover-unit entity scheduling,
+rechecks generation/epoch/replica instance under the entity lock, and persists
+failover-unit progress
+(`Reliability/Failover/ra/MessageHandler.cpp`,
+`MessageContext.h`, `Infrastructure.EntityScheduler.h`). RAProxy keeps a fresh
+runtime-bound proxy map, admits compatible action lists, and executes ordered
+service/replicator callbacks
+(`ReconfigurationAgentProxy.cpp`, `FailoverUnitProxy.cpp`,
+`ProxyActionsList.cpp`).
+
+Kuberic does not add a durable local LFUM. CRD status remains the sole durable
+global store. Agent state lasts one process generation and retains 16 terminal
+records. A same-Pod process restart changes `AgentGeneration`; prior local
+state is not inherited, and the operator observes durable postconditions
+before refreshing fences or redriving. When stable secondary runtime
+continuity cannot be proven, recovery enters the existing durable
+force-remove/rebuild protocol.
+
+`ExecuteCorrelatedControlAction` and additive status fields provide the strong
+path. `ExecuteDurableAction` and every individual RPC remain available as
+rolling-compatible paths through the same agent owner.

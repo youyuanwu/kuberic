@@ -8,6 +8,45 @@ Protocols implemented by the durable operator workflows and
 
 ---
 
+## Pod-Local Control Acceptance
+
+Production durable workflows remain operator-owned, but their runtime
+activities now cross a pod-local `ReplicaAgent` boundary:
+
+```
+persist pending action in CRD status
+observe target Pod UID + runtime epoch + agent generation/control version
+persist dispatch protocol and fences (no runtime activity)
+dispatch ExecuteCorrelatedControlAction
+  → agent validates version, target, generation, signature and fences
+  → exact duplicate: return current/retained observation
+  → conflict/stale/busy: explicit zero-effect rejection
+  → accepted: serialize and delegate one RuntimeEffect to PodRuntime
+PodRuntime executes ordered service/replicator callbacks
+agent records exact completion; operator observes before advancing
+```
+
+`ReplicaInstanceId` remains the Pod UID. `AgentGeneration` identifies one
+process inside that Pod, and changes after a container restart.
+`AgentControlVersion` counts accepted mutations within one generation.
+`observed_runtime_epoch` is a current-state fence, not an epoch the action
+intends to establish. Change-role/update-epoch payloads carry target epochs;
+durable `OnDataLoss` separately requires its payload epoch to match the
+runtime epoch.
+
+The agent retains one active action and 16 terminal observations. Retained
+ID/signature duplicates replay without another effect. After eviction, an old
+control-version request fails as continuity unavailable; a current-version
+redrive remains an operator-owned at-least-once decision after postcondition
+observation. There is no exactly-once claim or durable pod-local history.
+
+For rolling compatibility, an old pod advertises no agent protocol and the
+operator persists an explicit legacy selection. An old operator can call
+`ExecuteDurableAction` on a new pod; the shim uses the same correlation owner.
+A rejected versioned request never falls back to legacy.
+
+---
+
 ## Protocol: Failover
 
 Unplanned primary failure. Direct/non-operator callers may still use
@@ -91,9 +130,11 @@ epochs/configuration and labels, then publishes the compensated stable
 snapshot. Unverifiable post-promotion convergence becomes `poisoned`; it never
 publishes a snapshot containing an old-epoch retained member.
 
-The internal runtime activity endpoint records only the most recent completed
-action ID/signature. This correlates a lost reply without introducing replay
-history or exactly-once claims.
+The pod-local agent records the active action and 16 most recent terminal
+observations. Legacy current/last fields remain projected for rolling
+compatibility. The bounded records correlate a lost reply within one agent
+generation without becoming distributed workflow history or an exactly-once
+claim.
 
 ---
 

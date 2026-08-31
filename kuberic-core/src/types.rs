@@ -193,6 +193,116 @@ pub enum ReplicaSetQuorumMode {
 // Replica status info (operator-facing health probe result)
 // ---------------------------------------------------------------------------
 
+/// Identifies one pod-local control process independently of replica
+/// incarnation. A new value is generated for every process start.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AgentGeneration(String);
+
+impl AgentGeneration {
+    pub fn generate() -> Self {
+        Self(format!("{:032x}", rand::random::<u128>()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_string(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("agent generation must be 32 lowercase hexadecimal characters".to_string());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AgentGeneration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Monotonic command-admission version scoped to one [`AgentGeneration`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct AgentControlVersion(u64);
+
+impl AgentControlVersion {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    pub fn advance(&mut self) -> Self {
+        self.0 = self.0.saturating_add(1);
+        *self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrelatedActionAdmission {
+    Legacy,
+    Versioned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaAgentCapability {
+    CorrelatedControlActionV1,
+}
+
+#[derive(Debug, Clone)]
+pub struct CorrelatedControlActionRequest {
+    pub protocol_version: u32,
+    pub action_id: String,
+    pub input_signature: String,
+    pub target_replica_id: ReplicaId,
+    pub target_instance_id: ReplicaInstanceId,
+    pub expected_agent_generation: AgentGeneration,
+    pub expected_control_version: AgentControlVersion,
+    pub observed_runtime_epoch: Epoch,
+    pub action: DurableReplicaAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelatedControlActionAcknowledgement {
+    pub observation: CorrelatedActionObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrelatedActionObservation {
+    pub generation: AgentGeneration,
+    pub control_version: AgentControlVersion,
+    pub admission: CorrelatedActionAdmission,
+    pub action: DurableActionObservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalFaultRecord {
+    pub sequence: u64,
+    pub fault_type: FaultType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaAgentStatus {
+    pub generation: AgentGeneration,
+    pub control_version: AgentControlVersion,
+    pub capabilities: Vec<ReplicaAgentCapability>,
+    pub current_action: Option<CorrelatedActionObservation>,
+    pub retained_terminal_actions: Vec<CorrelatedActionObservation>,
+    pub local_faults: Vec<LocalFaultRecord>,
+}
+
 /// Status returned by `ReplicaHandle::get_status()`. Used by the
 /// reconciler to detect restarted pods (epoch mismatch, role=None).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +321,7 @@ pub struct ReplicaStatusInfo {
     pub last_completed_action: Option<DurableActionCompletion>,
     pub durable_action: Option<DurableActionObservation>,
     pub active_replica_connections: Vec<ReplicaConnectionStatus>,
+    pub agent: Option<ReplicaAgentStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

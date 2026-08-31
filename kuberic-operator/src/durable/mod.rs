@@ -25,7 +25,9 @@ pub use failover::{
 pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
 pub use switchover::{decide, start_switchover};
 
-pub const ACTION_DEADLINE_SECONDS: i64 = 5;
+// Includes authorization, dispatch-fence persistence, activity, and
+// observation-first retry reconciles.
+pub const ACTION_DEADLINE_SECONDS: i64 = 10;
 const MAX_ERROR_LENGTH: usize = 512;
 
 #[derive(Debug)]

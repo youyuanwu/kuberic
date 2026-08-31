@@ -632,6 +632,10 @@ fn pending_action(
         deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         last_error: None,
         dispatch_authorized: false,
+        dispatch_protocol: None,
+        dispatch_agent_generation: None,
+        dispatch_agent_control_version: None,
+        dispatch_observed_runtime_epoch: None,
     })
 }
 
@@ -1191,6 +1195,7 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                agent: None,
             },
             replicator_address: format!("http://{instance}"),
             pod_name: format!("set-{}", id - 1),

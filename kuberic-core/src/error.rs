@@ -1,4 +1,6 @@
-use crate::types::{Epoch, ReplicaId, ReplicaInstanceId, Role};
+use crate::types::{
+    AgentControlVersion, AgentGeneration, Epoch, ReplicaId, ReplicaInstanceId, Role,
+};
 
 /// Validation failures returned while reconstructing a driver from a durable
 /// stable snapshot and current live replica handles.
@@ -88,6 +90,79 @@ pub enum KubericError {
     /// The replica/partition is closed or shutting down.
     #[error("closed")]
     Closed,
+
+    /// A locally serialized mutation is already active.
+    #[error("replica agent is busy")]
+    AgentBusy,
+
+    /// The bounded direct-mutation queue cannot accept more work.
+    #[error("replica agent command queue is full")]
+    AgentQueueFull,
+
+    /// One retained action identifier was reused with different input.
+    #[error("correlated action ID {action_id} was reused with different input")]
+    ActionIdConflict { action_id: String },
+
+    /// Correlated actions require a stable non-empty identifier.
+    #[error("correlated action ID must not be empty")]
+    InvalidCorrelatedActionId,
+
+    /// The caller-provided signature does not describe the action payload.
+    #[error("correlated action {action_id} input signature does not match its payload")]
+    ActionSignatureMismatch { action_id: String },
+
+    /// The versioned correlated command uses an unsupported protocol version.
+    #[error("unsupported correlated control protocol version {got}")]
+    UnsupportedControlProtocolVersion { got: u32 },
+
+    /// The command addresses another replica or replica incarnation.
+    #[error(
+        "correlated action target mismatch: expected replica {expected_id}@{expected_instance}, got {actual_id}@{actual_instance}"
+    )]
+    CorrelatedTargetMismatch {
+        expected_id: ReplicaId,
+        expected_instance: ReplicaInstanceId,
+        actual_id: ReplicaId,
+        actual_instance: ReplicaInstanceId,
+    },
+
+    /// The command was fenced to another pod-local process.
+    #[error("stale agent generation: expected {expected}, current {current}")]
+    StaleAgentGeneration {
+        expected: AgentGeneration,
+        current: AgentGeneration,
+    },
+
+    /// Local mutation admission advanced after the caller observed status.
+    #[error("stale agent control version: expected {expected:?}, current {current:?}")]
+    StaleAgentControlVersion {
+        expected: AgentControlVersion,
+        current: AgentControlVersion,
+    },
+
+    /// An unretained action cannot be safely classified from an old snapshot.
+    #[error("correlated action {action_id} continuity is unavailable")]
+    CorrelatedContinuityUnavailable { action_id: String },
+
+    /// A remote agent rejected a request before execution.
+    #[error("remote replica-agent request rejected: {0}")]
+    RemoteAgentRequestRejected(String),
+
+    /// A remote agent rejected stale target/generation/version/epoch evidence.
+    #[error("remote replica-agent precondition rejected: {0}")]
+    RemoteAgentPreconditionRejected(String),
+
+    /// A remote agent reported a retained action-ID conflict.
+    #[error("remote replica-agent action conflict: {0}")]
+    RemoteAgentConflict(String),
+
+    /// A remote agent could not prove the requested local continuity.
+    #[error("remote replica-agent continuity unavailable: {0}")]
+    RemoteAgentContinuityUnavailable(String),
+
+    /// The remote endpoint does not support the requested control protocol.
+    #[error("remote replica-agent protocol unsupported: {0}")]
+    RemoteControlProtocolUnsupported(String),
 
     /// Internal error (IO, serialization, etc.)
     #[error(transparent)]

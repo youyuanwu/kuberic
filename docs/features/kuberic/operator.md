@@ -29,7 +29,8 @@ switchover, and scaling via `PartitionDriver`.
   switchover, replica add/rebuild, and configuration-first replica removal,
   plus Phase-1 failover/data-loss recovery, including optional
   previous/committed topology, target snapshot, one pending correlated action,
-  and failover observations/assessment/epoch intents
+  failover observations/assessment/epoch intents, and optional pod-local
+  dispatch protocol/generation/control-version/runtime-epoch fences
 - optional `stableElectionMetadataRefresh` checkpoint for topology-scoped,
   write-ahead runtime configuration recording and live progress publication
 - `primaryFailingSince`
@@ -144,6 +145,38 @@ state, the driver sends a precise `(replica ID, incarnation)` removal to the
 primary. Re-adding the ordinal installs the new endpoint and cancels the old
 connection's drain and acknowledgement tasks.
 
+### ReplicaAgent Dispatch Boundary
+
+Every control request reaches a pod-local `ReplicaAgent` before
+`PodRuntime`. The agent owns local admission, correlation, serialization and
+bounded completion replay; the runtime owns ordered service/replicator
+effects. This is intentionally narrower than Service Fabric RA: CRD status and
+the operator remain the only owners of distributed workflow state.
+
+Before a pending runtime action is dispatched, reconciliation observes and
+persists one explicit protocol choice:
+
+- `correlatedControlV1` with exact Pod UID, agent generation, agent control
+  version and observed runtime epoch; or
+- `legacy` only when the observed peer does not advertise the capability.
+
+A capability-present peer whose addressed/runtime/pending incarnations do not
+agree is not downgraded; reconciliation waits for the durable identity and
+postcondition logic to resolve the mismatch.
+
+This fence write is a separate reconciliation step and does not consume or
+reset the action attempt/deadline budget. The next reconcile reconstructs the
+deterministic action and uses `ExecuteCorrelatedControlAction`. A stale
+precondition or unavailable-continuity rejection itself executes no effect, so
+the advisory fences are cleared and re-observed without consuming an attempt;
+the agent makes no claim about whether an older unretained action executed.
+Other errors remain counted. A versioned rejection never triggers automatic
+legacy fallback.
+
+Legacy `ExecuteDurableAction` remains available for old operators and old
+pods. On a new pod it enters the same agent correlation ledger but cannot
+provide generation/control-version fences.
+
 ---
 
 ## Operator Restart Recovery
@@ -165,6 +198,15 @@ phase-specific failover fence. Durable `Creating`, `Switchover`,
 `status.operation`. Completed topology snapshots are refreshed with exact
 election metadata before they are used as unavailable-candidate comparison
 evidence. See `operator-failure-scenarios.md` §8.
+
+A container restart can keep the Pod UID while resetting role, epoch and all
+agent/runtime process-local state. Status exposes a new `AgentGeneration`, so
+the new process cannot replay or impersonate the previous process's action.
+On restart recovery, a stable secondary with the same Pod UID but unverifiable
+runtime role/epoch is persisted into the established durable
+force-remove/rebuild path before mutation. A stale primary enters durable
+failover. Missing prior-generation local state is never proof that an
+ambiguous effect did not run.
 
 ## Durable Partition Creation
 

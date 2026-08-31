@@ -981,6 +981,10 @@ fn make_pending(
         deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         last_error: None,
         dispatch_authorized: false,
+        dispatch_protocol: None,
+        dispatch_agent_generation: None,
+        dispatch_agent_control_version: None,
+        dispatch_observed_runtime_epoch: None,
     }
 }
 
@@ -1473,16 +1477,16 @@ fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), Str
 
 fn target_instance(operation: &DurableOperationStatus, target_id: i64) -> Option<String> {
     operation
-        .target_snapshot
+        .failover
+        .as_ref()?
+        .current_configuration
         .members
         .iter()
         .find(|member| member.id == target_id)
         .map(|member| member.instance_id.clone())
         .or_else(|| {
             operation
-                .failover
-                .as_ref()?
-                .current_configuration
+                .target_snapshot
                 .members
                 .iter()
                 .find(|member| member.id == target_id)
@@ -1646,6 +1650,7 @@ mod tests {
             last_completed_action: None,
             durable_action: None,
             active_replica_connections: Vec::<ReplicaConnectionStatus>::new(),
+            agent: None,
         }
     }
 

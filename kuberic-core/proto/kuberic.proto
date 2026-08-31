@@ -87,6 +87,7 @@ service ReplicatorControl {
     rpc OnDataLoss(OnDataLossRequest) returns (OnDataLossResponse);
     rpc RevokeWriteStatus(RevokeWriteStatusRequest) returns (RevokeWriteStatusResponse);
     rpc ExecuteDurableAction(ExecuteDurableActionRequest) returns (ExecuteDurableActionResponse);
+    rpc ExecuteCorrelatedControlAction(ExecuteCorrelatedControlActionRequest) returns (ExecuteCorrelatedControlActionResponse);
 }
 
 message OpenRequest {
@@ -130,6 +131,12 @@ message GetStatusResponse {
     ReplicaElectionConfigurationProto election_configuration = 18;
     DurableActionResultProto last_completed_action_result = 19;
     DurableActionResultProto durable_action_result = 20;
+    uint32 replica_agent_protocol_version = 21;
+    string agent_generation = 22;
+    uint64 agent_control_version = 23;
+    CorrelatedActionObservationProto current_agent_action = 24;
+    repeated CorrelatedActionObservationProto retained_terminal_actions = 25;
+    repeated LocalFaultRecordProto local_faults = 26;
 }
 
 message ReplicaDeactivationInfoProto {
@@ -226,6 +233,63 @@ message ExecuteDurableActionRequest {
     }
 }
 message ExecuteDurableActionResponse {}
+
+enum CorrelatedActionAdmissionProto {
+    CORRELATED_ACTION_ADMISSION_UNKNOWN = 0;
+    CORRELATED_ACTION_ADMISSION_LEGACY = 1;
+    CORRELATED_ACTION_ADMISSION_VERSIONED = 2;
+}
+
+enum LocalFaultTypeProto {
+    LOCAL_FAULT_UNKNOWN = 0;
+    LOCAL_FAULT_TRANSIENT = 1;
+    LOCAL_FAULT_PERMANENT = 2;
+}
+
+message CorrelatedActionObservationProto {
+    string agent_generation = 1;
+    uint64 agent_control_version = 2;
+    CorrelatedActionAdmissionProto admission = 3;
+    string action_id = 4;
+    string input_signature = 5;
+    DurableActionStateProto state = 6;
+    string error = 7;
+    DurableActionResultProto result = 8;
+}
+
+message LocalFaultRecordProto {
+    uint64 sequence = 1;
+    LocalFaultTypeProto fault_type = 2;
+}
+
+message ExecuteCorrelatedControlActionRequest {
+    uint32 protocol_version = 1;
+    string action_id = 2;
+    string input_signature = 3;
+    int64 target_replica_id = 4;
+    string target_instance_id = 5;
+    string expected_agent_generation = 6;
+    optional uint64 expected_agent_control_version = 7;
+    EpochProto observed_runtime_epoch = 8;
+    oneof action {
+        RevokeWriteStatusRequest revoke_write_status = 20;
+        ChangeRoleRequest change_role = 21;
+        UpdateEpochRequest update_epoch = 22;
+        UpdateCatchUpConfigRequest update_catch_up_configuration = 23;
+        WaitForCatchUpQuorumRequest wait_for_catch_up_quorum = 24;
+        UpdateCurrentConfigRequest update_current_configuration = 25;
+        OpenRequest open = 26;
+        CloseRequest close = 27;
+        BuildReplicaRequest build_replica = 28;
+        RemoveReplicaRequest remove_replica = 29;
+        DurableOnDataLossRequest on_data_loss = 30;
+        RecordElectionConfigurationRequest record_election_configuration = 31;
+    }
+}
+
+message ExecuteCorrelatedControlActionResponse {
+    CorrelatedActionObservationProto observation = 1;
+}
 
 // ---- Data plane: Pod ↔ Pod (replication + copy) ----
 

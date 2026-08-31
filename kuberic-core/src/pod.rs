@@ -1,101 +1,92 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tonic::transport::Server;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::error::{KubericError, Result};
 use crate::events::{LifecycleEvent, ReplicatorControlEvent};
+use crate::handles::PartitionState;
 use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
-    AccessStatus, CancellationToken, DataLossAction, DurableActionCompletion,
-    DurableActionObservation, DurableActionResult, DurableActionState, DurableReplicaAction, Epoch,
-    Lsn, OpenMode, ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaDeactivationInfo,
-    ReplicaElectionConfiguration, ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
-    ReplicaSetQuorumMode, Role,
+    AccessStatus, CancellationToken, DataLossAction, Epoch, OpenMode, ReplicaConfigurationMode,
+    ReplicaConfigurationStatus, ReplicaDeactivationInfo, ReplicaElectionConfiguration, ReplicaId,
+    ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
 };
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
-
 // ---------------------------------------------------------------------------
-// RuntimeCommand — what the gRPC control server sends to the runtime
+// RuntimeEffectCommand — what the replica agent sends to the runtime
 // ---------------------------------------------------------------------------
 
-/// Commands sent by the gRPC ControlServer to the PodRuntime.
-/// The runtime processes these with correct ordering (replicator + user events).
-pub enum RuntimeCommand {
+/// One ordered service/replicator effect delegated by [`ReplicaAgent`].
+pub enum RuntimeEffect {
     Open {
         mode: OpenMode,
-        reply: oneshot::Sender<Result<()>>,
     },
     Close {
-        reply: oneshot::Sender<Result<()>>,
+        terminate_runtime: bool,
     },
     ChangeRole {
         epoch: Epoch,
         role: Role,
-        reply: oneshot::Sender<Result<()>>,
     },
     UpdateEpoch {
         epoch: Epoch,
-        reply: oneshot::Sender<Result<()>>,
     },
     UpdateCatchUpConfiguration {
         current: ReplicaSetConfig,
         previous: ReplicaSetConfig,
-        reply: oneshot::Sender<Result<()>>,
+        observe_on_secondary: bool,
     },
     UpdateCurrentConfiguration {
         current: ReplicaSetConfig,
-        reply: oneshot::Sender<Result<()>>,
+        observe_on_secondary: bool,
     },
     WaitForCatchUpQuorum {
         mode: ReplicaSetQuorumMode,
-        reply: oneshot::Sender<Result<()>>,
     },
     BuildReplica {
         replica: ReplicaInfo,
-        reply: oneshot::Sender<Result<()>>,
+        extended_timeout: bool,
     },
     RemoveReplica {
         replica_id: ReplicaId,
         instance_id: ReplicaInstanceId,
-        reply: oneshot::Sender<Result<()>>,
     },
     OnDataLoss {
-        reply: oneshot::Sender<Result<DataLossAction>>,
+        expected_epoch: Option<Epoch>,
     },
     RevokeWriteStatus {
-        reply: oneshot::Sender<Result<()>>,
+        require_open: bool,
     },
-    ExecuteDurableAction {
-        action_id: String,
-        action: DurableReplicaAction,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    GetStatus {
-        reply: oneshot::Sender<StatusInfo>,
+    RecordElectionConfiguration {
+        configuration: ReplicaElectionConfiguration,
     },
 }
 
-/// Status info returned by GetStatus.
-pub struct StatusInfo {
+pub enum RuntimeEffectResult {
+    Unit,
+    DataLoss(DataLossAction),
+}
+
+pub struct RuntimeEffectCommand {
+    pub effect: RuntimeEffect,
+    pub reply: oneshot::Sender<Result<RuntimeEffectResult>>,
+}
+
+/// Non-blocking runtime state published to the replica agent.
+#[derive(Clone)]
+pub struct RuntimeControlSnapshot {
     pub instance_id: ReplicaInstanceId,
     pub role: Role,
     pub epoch: Epoch,
-    pub current_progress: Lsn,
-    pub catch_up_capability: Option<Lsn>,
-    pub committed_lsn: Lsn,
-    pub healthy: bool,
-    pub write_status: AccessStatus,
     pub configuration: Option<ReplicaConfigurationStatus>,
     pub election_configuration: Option<ReplicaElectionConfiguration>,
     pub deactivation_info: Option<ReplicaDeactivationInfo>,
-    pub last_completed_action: Option<DurableActionCompletion>,
-    pub durable_action: Option<DurableActionObservation>,
-    pub active_replica_connections: Vec<crate::types::ReplicaConnectionStatus>,
+    pub partition_state: Option<Arc<PartitionState>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +95,7 @@ pub struct StatusInfo {
 
 pub struct PodRuntime {
     lifecycle_tx: mpsc::Sender<LifecycleEvent>,
-    cmd_rx: mpsc::Receiver<RuntimeCommand>,
+    cmd_rx: mpsc::Receiver<RuntimeEffectCommand>,
     replicator_handle: Option<ReplicatorHandle>,
     shutdown: CancellationToken,
     reply_timeout: Duration,
@@ -115,8 +106,9 @@ pub struct PodRuntime {
     data_bind: String,
     configuration: Option<ReplicaConfigurationStatus>,
     election_configuration: Option<ReplicaElectionConfiguration>,
-    deactivation_info: Arc<Mutex<Option<ReplicaDeactivationInfo>>>,
-    durable_action: Arc<Mutex<Option<DurableActionObservation>>>,
+    deactivation_info: Option<ReplicaDeactivationInfo>,
+    fault_tx: mpsc::Sender<crate::types::FaultType>,
+    status_tx: watch::Sender<RuntimeControlSnapshot>,
 }
 
 pub struct PodRuntimeBundle {
@@ -168,12 +160,34 @@ impl PodRuntimeBuilder {
     pub async fn build(self) -> Result<PodRuntimeBundle> {
         let shutdown = CancellationToken::new();
         let (lifecycle_tx, lifecycle_rx) = mpsc::channel(16);
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (agent_tx, agent_rx) = mpsc::channel(16);
+        let (runtime_tx, cmd_rx) = mpsc::channel(16);
+        let (fault_tx, fault_rx) = mpsc::channel(16);
+        let initial_status = RuntimeControlSnapshot {
+            instance_id: self.instance_id.clone(),
+            role: Role::Unknown,
+            epoch: Epoch::default(),
+            configuration: None,
+            election_configuration: None,
+            deactivation_info: None,
+            partition_state: None,
+        };
+        let (status_tx, status_rx) = watch::channel(initial_status);
 
-        // Control plane gRPC server (runtime-owned, unchanged)
+        // Control plane gRPC server routes through the pod-local agent.
         // PartitionState is not available yet — it's created by the replicator
         // at Open time. ControlServer needs to work without it initially.
-        let control_server = crate::grpc::server::ControlServer::new(self.replica_id, cmd_tx);
+        let control_server = crate::grpc::server::ControlServer::new(self.replica_id, agent_tx);
+        let replica_agent = crate::replica_agent::ReplicaAgent::new(
+            self.replica_id,
+            self.instance_id.clone(),
+            agent_rx,
+            runtime_tx,
+            status_rx,
+            fault_rx,
+            shutdown.child_token(),
+        );
+        tokio::spawn(replica_agent.serve());
         let control_listener = tokio::net::TcpListener::bind(&self.control_bind)
             .await
             .map_err(|e| KubericError::Internal(Box::new(e)))?;
@@ -216,8 +230,9 @@ impl PodRuntimeBuilder {
             data_bind: self.data_bind,
             configuration: None,
             election_configuration: None,
-            deactivation_info: Arc::new(Mutex::new(None)),
-            durable_action: Arc::new(Mutex::new(None)),
+            deactivation_info: None,
+            fault_tx,
+            status_tx,
         };
 
         Ok(PodRuntimeBundle {
@@ -243,155 +258,141 @@ impl PodRuntime {
     /// Blocks until shutdown.
     pub async fn serve(mut self) {
         info!("PodRuntime serve loop started");
-        while let Some(cmd) = self.cmd_rx.recv().await {
-            match cmd {
-                RuntimeCommand::Open { mode, reply } => {
-                    let _ = reply.send(self.handle_open(mode).await);
+        while let Some(command) = self.cmd_rx.recv().await {
+            let terminate_runtime = matches!(
+                &command.effect,
+                RuntimeEffect::Close {
+                    terminate_runtime: true
                 }
-                RuntimeCommand::Close { reply } => {
-                    let _ = reply.send(self.handle_close().await);
-                    break;
-                }
-                RuntimeCommand::ChangeRole { epoch, role, reply } => {
-                    let _ = reply.send(match self.require_handle() {
-                        Ok(_) => self.handle_change_role(epoch, role).await,
-                        Err(e) => Err(e),
-                    });
-                }
-                RuntimeCommand::UpdateEpoch { epoch, reply } => {
-                    let _ = reply.send(self.handle_update_epoch(epoch).await);
-                }
-                RuntimeCommand::UpdateCatchUpConfiguration {
-                    current,
-                    previous,
-                    reply,
-                } => {
-                    let observed_configuration = ReplicaConfigurationStatus::from_config(
-                        ReplicaConfigurationMode::CatchUp,
-                        &current,
-                    );
-                    let result = self
-                        .send_replicator_control(|r| {
-                            ReplicatorControlEvent::UpdateCatchUpConfiguration {
-                                current,
-                                previous,
-                                reply: r,
-                            }
-                        })
-                        .await;
-                    if result.is_ok() && self.role == Role::Primary {
-                        if let Some(handle) = &self.replicator_handle {
-                            handle.state().set_write_status(AccessStatus::Granted);
-                        }
-                        self.configuration = Some(observed_configuration);
-                    }
-                    let _ = reply.send(result);
-                }
-                RuntimeCommand::UpdateCurrentConfiguration { current, reply } => {
-                    let observed_configuration = ReplicaConfigurationStatus::from_config(
-                        ReplicaConfigurationMode::Current,
-                        &current,
-                    );
-                    let result = self
-                        .send_replicator_control(|r| {
-                            ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply: r }
-                        })
-                        .await;
-                    if result.is_ok() && self.role == Role::Primary {
-                        if let Some(handle) = &self.replicator_handle {
-                            handle.state().set_write_status(AccessStatus::Granted);
-                        }
-                        self.configuration = Some(observed_configuration);
-                    }
-                    let _ = reply.send(result);
-                }
-                RuntimeCommand::WaitForCatchUpQuorum { mode, reply } => {
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| {
-                            ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply: r }
-                        })
-                        .await,
-                    );
-                }
-                RuntimeCommand::BuildReplica { replica, reply } => {
-                    // Copy protocol now runs inside the replicator actor.
-                    // The actor spawns a task and replies when copy completes.
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| ReplicatorControlEvent::BuildReplica {
-                            replica,
-                            reply: r,
-                        })
-                        .await,
-                    );
-                }
-                RuntimeCommand::RemoveReplica {
-                    replica_id,
-                    instance_id,
-                    reply,
-                } => {
-                    let _ = reply.send(
-                        self.send_replicator_control(|r| ReplicatorControlEvent::RemoveReplica {
-                            replica_id,
-                            instance_id,
-                            reply: r,
-                        })
-                        .await,
-                    );
-                }
-                RuntimeCommand::OnDataLoss { reply } => {
-                    let _ = reply.send(self.handle_on_data_loss().await);
-                }
-                RuntimeCommand::RevokeWriteStatus { reply } => {
-                    info!("revoking write status for switchover");
-                    if let Some(handle) = &self.replicator_handle {
-                        handle
-                            .state()
-                            .set_write_status(AccessStatus::ReconfigurationPending);
-                    }
-                    let _ = reply.send(Ok(()));
-                }
-                RuntimeCommand::ExecuteDurableAction {
-                    action_id,
-                    action,
-                    reply,
-                } => {
-                    let _ = reply.send(self.handle_durable_action(action_id, action).await);
-                }
-                RuntimeCommand::GetStatus { reply } => {
-                    let handle = self.replicator_handle.as_ref();
-                    let durable_action = self.durable_action.lock().unwrap().clone();
-                    let last_completed_action = durable_action.as_ref().and_then(|action| {
-                        (action.state == DurableActionState::Completed).then(|| {
-                            DurableActionCompletion {
-                                action_id: action.action_id.clone(),
-                                signature: action.signature.clone(),
-                                result: action.result,
-                            }
-                        })
-                    });
-                    let _ = reply.send(StatusInfo {
-                        instance_id: self.instance_id.clone(),
-                        role: self.role,
-                        epoch: self.epoch,
-                        current_progress: handle.map_or(0, |h| h.state().current_progress()),
-                        catch_up_capability: handle
-                            .and_then(|h| h.state().observed_catch_up_capability()),
-                        committed_lsn: handle.map_or(0, |h| h.state().committed_lsn()),
-                        healthy: handle.is_some(),
-                        write_status: handle
-                            .map_or(AccessStatus::NotPrimary, |h| h.state().write_status()),
-                        configuration: self.configuration.clone(),
-                        election_configuration: self.election_configuration.clone(),
-                        deactivation_info: *self.deactivation_info.lock().unwrap(),
-                        last_completed_action,
-                        durable_action,
-                        active_replica_connections: handle
-                            .map_or_else(Vec::new, |h| h.state().active_replica_connections()),
-                    });
-                }
+            );
+            let result = self.execute_effect(command.effect).await;
+            self.publish_status();
+            let _ = command.reply.send(result);
+            if terminate_runtime {
+                break;
             }
         }
         self.shutdown.cancel();
+    }
+
+    async fn execute_effect(&mut self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        let result = match effect {
+            RuntimeEffect::Open { mode } => self.handle_open(mode).await,
+            RuntimeEffect::Close { .. } => self.handle_close().await,
+            RuntimeEffect::ChangeRole { epoch, role } => {
+                self.require_handle()?;
+                self.handle_change_role(epoch, role).await
+            }
+            RuntimeEffect::UpdateEpoch { epoch } => self.handle_update_epoch(epoch).await,
+            RuntimeEffect::UpdateCatchUpConfiguration {
+                current,
+                previous,
+                observe_on_secondary,
+            } => {
+                let observed_configuration = ReplicaConfigurationStatus::from_config(
+                    ReplicaConfigurationMode::CatchUp,
+                    &current,
+                );
+                let result = self
+                    .send_replicator_control(|reply| {
+                        ReplicatorControlEvent::UpdateCatchUpConfiguration {
+                            current,
+                            previous,
+                            reply,
+                        }
+                    })
+                    .await;
+                if result.is_ok() && self.role == Role::Primary {
+                    self.require_handle()?
+                        .state()
+                        .set_write_status(AccessStatus::Granted);
+                }
+                if result.is_ok() && (observe_on_secondary || self.role == Role::Primary) {
+                    self.configuration = Some(observed_configuration);
+                }
+                result
+            }
+            RuntimeEffect::UpdateCurrentConfiguration {
+                current,
+                observe_on_secondary,
+            } => {
+                let observed_configuration = ReplicaConfigurationStatus::from_config(
+                    ReplicaConfigurationMode::Current,
+                    &current,
+                );
+                let result = self
+                    .send_replicator_control(|reply| {
+                        ReplicatorControlEvent::UpdateCurrentConfiguration { current, reply }
+                    })
+                    .await;
+                if result.is_ok() && self.role == Role::Primary {
+                    self.require_handle()?
+                        .state()
+                        .set_write_status(AccessStatus::Granted);
+                }
+                if result.is_ok() && (observe_on_secondary || self.role == Role::Primary) {
+                    self.configuration = Some(observed_configuration);
+                }
+                result
+            }
+            RuntimeEffect::WaitForCatchUpQuorum { mode } => {
+                self.send_replicator_control(|reply| ReplicatorControlEvent::WaitForCatchUpQuorum {
+                    mode,
+                    reply,
+                })
+                .await
+            }
+            RuntimeEffect::BuildReplica {
+                replica,
+                extended_timeout,
+            } => {
+                let timeout = if extended_timeout {
+                    BUILD_REPLY_TIMEOUT
+                } else {
+                    self.reply_timeout
+                };
+                self.send_replicator_control_with_timeout(
+                    |reply| ReplicatorControlEvent::BuildReplica { replica, reply },
+                    timeout,
+                )
+                .await
+            }
+            RuntimeEffect::RemoveReplica {
+                replica_id,
+                instance_id,
+            } => {
+                self.send_replicator_control(|reply| ReplicatorControlEvent::RemoveReplica {
+                    replica_id,
+                    instance_id,
+                    reply,
+                })
+                .await
+            }
+            RuntimeEffect::OnDataLoss { expected_epoch } => {
+                return self
+                    .handle_on_data_loss(expected_epoch)
+                    .await
+                    .map(RuntimeEffectResult::DataLoss);
+            }
+            RuntimeEffect::RevokeWriteStatus { require_open } => {
+                info!("revoking write status for switchover");
+                if require_open {
+                    self.require_handle()?
+                        .state()
+                        .set_write_status(AccessStatus::ReconfigurationPending);
+                } else if let Some(handle) = &self.replicator_handle {
+                    handle
+                        .state()
+                        .set_write_status(AccessStatus::ReconfigurationPending);
+                }
+                Ok(())
+            }
+            RuntimeEffect::RecordElectionConfiguration { configuration } => {
+                self.election_configuration = Some(configuration);
+                Ok(())
+            }
+        };
+        result.map(|()| RuntimeEffectResult::Unit)
     }
 
     // -----------------------------------------------------------------------
@@ -405,325 +406,13 @@ impl PodRuntime {
             .ok_or(KubericError::Internal("replicator not opened".into()))
     }
 
-    async fn handle_durable_action(
-        &mut self,
-        action_id: String,
-        action: DurableReplicaAction,
-    ) -> Result<()> {
-        let signature = action.signature();
-        {
-            let current = self.durable_action.lock().unwrap();
-            if let Some(observed) = current.as_ref() {
-                if observed.action_id == action_id {
-                    if observed.signature != signature {
-                        return Err(KubericError::Internal(
-                            format!(
-                                "durable action ID {action_id} was reused with different input"
-                            )
-                            .into(),
-                        ));
-                    }
-                    return match observed.state {
-                        DurableActionState::Scheduled
-                        | DurableActionState::InProgress
-                        | DurableActionState::Completed => Ok(()),
-                        DurableActionState::Failed => Err(KubericError::Internal(
-                            observed
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "durable action failed".to_string())
-                                .into(),
-                        )),
-                    };
-                } else if matches!(
-                    observed.state,
-                    DurableActionState::Scheduled | DurableActionState::InProgress
-                ) {
-                    return Err(KubericError::Internal(
-                        format!("durable action {} is still in progress", observed.action_id)
-                            .into(),
-                    ));
-                }
-            }
-        }
-
-        self.set_durable_action(&action_id, &signature, DurableActionState::Scheduled, None);
-
-        if let DurableReplicaAction::BuildReplica { replica } = action.clone() {
-            let handle = match self.require_handle() {
-                Ok(handle) => handle.clone(),
-                Err(error) => {
-                    self.set_durable_action(
-                        &action_id,
-                        &signature,
-                        DurableActionState::Failed,
-                        Some(error.to_string()),
-                    );
-                    return Err(error);
-                }
-            };
-            let durable_action = self.durable_action.clone();
-            let action_id_for_task = action_id.clone();
-            let signature_for_task = signature.clone();
-            tokio::spawn(async move {
-                Self::set_durable_action_state(
-                    &durable_action,
-                    &action_id_for_task,
-                    &signature_for_task,
-                    DurableActionState::InProgress,
-                    None,
-                );
-                let result = handle
-                    .send_control(
-                        |reply| ReplicatorControlEvent::BuildReplica { replica, reply },
-                        BUILD_REPLY_TIMEOUT,
-                    )
-                    .await;
-                match result {
-                    Ok(()) => Self::set_durable_action_state(
-                        &durable_action,
-                        &action_id_for_task,
-                        &signature_for_task,
-                        DurableActionState::Completed,
-                        None,
-                    ),
-                    Err(error) => Self::set_durable_action_state(
-                        &durable_action,
-                        &action_id_for_task,
-                        &signature_for_task,
-                        DurableActionState::Failed,
-                        Some(error.to_string()),
-                    ),
-                }
-            });
-            return Ok(());
-        }
-
-        if let DurableReplicaAction::OnDataLoss { epoch } = action.clone() {
-            if self.epoch != epoch {
-                let error = KubericError::Internal(
-                    format!(
-                        "data-loss action epoch {:?} does not match runtime epoch {:?}",
-                        epoch, self.epoch
-                    )
-                    .into(),
-                );
-                self.set_durable_action(
-                    &action_id,
-                    &signature,
-                    DurableActionState::Failed,
-                    Some(error.to_string()),
-                );
-                warn!(
-                    action_id,
-                    expected_epoch = ?epoch,
-                    runtime_epoch = ?self.epoch,
-                    "rejecting durable data-loss action at mismatched epoch"
-                );
-                return Err(error);
-            }
-
-            let handle = match self.require_handle() {
-                Ok(handle) => handle.clone(),
-                Err(error) => {
-                    self.set_durable_action(
-                        &action_id,
-                        &signature,
-                        DurableActionState::Failed,
-                        Some(error.to_string()),
-                    );
-                    return Err(error);
-                }
-            };
-            let durable_action = self.durable_action.clone();
-            let action_id_for_task = action_id.clone();
-            let signature_for_task = signature.clone();
-            let reply_timeout = self.reply_timeout;
-            let deactivation_info = self.deactivation_info.clone();
-            info!(
-                action_id,
-                expected_epoch = ?epoch,
-                "scheduling durable data-loss callback"
-            );
-            tokio::spawn(async move {
-                debug!(action_id = %action_id_for_task, "durable data-loss callback in progress");
-                Self::set_durable_action_state(
-                    &durable_action,
-                    &action_id_for_task,
-                    &signature_for_task,
-                    DurableActionState::InProgress,
-                    None,
-                );
-                let result = handle
-                    .send_control(
-                        |reply| ReplicatorControlEvent::OnDataLoss {
-                            expected_epoch: Some(epoch),
-                            reply,
-                        },
-                        reply_timeout,
-                    )
-                    .await;
-                match result {
-                    Ok(result) => {
-                        if result == DataLossAction::StateChanged {
-                            *deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
-                                epoch,
-                                catch_up_lsn: handle.state().committed_lsn(),
-                            });
-                        }
-                        info!(
-                            action_id = %action_id_for_task,
-                            state_changed = result == DataLossAction::StateChanged,
-                            "durable data-loss callback completed"
-                        );
-                        Self::set_durable_action_state_with_result(
-                            &durable_action,
-                            &action_id_for_task,
-                            &signature_for_task,
-                            DurableActionState::Completed,
-                            None,
-                            Some(DurableActionResult::DataLoss(result)),
-                        );
-                    }
-                    Err(error) => {
-                        warn!(
-                            action_id = %action_id_for_task,
-                            "durable data-loss callback failed"
-                        );
-                        Self::set_durable_action_state(
-                            &durable_action,
-                            &action_id_for_task,
-                            &signature_for_task,
-                            DurableActionState::Failed,
-                            Some(error.to_string()),
-                        );
-                    }
-                }
-            });
-            return Ok(());
-        }
-
-        self.set_durable_action(&action_id, &signature, DurableActionState::InProgress, None);
-        let result = match action {
-            DurableReplicaAction::Open { mode } => self.handle_open(mode).await,
-            DurableReplicaAction::Close => self.handle_close().await,
-            DurableReplicaAction::RevokeWriteStatus => {
-                let handle = self.require_handle()?;
-                handle
-                    .state()
-                    .set_write_status(AccessStatus::ReconfigurationPending);
-                Ok(())
-            }
-            DurableReplicaAction::ChangeRole { epoch, role } => {
-                self.require_handle()?;
-                self.handle_change_role(epoch, role).await
-            }
-            DurableReplicaAction::UpdateEpoch { epoch } => self.handle_update_epoch(epoch).await,
-            DurableReplicaAction::UpdateCatchUpConfiguration { current, previous } => {
-                let result = self
-                    .send_replicator_control(|reply| {
-                        ReplicatorControlEvent::UpdateCatchUpConfiguration {
-                            current: current.clone(),
-                            previous,
-                            reply,
-                        }
-                    })
-                    .await;
-                if result.is_ok() && self.role == Role::Primary {
-                    self.require_handle()?
-                        .state()
-                        .set_write_status(AccessStatus::Granted);
-                }
-                if result.is_ok() {
-                    self.configuration = Some(ReplicaConfigurationStatus::from_config(
-                        ReplicaConfigurationMode::CatchUp,
-                        &current,
-                    ));
-                }
-                result
-            }
-            DurableReplicaAction::WaitForCatchUpQuorum { mode } => {
-                self.send_replicator_control(|reply| ReplicatorControlEvent::WaitForCatchUpQuorum {
-                    mode,
-                    reply,
-                })
-                .await
-            }
-            DurableReplicaAction::UpdateCurrentConfiguration { current } => {
-                let result = self
-                    .send_replicator_control(|reply| {
-                        ReplicatorControlEvent::UpdateCurrentConfiguration {
-                            current: current.clone(),
-                            reply,
-                        }
-                    })
-                    .await;
-                if result.is_ok() && self.role == Role::Primary {
-                    self.require_handle()?
-                        .state()
-                        .set_write_status(AccessStatus::Granted);
-                }
-                if result.is_ok() {
-                    self.configuration = Some(ReplicaConfigurationStatus::from_config(
-                        ReplicaConfigurationMode::Current,
-                        &current,
-                    ));
-                }
-                result
-            }
-            DurableReplicaAction::RemoveReplica {
-                replica_id,
-                instance_id,
-            } => {
-                self.send_replicator_control(|reply| ReplicatorControlEvent::RemoveReplica {
-                    replica_id,
-                    instance_id,
-                    reply,
-                })
-                .await
-            }
-            DurableReplicaAction::RecordElectionConfiguration { configuration } => {
-                self.election_configuration = Some(configuration);
-                Ok(())
-            }
-            DurableReplicaAction::BuildReplica { .. } | DurableReplicaAction::OnDataLoss { .. } => {
-                unreachable!()
-            }
-        };
-
-        match &result {
-            Ok(()) => {
-                self.set_durable_action(&action_id, &signature, DurableActionState::Completed, None)
-            }
-            Err(error) => self.set_durable_action(
-                &action_id,
-                &signature,
-                DurableActionState::Failed,
-                Some(error.to_string()),
-            ),
-        }
-        result
-    }
-
-    fn set_durable_action(
-        &self,
-        action_id: &str,
-        signature: &str,
-        state: DurableActionState,
-        error: Option<String>,
-    ) {
-        Self::set_durable_action_state(&self.durable_action, action_id, signature, state, error);
-    }
-
     async fn handle_open(&mut self, mode: OpenMode) -> Result<()> {
         if self.replicator_handle.is_some() {
             return Err(KubericError::Internal("already opened".into()));
         }
         self.reset_lifecycle_evidence_for_open();
 
-        // 1. Send OpenContext to user, receive ReplicatorHandle back
-        let (fault_tx, _fault_rx) = mpsc::channel(4);
-
+        // 1. Send OpenContext to user, receive ReplicatorHandle back.
         let handle: ReplicatorHandle = self
             .send_lifecycle(|reply| LifecycleEvent::Open {
                 ctx: OpenContext {
@@ -731,7 +420,7 @@ impl PodRuntime {
                     open_mode: mode,
                     data_bind: self.data_bind.clone(),
                     token: self.shutdown.child_token(),
-                    fault_tx,
+                    fault_tx: self.fault_tx.clone(),
                 },
                 reply,
             })
@@ -760,7 +449,7 @@ impl PodRuntime {
         self.epoch = Epoch::default();
         self.configuration = None;
         self.election_configuration = None;
-        *self.deactivation_info.lock().unwrap() = None;
+        self.deactivation_info = None;
     }
 
     async fn handle_change_role(&mut self, epoch: Epoch, new_role: Role) -> Result<()> {
@@ -813,7 +502,7 @@ impl PodRuntime {
                 .replicator_handle
                 .as_ref()
                 .map_or(0, |handle| handle.state().committed_lsn());
-            *self.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+            self.deactivation_info = Some(ReplicaDeactivationInfo {
                 epoch,
                 catch_up_lsn,
             });
@@ -825,7 +514,7 @@ impl PodRuntime {
         if matches!(self.role, Role::Primary | Role::ActiveSecondary)
             && let Some(handle) = &self.replicator_handle
         {
-            *self.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+            self.deactivation_info = Some(ReplicaDeactivationInfo {
                 epoch: self.epoch,
                 catch_up_lsn: handle.state().committed_lsn(),
             });
@@ -859,33 +548,6 @@ impl PodRuntime {
         Ok(())
     }
 
-    fn set_durable_action_state(
-        slot: &Arc<Mutex<Option<DurableActionObservation>>>,
-        action_id: &str,
-        signature: &str,
-        state: DurableActionState,
-        error: Option<String>,
-    ) {
-        Self::set_durable_action_state_with_result(slot, action_id, signature, state, error, None);
-    }
-
-    fn set_durable_action_state_with_result(
-        slot: &Arc<Mutex<Option<DurableActionObservation>>>,
-        action_id: &str,
-        signature: &str,
-        state: DurableActionState,
-        error: Option<String>,
-        result: Option<DurableActionResult>,
-    ) {
-        *slot.lock().unwrap() = Some(DurableActionObservation {
-            action_id: action_id.to_string(),
-            signature: signature.to_string(),
-            state,
-            error,
-            result,
-        });
-    }
-
     async fn handle_update_epoch(&mut self, epoch: Epoch) -> Result<()> {
         // Route entirely through replicator — it handles user notification
         self.send_replicator_control(|reply| ReplicatorControlEvent::UpdateEpoch { epoch, reply })
@@ -896,7 +558,7 @@ impl PodRuntime {
                 .replicator_handle
                 .as_ref()
                 .map_or(0, |handle| handle.state().committed_lsn());
-            *self.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+            self.deactivation_info = Some(ReplicaDeactivationInfo {
                 epoch,
                 catch_up_lsn,
             });
@@ -904,13 +566,24 @@ impl PodRuntime {
         Ok(())
     }
 
-    async fn handle_on_data_loss(&mut self) -> Result<DataLossAction> {
+    async fn handle_on_data_loss(
+        &mut self,
+        expected_epoch: Option<Epoch>,
+    ) -> Result<DataLossAction> {
         // Route through replicator — it handles dual-query (replicator + user)
-        self.send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss {
-            expected_epoch: None,
-            reply,
-        })
-        .await
+        let result = self
+            .send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss {
+                expected_epoch,
+                reply,
+            })
+            .await?;
+        if result == DataLossAction::StateChanged && expected_epoch.is_some() {
+            self.deactivation_info = Some(ReplicaDeactivationInfo {
+                epoch: self.epoch,
+                catch_up_lsn: self.require_handle()?.state().committed_lsn(),
+            });
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -921,8 +594,17 @@ impl PodRuntime {
         &self,
         make: impl FnOnce(oneshot::Sender<Result<T>>) -> ReplicatorControlEvent,
     ) -> Result<T> {
+        self.send_replicator_control_with_timeout(make, self.reply_timeout)
+            .await
+    }
+
+    async fn send_replicator_control_with_timeout<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T>>) -> ReplicatorControlEvent,
+        timeout: Duration,
+    ) -> Result<T> {
         let handle = self.require_handle()?;
-        handle.send_control(make, self.reply_timeout).await
+        handle.send_control(make, timeout).await
     }
 
     async fn send_lifecycle<T>(
@@ -959,6 +641,21 @@ impl PodRuntime {
                 }
             }
         }
+    }
+
+    fn publish_status(&self) {
+        self.status_tx.send_replace(RuntimeControlSnapshot {
+            instance_id: self.instance_id.clone(),
+            role: self.role,
+            epoch: self.epoch,
+            configuration: self.configuration.clone(),
+            election_configuration: self.election_configuration.clone(),
+            deactivation_info: self.deactivation_info,
+            partition_state: self
+                .replicator_handle
+                .as_ref()
+                .map(|handle| handle.state().clone()),
+        });
     }
 }
 
@@ -1071,6 +768,19 @@ mod tests {
             .await
             .unwrap();
 
+        let empty_action_id = client
+            .execute_durable_action(crate::proto::ExecuteDurableActionRequest {
+                action_id: String::new(),
+                action: Some(
+                    crate::proto::execute_durable_action_request::Action::RevokeWriteStatus(
+                        crate::proto::RevokeWriteStatusRequest {},
+                    ),
+                ),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(empty_action_id.code(), tonic::Code::InvalidArgument);
+
         let durable_revoke = crate::proto::ExecuteDurableActionRequest {
             action_id: "operation:1:revoke".to_string(),
             action: Some(
@@ -1103,6 +813,58 @@ mod tests {
             crate::proto::DurableActionStateProto::DurableActionCompleted as i32
         );
         assert_eq!(status.durable_action_id, "operation:1:revoke");
+        assert_eq!(
+            status.replica_agent_protocol_version,
+            crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION
+        );
+        assert!(!status.agent_generation.is_empty());
+
+        let correlated_revoke = crate::proto::ExecuteCorrelatedControlActionRequest {
+            protocol_version: crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+            action_id: "operation:2:revoke".to_string(),
+            input_signature: "revoke-write-status".to_string(),
+            target_replica_id: 1,
+            target_instance_id: status.instance_id.clone(),
+            expected_agent_generation: status.agent_generation.clone(),
+            expected_agent_control_version: Some(status.agent_control_version),
+            observed_runtime_epoch: status.epoch,
+            action: Some(
+                crate::proto::execute_correlated_control_action_request::Action::RevokeWriteStatus(
+                    crate::proto::RevokeWriteStatusRequest {},
+                ),
+            ),
+        };
+        let acknowledgement = client
+            .execute_correlated_control_action(correlated_revoke.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .observation
+            .unwrap();
+        assert_eq!(
+            acknowledgement.admission,
+            crate::proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionVersioned as i32
+        );
+        assert_eq!(
+            acknowledgement.state,
+            crate::proto::DurableActionStateProto::DurableActionCompleted as i32
+        );
+        let replay = client
+            .execute_correlated_control_action(correlated_revoke.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .observation
+            .unwrap();
+        assert_eq!(replay, acknowledgement);
+
+        let mut unsupported = correlated_revoke;
+        unsupported.protocol_version += 1;
+        let error = client
+            .execute_correlated_control_action(unsupported)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
 
         let reused = client
             .execute_durable_action(crate::proto::ExecuteDurableActionRequest {
@@ -1159,7 +921,7 @@ mod tests {
                 write_quorum: 1,
             },
         });
-        *runtime.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+        runtime.deactivation_info = Some(ReplicaDeactivationInfo {
             epoch: runtime.epoch,
             catch_up_lsn: 8,
         });
@@ -1170,7 +932,7 @@ mod tests {
         assert_eq!(runtime.epoch, Epoch::default());
         assert!(runtime.configuration.is_none());
         assert!(runtime.election_configuration.is_none());
-        assert!(runtime.deactivation_info.lock().unwrap().is_none());
+        assert!(runtime.deactivation_info.is_none());
         runtime.shutdown.cancel();
     }
 }

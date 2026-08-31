@@ -5,9 +5,10 @@ use tracing::{info, warn};
 
 use crate::error::{KubericError, RecoveryError, Result};
 use crate::types::{
-    DataLossAction, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo,
-    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo,
-    Role, StablePartitionSnapshot, StableReplicaSnapshot,
+    CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest, DataLossAction,
+    DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaId, ReplicaInfo, ReplicaInstanceId,
+    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo, Role,
+    StablePartitionSnapshot, StableReplicaSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,15 @@ pub trait ReplicaHandle: Send + Sync {
                 KubericError::Internal("election configuration observation is unsupported".into()),
             ),
         }
+    }
+
+    async fn execute_correlated_control_action(
+        &self,
+        _request: CorrelatedControlActionRequest,
+    ) -> Result<CorrelatedControlActionAcknowledgement> {
+        Err(KubericError::RemoteControlProtocolUnsupported(
+            "replica handle does not support correlated control actions".to_string(),
+        ))
     }
 }
 
@@ -1701,6 +1711,7 @@ pub mod testing {
                 last_completed_action: None,
                 durable_action: None,
                 active_replica_connections: Vec::new(),
+                agent: None,
             })
         }
     }
@@ -1760,6 +1771,7 @@ mod tests {
                     last_completed_action: None,
                     durable_action: None,
                     active_replica_connections: Vec::new(),
+                    agent: None,
                 },
                 operations,
             }

@@ -8,6 +8,7 @@ creates the state provider channel and replicator at Open time, keeps
 > Part of the [Kuberic Design](../kuberic-replicator-design.md).
 > Separation design: [Runtime–Replicator Separation](implemented/runtime-replicator-separation.md).
 > State provider design: [State Provider Separation](implemented/state-provider-separation.md).
+> Control design: [Pod-Local RA-Lite Boundary](implemented/pod-local-ra-lite-control-boundary.md).
 
 ---
 
@@ -238,6 +239,27 @@ pub struct PodRuntimeBundle {
 
 `data_address` is no longer in the bundle — it comes from the replicator
 created at Open time (`ReplicatorHandle::data_address()`).
+
+---
+
+## Pod-Local Control Boundary
+
+`PodRuntimeBuilder::build()` starts both `ReplicaAgent` and `PodRuntime`
+without changing `PodRuntimeBundle`. The gRPC server sends every control
+request to the agent; only effect commands reach the runtime.
+
+All existing individual `ReplicaHandle` methods and
+`execute_durable_action()` remain available. Manager implementations can use
+the additive `execute_correlated_control_action()` method after observing
+`ReplicaAgentCapability::CorrelatedControlActionV1` in status. Its request
+includes the target Pod UID, agent generation, agent control version, observed
+runtime epoch, deterministic action ID/signature, and the coarse
+`DurableReplicaAction`.
+
+Individual mutations are serialized in arrival order. While a correlated
+action is active, another mutation receives a local-busy error, but status
+remains readable. The agent does not change the lifecycle ordering below:
+`PodRuntime` is still the sole caller of service and replicator callbacks.
 
 ---
 

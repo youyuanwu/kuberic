@@ -8,10 +8,11 @@ use crate::error::{KubericError, Result};
 use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
-    DataLossAction, DurableActionCompletion, DurableActionObservation, DurableActionResult,
-    DurableActionState, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConnectionStatus,
-    ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode,
-    ReplicaStatusInfo, Role,
+    CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest, DataLossAction,
+    DurableActionCompletion, DurableActionObservation, DurableActionResult, DurableActionState,
+    DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaAgentCapability, ReplicaAgentStatus,
+    ReplicaConnectionStatus, ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
+    ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
 };
 
 /// Implements `ReplicaHandle` by calling a remote pod's gRPC `ReplicatorControl` service.
@@ -52,7 +53,36 @@ impl GrpcReplicaHandle {
 
     fn map_err(e: tonic::Status) -> KubericError {
         match e.code() {
-            tonic::Code::FailedPrecondition => KubericError::NotPrimary,
+            tonic::Code::FailedPrecondition => {
+                if e.message().contains("replica-agent")
+                    || e.message().contains("stale agent")
+                    || e.message().contains("stale epoch")
+                    || e.message().contains("correlated action target")
+                {
+                    KubericError::RemoteAgentPreconditionRejected(e.message().to_string())
+                } else {
+                    KubericError::NotPrimary
+                }
+            }
+            tonic::Code::ResourceExhausted => {
+                if e.message().contains("queue is full") {
+                    KubericError::AgentQueueFull
+                } else {
+                    KubericError::AgentBusy
+                }
+            }
+            tonic::Code::AlreadyExists => {
+                KubericError::RemoteAgentConflict(e.message().to_string())
+            }
+            tonic::Code::Aborted => {
+                KubericError::RemoteAgentContinuityUnavailable(e.message().to_string())
+            }
+            tonic::Code::Unimplemented => {
+                KubericError::RemoteControlProtocolUnsupported(e.message().to_string())
+            }
+            tonic::Code::InvalidArgument => {
+                KubericError::RemoteAgentRequestRejected(e.message().to_string())
+            }
             tonic::Code::Unavailable => {
                 if e.message().contains("no write quorum") {
                     KubericError::NoWriteQuorum
@@ -259,6 +289,51 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .map(crate::types::ReplicaDeactivationInfo::try_from)
             .transpose()
             .map_err(|error| KubericError::Internal(error.into()))?;
+        let agent = match inner.replica_agent_protocol_version {
+            0 => {
+                if !inner.agent_generation.is_empty()
+                    || inner.agent_control_version != 0
+                    || inner.current_agent_action.is_some()
+                    || !inner.retained_terminal_actions.is_empty()
+                    || !inner.local_faults.is_empty()
+                {
+                    return Err(KubericError::RemoteAgentRequestRejected(
+                        "agent status fields are present without a protocol version".to_string(),
+                    ));
+                }
+                None
+            }
+            crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION => Some(ReplicaAgentStatus {
+                generation: crate::types::AgentGeneration::parse(inner.agent_generation)
+                    .map_err(KubericError::RemoteAgentRequestRejected)?,
+                control_version: crate::types::AgentControlVersion::new(
+                    inner.agent_control_version,
+                ),
+                capabilities: vec![ReplicaAgentCapability::CorrelatedControlActionV1],
+                current_action: inner
+                    .current_agent_action
+                    .map(crate::types::CorrelatedActionObservation::try_from)
+                    .transpose()
+                    .map_err(KubericError::RemoteAgentRequestRejected)?,
+                retained_terminal_actions: inner
+                    .retained_terminal_actions
+                    .into_iter()
+                    .map(crate::types::CorrelatedActionObservation::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(KubericError::RemoteAgentRequestRejected)?,
+                local_faults: inner
+                    .local_faults
+                    .into_iter()
+                    .map(crate::types::LocalFaultRecord::try_from)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(KubericError::RemoteAgentRequestRejected)?,
+            }),
+            version => {
+                return Err(KubericError::RemoteControlProtocolUnsupported(format!(
+                    "unsupported replica-agent status protocol version {version}"
+                )));
+            }
+        };
 
         // Update cached progress as side effect
         self.current_progress
@@ -326,6 +401,7 @@ impl ReplicaHandle for GrpcReplicaHandle {
                     instance_id: ReplicaInstanceId::new(connection.instance_id),
                 })
                 .collect(),
+            agent,
         })
     }
 
@@ -416,6 +492,28 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .map_err(Self::map_err)?;
         Ok(())
     }
+
+    async fn execute_correlated_control_action(
+        &self,
+        request: CorrelatedControlActionRequest,
+    ) -> Result<CorrelatedControlActionAcknowledgement> {
+        let mut client = self.client.clone();
+        let response = client
+            .execute_correlated_control_action(ExecuteCorrelatedControlActionRequest::from(request))
+            .await
+            .map_err(Self::map_err)?
+            .into_inner();
+        let observation = response
+            .observation
+            .ok_or_else(|| {
+                KubericError::RemoteAgentRequestRejected(
+                    "missing correlated control acknowledgement".to_string(),
+                )
+            })?
+            .try_into()
+            .map_err(KubericError::RemoteAgentRequestRejected)?;
+        Ok(CorrelatedControlActionAcknowledgement { observation })
+    }
 }
 
 #[cfg(test)]
@@ -426,5 +524,31 @@ mod tests {
     fn unknown_durable_action_result_is_rejected() {
         let error = GrpcReplicaHandle::decode_action_result(999).unwrap_err();
         assert!(error.to_string().contains("unknown durable action result"));
+    }
+
+    #[test]
+    fn replica_agent_transport_classes_survive_client_mapping() {
+        assert!(matches!(
+            GrpcReplicaHandle::map_err(tonic::Status::resource_exhausted("replica agent is busy")),
+            KubericError::AgentBusy
+        ));
+        assert!(matches!(
+            GrpcReplicaHandle::map_err(tonic::Status::already_exists(
+                "correlated action ID action was reused"
+            )),
+            KubericError::RemoteAgentConflict(_)
+        ));
+        assert!(matches!(
+            GrpcReplicaHandle::map_err(tonic::Status::aborted(
+                "correlated action continuity is unavailable"
+            )),
+            KubericError::RemoteAgentContinuityUnavailable(_)
+        ));
+        assert!(matches!(
+            GrpcReplicaHandle::map_err(tonic::Status::unimplemented(
+                "unsupported correlated control protocol version"
+            )),
+            KubericError::RemoteControlProtocolUnsupported(_)
+        ));
     }
 }

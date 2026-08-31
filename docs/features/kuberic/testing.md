@@ -23,7 +23,7 @@ Layer 2: Driver unit tests
             Protocol correctness: failover, switchover, epoch fencing
 
 Layer 1: Component unit tests
-         └─ QuorumTracker, NoopReplicator, KubericRuntime, PodRuntime
+         └─ QuorumTracker, NoopReplicator, KubericRuntime, ReplicaAgent, PodRuntime
             Individual component behavior in isolation
 ```
 
@@ -80,7 +80,24 @@ quorum tracking, no gRPC).
 
 **Infrastructure:** `PodRuntime::builder()` with real gRPC servers. Tests
 the dual-channel event delivery (lifecycle + state_provider) and the
-command routing from gRPC → PodRuntime → replicator + user.
+command routing from gRPC → ReplicaAgent → PodRuntime → replicator + user.
+
+### ReplicaAgent (`replica_agent.rs`)
+
+The agent suite uses effect-channel harnesses plus real gRPC coverage. It
+checks:
+
+- exact duplicate in-progress and terminal replay;
+- retained action-ID/signature conflict;
+- strict version, target incarnation, generation, control-version and runtime
+  epoch fences;
+- continuity-unavailable behavior after bounded eviction;
+- direct FIFO/overflow/close ordering and direct/correlated busy behavior;
+- 16-entry terminal/fault retention and 1,024-byte UTF-8 error bounds;
+- late execution-token rejection, shutdown status availability and
+  best-effort fault saturation;
+- same-Pod new-process generation with no inherited action state; and
+- legacy/versioned status projection and transport error classes.
 
 ---
 
@@ -326,6 +343,7 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 | **Driver-level** | `KvPod::restart(id)` / `SqlitePod::restart(id)` | Crash + start fresh pod on same `data_dir`. Returns new pod with new ports. |
 | **Reconciler-level** | `KvClusterApi::crash_pod(name)` | Aborts tasks, marks Pod NotReady, preserves `data_dir` in `data_dirs` map (PVC simulation). |
 | **Reconciler-level** | `KvClusterApi::restart_pod(name)` | Fresh PodRuntime on new ports, reuses saved `data_dir` (PVC re-attach), marks Ready. |
+| **Reconciler-level** | `KvClusterApi::restart_process_same_pod_uid(name)` | Fresh agent/runtime process and ports while retaining the Kubernetes Pod UID. |
 | **ACK-path failure** | `handle.close()` | Graceful shutdown, not a real crash, but deterministically stops persisted replication ACKs and is used for B0 quorum-loss coverage. |
 | **Legacy (low fidelity)** | `mark_pod_not_ready(name)` | Flips readiness flag but LivePod keeps running. |
 
@@ -337,6 +355,11 @@ on every reconcile cycle. This detects:
 - **Epoch mismatch** — pod restarted, reports `epoch = (0,0)` vs driver's current epoch
 - **Role = Unknown** — virgin PodRuntime, never received `ChangeRole`
 - **gRPC unreachable** — pod crashed, handle is dead
+
+Agent generation is observed for command dispatch fencing, not used as a
+Healthy-phase staleness signal. A same-Pod process restart is currently
+detected by runtime epoch/role divergence; the distinct generation prevents a
+pending old-process command from being accepted by the new process.
 
 The health check runs before switchover processing. A stale primary triggers
 FailingOver. A ready secondary with a new incarnation starts the durable
@@ -362,23 +385,29 @@ crash primary, `failover()`, start new pod, `add_replica()`.
 retire/build/reconfigure. If no ready replacement exists, the separate durable
 force-removal path commits reduced membership before cleanup.
 
-**Pattern 4: Primary crash → reconciler failover** ✅
+**Pattern 4: Same-Pod process restart + operator restart** ✅
+`test_same_pod_process_restart_changes_agent_generation_not_incarnation`
+proves that Pod UID remains stable, agent generation changes, local action
+state resets, and a fresh operator persists durable fail-closed recovery intent
+before mutation.
+
+**Pattern 5: Primary crash → reconciler failover** ✅
 `test_reconciler_detects_primary_failure_and_fails_over` and
 `test_reconciler_double_failover` in `reconciler.rs`: both use
 `crash_pod()` for high-fidelity simulation.
 
-**Pattern 5: Simultaneous ACK-path loss (quorum loss)** ✅
+**Pattern 6: Simultaneous ACK-path loss (quorum loss)** ✅
 `test_b0_simultaneous_secondary_loss_returns_no_write_quorum` closes
 both secondary ACK paths and verifies that the write returns
 `NoWriteQuorum` within a bound. A companion test races an in-flight write
 with both closes and verifies success-before-loss or bounded failure, never
 an indefinite wait.
 
-**Pattern 6: Crash during switchover (A3 rollback)**
+**Pattern 7: Crash during switchover (A3 rollback)**
 `test_switchover_rollback_on_target_failure` uses `handle.close()`.
 Could be upgraded to `crash()` for higher fidelity.
 
-**Pattern 7: Operator process restart recovery** ✅
+**Pattern 8: Operator process restart recovery** ✅
 `test_operator_restart_recovers_read_only_then_switches_and_scales` replaces
 only `ReconcilerState` while real pod runtimes and persisted status remain. It
 audits all control operations to prove recovery issues only `GetStatus`, then
@@ -386,7 +415,7 @@ verifies continued writes, switchover, and scale-up. Companion tests cover
 recovered unhealthy-primary failover, legacy/mismatched snapshot rejection,
 post-recovery pod logical/incarnation drift, and unordered pod listing.
 
-**Pattern 8: Durable switchover boundary and ambiguity recovery** ✅
+**Pattern 9: Durable switchover boundary and ambiguity recovery** ✅
 `test_durable_switchover_survives_state_loss_at_every_boundary` discards
 `ReconcilerState` after every checkpoint/activity window. Companion tests
 inject a lost target-promotion reply, force target-promotion compensation,
@@ -395,7 +424,7 @@ before mutation. Assertions cover deterministic single dispatch of unsafe role
 changes, terminal stable snapshot recovery, and unsupported checkpoint
 versions with no mutating RPC.
 
-**Pattern 9: Durable add/rejoin boundary and ambiguity recovery** ✅
+**Pattern 10: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` replaces
 controller state at every boundary and injects lost responses for Open,
 UpdateEpoch, both role changes, BuildReplica, catch-up/current configuration,
@@ -403,7 +432,7 @@ and quorum wait. Companion tests cover exact old-incarnation retirement,
 status conflict before intent, pre-configuration and dual-configuration
 compensation, and roll-forward after current configuration commits.
 
-**Pattern 10: Durable removal boundary and fencing** ✅
+**Pattern 11: Durable removal boundary and fencing** ✅
 `test_durable_remove_survives_state_loss_and_every_lost_runtime_reply`
 replaces controller state at every persisted removal phase and injects lost
 responses for catch-up/current configuration, quorum wait, exact primary
@@ -412,7 +441,7 @@ scale-down, unreachable force-removal, pre-commit configuration restoration,
 post-commit roll-forward, stable-snapshot commit ordering, conflict before
 intent, and same-name/new-UID deletion fencing.
 
-**Pattern 11: Durable Phase-1 failover and data loss** ✅
+**Pattern 12: Durable Phase-1 failover and data loss** ✅
 
 `failover_election` unit matrices cover complete previous/current
 denominators, overlap, unhealthy and unknown observations, stale deactivation,
@@ -424,7 +453,7 @@ quorum wait with rotating probes, fence incarnation drift on both sides of
 promotion commit, and run consecutive failovers. Every persisted failover
 phase also round-trips through serialization.
 
-**Pattern 12: Durable creation bootstrap and routing gate** ✅
+**Pattern 13: Durable creation bootstrap and routing gate** ✅
 `test_durable_create_survives_state_loss_and_every_lost_runtime_reply`
 replaces controller state at every creation boundary, injects a lost response
 for every correlated runtime activity instance, and verifies exact Open/build

@@ -767,6 +767,10 @@ fn pending_action(
             },
         last_error: None,
         dispatch_authorized: false,
+        dispatch_protocol: None,
+        dispatch_agent_generation: None,
+        dispatch_agent_control_version: None,
+        dispatch_observed_runtime_epoch: None,
     })
 }
 
@@ -1326,6 +1330,7 @@ mod tests {
                 last_completed_action: None,
                 durable_action: None,
                 active_replica_connections: Vec::new(),
+                agent: None,
             },
             replicator_address: format!("http://{instance_id}"),
             pod_name: instance_id.to_string(),

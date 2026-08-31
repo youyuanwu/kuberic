@@ -514,6 +514,21 @@ pub struct PendingActionStatus {
     pub last_error: Option<String>,
     #[serde(default)]
     pub dispatch_authorized: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_protocol: Option<DispatchProtocolStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_agent_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_agent_control_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_observed_runtime_epoch: Option<EpochStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DispatchProtocolStatus {
+    Legacy,
+    CorrelatedControlV1,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
@@ -865,6 +880,10 @@ mod tests {
             "failoverOnDataLoss",
             "dataLossCompleted",
             "dispatchAuthorized",
+            "dispatchProtocol",
+            "dispatchAgentGeneration",
+            "dispatchAgentControlVersion",
+            "dispatchObservedRuntimeEpoch",
             "unavailableReplicas",
             "stableElectionMetadataRefresh",
         ] {
@@ -881,6 +900,10 @@ mod tests {
             "failoverOnDataLoss",
             "dataLossCompleted",
             "dispatchAuthorized",
+            "dispatchProtocol",
+            "dispatchAgentGeneration",
+            "dispatchAgentControlVersion",
+            "dispatchObservedRuntimeEpoch",
             "unavailableReplicas",
             "stableElectionMetadataRefresh",
             "minimum: 0",
@@ -890,6 +913,47 @@ mod tests {
                 "missing deployment schema {required}"
             );
         }
+    }
+
+    #[test]
+    fn pending_action_dispatch_fences_are_backward_compatible_and_optional() {
+        let mut pending: PendingActionStatus = serde_json::from_value(serde_json::json!({
+            "actionId": "operation:1",
+            "sequence": 1,
+            "kind": "revokeWrite",
+            "targetId": 1,
+            "targetInstanceId": "pod-uid",
+            "expectedEpoch": {
+                "dataLossNumber": 0,
+                "configurationNumber": 1
+            },
+            "desiredPostcondition": {
+                "kind": "writeRevoked"
+            },
+            "attempts": 1,
+            "deadlineUnixSeconds": 100,
+            "dispatchAuthorized": true
+        }))
+        .unwrap();
+        assert!(pending.dispatch_protocol.is_none());
+        assert!(pending.dispatch_agent_generation.is_none());
+        assert!(pending.dispatch_agent_control_version.is_none());
+        assert!(pending.dispatch_observed_runtime_epoch.is_none());
+
+        pending.dispatch_protocol = Some(DispatchProtocolStatus::CorrelatedControlV1);
+        pending.dispatch_agent_generation = Some("0123456789abcdef0123456789abcdef".to_string());
+        pending.dispatch_agent_control_version = Some(7);
+        pending.dispatch_observed_runtime_epoch = Some(EpochStatus {
+            data_loss_number: 0,
+            configuration_number: 2,
+        });
+        let serialized = serde_json::to_value(pending).unwrap();
+        assert_eq!(serialized["dispatchProtocol"], "correlatedControlV1");
+        assert_eq!(serialized["dispatchAgentControlVersion"], 7);
+        assert_eq!(
+            serialized["dispatchObservedRuntimeEpoch"]["configurationNumber"],
+            2
+        );
     }
 }
 

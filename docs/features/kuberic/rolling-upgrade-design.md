@@ -539,7 +539,7 @@ removes the old entry and adds the new handle with the same ID. This
 means `synchronous_standby_names` (application_name = kuberic_{id})
 stays consistent. **Resolved by using `restart_secondary`.**
 
-### OQ-2: Mixed-Version Clusters (Deferred)
+### OQ-2: Mixed-Version Clusters (Control Boundary Resolved)
 
 During a rolling upgrade, the cluster has pods running different versions.
 Proto3 wire compatibility (unknown fields ignored) handles additive
@@ -547,9 +547,19 @@ changes, but **semantic compatibility** is the real concern — if the
 meaning of `committed_lsn` or quorum calculation changes between
 versions, old and new pods could disagree on what's committed.
 
-Deferred — not a concern until kuberic has multiple released versions.
-When needed: add a `protocol_version` field to replication messages,
-define N/N-1 compatibility guarantees.
+The operator-to-pod control boundary now has explicit mixed-version behavior.
+New pods advertise correlated-control protocol version 1 in `GetStatus`; a new
+operator persists an explicit legacy selection for a pod without that
+capability. Old operators continue to use `ExecuteDurableAction` against new
+pods, and the compatibility shim enters the same `ReplicaAgent` correlation
+owner. Unknown/malformed versioned requests fail explicitly, and rejection
+never triggers automatic legacy fallback. Optional CRD dispatch-fence fields
+can disappear during rollback; a later upgrade re-observes them rather than
+assuming continuity.
+
+Replication/data-plane semantic compatibility remains deferred. Before
+changing `committed_lsn`, quorum, copy, or replication message meaning, define
+N/N-1 guarantees and add a separate data-plane `protocol_version`.
 
 ### OQ-3: Upgrade During Failover
 

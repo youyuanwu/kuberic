@@ -1,9 +1,12 @@
 use crate::proto;
 use crate::types::{
-    AccessStatus, DataLossAction, DurableActionResult, Epoch, OpenMode,
-    ReplicaConfigurationMemberStatus, ReplicaConfigurationMode, ReplicaConfigurationStatus,
-    ReplicaDeactivationInfo, ReplicaElectionConfiguration, ReplicaInfo, ReplicaInstanceId,
-    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
+    AccessStatus, AgentControlVersion, AgentGeneration, CorrelatedActionAdmission,
+    CorrelatedActionObservation, CorrelatedControlActionRequest, DataLossAction,
+    DurableActionObservation, DurableActionResult, DurableActionState, DurableReplicaAction, Epoch,
+    FaultType, LocalFaultRecord, OpenMode, ReplicaConfigurationMemberStatus,
+    ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaDeactivationInfo,
+    ReplicaElectionConfiguration, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
+    ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 
 // --- Epoch ---
@@ -388,6 +391,399 @@ impl From<proto::ReplicaSetConfigProto> for ReplicaSetConfig {
     }
 }
 
+impl TryFrom<proto::ExecuteCorrelatedControlActionRequest> for CorrelatedControlActionRequest {
+    type Error = String;
+
+    fn try_from(
+        request: proto::ExecuteCorrelatedControlActionRequest,
+    ) -> Result<Self, Self::Error> {
+        if request.action_id.is_empty() {
+            return Err("missing correlated action ID".to_string());
+        }
+        if request.input_signature.is_empty() {
+            return Err("missing correlated action input signature".to_string());
+        }
+        if request.target_replica_id <= 0 {
+            return Err("target replica ID must be positive".to_string());
+        }
+        if request.target_instance_id.is_empty() {
+            return Err("missing target replica incarnation".to_string());
+        }
+        let expected_agent_generation = AgentGeneration::parse(request.expected_agent_generation)?;
+        let expected_control_version = AgentControlVersion::new(
+            request
+                .expected_agent_control_version
+                .ok_or_else(|| "missing expected agent control version".to_string())?,
+        );
+        let observed_runtime_epoch = request
+            .observed_runtime_epoch
+            .ok_or_else(|| "missing observed runtime epoch".to_string())?
+            .into();
+        let action = strict_correlated_action(
+            request
+                .action
+                .ok_or_else(|| "missing correlated control action".to_string())?,
+        )?;
+        Ok(Self {
+            protocol_version: request.protocol_version,
+            action_id: request.action_id,
+            input_signature: request.input_signature,
+            target_replica_id: request.target_replica_id,
+            target_instance_id: ReplicaInstanceId::new(request.target_instance_id),
+            expected_agent_generation,
+            expected_control_version,
+            observed_runtime_epoch,
+            action,
+        })
+    }
+}
+
+impl From<CorrelatedControlActionRequest> for proto::ExecuteCorrelatedControlActionRequest {
+    fn from(request: CorrelatedControlActionRequest) -> Self {
+        Self {
+            protocol_version: request.protocol_version,
+            action_id: request.action_id,
+            input_signature: request.input_signature,
+            target_replica_id: request.target_replica_id,
+            target_instance_id: request.target_instance_id.to_string(),
+            expected_agent_generation: request.expected_agent_generation.to_string(),
+            expected_agent_control_version: Some(request.expected_control_version.value()),
+            observed_runtime_epoch: Some(request.observed_runtime_epoch.into()),
+            action: Some(correlated_action_proto(request.action)),
+        }
+    }
+}
+
+impl From<CorrelatedActionObservation> for proto::CorrelatedActionObservationProto {
+    fn from(observation: CorrelatedActionObservation) -> Self {
+        Self {
+            agent_generation: observation.generation.to_string(),
+            agent_control_version: observation.control_version.value(),
+            admission: match observation.admission {
+                CorrelatedActionAdmission::Legacy => {
+                    proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionLegacy as i32
+                }
+                CorrelatedActionAdmission::Versioned => {
+                    proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionVersioned as i32
+                }
+            },
+            action_id: observation.action.action_id,
+            input_signature: observation.action.signature,
+            state: match observation.action.state {
+                DurableActionState::Scheduled => {
+                    proto::DurableActionStateProto::DurableActionScheduled as i32
+                }
+                DurableActionState::InProgress => {
+                    proto::DurableActionStateProto::DurableActionInProgress as i32
+                }
+                DurableActionState::Completed => {
+                    proto::DurableActionStateProto::DurableActionCompleted as i32
+                }
+                DurableActionState::Failed => {
+                    proto::DurableActionStateProto::DurableActionFailed as i32
+                }
+            },
+            error: observation.action.error.unwrap_or_default(),
+            result: observation
+                .action
+                .result
+                .map(proto::DurableActionResultProto::from)
+                .unwrap_or(proto::DurableActionResultProto::DurableActionResultNone)
+                as i32,
+        }
+    }
+}
+
+impl TryFrom<proto::CorrelatedActionObservationProto> for CorrelatedActionObservation {
+    type Error = String;
+
+    fn try_from(observation: proto::CorrelatedActionObservationProto) -> Result<Self, Self::Error> {
+        if observation.action_id.is_empty() {
+            return Err("missing correlated action observation ID".to_string());
+        }
+        if observation.input_signature.is_empty() {
+            return Err("missing correlated action observation signature".to_string());
+        }
+        let admission = match proto::CorrelatedActionAdmissionProto::try_from(observation.admission)
+            .map_err(|_| format!("unknown correlated admission {}", observation.admission))?
+        {
+            proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionLegacy => {
+                CorrelatedActionAdmission::Legacy
+            }
+            proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionVersioned => {
+                CorrelatedActionAdmission::Versioned
+            }
+            proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionUnknown => {
+                return Err("correlated action admission is unknown".to_string());
+            }
+        };
+        let state = match proto::DurableActionStateProto::try_from(observation.state)
+            .map_err(|_| format!("unknown durable action state {}", observation.state))?
+        {
+            proto::DurableActionStateProto::DurableActionScheduled => DurableActionState::Scheduled,
+            proto::DurableActionStateProto::DurableActionInProgress => {
+                DurableActionState::InProgress
+            }
+            proto::DurableActionStateProto::DurableActionCompleted => DurableActionState::Completed,
+            proto::DurableActionStateProto::DurableActionFailed => DurableActionState::Failed,
+            proto::DurableActionStateProto::DurableActionNone => {
+                return Err("correlated action state is none".to_string());
+            }
+        };
+        let result = proto::DurableActionResultProto::try_from(observation.result)
+            .map_err(|_| format!("unknown durable action result {}", observation.result))?;
+        Ok(Self {
+            generation: AgentGeneration::parse(observation.agent_generation)?,
+            control_version: AgentControlVersion::new(observation.agent_control_version),
+            admission,
+            action: DurableActionObservation {
+                action_id: observation.action_id,
+                signature: observation.input_signature,
+                state,
+                error: (!observation.error.is_empty()).then_some(observation.error),
+                result: if result == proto::DurableActionResultProto::DurableActionResultNone {
+                    None
+                } else {
+                    Some(
+                        DurableActionResult::try_from(result)
+                            .map_err(|_| "invalid durable action result".to_string())?,
+                    )
+                },
+            },
+        })
+    }
+}
+
+impl From<LocalFaultRecord> for proto::LocalFaultRecordProto {
+    fn from(record: LocalFaultRecord) -> Self {
+        Self {
+            sequence: record.sequence,
+            fault_type: match record.fault_type {
+                FaultType::Transient => proto::LocalFaultTypeProto::LocalFaultTransient as i32,
+                FaultType::Permanent => proto::LocalFaultTypeProto::LocalFaultPermanent as i32,
+            },
+        }
+    }
+}
+
+impl TryFrom<proto::LocalFaultRecordProto> for LocalFaultRecord {
+    type Error = String;
+
+    fn try_from(record: proto::LocalFaultRecordProto) -> Result<Self, Self::Error> {
+        let fault_type = match proto::LocalFaultTypeProto::try_from(record.fault_type)
+            .map_err(|_| format!("unknown local fault type {}", record.fault_type))?
+        {
+            proto::LocalFaultTypeProto::LocalFaultTransient => FaultType::Transient,
+            proto::LocalFaultTypeProto::LocalFaultPermanent => FaultType::Permanent,
+            proto::LocalFaultTypeProto::LocalFaultUnknown => {
+                return Err("local fault type is unknown".to_string());
+            }
+        };
+        Ok(Self {
+            sequence: record.sequence,
+            fault_type,
+        })
+    }
+}
+
+fn strict_correlated_action(
+    action: proto::execute_correlated_control_action_request::Action,
+) -> Result<DurableReplicaAction, String> {
+    use proto::execute_correlated_control_action_request::Action;
+    match action {
+        Action::RevokeWriteStatus(_) => Ok(DurableReplicaAction::RevokeWriteStatus),
+        Action::ChangeRole(request) => {
+            let role = proto::RoleProto::try_from(request.role)
+                .map_err(|_| format!("unknown role {}", request.role))?;
+            if role == proto::RoleProto::RoleUnknown {
+                return Err("change-role target role is unknown".to_string());
+            }
+            Ok(DurableReplicaAction::ChangeRole {
+                epoch: request
+                    .epoch
+                    .ok_or_else(|| "missing change-role target epoch".to_string())?
+                    .into(),
+                role: role.into(),
+            })
+        }
+        Action::UpdateEpoch(request) => Ok(DurableReplicaAction::UpdateEpoch {
+            epoch: request
+                .epoch
+                .ok_or_else(|| "missing update-epoch target epoch".to_string())?
+                .into(),
+        }),
+        Action::UpdateCatchUpConfiguration(request) => {
+            Ok(DurableReplicaAction::UpdateCatchUpConfiguration {
+                current: try_replica_set_config(
+                    request
+                        .current
+                        .ok_or_else(|| "missing current catch-up configuration".to_string())?,
+                )?,
+                previous: try_replica_set_config(
+                    request
+                        .previous
+                        .ok_or_else(|| "missing previous catch-up configuration".to_string())?,
+                )?,
+            })
+        }
+        Action::WaitForCatchUpQuorum(request) => {
+            let mode = proto::QuorumModeProto::try_from(request.mode)
+                .map_err(|_| format!("unknown quorum mode {}", request.mode))?;
+            Ok(DurableReplicaAction::WaitForCatchUpQuorum { mode: mode.into() })
+        }
+        Action::UpdateCurrentConfiguration(request) => {
+            Ok(DurableReplicaAction::UpdateCurrentConfiguration {
+                current: try_replica_set_config(
+                    request
+                        .current
+                        .ok_or_else(|| "missing current configuration".to_string())?,
+                )?,
+            })
+        }
+        Action::Open(request) => {
+            let mode = proto::OpenModeProto::try_from(request.mode)
+                .map_err(|_| format!("unknown open mode {}", request.mode))?;
+            Ok(DurableReplicaAction::Open { mode: mode.into() })
+        }
+        Action::Close(_) => Ok(DurableReplicaAction::Close),
+        Action::BuildReplica(request) => Ok(DurableReplicaAction::BuildReplica {
+            replica: try_replica_info(
+                request
+                    .replica
+                    .ok_or_else(|| "missing build replica".to_string())?,
+            )?,
+        }),
+        Action::RemoveReplica(request) => {
+            if request.replica_id <= 0 || request.instance_id.is_empty() {
+                return Err("remove-replica target identity is invalid".to_string());
+            }
+            Ok(DurableReplicaAction::RemoveReplica {
+                replica_id: request.replica_id,
+                instance_id: ReplicaInstanceId::new(request.instance_id),
+            })
+        }
+        Action::OnDataLoss(request) => Ok(DurableReplicaAction::OnDataLoss {
+            epoch: request
+                .expected_epoch
+                .ok_or_else(|| "missing data-loss epoch".to_string())?
+                .into(),
+        }),
+        Action::RecordElectionConfiguration(request) => {
+            Ok(DurableReplicaAction::RecordElectionConfiguration {
+                configuration: ReplicaElectionConfiguration::try_from(
+                    request
+                        .configuration
+                        .ok_or_else(|| "missing election configuration".to_string())?,
+                )?,
+            })
+        }
+    }
+}
+
+fn correlated_action_proto(
+    action: DurableReplicaAction,
+) -> proto::execute_correlated_control_action_request::Action {
+    use proto::execute_correlated_control_action_request::Action;
+    match action {
+        DurableReplicaAction::Open { mode } => Action::Open(proto::OpenRequest {
+            mode: proto::OpenModeProto::from(mode) as i32,
+        }),
+        DurableReplicaAction::Close => Action::Close(proto::CloseRequest {}),
+        DurableReplicaAction::RevokeWriteStatus => {
+            Action::RevokeWriteStatus(proto::RevokeWriteStatusRequest {})
+        }
+        DurableReplicaAction::ChangeRole { epoch, role } => {
+            Action::ChangeRole(proto::ChangeRoleRequest {
+                epoch: Some(epoch.into()),
+                role: proto::RoleProto::from(role) as i32,
+            })
+        }
+        DurableReplicaAction::UpdateEpoch { epoch } => {
+            Action::UpdateEpoch(proto::UpdateEpochRequest {
+                epoch: Some(epoch.into()),
+            })
+        }
+        DurableReplicaAction::UpdateCatchUpConfiguration { current, previous } => {
+            Action::UpdateCatchUpConfiguration(proto::UpdateCatchUpConfigRequest {
+                current: Some(current.into()),
+                previous: Some(previous.into()),
+            })
+        }
+        DurableReplicaAction::WaitForCatchUpQuorum { mode } => {
+            Action::WaitForCatchUpQuorum(proto::WaitForCatchUpQuorumRequest {
+                mode: proto::QuorumModeProto::from(mode) as i32,
+            })
+        }
+        DurableReplicaAction::UpdateCurrentConfiguration { current } => {
+            Action::UpdateCurrentConfiguration(proto::UpdateCurrentConfigRequest {
+                current: Some(current.into()),
+            })
+        }
+        DurableReplicaAction::BuildReplica { replica } => {
+            Action::BuildReplica(proto::BuildReplicaRequest {
+                replica: Some(replica.into()),
+            })
+        }
+        DurableReplicaAction::RemoveReplica {
+            replica_id,
+            instance_id,
+        } => Action::RemoveReplica(proto::RemoveReplicaRequest {
+            replica_id,
+            instance_id: instance_id.to_string(),
+        }),
+        DurableReplicaAction::OnDataLoss { epoch } => {
+            Action::OnDataLoss(proto::DurableOnDataLossRequest {
+                expected_epoch: Some(epoch.into()),
+            })
+        }
+        DurableReplicaAction::RecordElectionConfiguration { configuration } => {
+            Action::RecordElectionConfiguration(proto::RecordElectionConfigurationRequest {
+                configuration: Some(configuration.into()),
+            })
+        }
+    }
+}
+
+fn try_replica_set_config(
+    configuration: proto::ReplicaSetConfigProto,
+) -> Result<ReplicaSetConfig, String> {
+    Ok(ReplicaSetConfig {
+        members: configuration
+            .members
+            .into_iter()
+            .map(try_replica_info)
+            .collect::<Result<Vec<_>, _>>()?,
+        write_quorum: configuration.write_quorum,
+    })
+}
+
+fn try_replica_info(replica: proto::ReplicaInfoProto) -> Result<ReplicaInfo, String> {
+    if replica.id <= 0 || replica.instance_id.is_empty() {
+        return Err("replica identity is invalid".to_string());
+    }
+    let role = proto::RoleProto::try_from(replica.role)
+        .map_err(|_| format!("unknown replica role {}", replica.role))?;
+    if role == proto::RoleProto::RoleUnknown {
+        return Err(format!("replica {} has unknown role", replica.id));
+    }
+    let status = match proto::ReplicaStatusProto::try_from(replica.status)
+        .map_err(|_| format!("unknown replica status {}", replica.status))?
+    {
+        proto::ReplicaStatusProto::StatusUp => ReplicaStatus::Up,
+        proto::ReplicaStatusProto::StatusDown => ReplicaStatus::Down,
+    };
+    Ok(ReplicaInfo {
+        id: replica.id,
+        instance_id: ReplicaInstanceId::new(replica.instance_id),
+        role: role.into(),
+        status,
+        replicator_address: replica.replicator_address,
+        current_progress: replica.current_progress,
+        catch_up_capability: replica.catch_up_capability,
+        must_catch_up: replica.must_catch_up,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +875,104 @@ mod tests {
             previous: None,
         };
         assert!(ReplicaElectionConfiguration::try_from(malformed).is_err());
+    }
+
+    fn valid_correlated_request() -> CorrelatedControlActionRequest {
+        let action = DurableReplicaAction::RevokeWriteStatus;
+        CorrelatedControlActionRequest {
+            protocol_version: 1,
+            action_id: "operation:1".to_string(),
+            input_signature: action.signature(),
+            target_replica_id: 1,
+            target_instance_id: ReplicaInstanceId::new("pod-uid"),
+            expected_agent_generation: AgentGeneration::parse("0123456789abcdef0123456789abcdef")
+                .unwrap(),
+            expected_control_version: AgentControlVersion::new(7),
+            observed_runtime_epoch: Epoch::new(2, 3),
+            action,
+        }
+    }
+
+    #[test]
+    fn correlated_request_and_observation_round_trip_strictly() {
+        let request = valid_correlated_request();
+        let round_trip = CorrelatedControlActionRequest::try_from(
+            proto::ExecuteCorrelatedControlActionRequest::from(request.clone()),
+        )
+        .unwrap();
+        assert_eq!(round_trip.protocol_version, request.protocol_version);
+        assert_eq!(round_trip.action_id, request.action_id);
+        assert_eq!(round_trip.input_signature, request.input_signature);
+        assert_eq!(round_trip.target_replica_id, request.target_replica_id);
+        assert_eq!(round_trip.target_instance_id, request.target_instance_id);
+        assert_eq!(
+            round_trip.expected_agent_generation,
+            request.expected_agent_generation
+        );
+        assert_eq!(
+            round_trip.expected_control_version,
+            request.expected_control_version
+        );
+        assert_eq!(
+            round_trip.observed_runtime_epoch,
+            request.observed_runtime_epoch
+        );
+        assert_eq!(round_trip.action.signature(), request.action.signature());
+
+        let observation = CorrelatedActionObservation {
+            generation: request.expected_agent_generation,
+            control_version: AgentControlVersion::new(8),
+            admission: CorrelatedActionAdmission::Versioned,
+            action: DurableActionObservation {
+                action_id: request.action_id,
+                signature: request.input_signature,
+                state: DurableActionState::Completed,
+                error: None,
+                result: Some(DurableActionResult::DataLoss(DataLossAction::StateChanged)),
+            },
+        };
+        let round_trip = CorrelatedActionObservation::try_from(
+            proto::CorrelatedActionObservationProto::from(observation.clone()),
+        )
+        .unwrap();
+        assert_eq!(round_trip, observation);
+    }
+
+    #[test]
+    fn malformed_correlated_safety_fields_are_rejected() {
+        let encoded =
+            proto::ExecuteCorrelatedControlActionRequest::from(valid_correlated_request());
+
+        let mut missing_version = encoded.clone();
+        missing_version.expected_agent_control_version = None;
+        assert!(
+            CorrelatedControlActionRequest::try_from(missing_version)
+                .unwrap_err()
+                .contains("control version")
+        );
+
+        let mut missing_epoch = encoded.clone();
+        missing_epoch.observed_runtime_epoch = None;
+        assert!(
+            CorrelatedControlActionRequest::try_from(missing_epoch)
+                .unwrap_err()
+                .contains("runtime epoch")
+        );
+
+        let mut malformed_generation = encoded.clone();
+        malformed_generation.expected_agent_generation = "not-a-generation".to_string();
+        assert!(
+            CorrelatedControlActionRequest::try_from(malformed_generation)
+                .unwrap_err()
+                .contains("lowercase hexadecimal")
+        );
+
+        let mut missing_action = encoded;
+        missing_action.action = None;
+        assert!(
+            CorrelatedControlActionRequest::try_from(missing_action)
+                .unwrap_err()
+                .contains("missing correlated control action")
+        );
     }
 }

@@ -5,6 +5,7 @@ pub mod grpc;
 pub mod handles;
 pub mod noop;
 pub mod pod;
+pub mod replica_agent;
 pub mod replicator;
 pub mod runtime;
 pub mod types;

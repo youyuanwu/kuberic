@@ -516,6 +516,16 @@ Operator restart — first reconcile per KubericSet:
   └─ Resume normal reconciliation
 ```
 
+`GetStatus` also reports a pod-local `AgentGeneration`. It is distinct from
+the Pod UID and changes when the container/process restarts in place. A new
+generation publishes no inherited correlated action state. Pending versioned
+dispatches are fenced to the observed generation and agent control version;
+an old-generation request is rejected without effects. If stable secondary
+role/epoch continuity cannot be reconstructed under the same Pod UID, the
+operator persists the established durable force-remove/rebuild operation
+before mutation. Missing old-generation state is never treated as proof that
+an ambiguous activity did not run.
+
 `currentPrimary` is refreshed from recovered driver state and is not trusted
 as input. Legacy status without `stableSnapshot` is rejected. Stable topology
 changes persist a fresh snapshot; multi-member add/remove loops patch after
