@@ -79,9 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.demo {
         info!("Demo mode: simulating operator + client");
-        kvstore::demo::simulate_operator(control_address.clone()).await;
+        kvstore::demo::simulate_operator(control_address.clone(), args.replica_id).await;
         kvstore::demo::run_demo_client(args.client_bind).await;
-        kvstore::demo::demo_close(control_address).await;
+        kvstore::demo::demo_close(control_address, args.replica_id).await;
     } else {
         info!("Waiting for operator commands on {}", control_address);
         info!("Press Ctrl+C to shut down");

@@ -1,7 +1,11 @@
+use std::collections::HashSet;
+
+use prost::Message;
+
 use crate::proto;
 use crate::types::{
-    AccessStatus, AgentControlVersion, AgentGeneration, CorrelatedActionAdmission,
-    CorrelatedActionObservation, CorrelatedControlActionRequest, DataLossAction,
+    AccessStatus, AgentControlVersion, AgentGeneration, CorrelatedActionObservation,
+    CorrelatedControlActionRequest, DataLossAction, DurableActionErrorClass,
     DurableActionObservation, DurableActionResult, DurableActionState, DurableReplicaAction, Epoch,
     FaultType, LocalFaultRecord, OpenMode, ReplicaConfigurationMemberStatus,
     ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaDeactivationInfo,
@@ -127,16 +131,16 @@ impl From<AccessStatus> for proto::AccessStatusProto {
     }
 }
 
-impl From<i32> for AccessStatus {
-    fn from(value: i32) -> Self {
-        match proto::AccessStatusProto::try_from(value)
-            .unwrap_or(proto::AccessStatusProto::AccessNotPrimary)
-        {
-            proto::AccessStatusProto::AccessGranted => Self::Granted,
-            proto::AccessStatusProto::AccessReconfigurationPending => Self::ReconfigurationPending,
-            proto::AccessStatusProto::AccessNotPrimary => Self::NotPrimary,
-            proto::AccessStatusProto::AccessNoWriteQuorum => Self::NoWriteQuorum,
+pub(crate) fn try_access_status(value: i32) -> Result<AccessStatus, String> {
+    match proto::AccessStatusProto::try_from(value)
+        .map_err(|_| format!("unknown runtime write status {value}"))?
+    {
+        proto::AccessStatusProto::AccessGranted => Ok(AccessStatus::Granted),
+        proto::AccessStatusProto::AccessReconfigurationPending => {
+            Ok(AccessStatus::ReconfigurationPending)
         }
+        proto::AccessStatusProto::AccessNotPrimary => Ok(AccessStatus::NotPrimary),
+        proto::AccessStatusProto::AccessNoWriteQuorum => Ok(AccessStatus::NoWriteQuorum),
     }
 }
 
@@ -165,32 +169,67 @@ impl From<ReplicaConfigurationStatus> for proto::ReplicaConfigurationStatusProto
     }
 }
 
-impl From<proto::ReplicaConfigurationStatusProto> for ReplicaConfigurationStatus {
-    fn from(status: proto::ReplicaConfigurationStatusProto) -> Self {
-        Self {
-            mode: match proto::ReplicaConfigurationModeProto::try_from(status.mode)
-                .unwrap_or(proto::ReplicaConfigurationModeProto::ConfigurationNone)
-            {
-                proto::ReplicaConfigurationModeProto::ConfigurationCatchUp => {
-                    ReplicaConfigurationMode::CatchUp
-                }
-                proto::ReplicaConfigurationModeProto::ConfigurationCurrent
-                | proto::ReplicaConfigurationModeProto::ConfigurationNone => {
-                    ReplicaConfigurationMode::Current
-                }
-            },
-            members: status
-                .members
-                .into_iter()
-                .map(|member| ReplicaConfigurationMemberStatus {
-                    id: member.id,
-                    instance_id: ReplicaInstanceId::new(member.instance_id),
-                    role: Role::from(member.role),
-                })
-                .collect(),
-            write_quorum: status.write_quorum,
+pub(crate) fn try_runtime_configuration_status(
+    status: proto::ReplicaConfigurationStatusProto,
+) -> Result<ReplicaConfigurationStatus, String> {
+    let mode = match proto::ReplicaConfigurationModeProto::try_from(status.mode)
+        .map_err(|_| format!("unknown runtime configuration mode {}", status.mode))?
+    {
+        proto::ReplicaConfigurationModeProto::ConfigurationCatchUp => {
+            ReplicaConfigurationMode::CatchUp
         }
+        proto::ReplicaConfigurationModeProto::ConfigurationCurrent => {
+            ReplicaConfigurationMode::Current
+        }
+        proto::ReplicaConfigurationModeProto::ConfigurationNone => {
+            return Err("runtime configuration mode is none".to_string());
+        }
+    };
+    let mut ids = HashSet::new();
+    let mut instances = HashSet::new();
+    let members = status
+        .members
+        .into_iter()
+        .map(|member| {
+            if member.id <= 0 || !ids.insert(member.id) {
+                return Err(format!(
+                    "runtime configuration has invalid or duplicate replica ID {}",
+                    member.id
+                ));
+            }
+            if member.instance_id.is_empty() || !instances.insert(member.instance_id.clone()) {
+                return Err(format!(
+                    "runtime configuration replica {} has missing or duplicate incarnation",
+                    member.id
+                ));
+            }
+            let role = proto::RoleProto::try_from(member.role)
+                .map_err(|_| format!("unknown role {}", member.role))?;
+            if role == proto::RoleProto::RoleUnknown {
+                return Err(format!(
+                    "runtime configuration replica {} has unknown role",
+                    member.id
+                ));
+            }
+            Ok(ReplicaConfigurationMemberStatus {
+                id: member.id,
+                instance_id: ReplicaInstanceId::new(member.instance_id),
+                role: role.into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if status.write_quorum == 0 || status.write_quorum as usize > members.len() + 1 {
+        return Err(format!(
+            "invalid runtime configuration write quorum {} for {} remote members",
+            status.write_quorum,
+            members.len()
+        ));
     }
+    Ok(ReplicaConfigurationStatus {
+        mode,
+        members,
+        write_quorum: status.write_quorum,
+    })
 }
 
 impl From<ReplicaElectionConfiguration> for proto::ReplicaElectionConfigurationProto {
@@ -266,10 +305,52 @@ impl TryFrom<proto::DurableActionResultProto> for DurableActionResult {
             proto::DurableActionResultProto::DurableActionResultDataLossNoStateChange => {
                 Ok(Self::DataLoss(DataLossAction::None))
             }
+
             proto::DurableActionResultProto::DurableActionResultDataLossStateChanged => {
                 Ok(Self::DataLoss(DataLossAction::StateChanged))
             }
             proto::DurableActionResultProto::DurableActionResultNone => Err(()),
+        }
+    }
+}
+
+impl From<DurableActionErrorClass> for proto::DurableActionErrorClassProto {
+    fn from(class: DurableActionErrorClass) -> Self {
+        match class {
+            DurableActionErrorClass::Internal => Self::DurableActionErrorInternal,
+            DurableActionErrorClass::NotPrimary => Self::DurableActionErrorNotPrimary,
+            DurableActionErrorClass::NoWriteQuorum => Self::DurableActionErrorNoWriteQuorum,
+            DurableActionErrorClass::ReconfigurationPending => {
+                Self::DurableActionErrorReconfigurationPending
+            }
+            DurableActionErrorClass::StaleEpoch => Self::DurableActionErrorStaleEpoch,
+            DurableActionErrorClass::Cancelled => Self::DurableActionErrorCancelled,
+            DurableActionErrorClass::Closed => Self::DurableActionErrorClosed,
+        }
+    }
+}
+
+impl TryFrom<proto::DurableActionErrorClassProto> for DurableActionErrorClass {
+    type Error = ();
+
+    fn try_from(class: proto::DurableActionErrorClassProto) -> Result<Self, Self::Error> {
+        match class {
+            proto::DurableActionErrorClassProto::DurableActionErrorInternal => Ok(Self::Internal),
+            proto::DurableActionErrorClassProto::DurableActionErrorNotPrimary => {
+                Ok(Self::NotPrimary)
+            }
+            proto::DurableActionErrorClassProto::DurableActionErrorNoWriteQuorum => {
+                Ok(Self::NoWriteQuorum)
+            }
+            proto::DurableActionErrorClassProto::DurableActionErrorReconfigurationPending => {
+                Ok(Self::ReconfigurationPending)
+            }
+            proto::DurableActionErrorClassProto::DurableActionErrorStaleEpoch => {
+                Ok(Self::StaleEpoch)
+            }
+            proto::DurableActionErrorClassProto::DurableActionErrorCancelled => Ok(Self::Cancelled),
+            proto::DurableActionErrorClassProto::DurableActionErrorClosed => Ok(Self::Closed),
+            proto::DurableActionErrorClassProto::DurableActionErrorNone => Err(()),
         }
     }
 }
@@ -391,6 +472,59 @@ impl From<proto::ReplicaSetConfigProto> for ReplicaSetConfig {
     }
 }
 
+/// Serialize the exact correlated action payload for durable operator
+/// write-ahead intent. Envelope fences are persisted separately.
+pub fn encode_correlated_action_payload(action: &DurableReplicaAction) -> String {
+    proto::ExecuteCorrelatedControlActionRequest {
+        protocol_version: 0,
+        action_id: String::new(),
+        input_signature: String::new(),
+        target_replica_id: 0,
+        target_instance_id: String::new(),
+        expected_agent_generation: String::new(),
+        expected_agent_control_version: None,
+        observed_runtime_epoch: None,
+        action: Some(correlated_action_proto(action.clone())),
+    }
+    .encode_to_vec()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// Decode a previously persisted exact correlated action payload.
+pub fn decode_correlated_action_payload(encoded: &str) -> Result<DurableReplicaAction, String> {
+    let encoded = encoded.as_bytes();
+    if encoded.is_empty()
+        || encoded.len() % 2 != 0
+        || !encoded
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err("persisted correlated action payload is not valid hexadecimal".to_string());
+    }
+    let bytes = encoded
+        .chunks_exact(2)
+        .map(|pair| {
+            let nibble = |byte: u8| {
+                if byte.is_ascii_digit() {
+                    byte - b'0'
+                } else {
+                    byte - b'a' + 10
+                }
+            };
+            (nibble(pair[0]) << 4) | nibble(pair[1])
+        })
+        .collect::<Vec<_>>();
+    let request = proto::ExecuteCorrelatedControlActionRequest::decode(bytes.as_slice())
+        .map_err(|error| format!("invalid persisted correlated action payload: {error}"))?;
+    strict_correlated_action(
+        request
+            .action
+            .ok_or_else(|| "persisted correlated action payload is missing action".to_string())?,
+    )
+}
+
 impl TryFrom<proto::ExecuteCorrelatedControlActionRequest> for CorrelatedControlActionRequest {
     type Error = String;
 
@@ -459,14 +593,6 @@ impl From<CorrelatedActionObservation> for proto::CorrelatedActionObservationPro
         Self {
             agent_generation: observation.generation.to_string(),
             agent_control_version: observation.control_version.value(),
-            admission: match observation.admission {
-                CorrelatedActionAdmission::Legacy => {
-                    proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionLegacy as i32
-                }
-                CorrelatedActionAdmission::Versioned => {
-                    proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionVersioned as i32
-                }
-            },
             action_id: observation.action.action_id,
             input_signature: observation.action.signature,
             state: match observation.action.state {
@@ -490,6 +616,12 @@ impl From<CorrelatedActionObservation> for proto::CorrelatedActionObservationPro
                 .map(proto::DurableActionResultProto::from)
                 .unwrap_or(proto::DurableActionResultProto::DurableActionResultNone)
                 as i32,
+            error_class: observation
+                .action
+                .error_class
+                .map(proto::DurableActionErrorClassProto::from)
+                .unwrap_or(proto::DurableActionErrorClassProto::DurableActionErrorNone)
+                as i32,
         }
     }
 }
@@ -504,19 +636,6 @@ impl TryFrom<proto::CorrelatedActionObservationProto> for CorrelatedActionObserv
         if observation.input_signature.is_empty() {
             return Err("missing correlated action observation signature".to_string());
         }
-        let admission = match proto::CorrelatedActionAdmissionProto::try_from(observation.admission)
-            .map_err(|_| format!("unknown correlated admission {}", observation.admission))?
-        {
-            proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionLegacy => {
-                CorrelatedActionAdmission::Legacy
-            }
-            proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionVersioned => {
-                CorrelatedActionAdmission::Versioned
-            }
-            proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionUnknown => {
-                return Err("correlated action admission is unknown".to_string());
-            }
-        };
         let state = match proto::DurableActionStateProto::try_from(observation.state)
             .map_err(|_| format!("unknown durable action state {}", observation.state))?
         {
@@ -532,23 +651,57 @@ impl TryFrom<proto::CorrelatedActionObservationProto> for CorrelatedActionObserv
         };
         let result = proto::DurableActionResultProto::try_from(observation.result)
             .map_err(|_| format!("unknown durable action result {}", observation.result))?;
+        let error_class = proto::DurableActionErrorClassProto::try_from(observation.error_class)
+            .map_err(|_| {
+                format!(
+                    "unknown durable action error class {}",
+                    observation.error_class
+                )
+            })?;
+        let error_class =
+            if error_class == proto::DurableActionErrorClassProto::DurableActionErrorNone {
+                None
+            } else {
+                Some(
+                    DurableActionErrorClass::try_from(error_class)
+                        .map_err(|_| "invalid durable action error class".to_string())?,
+                )
+            };
+        let error = (!observation.error.is_empty()).then_some(observation.error);
+        let result = if result == proto::DurableActionResultProto::DurableActionResultNone {
+            None
+        } else {
+            Some(
+                DurableActionResult::try_from(result)
+                    .map_err(|_| "invalid durable action result".to_string())?,
+            )
+        };
+        match state {
+            DurableActionState::Scheduled | DurableActionState::InProgress
+                if error_class.is_some() || error.is_some() || result.is_some() =>
+            {
+                return Err("non-terminal correlated action carries terminal data".to_string());
+            }
+            DurableActionState::Completed if error_class.is_some() || error.is_some() => {
+                return Err("completed correlated action carries an error".to_string());
+            }
+            DurableActionState::Failed
+                if error_class.is_none() || error.is_none() || result.is_some() =>
+            {
+                return Err("failed correlated action has malformed terminal data".to_string());
+            }
+            _ => {}
+        }
         Ok(Self {
             generation: AgentGeneration::parse(observation.agent_generation)?,
             control_version: AgentControlVersion::new(observation.agent_control_version),
-            admission,
             action: DurableActionObservation {
                 action_id: observation.action_id,
                 signature: observation.input_signature,
                 state,
-                error: (!observation.error.is_empty()).then_some(observation.error),
-                result: if result == proto::DurableActionResultProto::DurableActionResultNone {
-                    None
-                } else {
-                    Some(
-                        DurableActionResult::try_from(result)
-                            .map_err(|_| "invalid durable action result".to_string())?,
-                    )
-                },
+                error_class,
+                error,
+                result,
             },
         })
     }
@@ -922,11 +1075,11 @@ mod tests {
         let observation = CorrelatedActionObservation {
             generation: request.expected_agent_generation,
             control_version: AgentControlVersion::new(8),
-            admission: CorrelatedActionAdmission::Versioned,
             action: DurableActionObservation {
                 action_id: request.action_id,
                 signature: request.input_signature,
                 state: DurableActionState::Completed,
+                error_class: None,
                 error: None,
                 result: Some(DurableActionResult::DataLoss(DataLossAction::StateChanged)),
             },
@@ -936,6 +1089,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(round_trip, observation);
+
+        let failed = CorrelatedActionObservation {
+            generation: AgentGeneration::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            control_version: AgentControlVersion::new(9),
+            action: DurableActionObservation {
+                action_id: "operation:failed".to_string(),
+                signature: "wait-for-catch-up:Write".to_string(),
+                state: DurableActionState::Failed,
+                error_class: Some(DurableActionErrorClass::NoWriteQuorum),
+                error: Some("no write quorum".to_string()),
+                result: None,
+            },
+        };
+        let failed_round_trip = CorrelatedActionObservation::try_from(
+            proto::CorrelatedActionObservationProto::from(failed.clone()),
+        )
+        .unwrap();
+        assert_eq!(failed_round_trip, failed);
+    }
+
+    #[test]
+    fn persisted_correlated_action_payload_round_trips_exact_progress() {
+        assert!(decode_correlated_action_payload("éé").is_err());
+        assert!(decode_correlated_action_payload("0g").is_err());
+
+        let action = DurableReplicaAction::UpdateCurrentConfiguration {
+            current: ReplicaSetConfig {
+                members: vec![ReplicaInfo {
+                    id: 2,
+                    instance_id: ReplicaInstanceId::new("secondary"),
+                    role: Role::ActiveSecondary,
+                    status: ReplicaStatus::Up,
+                    replicator_address: "http://secondary".to_string(),
+                    current_progress: 42,
+                    catch_up_capability: 17,
+                    must_catch_up: true,
+                }],
+                write_quorum: 2,
+            },
+        };
+        let signature = action.signature();
+        let decoded =
+            decode_correlated_action_payload(&encode_correlated_action_payload(&action)).unwrap();
+
+        assert_eq!(decoded.signature(), signature);
+        let DurableReplicaAction::UpdateCurrentConfiguration { current } = decoded else {
+            panic!("wrong decoded action");
+        };
+        assert_eq!(current.members[0].current_progress, 42);
+        assert_eq!(current.members[0].catch_up_capability, 17);
     }
 
     #[test]

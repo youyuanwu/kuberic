@@ -90,6 +90,6 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 | **Failover delay** | Optional `spec.failoverDelay` (default 0 = immediate) | K8s adaptation — SF failovers immediately, K8s pod probes can flap |
 | **Data loss protocol** | Wait on unresolved safety evidence; after conclusive loss, advance epoch then invoke correlated `OnDataLoss` | Prevents premature promotion and makes callback ambiguity recoverable |
 | **gRPC failure tracking** | Per-replica failure counter in CRD status | K8s adaptation — replaces SF federation heartbeats |
-| **Operator restart recovery** | Reconstruct driver from CRD status + pod list | SF FM pattern — stateless operator, durable state in API |
+| **Operator restart recovery** | Reconstruct read-only stable topology from CRD status + pod list | SF FM pattern — stateless operator, durable state in API |
 | **mTLS deferred** | Post-MVP; MVP assumes trusted cluster | Reduces initial complexity |
-| **ReplicaHandle trait** | Driver works with any transport | Tests: in-process channels. Operator: gRPC client. |
+| **ReplicaHandle trait** | Status plus one correlated mutation method | Operator and high-fidelity tests use the gRPC client. |

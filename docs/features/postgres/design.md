@@ -96,12 +96,13 @@ provides the control plane:
 ```
 ┌─────────────────────────────────────────────────────┐
 │                   kuberic operator                   │
-│  (PartitionDriver: failover, switchover, reconfig)  │
+│  (durable failover, switchover, reconfiguration)    │
 └──────────────┬───────────────────────┬──────────────┘
                │ gRPC control plane    │
         ┌──────▼──────┐         ┌──────▼──────┐
         │  Pod (P)    │         │  Pod (S)    │
         │             │         │             │
+        │ReplicaAgent │         │ReplicaAgent │
         │ PodRuntime  │         │ PodRuntime  │
         │ PgService   │         │ PgService   │
         │ PgMonitor   │         │ PgMonitor   │
@@ -148,9 +149,9 @@ Instead, write fencing uses **PostgreSQL's native mechanisms**:
 | ChangeRole(Primary) — promotion | `pg_ctl promote` + `ALTER SYSTEM SET default_transaction_read_only = off` + reload | Writable |
 
 **Implementation hook**: The adapter's `ChangeRole(ActiveSecondary)`
-handler is the demote signal. During switchover, the driver calls
-`revoke_write_status()` (atomic only) then immediately sends
-`ChangeRole(new_epoch, ActiveSecondary)` to the old primary's adapter.
+handler is the demote signal. During switchover, the operator submits a
+correlated `RevokeWriteStatus` action and then a correlated
+`ChangeRole(new_epoch, ActiveSecondary)` action to the old primary.
 The adapter executes the PG-level fencing there:
 
 ```rust
@@ -821,8 +822,8 @@ PG doesn't need this because:
 
 **What happens to each replica type during failover**:
 
-- **Zombie primaries** are removed from the operator's replica set by
-  `failover()` — they never receive `UpdateEpoch`.
+- **Zombie primaries** are excluded by the durable failover workflow — they
+  never receive `UpdateEpoch`.
 - **Surviving secondaries** get `ReconfigureStandby` (via
   `UpdateCatchUpConfiguration`) to reconnect to the new primary. PG
   handles timeline following automatically when reconnected.
@@ -928,7 +929,7 @@ without pg_rewind.
 
 | Aspect | CNPG | Kuberic PostgreSQL |
 |--------|------|--------------------|
-| **Operator** | Go, full K8s operator with CRD | Rust, kuberic-operator (PartitionDriver) |
+| **Operator** | Go, full K8s operator with CRD | Rust, CRD-backed durable workflows |
 | **Instance manager** | Go binary (PID 1 in pod) | Rust PgInstanceManager (child process) |
 | **Failover trigger** | HTTP health check failure | gRPC control plane failure |
 | **Candidate selection** | LSN-based (received, then replayed) | LSN-based (PartitionState.current_progress) |
@@ -945,9 +946,9 @@ Key differences:
 1. **Fencing**: CNPG uses annotation-based fencing + liveness probe
    self-fencing. Kuberic uses epoch-based fencing (SF protocol) — simpler,
    distributed after promotion, prevents zombie reads atomically.
-2. **Operator model**: CNPG manages pods directly. Kuberic uses
-   PartitionDriver with ReplicaSetConfig — a higher-level abstraction
-   that also supports non-PG workloads.
+2. **Operator model**: CNPG manages pods directly. Kuberic persists durable
+   topology workflows in CRD status and executes fenced actions through each
+   pod's ReplicaAgent.
 3. **Instance manager**: CNPG's is a full Go binary running as PID 1.
    Kuberic's is a Rust library called by PgService — lighter weight
    but requires the kuberic runtime as the process entry point.
@@ -986,7 +987,8 @@ needed in kuberic-core:
 - `PartitionState` atomics — PgMonitor writes the same fields
 - `LifecycleEvent` enum — Open/ChangeRole/Close/Abort are generic
 - `StateProviderEvent` — not used for PG (adapter handles PG ops directly)
-- Operator `PartitionDriver` — works with any ReplicatorHandle
+- Operator workflows use the transport-agnostic `ReplicaHandle` status and
+  correlated-action surface; `PartitionDriver` is read-only recovery.
 
 ### Future: Trait-based Replicator
 

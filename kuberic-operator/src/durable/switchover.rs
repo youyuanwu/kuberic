@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use kuberic_core::types::{
-    AccessStatus, DurableReplicaAction, Epoch, ReplicaConfigurationMode,
+    AccessStatus, DurableActionState, DurableReplicaAction, Epoch, ReplicaConfigurationMode,
     ReplicaConfigurationStatus, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
     ReplicaSetQuorumMode, ReplicaStatus, ReplicaStatusInfo, Role,
 };
@@ -12,14 +12,19 @@ use crate::crd::{
     PendingActionStatus, StablePartitionSnapshotStatus, StableReplicaRoleStatus,
 };
 
-use super::{ACTION_DEADLINE_SECONDS, Decision, OperationObservations, ReplicaObservation, poison};
 #[cfg(test)]
-use super::{MAX_ERROR_LENGTH, record_activity_error};
+use super::MAX_ERROR_LENGTH;
+use super::{
+    ACTION_DEADLINE_SECONDS, Decision, OperationObservations, ReplicaObservation, poison,
+    record_activity_error,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionObservation {
     Precondition,
     Postcondition,
+    InProgress,
+    Failed(String),
     Unavailable,
     Impossible,
 }
@@ -497,6 +502,21 @@ fn decide_pending(
                 })
             }
         }
+        ActionObservation::InProgress => {
+            if now >= pending.deadline_unix_seconds {
+                Ok(Decision::Persist(timeout_transition(
+                    operation, pending, now,
+                )))
+            } else {
+                Ok(Decision::Wait)
+            }
+        }
+        ActionObservation::Failed(error) => {
+            let recorded = record_activity_error(operation, &error);
+            let mut next = timeout_transition(&recorded, pending, now);
+            next.last_error = Some(error);
+            Ok(Decision::Persist(next))
+        }
         ActionObservation::Unavailable => {
             if now >= pending.deadline_unix_seconds {
                 Ok(Decision::Persist(poison(
@@ -526,17 +546,28 @@ fn observe_action(
         return Ok(ActionObservation::Impossible);
     }
 
-    if let Some(completed) = observation.status.last_completed_action.as_ref()
-        && completed.action_id == pending.action_id
+    if let Some(action) =
+        super::correlated_action_observation(&observation.status, &pending.action_id)
     {
         if pod_role_action(pending.kind).is_some() {
             return Ok(ActionObservation::Impossible);
         }
-        let expected_signature = action_for(operation, pending, observations)?.signature();
-        return Ok(if completed.signature == expected_signature {
-            ActionObservation::Postcondition
-        } else {
-            ActionObservation::Impossible
+        let expected_action = action_for(operation, pending, observations)?;
+        let expected_signature = super::pending_action_signature(pending, &expected_action)?;
+        if action.signature != expected_signature {
+            return Ok(ActionObservation::Impossible);
+        }
+        return Ok(match action.state {
+            DurableActionState::Scheduled | DurableActionState::InProgress => {
+                ActionObservation::InProgress
+            }
+            DurableActionState::Completed => ActionObservation::Postcondition,
+            DurableActionState::Failed => ActionObservation::Failed(
+                action
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "runtime reported durable activity failure".to_string()),
+            ),
         });
     }
 
@@ -907,10 +938,10 @@ fn pending_action(
         deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         last_error: None,
         dispatch_authorized: false,
-        dispatch_protocol: None,
         dispatch_agent_generation: None,
         dispatch_agent_control_version: None,
         dispatch_observed_runtime_epoch: None,
+        dispatch_action_payload: String::new(),
     })
 }
 
@@ -1357,10 +1388,19 @@ mod tests {
                     configuration: None,
                     election_configuration: None,
                     deactivation_info: None,
-                    last_completed_action: None,
-                    durable_action: None,
                     active_replica_connections: Vec::new(),
-                    agent: None,
+                    agent: kuberic_core::types::ReplicaAgentStatus {
+                        protocol_version:
+                            kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                        generation: kuberic_core::types::AgentGeneration::parse(
+                            "0123456789abcdef0123456789abcdef",
+                        )
+                        .unwrap(),
+                        control_version: kuberic_core::types::AgentControlVersion::default(),
+                        current_action: None,
+                        retained_terminal_actions: Vec::new(),
+                        local_faults: Vec::new(),
+                    },
                 },
                 replicator_address: "http://one".to_string(),
                 pod_name: "set-0".to_string(),

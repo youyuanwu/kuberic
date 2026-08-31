@@ -1,5 +1,6 @@
 use crate::types::{
-    AgentControlVersion, AgentGeneration, Epoch, ReplicaId, ReplicaInstanceId, Role,
+    AgentControlVersion, AgentGeneration, DurableActionErrorClass, Epoch, ReplicaId,
+    ReplicaInstanceId, Role,
 };
 
 /// Validation failures returned while reconstructing a driver from a durable
@@ -95,10 +96,6 @@ pub enum KubericError {
     #[error("replica agent is busy")]
     AgentBusy,
 
-    /// The bounded direct-mutation queue cannot accept more work.
-    #[error("replica agent command queue is full")]
-    AgentQueueFull,
-
     /// One retained action identifier was reused with different input.
     #[error("correlated action ID {action_id} was reused with different input")]
     ActionIdConflict { action_id: String },
@@ -163,6 +160,14 @@ pub enum KubericError {
     /// The remote endpoint does not support the requested control protocol.
     #[error("remote replica-agent protocol unsupported: {0}")]
     RemoteControlProtocolUnsupported(String),
+
+    /// The remote agent retained a terminal action failure with its stable
+    /// classification.
+    #[error("remote replica-agent terminal failure ({class:?}): {message}")]
+    RemoteAgentTerminalFailure {
+        class: DurableActionErrorClass,
+        message: String,
+    },
 
     /// Internal error (IO, serialization, etc.)
     #[error(transparent)]

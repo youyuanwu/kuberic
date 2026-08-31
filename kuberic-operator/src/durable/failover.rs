@@ -24,6 +24,8 @@ use crate::durable::{
     ACTION_DEADLINE_SECONDS, Decision, OperationObservations, bounded_error, poison,
 };
 
+const DATA_LOSS_ACTION_DEADLINE_SECONDS: i64 = 60;
+
 pub fn start_failover(
     set_identity: &str,
     previous_snapshot: StablePartitionSnapshotStatus,
@@ -536,7 +538,7 @@ fn decide_data_loss(
     if let Some(pending) = &operation.pending_action {
         if let Some(observation) = observations.get(&pending.target_id) {
             let action = action_for(operation, pending, &BTreeMap::new())?;
-            let signature = action.signature();
+            let signature = super::pending_action_signature(pending, &action)?;
             if let Some(result) = completed_data_loss(&observation.status, pending, &signature)? {
                 let mut next = operation.clone();
                 next.pending_action = None;
@@ -718,7 +720,8 @@ fn decide_pending_action(
         };
         let signature = placeholder_action(operation, pending)
             .ok()
-            .map(|action| action.signature());
+            .map(|action| super::pending_action_signature(pending, &action))
+            .transpose()?;
         match action_observed(
             &observation.status,
             pending,
@@ -735,7 +738,23 @@ fn decide_pending_action(
                 Ok(Decision::Persist(next))
             }
             ActionObservation::Failed(error) => Ok(Decision::Persist(poison(operation, &error))),
+            ActionObservation::InProgress => {
+                if now >= pending.deadline_unix_seconds {
+                    Ok(Decision::Persist(poison(
+                        operation,
+                        "durable failover action remained in progress past its deadline",
+                    )))
+                } else {
+                    Ok(Decision::Wait)
+                }
+            }
             ActionObservation::Incomplete => {
+                if now >= pending.deadline_unix_seconds {
+                    return Ok(Decision::Persist(poison(
+                        operation,
+                        "durable failover action reached its deadline",
+                    )));
+                }
                 let mut next = operation.clone();
                 next.pending_action.as_mut().unwrap().dispatch_authorized = true;
                 Ok(Decision::Persist(next))
@@ -835,32 +854,26 @@ fn action_observed(
     postcondition: DurablePostconditionKind,
     role: Option<StableReplicaRoleStatus>,
 ) -> Result<ActionObservation, String> {
-    if let Some(action) = &status.durable_action
-        && action.action_id == pending.action_id
-    {
+    if let Some(action) = super::correlated_action_observation(status, &pending.action_id) {
         if signature.is_some_and(|signature| action.signature != signature) {
             return Ok(ActionObservation::Failed(
                 "durable action signature conflict".to_string(),
             ));
         }
-        if action.state == DurableActionState::Failed {
-            return Ok(ActionObservation::Failed(
-                action
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "durable action failed".to_string()),
-            ));
+        match action.state {
+            DurableActionState::Completed => return Ok(ActionObservation::Completed),
+            DurableActionState::Failed => {
+                return Ok(ActionObservation::Failed(
+                    action
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "durable action failed".to_string()),
+                ));
+            }
+            DurableActionState::Scheduled | DurableActionState::InProgress => {
+                return Ok(ActionObservation::InProgress);
+            }
         }
-    }
-    if let Some(completed) = &status.last_completed_action
-        && completed.action_id == pending.action_id
-    {
-        if signature.is_some_and(|signature| completed.signature != signature) {
-            return Ok(ActionObservation::Failed(
-                "completed action signature conflict".to_string(),
-            ));
-        }
-        return Ok(ActionObservation::Completed);
     }
     let expected_epoch = epoch(&pending.expected_epoch);
     let completed = match postcondition {
@@ -916,23 +929,23 @@ fn completed_data_loss(
     pending: &PendingActionStatus,
     signature: &str,
 ) -> Result<Option<DurableDataLossResultStatus>, String> {
-    if let Some(action) = &status.durable_action
-        && action.action_id == pending.action_id
-        && action.state == DurableActionState::Failed
-    {
-        return Err(action
-            .error
-            .clone()
-            .unwrap_or_else(|| "data-loss callback failed".to_string()));
-    }
-    let Some(completed) = &status.last_completed_action else {
+    let Some(completed) = super::correlated_action_observation(status, &pending.action_id) else {
         return Ok(None);
     };
-    if completed.action_id != pending.action_id {
+    if matches!(
+        completed.state,
+        DurableActionState::Scheduled | DurableActionState::InProgress
+    ) {
         return Ok(None);
     }
     if completed.signature != signature {
         return Err("data-loss completion signature conflict".to_string());
+    }
+    if completed.state == DurableActionState::Failed {
+        return Err(completed
+            .error
+            .clone()
+            .unwrap_or_else(|| "data-loss callback failed".to_string()));
     }
     match completed.result {
         Some(DurableActionResult::DataLoss(DataLossAction::None)) => {
@@ -978,13 +991,18 @@ fn make_pending(
             role,
         },
         attempts: 0,
-        deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
+        deadline_unix_seconds: now
+            + if kind == DurableActionKind::FailoverOnDataLoss {
+                DATA_LOSS_ACTION_DEADLINE_SECONDS
+            } else {
+                ACTION_DEADLINE_SECONDS
+            },
         last_error: None,
         dispatch_authorized: false,
-        dispatch_protocol: None,
         dispatch_agent_generation: None,
         dispatch_agent_control_version: None,
         dispatch_observed_runtime_epoch: None,
+        dispatch_action_payload: String::new(),
     }
 }
 
@@ -1478,12 +1496,15 @@ fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), Str
 fn target_instance(operation: &DurableOperationStatus, target_id: i64) -> Option<String> {
     operation
         .failover
-        .as_ref()?
-        .current_configuration
-        .members
-        .iter()
-        .find(|member| member.id == target_id)
-        .map(|member| member.instance_id.clone())
+        .as_ref()
+        .and_then(|failover| {
+            failover
+                .current_configuration
+                .members
+                .iter()
+                .find(|member| member.id == target_id)
+                .map(|member| member.instance_id.clone())
+        })
         .or_else(|| {
             operation
                 .target_snapshot
@@ -1540,6 +1561,7 @@ fn parse_role(role: &str) -> Role {
 enum ActionObservation {
     Completed,
     Failed(String),
+    InProgress,
     Incomplete,
 }
 
@@ -1647,10 +1669,18 @@ mod tests {
                 epoch,
                 catch_up_lsn: id * 10,
             }),
-            last_completed_action: None,
-            durable_action: None,
             active_replica_connections: Vec::<ReplicaConnectionStatus>::new(),
-            agent: None,
+            agent: kuberic_core::types::ReplicaAgentStatus {
+                protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                generation: kuberic_core::types::AgentGeneration::parse(
+                    "0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+                control_version: kuberic_core::types::AgentControlVersion::default(),
+                current_action: None,
+                retained_terminal_actions: Vec::new(),
+                local_faults: Vec::new(),
+            },
         }
     }
 

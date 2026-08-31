@@ -585,9 +585,9 @@ fn observe_action(
     }
 
     if let Ok(expected_action) = action_for(operation, pending, observations) {
-        let expected_signature = expected_action.signature();
-        if let Some(active) = observation.status.durable_action.as_ref()
-            && active.action_id == pending.action_id
+        let expected_signature = super::pending_action_signature(pending, &expected_action)?;
+        if let Some(active) =
+            super::correlated_action_observation(&observation.status, &pending.action_id)
         {
             if active.signature != expected_signature {
                 return Ok(ActionObservation::Impossible);
@@ -603,15 +603,6 @@ fn observe_action(
                         .clone()
                         .unwrap_or_else(|| "runtime reported durable activity failure".to_string()),
                 ),
-            });
-        }
-        if let Some(completed) = observation.status.last_completed_action.as_ref()
-            && completed.action_id == pending.action_id
-        {
-            return Ok(if completed.signature == expected_signature {
-                ActionObservation::Postcondition
-            } else {
-                ActionObservation::Impossible
             });
         }
     }
@@ -767,10 +758,10 @@ fn pending_action(
             },
         last_error: None,
         dispatch_authorized: false,
-        dispatch_protocol: None,
         dispatch_agent_generation: None,
         dispatch_agent_control_version: None,
         dispatch_observed_runtime_epoch: None,
+        dispatch_action_payload: String::new(),
     })
 }
 
@@ -1277,7 +1268,9 @@ fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), Str
 mod tests {
     use super::*;
     use crate::durable::ReplicaObservation;
-    use kuberic_core::types::{AccessStatus, DurableActionObservation};
+    use kuberic_core::types::{
+        AccessStatus, CorrelatedActionObservation, DurableActionObservation,
+    };
 
     fn snapshot() -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {
@@ -1327,10 +1320,19 @@ mod tests {
                 configuration,
                 election_configuration: None,
                 deactivation_info: None,
-                last_completed_action: None,
-                durable_action: None,
                 active_replica_connections: Vec::new(),
-                agent: None,
+                agent: kuberic_core::types::ReplicaAgentStatus {
+                    protocol_version:
+                        kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                    generation: kuberic_core::types::AgentGeneration::parse(
+                        "0123456789abcdef0123456789abcdef",
+                    )
+                    .unwrap(),
+                    control_version: kuberic_core::types::AgentControlVersion::default(),
+                    current_action: None,
+                    retained_terminal_actions: Vec::new(),
+                    local_faults: Vec::new(),
+                },
             },
             replicator_address: format!("http://{instance_id}"),
             pod_name: instance_id.to_string(),
@@ -1429,12 +1431,18 @@ mod tests {
         let signature = action_for(&operation, &pending, &observations)
             .unwrap()
             .signature();
-        observations.get_mut(&1).unwrap().status.durable_action = Some(DurableActionObservation {
-            action_id: pending.action_id,
-            signature,
-            state: DurableActionState::InProgress,
-            error: None,
-            result: None,
+        let primary = &mut observations.get_mut(&1).unwrap().status;
+        primary.agent.current_action = Some(CorrelatedActionObservation {
+            generation: primary.agent.generation.clone(),
+            control_version: primary.agent.control_version,
+            action: DurableActionObservation {
+                action_id: pending.action_id,
+                signature,
+                state: DurableActionState::InProgress,
+                error_class: None,
+                error: None,
+                result: None,
+            },
         });
 
         assert!(matches!(
@@ -1485,13 +1493,22 @@ mod tests {
             .signature();
         let primary = observations.get_mut(&1).unwrap();
         primary.status.configuration = Some(current);
-        primary.status.durable_action = Some(DurableActionObservation {
-            action_id: pending.action_id,
-            signature: failed_signature,
-            state: DurableActionState::Failed,
-            error: Some("lost reply".to_string()),
-            result: None,
-        });
+        primary
+            .status
+            .agent
+            .retained_terminal_actions
+            .push(CorrelatedActionObservation {
+                generation: primary.status.agent.generation.clone(),
+                control_version: primary.status.agent.control_version,
+                action: DurableActionObservation {
+                    action_id: pending.action_id,
+                    signature: failed_signature,
+                    state: DurableActionState::Failed,
+                    error_class: Some(kuberic_core::types::DurableActionErrorClass::Internal),
+                    error: Some("lost reply".to_string()),
+                    result: None,
+                },
+            });
 
         let Decision::Persist(next) = decide_add_replica(&operation, &observations, 20).unwrap()
         else {

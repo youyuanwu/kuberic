@@ -6,10 +6,11 @@ Core replication framework for [Kuberic](../README.md). Provides the building bl
 
 | Module | Purpose |
 |--------|---------|
-| `PodRuntime` | Per-pod async runtime — hosts the replicator and dispatches lifecycle events to user code |
+| `ReplicaAgent` | Pod-local correlated control admission, fencing, replay, and serialization |
+| `PodRuntime` | Per-pod async runtime — executes ordered service and replicator effects |
 | `WalReplicator` | Quorum-based replicator — manages primary→secondary data flow, copy protocol, epoch tracking |
-| `PartitionDriver` | Orchestrates replica lifecycle — create partition, failover, switchover, scale up/down |
-| `ReplicaHandle` | Trait abstracting gRPC (production) vs in-process (testing) replica communication |
+| `PartitionDriver` | Read-only reconstruction of a durably committed stable topology |
+| `ReplicaHandle` | Status access plus the single correlated control-action mutation method |
 
 ## Usage
 

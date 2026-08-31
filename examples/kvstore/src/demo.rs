@@ -1,14 +1,66 @@
 use std::time::Duration;
 
+use tonic::transport::Channel;
 use tracing::{info, warn};
 
 use crate::proto;
+use kuberic_core::proto::GetStatusRequest;
+use kuberic_core::proto::replicator_control_client::ReplicatorControlClient;
+use kuberic_core::types::{
+    AgentControlVersion, AgentGeneration, CorrelatedControlActionRequest, DurableReplicaAction,
+    Epoch, OpenMode, ReplicaInstanceId, Role,
+};
+
+async fn execute_action(
+    client: &mut ReplicatorControlClient<Channel>,
+    replica_id: i64,
+    action_id: &str,
+    action: DurableReplicaAction,
+) {
+    let status = client
+        .get_status(GetStatusRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let runtime_epoch = status.epoch.expect("runtime status must include epoch");
+    let signature = action.signature();
+    let observation = client
+        .execute_correlated_control_action(
+            kuberic_core::proto::ExecuteCorrelatedControlActionRequest::from(
+                CorrelatedControlActionRequest {
+                    protocol_version:
+                        kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                    action_id: action_id.to_string(),
+                    input_signature: signature,
+                    target_replica_id: replica_id,
+                    target_instance_id: ReplicaInstanceId::new(status.instance_id),
+                    expected_agent_generation: AgentGeneration::parse(status.agent_generation)
+                        .expect("valid agent generation"),
+                    expected_control_version: AgentControlVersion::new(
+                        status.agent_control_version,
+                    ),
+                    observed_runtime_epoch: runtime_epoch.into(),
+                    action,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .observation
+        .expect("correlated action acknowledgement");
+    let state = kuberic_core::proto::DurableActionStateProto::try_from(observation.state)
+        .expect("known correlated action state");
+    assert_ne!(
+        state,
+        kuberic_core::proto::DurableActionStateProto::DurableActionFailed,
+        "correlated demo action {action_id} failed: {}",
+        observation.error
+    );
+}
 
 /// Simulate an operator: Open → Idle → Active → Primary.
-pub async fn simulate_operator(control_address: String) {
-    use kuberic_core::proto::replicator_control_client::ReplicatorControlClient;
-    use kuberic_core::proto::*;
-
+pub async fn simulate_operator(control_address: String, replica_id: i64) {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut client = ReplicatorControlClient::connect(control_address)
@@ -16,35 +68,33 @@ pub async fn simulate_operator(control_address: String) {
         .expect("connect to control server");
 
     info!("--- Operator: Open ---");
-    client.open(OpenRequest { mode: 0 }).await.unwrap();
-
-    let epoch = Some(EpochProto {
-        data_loss_number: 0,
-        configuration_number: 1,
-    });
+    execute_action(
+        &mut client,
+        replica_id,
+        "demo-open",
+        DurableReplicaAction::Open {
+            mode: OpenMode::New,
+        },
+    )
+    .await;
 
     info!("--- Operator: Idle → Active → Primary ---");
-    client
-        .change_role(ChangeRoleRequest {
-            epoch,
-            role: RoleProto::RoleIdleSecondary as i32,
-        })
-        .await
-        .unwrap();
-    client
-        .change_role(ChangeRoleRequest {
-            epoch,
-            role: RoleProto::RoleActiveSecondary as i32,
-        })
-        .await
-        .unwrap();
-    client
-        .change_role(ChangeRoleRequest {
-            epoch,
-            role: RoleProto::RolePrimary as i32,
-        })
-        .await
-        .unwrap();
+    for (action_id, role) in [
+        ("demo-idle", Role::IdleSecondary),
+        ("demo-active", Role::ActiveSecondary),
+        ("demo-primary", Role::Primary),
+    ] {
+        execute_action(
+            &mut client,
+            replica_id,
+            action_id,
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch::new(0, 1),
+                role,
+            },
+        )
+        .await;
+    }
 }
 
 /// Run demo client exercising Put/Get/Delete via the KV gRPC API.
@@ -133,26 +183,29 @@ pub async fn run_demo_client(client_bind: String) {
 }
 
 /// Demote and close the replica.
-pub async fn demo_close(control_address: String) {
-    use kuberic_core::proto::replicator_control_client::ReplicatorControlClient;
-    use kuberic_core::proto::*;
-
+pub async fn demo_close(control_address: String, replica_id: i64) {
     let mut client = ReplicatorControlClient::connect(control_address)
         .await
         .unwrap();
 
     info!("--- Operator: Demote ---");
-    client
-        .change_role(ChangeRoleRequest {
-            epoch: Some(EpochProto {
-                data_loss_number: 0,
-                configuration_number: 2,
-            }),
-            role: RoleProto::RoleActiveSecondary as i32,
-        })
-        .await
-        .unwrap();
+    execute_action(
+        &mut client,
+        replica_id,
+        "demo-demote",
+        DurableReplicaAction::ChangeRole {
+            epoch: Epoch::new(0, 2),
+            role: Role::ActiveSecondary,
+        },
+    )
+    .await;
 
     info!("--- Operator: Close ---");
-    client.close(CloseRequest {}).await.unwrap();
+    execute_action(
+        &mut client,
+        replica_id,
+        "demo-close",
+        DurableReplicaAction::Close,
+    )
+    .await;
 }

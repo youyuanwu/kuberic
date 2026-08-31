@@ -207,7 +207,7 @@ impl KvPod {
     /// Simulate a pod crash. Aborts the PodRuntime and service without
     /// graceful shutdown. The KvPod instance becomes unusable, but tasks
     /// independently spawned by the aborted owners can survive; use
-    /// `ReplicaHandle::close` when a test must stop replication ACKs.
+    /// a correlated `Close` action when a test needs graceful shutdown.
     pub async fn crash(self) {
         self._runtime_handle.abort();
         self._service_handle.abort();

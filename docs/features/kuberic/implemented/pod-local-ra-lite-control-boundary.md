@@ -3,88 +3,90 @@
 > **Status:** Implemented
 > **Date:** 2026-08-31
 
-Inserted `ReplicaAgent` between the gRPC control server and `PodRuntime`.
-The agent owns pod-local manager-protocol acceptance and observation;
-the runtime owns ordered service/replicator effects.
-
----
-
 ## Problem
 
-`PodRuntime` previously held the current correlated action, validated action
-IDs/signatures, classified duplicate/conflicting work, spawned long-running
-actions, retained their result, and also executed service/replicator effects.
-A container restart under the same Kubernetes Pod UID therefore had no
-separate identity for the new process, and absent volatile correlation state
-could be mistaken for evidence that an old action had not run.
+`PodRuntime` previously combined manager-protocol correlation with ordered
+service and replicator effects. Process restart under the same Kubernetes Pod
+UID could therefore erase correlation evidence without changing the replica
+incarnation.
+
+Multiple mutation RPCs also allowed callers to bypass the correlated,
+generation-fenced admission path.
 
 ## Decision
 
-Use two channel boundaries:
+Use one production control path:
 
 ```
-ControlServer → ReplicaAgent → PodRuntime
+operator → ExecuteCorrelatedControlAction → ReplicaAgent → PodRuntime
 ```
 
-`ReplicaAgent` owns:
+`GetStatus` is the only other public `ReplicatorControl` RPC. The removed
+individual mutation methods and `ExecuteDurableAction` have no compatibility
+shim. Their protobuf request shapes remain only where needed as action-oneof
+payloads, and removed status tags and names are reserved.
 
-- replica/process/epoch/control-version fences;
-- legacy and versioned correlated admission;
-- one active action and 16 terminal observations;
-- duplicate replay and retained signature conflicts;
-- capacity-16 direct mutation serialization;
+`ReplicaAgent` exclusively owns:
+
+- protocol-version, replica-incarnation, process-generation,
+  control-version, runtime-epoch, action-ID, and signature admission;
+- one active action and 16 retained terminal observations;
+- duplicate replay, conflict detection, and local serialization;
 - generation-qualified runtime completion tokens; and
-- bounded local fault/error status.
+- bounded local fault and typed, normalized error publication.
 
-`PodRuntime` owns:
+`PodRuntime` exclusively owns ordered open, role, epoch, configuration,
+catch-up, build/remove, data-loss, write-revocation, and close effects. It has
+no manager action ledger.
 
-- open, role, epoch, configuration, catch-up, build/remove, data-loss, and
-  close effects;
-- established service/replicator callback order; and
-- exact typed completion.
+## Status and Fencing
 
-Runtime status is published through `RuntimeControlSnapshot` plus shared
-`PartitionState`, keeping agent status readable while an effect runs.
+Every supported pod reports required replica-agent status with numeric control
+protocol version 1, `AgentGeneration`, `AgentControlVersion`,
+`current_action`, and `retained_terminal_actions`. Missing, malformed, or
+unsupported agent status is rejected; it is not interpreted as an old peer.
 
-## Process Identity
+Before dispatch, the operator requires matching addressed, runtime, and
+pending Pod incarnations. It persists the observed generation, control
+version, runtime epoch, and exact encoded action payload in CRD status during
+a no-activity reconcile. Freezing the payload keeps its deterministic
+signature stable even when observed replica progress changes. The next
+reconcile calls only `ExecuteCorrelatedControlAction`.
 
-Pod UID remains `ReplicaInstanceId`. `AgentGeneration` is a separate random
-value created on every process start. `AgentControlVersion` advances on
-distinct mutation admission only.
+This is a coordinated operator/runtime deployment boundary. Mixed control
+versions do not interoperate. Deployments must quiesce durable topology work
+and update the operator and replica runtimes together.
 
-Agent observations never cross generations. A prior-generation request is
-stale even if the Pod UID is unchanged. CRD status remains the only durable
-workflow store; it records optional dispatch fences, not the local action
-buffer.
+## Recovery and Replay
 
-## Protocol Compatibility
+CRD status remains the only durable global store. The operator retains
+write-ahead intent, deterministic signatures, resource-version fencing,
+observation-first recovery, one transition or one activity per reconcile, and
+all existing commit, compensation, and roll-forward boundaries.
 
-`ExecuteCorrelatedControlAction` is additive and strictly validates every
-safety field. Existing RPCs and `ExecuteDurableAction` remain available. The
-legacy correlated method uses the same agent ledger without the new fences.
+The authoritative local ledger is `current_action` plus
+`retained_terminal_actions`. Exact duplicates replay without another effect.
+A retained signature conflict performs no effect. Eviction is deterministic
+and bounded; an old control-version request for an unretained action fails as
+continuity unavailable. There is no exactly-once claim or durable local
+history.
 
-The operator persists an explicit `correlatedControlV1` or `legacy` selection
-before activity. Capability absence can select legacy; a rejected versioned
-request never silently falls back.
+A same-Pod process restart changes `AgentGeneration` and publishes no inherited
+action state. Old-generation requests fail before effects. The operator
+evaluates durable postconditions before any at-least-once redrive.
 
 ## Consequences
 
-- Duplicate reply replay is exact while the terminal is retained in the same
-  reachable generation.
-- Evicted/old-version continuity fails closed without an exactly-once claim.
-- Same-Pod process restart is observable independently of Pod replacement.
-- Unverifiable stable secondary process state enters the existing durable
-  force-remove/rebuild path.
-- Direct close tears down the endpoint, so its terminal replay is best effort.
-- Fault publication is bounded and best effort, not a global health history.
+- There is one fenced mutation API and one local observation ledger.
+- Old control-plane clients and runtimes require coordinated replacement.
+- ReplicaAgent remains a local acceptance/replay boundary, not a distributed
+  workflow engine or peer protocol.
+- PodRuntime callback ordering and typed completion remain unchanged.
+- Fault and terminal histories are bounded, volatile evidence.
 
 ## Service Fabric Mapping
 
-The ownership split follows SF RA versus RAProxy:
-
-- RA accepts/fences FM messages and serializes per failover unit.
-- RAProxy binds runtime identity and executes ordered service/replicator
-  action lists.
-
-Kuberic deliberately does not copy RA's durable local failover-unit store.
-Kubernetes CRD status and the operator remain the global durable authority.
+The ownership split follows the useful SF RA/RAProxy distinction: the local RA
+accepts and fences commands while the runtime proxy executes ordered effects.
+Kuberic deliberately does not copy RA's local durable failover-unit store;
+Kubernetes CRD status and the operator remain globally authoritative.

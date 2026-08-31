@@ -31,7 +31,7 @@ Implementation status, known gaps, and open questions.
 | Durable switchover restart recovery | ✅ Implemented — compact CRD operation checkpoint, correlated activities, compensation |
 | Durable scale-up and stale-secondary rejoin | ✅ Implemented — correlated lifecycle/build/configuration activities and phase-aware compensation |
 | Durable scale-down and stale/dead-secondary eviction | ✅ Implemented — config-first commit, exact connection cleanup, UID-fenced deletion |
-| Pod-local RA-lite boundary | ✅ Implemented — generation/version fencing, correlation, serialization, bounded replay, additive compatibility |
+| Pod-local RA-lite boundary | ✅ Implemented — one versioned correlated mutation path with generation/version fencing and bounded replay |
 | Primary self-fencing (liveness probe) | ❌ Not implemented — K8s defense-in-depth (from CNPG) |
 | Node drain handling | ❌ Not implemented — K8s adaptation (analogous to SF PLB) |
 | CRD conditions (Ready, Degraded, Quorum) | ❌ Not implemented — K8s addition |
@@ -41,10 +41,12 @@ Implementation status, known gaps, and open questions.
 
 ## Pod-Local Control Status
 
-`GetStatus` preserves its legacy fields and adds protocol version,
-`AgentGeneration`, `AgentControlVersion`, the current generation-qualified
-action, 16 retained terminal observations, and up to 16 successfully received
-local fault records. Error text is limited to 1,024 UTF-8 bytes.
+`GetStatus` requires protocol version 1, `AgentGeneration`,
+`AgentControlVersion`, the current generation-qualified action, 16 retained
+terminal observations, and up to 16 successfully received local fault records.
+The current action and retained terminals are the only local correlation
+ledger. Terminal failures carry a stable error class; error text is limited to
+1,024 UTF-8 bytes.
 
 Pod UID and agent generation have different meanings. The Pod UID is the
 replica incarnation; the generation changes on every process start, including
@@ -135,7 +137,7 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 
 ```
 kuberic-core/
-├── proto/kuberic.proto           # gRPC: ReplicatorControl (14 RPCs) + ReplicatorData (3 RPCs)
+├── proto/kuberic.proto           # gRPC: ReplicatorControl (2 RPCs) + ReplicatorData (3 RPCs)
 ├── src/
 │   ├── types.rs                     # Epoch, Role, AccessStatus, ReplicaInfo, Operation, OperationStream
 │   ├── error.rs                     # KubericError enum (NotPrimary, NoWriteQuorum, etc.)
@@ -145,7 +147,7 @@ kuberic-core/
 │   ├── runtime.rs                   # KubericRuntime (lower-level harness)
 │   ├── replica_agent.rs             # Pod-local admission, correlation, replay, status and faults
 │   ├── pod.rs                       # PodRuntime ordered service/replicator effects
-│   ├── driver.rs                    # PartitionDriver + ReplicaHandle trait + InProcessReplicaHandle
+│   ├── driver.rs                    # Read-only PartitionDriver + ReplicaHandle trait
 │   ├── replicator/
 │   │   ├── quorum.rs                # QuorumTracker (single + dual-config + must_catch_up + baseline)
 │   │   ├── queue.rs                 # ReplicationQueue (in-memory op retention for replay to new replicas)

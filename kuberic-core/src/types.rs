@@ -250,17 +250,6 @@ impl AgentControlVersion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CorrelatedActionAdmission {
-    Legacy,
-    Versioned,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplicaAgentCapability {
-    CorrelatedControlActionV1,
-}
-
 #[derive(Debug, Clone)]
 pub struct CorrelatedControlActionRequest {
     pub protocol_version: u32,
@@ -283,7 +272,6 @@ pub struct CorrelatedControlActionAcknowledgement {
 pub struct CorrelatedActionObservation {
     pub generation: AgentGeneration,
     pub control_version: AgentControlVersion,
-    pub admission: CorrelatedActionAdmission,
     pub action: DurableActionObservation,
 }
 
@@ -295,9 +283,9 @@ pub struct LocalFaultRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaAgentStatus {
+    pub protocol_version: u32,
     pub generation: AgentGeneration,
     pub control_version: AgentControlVersion,
-    pub capabilities: Vec<ReplicaAgentCapability>,
     pub current_action: Option<CorrelatedActionObservation>,
     pub retained_terminal_actions: Vec<CorrelatedActionObservation>,
     pub local_faults: Vec<LocalFaultRecord>,
@@ -318,10 +306,8 @@ pub struct ReplicaStatusInfo {
     pub configuration: Option<ReplicaConfigurationStatus>,
     pub election_configuration: Option<ReplicaElectionConfiguration>,
     pub deactivation_info: Option<ReplicaDeactivationInfo>,
-    pub last_completed_action: Option<DurableActionCompletion>,
-    pub durable_action: Option<DurableActionObservation>,
     pub active_replica_connections: Vec<ReplicaConnectionStatus>,
-    pub agent: Option<ReplicaAgentStatus>,
+    pub agent: ReplicaAgentStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,11 +402,15 @@ pub enum DurableActionResult {
     DataLoss(DataLossAction),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DurableActionCompletion {
-    pub action_id: String,
-    pub signature: String,
-    pub result: Option<DurableActionResult>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableActionErrorClass {
+    Internal,
+    NotPrimary,
+    NoWriteQuorum,
+    ReconfigurationPending,
+    StaleEpoch,
+    Cancelled,
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,6 +426,7 @@ pub struct DurableActionObservation {
     pub action_id: String,
     pub signature: String,
     pub state: DurableActionState,
+    pub error_class: Option<DurableActionErrorClass>,
     pub error: Option<String>,
     pub result: Option<DurableActionResult>,
 }
@@ -507,8 +498,15 @@ impl DurableReplicaAction {
                 format!("update-current:{}", config_signature(current))
             }
             Self::BuildReplica { replica } => format!(
-                "build-replica:{}@{}:{:?}:{}",
-                replica.id, replica.instance_id, replica.role, replica.replicator_address
+                "build-replica:{}@{}:{:?}:{:?}:{}:{}:{}:{}",
+                replica.id,
+                replica.instance_id,
+                replica.role,
+                replica.status,
+                replica.replicator_address,
+                replica.current_progress,
+                replica.catch_up_capability,
+                replica.must_catch_up
             ),
             Self::RemoveReplica {
                 replica_id,
@@ -552,12 +550,14 @@ fn config_signature(config: &ReplicaSetConfig) -> String {
         .iter()
         .map(|member| {
             format!(
-                "{}@{}:{:?}:{:?}:{}:{}",
+                "{}@{}:{:?}:{:?}:{}:{}:{}:{}",
                 member.id,
                 member.instance_id,
                 member.role,
                 member.status,
                 member.replicator_address,
+                member.current_progress,
+                member.catch_up_capability,
                 member.must_catch_up
             )
         })
@@ -676,6 +676,36 @@ mod durable_action_tests {
         assert_ne!(build.signature(), remove_old.signature());
         assert_ne!(remove_old.signature(), remove_new.signature());
         assert!(build.signature().contains("7@new"));
+    }
+
+    #[test]
+    fn configuration_signatures_include_execution_relevant_progress() {
+        let member = ReplicaInfo {
+            id: 2,
+            instance_id: ReplicaInstanceId::new("secondary"),
+            role: Role::ActiveSecondary,
+            status: ReplicaStatus::Up,
+            replicator_address: "http://secondary".to_string(),
+            current_progress: 10,
+            catch_up_capability: 4,
+            must_catch_up: true,
+        };
+        let first = DurableReplicaAction::UpdateCurrentConfiguration {
+            current: ReplicaSetConfig {
+                members: vec![member.clone()],
+                write_quorum: 2,
+            },
+        };
+        let mut advanced = member;
+        advanced.current_progress = 11;
+        let second = DurableReplicaAction::UpdateCurrentConfiguration {
+            current: ReplicaSetConfig {
+                members: vec![advanced],
+                write_quorum: 2,
+            },
+        };
+
+        assert_ne!(first.signature(), second.signature());
     }
 
     #[test]

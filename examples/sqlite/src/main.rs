@@ -82,9 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.demo {
         info!("Demo mode: simulating operator + client");
-        sqlite_replicated::demo::simulate_operator(control_address.clone()).await;
+        sqlite_replicated::demo::simulate_operator(control_address.clone(), args.replica_id).await;
         sqlite_replicated::demo::run_demo_client(args.client_bind).await;
-        sqlite_replicated::demo::demo_close(control_address).await;
+        sqlite_replicated::demo::demo_close(control_address, args.replica_id).await;
     } else {
         info!("Waiting for operator commands on {}", control_address);
         info!("Press Ctrl+C to shut down");

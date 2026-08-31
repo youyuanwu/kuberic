@@ -17,6 +17,7 @@ use crate::types::{
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const BUILD_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
+const DATA_LOSS_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 // ---------------------------------------------------------------------------
 // RuntimeEffectCommand — what the replica agent sends to the runtime
 // ---------------------------------------------------------------------------
@@ -26,9 +27,7 @@ pub enum RuntimeEffect {
     Open {
         mode: OpenMode,
     },
-    Close {
-        terminate_runtime: bool,
-    },
+    Close,
     ChangeRole {
         epoch: Epoch,
         role: Role,
@@ -39,34 +38,30 @@ pub enum RuntimeEffect {
     UpdateCatchUpConfiguration {
         current: ReplicaSetConfig,
         previous: ReplicaSetConfig,
-        observe_on_secondary: bool,
     },
     UpdateCurrentConfiguration {
         current: ReplicaSetConfig,
-        observe_on_secondary: bool,
     },
     WaitForCatchUpQuorum {
         mode: ReplicaSetQuorumMode,
     },
     BuildReplica {
         replica: ReplicaInfo,
-        extended_timeout: bool,
     },
     RemoveReplica {
         replica_id: ReplicaId,
         instance_id: ReplicaInstanceId,
     },
     OnDataLoss {
-        expected_epoch: Option<Epoch>,
+        expected_epoch: Epoch,
     },
-    RevokeWriteStatus {
-        require_open: bool,
-    },
+    RevokeWriteStatus,
     RecordElectionConfiguration {
         configuration: ReplicaElectionConfiguration,
     },
 }
 
+#[derive(Debug)]
 pub enum RuntimeEffectResult {
     Unit,
     DataLoss(DataLossAction),
@@ -177,7 +172,7 @@ impl PodRuntimeBuilder {
         // Control plane gRPC server routes through the pod-local agent.
         // PartitionState is not available yet — it's created by the replicator
         // at Open time. ControlServer needs to work without it initially.
-        let control_server = crate::grpc::server::ControlServer::new(self.replica_id, agent_tx);
+        let control_server = crate::grpc::server::ControlServer::new(agent_tx);
         let replica_agent = crate::replica_agent::ReplicaAgent::new(
             self.replica_id,
             self.instance_id.clone(),
@@ -259,18 +254,9 @@ impl PodRuntime {
     pub async fn serve(mut self) {
         info!("PodRuntime serve loop started");
         while let Some(command) = self.cmd_rx.recv().await {
-            let terminate_runtime = matches!(
-                &command.effect,
-                RuntimeEffect::Close {
-                    terminate_runtime: true
-                }
-            );
             let result = self.execute_effect(command.effect).await;
             self.publish_status();
             let _ = command.reply.send(result);
-            if terminate_runtime {
-                break;
-            }
         }
         self.shutdown.cancel();
     }
@@ -278,17 +264,13 @@ impl PodRuntime {
     async fn execute_effect(&mut self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         let result = match effect {
             RuntimeEffect::Open { mode } => self.handle_open(mode).await,
-            RuntimeEffect::Close { .. } => self.handle_close().await,
+            RuntimeEffect::Close => self.handle_close().await,
             RuntimeEffect::ChangeRole { epoch, role } => {
                 self.require_handle()?;
                 self.handle_change_role(epoch, role).await
             }
             RuntimeEffect::UpdateEpoch { epoch } => self.handle_update_epoch(epoch).await,
-            RuntimeEffect::UpdateCatchUpConfiguration {
-                current,
-                previous,
-                observe_on_secondary,
-            } => {
+            RuntimeEffect::UpdateCatchUpConfiguration { current, previous } => {
                 let observed_configuration = ReplicaConfigurationStatus::from_config(
                     ReplicaConfigurationMode::CatchUp,
                     &current,
@@ -307,15 +289,12 @@ impl PodRuntime {
                         .state()
                         .set_write_status(AccessStatus::Granted);
                 }
-                if result.is_ok() && (observe_on_secondary || self.role == Role::Primary) {
+                if result.is_ok() {
                     self.configuration = Some(observed_configuration);
                 }
                 result
             }
-            RuntimeEffect::UpdateCurrentConfiguration {
-                current,
-                observe_on_secondary,
-            } => {
+            RuntimeEffect::UpdateCurrentConfiguration { current } => {
                 let observed_configuration = ReplicaConfigurationStatus::from_config(
                     ReplicaConfigurationMode::Current,
                     &current,
@@ -330,7 +309,7 @@ impl PodRuntime {
                         .state()
                         .set_write_status(AccessStatus::Granted);
                 }
-                if result.is_ok() && (observe_on_secondary || self.role == Role::Primary) {
+                if result.is_ok() {
                     self.configuration = Some(observed_configuration);
                 }
                 result
@@ -342,18 +321,10 @@ impl PodRuntime {
                 })
                 .await
             }
-            RuntimeEffect::BuildReplica {
-                replica,
-                extended_timeout,
-            } => {
-                let timeout = if extended_timeout {
-                    BUILD_REPLY_TIMEOUT
-                } else {
-                    self.reply_timeout
-                };
+            RuntimeEffect::BuildReplica { replica } => {
                 self.send_replicator_control_with_timeout(
                     |reply| ReplicatorControlEvent::BuildReplica { replica, reply },
-                    timeout,
+                    BUILD_REPLY_TIMEOUT,
                 )
                 .await
             }
@@ -370,21 +341,15 @@ impl PodRuntime {
             }
             RuntimeEffect::OnDataLoss { expected_epoch } => {
                 return self
-                    .handle_on_data_loss(expected_epoch)
+                    .handle_on_data_loss(Some(expected_epoch))
                     .await
                     .map(RuntimeEffectResult::DataLoss);
             }
-            RuntimeEffect::RevokeWriteStatus { require_open } => {
+            RuntimeEffect::RevokeWriteStatus => {
                 info!("revoking write status for switchover");
-                if require_open {
-                    self.require_handle()?
-                        .state()
-                        .set_write_status(AccessStatus::ReconfigurationPending);
-                } else if let Some(handle) = &self.replicator_handle {
-                    handle
-                        .state()
-                        .set_write_status(AccessStatus::ReconfigurationPending);
-                }
+                self.require_handle()?
+                    .state()
+                    .set_write_status(AccessStatus::ReconfigurationPending);
                 Ok(())
             }
             RuntimeEffect::RecordElectionConfiguration { configuration } => {
@@ -572,10 +537,13 @@ impl PodRuntime {
     ) -> Result<DataLossAction> {
         // Route through replicator — it handles dual-query (replicator + user)
         let result = self
-            .send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss {
-                expected_epoch,
-                reply,
-            })
+            .send_replicator_control_with_timeout(
+                |reply| ReplicatorControlEvent::OnDataLoss {
+                    expected_epoch,
+                    reply,
+                },
+                DATA_LOSS_REPLY_TIMEOUT,
+            )
             .await?;
         if result == DataLossAction::StateChanged && expected_epoch.is_some() {
             self.deactivation_info = Some(ReplicaDeactivationInfo {
@@ -662,34 +630,56 @@ impl PodRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::ReplicaHandle;
     use crate::events::LifecycleEvent;
+    use crate::grpc::handle::GrpcReplicaHandle;
     use crate::replicator::WalReplicator;
+    use crate::types::{AgentControlVersion, CorrelatedControlActionRequest, DurableReplicaAction};
+
+    async fn execute(handle: &GrpcReplicaHandle, action_id: &str, action: DurableReplicaAction) {
+        let status = handle.get_status().await.unwrap();
+        let signature = action.signature();
+        handle
+            .execute_correlated_control_action(CorrelatedControlActionRequest {
+                protocol_version: crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                action_id: action_id.to_string(),
+                input_signature: signature,
+                target_replica_id: handle.id(),
+                target_instance_id: handle.instance_id(),
+                expected_agent_generation: status.agent.generation,
+                expected_control_version: AgentControlVersion::new(
+                    status.agent.control_version.value(),
+                ),
+                observed_runtime_epoch: status.epoch,
+                action,
+            })
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
-    async fn test_pod_runtime_user_lifecycle() {
+    async fn correlated_control_preserves_runtime_lifecycle_ordering() {
+        let instance_id = ReplicaInstanceId::new("pod-runtime-test");
         let bundle = PodRuntime::builder(1)
+            .instance_id(instance_id.clone())
             .reply_timeout(Duration::from_secs(5))
             .build()
             .await
             .unwrap();
-
-        let runtime = bundle.runtime;
+        let shutdown = bundle.runtime.shutdown_token();
+        let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let mut lifecycle_rx = bundle.lifecycle_rx;
-
-        // Spawn user event loop — creates replicator at Open
         let user_handle = tokio::spawn(async move {
             let mut replicator = None;
-
             while let Some(event) = lifecycle_rx.recv().await {
                 match event {
                     LifecycleEvent::Open { ctx, reply } => {
-                        // User creates channel and replicator
-                        let (sp_tx, _sp_rx) = mpsc::unbounded_channel();
+                        let (state_provider_tx, _state_provider_rx) = mpsc::unbounded_channel();
                         let (handle, handles) = WalReplicator::create(
                             ctx.replica_id,
                             &ctx.data_bind,
-                            ctx.fault_tx.clone(),
-                            sp_tx,
+                            ctx.fault_tx,
+                            state_provider_tx,
                         )
                         .await
                         .unwrap();
@@ -698,8 +688,9 @@ mod tests {
                     }
                     LifecycleEvent::ChangeRole { new_role, reply } => {
                         if new_role == Role::Primary {
-                            let r = replicator.as_ref().unwrap();
-                            let result = r
+                            let result = replicator
+                                .as_ref()
+                                .unwrap()
                                 .replicate(
                                     bytes::Bytes::from("from-user"),
                                     CancellationToken::new(),
@@ -717,189 +708,59 @@ mod tests {
                 }
             }
         });
-
-        // Spawn the runtime command loop
-        let runtime_handle = tokio::spawn(runtime.serve());
-
-        // Drive lifecycle via the gRPC control server (simulating operator)
-        let mut client = crate::proto::replicator_control_client::ReplicatorControlClient::connect(
-            bundle.control_address.clone(),
+        let handle = GrpcReplicaHandle::connect(
+            1,
+            instance_id,
+            bundle.control_address,
+            "http://unused".to_string(),
         )
         .await
         .unwrap();
 
-        // Open
-        client
-            .open(crate::proto::OpenRequest { mode: 0 })
-            .await
-            .unwrap();
-
-        // ChangeRole Idle → Active → Primary
-        client
-            .change_role(crate::proto::ChangeRoleRequest {
-                epoch: Some(crate::proto::EpochProto {
-                    data_loss_number: 0,
-                    configuration_number: 1,
-                }),
-                role: crate::proto::RoleProto::RoleIdleSecondary as i32,
-            })
-            .await
-            .unwrap();
-
-        client
-            .change_role(crate::proto::ChangeRoleRequest {
-                epoch: Some(crate::proto::EpochProto {
-                    data_loss_number: 0,
-                    configuration_number: 1,
-                }),
-                role: crate::proto::RoleProto::RoleActiveSecondary as i32,
-            })
-            .await
-            .unwrap();
-
-        client
-            .change_role(crate::proto::ChangeRoleRequest {
-                epoch: Some(crate::proto::EpochProto {
-                    data_loss_number: 0,
-                    configuration_number: 1,
-                }),
-                role: crate::proto::RoleProto::RolePrimary as i32,
-            })
-            .await
-            .unwrap();
-
-        let empty_action_id = client
-            .execute_durable_action(crate::proto::ExecuteDurableActionRequest {
-                action_id: String::new(),
-                action: Some(
-                    crate::proto::execute_durable_action_request::Action::RevokeWriteStatus(
-                        crate::proto::RevokeWriteStatusRequest {},
-                    ),
-                ),
-            })
-            .await
-            .unwrap_err();
-        assert_eq!(empty_action_id.code(), tonic::Code::InvalidArgument);
-
-        let durable_revoke = crate::proto::ExecuteDurableActionRequest {
-            action_id: "operation:1:revoke".to_string(),
-            action: Some(
-                crate::proto::execute_durable_action_request::Action::RevokeWriteStatus(
-                    crate::proto::RevokeWriteStatusRequest {},
-                ),
-            ),
-        };
-        client
-            .execute_durable_action(durable_revoke.clone())
-            .await
-            .unwrap();
-        client.execute_durable_action(durable_revoke).await.unwrap();
-        let status = client
-            .get_status(crate::proto::GetStatusRequest {})
-            .await
-            .unwrap()
-            .into_inner();
+        execute(
+            &handle,
+            "open",
+            DurableReplicaAction::Open {
+                mode: OpenMode::New,
+            },
+        )
+        .await;
+        execute(
+            &handle,
+            "idle",
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch::new(0, 1),
+                role: Role::IdleSecondary,
+            },
+        )
+        .await;
+        execute(
+            &handle,
+            "active",
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch::new(0, 1),
+                role: Role::ActiveSecondary,
+            },
+        )
+        .await;
+        execute(
+            &handle,
+            "primary",
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch::new(0, 1),
+                role: Role::Primary,
+            },
+        )
+        .await;
+        execute(&handle, "revoke", DurableReplicaAction::RevokeWriteStatus).await;
         assert_eq!(
-            status.write_status,
-            crate::proto::AccessStatusProto::AccessReconfigurationPending as i32
+            handle.get_status().await.unwrap().write_status,
+            AccessStatus::ReconfigurationPending
         );
-        assert_eq!(status.last_completed_action_id, "operation:1:revoke");
-        assert_eq!(
-            status.last_completed_action_signature,
-            "revoke-write-status"
-        );
-        assert_eq!(
-            status.durable_action_state,
-            crate::proto::DurableActionStateProto::DurableActionCompleted as i32
-        );
-        assert_eq!(status.durable_action_id, "operation:1:revoke");
-        assert_eq!(
-            status.replica_agent_protocol_version,
-            crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION
-        );
-        assert!(!status.agent_generation.is_empty());
-
-        let correlated_revoke = crate::proto::ExecuteCorrelatedControlActionRequest {
-            protocol_version: crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-            action_id: "operation:2:revoke".to_string(),
-            input_signature: "revoke-write-status".to_string(),
-            target_replica_id: 1,
-            target_instance_id: status.instance_id.clone(),
-            expected_agent_generation: status.agent_generation.clone(),
-            expected_agent_control_version: Some(status.agent_control_version),
-            observed_runtime_epoch: status.epoch,
-            action: Some(
-                crate::proto::execute_correlated_control_action_request::Action::RevokeWriteStatus(
-                    crate::proto::RevokeWriteStatusRequest {},
-                ),
-            ),
-        };
-        let acknowledgement = client
-            .execute_correlated_control_action(correlated_revoke.clone())
-            .await
-            .unwrap()
-            .into_inner()
-            .observation
-            .unwrap();
-        assert_eq!(
-            acknowledgement.admission,
-            crate::proto::CorrelatedActionAdmissionProto::CorrelatedActionAdmissionVersioned as i32
-        );
-        assert_eq!(
-            acknowledgement.state,
-            crate::proto::DurableActionStateProto::DurableActionCompleted as i32
-        );
-        let replay = client
-            .execute_correlated_control_action(correlated_revoke.clone())
-            .await
-            .unwrap()
-            .into_inner()
-            .observation
-            .unwrap();
-        assert_eq!(replay, acknowledgement);
-
-        let mut unsupported = correlated_revoke;
-        unsupported.protocol_version += 1;
-        let error = client
-            .execute_correlated_control_action(unsupported)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::Unimplemented);
-
-        let reused = client
-            .execute_durable_action(crate::proto::ExecuteDurableActionRequest {
-                action_id: "operation:1:revoke".to_string(),
-                action: Some(
-                    crate::proto::execute_durable_action_request::Action::UpdateEpoch(
-                        crate::proto::UpdateEpochRequest {
-                            epoch: Some(crate::proto::EpochProto {
-                                data_loss_number: 0,
-                                configuration_number: 2,
-                            }),
-                        },
-                    ),
-                ),
-            })
-            .await;
-        assert!(reused.is_err());
-
-        // Demote
-        client
-            .change_role(crate::proto::ChangeRoleRequest {
-                epoch: Some(crate::proto::EpochProto {
-                    data_loss_number: 0,
-                    configuration_number: 2,
-                }),
-                role: crate::proto::RoleProto::RoleActiveSecondary as i32,
-            })
-            .await
-            .unwrap();
-
-        // Close
-        client.close(crate::proto::CloseRequest {}).await.unwrap();
+        execute(&handle, "close", DurableReplicaAction::Close).await;
 
         user_handle.await.unwrap();
-
+        shutdown.cancel();
         runtime_handle.await.unwrap();
     }
 

@@ -181,11 +181,6 @@ spec:
                       dispatchAuthorized:
                         type: boolean
                         default: false
-                      dispatchProtocol:
-                        type: string
-                        enum:
-                        - legacy
-                        - correlatedControlV1
                       dispatchAgentGeneration:
                         type: string
                       dispatchAgentControlVersion:
@@ -203,6 +198,8 @@ spec:
                           configurationNumber:
                             type: integer
                             format: int64
+                      dispatchActionPayload:
+                        type: string
               members:
                 type: array
                 items:
@@ -849,11 +846,6 @@ spec:
                       dispatchAuthorized:
                         type: boolean
                         default: false
-                      dispatchProtocol:
-                        type: string
-                        enum:
-                        - legacy
-                        - correlatedControlV1
                       dispatchAgentGeneration:
                         type: string
                       dispatchAgentControlVersion:
@@ -871,6 +863,8 @@ spec:
                           configurationNumber:
                             type: integer
                             format: int64
+                      dispatchActionPayload:
+                        type: string
                   failover:
                     type: object
                     required:
