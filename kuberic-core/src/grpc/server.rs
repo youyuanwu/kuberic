@@ -5,7 +5,7 @@ use crate::error::KubericError;
 use crate::pod::RuntimeCommand;
 use crate::proto::replicator_control_server::ReplicatorControl;
 use crate::proto::*;
-use crate::types::{DurableReplicaAction, Epoch, ReplicaInstanceId, Role};
+use crate::types::{DurableActionResult, DurableReplicaAction, Epoch, ReplicaInstanceId, Role};
 
 /// Control server that routes all commands through the PodRuntime's
 /// command channel. This ensures correct replicator/event ordering
@@ -21,6 +21,12 @@ fn runtime_error_status(error: KubericError) -> Status {
         KubericError::NoWriteQuorum => Status::unavailable(error.to_string()),
         other => Status::internal(other.to_string()),
     }
+}
+
+fn action_result_proto(result: Option<DurableActionResult>) -> i32 {
+    result
+        .map(crate::proto::DurableActionResultProto::from)
+        .unwrap_or(crate::proto::DurableActionResultProto::DurableActionResultNone) as i32
 }
 
 impl ControlServer {
@@ -92,6 +98,16 @@ impl ReplicatorControl for ControlServer {
         let info = rx
             .await
             .map_err(|_| Status::unavailable("runtime closed"))?;
+        let last_completed_action_result = action_result_proto(
+            info.last_completed_action
+                .as_ref()
+                .and_then(|action| action.result),
+        );
+        let durable_action_result = action_result_proto(
+            info.durable_action
+                .as_ref()
+                .and_then(|action| action.result),
+        );
         Ok(Response::new(GetStatusResponse {
             role: crate::proto::RoleProto::from(info.role) as i32,
             epoch: Some(info.epoch.into()),
@@ -151,6 +167,10 @@ impl ReplicatorControl for ControlServer {
                     instance_id: connection.instance_id.to_string(),
                 })
                 .collect(),
+            deactivation_info: info.deactivation_info.map(Into::into),
+            election_configuration: info.election_configuration.map(Into::into),
+            last_completed_action_result,
+            durable_action_result,
         }))
     }
 
@@ -291,6 +311,25 @@ impl ReplicatorControl for ControlServer {
                 DurableReplicaAction::RemoveReplica {
                     replica_id: request.replica_id,
                     instance_id: crate::types::ReplicaInstanceId::new(request.instance_id),
+                }
+            }
+            Some(execute_durable_action_request::Action::OnDataLoss(request)) => {
+                DurableReplicaAction::OnDataLoss {
+                    epoch: request
+                        .expected_epoch
+                        .ok_or_else(|| Status::invalid_argument("missing data-loss epoch"))?
+                        .into(),
+                }
+            }
+            Some(execute_durable_action_request::Action::RecordElectionConfiguration(request)) => {
+                let configuration = request
+                    .configuration
+                    .ok_or_else(|| Status::invalid_argument("missing election configuration"))?;
+                DurableReplicaAction::RecordElectionConfiguration {
+                    configuration: crate::types::ReplicaElectionConfiguration::try_from(
+                        configuration,
+                    )
+                    .map_err(Status::invalid_argument)?,
                 }
             }
             None => return Err(Status::invalid_argument("missing durable action")),

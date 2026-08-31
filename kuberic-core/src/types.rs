@@ -106,6 +106,16 @@ pub struct StableReplicaSnapshot {
     pub id: ReplicaId,
     pub instance_id: ReplicaInstanceId,
     pub role: Role,
+    pub election_metadata: Option<StableReplicaElectionMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableReplicaElectionMetadata {
+    pub current_lsn: Lsn,
+    pub committed_lsn: Lsn,
+    pub first_retained_lsn: Lsn,
+    pub deactivation_epoch: Epoch,
+    pub deactivation_catch_up_lsn: Lsn,
 }
 
 /// Durable description of a complete committed partition topology.
@@ -191,9 +201,13 @@ pub struct ReplicaStatusInfo {
     pub role: Role,
     pub epoch: Epoch,
     pub current_progress: Lsn,
+    pub catch_up_capability: Option<Lsn>,
+    pub committed_lsn: Lsn,
     pub healthy: bool,
     pub write_status: AccessStatus,
     pub configuration: Option<ReplicaConfigurationStatus>,
+    pub election_configuration: Option<ReplicaElectionConfiguration>,
+    pub deactivation_info: Option<ReplicaDeactivationInfo>,
     pub last_completed_action: Option<DurableActionCompletion>,
     pub durable_action: Option<DurableActionObservation>,
     pub active_replica_connections: Vec<ReplicaConnectionStatus>,
@@ -275,9 +289,27 @@ impl ReplicaConfigurationStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaElectionConfiguration {
+    pub previous: Option<ReplicaConfigurationStatus>,
+    pub current: ReplicaConfigurationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaDeactivationInfo {
+    pub epoch: Epoch,
+    pub catch_up_lsn: Lsn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableActionResult {
+    DataLoss(DataLossAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableActionCompletion {
     pub action_id: String,
     pub signature: String,
+    pub result: Option<DurableActionResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +326,7 @@ pub struct DurableActionObservation {
     pub signature: String,
     pub state: DurableActionState,
     pub error: Option<String>,
+    pub result: Option<DurableActionResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +359,12 @@ pub enum DurableReplicaAction {
     RemoveReplica {
         replica_id: ReplicaId,
         instance_id: ReplicaInstanceId,
+    },
+    OnDataLoss {
+        epoch: Epoch,
+    },
+    RecordElectionConfiguration {
+        configuration: ReplicaElectionConfiguration,
     },
 }
 
@@ -364,8 +403,36 @@ impl DurableReplicaAction {
                 replica_id,
                 instance_id,
             } => format!("remove-replica:{replica_id}@{instance_id}"),
+            Self::OnDataLoss { epoch } => format!(
+                "on-data-loss:{}:{}",
+                epoch.data_loss_number, epoch.configuration_number
+            ),
+            Self::RecordElectionConfiguration { configuration } => format!(
+                "record-election-configuration:current={}:previous={}",
+                configuration_signature(&configuration.current),
+                configuration
+                    .previous
+                    .as_ref()
+                    .map(configuration_signature)
+                    .unwrap_or_else(|| "none".to_string())
+            ),
         }
     }
+}
+
+fn configuration_signature(configuration: &ReplicaConfigurationStatus) -> String {
+    let mut members = configuration
+        .members
+        .iter()
+        .map(|member| format!("{}@{}:{:?}", member.id, member.instance_id, member.role))
+        .collect::<Vec<_>>();
+    members.sort();
+    format!(
+        "{:?}:q{}[{}]",
+        configuration.mode,
+        configuration.write_quorum,
+        members.join(",")
+    )
 }
 
 fn config_signature(config: &ReplicaSetConfig) -> String {
@@ -498,5 +565,39 @@ mod durable_action_tests {
         assert_ne!(build.signature(), remove_old.signature());
         assert_ne!(remove_old.signature(), remove_new.signature());
         assert!(build.signature().contains("7@new"));
+    }
+
+    #[test]
+    fn data_loss_and_election_configuration_signatures_include_all_inputs() {
+        let epoch = Epoch::new(3, 9);
+        assert_eq!(
+            DurableReplicaAction::OnDataLoss { epoch }.signature(),
+            "on-data-loss:3:9"
+        );
+
+        let current = ReplicaConfigurationStatus {
+            mode: ReplicaConfigurationMode::Current,
+            members: vec![ReplicaConfigurationMemberStatus {
+                id: 1,
+                instance_id: ReplicaInstanceId::new("one"),
+                role: Role::Primary,
+            }],
+            write_quorum: 1,
+        };
+        let without_previous = DurableReplicaAction::RecordElectionConfiguration {
+            configuration: ReplicaElectionConfiguration {
+                previous: None,
+                current: current.clone(),
+            },
+        };
+        let with_previous = DurableReplicaAction::RecordElectionConfiguration {
+            configuration: ReplicaElectionConfiguration {
+                previous: Some(current.clone()),
+                current,
+            },
+        };
+
+        assert_ne!(without_previous.signature(), with_previous.signature());
+        assert!(with_previous.signature().contains("one"));
     }
 }

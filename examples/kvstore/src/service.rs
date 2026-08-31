@@ -9,11 +9,27 @@ use tracing::info;
 use crate::server::run_client_server;
 use crate::state::{KvOp, SharedState, drain_stream};
 
+#[derive(Debug, Clone, Default)]
+pub enum DataLossBehavior {
+    #[default]
+    NoStateChange,
+    StateChanged,
+    Fail(String),
+    Delay {
+        duration: std::time::Duration,
+        state_changed: bool,
+    },
+}
+
 /// Handle a single state provider event.
 ///
 /// This is the KV service's "state provider" — the replicator calls these
 /// during copy, catchup, and reconfiguration. Matches SF's IStateProvider.
-async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedState) {
+async fn handle_state_provider_event(
+    event: StateProviderEvent,
+    state: &SharedState,
+    data_loss_behavior: &DataLossBehavior,
+) {
     match event {
         StateProviderEvent::UpdateEpoch {
             previous_epoch_last_lsn,
@@ -107,8 +123,29 @@ async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedSt
             });
         }
         StateProviderEvent::OnDataLoss { reply } => {
-            info!("data loss reported, accepting state as-is");
-            let _ = reply.send(Ok(false));
+            let result = match data_loss_behavior {
+                DataLossBehavior::NoStateChange => Ok(false),
+                DataLossBehavior::StateChanged => Ok(true),
+                DataLossBehavior::Fail(message) => {
+                    Err(kuberic_core::KubericError::Internal(message.clone().into()))
+                }
+                DataLossBehavior::Delay {
+                    duration,
+                    state_changed,
+                } => {
+                    tokio::time::sleep(*duration).await;
+                    Ok(*state_changed)
+                }
+            };
+            match &result {
+                Ok(state_changed) => {
+                    info!(state_changed, "data loss callback completed");
+                }
+                Err(_) => {
+                    tracing::warn!("data loss callback failed");
+                }
+            }
+            let _ = reply.send(result);
         }
     }
 }
@@ -134,10 +171,27 @@ pub async fn run_service(
 
 /// Run the service with explicit WAL replicator options.
 pub async fn run_service_with_options(
+    lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
+    state: SharedState,
+    client_bind: String,
+    replicator_options: WalReplicatorOptions,
+) {
+    run_service_with_options_and_data_loss(
+        lifecycle_rx,
+        state,
+        client_bind,
+        replicator_options,
+        DataLossBehavior::default(),
+    )
+    .await;
+}
+
+pub async fn run_service_with_options_and_data_loss(
     mut lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
     state: SharedState,
     client_bind: String,
     replicator_options: WalReplicatorOptions,
+    data_loss_behavior: DataLossBehavior,
 ) {
     let mut partition = None;
     let mut replicator: Option<StateReplicatorHandle> = None;
@@ -311,7 +365,7 @@ pub async fn run_service_with_options(
                     None => std::future::pending().await,
                 }
             } => {
-                handle_state_provider_event(event, &state).await;
+                handle_state_provider_event(event, &state, &data_loss_behavior).await;
             },
 
             else => break,

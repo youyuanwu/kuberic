@@ -112,6 +112,7 @@ pub fn start_remove_replica(
         phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         pending_action: None,
         last_error: None,
+        failover: None,
     })
 }
 
@@ -630,6 +631,7 @@ fn pending_action(
         attempts,
         deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         last_error: None,
+        dispatch_authorized: false,
     })
 }
 
@@ -1131,16 +1133,19 @@ mod tests {
                     id: 1,
                     instance_id: "one".to_string(),
                     role: StableReplicaRoleStatus::Primary,
+                    election_metadata: None,
                 },
                 crate::crd::StableReplicaSnapshotStatus {
                     id: 2,
                     instance_id: "two".to_string(),
                     role: StableReplicaRoleStatus::ActiveSecondary,
+                    election_metadata: None,
                 },
                 crate::crd::StableReplicaSnapshotStatus {
                     id: 3,
                     instance_id: "three".to_string(),
                     role: StableReplicaRoleStatus::ActiveSecondary,
+                    election_metadata: None,
                 },
             ],
             write_quorum: 2,
@@ -1159,6 +1164,8 @@ mod tests {
                 role,
                 epoch: Epoch::new(1, 7),
                 current_progress: 10,
+                catch_up_capability: Some(10),
+                committed_lsn: 10,
                 healthy: true,
                 write_status: if role == Role::Primary {
                     AccessStatus::Granted
@@ -1166,6 +1173,8 @@ mod tests {
                     AccessStatus::NotPrimary
                 },
                 configuration,
+                election_configuration: None,
+                deactivation_info: None,
                 last_completed_action: None,
                 durable_action: None,
                 active_replica_connections: if role == Role::Primary {

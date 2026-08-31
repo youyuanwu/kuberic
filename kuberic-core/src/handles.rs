@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +29,7 @@ pub struct PartitionState {
     write_status: AtomicU8,
     current_progress: AtomicI64,
     catch_up_capability: AtomicI64,
+    catch_up_capability_known: AtomicBool,
     committed_lsn: AtomicI64,
     copy_lsn_map: Mutex<HashMap<ReplicaId, Lsn>>,
     active_replica_connections: Mutex<HashMap<ReplicaId, ReplicaInstanceId>>,
@@ -41,6 +42,7 @@ impl PartitionState {
             write_status: AtomicU8::new(AccessStatus::NotPrimary as u8),
             current_progress: AtomicI64::new(0),
             catch_up_capability: AtomicI64::new(0),
+            catch_up_capability_known: AtomicBool::new(false),
             committed_lsn: AtomicI64::new(0),
             copy_lsn_map: Mutex::new(HashMap::new()),
             active_replica_connections: Mutex::new(HashMap::new()),
@@ -65,6 +67,12 @@ impl PartitionState {
         self.catch_up_capability.load(Ordering::Acquire)
     }
 
+    pub fn observed_catch_up_capability(&self) -> Option<Lsn> {
+        self.catch_up_capability_known
+            .load(Ordering::Acquire)
+            .then(|| self.catch_up_capability())
+    }
+
     pub fn committed_lsn(&self) -> Lsn {
         self.committed_lsn.load(Ordering::Acquire)
     }
@@ -85,6 +93,8 @@ impl PartitionState {
 
     pub fn set_catch_up_capability(&self, lsn: Lsn) {
         self.catch_up_capability.store(lsn, Ordering::Release);
+        self.catch_up_capability_known
+            .store(true, Ordering::Release);
     }
 
     pub fn set_committed_lsn(&self, lsn: Lsn) {

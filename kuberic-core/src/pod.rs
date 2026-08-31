@@ -3,16 +3,17 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use tonic::transport::Server;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{KubericError, Result};
 use crate::events::{LifecycleEvent, ReplicatorControlEvent};
 use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
     AccessStatus, CancellationToken, DataLossAction, DurableActionCompletion,
-    DurableActionObservation, DurableActionState, DurableReplicaAction, Epoch, Lsn, OpenMode,
-    ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaId, ReplicaInfo,
-    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    DurableActionObservation, DurableActionResult, DurableActionState, DurableReplicaAction, Epoch,
+    Lsn, OpenMode, ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaDeactivationInfo,
+    ReplicaElectionConfiguration, ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
+    ReplicaSetQuorumMode, Role,
 };
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,11 +86,13 @@ pub struct StatusInfo {
     pub role: Role,
     pub epoch: Epoch,
     pub current_progress: Lsn,
-    pub catch_up_capability: Lsn,
+    pub catch_up_capability: Option<Lsn>,
     pub committed_lsn: Lsn,
     pub healthy: bool,
     pub write_status: AccessStatus,
     pub configuration: Option<ReplicaConfigurationStatus>,
+    pub election_configuration: Option<ReplicaElectionConfiguration>,
+    pub deactivation_info: Option<ReplicaDeactivationInfo>,
     pub last_completed_action: Option<DurableActionCompletion>,
     pub durable_action: Option<DurableActionObservation>,
     pub active_replica_connections: Vec<crate::types::ReplicaConnectionStatus>,
@@ -111,6 +114,8 @@ pub struct PodRuntime {
     instance_id: ReplicaInstanceId,
     data_bind: String,
     configuration: Option<ReplicaConfigurationStatus>,
+    election_configuration: Option<ReplicaElectionConfiguration>,
+    deactivation_info: Arc<Mutex<Option<ReplicaDeactivationInfo>>>,
     durable_action: Arc<Mutex<Option<DurableActionObservation>>>,
 }
 
@@ -210,6 +215,8 @@ impl PodRuntimeBuilder {
             instance_id: self.instance_id,
             data_bind: self.data_bind,
             configuration: None,
+            election_configuration: None,
+            deactivation_info: Arc::new(Mutex::new(None)),
             durable_action: Arc::new(Mutex::new(None)),
         };
 
@@ -358,6 +365,7 @@ impl PodRuntime {
                             DurableActionCompletion {
                                 action_id: action.action_id.clone(),
                                 signature: action.signature.clone(),
+                                result: action.result,
                             }
                         })
                     });
@@ -366,12 +374,15 @@ impl PodRuntime {
                         role: self.role,
                         epoch: self.epoch,
                         current_progress: handle.map_or(0, |h| h.state().current_progress()),
-                        catch_up_capability: handle.map_or(0, |h| h.state().catch_up_capability()),
+                        catch_up_capability: handle
+                            .and_then(|h| h.state().observed_catch_up_capability()),
                         committed_lsn: handle.map_or(0, |h| h.state().committed_lsn()),
                         healthy: handle.is_some(),
                         write_status: handle
                             .map_or(AccessStatus::NotPrimary, |h| h.state().write_status()),
                         configuration: self.configuration.clone(),
+                        election_configuration: self.election_configuration.clone(),
+                        deactivation_info: *self.deactivation_info.lock().unwrap(),
                         last_completed_action,
                         durable_action,
                         active_replica_connections: handle
@@ -438,7 +449,7 @@ impl PodRuntime {
 
         self.set_durable_action(&action_id, &signature, DurableActionState::Scheduled, None);
 
-        if let DurableReplicaAction::BuildReplica { replica } = action {
+        if let DurableReplicaAction::BuildReplica { replica } = action.clone() {
             let handle = match self.require_handle() {
                 Ok(handle) => handle.clone(),
                 Err(error) => {
@@ -483,6 +494,110 @@ impl PodRuntime {
                         DurableActionState::Failed,
                         Some(error.to_string()),
                     ),
+                }
+            });
+            return Ok(());
+        }
+
+        if let DurableReplicaAction::OnDataLoss { epoch } = action.clone() {
+            if self.epoch != epoch {
+                let error = KubericError::Internal(
+                    format!(
+                        "data-loss action epoch {:?} does not match runtime epoch {:?}",
+                        epoch, self.epoch
+                    )
+                    .into(),
+                );
+                self.set_durable_action(
+                    &action_id,
+                    &signature,
+                    DurableActionState::Failed,
+                    Some(error.to_string()),
+                );
+                warn!(
+                    action_id,
+                    expected_epoch = ?epoch,
+                    runtime_epoch = ?self.epoch,
+                    "rejecting durable data-loss action at mismatched epoch"
+                );
+                return Err(error);
+            }
+
+            let handle = match self.require_handle() {
+                Ok(handle) => handle.clone(),
+                Err(error) => {
+                    self.set_durable_action(
+                        &action_id,
+                        &signature,
+                        DurableActionState::Failed,
+                        Some(error.to_string()),
+                    );
+                    return Err(error);
+                }
+            };
+            let durable_action = self.durable_action.clone();
+            let action_id_for_task = action_id.clone();
+            let signature_for_task = signature.clone();
+            let reply_timeout = self.reply_timeout;
+            let deactivation_info = self.deactivation_info.clone();
+            info!(
+                action_id,
+                expected_epoch = ?epoch,
+                "scheduling durable data-loss callback"
+            );
+            tokio::spawn(async move {
+                debug!(action_id = %action_id_for_task, "durable data-loss callback in progress");
+                Self::set_durable_action_state(
+                    &durable_action,
+                    &action_id_for_task,
+                    &signature_for_task,
+                    DurableActionState::InProgress,
+                    None,
+                );
+                let result = handle
+                    .send_control(
+                        |reply| ReplicatorControlEvent::OnDataLoss {
+                            expected_epoch: Some(epoch),
+                            reply,
+                        },
+                        reply_timeout,
+                    )
+                    .await;
+                match result {
+                    Ok(result) => {
+                        if result == DataLossAction::StateChanged {
+                            *deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+                                epoch,
+                                catch_up_lsn: handle.state().committed_lsn(),
+                            });
+                        }
+                        info!(
+                            action_id = %action_id_for_task,
+                            state_changed = result == DataLossAction::StateChanged,
+                            "durable data-loss callback completed"
+                        );
+                        Self::set_durable_action_state_with_result(
+                            &durable_action,
+                            &action_id_for_task,
+                            &signature_for_task,
+                            DurableActionState::Completed,
+                            None,
+                            Some(DurableActionResult::DataLoss(result)),
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            action_id = %action_id_for_task,
+                            "durable data-loss callback failed"
+                        );
+                        Self::set_durable_action_state(
+                            &durable_action,
+                            &action_id_for_task,
+                            &signature_for_task,
+                            DurableActionState::Failed,
+                            Some(error.to_string()),
+                        );
+                    }
                 }
             });
             return Ok(());
@@ -567,7 +682,13 @@ impl PodRuntime {
                 })
                 .await
             }
-            DurableReplicaAction::BuildReplica { .. } => unreachable!(),
+            DurableReplicaAction::RecordElectionConfiguration { configuration } => {
+                self.election_configuration = Some(configuration);
+                Ok(())
+            }
+            DurableReplicaAction::BuildReplica { .. } | DurableReplicaAction::OnDataLoss { .. } => {
+                unreachable!()
+            }
         };
 
         match &result {
@@ -598,6 +719,7 @@ impl PodRuntime {
         if self.replicator_handle.is_some() {
             return Err(KubericError::Internal("already opened".into()));
         }
+        self.reset_lifecycle_evidence_for_open();
 
         // 1. Send OpenContext to user, receive ReplicatorHandle back
         let (fault_tx, _fault_rx) = mpsc::channel(4);
@@ -631,6 +753,14 @@ impl PodRuntime {
         // 3. Store handle for future lifecycle calls
         self.replicator_handle = Some(handle);
         Ok(())
+    }
+
+    fn reset_lifecycle_evidence_for_open(&mut self) {
+        self.role = Role::Unknown;
+        self.epoch = Epoch::default();
+        self.configuration = None;
+        self.election_configuration = None;
+        *self.deactivation_info.lock().unwrap() = None;
     }
 
     async fn handle_change_role(&mut self, epoch: Epoch, new_role: Role) -> Result<()> {
@@ -676,10 +806,30 @@ impl PodRuntime {
 
         self.role = new_role;
         self.epoch = epoch;
+        if matches!(old_role, Role::Primary | Role::ActiveSecondary)
+            || matches!(new_role, Role::Primary | Role::ActiveSecondary)
+        {
+            let catch_up_lsn = self
+                .replicator_handle
+                .as_ref()
+                .map_or(0, |handle| handle.state().committed_lsn());
+            *self.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+                epoch,
+                catch_up_lsn,
+            });
+        }
         Ok(())
     }
 
     async fn handle_close(&mut self) -> Result<()> {
+        if matches!(self.role, Role::Primary | Role::ActiveSecondary)
+            && let Some(handle) = &self.replicator_handle
+        {
+            *self.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+                epoch: self.epoch,
+                catch_up_lsn: handle.state().committed_lsn(),
+            });
+        }
         if let Some(handle) = &self.replicator_handle {
             handle
                 .state()
@@ -716,11 +866,23 @@ impl PodRuntime {
         state: DurableActionState,
         error: Option<String>,
     ) {
+        Self::set_durable_action_state_with_result(slot, action_id, signature, state, error, None);
+    }
+
+    fn set_durable_action_state_with_result(
+        slot: &Arc<Mutex<Option<DurableActionObservation>>>,
+        action_id: &str,
+        signature: &str,
+        state: DurableActionState,
+        error: Option<String>,
+        result: Option<DurableActionResult>,
+    ) {
         *slot.lock().unwrap() = Some(DurableActionObservation {
             action_id: action_id.to_string(),
             signature: signature.to_string(),
             state,
             error,
+            result,
         });
     }
 
@@ -729,13 +891,26 @@ impl PodRuntime {
         self.send_replicator_control(|reply| ReplicatorControlEvent::UpdateEpoch { epoch, reply })
             .await?;
         self.epoch = epoch;
+        if matches!(self.role, Role::Primary | Role::ActiveSecondary) {
+            let catch_up_lsn = self
+                .replicator_handle
+                .as_ref()
+                .map_or(0, |handle| handle.state().committed_lsn());
+            *self.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+                epoch,
+                catch_up_lsn,
+            });
+        }
         Ok(())
     }
 
     async fn handle_on_data_loss(&mut self) -> Result<DataLossAction> {
         // Route through replicator — it handles dual-query (replicator + user)
-        self.send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss { reply })
-            .await
+        self.send_replicator_control(|reply| ReplicatorControlEvent::OnDataLoss {
+            expected_epoch: None,
+            reply,
+        })
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -964,5 +1139,38 @@ mod tests {
         user_handle.await.unwrap();
 
         runtime_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_reset_clears_incarnation_local_evidence() {
+        let bundle = PodRuntime::builder(1).build().await.unwrap();
+        let mut runtime = bundle.runtime;
+        runtime.role = Role::Primary;
+        runtime.epoch = Epoch::new(2, 3);
+        runtime.election_configuration = Some(ReplicaElectionConfiguration {
+            previous: None,
+            current: ReplicaConfigurationStatus {
+                mode: ReplicaConfigurationMode::Current,
+                members: vec![crate::types::ReplicaConfigurationMemberStatus {
+                    id: 1,
+                    instance_id: runtime.instance_id.clone(),
+                    role: Role::Primary,
+                }],
+                write_quorum: 1,
+            },
+        });
+        *runtime.deactivation_info.lock().unwrap() = Some(ReplicaDeactivationInfo {
+            epoch: runtime.epoch,
+            catch_up_lsn: 8,
+        });
+
+        runtime.reset_lifecycle_evidence_for_open();
+
+        assert_eq!(runtime.role, Role::Unknown);
+        assert_eq!(runtime.epoch, Epoch::default());
+        assert!(runtime.configuration.is_none());
+        assert!(runtime.election_configuration.is_none());
+        assert!(runtime.deactivation_info.lock().unwrap().is_none());
+        runtime.shutdown.cancel();
     }
 }

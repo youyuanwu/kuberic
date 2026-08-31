@@ -331,8 +331,11 @@ impl KubericRuntime {
     }
 
     pub async fn on_data_loss(&self) -> Result<crate::types::DataLossAction> {
-        self.send_control(|reply| ReplicatorControlEvent::OnDataLoss { reply })
-            .await
+        self.send_control(|reply| ReplicatorControlEvent::OnDataLoss {
+            expected_epoch: None,
+            reply,
+        })
+        .await
     }
 
     // -----------------------------------------------------------------------

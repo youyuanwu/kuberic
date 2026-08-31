@@ -14,8 +14,24 @@ use crate::frames::WalFrameSet;
 use crate::server::run_client_server;
 use crate::state::SharedState;
 
+#[derive(Debug, Clone, Default)]
+pub enum DataLossBehavior {
+    #[default]
+    NoStateChange,
+    StateChanged,
+    Fail(String),
+    Delay {
+        duration: std::time::Duration,
+        state_changed: bool,
+    },
+}
+
 /// Handle a single state provider event.
-async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedState) {
+async fn handle_state_provider_event(
+    event: StateProviderEvent,
+    state: &SharedState,
+    data_loss_behavior: &DataLossBehavior,
+) {
     match event {
         StateProviderEvent::UpdateEpoch {
             previous_epoch_last_lsn,
@@ -106,8 +122,29 @@ async fn handle_state_provider_event(event: StateProviderEvent, state: &SharedSt
             });
         }
         StateProviderEvent::OnDataLoss { reply } => {
-            info!("data loss reported, accepting state as-is");
-            let _ = reply.send(Ok(false));
+            let result = match data_loss_behavior {
+                DataLossBehavior::NoStateChange => Ok(false),
+                DataLossBehavior::StateChanged => Ok(true),
+                DataLossBehavior::Fail(message) => {
+                    Err(kuberic_core::KubericError::Internal(message.clone().into()))
+                }
+                DataLossBehavior::Delay {
+                    duration,
+                    state_changed,
+                } => {
+                    tokio::time::sleep(*duration).await;
+                    Ok(*state_changed)
+                }
+            };
+            match &result {
+                Ok(state_changed) => {
+                    info!(state_changed, "data loss callback completed");
+                }
+                Err(_) => {
+                    warn!("data loss callback failed");
+                }
+            }
+            let _ = reply.send(result);
         }
     }
 }
@@ -169,9 +206,24 @@ async fn drain_stream(
 
 /// Main service event loop.
 pub async fn run_service(
+    lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
+    state: SharedState,
+    client_bind: String,
+) {
+    run_service_with_data_loss(
+        lifecycle_rx,
+        state,
+        client_bind,
+        DataLossBehavior::default(),
+    )
+    .await;
+}
+
+pub async fn run_service_with_data_loss(
     mut lifecycle_rx: mpsc::Receiver<LifecycleEvent>,
     state: SharedState,
     client_bind: String,
+    data_loss_behavior: DataLossBehavior,
 ) {
     let mut partition = None;
     let mut replicator: Option<StateReplicatorHandle> = None;
@@ -369,7 +421,7 @@ pub async fn run_service(
                     None => std::future::pending().await,
                 }
             } => {
-                handle_state_provider_event(event, &state).await;
+                handle_state_provider_event(event, &state, &data_loss_behavior).await;
             },
 
             else => break,

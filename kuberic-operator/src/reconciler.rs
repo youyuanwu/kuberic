@@ -10,22 +10,29 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::ResourceExt;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
-use kuberic_core::types::{ReplicaId, ReplicaInstanceId, StablePartitionSnapshot};
+use kuberic_core::types::{
+    DurableReplicaAction, ReplicaConfigurationMemberStatus, ReplicaConfigurationMode,
+    ReplicaConfigurationStatus, ReplicaElectionConfiguration,
+};
+use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, StablePartitionSnapshot};
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
-    DurableAddMode, DurableOperationKind, DurableOperationPhase, DurableRemoveMode, EpochStatus,
-    KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus, Phase, ReconfigurationPhase,
-    StablePartitionSnapshotStatus, StableReplicaRoleStatus, StatusCondition,
+    DurableAddMode, DurableOperationKind, DurableOperationPhase, DurableRemoveMode, KubericSet,
+    KubericSetSpec, KubericSetStatus, MemberStatus, Phase, ReconfigurationPhase,
+    StablePartitionSnapshotStatus, StableReplicaElectionMetadataStatus, StableReplicaRoleStatus,
+    StatusCondition,
 };
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
-    RemoveReplicaTarget, ReplicaObservation, decide, decide_add_replica, decide_create_partition,
-    decide_remove_replica, fail_closed, operation_condition, record_activity_error,
-    start_add_replica, start_create_partition, start_remove_replica, start_switchover,
+    RemoveReplicaTarget, ReplicaObservation, adopt_replacement_before_confirmation, decide,
+    decide_add_replica, decide_create_partition, decide_failover, decide_remove_replica,
+    fail_closed, failover_action_for, failover_pending_label, operation_condition,
+    record_activity_error, record_observation, start_add_replica, start_create_partition,
+    start_failover, start_remove_replica, start_switchover,
 };
 
 /// Shared state across reconciliation loops.
@@ -110,6 +117,7 @@ pub async fn reconcile_set(
             DurableOperationKind::Switchover => Phase::Switchover,
             DurableOperationKind::AddReplica => Phase::AddingReplica,
             DurableOperationKind::RemoveReplica => Phase::RemovingReplica,
+            DurableOperationKind::Failover => Phase::FailingOver,
         };
         if current_phase != expected_phase {
             return Err(format!(
@@ -193,7 +201,7 @@ pub async fn reconcile_set(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(5)));
             }
 
-            info!(
+            debug!(
                 name,
                 "all pods ready, checkpointing durable partition creation"
             );
@@ -255,6 +263,90 @@ pub async fn reconcile_set(
                 .ok_or_else(|| {
                     format!("cannot recover {namespace}/{name}: stable snapshot is absent")
                 })?;
+            let stable_primary = persisted_snapshot
+                .members
+                .iter()
+                .find(|member| member.id == persisted_snapshot.primary_id)
+                .ok_or_else(|| "stable snapshot primary member is missing".to_string())?;
+            let primary_stale_before_topology = match current_pods
+                .iter()
+                .find(|(id, _, _)| *id == stable_primary.id)
+            {
+                None => true,
+                Some((_, instance_id, _)) if instance_id.as_str() != stable_primary.instance_id => {
+                    true
+                }
+                Some((_, _, pod)) if !is_pod_ready(pod) => true,
+                Some((_, _, pod)) => match api
+                    .create_replica_handle(stable_primary.id, pod, &set.spec)
+                    .await
+                {
+                    Ok(handle) => match handle.get_status().await {
+                        Ok(status) => {
+                            status.instance_id.as_str() != stable_primary.instance_id
+                                || status.epoch
+                                    != Epoch::new(
+                                        persisted_snapshot.epoch.data_loss_number,
+                                        persisted_snapshot.epoch.configuration_number,
+                                    )
+                                || status.role != kuberic_core::types::Role::Primary
+                        }
+                        Err(_) => true,
+                    },
+                    Err(_) => true,
+                },
+            };
+            if primary_stale_before_topology {
+                if set.spec.failover_delay < 0 {
+                    return Err("failoverDelay must be non-negative".to_string());
+                }
+                let now = unix_seconds();
+                let failing_since = set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.primary_failing_since.as_deref())
+                    .and_then(|value| value.parse::<i64>().ok());
+                if set.spec.failover_delay > 0
+                    && failing_since.is_none_or(|since| {
+                        now.saturating_sub(since) < i64::from(set.spec.failover_delay)
+                    })
+                {
+                    let status = KubericSetStatus {
+                        primary_failing_since: Some(failing_since.unwrap_or(now).to_string()),
+                        ..set.status.clone().unwrap_or_default()
+                    };
+                    api.patch_set_status(
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
+                let operation = start_failover(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    persisted_snapshot.clone(),
+                    stable_primary.id,
+                    set.spec.min_replicas as usize,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
+                    phase: Phase::FailingOver,
+                    operation: Some(operation.clone()),
+                    ..set.status.clone().unwrap_or_default()
+                };
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
 
             // Rebuild compensation deletes the failed candidate while keeping
             // the old stable identity. Recreate that ordinal so the durable
@@ -408,6 +500,93 @@ pub async fn reconcile_set(
             // never used as recovery input.
             let needs_recovery = !state.drivers.lock().await.contains_key(&set_key);
             if needs_recovery {
+                let primary_member = persisted_snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.id == persisted_snapshot.primary_id)
+                    .ok_or_else(|| "stable snapshot primary member is missing".to_string())?;
+                let primary_stale = match current_pods
+                    .iter()
+                    .find(|(id, _, _)| *id == primary_member.id)
+                {
+                    None => true,
+                    Some((_, instance_id, pod))
+                        if instance_id.as_str() != primary_member.instance_id =>
+                    {
+                        true
+                    }
+                    Some((_, _, pod)) if !is_pod_ready(pod) => true,
+                    Some((_, _, pod)) => {
+                        match api
+                            .create_replica_handle(primary_member.id, pod, &set.spec)
+                            .await
+                        {
+                            Ok(handle) => match handle.get_status().await {
+                                Ok(status) => {
+                                    status.instance_id.as_str() != primary_member.instance_id
+                                        || status.epoch
+                                            != Epoch::new(
+                                                persisted_snapshot.epoch.data_loss_number,
+                                                persisted_snapshot.epoch.configuration_number,
+                                            )
+                                        || status.role != kuberic_core::types::Role::Primary
+                                }
+                                Err(_) => true,
+                            },
+                            Err(_) => true,
+                        }
+                    }
+                };
+                if primary_stale {
+                    if set.spec.failover_delay < 0 {
+                        return Err("failoverDelay must be non-negative".to_string());
+                    }
+                    let now = unix_seconds();
+                    let failing_since = set
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.primary_failing_since.as_deref())
+                        .and_then(|value| value.parse::<i64>().ok());
+                    if set.spec.failover_delay > 0
+                        && failing_since.is_none_or(|since| {
+                            now.saturating_sub(since) < i64::from(set.spec.failover_delay)
+                        })
+                    {
+                        let status = KubericSetStatus {
+                            primary_failing_since: Some(failing_since.unwrap_or(now).to_string()),
+                            ..set.status.clone().unwrap_or_default()
+                        };
+                        api.patch_set_status(
+                            &namespace,
+                            &name,
+                            &status,
+                            set.metadata.resource_version.as_deref(),
+                        )
+                        .await?;
+                        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                    }
+                    let operation = start_failover(
+                        set.metadata.uid.as_deref().unwrap_or(&set_key),
+                        persisted_snapshot.clone(),
+                        primary_member.id,
+                        set.spec.min_replicas as usize,
+                        now,
+                    )?;
+                    let mut status = KubericSetStatus {
+                        phase: Phase::FailingOver,
+                        operation: Some(operation.clone()),
+                        ..set.status.clone().unwrap_or_default()
+                    };
+                    set_operation_condition(&mut status, operation_condition(&operation, now));
+                    api.patch_set_status(
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
                 let snapshot = StablePartitionSnapshot::try_from(persisted_snapshot)
                     .map_err(|error| format!("invalid stable snapshot: {error}"))?;
                 let mut handles: Vec<Box<dyn ReplicaHandle>> = Vec::new();
@@ -533,26 +712,70 @@ pub async fn reconcile_set(
             // Primary stale → failover (takes priority over everything)
             if primary_stale {
                 warn!(name, "primary unhealthy, initiating failover");
-                {
-                    let mut drivers = state.drivers.lock().await;
-                    let driver = drivers.get_mut(&set_key).unwrap();
-                    for &id in &stale_ids {
-                        info!(
-                            name,
-                            replica_id = id,
-                            "removing stale secondary before failover"
-                        );
-                        driver.remove_replica_from_driver(id);
-                    }
+                if set.spec.failover_delay < 0 {
+                    return Err("failoverDelay must be non-negative".to_string());
                 }
-                let status = KubericSetStatus {
+                let now = unix_seconds();
+                let failing_since = set
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.primary_failing_since.as_deref())
+                    .and_then(|value| value.parse::<i64>().ok());
+                if set.spec.failover_delay > 0
+                    && failing_since.is_none_or(|since| {
+                        now.saturating_sub(since) < i64::from(set.spec.failover_delay)
+                    })
+                {
+                    let status = KubericSetStatus {
+                        primary_failing_since: Some(failing_since.unwrap_or(now).to_string()),
+                        ..set.status.clone().unwrap_or_default()
+                    };
+                    api.patch_set_status(
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
+                let failed_primary_id = current_primary_id
+                    .ok_or_else(|| "stale partition has no primary ID".to_string())?;
+                let operation = start_failover(
+                    set.metadata.uid.as_deref().unwrap_or(&set_key),
+                    persisted_snapshot.clone(),
+                    failed_primary_id,
+                    set.spec.min_replicas as usize,
+                    now,
+                )?;
+                let mut status = KubericSetStatus {
                     phase: Phase::FailingOver,
+                    operation: Some(operation.clone()),
                     ..set.status.clone().unwrap_or_default()
                 };
-                persist_committed_status(
-                    api,
-                    state,
-                    &set_key,
+                set_operation_condition(&mut status, operation_condition(&operation, now));
+                api.patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await?;
+                state.drivers.lock().await.remove(&set_key);
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+
+            if set
+                .status
+                .as_ref()
+                .and_then(|status| status.primary_failing_since.as_ref())
+                .is_some()
+            {
+                let status = KubericSetStatus {
+                    primary_failing_since: None,
+                    ..set.status.clone().unwrap_or_default()
+                };
+                api.patch_set_status(
                     &namespace,
                     &name,
                     &status,
@@ -608,6 +831,12 @@ pub async fn reconcile_set(
 
             // --- Switchover check (only when all replicas are healthy) ---
             let target_primary = set.status.as_ref().and_then(|s| s.target_primary.clone());
+            info!(
+                name,
+                ?current_primary,
+                ?target_primary,
+                "evaluating switchover request"
+            );
             if let (Some(current), Some(target)) = (&current_primary, &target_primary)
                 && current != target
             {
@@ -736,80 +965,18 @@ pub async fn reconcile_set(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
 
+            if let Some(action) =
+                reconcile_stable_election_metadata(set, api, persisted_snapshot, &current_pods)
+                    .await?
+            {
+                return Ok(action);
+            }
+
             Ok(ReconcileAction::Requeue(Duration::from_secs(30)))
         }
 
         Phase::FailingOver => {
-            let mut drivers = state.drivers.lock().await;
-            let current_pods = checked_pods_by_id(&pods)?;
-
-            if let Some(driver) = drivers.get_mut(&set_key) {
-                validate_pod_handle_identities(driver, &current_pods, set.spec.replicas as usize)?;
-                if let Some(primary_id) = driver.primary_id() {
-                    let current_primary_name = pod_name_for_id(&current_pods, primary_id)
-                        .ok_or_else(|| {
-                            format!("current primary replica {primary_id} has no current pod")
-                        })?;
-                    info!(name, primary_id, "running driver failover");
-                    driver
-                        .failover(primary_id)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    let new_primary_id = driver.primary_id().unwrap();
-                    let new_primary_name = pod_name_for_id(&current_pods, new_primary_id)
-                        .ok_or_else(|| {
-                            format!("new primary replica {new_primary_id} has no current pod")
-                        })?;
-                    let epoch = driver.epoch();
-
-                    // Update labels
-                    let mut labels = BTreeMap::new();
-                    labels.insert("kuberic.io/role".to_string(), "primary".to_string());
-                    let _ = api
-                        .patch_pod_labels(&namespace, &new_primary_name, labels)
-                        .await;
-
-                    let mut labels = BTreeMap::new();
-                    labels.insert("kuberic.io/role".to_string(), "secondary".to_string());
-                    let _ = api
-                        .patch_pod_labels(&namespace, &current_primary_name, labels)
-                        .await;
-
-                    let members = build_member_status(&pods, &set.spec);
-                    let status = KubericSetStatus {
-                        epoch: EpochStatus {
-                            data_loss_number: epoch.data_loss_number,
-                            configuration_number: epoch.configuration_number,
-                        },
-                        current_primary: Some(new_primary_name.clone()),
-                        target_primary: Some(new_primary_name),
-                        phase: Phase::Healthy,
-                        reconfiguration_phase: ReconfigurationPhase::None,
-                        ready_replicas: ready_pods.len() as i32,
-                        replicas: pods.len() as i32,
-                        members,
-                        stable_snapshot: Some(snapshot_status(driver)?),
-                        operation: None,
-                        conditions: Vec::new(),
-                        primary_failing_since: None,
-                    };
-                    persist_committed_status(
-                        api,
-                        state,
-                        &set_key,
-                        &namespace,
-                        &name,
-                        &status,
-                        set.metadata.resource_version.as_deref(),
-                    )
-                    .await?;
-                }
-            } else {
-                warn!(name, "no driver state for failover, requeueing");
-            }
-
-            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+            reconcile_failover_operation(set, api, state, &pods, &ready_pods, &set_key).await
         }
 
         Phase::Switchover | Phase::AddingReplica | Phase::RemovingReplica => {
@@ -825,6 +992,899 @@ pub async fn reconcile_set(
 // ---------------------------------------------------------------------------
 
 type CurrentPod<'a> = (ReplicaId, ReplicaInstanceId, &'a Pod);
+
+async fn reconcile_stable_election_metadata(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    snapshot: &StablePartitionSnapshotStatus,
+    current_pods: &[CurrentPod<'_>],
+) -> Result<Option<ReconcileAction>, String> {
+    let existing = set
+        .status
+        .as_ref()
+        .and_then(|status| status.stable_election_metadata_refresh.clone());
+    if existing.is_none()
+        && snapshot
+            .members
+            .iter()
+            .all(|member| member.election_metadata.is_some())
+    {
+        return Ok(None);
+    }
+    let mut refresh = existing.unwrap_or(crate::crd::StableElectionMetadataRefreshStatus {
+        snapshot_epoch: snapshot.epoch.clone(),
+        next_member_index: 0,
+        completed_members: Vec::new(),
+        pending_action: None,
+    });
+    if refresh.snapshot_epoch != snapshot.epoch {
+        refresh = crate::crd::StableElectionMetadataRefreshStatus {
+            snapshot_epoch: snapshot.epoch.clone(),
+            next_member_index: 0,
+            completed_members: Vec::new(),
+            pending_action: None,
+        };
+    }
+    if snapshot.members.is_empty() {
+        return Ok(None);
+    }
+    let index = refresh.next_member_index as usize % snapshot.members.len();
+    refresh.next_member_index = index as u32;
+    let member = &snapshot.members[index];
+    let Some((_, instance_id, pod)) = current_pods.iter().find(|(id, _, _)| *id == member.id)
+    else {
+        return advance_metadata_refresh(set, api, refresh, snapshot.members.len()).await;
+    };
+    if instance_id.as_str() != member.instance_id {
+        return advance_metadata_refresh(set, api, refresh, snapshot.members.len()).await;
+    }
+    let Ok(handle) = api.create_replica_handle(member.id, pod, &set.spec).await else {
+        return advance_metadata_refresh(set, api, refresh, snapshot.members.len()).await;
+    };
+    let Ok(observed) = handle.get_status().await else {
+        return advance_metadata_refresh(set, api, refresh, snapshot.members.len()).await;
+    };
+    let expected = ReplicaElectionConfiguration {
+        previous: None,
+        current: ReplicaConfigurationStatus {
+            mode: ReplicaConfigurationMode::Current,
+            members: snapshot
+                .members
+                .iter()
+                .map(|member| ReplicaConfigurationMemberStatus {
+                    id: member.id,
+                    instance_id: ReplicaInstanceId::new(member.instance_id.clone()),
+                    role: match member.role {
+                        StableReplicaRoleStatus::Primary => kuberic_core::types::Role::Primary,
+                        StableReplicaRoleStatus::ActiveSecondary => {
+                            kuberic_core::types::Role::ActiveSecondary
+                        }
+                    },
+                })
+                .collect(),
+            write_quorum: snapshot.write_quorum,
+        },
+    };
+    let evidence_complete = observed.instance_id.as_str() == member.instance_id
+        && observed.epoch
+            == Epoch::new(
+                snapshot.epoch.data_loss_number,
+                snapshot.epoch.configuration_number,
+            )
+        && observed.election_configuration.as_ref() == Some(&expected)
+        && observed.catch_up_capability.is_some()
+        && observed.deactivation_info.is_some();
+    if evidence_complete {
+        let deactivation = observed.deactivation_info.unwrap();
+        let mut status = set.status.clone().unwrap_or_default();
+        let stable = status
+            .stable_snapshot
+            .as_mut()
+            .and_then(|snapshot| {
+                snapshot
+                    .members
+                    .iter_mut()
+                    .find(|stable| stable.id == member.id)
+            })
+            .ok_or_else(|| "stable metadata refresh member disappeared".to_string())?;
+        stable.election_metadata = Some(StableReplicaElectionMetadataStatus {
+            current_lsn: observed.current_progress,
+            committed_lsn: observed.committed_lsn,
+            first_retained_lsn: observed.catch_up_capability.unwrap(),
+            deactivation_epoch: crate::crd::EpochStatus {
+                data_loss_number: deactivation.epoch.data_loss_number,
+                configuration_number: deactivation.epoch.configuration_number,
+            },
+            deactivation_catch_up_lsn: deactivation.catch_up_lsn,
+        });
+        if !refresh.completed_members.contains(&member.id) {
+            refresh.completed_members.push(member.id);
+            refresh.completed_members.sort_unstable();
+        }
+        refresh.next_member_index = (refresh.next_member_index + 1) % snapshot.members.len() as u32;
+        refresh.pending_action = None;
+        status.stable_election_metadata_refresh =
+            (refresh.completed_members.len() < snapshot.members.len()).then_some(refresh);
+        api.patch_set_status(
+            &set.namespace().unwrap_or_default(),
+            &set.name_any(),
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await?;
+        return Ok(Some(ReconcileAction::Requeue(Duration::from_secs(1))));
+    }
+
+    if let Some(pending) = &refresh.pending_action
+        && pending.dispatch_authorized
+    {
+        let terminal_action = observed.durable_action.as_ref().is_some_and(|action| {
+            action.action_id == pending.action_id
+                && matches!(
+                    action.state,
+                    kuberic_core::types::DurableActionState::Completed
+                        | kuberic_core::types::DurableActionState::Failed
+                )
+        }) || observed
+            .last_completed_action
+            .as_ref()
+            .is_some_and(|action| action.action_id == pending.action_id);
+        if terminal_action
+            || observed.election_configuration.as_ref() == Some(&expected)
+            || unix_seconds() >= pending.deadline_unix_seconds
+        {
+            return advance_metadata_refresh(set, api, refresh, snapshot.members.len()).await;
+        }
+    }
+
+    if refresh.pending_action.is_none() {
+        let topology_key = snapshot
+            .members
+            .iter()
+            .map(|member| format!("{}@{}", member.id, member.instance_id))
+            .collect::<Vec<_>>()
+            .join(",");
+        refresh.pending_action = Some(crate::crd::PendingActionStatus {
+            action_id: format!(
+                "stable-election-metadata:{}:{}:{}:{}",
+                snapshot.epoch.data_loss_number,
+                snapshot.epoch.configuration_number,
+                topology_key,
+                member.id
+            ),
+            sequence: refresh.next_member_index,
+            kind: crate::crd::DurableActionKind::FailoverRecordElectionConfiguration,
+            target_id: member.id,
+            target_instance_id: member.instance_id.clone(),
+            expected_epoch: snapshot.epoch.clone(),
+            desired_postcondition: crate::crd::DurablePostconditionStatus {
+                kind: crate::crd::DurablePostconditionKind::ElectionConfiguration,
+                role: Some(member.role),
+            },
+            attempts: 0,
+            deadline_unix_seconds: unix_seconds() + crate::durable::ACTION_DEADLINE_SECONDS,
+            last_error: None,
+            dispatch_authorized: false,
+        });
+        let mut status = set.status.clone().unwrap_or_default();
+        status.stable_election_metadata_refresh = Some(refresh);
+        api.patch_set_status(
+            &set.namespace().unwrap_or_default(),
+            &set.name_any(),
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await?;
+        return Ok(Some(ReconcileAction::Requeue(Duration::from_secs(1))));
+    }
+    if !refresh.pending_action.as_ref().unwrap().dispatch_authorized {
+        let pending = refresh.pending_action.as_mut().unwrap();
+        pending.dispatch_authorized = true;
+        pending.attempts = pending.attempts.saturating_add(1);
+        let mut status = set.status.clone().unwrap_or_default();
+        status.stable_election_metadata_refresh = Some(refresh);
+        api.patch_set_status(
+            &set.namespace().unwrap_or_default(),
+            &set.name_any(),
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await?;
+        return Ok(Some(ReconcileAction::Requeue(Duration::from_secs(1))));
+    }
+    let pending = refresh.pending_action.as_ref().unwrap();
+    let _ = handle
+        .execute_durable_action(
+            &pending.action_id,
+            DurableReplicaAction::RecordElectionConfiguration {
+                configuration: expected,
+            },
+        )
+        .await;
+    Ok(Some(ReconcileAction::Requeue(Duration::from_secs(1))))
+}
+
+async fn advance_metadata_refresh(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    mut refresh: crate::crd::StableElectionMetadataRefreshStatus,
+    member_count: usize,
+) -> Result<Option<ReconcileAction>, String> {
+    refresh.pending_action = None;
+    refresh.next_member_index = (refresh.next_member_index + 1) % member_count as u32;
+    let mut status = set.status.clone().unwrap_or_default();
+    status.stable_election_metadata_refresh = Some(refresh);
+    api.patch_set_status(
+        &set.namespace().unwrap_or_default(),
+        &set.name_any(),
+        &status,
+        set.metadata.resource_version.as_deref(),
+    )
+    .await?;
+    Ok(Some(ReconcileAction::Requeue(Duration::from_secs(1))))
+}
+
+async fn reconcile_failover_operation(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+    ready_pods: &[&Pod],
+    set_key: &str,
+) -> Result<ReconcileAction, String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let operation = set
+        .status
+        .as_ref()
+        .and_then(|status| status.operation.clone())
+        .ok_or_else(|| "failover phase has no durable operation".to_string())?;
+    if operation.kind != DurableOperationKind::Failover {
+        return Err("FailingOver phase has a non-failover operation".to_string());
+    }
+    let current_pods = checked_pods_by_id(pods)?;
+    let now = unix_seconds();
+    let failover = operation
+        .failover
+        .as_ref()
+        .ok_or_else(|| "failover operation has no checkpoint".to_string())?;
+
+    let mut configured_members = BTreeMap::new();
+    if let Some(previous) = &failover.previous_configuration {
+        for member in previous.members.iter().filter(|member| !member.dropped) {
+            configured_members.insert(member.id, member);
+        }
+    }
+    for member in failover
+        .current_configuration
+        .members
+        .iter()
+        .filter(|member| !member.dropped)
+    {
+        configured_members.insert(member.id, member);
+    }
+    for member in configured_members.into_values() {
+        let Some((_, instance_id, _)) = current_pods.iter().find(|(id, _, _)| *id == member.id)
+        else {
+            continue;
+        };
+        if instance_id.as_str() != member.instance_id {
+            let next = if !failover.target_confirmed {
+                adopt_replacement_before_confirmation(
+                    &operation,
+                    member.id,
+                    instance_id.as_str(),
+                    now,
+                )?
+            } else if failover.promotion_committed && member.id != operation.target_primary_id {
+                if operation.target_snapshot.members.len().saturating_sub(1)
+                    < operation.minimum_committed_replicas.unwrap_or(1) as usize
+                {
+                    fail_closed(
+                        &operation,
+                        "post-promotion replacement would reduce target below minimum replicas",
+                    )
+                } else {
+                    let mut next = operation.clone();
+                    next.target_snapshot
+                        .members
+                        .retain(|target| target.id != member.id);
+                    next.target_snapshot.write_quorum =
+                        next.target_snapshot.members.len() as u32 / 2 + 1;
+                    let checkpoint = next.failover.as_mut().unwrap();
+                    checkpoint
+                        .current_configuration
+                        .members
+                        .retain(|target| target.id != member.id);
+                    checkpoint.current_configuration.write_quorum =
+                        checkpoint.current_configuration.members.len() as u32 / 2 + 1;
+                    checkpoint
+                        .observations
+                        .retain(|observation| observation.id != member.id);
+                    checkpoint
+                        .final_attestations
+                        .retain(|observation| observation.id != member.id);
+                    checkpoint.next_secondary_index = 0;
+                    checkpoint.next_configuration_index = 0;
+                    checkpoint.next_label_index = 0;
+                    checkpoint.next_attestation_index = 0;
+                    next.pending_action = None;
+                    next.phase = DurableOperationPhase::FailoverCatchUpConfiguration;
+                    next
+                }
+            } else {
+                fail_closed(
+                    &operation,
+                    &format!(
+                        "confirmed failover replica {} incarnation changed",
+                        member.id
+                    ),
+                )
+            };
+            return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+        }
+    }
+
+    let mut handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::new();
+    for (replica_id, _, pod) in &current_pods {
+        let relevant = failover
+            .current_configuration
+            .members
+            .iter()
+            .any(|member| member.id == *replica_id)
+            || failover
+                .previous_configuration
+                .as_ref()
+                .is_some_and(|configuration| {
+                    configuration
+                        .members
+                        .iter()
+                        .any(|member| member.id == *replica_id)
+                })
+            || operation
+                .target_snapshot
+                .members
+                .iter()
+                .any(|member| member.id == *replica_id);
+        if !relevant {
+            continue;
+        }
+        if let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await {
+            handles.insert(*replica_id, handle);
+        }
+    }
+
+    let probe_id = failover_probe_id(&operation);
+    let mut observations = OperationObservations::new();
+    if let Some(probe_id) = probe_id
+        && let Some(handle) = handles.get(&probe_id)
+        && let Ok(status) = handle.get_status().await
+        && let Some((_, _, pod)) = current_pods.iter().find(|(id, _, _)| *id == probe_id)
+    {
+        observations.insert(
+            probe_id,
+            ReplicaObservation {
+                status,
+                replicator_address: handle.replicator_address(),
+                pod_name: pod.name_any(),
+                pod_role_label: pod
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kuberic.io/role"))
+                    .cloned(),
+            },
+        );
+    }
+
+    if matches!(
+        operation.phase,
+        DurableOperationPhase::FailoverCollect
+            | DurableOperationPhase::FailoverWaitForBestCandidate
+            | DurableOperationPhase::FailoverWaitForReadQuorum
+    ) && let Some(probe_id) = probe_id
+        && let Some(observation) = observations.get(&probe_id)
+    {
+        let was_waiting = matches!(
+            operation.phase,
+            DurableOperationPhase::FailoverWaitForBestCandidate
+                | DurableOperationPhase::FailoverWaitForReadQuorum
+        );
+        let mut next =
+            match record_observation(&operation, probe_id, &observation.status, false, now) {
+                Ok(next) => next,
+                Err(error) => fail_closed(&operation, &error),
+            };
+        if was_waiting && let Some(failover) = next.failover.as_mut() {
+            let wait_count = failover_wait_probe_ids(&operation).len();
+            if wait_count > 0 {
+                let prior = operation.failover.as_ref().unwrap().next_unavailable_index;
+                failover.next_unavailable_index = rotate_wait_probe_index(prior, wait_count);
+            }
+        }
+        return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+    }
+    if operation.phase == DurableOperationPhase::FailoverCollect
+        && let Some(probe_id) = probe_id
+        && !observations.contains_key(&probe_id)
+    {
+        let mut next = operation.clone();
+        let unavailable = &mut next.failover.as_mut().unwrap().unavailable_replicas;
+        if !unavailable.contains(&probe_id) {
+            unavailable.push(probe_id);
+            unavailable.sort_unstable();
+        }
+        return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+    }
+    if matches!(
+        operation.phase,
+        DurableOperationPhase::FailoverWaitForBestCandidate
+            | DurableOperationPhase::FailoverWaitForReadQuorum
+    ) && let Some(probe_id) = probe_id
+        && !observations.contains_key(&probe_id)
+    {
+        let mut next = operation.clone();
+        let wait_count = failover_wait_probe_ids(&operation).len();
+        let failover = next.failover.as_mut().unwrap();
+        if wait_count > 0 {
+            failover.next_unavailable_index =
+                rotate_wait_probe_index(failover.next_unavailable_index, wait_count);
+        }
+        return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+    }
+
+    if operation.phase == DurableOperationPhase::FailoverRefreshCandidate
+        && let Some(observation) = observations.get(&operation.target_primary_id)
+    {
+        if observation.status.epoch
+            != Epoch::new(
+                operation.target_snapshot.epoch.data_loss_number,
+                operation.target_snapshot.epoch.configuration_number,
+            )
+        {
+            let failed = fail_closed(&operation, "refreshed data-loss candidate has wrong epoch");
+            return persist_failover_operation(set, api, &failed, Duration::from_secs(10)).await;
+        }
+        let refreshed = &observation.status;
+        let refreshed_valid = refreshed.healthy
+            && matches!(
+                refreshed.role,
+                kuberic_core::types::Role::Primary | kuberic_core::types::Role::ActiveSecondary
+            )
+            && refreshed.catch_up_capability.is_some_and(|first| {
+                first <= refreshed.committed_lsn
+                    && refreshed.committed_lsn <= refreshed.current_progress
+            })
+            && refreshed.deactivation_info.is_some_and(|deactivation| {
+                deactivation.epoch
+                    == Epoch::new(
+                        operation.target_snapshot.epoch.data_loss_number,
+                        operation.target_snapshot.epoch.configuration_number,
+                    )
+            });
+        if !refreshed_valid {
+            let failed = fail_closed(
+                &operation,
+                "state-changing data-loss callback produced invalid candidate evidence",
+            );
+            return persist_failover_operation(set, api, &failed, Duration::from_secs(10)).await;
+        }
+        let mut next = match record_observation(
+            &operation,
+            operation.target_primary_id,
+            &observation.status,
+            false,
+            now,
+        ) {
+            Ok(next) => next,
+            Err(error) => fail_closed(&operation, &error),
+        };
+        if next.phase == DurableOperationPhase::Poisoned {
+            return persist_failover_operation(set, api, &next, Duration::from_secs(10)).await;
+        }
+        let deactivation = refreshed.deactivation_info.unwrap();
+        let member = next
+            .target_snapshot
+            .members
+            .iter_mut()
+            .find(|member| member.id == operation.target_primary_id)
+            .unwrap();
+        member.election_metadata = Some(StableReplicaElectionMetadataStatus {
+            current_lsn: refreshed.current_progress,
+            committed_lsn: refreshed.committed_lsn,
+            first_retained_lsn: refreshed.catch_up_capability.unwrap(),
+            deactivation_epoch: crate::crd::EpochStatus {
+                data_loss_number: deactivation.epoch.data_loss_number,
+                configuration_number: deactivation.epoch.configuration_number,
+            },
+            deactivation_catch_up_lsn: deactivation.catch_up_lsn,
+        });
+        next.phase = DurableOperationPhase::FailoverPromoteCandidate;
+        return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+    }
+
+    if operation.phase == DurableOperationPhase::FailoverAttest
+        && let Some(probe_id) = probe_id
+        && let Some(observation) = observations.get(&probe_id)
+    {
+        let next = match record_observation(&operation, probe_id, &observation.status, true, now) {
+            Ok(next) => next,
+            Err(error) => fail_closed(&operation, &error),
+        };
+        return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+    }
+
+    if operation.pending_action.as_ref().is_some_and(|pending| {
+        pending.kind == crate::crd::DurableActionKind::FailoverRecordStartingConfiguration
+            && !handles.contains_key(&pending.target_id)
+    }) {
+        let mut next = operation.clone();
+        next.pending_action = None;
+        next.failover.as_mut().unwrap().next_configuration_index += 1;
+        return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+    }
+
+    if operation.phase == DurableOperationPhase::FailoverLabelMembers
+        && operation
+            .pending_action
+            .as_ref()
+            .is_some_and(|pending| !pending.dispatch_authorized)
+    {
+        let (target_id, desired) = failover_pending_label(&operation)
+            .ok_or_else(|| "failover label phase has invalid pending action".to_string())?;
+        let current_label = current_pods
+            .iter()
+            .find(|(id, _, _)| *id == target_id)
+            .and_then(|(_, _, pod)| pod.metadata.labels.as_ref())
+            .and_then(|labels| labels.get("kuberic.io/role"))
+            .map(String::as_str);
+        let mut next = operation.clone();
+        if current_label == Some(desired) || !current_pods.iter().any(|(id, _, _)| *id == target_id)
+        {
+            next.pending_action = None;
+            next.failover.as_mut().unwrap().next_label_index += 1;
+        } else {
+            next.pending_action.as_mut().unwrap().dispatch_authorized = true;
+        }
+        return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+    }
+
+    if operation
+        .pending_action
+        .as_ref()
+        .is_some_and(|pending| pending.dispatch_authorized)
+    {
+        if let Some((target_id, role)) = failover_pending_label(&operation) {
+            let Some((_, _, pod)) = current_pods.iter().find(|(id, _, _)| *id == target_id) else {
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            };
+            if pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kuberic.io/role"))
+                .is_some_and(|current| current == role)
+            {
+                let mut next = operation.clone();
+                next.pending_action = None;
+                next.failover.as_mut().unwrap().next_label_index += 1;
+                return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
+            }
+            let mut labels = BTreeMap::new();
+            labels.insert("kuberic.io/role".to_string(), role.to_string());
+            let _ = api
+                .patch_pod_labels(&namespace, &pod.name_any(), labels)
+                .await;
+            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+        }
+        let mut probe_operation = operation.clone();
+        probe_operation
+            .pending_action
+            .as_mut()
+            .unwrap()
+            .dispatch_authorized = false;
+        let observed_decision = match decide_failover(&probe_operation, &observations, now) {
+            Ok(decision) => decision,
+            Err(error) => Decision::Persist(fail_closed(&operation, &error)),
+        };
+        let still_incomplete = matches!(
+            &observed_decision,
+            Decision::Persist(next)
+                if next.pending_action.as_ref().is_some_and(|pending| pending.dispatch_authorized)
+        );
+        if still_incomplete {
+            let pending = operation.pending_action.as_ref().unwrap();
+            let Some(handle) = handles.get(&pending.target_id) else {
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            };
+            let action = failover_action_for(&operation, pending, &handles)?;
+            let _ = handle
+                .execute_durable_action(&pending.action_id, action)
+                .await;
+            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+        }
+        return apply_failover_decision(
+            set,
+            api,
+            state,
+            pods,
+            ready_pods,
+            set_key,
+            &current_pods,
+            observed_decision,
+            now,
+        )
+        .await;
+    }
+
+    let decision = match decide_failover(&operation, &observations, now) {
+        Ok(decision) => decision,
+        Err(error) => Decision::Persist(fail_closed(&operation, &error)),
+    };
+    apply_failover_decision(
+        set,
+        api,
+        state,
+        pods,
+        ready_pods,
+        set_key,
+        &current_pods,
+        decision,
+        now,
+    )
+    .await
+}
+
+fn failover_probe_id(operation: &crate::crd::DurableOperationStatus) -> Option<i64> {
+    if let Some(pending) = &operation.pending_action {
+        return Some(pending.target_id);
+    }
+    let failover = operation.failover.as_ref()?;
+    match operation.phase {
+        DurableOperationPhase::FailoverCollect => next_unobserved_failover_member(failover),
+        DurableOperationPhase::FailoverWaitForBestCandidate
+        | DurableOperationPhase::FailoverWaitForReadQuorum => {
+            let probes = failover_wait_probe_ids(operation);
+            (!probes.is_empty()).then(|| {
+                let index = failover.next_unavailable_index as usize % probes.len();
+                probes[index]
+            })
+        }
+        DurableOperationPhase::FailoverRefreshCandidate => Some(operation.target_primary_id),
+        DurableOperationPhase::FailoverAttest => operation
+            .target_snapshot
+            .members
+            .iter()
+            .find(|member| {
+                !failover
+                    .final_attestations
+                    .iter()
+                    .any(|observation| observation.id == member.id)
+            })
+            .map(|member| member.id),
+        _ => None,
+    }
+}
+
+fn failover_wait_probe_ids(operation: &crate::crd::DurableOperationStatus) -> Vec<i64> {
+    let Some(failover) = operation.failover.as_ref() else {
+        return Vec::new();
+    };
+    let expected_epoch = operation
+        .previous_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.epoch.clone())
+        .unwrap_or_else(|| operation.target_snapshot.epoch.clone());
+    let mut probes = failover.unavailable_replicas.clone();
+    for observation in &failover.observations {
+        let eligible_role = matches!(observation.role.as_str(), "primary" | "activeSecondary");
+        let transient = eligible_role
+            && (observation.epoch != expected_epoch
+                || !observation.healthy
+                || observation.first_retained_lsn.is_none());
+        if transient && !probes.contains(&observation.id) {
+            probes.push(observation.id);
+        }
+    }
+    probes.sort_unstable();
+    probes
+}
+
+fn rotate_wait_probe_index(previous: u32, probe_count: usize) -> u32 {
+    debug_assert!(probe_count > 0);
+    previous.wrapping_add(1) % probe_count as u32
+}
+
+fn next_unobserved_failover_member(failover: &crate::crd::DurableFailoverStatus) -> Option<i64> {
+    let mut seen = HashSet::new();
+    failover
+        .previous_configuration
+        .iter()
+        .flat_map(|configuration| configuration.members.iter())
+        .chain(failover.current_configuration.members.iter())
+        .filter(|member| seen.insert(member.id))
+        .filter(|member| !member.dropped)
+        .find(|member| {
+            !failover
+                .observations
+                .iter()
+                .any(|observation| observation.id == member.id)
+                && !failover.unavailable_replicas.contains(&member.id)
+        })
+        .map(|member| member.id)
+}
+
+async fn persist_failover_operation(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    operation: &crate::crd::DurableOperationStatus,
+    requeue: Duration,
+) -> Result<ReconcileAction, String> {
+    let mut status = set.status.clone().unwrap_or_default();
+    status.operation = Some(operation.clone());
+    set_operation_condition(&mut status, operation_condition(operation, unix_seconds()));
+    api.patch_set_status(
+        &set.namespace().unwrap_or_default(),
+        &set.name_any(),
+        &status,
+        set.metadata.resource_version.as_deref(),
+    )
+    .await?;
+    Ok(ReconcileAction::Requeue(requeue))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_failover_decision(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+    ready_pods: &[&Pod],
+    set_key: &str,
+    current_pods: &[CurrentPod<'_>],
+    decision: Decision,
+    now: i64,
+) -> Result<ReconcileAction, String> {
+    match decision {
+        Decision::Persist(operation) => {
+            persist_failover_operation(set, api, &operation, Duration::from_secs(1)).await
+        }
+        Decision::CommitSnapshot {
+            operation,
+            snapshot,
+        } => {
+            let mut status = set.status.clone().unwrap_or_default();
+            status.epoch = snapshot.epoch.clone();
+            status.stable_snapshot = Some(snapshot);
+            status.operation = Some(operation.clone());
+            status.ready_replicas = ready_pods.len() as i32;
+            status.replicas = pods.len() as i32;
+            set_operation_condition(&mut status, operation_condition(&operation, now));
+            persist_committed_status(
+                api,
+                state,
+                set_key,
+                &set.namespace().unwrap_or_default(),
+                &set.name_any(),
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        Decision::Complete {
+            operation,
+            snapshot,
+            ..
+        } => {
+            let recovery_snapshot = snapshot.clone();
+            let primary_name = pod_name_for_id(current_pods, snapshot.primary_id)
+                .ok_or_else(|| "completed failover primary has no current pod".to_string())?;
+            let failover = operation
+                .failover
+                .as_ref()
+                .ok_or_else(|| "completed failover has no attestation".to_string())?;
+            let mut members = Vec::new();
+            for stable in &snapshot.members {
+                let observation = failover
+                    .final_attestations
+                    .iter()
+                    .find(|observation| observation.id == stable.id)
+                    .ok_or_else(|| {
+                        format!("replica {} lacks final status attestation", stable.id)
+                    })?;
+                let (_, _, pod) = current_pods
+                    .iter()
+                    .find(|(id, _, _)| *id == stable.id)
+                    .ok_or_else(|| format!("replica {} has no current pod", stable.id))?;
+                let pod_ip = pod
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.pod_ip.clone())
+                    .unwrap_or_default();
+                members.push(MemberStatus {
+                    name: pod.name_any(),
+                    id: stable.id,
+                    instance_id: stable.instance_id.clone(),
+                    role: if stable.id == snapshot.primary_id {
+                        "primary".to_string()
+                    } else {
+                        "secondary".to_string()
+                    },
+                    current_progress: observation.current_lsn,
+                    healthy: observation.healthy,
+                    control_address: format!("http://{}:{}", pod_ip, set.spec.control_port),
+                    data_address: format!("http://{}:{}", pod_ip, set.spec.data_port),
+                });
+            }
+            members.sort_by_key(|member| member.id);
+            let status = KubericSetStatus {
+                epoch: snapshot.epoch.clone(),
+                current_primary: Some(primary_name.clone()),
+                target_primary: Some(primary_name),
+                phase: Phase::Healthy,
+                reconfiguration_phase: ReconfigurationPhase::None,
+                ready_replicas: ready_pods.len() as i32,
+                replicas: pods.len() as i32,
+                members,
+                stable_snapshot: Some(snapshot),
+                operation: None,
+                conditions: Vec::new(),
+                primary_failing_since: None,
+                stable_election_metadata_refresh: None,
+            };
+            persist_committed_status(
+                api,
+                state,
+                set_key,
+                &set.namespace().unwrap_or_default(),
+                &set.name_any(),
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+            let core_snapshot = StablePartitionSnapshot::try_from(&recovery_snapshot)
+                .map_err(|error| format!("invalid completed failover snapshot: {error}"))?;
+            let mut recovery_handles = Vec::new();
+            for member in &recovery_snapshot.members {
+                let (_, _, pod) = current_pods
+                    .iter()
+                    .find(|(id, _, _)| *id == member.id)
+                    .ok_or_else(|| {
+                        format!(
+                            "completed failover replica {} has no current pod",
+                            member.id
+                        )
+                    })?;
+                recovery_handles.push(
+                    api.create_replica_handle(member.id, pod, &set.spec)
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "completed failover replica {} handle failed: {error}",
+                                member.id
+                            )
+                        })?,
+                );
+            }
+            let driver = PartitionDriver::recover(core_snapshot, recovery_handles)
+                .await
+                .map_err(|error| format!("completed failover recovery failed: {error}"))?;
+            state
+                .drivers
+                .lock()
+                .await
+                .insert(set_key.to_string(), driver);
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        Decision::Wait => Ok(ReconcileAction::Requeue(Duration::from_secs(1))),
+        Decision::Execute { .. }
+        | Decision::PatchPodRole { .. }
+        | Decision::DeletePod { .. }
+        | Decision::RestartCreation { .. } => {
+            Err("failover emitted an activity without persisted dispatch authorization".to_string())
+        }
+    }
+}
 
 async fn reconcile_durable_operation(
     set: &KubericSet,
@@ -878,6 +1938,7 @@ async fn reconcile_durable_operation(
             .cloned()
             .collect(),
         DurableOperationKind::RemoveReplica => operation.target_snapshot.members.clone(),
+        DurableOperationKind::Failover => Vec::new(),
     };
     let identity_error = identity_members.iter().find_map(|member| {
         match current_pods.iter().find(|(id, _, _)| *id == member.id) {
@@ -960,6 +2021,7 @@ async fn reconcile_durable_operation(
         DurableOperationKind::RemoveReplica => {
             decide_remove_replica(&operation, &observations, &pod_identities, now)
         }
+        DurableOperationKind::Failover => decide_failover(&operation, &observations, now),
     };
     let decision = match decision {
         Ok(decision) => decision,
@@ -1069,6 +2131,7 @@ async fn reconcile_durable_operation(
             operation,
             snapshot,
         } => {
+            let snapshot = snapshot_with_observed_metadata(snapshot, &observations);
             let mut status = set.status.clone().unwrap_or_default();
             status.epoch = snapshot.epoch.clone();
             status.ready_replicas = ready_pods.len() as i32;
@@ -1094,6 +2157,7 @@ async fn reconcile_durable_operation(
             snapshot,
             compensated: _,
         } => {
+            let snapshot = snapshot_with_observed_metadata(snapshot, &observations);
             let recovery_snapshot = snapshot.clone();
             let primary_name = pod_name_for_id(&current_pods, snapshot.primary_id)
                 .ok_or_else(|| "completed snapshot primary has no current pod".to_string())?;
@@ -1109,6 +2173,13 @@ async fn reconcile_durable_operation(
             status.stable_snapshot = Some(snapshot);
             status.operation = Some(operation.clone());
             status.primary_failing_since = None;
+            status.stable_election_metadata_refresh =
+                Some(crate::crd::StableElectionMetadataRefreshStatus {
+                    snapshot_epoch: status.epoch.clone(),
+                    next_member_index: 0,
+                    completed_members: Vec::new(),
+                    pending_action: None,
+                });
             set_operation_condition(&mut status, operation_condition(&operation, now));
             persist_committed_status(
                 api,
@@ -1384,6 +2455,43 @@ fn build_member_status_for_snapshot(
         }
     }
     members
+}
+
+fn snapshot_with_observed_metadata(
+    mut snapshot: StablePartitionSnapshotStatus,
+    observations: &OperationObservations,
+) -> StablePartitionSnapshotStatus {
+    for member in &mut snapshot.members {
+        let Some(observation) = observations.get(&member.id) else {
+            continue;
+        };
+        if observation.status.instance_id.as_str() != member.instance_id
+            || observation.status.epoch
+                != Epoch::new(
+                    snapshot.epoch.data_loss_number,
+                    snapshot.epoch.configuration_number,
+                )
+        {
+            continue;
+        }
+        let (Some(first_retained_lsn), Some(deactivation)) = (
+            observation.status.catch_up_capability,
+            observation.status.deactivation_info,
+        ) else {
+            continue;
+        };
+        member.election_metadata = Some(StableReplicaElectionMetadataStatus {
+            current_lsn: observation.status.current_progress,
+            committed_lsn: observation.status.committed_lsn,
+            first_retained_lsn,
+            deactivation_epoch: crate::crd::EpochStatus {
+                data_loss_number: deactivation.epoch.data_loss_number,
+                configuration_number: deactivation.epoch.configuration_number,
+            },
+            deactivation_catch_up_lsn: deactivation.catch_up_lsn,
+        });
+    }
+    snapshot
 }
 
 fn set_operation_condition(status: &mut KubericSetStatus, condition: StatusCondition) {

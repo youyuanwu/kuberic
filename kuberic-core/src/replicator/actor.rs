@@ -11,7 +11,7 @@ use crate::handles::PartitionState;
 use crate::replicator::primary::PrimarySender;
 use crate::replicator::queue::ReplicationQueue;
 use crate::replicator::quorum::{DEFAULT_QUORUM_TIMEOUT, QuorumTracker};
-use crate::types::{CancellationToken, DataLossAction, Epoch, Lsn, ReplicaId, Role};
+use crate::types::{CancellationToken, DataLossAction, Epoch, Lsn, OpenMode, ReplicaId, Role};
 
 /// The WalReplicator actor. Processes control and data events in a single
 /// loop with biased select (control has priority). The data path is
@@ -68,7 +68,41 @@ impl WalReplicatorActor {
                 event = control_rx.recv() => {
                     let Some(event) = event else { break };
                     match event {
-                        ReplicatorControlEvent::Open { reply, .. } => {
+                        ReplicatorControlEvent::Open { mode, reply } => {
+                            if mode == OpenMode::Existing {
+                                let (sp_tx, sp_rx) = tokio::sync::oneshot::channel();
+                                if state_provider_tx
+                                    .send(StateProviderEvent::GetLastCommittedLsn { reply: sp_tx })
+                                    .is_err()
+                                {
+                                    let _ = reply.send(Err(KubericError::Closed));
+                                    continue;
+                                }
+                                match tokio::time::timeout(Duration::from_secs(30), sp_rx).await {
+                                    Ok(Ok(Ok(lsn))) => {
+                                        state.set_current_progress(lsn);
+                                        state.set_catch_up_capability(lsn);
+                                        state.set_committed_lsn(lsn);
+                                        next_lsn = next_lsn.max(lsn.saturating_add(1));
+                                    }
+                                    Ok(Ok(Err(error))) => {
+                                        let _ = reply.send(Err(error));
+                                        continue;
+                                    }
+                                    Ok(Err(_)) => {
+                                        let _ = reply.send(Err(KubericError::Closed));
+                                        continue;
+                                    }
+                                    Err(_) => {
+                                        let _ = reply.send(Err(KubericError::Internal(
+                                            "state provider GetLastCommittedLsn timeout".into(),
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                state.set_catch_up_capability(0);
+                            }
                             info!(replica_id = self.replica_id, "replicator opened");
                             let _ = reply.send(Ok(()));
                         }
@@ -345,7 +379,21 @@ impl WalReplicatorActor {
                             );
                             let _ = reply.send(Ok(()));
                         }
-                        ReplicatorControlEvent::OnDataLoss { reply } => {
+                        ReplicatorControlEvent::OnDataLoss {
+                            expected_epoch,
+                            reply,
+                        } => {
+                            if expected_epoch.is_some_and(|expected| expected != epoch) {
+                                let _ = reply.send(Err(KubericError::Internal(
+                                    format!(
+                                        "data-loss expected epoch {:?} does not match actor epoch {:?}",
+                                        expected_epoch.unwrap(),
+                                        epoch
+                                    )
+                                    .into(),
+                                )));
+                                continue;
+                            }
                             // Forward to state provider, convert bool → DataLossAction
                             let (sp_tx, sp_rx) = tokio::sync::oneshot::channel();
                             if state_provider_tx.send(StateProviderEvent::OnDataLoss {
@@ -363,6 +411,48 @@ impl WalReplicatorActor {
                                     } else {
                                         DataLossAction::None
                                     };
+                                    if state_changed {
+                                        let (lsn_tx, lsn_rx) = tokio::sync::oneshot::channel();
+                                        if state_provider_tx
+                                            .send(StateProviderEvent::GetLastCommittedLsn {
+                                                reply: lsn_tx,
+                                            })
+                                            .is_err()
+                                        {
+                                            let _ = reply.send(Err(KubericError::Closed));
+                                            continue;
+                                        }
+                                        match tokio::time::timeout(Duration::from_secs(30), lsn_rx)
+                                            .await
+                                        {
+                                            Ok(Ok(Ok(lsn))) => {
+                                                state.set_current_progress(lsn);
+                                                state.set_catch_up_capability(lsn);
+                                                state.set_committed_lsn(lsn);
+                                                quorum_tracker
+                                                    .lock()
+                                                    .await
+                                                    .reset_progress_after_data_loss(lsn, lsn);
+                                                replication_queue.clear();
+                                                next_lsn = lsn.saturating_add(1);
+                                            }
+                                            Ok(Ok(Err(error))) => {
+                                                let _ = reply.send(Err(error));
+                                                continue;
+                                            }
+                                            Ok(Err(_)) => {
+                                                let _ = reply.send(Err(KubericError::Closed));
+                                                continue;
+                                            }
+                                            Err(_) => {
+                                                let _ = reply.send(Err(KubericError::Internal(
+                                                    "state provider progress refresh timeout"
+                                                        .into(),
+                                                )));
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     let _ = reply.send(Ok(action));
                                 }
                                 Ok(Ok(Err(e))) => { let _ = reply.send(Err(e)); }
@@ -455,7 +545,9 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use crate::events::{ReplicateRequest, ReplicatorControlEvent, StateProviderEvent};
-    use crate::types::{Epoch, ReplicaInfo, ReplicaSetConfig, ReplicaStatus, Role};
+    use crate::types::{
+        DataLossAction, Epoch, OpenMode, ReplicaInfo, ReplicaSetConfig, ReplicaStatus, Role,
+    };
 
     struct ActorHarness {
         control_tx: mpsc::Sender<ReplicatorControlEvent>,
@@ -526,6 +618,94 @@ mod tests {
             }
             receiver
         }
+    }
+
+    #[tokio::test]
+    async fn existing_open_and_state_changed_data_loss_refresh_progress() {
+        let mut harness = ActorHarness::start(Duration::from_secs(5)).await;
+
+        let (open_tx, open_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::Open {
+                mode: OpenMode::Existing,
+                reply: open_tx,
+            })
+            .await
+            .unwrap();
+        match harness.state_provider_rx.recv().await.unwrap() {
+            StateProviderEvent::GetLastCommittedLsn { reply } => {
+                reply.send(Ok(21)).unwrap();
+            }
+            _ => panic!("existing open did not query provider progress"),
+        }
+        open_rx.await.unwrap().unwrap();
+        assert_eq!(harness.state.current_progress(), 21);
+        assert_eq!(harness.state.catch_up_capability(), 21);
+        assert_eq!(harness.state.committed_lsn(), 21);
+
+        let (loss_tx, loss_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::OnDataLoss {
+                expected_epoch: Some(Epoch::new(1, 1)),
+                reply: loss_tx,
+            })
+            .await
+            .unwrap();
+        match harness.state_provider_rx.recv().await.unwrap() {
+            StateProviderEvent::OnDataLoss { reply } => reply.send(Ok(true)).unwrap(),
+            _ => panic!("data loss callback was not forwarded"),
+        }
+        match harness.state_provider_rx.recv().await.unwrap() {
+            StateProviderEvent::GetLastCommittedLsn { reply } => {
+                reply.send(Ok(7)).unwrap();
+            }
+            _ => panic!("state-changing data loss did not refresh progress"),
+        }
+        assert_eq!(
+            loss_rx.await.unwrap().unwrap(),
+            DataLossAction::StateChanged
+        );
+        assert_eq!(harness.state.current_progress(), 7);
+        assert_eq!(harness.state.catch_up_capability(), 7);
+        assert_eq!(harness.state.committed_lsn(), 7);
+    }
+
+    #[tokio::test]
+    async fn data_loss_epoch_is_checked_by_actor_before_provider_callback() {
+        let mut harness = ActorHarness::start(Duration::from_secs(5)).await;
+        let (epoch_tx, epoch_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::UpdateEpoch {
+                epoch: Epoch::new(1, 2),
+                reply: epoch_tx,
+            })
+            .await
+            .unwrap();
+        match harness.state_provider_rx.recv().await.unwrap() {
+            StateProviderEvent::UpdateEpoch { reply, .. } => reply.send(Ok(())).unwrap(),
+            _ => panic!("epoch update was not forwarded"),
+        }
+        epoch_rx.await.unwrap().unwrap();
+
+        let (loss_tx, loss_rx) = oneshot::channel();
+        harness
+            .control_tx
+            .send(ReplicatorControlEvent::OnDataLoss {
+                expected_epoch: Some(Epoch::new(1, 1)),
+                reply: loss_tx,
+            })
+            .await
+            .unwrap();
+        let error = loss_rx.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("does not match actor epoch"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), harness.state_provider_rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     fn three_replica_config() -> ReplicaSetConfig {

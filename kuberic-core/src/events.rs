@@ -36,6 +36,7 @@ pub enum ReplicatorControlEvent {
 
     // Primary-only reconfiguration commands
     OnDataLoss {
+        expected_epoch: Option<Epoch>,
         reply: oneshot::Sender<Result<DataLossAction>>,
     },
     UpdateCatchUpConfiguration {

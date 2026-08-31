@@ -94,6 +94,7 @@ pub fn start_add_replica(
             id: target_replica_id,
             instance_id: target_instance_id.clone(),
             role: StableReplicaRoleStatus::ActiveSecondary,
+            election_metadata: None,
         }),
     }
     target.members.sort_by_key(|member| member.id);
@@ -135,6 +136,7 @@ pub fn start_add_replica(
         phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         pending_action: None,
         last_error: None,
+        failover: None,
     })
 }
 
@@ -764,6 +766,7 @@ fn pending_action(
                 ACTION_DEADLINE_SECONDS
             },
         last_error: None,
+        dispatch_authorized: false,
     })
 }
 
@@ -1284,11 +1287,13 @@ mod tests {
                     id: 1,
                     instance_id: "primary".to_string(),
                     role: StableReplicaRoleStatus::Primary,
+                    election_metadata: None,
                 },
                 StableReplicaSnapshotStatus {
                     id: 2,
                     instance_id: "secondary".to_string(),
                     role: StableReplicaRoleStatus::ActiveSecondary,
+                    election_metadata: None,
                 },
             ],
             write_quorum: 2,
@@ -1307,6 +1312,8 @@ mod tests {
                 role,
                 epoch,
                 current_progress: 10,
+                catch_up_capability: Some(10),
+                committed_lsn: 10,
                 healthy: role != Role::Unknown,
                 write_status: if role == Role::Primary {
                     AccessStatus::Granted
@@ -1314,6 +1321,8 @@ mod tests {
                     AccessStatus::NotPrimary
                 },
                 configuration,
+                election_configuration: None,
+                deactivation_info: None,
                 last_completed_action: None,
                 durable_action: None,
                 active_replica_connections: Vec::new(),
@@ -1420,6 +1429,7 @@ mod tests {
             signature,
             state: DurableActionState::InProgress,
             error: None,
+            result: None,
         });
 
         assert!(matches!(
@@ -1475,6 +1485,7 @@ mod tests {
             signature: failed_signature,
             state: DurableActionState::Failed,
             error: Some("lost reply".to_string()),
+            result: None,
         });
 
         let Decision::Persist(next) = decide_add_replica(&operation, &observations, 20).unwrap()

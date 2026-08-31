@@ -89,6 +89,10 @@ pub trait ReplicaHandle: Send + Sync {
                 replica_id,
                 instance_id,
             } => self.remove_replica(replica_id, instance_id).await,
+            DurableReplicaAction::OnDataLoss { .. } => self.on_data_loss().await.map(|_| ()),
+            DurableReplicaAction::RecordElectionConfiguration { .. } => Err(
+                KubericError::Internal("election configuration observation is unsupported".into()),
+            ),
         }
     }
 }
@@ -393,6 +397,7 @@ impl PartitionDriver {
                 id,
                 instance_id: state.handle.instance_id(),
                 role: state.role,
+                election_metadata: None,
             });
         }
         members.sort_by_key(|member| member.id);
@@ -1596,7 +1601,10 @@ pub mod testing {
         async fn on_data_loss(&self) -> Result<DataLossAction> {
             let (tx, rx) = oneshot::channel();
             self.control_tx
-                .send(ReplicatorControlEvent::OnDataLoss { reply: tx })
+                .send(ReplicatorControlEvent::OnDataLoss {
+                    expected_epoch: None,
+                    reply: tx,
+                })
                 .await
                 .map_err(|_| KubericError::Closed)?;
             rx.await.map_err(|_| KubericError::Closed)?
@@ -1683,9 +1691,13 @@ pub mod testing {
                 role,
                 epoch,
                 current_progress: self.state.current_progress(),
+                catch_up_capability: self.state.observed_catch_up_capability(),
+                committed_lsn: self.state.committed_lsn(),
                 healthy: true,
                 write_status: self.state.write_status(),
                 configuration: None,
+                election_configuration: None,
+                deactivation_info: None,
                 last_completed_action: None,
                 durable_action: None,
                 active_replica_connections: Vec::new(),
@@ -1734,6 +1746,8 @@ mod tests {
                     role,
                     epoch,
                     current_progress: id,
+                    catch_up_capability: Some(id),
+                    committed_lsn: id,
                     healthy: true,
                     write_status: if role == Role::Primary {
                         AccessStatus::Granted
@@ -1741,6 +1755,8 @@ mod tests {
                         AccessStatus::NotPrimary
                     },
                     configuration: None,
+                    election_configuration: None,
+                    deactivation_info: None,
                     last_completed_action: None,
                     durable_action: None,
                     active_replica_connections: Vec::new(),
@@ -1793,7 +1809,7 @@ mod tests {
         }
 
         fn catch_up_capability(&self) -> Lsn {
-            self.status.current_progress
+            self.status.catch_up_capability.unwrap_or(0)
         }
 
         async fn on_data_loss(&self) -> Result<DataLossAction> {
@@ -1854,16 +1870,19 @@ mod tests {
                     id: 1,
                     instance_id: ReplicaInstanceId::new("one"),
                     role: Role::Primary,
+                    election_metadata: None,
                 },
                 StableReplicaSnapshot {
                     id: 2,
                     instance_id: ReplicaInstanceId::new("two"),
                     role: Role::ActiveSecondary,
+                    election_metadata: None,
                 },
                 StableReplicaSnapshot {
                     id: 3,
                     instance_id: ReplicaInstanceId::new("three"),
                     role: Role::ActiveSecondary,
+                    election_metadata: None,
                 },
             ],
             write_quorum: 2,

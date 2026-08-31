@@ -9,12 +9,18 @@ use crate::crd::{
 
 mod add_replica;
 mod create_partition;
+mod failover;
+pub mod failover_election;
 mod remove_replica;
 mod switchover;
 
 pub use add_replica::{decide_add_replica, start_add_replica};
 pub use create_partition::{
     CreatePartitionTarget, decide_create_partition, start_create_partition,
+};
+pub use failover::{
+    action_for as failover_action_for, adopt_replacement_before_confirmation, decide_failover,
+    pending_label as failover_pending_label, record_observation, start_failover,
 };
 pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
 pub use switchover::{decide, start_switchover};
@@ -100,6 +106,7 @@ pub fn operation_condition(operation: &DurableOperationStatus, now: i64) -> Stat
         DurableOperationKind::Switchover => "switchover",
         DurableOperationKind::AddReplica => "replica add/rebuild",
         DurableOperationKind::RemoveReplica => "replica removal",
+        DurableOperationKind::Failover => "failover",
     };
     let (status, reason, message) = match operation.phase {
         DurableOperationPhase::Completed => (
@@ -124,6 +131,29 @@ pub fn operation_condition(operation: &DurableOperationStatus, now: i64) -> Stat
                 .as_deref()
                 .unwrap_or("durable operation cannot advance safely")
                 .to_string(),
+        ),
+        DurableOperationPhase::FailoverWaitForBestCandidate => (
+            "True",
+            "WaitingForBestCandidate",
+            operation
+                .failover
+                .as_ref()
+                .and_then(|failover| failover.assessment.clone())
+                .unwrap_or_else(|| "waiting for the best eligible replica".to_string()),
+        ),
+        DurableOperationPhase::FailoverWaitForReadQuorum => (
+            "True",
+            "QuorumLoss",
+            operation
+                .failover
+                .as_ref()
+                .and_then(|failover| failover.assessment.clone())
+                .unwrap_or_else(|| "waiting for previous/current read quorum".to_string()),
+        ),
+        DurableOperationPhase::FailoverNotifyDataLoss => (
+            "True",
+            "DataLossNegotiation",
+            "advanced data-loss epoch is awaiting correlated callback completion".to_string(),
         ),
         _ => (
             "True",

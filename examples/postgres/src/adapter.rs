@@ -170,7 +170,7 @@ pub fn create_pg_replicator(
                     let _ = reply.send(Ok(()));
                 }
 
-                ReplicatorControlEvent::OnDataLoss { reply } => {
+                ReplicatorControlEvent::OnDataLoss { reply, .. } => {
                     let _ = reply.send(Ok(DataLossAction::None));
                 }
 
