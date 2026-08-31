@@ -35,8 +35,8 @@ and continues to work for its use cases.
 >   (synchronous quorum-confirmed), then queries surviving replicas
 >   for `received_lsn`, then computes `authority_lsn = max(received_lsn)`,
 >   then pushes `update_epoch{new_epoch, authority_lsn}`. Mirrors
->   Service Fabric A2 (`revoke_write_status`) and the existing
->   kuberic `driver.rs:340` failover pattern.
+>   Service Fabric A2 (`revoke_write_status`) and Kuberic's durable
+>   failover fence-before-observe pattern.
 > - **Single-op-in-flight serialization**: the Writer internally
 >   serializes `replicate()` calls via an actor (mpsc channel),
 >   preserving strict total ordering. Throughput is capped at
@@ -215,7 +215,7 @@ it):
 | `AccessStatus::NotPrimary` | `handles.rs:166` | Gate writes on non-primary |
 | `PrimarySender` | `primary.rs` | Primary → secondary fan-out |
 | `WalReplicatorActor` data path | `actor.rs:312-336` | LSN assignment, quorum, fan-out |
-| `revoke_write_status()` RPC | `grpc/server.rs` | Write revocation before switchover (A2) |
+| Correlated `RevokeWriteStatus` action | `replica_agent.rs`, `pod.rs` | Write revocation before switchover (A2) |
 | Switchover rollback (A3) | `pod.rs` | Re-promote old primary on failure |
 | SF Phase 4 epoch distribution | `pod.rs` | Primary distributes epoch to secondaries after promotion |
 | Primary election / failover | `kuberic-operator` | Elect new primary on failure |
@@ -988,7 +988,7 @@ with the old Writer's in-flight `Ok` returns. Instead:
 ```
 
 This mirrors Service Fabric's `revoke_write_status` (Phase 0) and
-the existing kuberic `driver.rs:340` failover pattern. The two
+Kuberic's durable failover fencing pattern. The two
 mechanisms (in-doubt contract + fence-first recovery) together
 provide response consistency without per-commit external state.
 
@@ -1799,8 +1799,8 @@ truncate an LSN the user already received `Ok` for. This is exactly
 the same response-consistency violation we set out to eliminate.
 
 The correct ordering mirrors Service Fabric's `revoke_write_status`
-(Phase 0) and the existing kuberic `driver.rs:340` failover
-pattern: fence the old epoch synchronously before sampling state.
+(Phase 0) and Kuberic's durable failover pattern: fence the old epoch
+synchronously before sampling state.
 
 #### Recovery Generation: Binding Mechanism Across Async Boundaries
 
@@ -2221,7 +2221,7 @@ for **latency + correctness**:
 |---|---|---|
 | Write latency (steady state) | 2 RTT (client→primary→secondary) | 1 RTT (Writer→replicas, in-cluster only) |
 | Throughput per partition | High (pipelined) | ~1/RTT (~1000 ops/sec at 1ms RTT) |
-| Failover latency | ~1 RTT (driver-orchestrated) | ~2 RTT (fence + query+update_epoch) |
+| Failover latency | Durable multi-reconcile workflow | ~2 RTT (fence + query+update_epoch) |
 | Correctness | Primary-as-replica authority | Authority approach + in-doubt contract |
 | External store per commit | None | None |
 | Writer-takeover frequency on quorum blip | N/A (operator-managed) | Configurable retry budget; PauseWrites for planned ops |
@@ -3087,13 +3087,10 @@ where epoch propagation to replicas is not atomic. A partitioned-
 but-alive "zombie" Writer could still send items to replicas that
 haven't yet received the epoch bump.
 
-**This is not a new problem.** The existing leader-based system has
-the same window during failover: the operator bumps
-`configuration_number`, pushes the new epoch to secondaries
-best-effort (`driver.rs:369` — logs a warning and continues if
-`update_epoch` fails on a secondary), and promotes the new primary.
-There is a window where the old primary can still reach
-not-yet-bumped secondaries.
+**This is not a new problem.** The existing leader-based system also needs
+old-primary isolation while durable failover applies a new epoch, commits the
+new authority, and converges retained secondaries. Unverifiable convergence
+fails closed rather than becoming a successful stable snapshot.
 
 The existing system accepts this because:
 - Epoch propagation is **in-cluster** (operator → replicas), so it's
@@ -3135,9 +3132,9 @@ is broken for the in-progress build.
 an in-memory `ReplicationQueue` (`queue.rs`). If the primary crashes
 during a build, the queue is lost. The existing system handles this
 by aborting the in-progress build: the operator detects primary
-failure, triggers failover, and the new primary restarts the build
-from scratch via `restart_secondary` → full `add_replica` (copy +
-build). The partially-built secondary is closed and rebuilt.
+failure, triggers durable failover, and the new primary restarts the build
+from scratch through durable add/rebuild. The partially-built secondary is
+closed and rebuilt.
 
 **The Writer system does the same thing:**
 1. Writer crashes → coordinator detects stream disconnect

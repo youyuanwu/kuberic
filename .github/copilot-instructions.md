@@ -17,15 +17,17 @@ cargo fmt                                      # format before committing
 
 - The `kuberic-tests` crate requires a K8s cluster — skip it in local dev.
 - All kvstore and sqlite tests use `#[serial]` (port contention).
-- The build buffer replay test (`operator_replication.rs`) takes ~7s (500+200 entries).
+- The high-fidelity KV reconciler suite is long-running; use focused filters
+  while iterating and run the full suite before review.
 
 ## Architecture
 
 ```
 kuberic-operator/     K8s operator (reconciler, CRD, ClusterApi)
 kuberic-core/         Core replication framework
-  driver.rs              PartitionDriver — SF RA equivalent, orchestrates lifecycle
-  pod.rs                 PodRuntime — per-pod runtime, hosts replicator + user service
+  driver.rs              PartitionDriver — read-only stable topology recovery
+  replica_agent.rs       ReplicaAgent — correlated admission/fencing/replay owner
+  pod.rs                 PodRuntime — ordered replicator + user-service effect executor
   replicator/
     actor.rs             WalReplicatorActor — single select loop, non-blocking
     primary.rs           PrimarySender — unbounded per-secondary channels
@@ -39,18 +41,18 @@ kuberic-core/         Core replication framework
   types.rs               Epoch, Role, Lsn, ReplicaInfo, etc.
 examples/kvstore/    Example KV store app using the framework
   src/testing.rs         Shared test utilities (KvPod, connect_kv_client)
-  tests/                 Integration tests (operator_basic, failover, replication, reconciler)
+  tests/                 Durable reconciler and data-loss integration tests
 examples/sqlite/     Example replicated SQLite DB using the framework
   src/testing.rs         Test utilities (SqlitePod, connect_sqlite_client)
-  tests/                 Integration tests (operator_basic, failover, replication)
+  tests/                 Correlated data-loss integration tests
 ```
 
 ## Key Design Patterns
 
 - **SF Phase 4 epoch distribution:** Epoch is sent to secondaries AFTER
   promotion (not before). Unreachable secondaries are skipped (best-effort).
-- **Write revocation (A2):** `revoke_write_status()` RPC on old primary
-  before switchover demotion. Matches SF SwapPrimary Phase 0.
+- **Write revocation (A2):** A correlated `RevokeWriteStatus` action on the
+  old primary precedes switchover demotion. Matches SF SwapPrimary Phase 0.
 - **Switchover rollback (A3):** If target promotion fails, re-promote old
   primary. Matches SF AbortPhase0Demote + RevertConfiguration.
 - **ReplicationQueue:** In-memory BTreeMap retains ops for replay to new
@@ -75,7 +77,7 @@ examples/sqlite/     Example replicated SQLite DB using the framework
 ## Conventions
 
 - Use `tracing` (info/warn/debug) — per-op traces at `debug!`, lifecycle at `info!`
-- `ReplicaHandle` trait abstracts gRPC vs in-process (testing) handles
+- `ReplicaHandle` exposes status plus one correlated mutation method
 - Tests use real gRPC (no mocks) via `KvPod` helper and `GrpcReplicaHandle`
 - `#[serial]` on all KV tests, `testing` feature flag for shared test utilities
 - Design gaps tracked in `design-gaps.md` with SF source citations

@@ -181,6 +181,25 @@ spec:
                       dispatchAuthorized:
                         type: boolean
                         default: false
+                      dispatchAgentGeneration:
+                        type: string
+                      dispatchAgentControlVersion:
+                        type: integer
+                        format: uint64
+                      dispatchObservedRuntimeEpoch:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      dispatchActionPayload:
+                        type: string
               members:
                 type: array
                 items:
@@ -827,6 +846,25 @@ spec:
                       dispatchAuthorized:
                         type: boolean
                         default: false
+                      dispatchAgentGeneration:
+                        type: string
+                      dispatchAgentControlVersion:
+                        type: integer
+                        format: uint64
+                      dispatchObservedRuntimeEpoch:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      dispatchActionPayload:
+                        type: string
                   failover:
                     type: object
                     required:

@@ -40,9 +40,9 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 │                      Kubernetes Cluster                          │
 │                                                                  │
 │  ┌──────────────────────┐                                        │
-│  │ Kuberic Operator  │   Watches: KubericSet CRD           │
-│  │ (future crate)       │   Uses: PartitionDriver + GrpcReplica- │
-│  │                      │   Handle to drive remote pods           │
+│  │ Kuberic Operator     │   Watches: KubericSet CRD             │
+│  │                      │   Uses: durable workflows +           │
+│  │                      │   GrpcReplicaHandle for remote pods   │
 │  └──────────┬───────────┘                                        │
 │             │ gRPC (ReplicatorControl)                           │
 │             ▼                                                    │
@@ -53,6 +53,7 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 │  │  │ Pod 1       │  │ Pod 2       │  │ Pod 3       │   │       │
 │  │  │ PRIMARY     │  │ ACTIVE SEC  │  │ ACTIVE SEC  │   │       │
 │  │  │             │  │             │  │             │   │       │
+│  │  │ ReplicaAgent│  │ ReplicaAgent│  │ ReplicaAgent│   │       │
 │  │  │ PodRuntime  │  │ PodRuntime  │  │ PodRuntime  │   │       │
 │  │  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │   │       │
 │  │  │ │Replicatr│◄├──├─┤Replicatr│ ├──├─┤Replicatr│ │   │       │
@@ -79,6 +80,7 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 | **No StatefulSets** | Operator manages Pods directly | LSN-based primary selection, per-instance control |
 | **Replicator is in-process** | Library linked into app, not sidecar | No coordination overhead, shared memory |
 | **Operator-managed membership** | Operator pushes ReplicaSetConfig | Dual-config quorum, must-catch-up markers, idle/active gating |
+| **Pod-local RA-lite boundary** | `ControlServer → ReplicaAgent → PodRuntime` | Agent owns local admission/fencing/correlation; runtime owns ordered effects |
 | **Event-based APIs** | Both replicator and user use mpsc channels | Owned `&mut` state, no `Arc<Mutex<...>>` |
 | **Dual-channel replicator** | Separate control (low-freq) and data (high-freq) channels | Control events don't block write path |
 | **Atomic status reads** | PartitionState uses AtomicU8/AtomicI64 | Zero-cost read_status()/write_status() polling |
@@ -88,6 +90,6 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 | **Failover delay** | Optional `spec.failoverDelay` (default 0 = immediate) | K8s adaptation — SF failovers immediately, K8s pod probes can flap |
 | **Data loss protocol** | Wait on unresolved safety evidence; after conclusive loss, advance epoch then invoke correlated `OnDataLoss` | Prevents premature promotion and makes callback ambiguity recoverable |
 | **gRPC failure tracking** | Per-replica failure counter in CRD status | K8s adaptation — replaces SF federation heartbeats |
-| **Operator restart recovery** | Reconstruct driver from CRD status + pod list | SF FM pattern — stateless operator, durable state in API |
+| **Operator restart recovery** | Reconstruct read-only stable topology from CRD status + pod list | SF FM pattern — stateless operator, durable state in API |
 | **mTLS deferred** | Post-MVP; MVP assumes trusted cluster | Reduces initial complexity |
-| **ReplicaHandle trait** | Driver works with any transport | Tests: in-process channels. Operator: gRPC client. |
+| **ReplicaHandle trait** | Status plus one correlated mutation method | Operator and high-fidelity tests use the gRPC client. |

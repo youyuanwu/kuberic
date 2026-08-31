@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::error::{KubericError, Result};
 use crate::events::ReplicateRequest;
@@ -179,7 +180,9 @@ impl PartitionHandle {
 
     /// Report a fault to trigger failover or restart.
     pub fn report_fault(&self, fault_type: FaultType) {
-        let _ = self.fault_tx.try_send(fault_type);
+        if let Err(error) = self.fault_tx.try_send(fault_type) {
+            warn!(?fault_type, ?error, "dropping local fault report");
+        }
     }
 }
 
@@ -290,5 +293,17 @@ mod tests {
         token.cancel();
 
         assert_eq!(task.await.unwrap().unwrap(), 42);
+    }
+
+    #[test]
+    fn fault_reporting_is_non_blocking_when_ingress_is_full() {
+        let (fault_tx, mut fault_rx) = mpsc::channel(1);
+        let handle = PartitionHandle::new(Arc::new(PartitionState::new()), fault_tx);
+
+        handle.report_fault(FaultType::Transient);
+        handle.report_fault(FaultType::Permanent);
+
+        assert_eq!(fault_rx.try_recv().unwrap(), FaultType::Transient);
+        assert!(fault_rx.try_recv().is_err());
     }
 }

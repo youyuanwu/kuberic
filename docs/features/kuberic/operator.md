@@ -2,7 +2,7 @@
 
 The Kuberic operator acts as SF's Failover Manager on Kubernetes.
 It watches `KubericSet` CRDs and orchestrates pod lifecycle, failover,
-switchover, and scaling via `PartitionDriver`.
+switchover, and scaling through CRD-backed durable workflows.
 
 > Part of the [Kuberic Design](../kuberic-replicator-design.md).
 > Failure scenarios documented in [operator-failure-scenarios.md](../operator-failure-scenarios.md).
@@ -29,15 +29,16 @@ switchover, and scaling via `PartitionDriver`.
   switchover, replica add/rebuild, and configuration-first replica removal,
   plus Phase-1 failover/data-loss recovery, including optional
   previous/committed topology, target snapshot, one pending correlated action,
-  and failover observations/assessment/epoch intents
+  failover observations/assessment/epoch intents, and optional pod-local
+  generation/control-version/runtime-epoch fences and a frozen action payload
 - optional `stableElectionMetadataRefresh` checkpoint for topology-scoped,
   write-ahead runtime configuration recording and live progress publication
 - `primaryFailingSince`
 - per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
 - `conditions`
 
-**Reconciliation:** Stable workflows use `PartitionDriver` with
-`GrpcReplicaHandle` (same driver as tests, different transport). A stable
+**Reconciliation:** `PartitionDriver` performs read-only stable recovery with
+`GrpcReplicaHandle`; CRD-backed state machines own every mutation. A stable
 operation is complete only after its resulting snapshot is persisted. Durable
 creation persists partial committed bootstrap topology after primary-only and
 each expanded current configuration, so process loss rolls forward from live
@@ -144,6 +145,36 @@ state, the driver sends a precise `(replica ID, incarnation)` removal to the
 primary. Re-adding the ordinal installs the new endpoint and cancels the old
 connection's drain and acknowledgement tasks.
 
+### ReplicaAgent Dispatch Boundary
+
+Every control request reaches a pod-local `ReplicaAgent` before
+`PodRuntime`. The agent owns local admission, correlation, serialization and
+bounded completion replay; the runtime owns ordered service/replicator
+effects. This is intentionally narrower than Service Fabric RA: CRD status and
+the operator remain the only owners of distributed workflow state.
+
+Before a pending runtime action is dispatched, reconciliation requires
+replica-agent control protocol version 1 and exact agreement among the
+addressed, runtime, and pending Pod incarnations. It persists the observed
+agent generation, agent control version, and runtime epoch.
+The same write freezes the exact encoded action payload so observation and
+retry signatures cannot drift with live progress.
+
+Missing, malformed, or unsupported agent status fails closed. There is no
+capability negotiation or old-peer fallback.
+
+This fence write is a separate reconciliation step and does not consume or
+reset the action attempt/deadline budget. The next reconcile reconstructs the
+deterministic action and uses `ExecuteCorrelatedControlAction`. A stale
+precondition or unavailable-continuity rejection itself executes no effect, so
+the advisory fences are cleared and re-observed without consuming an attempt;
+the agent makes no claim about whether an older unretained action executed.
+Other errors remain counted. The only production mutation call is
+`ExecuteCorrelatedControlAction`.
+
+This is a coordinated deployment boundary: quiesce durable topology work and
+deploy the operator and replica runtimes together.
+
 ---
 
 ## Operator Restart Recovery
@@ -165,6 +196,15 @@ phase-specific failover fence. Durable `Creating`, `Switchover`,
 `status.operation`. Completed topology snapshots are refreshed with exact
 election metadata before they are used as unavailable-candidate comparison
 evidence. See `operator-failure-scenarios.md` §8.
+
+A container restart can keep the Pod UID while resetting role, epoch and all
+agent/runtime process-local state. Status exposes a new `AgentGeneration`, so
+the new process cannot replay or impersonate the previous process's action.
+On restart recovery, a stable secondary with the same Pod UID but unverifiable
+runtime role/epoch is persisted into the established durable
+force-remove/rebuild path before mutation. A stale primary enters durable
+failover. Missing prior-generation local state is never proof that an
+ambiguous effect did not run.
 
 ## Durable Partition Creation
 
@@ -204,12 +244,12 @@ source and target stable snapshots, phase, frozen LSN, retry/deadline/error
 metadata, and at most one pending action. Each action identifies the exact
 replica ID, pod-UID incarnation, expected epoch, and desired postcondition.
 
-`GetStatus` exposes write access, canonical configuration state, the last
-completed durable action, and the scheduled/in-progress/completed/failed state
-of the current durable activity. Lost replies therefore resume by observation
-rather than blind RPC repetition. Target-promotion failure can durably restore
-the old primary; impossible or stale observations poison the operation without
-publishing a new stable snapshot.
+`GetStatus` exposes write access, canonical configuration state,
+`current_action`, and bounded `retained_terminal_actions`. Lost replies
+therefore resume from the authoritative local ledger and runtime
+postconditions rather than blind RPC repetition. Target-promotion failure can
+durably restore the old primary; impossible or stale observations poison the
+operation without publishing a new stable snapshot.
 
 ---
 
@@ -246,14 +286,13 @@ Design follows SF's config-first approach (remove from quorum before closing):
 
 ```
 1. Operator selects secondary to remove (prefer newest, never primary)
-2. driver.remove_secondary(replica_id):
+2. Advance the durable remove checkpoint one correlated action at a time:
    a. Verify replica_count > min_replicas (safety)
-   b. update_catch_up_configuration (new config WITHOUT the replica)
-   c. wait_for_catch_up_quorum(Write)
-   d. update_current_configuration (finalize)
-   e. change_role(None) on removed replica
-   f. close removed replica
-   g. Remove from driver
+   b. `UpdateCatchUpConfiguration` (new config WITHOUT the replica)
+   c. `WaitForCatchUpQuorum(Write)`
+   d. `UpdateCurrentConfiguration` (irreversible membership commit)
+   e. exact-incarnation primary connection cleanup
+   f. `ChangeRole(None)` and `Close` on the removed replica
 3. Operator deletes Pod + PVC
 4. Update CRD status
 ```

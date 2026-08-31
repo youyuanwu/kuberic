@@ -10,13 +10,12 @@ use serial_test::serial;
 use tokio::sync::RwLock;
 
 use kuberic_core::driver::ReplicaHandle;
-use kuberic_core::error::Result as CoreResult;
+use kuberic_core::error::{KubericError, Result as CoreResult};
 use kuberic_core::grpc::handle::GrpcReplicaHandle;
 use kuberic_core::pod::PodRuntime;
 use kuberic_core::types::{
-    DataLossAction, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConfigurationMode,
-    ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode,
-    ReplicaStatusInfo, Role,
+    CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest, DurableReplicaAction,
+    Epoch, Lsn, ReplicaConfigurationMode, ReplicaId, ReplicaInstanceId, ReplicaStatusInfo, Role,
 };
 
 use kuberic_operator::cluster_api::ClusterApi;
@@ -78,121 +77,27 @@ enum ControlOperation {
     GetStatus,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum InjectedStatusError {
+    UnsupportedProtocol,
+    MalformedAgentStatus,
+}
+
 struct ObservedHandle {
     inner: Box<dyn ReplicaHandle>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_next_status: Arc<Mutex<Option<InjectedStatusError>>>,
 }
 
 impl ObservedHandle {
     fn record(&self, operation: ControlOperation) {
         self.operations.lock().unwrap().push(operation);
     }
-}
 
-#[async_trait]
-impl ReplicaHandle for ObservedHandle {
-    fn id(&self) -> ReplicaId {
-        self.inner.id()
-    }
-
-    fn instance_id(&self) -> ReplicaInstanceId {
-        self.inner.instance_id()
-    }
-
-    async fn open(&self, mode: OpenMode) -> CoreResult<()> {
-        self.record(ControlOperation::Open);
-        self.inner.open(mode).await
-    }
-
-    async fn close(&self) -> CoreResult<()> {
-        self.record(ControlOperation::Close);
-        self.inner.close().await
-    }
-
-    fn abort(&self) {
-        self.inner.abort();
-    }
-
-    async fn change_role(&self, epoch: Epoch, role: Role) -> CoreResult<()> {
-        self.record(ControlOperation::ChangeRole);
-        self.inner.change_role(epoch, role).await
-    }
-
-    async fn update_epoch(&self, epoch: Epoch) -> CoreResult<()> {
-        self.record(ControlOperation::UpdateEpoch);
-        self.inner.update_epoch(epoch).await
-    }
-
-    fn current_progress(&self) -> Lsn {
-        self.inner.current_progress()
-    }
-
-    fn catch_up_capability(&self) -> Lsn {
-        self.inner.catch_up_capability()
-    }
-
-    async fn on_data_loss(&self) -> CoreResult<DataLossAction> {
-        self.record(ControlOperation::OnDataLoss);
-        self.inner.on_data_loss().await
-    }
-
-    async fn update_catch_up_configuration(
-        &self,
-        current: ReplicaSetConfig,
-        previous: ReplicaSetConfig,
-    ) -> CoreResult<()> {
-        self.record(ControlOperation::UpdateCatchUpConfiguration);
-        self.inner
-            .update_catch_up_configuration(current, previous)
-            .await
-    }
-
-    async fn update_current_configuration(&self, current: ReplicaSetConfig) -> CoreResult<()> {
-        self.record(ControlOperation::UpdateCurrentConfiguration);
-        self.inner.update_current_configuration(current).await
-    }
-
-    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> CoreResult<()> {
-        self.record(ControlOperation::WaitForCatchUpQuorum);
-        self.inner.wait_for_catch_up_quorum(mode).await
-    }
-
-    async fn build_replica(&self, replica: ReplicaInfo) -> CoreResult<()> {
-        self.record(ControlOperation::BuildReplica);
-        self.inner.build_replica(replica).await
-    }
-
-    async fn remove_replica(
-        &self,
-        replica_id: ReplicaId,
-        instance_id: ReplicaInstanceId,
-    ) -> CoreResult<()> {
-        self.record(ControlOperation::RemoveReplica);
-        self.inner.remove_replica(replica_id, instance_id).await
-    }
-
-    async fn revoke_write_status(&self) -> CoreResult<()> {
-        self.record(ControlOperation::RevokeWriteStatus);
-        self.inner.revoke_write_status().await
-    }
-
-    fn replicator_address(&self) -> String {
-        self.inner.replicator_address()
-    }
-
-    async fn get_status(&self) -> CoreResult<ReplicaStatusInfo> {
-        self.record(ControlOperation::GetStatus);
-        self.inner.get_status().await
-    }
-
-    async fn execute_durable_action(
-        &self,
-        action_id: &str,
-        action: DurableReplicaAction,
-    ) -> CoreResult<()> {
-        let operation = match &action {
+    fn operation_for(action: &DurableReplicaAction) -> ControlOperation {
+        match action {
             DurableReplicaAction::Open { .. } => ControlOperation::Open,
             DurableReplicaAction::Close => ControlOperation::Close,
             DurableReplicaAction::RevokeWriteStatus => ControlOperation::RevokeWriteStatus,
@@ -213,7 +118,56 @@ impl ReplicaHandle for ObservedHandle {
             DurableReplicaAction::RecordElectionConfiguration { .. } => {
                 ControlOperation::RecordElectionConfiguration
             }
-        };
+        }
+    }
+}
+
+#[async_trait]
+impl ReplicaHandle for ObservedHandle {
+    fn id(&self) -> ReplicaId {
+        self.inner.id()
+    }
+
+    fn instance_id(&self) -> ReplicaInstanceId {
+        self.inner.instance_id()
+    }
+
+    fn current_progress(&self) -> Lsn {
+        self.inner.current_progress()
+    }
+
+    fn catch_up_capability(&self) -> Lsn {
+        self.inner.catch_up_capability()
+    }
+
+    fn replicator_address(&self) -> String {
+        self.inner.replicator_address()
+    }
+
+    async fn get_status(&self) -> CoreResult<ReplicaStatusInfo> {
+        self.record(ControlOperation::GetStatus);
+        if let Some(error) = self.fail_next_status.lock().unwrap().take() {
+            return Err(match error {
+                InjectedStatusError::UnsupportedProtocol => {
+                    KubericError::RemoteControlProtocolUnsupported(
+                        "injected unsupported replica-agent protocol".to_string(),
+                    )
+                }
+                InjectedStatusError::MalformedAgentStatus => {
+                    KubericError::RemoteAgentRequestRejected(
+                        "injected malformed replica-agent status".to_string(),
+                    )
+                }
+            });
+        }
+        self.inner.get_status().await
+    }
+
+    async fn execute_correlated_control_action(
+        &self,
+        request: CorrelatedControlActionRequest,
+    ) -> CoreResult<CorrelatedControlActionAcknowledgement> {
+        let operation = Self::operation_for(&request.action);
         self.record(operation);
         if self
             .fail_before_next_durable_action
@@ -227,15 +181,40 @@ impl ReplicaHandle for ObservedHandle {
                 "injected activity failure".into(),
             ));
         }
-        self.inner.execute_durable_action(action_id, action).await?;
+        let acknowledgement = self
+            .inner
+            .execute_correlated_control_action(request)
+            .await?;
         if self.fail_after_next_durable_action.lock().unwrap().as_ref() == Some(&operation) {
             self.fail_after_next_durable_action.lock().unwrap().take();
             return Err(kuberic_core::error::KubericError::Internal(
                 "injected lost activity reply".into(),
             ));
         }
-        Ok(())
+        Ok(acknowledgement)
     }
+}
+
+async fn execute_with_fresh_fences(
+    handle: &dyn ReplicaHandle,
+    action_id: &str,
+    action: DurableReplicaAction,
+) -> CoreResult<CorrelatedControlActionAcknowledgement> {
+    let status = handle.get_status().await?;
+    let input_signature = action.signature();
+    handle
+        .execute_correlated_control_action(CorrelatedControlActionRequest {
+            protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+            action_id: action_id.to_string(),
+            input_signature,
+            target_replica_id: handle.id(),
+            target_instance_id: status.instance_id,
+            expected_agent_generation: status.agent.generation,
+            expected_control_version: status.agent.control_version,
+            observed_runtime_epoch: status.epoch,
+            action,
+        })
+        .await
 }
 
 /// Mock ClusterApi that starts real PodRuntime + KV service for each pod.
@@ -253,6 +232,7 @@ struct KvClusterApi {
     fail_next_status_conflict: Mutex<bool>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_next_status: Arc<Mutex<Option<InjectedStatusError>>>,
     data_loss_behavior: service::DataLossBehavior,
 }
 
@@ -271,6 +251,7 @@ impl KvClusterApi {
             fail_next_status_conflict: Mutex::new(false),
             fail_before_next_durable_action: Arc::new(Mutex::new(None)),
             fail_after_next_durable_action: Arc::new(Mutex::new(None)),
+            fail_next_status: Arc::new(Mutex::new(None)),
             data_loss_behavior: service::DataLossBehavior::default(),
         }
     }
@@ -366,6 +347,10 @@ impl KvClusterApi {
         *self.fail_after_next_durable_action.lock().unwrap() = Some(operation);
     }
 
+    fn fail_next_status(&self, error: InjectedStatusError) {
+        *self.fail_next_status.lock().unwrap() = Some(error);
+    }
+
     /// Simulate a pod crash. Aborts the PodRuntime and service tasks
     /// (gRPC channels break immediately), marks the K8s Pod NotReady,
     /// and removes the LivePod entry. Preserves data_dir (simulates PVC).
@@ -381,15 +366,36 @@ impl KvClusterApi {
         self.mark_pod_not_ready(pod_name);
     }
 
-    /// Simulate K8s restarting a crashed pod. Creates a fresh
-    /// PodRuntime + KV service on new ports, reuses the same data_dir
-    /// (simulates PVC re-attach), and marks the pod Ready.
+    /// Simulate replacement of a crashed Pod with a new Pod UID.
     async fn restart_pod(&self, pod_name: &str) {
-        let replica_id: i64 = pod_name.rsplit('-').next().unwrap().parse::<i64>().unwrap() + 1;
         static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let instance_id = ReplicaInstanceId::new(format!("restarted-{pod_name}-{generation}"));
+        self.restart_runtime(pod_name, instance_id, true).await;
+    }
+
+    /// Simulate a container/process restart inside the same Kubernetes Pod.
+    async fn restart_process_same_pod_uid(&self, pod_name: &str) {
+        let instance_id = self
+            .pods
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+            .and_then(|pod| pod.metadata.uid.clone())
+            .map(ReplicaInstanceId::new)
+            .expect("existing pod UID");
+        self.restart_runtime(pod_name, instance_id, false).await;
+    }
+
+    async fn restart_runtime(
+        &self,
+        pod_name: &str,
+        instance_id: ReplicaInstanceId,
+        replace_pod_uid: bool,
+    ) {
+        let replica_id: i64 = pod_name.rsplit('-').next().unwrap().parse::<i64>().unwrap() + 1;
 
         let client_address = allocate_unique_address().await;
         let data_bind = allocate_unique_address().await;
@@ -449,13 +455,14 @@ impl KvClusterApi {
             },
         );
 
-        let mut pods = self.pods.lock().unwrap();
-        let pod = pods
-            .iter_mut()
-            .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
-            .unwrap();
-        pod.metadata.uid = Some(instance_id.to_string());
-        drop(pods);
+        if replace_pod_uid {
+            let mut pods = self.pods.lock().unwrap();
+            let pod = pods
+                .iter_mut()
+                .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+                .unwrap();
+            pod.metadata.uid = Some(instance_id.to_string());
+        }
         self.mark_all_pods_ready();
     }
 }
@@ -638,6 +645,7 @@ impl ClusterApi for KvClusterApi {
             operations: self.operations.clone(),
             fail_before_next_durable_action: self.fail_before_next_durable_action.clone(),
             fail_after_next_durable_action: self.fail_after_next_durable_action.clone(),
+            fail_next_status: self.fail_next_status.clone(),
         }))
     }
 
@@ -942,7 +950,7 @@ async fn advance_until_pending_action(
             .operation
             .as_ref()
             .and_then(|operation| operation.pending_action.as_ref())
-            .is_some_and(|action| action.kind == kind)
+            .is_some_and(|action| action.kind == kind && action.dispatch_agent_generation.is_some())
         {
             return status;
         }
@@ -4032,16 +4040,16 @@ async fn test_durable_rejoin_retires_old_incarnation_once() {
         )
         .await
         .unwrap();
-    primary_handle
-        .execute_durable_action(
-            &retire_action_id,
-            DurableReplicaAction::RemoveReplica {
-                replica_id: target_replica_id,
-                instance_id: ReplicaInstanceId::new(old_instance),
-            },
-        )
-        .await
-        .unwrap();
+    execute_with_fresh_fences(
+        primary_handle.as_ref(),
+        &retire_action_id,
+        DurableReplicaAction::RemoveReplica {
+            replica_id: target_replica_id,
+            instance_id: ReplicaInstanceId::new(old_instance),
+        },
+    )
+    .await
+    .unwrap();
     let target_status = live_replica_statuses(&api, "durable-rejoin", 3)
         .await
         .into_iter()
@@ -4602,6 +4610,45 @@ async fn test_durable_remove_compensates_before_commit_and_rolls_forward_after_c
 
 #[test_log::test(tokio::test)]
 #[serial]
+async fn test_durable_remove_rejects_malformed_agent_status_without_mutation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "remove-malformed-agent", 3).await;
+
+    reconcile_set(
+        &make_set("remove-malformed-agent", 2, Some(status)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let started = api.last_status().unwrap();
+    assert_eq!(started.phase, Phase::RemovingReplica);
+    let status_count = api.statuses.lock().unwrap().len();
+
+    api.reset_operations();
+    api.fail_next_status(InjectedStatusError::MalformedAgentStatus);
+    let error = reconcile_set(
+        &make_set("remove-malformed-agent", 2, Some(started.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .err()
+    .expect("malformed control status must fail closed");
+
+    assert!(error.contains("unsupported or malformed control status"));
+    assert_eq!(api.statuses.lock().unwrap().len(), status_count);
+    assert_eq!(api.last_status().unwrap(), started);
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
 async fn test_uid_fenced_delete_and_remove_intent_conflict_are_mutation_free() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -4759,6 +4806,185 @@ async fn test_reconciler_scale_up() {
         .await
         .unwrap();
     assert!(resp.get_ref().found);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_scale_up_replays_writes_buffered_during_copy() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "buffered-scale", 1).await;
+    let primary_name = status.current_primary.clone().unwrap();
+    let mut client = connect_kv(&api.client_address(&primary_name).unwrap()).await;
+
+    for index in 0..500 {
+        client
+            .put(proto::PutRequest {
+                key: format!("before-{index}"),
+                value: format!("value-{index}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    reconcile_set(&make_set("buffered-scale", 2, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    api.mark_all_pods_ready();
+    let pending = advance_until_pending_action(
+        &api,
+        "buffered-scale",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::BuildCandidate,
+    )
+    .await;
+
+    let dispatch_set = make_set("buffered-scale", 2, Some(pending));
+    let restarted_state = ReconcilerState::default();
+    let dispatch = reconcile_set(&dispatch_set, &api, &restarted_state);
+    let writes = async {
+        for index in 0..200 {
+            client
+                .put(proto::PutRequest {
+                    key: format!("during-{index}"),
+                    value: format!("value-{index}"),
+                })
+                .await
+                .unwrap();
+        }
+    };
+    let (dispatch_result, ()) = tokio::join!(dispatch, writes);
+    dispatch_result.unwrap();
+
+    let completed = drive_add_replica(
+        &api,
+        &state,
+        "buffered-scale",
+        2,
+        api.last_status().unwrap(),
+    )
+    .await;
+    assert_stable_snapshot(&api, &completed, 2);
+
+    let secondary_name = completed
+        .stable_snapshot
+        .as_ref()
+        .unwrap()
+        .members
+        .iter()
+        .find(|member| member.id != completed.stable_snapshot.as_ref().unwrap().primary_id)
+        .map(|member| format!("buffered-scale-{}", member.id - 1))
+        .unwrap();
+    let secondary_state = api
+        .live_pods
+        .lock()
+        .unwrap()
+        .get(&secondary_name)
+        .unwrap()
+        .state
+        .clone();
+    let secondary_state = secondary_state.read().await;
+    assert_eq!(secondary_state.data.len(), 700);
+    for index in 0..200 {
+        assert_eq!(
+            secondary_state.data.get(&format!("during-{index}")),
+            Some(&format!("value-{index}"))
+        );
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_simultaneous_secondary_loss_bounds_new_and_inflight_writes() {
+    async fn setup(
+        name: &str,
+    ) -> (
+        KvClusterApi,
+        ReconcilerState,
+        String,
+        Vec<Box<dyn ReplicaHandle>>,
+    ) {
+        let api = KvClusterApi::new();
+        let state = ReconcilerState::default();
+        let status = create_healthy_set(&api, &state, name, 3).await;
+        let primary = status.current_primary.unwrap();
+        let secondary_pods = api
+            .pods
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|pod| {
+                (pod.metadata.name.as_deref() != Some(primary.as_str())).then_some(pod.clone())
+            })
+            .collect::<Vec<_>>();
+        let spec = make_set(name, 3, None).spec;
+        let mut secondaries = Vec::new();
+        for pod in secondary_pods {
+            let id = pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                .unwrap()
+                .parse::<i64>()
+                .unwrap()
+                + 1;
+            secondaries.push(api.create_replica_handle(id, &pod, &spec).await.unwrap());
+        }
+        (api, state, primary, secondaries)
+    }
+
+    let (api, _state, primary, secondaries) = setup("bounded-new-write").await;
+    let mut client = connect_kv(&api.client_address(&primary).unwrap()).await;
+    for (index, secondary) in secondaries.iter().enumerate() {
+        execute_with_fresh_fences(
+            secondary.as_ref(),
+            &format!("bounded-new-write:close:{index}"),
+            DurableReplicaAction::Close,
+        )
+        .await
+        .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.put(proto::PutRequest {
+            key: "after-loss".to_string(),
+            value: "bounded".to_string(),
+        }),
+    )
+    .await
+    .expect("write must not hang after quorum loss");
+    assert!(
+        result.is_err(),
+        "write unexpectedly committed without quorum"
+    );
+
+    let (api, _state, primary, secondaries) = setup("bounded-inflight-write").await;
+    let mut client = connect_kv(&api.client_address(&primary).unwrap()).await;
+    let write = tokio::spawn(async move {
+        client
+            .put(proto::PutRequest {
+                key: "racing-loss".to_string(),
+                value: "bounded".to_string(),
+            })
+            .await
+    });
+    tokio::task::yield_now().await;
+    for (index, secondary) in secondaries.iter().enumerate() {
+        execute_with_fresh_fences(
+            secondary.as_ref(),
+            &format!("bounded-inflight-write:close:{index}"),
+            DurableReplicaAction::Close,
+        )
+        .await
+        .unwrap();
+    }
+    let _result = tokio::time::timeout(Duration::from_secs(8), write)
+        .await
+        .expect("in-flight write must complete or fail within the quorum bound")
+        .unwrap();
 }
 
 /// Reconciler test: Healthy phase detects spec.replicas < actual → scale-down.
@@ -5059,6 +5285,56 @@ async fn test_durable_failover_data_loss_state_changed_and_failure() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+async fn test_slow_data_loss_callback_does_not_poison_failover() {
+    let api = KvClusterApi::new_with_data_loss_behavior(service::DataLossBehavior::Delay {
+        duration: Duration::from_secs(12),
+        state_changed: false,
+    });
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "slow-data-loss", 3).await;
+    let old_primary = status.current_primary.clone().unwrap();
+    let replaced_secondary = status
+        .members
+        .iter()
+        .find(|member| member.name != old_primary)
+        .unwrap()
+        .name
+        .clone();
+    api.restart_pod(&replaced_secondary).await;
+    api.crash_pod(&old_primary);
+    reconcile_set(&make_set("slow-data-loss", 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+
+    let mut status = api.last_status().unwrap();
+    for _ in 0..800 {
+        reconcile_set(
+            &make_set("slow-data-loss", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        assert!(
+            status
+                .operation
+                .as_ref()
+                .is_none_or(|operation| operation.phase != DurableOperationPhase::Poisoned),
+            "slow in-progress data-loss callback poisoned failover: {status:?}"
+        );
+        if status.phase == Phase::Healthy {
+            assert_eq!(status.epoch.data_loss_number, 1);
+            assert!(api.operations().contains(&ControlOperation::OnDataLoss));
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("slow data-loss callback did not complete durable failover: {status:?}");
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
 async fn test_durable_failover_observes_lost_data_loss_reply() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -5262,6 +5538,58 @@ async fn test_durable_failover_final_status_lost_reply_reloads_applied_snapshot(
     .await
     .unwrap();
     assert_eq!(api.statuses.lock().unwrap().len(), count);
+}
+
+async fn assert_active_failover_rejects_control_status(name: &str, injected: InjectedStatusError) {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, name, 3).await;
+    let old_primary = status.current_primary.clone().unwrap();
+    api.crash_pod(&old_primary);
+
+    reconcile_set(&make_set(name, 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    let started = api.last_status().unwrap();
+    reconcile_set(&make_set(name, 3, Some(started)), &api, &state)
+        .await
+        .unwrap();
+    let before = api.last_status().unwrap();
+    let status_count = api.statuses.lock().unwrap().len();
+
+    api.reset_operations();
+    api.fail_next_status(injected);
+    let error = reconcile_set(&make_set(name, 3, Some(before.clone())), &api, &state)
+        .await
+        .err()
+        .expect("incompatible control status must fail closed");
+
+    assert!(
+        error.contains("unsupported or malformed control status"),
+        "unexpected fail-closed error: {error}"
+    );
+    assert_eq!(api.statuses.lock().unwrap().len(), status_count);
+    assert_eq!(api.last_status().unwrap(), before);
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_active_failover_rejects_unsupported_or_malformed_agent_status() {
+    assert_active_failover_rejects_control_status(
+        "failover-unsupported-agent",
+        InjectedStatusError::UnsupportedProtocol,
+    )
+    .await;
+    assert_active_failover_rejects_control_status(
+        "failover-malformed-agent",
+        InjectedStatusError::MalformedAgentStatus,
+    )
+    .await;
 }
 
 #[test_log::test(tokio::test)]
@@ -5622,4 +5950,172 @@ async fn test_reconciler_secondary_crash_and_rejoin() {
         .unwrap();
     assert!(resp.get_ref().found);
     assert_eq!(resp.get_ref().value, "recovered");
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_same_pod_process_restart_changes_agent_generation_not_incarnation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "same-pod-restart", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    let secondary = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() != Some(primary.as_str()))
+        .cloned()
+        .unwrap();
+    let pod_name = secondary.metadata.name.clone().unwrap();
+    let pod_uid = secondary.metadata.uid.clone().unwrap();
+    let replica_id = secondary
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("kuberic.io/pod-index"))
+        .unwrap()
+        .parse::<i64>()
+        .unwrap()
+        + 1;
+    let set = make_set("same-pod-restart", 3, None);
+
+    let before = api
+        .create_replica_handle(replica_id, &secondary, &set.spec)
+        .await
+        .unwrap()
+        .get_status()
+        .await
+        .unwrap();
+    let before_generation = before.agent.generation;
+    assert_eq!(before.instance_id.as_str(), pod_uid);
+
+    api.crash_pod(&pod_name);
+    api.restart_process_same_pod_uid(&pod_name).await;
+    let restarted_pod = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(pod_name.as_str()))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        restarted_pod.metadata.uid.as_deref(),
+        Some(pod_uid.as_str())
+    );
+
+    let after = api
+        .create_replica_handle(replica_id, &restarted_pod, &set.spec)
+        .await
+        .unwrap()
+        .get_status()
+        .await
+        .unwrap();
+    let after_agent = after.agent;
+    assert_eq!(after.instance_id.as_str(), pod_uid);
+    assert_ne!(after_agent.generation, before_generation);
+    assert_eq!(after_agent.control_version.value(), 0);
+    assert!(after_agent.current_action.is_none());
+    assert!(after_agent.retained_terminal_actions.is_empty());
+
+    api.reset_operations();
+    reconcile_set(
+        &make_set("same-pod-restart", 3, Some(api.last_status().unwrap())),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let fail_closed = api.last_status().unwrap();
+    assert_eq!(fail_closed.phase, Phase::RemovingReplica);
+    let operation = fail_closed.operation.unwrap();
+    assert_eq!(operation.kind, DurableOperationKind::RemoveReplica);
+    assert_eq!(operation.target_replica_id, Some(replica_id));
+    assert_eq!(
+        operation.target_instance_id.as_deref(),
+        Some(pod_uid.as_str())
+    );
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus),
+        "operator restart must persist durable recovery intent before mutation"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_missing_dispatch_fences_are_reobserved_before_dispatch() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "rollback-fences", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    reconcile_set(
+        &make_set(
+            "rollback-fences",
+            3,
+            Some(KubericSetStatus {
+                target_primary: Some(target),
+                ..status
+            }),
+        ),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut pending_status = advance_until_pending_action(
+        &api,
+        "rollback-fences",
+        3,
+        api.last_status().unwrap(),
+        DurableActionKind::PromoteTarget,
+    )
+    .await;
+    let pending = pending_status
+        .operation
+        .as_mut()
+        .unwrap()
+        .pending_action
+        .as_mut()
+        .unwrap();
+    let attempts = pending.attempts;
+    let deadline = pending.deadline_unix_seconds;
+    pending.dispatch_agent_generation = None;
+    pending.dispatch_agent_control_version = None;
+    pending.dispatch_observed_runtime_epoch = None;
+
+    api.reset_operations();
+    reconcile_set(
+        &make_set("rollback-fences", 3, Some(pending_status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let refreshed = api.last_status().unwrap();
+    let pending = refreshed
+        .operation
+        .as_ref()
+        .unwrap()
+        .pending_action
+        .as_ref()
+        .unwrap();
+    assert!(pending.dispatch_agent_generation.is_some());
+    assert_eq!(pending.attempts, attempts);
+    assert_eq!(pending.deadline_unix_seconds, deadline);
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
 }

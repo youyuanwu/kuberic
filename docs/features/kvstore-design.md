@@ -163,7 +163,10 @@ examples/kvstore/
 │   ├── service.rs                # Lifecycle + StateProvider event loop
 │   ├── testing.rs                # KvPod helper (feature = "testing")
 │   └── demo.rs                   # Operator/client simulators for --demo mode
-└── tests/                        # Integration tests (operator_basic, failover, replication, reconciler)
+└── tests/
+    ├── reconciler.rs             # Durable workflow integration tests
+    │                              # Includes build-buffer + quorum-loss E2E
+    └── durable_data_loss.rs      # Correlated data-loss/replay tests
 ```
 
 ## Implementation Notes

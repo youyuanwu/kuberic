@@ -790,10 +790,8 @@ fn observe_action(
     }
 
     if let Ok(expected_action) = action_for(operation, pending, observations) {
-        let expected_signature = expected_action.signature();
-        if let Some(active) = status.durable_action.as_ref()
-            && active.action_id == pending.action_id
-        {
+        let expected_signature = super::pending_action_signature(pending, &expected_action)?;
+        if let Some(active) = super::correlated_action_observation(status, &pending.action_id) {
             if active.signature != expected_signature {
                 return Ok(ActionObservation::Impossible);
             }
@@ -808,15 +806,6 @@ fn observe_action(
                         .clone()
                         .unwrap_or_else(|| "runtime reported durable activity failure".to_string()),
                 ),
-            });
-        }
-        if let Some(completed) = status.last_completed_action.as_ref()
-            && completed.action_id == pending.action_id
-        {
-            return Ok(if completed.signature == expected_signature {
-                ActionObservation::Postcondition
-            } else {
-                ActionObservation::Impossible
             });
         }
     }
@@ -1013,6 +1002,10 @@ fn pending_action(
             },
         last_error: None,
         dispatch_authorized: false,
+        dispatch_agent_generation: None,
+        dispatch_agent_control_version: None,
+        dispatch_observed_runtime_epoch: None,
+        dispatch_action_payload: String::new(),
     })
 }
 
@@ -1820,9 +1813,19 @@ mod tests {
                 configuration,
                 election_configuration: None,
                 deactivation_info: None,
-                last_completed_action: None,
-                durable_action: None,
                 active_replica_connections: Vec::new(),
+                agent: kuberic_core::types::ReplicaAgentStatus {
+                    protocol_version:
+                        kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                    generation: kuberic_core::types::AgentGeneration::parse(
+                        "0123456789abcdef0123456789abcdef",
+                    )
+                    .unwrap(),
+                    control_version: kuberic_core::types::AgentControlVersion::default(),
+                    current_action: None,
+                    retained_terminal_actions: Vec::new(),
+                    local_faults: Vec::new(),
+                },
             },
             replicator_address: format!("http://{instance_id}"),
             pod_name: instance_id.to_string(),

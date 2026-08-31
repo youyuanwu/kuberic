@@ -18,8 +18,9 @@ implementation.
 ### A1. Partial Failure in Multi-Replica Operations — ✅ Fixed
 
 **Severity:** ✅ Resolved
-**Affects:** `failover()`, `switchover()`
-**File:** `kuberic-core/src/driver.rs`
+**Affects:** Durable failover and switchover
+**Files:** `kuberic-operator/src/durable/failover.rs`,
+`kuberic-operator/src/durable/switchover.rs`
 
 **Problem (was):** The switchover/failover had a "fence-before-promote"
 pattern — `update_epoch` was called on ALL secondaries with `?`
@@ -33,62 +34,38 @@ the new primary is active. Pre-promotion fencing is unnecessary because:
 - **Failover:** old primary is dead → can't send ops
 - **Switchover:** old primary's writes are revoked → can't send new ops
 
-**Fix:** Restructured both `failover()` and `switchover()` to match SF's
-Phase 4 pattern:
-1. Promotion happens first (with new epoch delivered to promoted replicas)
-2. Epoch distributed to other secondaries **after** promotion, best-effort
-3. Unreachable secondaries are skipped with a warning (rebuilt later)
+**Fix:** The CRD-backed workflows persist every transition and execute one
+correlated activity at a time. Promotion is followed by durable epoch and
+configuration convergence. Unavailable members are retained in the workflow
+denominator and cannot be silently dropped; impossible convergence fails
+closed.
 
-**Switchover flow (now):**
-1. `revoke_write_status()` on old primary (A2 fix)
-2. `change_role(ActiveSecondary)` on old primary
-3. `change_role(Primary)` on target (Phase 4)
-4. Best-effort `update_epoch` on other secondaries
-5. Reconfigure quorum + catchup
-
-**Failover flow (now):**
-1. Select best candidate by LSN
-2. `change_role(Primary)` on winner (Phase 4)
-3. Best-effort `update_epoch` on other secondaries
-4. Reconfigure quorum + catchup
-
-**Test:** Switchover with one secondary closed succeeds — unreachable pod
-is skipped during epoch distribution, new primary is active and serving.
+**Test:** Durable switchover/failover restart matrices and lost-reply tests
+exercise every persistence and runtime boundary.
 
 ---
 
 ### A2. Switchover Write Revocation — ✅ Fixed
 
 **Severity:** ✅ Resolved
-**Affects:** `switchover()`
-**File:** `kuberic-core/src/driver.rs`
+**Affects:** Durable switchover
+**Files:** `kuberic-operator/src/durable/switchover.rs`,
+`kuberic-core/src/pod.rs`
 
-**Problem (was):** The switchover jumped directly to `change_role(ActiveSecondary)`
-without revoking writes first. During the gap between epoch fencing and
-demotion, the old primary could still accept and commit writes.
+**Problem (was):** Switchover could demote the old primary without first
+closing its write-admission window.
 
-**Fix:** Added `RevokeWriteStatus` RPC to the control plane. The switchover
-now calls `revoke_write_status()` on the old primary as its **first step**,
-before epoch fencing and demotion. This sets `write_status = ReconfigurationPending`,
-immediately rejecting new writes via the existing fast-path check in
-`replicate()`. In-flight writes continue to completion and are failed by
-demotion's `fail_all()`.
+**Fix:** The durable switchover persists a `RevokeWriteStatus` action before
+demotion. It is dispatched through `ExecuteCorrelatedControlAction`, setting
+`write_status = ReconfigurationPending`. New writes are rejected immediately;
+demotion fails remaining in-flight writes.
 
 **Switchover sequence (now):**
-1. `revoke_write_status()` on old primary → new writes rejected immediately
-2. Fence secondaries with new epoch
-3. Demote old primary → `change_role(ActiveSecondary)` → in-flight writes failed
-4. Promote target → `change_role(Primary)`
+1. Correlated `RevokeWriteStatus` → new writes rejected immediately
+2. Catch up the target and persist the demotion intent
+3. Correlated `ChangeRole(ActiveSecondary)` → in-flight writes failed
+4. Correlated `ChangeRole(Primary)` on the target
 5. Rebuild configuration + catch-up
-
-**Changes made:**
-1. Proto: `RevokeWriteStatus` RPC + request/response messages
-2. `ReplicaHandle` trait: `revoke_write_status()` method
-3. `GrpcReplicaHandle`: calls RPC
-4. `InProcessReplicaHandle`: sets `PartitionState` directly
-5. `PodRuntime`: `RuntimeCommand::RevokeWriteStatus` + handler
-6. `ControlServer`: gRPC handler
-7. `switchover()`: calls `revoke_write_status()` as step 1
 
 **Remaining consideration:** SF's SwapPrimary has a double-catchup pattern
 (catchup WITH writes → revoke → catchup WITHOUT writes → promote). Our
@@ -97,26 +74,25 @@ this is fine — the write revocation + catch-up at step 5 is sufficient.
 Double-catchup would reduce the catch-up window after revocation for
 high-throughput workloads.
 
-**Test:** Concurrent writer during `driver.switchover()` checks for
-`ReconfigurationPending` error messages. Verified: test fails without fix
-(`reconfig=0`), passes with fix (`reconfig>0`).
+**Test:** Durable switchover and lost-reply tests verify persisted write
+revocation, observation-first recovery, and compensation.
 
 ---
 
 ### A3. Promotion Failure Leaves Partition Unavailable — ✅ Fixed (switchover)
 
 **Severity:** ✅ Switchover fixed / 🟡 Failover handled by reconciler retry
-**Affects:** `switchover()`
-**File:** `kuberic-core/src/driver.rs`
+**Affects:** Durable switchover and failover
+**Files:** `kuberic-operator/src/durable/switchover.rs`,
+`kuberic-operator/src/durable/failover.rs`
 
 **Problem:** If `change_role(Primary)` on the target fails during
 switchover, the old primary is already demoted. No replica can accept
-writes. The driver returns `Err` but doesn't rollback the demotion.
+writes. Returning an error without durable compensation would strand the
+partition.
 
-For failover, this is less severe: the driver returns `Err` and the
-reconciler retries (matching SF's FM retry-via-new-reconfiguration
-pattern). The reconciler re-evaluates which replicas are alive and
-picks a different candidate.
+The durable reconciler instead retains pending intent, observes the result,
+and follows explicit compensation or post-promotion roll-forward phases.
 
 **SF reference:** SF has explicit `AbortPhase0Demote` and
 `RevertConfiguration()` in the RA. When a swap is aborted (target dies
@@ -130,29 +106,14 @@ or higher-priority reconfig arrives), SF:
 SF doesn't retry inside the reconfiguration — the FM's outer loop handles
 retry by triggering a new reconfiguration.
 
-**Fix (switchover):** Target promotion is wrapped in a 5s timeout. On
-failure or timeout, the driver re-promotes the old primary via
-`change_role(new_epoch, Primary)` — matching SF's `RevertConfiguration()`
-pattern. The old primary becomes primary in the new epoch, which is safe.
+**Fix:** Durable switchover records explicit restore/compensation phases before
+the irreversible target promotion boundary. After that boundary, failures
+roll forward or poison rather than publishing an inconsistent snapshot.
+Failover separately confirms its candidate and commits a primary-only
+snapshot before convergence.
 
-**Rollback completion:** The driver restores the last current configuration
-after re-promoting the old primary. This ends any partial catch-up attempt and
-re-grants writes when the surviving configuration can still reach quorum.
-
-**Test:** Close the switchover target before switchover → promotion fails
-→ verify old primary is re-promoted, its configuration is restored, and a
-surviving secondary can still provide write quorum.
-
-**Design:**
-- **Switchover:** If target promotion fails, rollback:
-  ```
-  if change_role(Primary, target) fails:
-      change_role(Primary, old_primary)  // re-promote
-      // old primary still has the new epoch — that's fine,
-      // it becomes primary in the new epoch
-  ```
-- **Failover:** Return `Err`, let reconciler retry with a different
-  candidate. This already works with the current code + reconciler.
+**Test:** Promotion failure, lost reply, operator restart, compensation, and
+post-commit roll-forward are covered by the durable reconciler suite.
 
 **Operator crash recovery (related):**
 
@@ -161,11 +122,9 @@ authoritative `stableSnapshot`, current pod logical/incarnation identities,
 and runtime `GetStatus`. It does not trust live state to invent a topology and
 does not issue mutating RPCs during reconstruction.
 
-Mid-switchover remains outside that stable-only contract. If runtime mutation
-has advanced beyond the last durably persisted stable snapshot, recovery
-rejects the epoch/role/topology mismatch. Resuming or rolling back such a
-transition requires a durable reconfiguration journal; it is not treated as a
-normal failover inferred from whichever live role happens to be visible.
+Mid-switchover and mid-failover recovery use the persisted
+`status.operation` checkpoint; they are not inferred from whichever live role
+happens to be visible.
 
 ---
 
@@ -176,24 +135,18 @@ normal failover inferred from whichever live role happens to be visible.
 
 **Original concern:** gRPC/HTTP2 multiplexing could reorder control RPCs.
 
-**Analysis:** The driver calls all RPCs **sequentially** — each `.await`
-completes before the next RPC is sent. There are never concurrent RPCs
-to the same handle. HTTP2 multiplexing can only reorder concurrent
-requests; sequential request-response pairs are inherently ordered.
+**Analysis:** The operator issues one correlated action at a time and the
+ReplicaAgent admits only one local action at a time. HTTP2 multiplexing cannot
+reorder a runtime effect because no individual mutation RPC bypass exists.
 
-The only exception is `abort()` (fire-and-forget via `tokio::spawn`),
-which is a last-resort shutdown where ordering doesn't matter.
-
-**Conclusion:** No fix needed. A mutex would add complexity for zero
-benefit since the driver is single-threaded per-partition.
+**Conclusion:** No additional transport mutex is needed.
 
 ---
 
 ### A5. Synchronous BuildReplica and CatchUp Block Operator
 
 **Severity:** 🔴 Critical (for large datasets) / 🟢 OK for MVP
-**Affects:** `PartitionDriver::add_replica()`, `reconfigure_quorum()`,
-`GrpcReplicaHandle::build_replica()`, `wait_for_catch_up_quorum()`
+**Affects:** Durable add/rebuild and catch-up workflow activities
 **Files:** `driver.rs`, `handle.rs`, `pod.rs`, `server.rs`, `quorum.rs`
 
 **Problem:** Two long-running operations block the operator synchronously:
@@ -396,10 +349,9 @@ mid-transfer (network error, pod crash), the error propagates up:
 ```
 copy_stream fails (pod.rs:579)
   → handle_build_replica returns Err
-    → driver.add_replica returns Err (handle NOT added)
-      → reconciler requeues after 5s
-        → next reconcile retries add_replica from scratch
-          → new channel, new GetCopyContext, full rebuild
+    → ReplicaAgent retains a Failed correlated observation
+      → durable add/rebuild remains at its pending action
+        → reconciler observes failure and follows retry/compensation policy
 ```
 
 This matches SF's model: `BuildReplica` is a single atomic operation.
@@ -433,23 +385,20 @@ memory exhaustion. Should be replaced with a direct pipe:
 **Affects:** Short control-plane RPCs, state provider callbacks
 **Files:** `handle.rs`, `pod.rs`, `actor.rs`
 
-**Problem:** Short RPCs (`update_epoch`, `change_role`, `open`, `close`)
-have no timeout. A crashed or unreachable pod causes these calls to hang
-indefinitely, blocking the entire failover or switchover protocol.
-
-**Note:** Long-running operations (`build_replica`, `wait_for_catch_up`)
-are addressed by A5 (async with progress-based stall detection). This
-gap covers only short RPCs that should complete in milliseconds.
+**Problem:** `GetStatus` and `ExecuteCorrelatedControlAction` have no
+transport-level client deadline. A broken connection can therefore hold one
+reconcile longer than intended, although CRD action deadlines still bound
+workflow policy and runtime effects have internal reply timeouts.
 
 **Design needed:**
-- **Per-RPC timeout on `GrpcReplicaHandle`:** Add `timeout` field
-  (default 10s), wrap every control RPC in `tokio::time::timeout()`:
+- **Per-call timeout on `GrpcReplicaHandle`:** Add a timeout field and wrap
+  both public control calls:
   ```rust
-  async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
-      tokio::time::timeout(self.timeout, self.client.clone().update_epoch(...))
+  async fn get_status(&self) -> Result<ReplicaStatusInfo> {
+      tokio::time::timeout(self.timeout, self.client.clone().get_status(...))
           .await
           .map_err(|_| KubericError::Timeout)??;
-      Ok(())
+      // strict decode...
   }
   ```
 - **State provider callback timeout:** `send_state_provider()` already
@@ -763,34 +712,29 @@ design work needed — just implementation.
 
 ## Category E: Rolling Upgrade Review Findings
 
-Discovered during SoT review of `rolling-upgrade-design.md`. Two are
-existing code bugs in `kuberic-core/src/driver.rs`.
+Discovered during review of `rolling-upgrade-design.md`. The original
+mutable-driver findings below are superseded by CRD-backed durable workflows
+and the read-only production `PartitionDriver`.
 
 ### E1. `add_replica` zombie on failure — ✅ Fixed
 
 **Severity:** ✅ Resolved
 
-`add_replica` used to insert into `self.replicas` at driver.rs:721 *before*
-fallible ops (`open`, `build_replica`, `change_role`). If any step failed,
-the zombie replica stayed in the map — inflating quorum and blocking
-re-addition.
+The durable add workflow keeps the candidate outside the authoritative stable
+snapshot until current configuration commits. Failure before that boundary
+uses explicit compensation and cannot inflate failover quorum.
 
-**Fix:** Deferred insertion — the handle is held locally through all
-fallible ops (`open`, `update_epoch`, `change_role`, `build_replica`,
-promote). Only after all succeed is it inserted into `self.replicas`
-with `Role::ActiveSecondary`. On error, the handle is simply dropped.
-
-**Test:** `test_add_replica_cleans_up_on_failure` — aborts a handle
-before `add_replica`, verifies the failed call leaves no zombie.
+**Test:** Durable add compensation, lost-reply, operator-restart, and
+current-configuration roll-forward tests.
 
 ### E2. Switchover missing catchup — ✅ Fixed
 
 **Severity:** ✅ Resolved
-**Affects:** `PartitionDriver::switchover()`
-**File:** `kuberic-core/src/driver.rs`
+**Affects:** Durable switchover
+**Files:** `kuberic-operator/src/durable/switchover.rs`, `kuberic-core/src/pod.rs`
 
-`switchover()` had no catch-up step between `revoke_write_status` and
-`change_role(ActiveSecondary)` on the old primary.
+The original switchover sequence had no catch-up step between write revocation
+and demotion of the old primary.
 
 **Confirmed scenario** (3-replica, P=1, S=2=target, S=3):
 1. Write W ACKed to client via P=1 + S=3 (quorum met)
@@ -911,24 +855,17 @@ This is simpler than SF's full sequence because:
 
 **Fix (implemented):**
 
-- `switchover()` now polls target's `current_progress` via `get_status()`
-  after `revoke_write_status` and before `change_role(ActiveSecondary)`.
-  The loop polls every 10ms with a 5-second timeout. On timeout, the
-  switchover is aborted and write status restored on the old primary.
+- Durable switchover captures the frozen LSN, waits for the target to catch
+  up, then persists correlated revocation/demotion/promotion actions. Deadline
+  and compensation state live in CRD status.
 
 - `SecondaryReceiver` now updates `PartitionState::current_progress`
   when accepting replication items. Previously, only the primary actor
   set `current_progress` — secondaries always reported 0. This made
   `GetStatus` on a secondary return stale progress.
 
-- `InProcessReplicaHandle::change_role` no longer calls
-  `secondary_state.update_epoch()` — this was a test-infrastructure
-  divergence from the production `PodRuntime` path, which only updates
-  `SecondaryState` epoch via explicit `update_epoch()` calls. Added
-  local `epoch: Mutex<Epoch>` field for `get_status()` reporting.
-
-- Test: `test_e2_switchover_data_loss_without_catchup` verifies that
-  concurrent writes + immediate switchover preserves all committed data.
+- High-fidelity durable switchover tests exercise the production
+  `ReplicaAgent → PodRuntime` path, including compensation and lost replies.
 
 ### E3. Pod restart not detected — stale handle in driver
 
@@ -948,9 +885,8 @@ may select a blank pod.
   to distinguish "never assigned" from `Role::None` (explicit demotion).
   Proto updated: `ROLE_UNKNOWN = 0`, `ROLE_NONE = 4`.
 
-- Added `ReplicaStatusInfo` struct and `get_status()` to `ReplicaHandle`
-  trait. `GrpcReplicaHandle` calls existing `GetStatus` RPC.
-  `InProcessReplicaHandle` reads from `AtomicU8` role field + shared state.
+- `ReplicaStatusInfo` and `ReplicaHandle::get_status()` expose strict runtime
+  and required replica-agent observations through `GrpcReplicaHandle`.
 
 - Reconciler Healthy phase probes ALL replicas (primary + secondaries)
   via `get_status()` on every reconcile cycle. Detects:
@@ -1068,3 +1004,49 @@ and replication `CreateInitialPrimary` transition
 (`Failover/ra/ReconfigurationAgent.cpp`,
 `Replication/Replicator.ChangeRoleAsyncOperation.cpp`) while retaining
 Kuberic's explicit incremental configuration checkpoints.
+
+### E8. Pod runtime owns manager-protocol correlation — ✅ Fixed
+
+**Affects:** Control server, pod-local restart fencing, durable activity
+observation
+
+`ReplicaAgent` now sits between `ControlServer` and `PodRuntime`. It owns
+action ID/signature validation, active/terminal observations, duplicate replay,
+local mutation serialization, bounded errors/faults, and explicit
+replica-incarnation, process-generation, control-version, and runtime-epoch
+fences. `PodRuntime` owns effect ordering and exact completion only; it has no
+correlation ledger.
+
+This follows the Service Fabric ownership split rather than copying its storage
+model. RA routes FM messages through per-failover-unit entity scheduling,
+rechecks generation/epoch/replica instance under the entity lock, and persists
+failover-unit progress
+(`Reliability/Failover/ra/MessageHandler.cpp`,
+`MessageContext.h`, `Infrastructure.EntityScheduler.h`). RAProxy keeps a fresh
+runtime-bound proxy map, admits compatible action lists, and executes ordered
+service/replicator callbacks
+(`ReconfigurationAgentProxy.cpp`, `FailoverUnitProxy.cpp`,
+`ProxyActionsList.cpp`).
+
+Kuberic does not add a durable local LFUM. CRD status remains the sole durable
+global store. Agent state lasts one process generation and retains 16 terminal
+records. A same-Pod process restart changes `AgentGeneration`; prior local
+state is not inherited, and the operator observes durable postconditions
+before refreshing fences or redriving. When stable secondary runtime
+continuity cannot be proven, recovery enters the existing durable
+force-remove/rebuild protocol.
+
+`ExecuteCorrelatedControlAction` is the only production mutation path, and
+`current_action` plus `retained_terminal_actions` is the only local
+correlation ledger. Individual mutation RPCs and `ExecuteDurableAction` are
+retired. Required numeric protocol-version mismatch fails closed, so operator
+and runtime deployment must be coordinated.
+
+### E9. PostgreSQL correlated topology integration
+
+The retired mutable-driver Postgres suites were not recreated. PostgreSQL
+instance/adapter tests remain, while durable topology checkpoint integration
+is covered with real KV pods and correlated SQLite replication covers the
+external data-plane shape. A future Postgres-specific `ClusterApi` harness
+should exercise durable failover and switchover without restoring a public
+mutation bypass.

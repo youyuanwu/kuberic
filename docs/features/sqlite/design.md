@@ -284,9 +284,8 @@ examples/sqlite/
 │   ├── framelog.rs      # frames.log + meta.json persistence
 │   └── testing.rs       # SqlitePod helper (feature = "testing")
 └── tests/
-    ├── operator_basic.rs       # CRUD, read-after-write, query, batch
-    ├── operator_replication.rs  # Single write, multi-page, schema DDL
-    └── operator_failover.rs    # Failover + switchover data survival
+    ├── durable_data_loss.rs        # Correlated typed data-loss completion
+    └── correlated_replication.rs   # WAL shipping, schema, switchover, failover
 ```
 
 Key dependency: `rusqlite = { features = ["bundled", "hooks"] }` —
@@ -314,19 +313,17 @@ statically links SQLite, enables WAL hook. Also `crc32fast` for checksums.
 Tests use in-process pods with real gRPC via `SqlitePod` helper.
 All tests use `#[serial]` (port contention).
 
-### Implemented (Phase 1)
+### Implemented
 
-| # | Test | File |
-|---|------|------|
-| 1 | test_single_write_replicates | operator_replication.rs |
-| 2 | test_multi_page_transaction | operator_replication.rs |
-| 3 | test_read_after_write | operator_basic.rs |
-| 4 | test_schema_changes_replicate | operator_replication.rs |
-| 5 | test_failover_data_survives | operator_failover.rs |
-| 12 | test_execute_insert_update_delete | operator_basic.rs |
-| 13 | test_execute_batch_transaction | operator_basic.rs |
-| 14 | test_query_returns_rows | operator_basic.rs |
-| — | test_switchover_data_survives | operator_failover.rs |
+`sqlite_durable_data_loss_result_uses_real_runtime_path` opens and promotes a
+real SQLite pod through `ExecuteCorrelatedControlAction`, executes the
+epoch-fenced data-loss callback, and verifies its retained typed terminal
+result.
+
+`correlated_replication.rs` builds real three-pod partitions through the
+single correlated control path and covers multi-page WAL shipping, schema
+changes, switchover data survival, and failover data survival. Cross-workflow
+checkpoint integration is exercised by the durable KV reconciler suite.
 
 ### Planned (Phase 2+)
 
@@ -415,9 +412,10 @@ design change.
 `Close` from any other role preserves data for restart recovery.
 See `design-gaps.md` C4.
 
-### KP-4: `add_replica` / `restart_secondary` Always Forces Full Rebuild
+### KP-4: Durable Replacement Always Forces Full Rebuild
 
-`add_replica` always uses `OpenMode::New` + full `build_replica` copy,
+The durable add/rebuild workflow uses `OpenMode::New` plus full
+`BuildReplica` copy,
 even when the secondary's `data_dir` has valid persisted state (db.sqlite
 + frames.log) from a previous run. A pod restart with PVC-preserved data
 could skip the full DB snapshot copy and reattach using

@@ -71,42 +71,24 @@ message ReplicaSetConfigProto {
 // ---- Control plane: Operator → Pod ----
 
 service ReplicatorControl {
-    rpc Open(OpenRequest) returns (OpenResponse);
-    rpc Close(CloseRequest) returns (CloseResponse);
-
-    rpc ChangeRole(ChangeRoleRequest) returns (ChangeRoleResponse);
-    rpc UpdateEpoch(UpdateEpochRequest) returns (UpdateEpochResponse);
-
     rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
-
-    rpc UpdateCatchUpConfiguration(UpdateCatchUpConfigRequest) returns (UpdateCatchUpConfigResponse);
-    rpc UpdateCurrentConfiguration(UpdateCurrentConfigRequest) returns (UpdateCurrentConfigResponse);
-    rpc WaitForCatchUpQuorum(WaitForCatchUpQuorumRequest) returns (WaitForCatchUpQuorumResponse);
-    rpc BuildReplica(BuildReplicaRequest) returns (BuildReplicaResponse);
-    rpc RemoveReplica(RemoveReplicaRequest) returns (RemoveReplicaResponse);
-    rpc OnDataLoss(OnDataLossRequest) returns (OnDataLossResponse);
-    rpc RevokeWriteStatus(RevokeWriteStatusRequest) returns (RevokeWriteStatusResponse);
-    rpc ExecuteDurableAction(ExecuteDurableActionRequest) returns (ExecuteDurableActionResponse);
+    rpc ExecuteCorrelatedControlAction(ExecuteCorrelatedControlActionRequest) returns (ExecuteCorrelatedControlActionResponse);
 }
 
 message OpenRequest {
     OpenModeProto mode = 1;
 }
-message OpenResponse {}
 
 message CloseRequest {}
-message CloseResponse {}
 
 message ChangeRoleRequest {
     EpochProto epoch = 1;
     RoleProto role = 2;
 }
-message ChangeRoleResponse {}
 
 message UpdateEpochRequest {
     EpochProto epoch = 1;
 }
-message UpdateEpochResponse {}
 
 message GetStatusRequest {}
 message GetStatusResponse {
@@ -117,19 +99,23 @@ message GetStatusResponse {
     int64 committed_lsn = 5;
     bool healthy = 6;
     string instance_id = 7;
-    AccessStatusProto write_status = 8;
+    optional AccessStatusProto write_status = 8;
     ReplicaConfigurationStatusProto configuration = 9;
-    string last_completed_action_id = 10;
-    string last_completed_action_signature = 11;
-    string durable_action_id = 12;
-    string durable_action_signature = 13;
-    DurableActionStateProto durable_action_state = 14;
-    string durable_action_error = 15;
+    reserved 10 to 15;
+    reserved "last_completed_action_id", "last_completed_action_signature",
+        "durable_action_id", "durable_action_signature", "durable_action_state",
+        "durable_action_error";
     repeated ReplicaConnectionStatusProto active_replica_connections = 16;
     ReplicaDeactivationInfoProto deactivation_info = 17;
     ReplicaElectionConfigurationProto election_configuration = 18;
-    DurableActionResultProto last_completed_action_result = 19;
-    DurableActionResultProto durable_action_result = 20;
+    reserved 19, 20;
+    reserved "last_completed_action_result", "durable_action_result";
+    uint32 replica_agent_protocol_version = 21;
+    string agent_generation = 22;
+    uint64 agent_control_version = 23;
+    CorrelatedActionObservationProto current_agent_action = 24;
+    repeated CorrelatedActionObservationProto retained_terminal_actions = 25;
+    repeated LocalFaultRecordProto local_faults = 26;
 }
 
 message ReplicaDeactivationInfoProto {
@@ -146,6 +132,17 @@ enum DurableActionResultProto {
     DURABLE_ACTION_RESULT_NONE = 0;
     DURABLE_ACTION_RESULT_DATA_LOSS_NO_STATE_CHANGE = 1;
     DURABLE_ACTION_RESULT_DATA_LOSS_STATE_CHANGED = 2;
+}
+
+enum DurableActionErrorClassProto {
+    DURABLE_ACTION_ERROR_NONE = 0;
+    DURABLE_ACTION_ERROR_INTERNAL = 1;
+    DURABLE_ACTION_ERROR_NOT_PRIMARY = 2;
+    DURABLE_ACTION_ERROR_NO_WRITE_QUORUM = 3;
+    DURABLE_ACTION_ERROR_RECONFIGURATION_PENDING = 4;
+    DURABLE_ACTION_ERROR_STALE_EPOCH = 5;
+    DURABLE_ACTION_ERROR_CANCELLED = 6;
+    DURABLE_ACTION_ERROR_CLOSED = 7;
 }
 
 message ReplicaConnectionStatusProto {
@@ -169,63 +166,86 @@ message UpdateCatchUpConfigRequest {
     ReplicaSetConfigProto current = 1;
     ReplicaSetConfigProto previous = 2;
 }
-message UpdateCatchUpConfigResponse {}
 
 message UpdateCurrentConfigRequest {
     ReplicaSetConfigProto current = 1;
 }
-message UpdateCurrentConfigResponse {}
 
 message WaitForCatchUpQuorumRequest {
     QuorumModeProto mode = 1;
 }
-message WaitForCatchUpQuorumResponse {}
 
 message BuildReplicaRequest {
     ReplicaInfoProto replica = 1;
 }
-message BuildReplicaResponse {}
 
 message RemoveReplicaRequest {
     int64 replica_id = 1;
     string instance_id = 2;
 }
-message RemoveReplicaResponse {}
-
-message OnDataLossRequest {}
 
 message DurableOnDataLossRequest {
     EpochProto expected_epoch = 1;
 }
-message OnDataLossResponse {
-    bool state_changed = 1;
-}
 
 message RevokeWriteStatusRequest {}
-message RevokeWriteStatusResponse {}
 
 message RecordElectionConfigurationRequest {
     ReplicaElectionConfigurationProto configuration = 1;
 }
 
-message ExecuteDurableActionRequest {
-    string action_id = 1;
+enum LocalFaultTypeProto {
+    LOCAL_FAULT_UNKNOWN = 0;
+    LOCAL_FAULT_TRANSIENT = 1;
+    LOCAL_FAULT_PERMANENT = 2;
+}
+
+message CorrelatedActionObservationProto {
+    string agent_generation = 1;
+    uint64 agent_control_version = 2;
+    reserved 3;
+    reserved "admission";
+    string action_id = 4;
+    string input_signature = 5;
+    DurableActionStateProto state = 6;
+    string error = 7;
+    DurableActionResultProto result = 8;
+    DurableActionErrorClassProto error_class = 9;
+}
+
+message LocalFaultRecordProto {
+    uint64 sequence = 1;
+    LocalFaultTypeProto fault_type = 2;
+}
+
+message ExecuteCorrelatedControlActionRequest {
+    uint32 protocol_version = 1;
+    string action_id = 2;
+    string input_signature = 3;
+    int64 target_replica_id = 4;
+    string target_instance_id = 5;
+    string expected_agent_generation = 6;
+    optional uint64 expected_agent_control_version = 7;
+    EpochProto observed_runtime_epoch = 8;
     oneof action {
-        RevokeWriteStatusRequest revoke_write_status = 2;
-        ChangeRoleRequest change_role = 3;
-        UpdateEpochRequest update_epoch = 4;
-        UpdateCatchUpConfigRequest update_catch_up_configuration = 5;
-        WaitForCatchUpQuorumRequest wait_for_catch_up_quorum = 6;
-        UpdateCurrentConfigRequest update_current_configuration = 7;
-        OpenRequest open = 8;
-        CloseRequest close = 9;
-        BuildReplicaRequest build_replica = 10;
-        RemoveReplicaRequest remove_replica = 11;
-        DurableOnDataLossRequest on_data_loss = 12;
-        RecordElectionConfigurationRequest record_election_configuration = 13;
+        RevokeWriteStatusRequest revoke_write_status = 20;
+        ChangeRoleRequest change_role = 21;
+        UpdateEpochRequest update_epoch = 22;
+        UpdateCatchUpConfigRequest update_catch_up_configuration = 23;
+        WaitForCatchUpQuorumRequest wait_for_catch_up_quorum = 24;
+        UpdateCurrentConfigRequest update_current_configuration = 25;
+        OpenRequest open = 26;
+        CloseRequest close = 27;
+        BuildReplicaRequest build_replica = 28;
+        RemoveReplicaRequest remove_replica = 29;
+        DurableOnDataLossRequest on_data_loss = 30;
+        RecordElectionConfigurationRequest record_election_configuration = 31;
     }
 }
-message ExecuteDurableActionResponse {}
+
+message ExecuteCorrelatedControlActionResponse {
+    CorrelatedActionObservationProto observation = 1;
+}
 
 // ---- Data plane: Pod ↔ Pod (replication + copy) ----
 

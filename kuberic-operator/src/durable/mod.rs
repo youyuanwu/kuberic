@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use kuberic_core::types::{DurableReplicaAction, ReplicaStatusInfo};
+use kuberic_core::types::{DurableActionObservation, DurableReplicaAction, ReplicaStatusInfo};
 
 use crate::crd::{
-    DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
+    DurableOperationKind, DurableOperationPhase, DurableOperationStatus, PendingActionStatus,
     StablePartitionSnapshotStatus, StatusCondition,
 };
 
@@ -25,7 +25,9 @@ pub use failover::{
 pub use remove_replica::{RemoveReplicaTarget, decide_remove_replica, start_remove_replica};
 pub use switchover::{decide, start_switchover};
 
-pub const ACTION_DEADLINE_SECONDS: i64 = 5;
+// Includes authorization, dispatch-fence persistence, activity, and
+// observation-first retry reconciles.
+pub const ACTION_DEADLINE_SECONDS: i64 = 10;
 const MAX_ERROR_LENGTH: usize = 512;
 
 #[derive(Debug)]
@@ -38,6 +40,45 @@ pub struct ReplicaObservation {
 
 pub type OperationObservations = BTreeMap<i64, ReplicaObservation>;
 pub type OperationPodIdentities = BTreeMap<i64, String>;
+
+/// Find the authoritative process-local observation for an action. Active
+/// work wins; retained terminals are searched newest first.
+pub(crate) fn correlated_action_observation<'a>(
+    status: &'a ReplicaStatusInfo,
+    action_id: &str,
+) -> Option<&'a DurableActionObservation> {
+    status
+        .agent
+        .current_action
+        .as_ref()
+        .filter(|observation| observation.action.action_id == action_id)
+        .map(|observation| &observation.action)
+        .or_else(|| {
+            status
+                .agent
+                .retained_terminal_actions
+                .iter()
+                .rev()
+                .find(|observation| observation.action.action_id == action_id)
+                .map(|observation| &observation.action)
+        })
+}
+
+/// Use the exact payload frozen with dispatch evidence when available.
+/// Before dispatch planning, the freshly derived action remains authoritative.
+pub(crate) fn pending_action_signature(
+    pending: &PendingActionStatus,
+    derived_action: &DurableReplicaAction,
+) -> Result<String, String> {
+    if pending.dispatch_action_payload.is_empty() {
+        Ok(derived_action.signature())
+    } else {
+        kuberic_core::grpc::convert::decode_correlated_action_payload(
+            &pending.dispatch_action_payload,
+        )
+        .map(|action| action.signature())
+    }
+}
 
 #[derive(Debug)]
 pub enum Decision {

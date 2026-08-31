@@ -14,16 +14,16 @@ fidelity. Higher layers exercise more integration but are slower and
 harder to debug.
 
 ```
-Layer 3: Reconciler E2E + Operator-driven integration tests
+Layer 3: Reconciler E2E integration tests
          └─ KvClusterApi/KvPod → real PodRuntime + KV service per pod
             Full reconciler state machine, real gRPC, real replication
 
-Layer 2: Driver unit tests
-         └─ PartitionDriver + InProcessReplicaHandle (no app)
-            Protocol correctness: failover, switchover, epoch fencing
+Layer 2: Stable-recovery tests
+         └─ Read-only PartitionDriver + status-only ReplicaHandle
+            Snapshot identity, epoch, role, and quorum validation
 
 Layer 1: Component unit tests
-         └─ QuorumTracker, NoopReplicator, KubericRuntime, PodRuntime
+         └─ QuorumTracker, NoopReplicator, KubericRuntime, ReplicaAgent, PodRuntime
             Individual component behavior in isolation
 ```
 
@@ -76,69 +76,45 @@ quorum tracking, no gRPC).
 
 | Test | What It Validates |
 |------|-------------------|
-| `test_pod_runtime_user_lifecycle` | Open → ChangeRole(Primary) → replicate → demote → Close via gRPC control server |
+| `correlated_control_preserves_runtime_lifecycle_ordering` | Correlated Open → role changes → write revocation → Close through the sole production mutation path |
 
 **Infrastructure:** `PodRuntime::builder()` with real gRPC servers. Tests
 the dual-channel event delivery (lifecycle + state_provider) and the
-command routing from gRPC → PodRuntime → replicator + user.
+command routing from gRPC → ReplicaAgent → PodRuntime → replicator + user.
+
+### ReplicaAgent (`replica_agent.rs`)
+
+The agent suite uses effect-channel harnesses plus real gRPC coverage. It
+checks:
+
+- exact duplicate in-progress and terminal replay;
+- retained action-ID/signature conflict;
+- strict version, target incarnation, generation, control-version and runtime
+  epoch fences;
+- continuity-unavailable behavior after bounded eviction;
+- 16-entry terminal/fault retention and 1,024-byte UTF-8 error bounds;
+- late execution-token rejection and best-effort fault saturation;
+- same-Pod new-process generation with no inherited action state; and
+- missing/malformed/unsupported protocol rejection and transport error
+  classes.
 
 ---
 
-## Layer 2: Driver Unit Tests
+## Layer 2: Stable-Recovery Unit Tests
 
-The driver tests were migrated to KvPod-based integration tests (Layer 3).
-The `InProcessReplicaHandle` and `PartitionDriver` testing infrastructure
-remains available for future use (e.g., testing new driver methods before
-wiring the full KV stack).
-
-### InProcessReplicaHandle
-
-Available for tests that need fast, no-app protocol testing. Each
-`InProcessReplicaHandle` spawns:
-- A `WalReplicatorActor` (real quorum + replication logic)
-- A `SecondaryReceiver` gRPC data server (real ACK handling)
-- Channels for control and data events
-
-```rust
-let handle = InProcessReplicaHandle::spawn(id).await?;
-```
-
-It implements `ReplicaHandle` via in-process channels (no network), so
-the driver can orchestrate protocols at full speed. The data plane uses
-real gRPC (localhost) because `PrimarySender` connects to secondaries
-via gRPC streams.
-
-**Note:** `InProcessReplicaHandle`'s `build_replica` is a no-op — it
-calls `PrimarySender::start_build()` (starts build buffering) but does
-NOT execute the copy protocol. The full copy flow requires `PodRuntime`
-(which `KvPod` provides). This is why driver tests were migrated.
+`PartitionDriver` is read-only. Its tests prove stable snapshot recovery calls
+only `GetStatus`, validates identity/epoch/role/quorum, and round-trips the
+authoritative snapshot. Mutable driver workflow tests were removed with the
+retired production bypass.
 
 ---
 
 ## Layer 3: Integration & E2E Tests
 
-Test the full stack: `PartitionDriver` with `GrpcReplicaHandle` driving
-real `PodRuntime` pods running the KV store application. Real gRPC
-transport, real copy/replication streams, real user state management.
-Also tests the reconciler state machine end-to-end.
-
-### Operator-Driven Tests
-
-**File:** `examples/kvstore/src/tests.rs` — 8 tests
-
-| Test | What It Validates |
-|------|-------------------|
-| `test_operator_single_replica_kv` | Single pod: create, write KV via client gRPC, read back. |
-| `test_operator_three_replica_failover` | 3 pods, write data, failover, verify data survives on new primary. |
-| `test_operator_kv_crud_operations` | Put/Get/Delete operations, verify consistency across replicas. |
-| `test_operator_restart_secondary_copies_state` | restart_secondary: close + remove + add_replica. Verify copy protocol delivers full state to rebuilt secondary. |
-| `test_operator_scale_up` | Scale 1→3: add two replicas, verify copy delivers existing data. |
-| `test_operator_scale_down` | Scale 3→1: remove two replicas, verify writes still work. |
-| `test_operator_switchover` | Switchover: old primary rejects writes, new primary works, data survives. |
-| `test_operator_build_buffer_replay` | Write 500 entries, then add a 4th replica while writing 200 more concurrently. Verifies ReplicationQueue replay delivers all ops to the new secondary. 700 total entries verified. |
-| `test_operator_epoch_fencing_after_failover` | Failover: new primary works, pre-failover data survives on new primary. |
-| `test_operator_delete_partition` | delete_partition closes all replicas. Primary rejects writes after deletion. |
-| `test_operator_secondary_state_after_failover` | After failover, secondaries retain all committed data (epoch truncation preserves committed ops). |
+Test the full stack with `GrpcReplicaHandle`, real `PodRuntime` pods, real
+copy/replication streams, real user state management, and the durable
+reconciler state machines. The test handle exposes only
+`execute_correlated_control_action`.
 
 ### Reconciler E2E Tests
 
@@ -162,8 +138,8 @@ Also supports `mark_pod_not_ready()` for testing failure detection paths.
 | `test_durable_failover_incarnation_drift_is_phase_fenced` | Rejects confirmed-candidate replacement and rolls forward after post-commit secondary replacement. |
 | `test_durable_failover_final_status_lost_reply_reloads_applied_snapshot` | Applies final stable status then loses the API response; authoritative reload prevents duplicate work. |
 | `test_stable_metadata_refresh_records_live_configuration` | Records runtime election configuration and exact epoch/incarnation progress into the stable snapshot. |
-| `test_reconciler_scale_up` | Healthy phase: spec.replicas increased → creates pods → adds replicas to driver. |
-| `test_reconciler_scale_down` | Healthy phase: spec.replicas decreased → removes secondary from driver. |
+| `test_reconciler_scale_up` | Healthy phase: spec.replicas increased → creates pods → completes durable correlated add. |
+| `test_reconciler_scale_down` | Healthy phase: spec.replicas decreased → completes config-first durable correlated removal. |
 
 ### KvPod Helper
 
@@ -207,7 +183,6 @@ impl ClusterApi for KvClusterApi {
 | `QuorumTracker` (direct) | Test quorum math in isolation | Layer 1 |
 | `NoopReplicator` | Stub replicator for lifecycle tests | Layer 1 |
 | `KubericRuntime` | Lower-level harness (no gRPC) | Layer 1 |
-| `InProcessReplicaHandle` | Real replicator + gRPC data server, in-process control | Available (Layer 2) |
 | `KvPod` | Real PodRuntime + KV service + client server | Layer 3 |
 | `GrpcReplicaHandle` | Real gRPC transport to pods | Layer 3 |
 | `KvClusterApi` | Mock ClusterApi backed by real KvPods + readiness control | Layer 3 (reconciler) |
@@ -226,11 +201,11 @@ cargo test -p kuberic-core
 # KV example only
 cargo test -p kvstore
 
-# Specific test
-cargo test test_driver_failover
+# Specific durable workflow test
+cargo test -p kvstore --test reconciler test_durable_failover
 
 # With logging (requires test-log crate)
-RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
+RUST_LOG=info cargo test -p kvstore --test reconciler test_durable_failover -- --nocapture
 ```
 
 ---
@@ -286,22 +261,18 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 
 ## Testing Principles
 
-1. **Layer 2 (driver tests) is the primary correctness layer.** Protocol
-   invariants (fence-before-promote, config-first removal, dual-config
-   quorum) are tested here because `InProcessReplicaHandle` exercises
-   the real replicator logic without gRPC noise.
+1. **Layer 2 validates read-only recovery.** Stable snapshot
+   identity/epoch/role/quorum invariants are tested without mutation.
 
 2. **Layer 3 integration tests validate the full stack.** These tests
    catch integration issues (gRPC serialization, stream lifecycle,
-   copy protocol end-to-end) that Layer 2 can't. Both operator-driven
-   (direct driver use) and reconciler-driven (state machine) variants
-   exercise the same underlying protocols.
+   copy protocol end-to-end) that Layer 2 cannot. Durable reconciler tests
+   drive the sole correlated mutation path.
 
-3. **`InProcessReplicaHandle` is the key abstraction.** It enables driver
-   tests to run fast (no network) while still exercising real quorum
-   tracking, real ACK handling, and real epoch fencing. The
-   `ReplicaHandle` trait makes this possible — same driver code works
-   with in-process channels (tests) or gRPC (production).
+3. **`KvClusterApi` is the topology integration harness.** It preserves
+   deterministic status/activity fault injection while using real
+   `GrpcReplicaHandle`, `ReplicaAgent`, `PodRuntime`, quorum tracking, and
+   replication streams.
 
 4. **No separate gRPC transport tests.** gRPC transport correctness is
    validated implicitly by Layer 3 tests which use real `GrpcReplicaHandle`
@@ -326,6 +297,7 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 | **Driver-level** | `KvPod::restart(id)` / `SqlitePod::restart(id)` | Crash + start fresh pod on same `data_dir`. Returns new pod with new ports. |
 | **Reconciler-level** | `KvClusterApi::crash_pod(name)` | Aborts tasks, marks Pod NotReady, preserves `data_dir` in `data_dirs` map (PVC simulation). |
 | **Reconciler-level** | `KvClusterApi::restart_pod(name)` | Fresh PodRuntime on new ports, reuses saved `data_dir` (PVC re-attach), marks Ready. |
+| **Reconciler-level** | `KvClusterApi::restart_process_same_pod_uid(name)` | Fresh agent/runtime process and ports while retaining the Kubernetes Pod UID. |
 | **ACK-path failure** | `handle.close()` | Graceful shutdown, not a real crash, but deterministically stops persisted replication ACKs and is used for B0 quorum-loss coverage. |
 | **Legacy (low fidelity)** | `mark_pod_not_ready(name)` | Flips readiness flag but LivePod keeps running. |
 
@@ -338,6 +310,11 @@ on every reconcile cycle. This detects:
 - **Role = Unknown** — virgin PodRuntime, never received `ChangeRole`
 - **gRPC unreachable** — pod crashed, handle is dead
 
+Agent generation is observed for command dispatch fencing, not used as a
+Healthy-phase staleness signal. A same-Pod process restart is currently
+detected by runtime epoch/role divergence; the distinct generation prevents a
+pending old-process command from being accepted by the new process.
+
 The health check runs before switchover processing. A stale primary triggers
 FailingOver. A ready secondary with a new incarnation starts the durable
 replica-rejoin operation, which retires the old exact primary connection and
@@ -349,36 +326,37 @@ extension details.
 
 ### Test Patterns
 
-**Pattern 1: Secondary crash-restart (driver-level)**
-Uses `restart_secondary()` — close + new pod + `add_replica`.
-
-**Pattern 2: Primary crash → failover → rejoin (driver-level)** ✅
-`test_primary_crash_failover_rejoin` in `operator_failover.rs`:
-crash primary, `failover()`, start new pod, `add_replica()`.
-
-**Pattern 3: Secondary crash → reconciler re-integration** ✅
+**Pattern 1: Secondary crash → reconciler re-integration** ✅
 `test_reconciler_secondary_crash_and_rejoin` in `reconciler.rs`:
 `crash_pod()` → `restart_pod()` before reconciliation → durable
 retire/build/reconfigure. If no ready replacement exists, the separate durable
 force-removal path commits reduced membership before cleanup.
 
-**Pattern 4: Primary crash → reconciler failover** ✅
+**Pattern 2: Same-Pod process restart + operator restart** ✅
+`test_same_pod_process_restart_changes_agent_generation_not_incarnation`
+proves that Pod UID remains stable, agent generation changes, local action
+state resets, and a fresh operator persists durable fail-closed recovery intent
+before mutation.
+
+**Pattern 3: Primary crash → reconciler failover** ✅
 `test_reconciler_detects_primary_failure_and_fails_over` and
 `test_reconciler_double_failover` in `reconciler.rs`: both use
 `crash_pod()` for high-fidelity simulation.
 
-**Pattern 5: Simultaneous ACK-path loss (quorum loss)** ✅
-`test_b0_simultaneous_secondary_loss_returns_no_write_quorum` closes
-both secondary ACK paths and verifies that the write returns
-`NoWriteQuorum` within a bound. A companion test races an in-flight write
-with both closes and verifies success-before-loss or bounded failure, never
-an indefinite wait.
+**Pattern 4: Bounded quorum and catch-up loss** ✅
+`QuorumTracker::test_pending_operations_expire_with_no_write_quorum`,
+`test_catch_up_waiter_expires`, and the actor's
+`demotion_fails_pending_write_before_expiration` verify bounded failure and
+error preservation. The high-fidelity
+`test_simultaneous_secondary_loss_bounds_new_and_inflight_writes` removes
+both ACK paths through correlated Close actions and bounds new/in-flight
+writes.
 
-**Pattern 6: Crash during switchover (A3 rollback)**
-`test_switchover_rollback_on_target_failure` uses `handle.close()`.
-Could be upgraded to `crash()` for higher fidelity.
+**Pattern 5: Failure during switchover compensation** ✅
+`test_durable_switchover_compensates_failed_target_promotion` exercises the
+real correlated path and verifies old-primary restoration.
 
-**Pattern 7: Operator process restart recovery** ✅
+**Pattern 6: Operator process restart recovery** ✅
 `test_operator_restart_recovers_read_only_then_switches_and_scales` replaces
 only `ReconcilerState` while real pod runtimes and persisted status remain. It
 audits all control operations to prove recovery issues only `GetStatus`, then
@@ -386,7 +364,7 @@ verifies continued writes, switchover, and scale-up. Companion tests cover
 recovered unhealthy-primary failover, legacy/mismatched snapshot rejection,
 post-recovery pod logical/incarnation drift, and unordered pod listing.
 
-**Pattern 8: Durable switchover boundary and ambiguity recovery** ✅
+**Pattern 7: Durable switchover boundary and ambiguity recovery** ✅
 `test_durable_switchover_survives_state_loss_at_every_boundary` discards
 `ReconcilerState` after every checkpoint/activity window. Companion tests
 inject a lost target-promotion reply, force target-promotion compensation,
@@ -395,15 +373,22 @@ before mutation. Assertions cover deterministic single dispatch of unsafe role
 changes, terminal stable snapshot recovery, and unsupported checkpoint
 versions with no mutating RPC.
 
-**Pattern 9: Durable add/rejoin boundary and ambiguity recovery** ✅
+**Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` replaces
 controller state at every boundary and injects lost responses for Open,
 UpdateEpoch, both role changes, BuildReplica, catch-up/current configuration,
 and quorum wait. Companion tests cover exact old-incarnation retirement,
 status conflict before intent, pre-configuration and dual-configuration
 compensation, and roll-forward after current configuration commits.
+`test_scale_up_replays_writes_buffered_during_copy` additionally writes during
+the real copy window and verifies all buffered operations on the new
+secondary.
 
-**Pattern 10: Durable removal boundary and fencing** ✅
+**Adapter data-plane coverage** ✅
+`examples/sqlite/tests/correlated_replication.rs` covers multi-page WAL
+shipping, schema changes, switchover, and failover through correlated actions.
+
+**Pattern 9: Durable removal boundary and fencing** ✅
 `test_durable_remove_survives_state_loss_and_every_lost_runtime_reply`
 replaces controller state at every persisted removal phase and injects lost
 responses for catch-up/current configuration, quorum wait, exact primary
@@ -412,7 +397,7 @@ scale-down, unreachable force-removal, pre-commit configuration restoration,
 post-commit roll-forward, stable-snapshot commit ordering, conflict before
 intent, and same-name/new-UID deletion fencing.
 
-**Pattern 11: Durable Phase-1 failover and data loss** ✅
+**Pattern 10: Durable Phase-1 failover and data loss** ✅
 
 `failover_election` unit matrices cover complete previous/current
 denominators, overlap, unhealthy and unknown observations, stale deactivation,
@@ -423,8 +408,11 @@ exercise no-change/state-changed/failed/lost `OnDataLoss`, verify explicit
 quorum wait with rotating probes, fence incarnation drift on both sides of
 promotion commit, and run consecutive failovers. Every persisted failover
 phase also round-trips through serialization.
+`test_slow_data_loss_callback_does_not_poison_failover` keeps a callback
+in-progress beyond the normal 10-second action window and verifies the
+data-loss-specific deadline permits safe completion.
 
-**Pattern 12: Durable creation bootstrap and routing gate** ✅
+**Pattern 11: Durable creation bootstrap and routing gate** ✅
 `test_durable_create_survives_state_loss_and_every_lost_runtime_reply`
 replaces controller state at every creation boundary, injects a lost response
 for every correlated runtime activity instance, and verifies exact Open/build

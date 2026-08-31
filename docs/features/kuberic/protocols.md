@@ -1,18 +1,56 @@
 # Kuberic: Replication Protocols
 
-Protocols implemented by the durable operator workflows and
-`PartitionDriver` (direct/non-operator orchestration), with
+Protocols implemented by the durable operator workflows, with
 `WalReplicatorActor` as the pod-side replication engine.
 
 > Part of the [Kuberic Design](../kuberic-replicator-design.md).
 
 ---
 
+## Pod-Local Control Acceptance
+
+Production durable workflows remain operator-owned, but their runtime
+activities now cross a pod-local `ReplicaAgent` boundary:
+
+```
+persist pending action in CRD status
+observe target Pod UID + runtime epoch + agent generation/control version
+persist generation/control-version/runtime-epoch fences + exact action payload
+  (no runtime activity)
+dispatch ExecuteCorrelatedControlAction
+  → agent validates version, target, generation, signature and fences
+  → exact duplicate: return current/retained observation
+  → conflict/stale/busy: explicit zero-effect rejection
+  → accepted: serialize and delegate one RuntimeEffect to PodRuntime
+PodRuntime executes ordered service/replicator callbacks
+agent records exact completion; operator observes before advancing
+```
+
+`ReplicaInstanceId` remains the Pod UID. `AgentGeneration` identifies one
+process inside that Pod, and changes after a container restart.
+`AgentControlVersion` counts accepted mutations within one generation.
+`observed_runtime_epoch` is a current-state fence, not an epoch the action
+intends to establish. Change-role/update-epoch payloads carry target epochs;
+durable `OnDataLoss` separately requires its payload epoch to match the
+runtime epoch.
+
+The agent retains one active action and 16 terminal observations. Retained
+ID/signature duplicates replay without another effect. After eviction, an old
+control-version request fails as continuity unavailable; a current-version
+redrive remains an operator-owned at-least-once decision after postcondition
+observation. There is no exactly-once claim or durable pod-local history.
+
+Replica-agent status is required and advertises numeric control protocol
+version 1. Missing, malformed, or unsupported status fails closed. The
+operator and pod runtimes must be deployed together; the control boundary does
+not provide mixed-version interoperability or fallback.
+
+---
+
 ## Protocol: Failover
 
-Unplanned primary failure. Direct/non-operator callers may still use
-`PartitionDriver::failover()`. The production reconciler uses a versioned
-`Failover` checkpoint in CRD status.
+Unplanned primary failure uses a versioned `Failover` checkpoint in CRD
+status.
 
 ```
 persist failover checkpoint with exact starting membership
@@ -63,9 +101,8 @@ fail closed and never restore the failed primary.
 
 ## Protocol: Switchover
 
-Planned primary change has two callers. Direct tests may still invoke the
-monolithic `PartitionDriver::switchover()`. Reconciler-driven switchover uses a
-versioned compact checkpoint in `status.operation`.
+Planned primary change uses a versioned compact checkpoint in
+`status.operation`.
 
 ```
 persist revoke intent → revoke writes
@@ -91,17 +128,16 @@ epochs/configuration and labels, then publishes the compensated stable
 snapshot. Unverifiable post-promotion convergence becomes `poisoned`; it never
 publishes a snapshot containing an old-epoch retained member.
 
-The internal runtime activity endpoint records only the most recent completed
-action ID/signature. This correlates a lost reply without introducing replay
-history or exactly-once claims.
+The pod-local agent records the active action and 16 most recent terminal
+observations. These fields are the only local correlation ledger. The bounded
+records correlate a lost reply within one agent generation without becoming
+distributed workflow history or an exactly-once claim.
 
 ---
 
 ## Protocol: Create Partition
 
-Reconciler-driven creation uses a durable `CreatePartition` checkpoint.
-Direct tests and non-operator consumers may still invoke
-`PartitionDriver::create_partition()`.
+Partition creation uses a durable `CreatePartition` checkpoint.
 
 ```
 1. Validate pod-index IDs and pod UIDs; sort by logical ID
@@ -141,16 +177,12 @@ fails closed. A missing or replacement uncommitted member restarts creation
 with a new target UID while preserving any committed prefix. Compensation is
 rejected if its target appears in the committed bootstrap snapshot.
 
-The direct driver workflow retains its existing SF-style ordering and grows
-configuration one secondary at a time.
-
 ---
 
 ## Protocol: Scale-Up (Add Replica)
 
-Add a new replica to a running partition. Direct/in-process callers may use
-`PartitionDriver::add_replica()`. Operator reconciliation uses the durable
-`AddingReplica` operation.
+Add a new replica to a running partition through the durable `AddingReplica`
+operation.
 
 ```
 1. Operator creates new Pod + waits for Ready
@@ -210,7 +242,8 @@ replacement is force-removed; later scale-up can restore desired capacity.
 
 ## Protocol: Restart Secondary
 
-Replace a failed secondary. Implemented in `PartitionDriver::restart_secondary()`.
+Replace a failed secondary through the operator's durable removal/rebuild
+workflow.
 
 ```
 1. Identify the old replica incarnation (Kubernetes Pod UID in production)
@@ -263,8 +296,7 @@ restarted pod runtime.
 
 ## Protocol: Scale-Down (Remove Secondary)
 
-Remove a replica from the partition. Implemented in
-`PartitionDriver::remove_secondary()`.
+Remove a replica through the operator's durable `RemoveReplica` workflow.
 
 Design follows SF's config-first approach (remove from quorum before closing):
 
@@ -293,8 +325,8 @@ live replication — the complete orchestration across all components.
 ### Components Involved
 
 ```
-Operator (PartitionDriver)
-  │ control plane RPCs
+Operator (durable state machines)
+  │ fenced correlated actions
   ▼
 Primary Pod (PodRuntime + WalReplicatorActor + PrimarySender)
   │ data plane gRPC
@@ -332,7 +364,7 @@ The user holds the receiving ends via `ServiceContext.copy_stream` and
 ```
 Operator                    Primary                     Secondary             User
    │                           │                           │                    │
-   │ 1. open(secondary)        │                           │                    │
+   │ 1. Correlated Open        │                           │                    │
    │──────────────────────────────────────────────────────►│                    │
    │                           │                           │──Open event──────►│
    │                           │                           │  (gives user       │
@@ -340,15 +372,15 @@ Operator                    Primary                     Secondary             Us
    │                           │                           │   replication_     │
    │                           │                           │   stream handles)  │
    │                           │                           │                    │
-   │ 2. change_role(Idle)      │                           │                    │
+   │ 2. Correlated ChangeRole(Idle)                        │                    │
    │──────────────────────────────────────────────────────►│                    │
    │                           │                           │──ChangeRole(Idle)─►│
    │                           │                           │  User starts       │
    │                           │                           │  draining          │
    │                           │                           │  copy_stream       │
    │                           │                           │                    │
-   │ 3. build_replica ─────────────────────────────────►│  │                    │
-   │    (RPC to PRIMARY, blocks until copy done)        │  │                    │
+   │ 3. Correlated BuildReplica ───────────────────────►│  │                    │
+   │    (returns InProgress; completion is observed)    │  │                    │
    │                           │                        │  │                    │
    │                           │ 3a. GetCopyContext RPC ►│  │                    │
    │                           │◄── context stream ─────│  │──GetCopyContext──►│
@@ -368,12 +400,12 @@ Operator                    Primary                     Secondary             Us
    │                           │                           │                    │
    │                           │ 3d. CopyStream RPC ends   │                    │
    │                           │     copy_op_tx dropped    │  copy_stream       │
-   │◄── build_replica returns ─│     by SecondaryReceiver  │  returns None      │
+   │◄── terminal status ───────│     by SecondaryReceiver  │  returns None      │
    │                           │                           │  (stream ended)    │
    │                           │                           │                    │
    │                           │ ** COPY COMPLETE **       │                    │
    │                           │                           │                    │
-   │ 4. change_role(Active)    │                           │                    │
+   │ 4. Correlated ChangeRole(Active)                      │                    │
    │──────────────────────────────────────────────────────►│                    │
    │                           │                           │──ChangeRole       │
    │                           │                           │  (Active)────────►│
@@ -382,7 +414,7 @@ Operator                    Primary                     Secondary             Us
    │                           │                           │  replication_      │
    │                           │                           │  stream            │
    │                           │                           │                    │
-   │ 5. update_catch_up_config │                           │                    │
+   │ 5. Correlated UpdateCatchUpConfiguration              │                    │
    │──(on primary)────────────►│                           │                    │
    │                           │ PrimarySender::           │                    │
    │                           │   add_secondary(addr)     │                    │
@@ -507,10 +539,10 @@ Neither stream reconnects on failure:
 
 | Phase | Read | Write | Notes |
 |---|---|---|---|
-| Pre-catchup | Granted | **Granted** | SF catchup #1 (target catches up while writes flow) |
-| Write revoked | Granted | ReconfigPending | `revoke_write_status()` — no new writes |
-| Post-revoke catchup | Granted | ReconfigPending | SF catchup #2 (final drain) — **kuberic: E2 not yet implemented** |
-| Role changed | NotPrimary | NotPrimary | `change_role(ActiveSecondary)` → `close_all()` |
+| Before durable switchover | Granted | **Granted** | Normal primary service |
+| Write revoked | Granted | ReconfigPending | Correlated `RevokeWriteStatus`; frozen LSN captured |
+| Target catch-up | Granted | ReconfigPending | Target must reach the frozen LSN |
+| Role changed | NotPrimary | NotPrimary | Correlated `ChangeRole(ActiveSecondary)` closes old-primary senders |
 
 **Runtime owns status transitions** — the replicator only writes LSN values
 to `PartitionState`. Role transitions set the initial access state, and a
@@ -594,8 +626,8 @@ Step 3: update_current_configuration(new_config)
   Done — configuration change is finalized
 ```
 
-This is implemented in `PartitionDriver::reconfigure_quorum()` and
-called by `add_replica`, `remove_secondary`, `failover`, and `switchover`.
+This sequence is issued as correlated actions by the durable add, remove,
+failover, and switchover workflows.
 
 ### QuorumTracker Internals
 
@@ -762,12 +794,13 @@ for (id, progress) in &member_progress {
 
 | Mode | What Must Be True | Used By |
 |------|-------------------|---------|
-| `Write` | Pending empty + each `must_catch_up` replica ACKed `>= highest_lsn` | `PartitionDriver` (all operations) |
-| `All` | Pending empty + ALL `current_members` ACKed `>= highest_lsn` | SF legacy fallback (not used by driver) |
+| `Write` | Pending empty + each `must_catch_up` replica ACKed `>= highest_lsn` | Durable topology workflows |
+| `All` | Pending empty + ALL `current_members` ACKed `>= highest_lsn` | SF-style replicator compatibility |
 
 `Write` mode is the default. `All` mode is stricter (every member, not
-just `must_catch_up` ones) and exists only for backward compatibility
-with SF replicators that don't support `must_catch_up` markers.
+just `must_catch_up` ones) and is retained for replicator behavior that does
+not provide `must_catch_up` markers. This is unrelated to control-plane
+version compatibility.
 
 ### Notify Chain
 
