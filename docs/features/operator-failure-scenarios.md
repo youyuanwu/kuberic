@@ -51,12 +51,13 @@ Current fields:
 `currentPrimary` and per-member status remain compatibility/observational
 output. They are not used to reconstruct topology.
 
-**New fields needed:**
+**Implemented and future fields:**
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `failingSinceTimestamp` | `Option<DateTime>` | When primary started failing (for failover delay) |
-| `quorumLossSince` | `Option<DateTime>` | When quorum loss was first detected (for wait duration) |
+| `primaryFailingSince` | `Option<String>` | Persisted Unix time when continuous primary failure began |
+| `stableElectionMetadataRefresh` | `Option<Checkpoint>` | Healthy-path configuration/progress refresh cursor and pending action |
+| `operation.failover` | `Option<Checkpoint>` | Phase-1 observations, waits, epoch intents, callback result, and attestations |
 | `instanceNames` | `Vec<String>` | All instance pod names (for missing-pod detection) |
 | `instanceStates` | `HashMap<String, InstanceState>` | Per-instance reported state |
 | `grpcFailureCounts` | `HashMap<String, u32>` | Consecutive gRPC failures per replica |
@@ -90,11 +91,18 @@ struct InstanceState {
 **Detection:** Healthy phase checks `is_pod_ready(primary_pod) == false`.
 
 **Current behavior:** ✅ Implemented
-- Transitions to `Phase::FailingOver`
-- Calls `driver.failover(primary_id)`
-- Selects secondary with highest LSN as new primary
-- Updates labels + CRD status
-- Returns to `Phase::Healthy`
+- Persists a versioned `Failover` operation before runtime mutation
+- Records and validates live incarnation, epoch, role/configuration,
+  progress/retained range, health, and deactivation evidence
+- Evaluates previous/current read quorum independently
+- Persists `WaitingForBestCandidate` or `QuorumLoss` when missing evidence
+  could change the safe result
+- Durably confirms the deterministic best candidate and immutable target
+- Advances configuration/data-loss epochs through separate write-ahead intent
+- Invokes epoch-fenced, correlated `OnDataLoss` only after the candidate
+  observes the advanced epoch
+- Commits promotion, rolls configuration/labels forward, attests exact final
+  state, and atomically publishes `Healthy`
 
 **Design addition — failover delay (K8s adaptation):**
 
@@ -112,77 +120,53 @@ Primary not ready detected:
   ├─ If failoverDelay == 0: immediate failover (SF default)
   │
   ├─ If failoverDelay > 0:
-  │    ├─ If failingSinceTimestamp is None:
-  │    │    Set failingSinceTimestamp = now
+  │    ├─ If primaryFailingSince is None:
+  │    │    Set primaryFailingSince = now
   │    │    Requeue after 1s
   │    │
   │    ├─ If elapsed < failoverDelay:
   │    │    Requeue after 1s (keep checking)
   │    │
   │    ├─ If primary recovers:
-  │    │    Clear failingSinceTimestamp
+  │    │    Clear primaryFailingSince
   │    │    Stay in Healthy
   │    │
   │    └─ If elapsed >= failoverDelay:
-  │         Clear failingSinceTimestamp
+  │         Clear primaryFailingSince
   │         Transition to FailingOver
 ```
 
-**Quorum loss detection (aligned with SF data loss handling):**
-
-SF's FM distinguishes two cases when a primary fails:
-
-1. **Write quorum available** — enough surviving replicas have the data.
-   Normal failover: promote replica with highest LSN. This is our
-   existing `driver.failover()`.
-
-2. **Write quorum NOT available** — surviving replicas may not have all
-   committed ops. SF distinguishes two sub-cases:
-   
-   a. **Primary alive, secondaries down** — quorum loss. Primary blocks
-      writes (`NoWriteQuorum`). FM waits `QuorumLossWaitDuration` for
-      secondaries to recover. If timeout expires, FM drops offline replicas
-      and declares data loss.
-   
-   b. **Primary also dead** — FM selects best surviving replica, increments
-      `data_loss_number`, promotes with `on_data_loss()` callback.
-
-Our design follows SF's two-phase approach:
+**Phase-1 quorum and data-loss handling:**
 
 ```
-Failover with quorum check (SF-aligned):
+Durable failover:
   │
-  ├─ Count available replicas with valid LSN
+  ├─ Persist full previous/current membership denominators
+  ├─ Collect exact-incarnation live evidence
   │
-  ├─ If write quorum available (≥ ⌊N/2⌋+1 replicas):
-  │    Normal failover: promote highest-LSN replica
-  │    No data loss
+  ├─ Missing replica could outrank survivor:
+  │    WaitForBestCandidate; rotate probes; no mutation
   │
-  ├─ If primary alive but write quorum lost:
-  │    Primary already blocks writes (NoWriteQuorum via PartitionState)
-  │    Reconciler waits spec.quorumLossWaitDuration (default 60s)
-  │    for secondaries to recover
-  │    If timeout: drop offline replicas → data loss path below
-  │    Set condition QuorumAvailable=False
+  ├─ Previous/current read quorum could still recover:
+  │    WaitForReadQuorum; rotate probes; no mutation
   │
-  └─ If primary dead AND write quorum NOT available:
-       Data loss scenario (SF path):
-       ├─ Wait spec.quorumLossWaitDuration for any recovery
-       ├─ If timeout: increment epoch.data_loss_number
-       ├─ Promote best available replica
-       ├─ Call on_data_loss() on new primary
-       ├─ Rebuild all other replicas from new primary
-       └─ Set condition QuorumAvailable=False (informational)
+  ├─ Read quorum satisfied:
+  │    Persist best candidate → configuration epoch → promote/converge
+  │
+  └─ At least one read quorum conclusively unavailable, no restorer,
+       and no possibly better candidate:
+       Persist candidate → configuration epoch → data-loss epoch
+       Apply epoch → durable OnDataLoss
+         NoStateChange → converge compatible target
+         StateChanged → refresh candidate → primary-only target
+         Error/conflict → poison without promotion
 ```
 
-**SF nuance discovered from C++ source:** SF does NOT failover immediately
-on quorum loss. It waits `QuorumLossWaitDuration` (configurable per-service)
-for secondaries to recover. If they do, quorum is restored with no data
-loss. Only after timeout does SF proceed with data loss declaration.
-
-This is a middle ground between CNPG (blocks indefinitely) and our
-previous design (failover immediately). We should add
-`spec.quorumLossWaitDuration` to the CRD.
+Elapsed time never converts missing safety evidence into data loss. This is
+deliberately fail closed: the callback path is reached from conclusive
+observations, not from a timeout. `failoverDelay` only delays initial primary
+failure detection and resets if the primary recovers before operation
+persistence.
 
 **Edge case — gRPC unreachable but pod Ready:** See scenario 5.
 
@@ -270,7 +254,10 @@ commit.
 
 **Detection:** `container_status.state.waiting.reason == "CrashLoopBackOff"`
 
-**Current behavior:** Same as "not ready" — only detected for primary.
+**Current behavior:** Kubernetes readiness gates primary health. Live gRPC
+status checks cover both primary and secondary replicas and drive secondary
+staleness handling. The operator does not yet inspect the `CrashLoopBackOff`
+reason separately or enforce a recreate-attempt cap.
 
 **Design (informed by CNPG):**
 
@@ -282,9 +269,9 @@ CrashLoop handling:
   │
   ├─ Crash-looping pods are treated as "not ready" (scenario 2 flow)
   │
-  ├─ Excluded from failover election candidates
-  │   (driver.failover already selects by LSN from ReplicaInfo;
-  │    a crash-looping pod won't respond to GetStatus → no LSN → excluded)
+  ├─ Primary loss routes to durable Phase-1 failover
+  │   Unavailable replicas remain in quorum denominators
+  │   Unknown/possibly-best replicas cause an explicit wait
   │
   ├─ After replacementDelay: delete and recreate
   │
@@ -452,79 +439,46 @@ can colocate if scheduling fails. `required` enforces strict separation
 **Detection:** Primary's `write_status()` returns `NoWriteQuorum`, or
 gRPC calls to majority of replicas fail.
 
-**Current behavior:** ❌ Not detected by operator
-
-**Design (aligned with SF quorum loss / data loss protocol):**
+**Current behavior:** Primary-dead Phase-1 quorum loss is implemented in the
+durable failover operation. Primary-alive `NoWriteQuorum` condition reporting
+remains future operator health work.
 
 SF distinguishes **quorum loss** (runtime state: writes blocked, system
 waits) from **data loss** (explicit FM decision: committed ops may be
-irrecoverable). Quorum loss may recover without data loss if replicas
-come back before `QuorumLossWaitDuration` expires.
+irrecoverable). Kuberic does not infer data loss from elapsed time.
 
 See `docs/background/service-fabric/failover.md` §Quorum Loss
 and Data Loss for the full SF protocol.
 
-#### Case 1: Primary alive, quorum lost
+#### Case 1: Primary alive, write quorum lost
 
-```
-Primary is up but write_status == NoWriteQuorum:
-  │
-  ├─ Detection: periodic GetStatus on primary
-  │
-  ├─ Set condition QuorumAvailable=False
-  ├─ Record quorumLossSince = now (in CRD status)
-  │
-  ├─ Wait for replicas to recover:
-  │    Requeue every 5s
-  │    Primary already blocks writes (NoWriteQuorum via PartitionState)
-  │    Reads still work on primary
-  │
-  ├─ If replicas recover (quorum restored):
-  │    Clear quorumLossSince
-  │    Set condition QuorumAvailable=True
-  │    Writes resume automatically (no operator action needed)
-  │    *** NO DATA LOSS ***
-  │
-  └─ If quorumLossWaitDuration expires:
-       Drop offline replicas from configuration
-       → data loss protocol (same as §1 failover with quorum check)
-       Increment epoch.data_loss_number
-       Call on_data_loss() on primary
-       Rebuild secondaries from primary
-```
-
-This matches SF's `ReconfigurationTask::CheckFailoverUnit()` behavior:
-wait `QuorumLossWaitDuration`, then `DropOfflineReplicas()`.
+The runtime reports `NoWriteQuorum` and blocks writes. Operator conditions and
+an explicit primary-alive recovery policy remain future work; the operator does
+not automatically advance the data-loss epoch from a timer.
 
 #### Case 2: Primary dead, quorum lost (data loss scenario)
 
-Covered by the failover protocol (§1). When write quorum is not available
-among survivors:
-1. Wait `quorumLossWaitDuration` for replicas to recover
-2. If timeout: increment `data_loss_number`, promote best available,
-   call `on_data_loss()`
-3. User's handler decides: accept loss, restore, or error
+Covered by the failover protocol (§1). The operator evaluates previous/current
+**read** quorum from exact live observations. It waits while any unavailable
+member could restore quorum or outrank the surviving candidate. Once all
+safety-relevant members are accounted for, it persists the data-loss epoch,
+applies it to the candidate, and invokes correlated `OnDataLoss`.
 
 #### Case 3: Quorum loss during reconfiguration
 
-SF also checks **read quorum** on the *previous* configuration during
-reconfiguration. If `PC.UpCount < PC.ReadQuorumSize`, data from the
-previous epoch may not be preserved. This is a subtle data loss scenario
-that we should handle in `PartitionDriver` when dual-config quorum is
-active.
+The pure evaluator and persisted failover schema support distinct previous and
+current configurations and count overlap independently. Production handoff
+currently starts from stable `Healthy` topology, so previous configuration is
+absent. Mid-reconfiguration failover handoff remains future work.
 
-**Key principle (from SF):** The system eventually makes progress, but
-waits first. `QuorumLossWaitDuration` is the knob that trades
-availability (longer wait = longer write outage) for consistency (more
-time for replicas to recover without data loss).
-
-**New CRD field:** `spec.quorumLossWaitDuration` (default 60s).
+**Key principle:** Missing evidence is a wait, not permission to discard it.
+Data loss requires conclusive observations and a durably confirmed candidate.
 
 **Prevention (matching SF):**
 - Use `spec.minReplicas` ≥ 2 to require quorum for writes
 - Use pod anti-affinity across nodes (fault domain spreading)
 - Synchronous replication (our default via persisted-mode ACK)
-- Set `quorumLossWaitDuration` per application needs
+- Monitor `WaitingForBestCandidate` and `QuorumLoss` durable conditions
 
 ---
 
@@ -569,7 +523,8 @@ each committed change. If runtime mutation succeeds but status persistence
 does not, the live operator retries that exact pending status before another
 action.
 
-During `Creating`, `Switchover`, `AddingReplica`, and `RemovingReplica`,
+During `Creating`, `Switchover`, `AddingReplica`, `RemovingReplica`, and
+`FailingOver`,
 `status.operation` is the authoritative compact checkpoint. Creation records
 explicit no previous topology and an optional committed bootstrap snapshot;
 the other protocols record previous/target stable snapshots. Each operation
@@ -579,7 +534,10 @@ role/epoch/incarnation/progress/write/configuration/activity state, and either
 advances one checkpoint, dispatches one activity, waits, compensates, or
 poisons. Add/rebuild observes long-running copy progress and restores the
 previous current configuration before candidate cleanup when catch-up had
-started. Kubernetes `resourceVersion` rejects stale concurrent advancement.
+started. Kubernetes `resourceVersion` rejects stale concurrent advancement. Failover
+additionally persists Phase-1 observations, unavailable-probe rotation,
+separate configuration/data-loss epoch intents, callback result, promotion
+commit, and final attestations.
 
 Creation commits primary-only and expanded partial bootstrap snapshots before
 starting later members. Pods remain on a non-serving bootstrap label until the
@@ -588,9 +546,9 @@ checkpointed. Before the first commit, cleanup can restart from no topology.
 After a commit, creation preserves committed members and retries only the
 candidate. A changed committed-member incarnation fails closed.
 
-**Boundary:** This does not recover `FailingOver`, data-loss transitions, or a
-lost bootstrap primary. Those cases require additional durable-operation
-migrations or a separate pod-state recovery protocol.
+**Boundary:** Stable failover from `Healthy`, including data loss, is
+recoverable. Mid-reconfiguration handoff into failover and loss of an
+uncommitted bootstrap primary remain separate recovery problems.
 
 ---
 
@@ -603,10 +561,10 @@ and accepting writes if it didn't receive the epoch fence.
 
 | Layer | Mechanism | Origin | Status |
 |-------|-----------|--------|--------|
-| 1. Epoch fencing | `update_epoch()` on secondaries before promote. Secondaries reject old-epoch ops. | **SF core** | ✅ Implemented |
+| 1. Epoch fencing | Candidate observes the new epoch before promotion; retained secondaries receive it during post-promotion convergence. | **SF core** | ✅ Implemented |
 | 2. Role status | `set_status_for_role()` sets `NotPrimary` on demotion. `StateReplicatorHandle::replicate()` rejects. | **SF core** | ✅ Implemented |
 | 3. Primary self-fencing | Liveness probe isolation check (see scenario 5, level 3). Pod self-kills if isolated. | **K8s addition** (from CNPG) | ❌ Not implemented |
-| 4. Old primary cleanup | Operator verifies old primary pod is closed/deleted after failover. | **K8s addition** | ❌ Not implemented |
+| 4. Old primary routing fence | Durable label convergence removes the old primary from serving selection; physical cleanup follows topology reconciliation. | **K8s addition** | ✅ Label fence |
 | 5. Multi-primary detection | Healthy phase detects two primaries via GetStatus. Closes stale one (epoch comparison). | **K8s addition** | ❌ Not implemented |
 
 **SF's primary defense is epoch fencing (layers 1-2).** Layers 3-5 are
@@ -638,12 +596,12 @@ After failover completes:
 |----------|----------|--------|--------|
 | P0 | Secondary not ready → replace | Medium | SF (FM detects + replaces) |
 | P0 | Pod deleted → detect + replace | Medium | SF (FM detects) + K8s pod mgmt |
-| P0 | Data loss failover (quorum lost) | Medium | **SF** (`on_data_loss()` protocol) |
+| Done | Durable Phase-1/data loss failover | Implemented | **SF** (`OnDataLoss` protocol) |
 | Done | Stable Healthy operator restart → recover driver | Implemented | SF (FM is stateless, uses persistent config) |
 | P1 | gRPC failure tracking | Medium | K8s adaptation (replaces SF federation heartbeats) |
 | P1 | Old primary cleanup after failover | Small | K8s addition |
 | P1 | CRD conditions (Ready, Degraded, Quorum) | Small | K8s addition (from CNPG) |
-| P1 | Failover delay (optional) | Small | K8s adaptation (from CNPG) |
+| Done | Failover delay (optional) | Implemented | K8s adaptation (from CNPG) |
 | P2 | Primary self-fencing liveness probe | Medium | K8s addition (from CNPG isolation check) |
 | P2 | Node drain detection | Medium | K8s addition (from CNPG, analogous to SF PLB) |
 | P2 | Multi-primary detection | Small | K8s addition (epoch comparison) |
@@ -690,10 +648,11 @@ After failover completes:
                     node drain: switchover primary off draining node
 ```
 
-**SF-aligned failover:** Unlike CNPG which blocks indefinitely on quorum
-loss, we follow SF's data loss protocol. If write quorum is available,
-normal failover. If not, promote best available with `on_data_loss()`.
-The system always makes progress.
+**SF-aligned failover:** The operator validates previous/current read quorum
+and the complete best-candidate ordering. Missing quorum-restoring or possibly
+better evidence remains in an explicit durable wait. Once observations
+conclusively establish data loss, the operator advances the data-loss epoch
+before correlated `OnDataLoss`; it never promotes merely because time elapsed.
 
 **New in Healthy phase:**
 - Secondary health monitoring (replace unhealthy replicas)

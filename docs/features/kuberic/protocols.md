@@ -1,7 +1,8 @@
 # Kuberic: Replication Protocols
 
-Protocols implemented by `PartitionDriver` (operator-side orchestration)
-and `WalReplicatorActor` (pod-side replication engine).
+Protocols implemented by the durable operator workflows and
+`PartitionDriver` (direct/non-operator orchestration), with
+`WalReplicatorActor` as the pod-side replication engine.
 
 > Part of the [Kuberic Design](../kuberic-replicator-design.md).
 
@@ -9,41 +10,54 @@ and `WalReplicatorActor` (pod-side replication engine).
 
 ## Protocol: Failover
 
-Unplanned primary failure. Implemented in `PartitionDriver::failover()`.
+Unplanned primary failure. Direct/non-operator callers may still use
+`PartitionDriver::failover()`. The production reconciler uses a versioned
+`Failover` checkpoint in CRD status.
 
 ```
-1. Enforce failover delay (if spec.failoverDelay > 0, K8s-specific):
-   - Record failingSinceTimestamp
-   - Requeue until delay elapsed or primary recovers
-   - Default: 0 (immediate, matching SF behavior)
-2. Remove failed primary, increment epoch
-3. Select new primary: replica with highest current_progress (LSN)
-   - Exclude crash-looping and unreachable replicas
-   - Matches SF FM's CompareForPrimary() logic
-4. Check quorum availability:
-   a. If write quorum available (≥ ⌊N/2⌋+1 survivors):
-      Normal failover — no data loss
-   b. If write quorum NOT available:
-      Wait spec.quorumLossWaitDuration (default 60s)
-      for replicas to recover (SF QuorumLossWaitDuration)
-      If replicas recover → normal failover (no data loss)
-      If timeout expires → data loss protocol:
-        Increment epoch.data_loss_number
-        Promote best available replica
-        Call on_data_loss() on new primary
-        Rebuild all secondaries from new primary
-5. Promote: change_role(new_epoch, Primary) on winner (SF Phase 4: Activate)
-6. Distribute epoch to surviving secondaries (best-effort, skip unreachable)
-   → Unreachable secondaries are rebuilt later
-7. Reconfigure quorum: update_catch_up → wait_for_catch_up → update_current
-8. Grant access: new primary → Granted, secondaries → NotPrimary
-9. Clean up old primary: close/delete pod, create replacement secondary
+persist failover checkpoint with exact starting membership
+record live election configuration on reachable replicas
+collect incarnation/epoch/role/progress/deactivation evidence
+assess previous and current read quorum independently
+  → unavailable possible-best: WaitingForBestCandidate
+  → recoverable missing quorum: QuorumLoss
+  → quorum available: confirm deterministic target
+  → quorum conclusively lost: confirm target + data-loss requirement
+persist configuration epoch intent
+persist data-loss epoch intent when required
+apply and observe the combined epoch at the candidate
+invoke/observe epoch-fenced durable OnDataLoss when required
+  → NoStateChange: retain compatible survivors
+  → StateChanged: refresh progress and narrow to primary-only
+promote candidate → commit primary-only snapshot
+distribute epoch → catch-up config → wait quorum → current config
+record final election configuration and converge serving labels
+attest exact target state
+atomically publish stable snapshot + Healthy and clear operation
 ```
 
-**SF alignment:** Epoch is distributed AFTER promotion (Phase 4: Activate),
-not before. The old primary is dead and can't send ops — no pre-promotion
-fencing needed. Unreachable secondaries are skipped (best-effort) and
-rebuilt when they come back.
+Every configuration denominator retains all persisted members; only validated
+live observations enter the numerator. Stale deactivation evidence can count
+toward read quorum but is filtered from primary candidacy. Candidate comparison
+uses deactivation freshness, catch-up capability, LSN, retained range, and a
+stable identity tie break.
+
+Transiently unusable replies (incarnation/epoch mismatch, unhealthy, or
+unknown retained progress) remain outstanding rather than becoming evidence
+of permanent loss. Terminal role/range/configuration contradictions remain
+excluded. A confirmed target may not fall below `minReplicas`.
+
+`failoverDelay` is only a continuous primary-failure detection delay. It does
+not end either Phase-1 wait or authorize data loss. Unavailable members are
+probed in durable rotation. Data loss begins only when an applicable read
+quorum is conclusively unavailable and no missing member can restore quorum or
+outrank the survivor.
+
+The candidate observes the advanced epoch before `OnDataLoss`; epoch equality
+is checked again inside the replicator actor immediately before the provider
+callback. Callback completion and result are status-observable after a lost
+reply. Promotion is the irreversible boundary: later failures roll forward or
+fail closed and never restore the failed primary.
 
 ---
 

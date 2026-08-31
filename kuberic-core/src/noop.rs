@@ -53,7 +53,7 @@ impl NoopReplicator {
                         ReplicatorControlEvent::UpdateEpoch { reply, .. } => {
                             let _ = reply.send(Ok(()));
                         }
-                        ReplicatorControlEvent::OnDataLoss { reply } => {
+                        ReplicatorControlEvent::OnDataLoss { reply, .. } => {
                             let _ = reply.send(Ok(crate::types::DataLossAction::None));
                         }
                         ReplicatorControlEvent::UpdateCatchUpConfiguration { reply, .. } => {

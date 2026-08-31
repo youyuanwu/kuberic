@@ -82,13 +82,12 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 | **Event-based APIs** | Both replicator and user use mpsc channels | Owned `&mut` state, no `Arc<Mutex<...>>` |
 | **Dual-channel replicator** | Separate control (low-freq) and data (high-freq) channels | Control events don't block write path |
 | **Atomic status reads** | PartitionState uses AtomicU8/AtomicI64 | Zero-cost read_status()/write_status() polling |
-| **Fence-before-promote** | update_epoch to all secondaries BEFORE change_role(Primary) | Prevents zombie primary writes to unfenced nodes |
+| **Failover epoch ordering** | Confirm candidate, apply epoch to it, promote, then converge retained secondaries | Matches durable Phase-1/Phase-4 ordering while fencing the chosen write authority |
 | **State provider as durability layer** | Persisted mode: `acknowledge()` gates quorum (SF default) | Strongest guarantee: replicate() returns only after quorum applied |
 | **Primary self-fencing** | Liveness probe isolation check (CNPG-style) | Defense-in-depth for asymmetric partitions |
 | **Failover delay** | Optional `spec.failoverDelay` (default 0 = immediate) | K8s adaptation — SF failovers immediately, K8s pod probes can flap |
-| **Data loss protocol** | Failover always proceeds; `on_data_loss()` if quorum lost | SF FM pattern — system always makes progress, user decides |
+| **Data loss protocol** | Wait on unresolved safety evidence; after conclusive loss, advance epoch then invoke correlated `OnDataLoss` | Prevents premature promotion and makes callback ambiguity recoverable |
 | **gRPC failure tracking** | Per-replica failure counter in CRD status | K8s adaptation — replaces SF federation heartbeats |
 | **Operator restart recovery** | Reconstruct driver from CRD status + pod list | SF FM pattern — stateless operator, durable state in API |
 | **mTLS deferred** | Post-MVP; MVP assumes trusted cluster | Reduces initial complexity |
 | **ReplicaHandle trait** | Driver works with any transport | Tests: in-process channels. Operator: gRPC client. |
-

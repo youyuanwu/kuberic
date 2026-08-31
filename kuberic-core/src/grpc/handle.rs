@@ -8,9 +8,10 @@ use crate::error::{KubericError, Result};
 use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
 use crate::types::{
-    DataLossAction, DurableActionCompletion, DurableActionObservation, DurableActionState,
-    DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConnectionStatus, ReplicaId, ReplicaInfo,
-    ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatusInfo, Role,
+    DataLossAction, DurableActionCompletion, DurableActionObservation, DurableActionResult,
+    DurableActionState, DurableReplicaAction, Epoch, Lsn, OpenMode, ReplicaConnectionStatus,
+    ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode,
+    ReplicaStatusInfo, Role,
 };
 
 /// Implements `ReplicaHandle` by calling a remote pod's gRPC `ReplicatorControl` service.
@@ -62,6 +63,19 @@ impl GrpcReplicaHandle {
                 }
             }
             _ => KubericError::Internal(Box::new(e)),
+        }
+    }
+
+    fn decode_action_result(value: i32) -> Result<Option<DurableActionResult>> {
+        let result = DurableActionResultProto::try_from(value).map_err(|_| {
+            KubericError::Internal(format!("unknown durable action result {value}").into())
+        })?;
+        if result == DurableActionResultProto::DurableActionResultNone {
+            Ok(None)
+        } else {
+            DurableActionResult::try_from(result)
+                .map(Some)
+                .map_err(|_| KubericError::Internal("invalid durable action result".into()))
         }
     }
 }
@@ -232,27 +246,49 @@ impl ReplicaHandle for GrpcReplicaHandle {
         let inner = resp.into_inner();
         let epoch = inner.epoch.map(Epoch::from).unwrap_or(Epoch::new(0, 0));
         let role = Role::from(inner.role);
+        let last_completed_action_result =
+            Self::decode_action_result(inner.last_completed_action_result)?;
+        let durable_action_result = Self::decode_action_result(inner.durable_action_result)?;
+        let election_configuration = inner
+            .election_configuration
+            .map(crate::types::ReplicaElectionConfiguration::try_from)
+            .transpose()
+            .map_err(|error| KubericError::Internal(error.into()))?;
+        let deactivation_info = inner
+            .deactivation_info
+            .map(crate::types::ReplicaDeactivationInfo::try_from)
+            .transpose()
+            .map_err(|error| KubericError::Internal(error.into()))?;
 
         // Update cached progress as side effect
         self.current_progress
             .store(inner.current_progress, Ordering::Release);
-        self.catch_up_capability
-            .store(inner.catch_up_capability, Ordering::Release);
+        if let Some(catch_up_capability) = inner.catch_up_capability {
+            self.catch_up_capability
+                .store(catch_up_capability, Ordering::Release);
+        } else {
+            self.catch_up_capability.store(0, Ordering::Release);
+        }
 
         Ok(ReplicaStatusInfo {
             instance_id: ReplicaInstanceId::new(inner.instance_id),
             role,
             epoch,
             current_progress: inner.current_progress,
+            catch_up_capability: inner.catch_up_capability,
+            committed_lsn: inner.committed_lsn,
             healthy: inner.healthy,
             write_status: crate::types::AccessStatus::from(inner.write_status),
             configuration: inner.configuration.map(Into::into),
+            election_configuration,
+            deactivation_info,
             last_completed_action: if inner.last_completed_action_id.is_empty() {
                 None
             } else {
                 Some(DurableActionCompletion {
                     action_id: inner.last_completed_action_id,
                     signature: inner.last_completed_action_signature,
+                    result: last_completed_action_result,
                 })
             },
             durable_action: if inner.durable_action_id.is_empty() {
@@ -279,6 +315,7 @@ impl ReplicaHandle for GrpcReplicaHandle {
                     state,
                     error: (!inner.durable_action_error.is_empty())
                         .then_some(inner.durable_action_error),
+                    result: durable_action_result,
                 })
             },
             active_replica_connections: inner
@@ -356,6 +393,18 @@ impl ReplicaHandle for GrpcReplicaHandle {
                 replica_id,
                 instance_id: instance_id.to_string(),
             }),
+            DurableReplicaAction::OnDataLoss { epoch } => {
+                execute_durable_action_request::Action::OnDataLoss(DurableOnDataLossRequest {
+                    expected_epoch: Some(epoch.into()),
+                })
+            }
+            DurableReplicaAction::RecordElectionConfiguration { configuration } => {
+                execute_durable_action_request::Action::RecordElectionConfiguration(
+                    RecordElectionConfigurationRequest {
+                        configuration: Some(configuration.into()),
+                    },
+                )
+            }
         };
         let mut client = self.client.clone();
         client
@@ -366,5 +415,16 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .await
             .map_err(Self::map_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_durable_action_result_is_rejected() {
+        let error = GrpcReplicaHandle::decode_action_result(999).unwrap_err();
+        assert!(error.to_string().contains("unknown durable action result"));
     }
 }

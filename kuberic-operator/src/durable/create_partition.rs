@@ -88,6 +88,7 @@ pub fn start_create_partition(
                 } else {
                     StableReplicaRoleStatus::ActiveSecondary
                 },
+                election_metadata: None,
             })
             .collect(),
         write_quorum: majority(targets.len()),
@@ -133,6 +134,7 @@ pub fn start_create_partition(
         phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         pending_action: None,
         last_error: None,
+        failover: None,
     })
 }
 
@@ -1010,6 +1012,7 @@ fn pending_action(
                 ACTION_DEADLINE_SECONDS
             },
         last_error: None,
+        dispatch_authorized: false,
     })
 }
 
@@ -1806,6 +1809,8 @@ mod tests {
                 role,
                 epoch,
                 current_progress: 0,
+                catch_up_capability: Some(0),
+                committed_lsn: 0,
                 healthy,
                 write_status: if role == Role::Primary {
                     AccessStatus::Granted
@@ -1813,6 +1818,8 @@ mod tests {
                     AccessStatus::NotPrimary
                 },
                 configuration,
+                election_configuration: None,
+                deactivation_info: None,
                 last_completed_action: None,
                 durable_action: None,
                 active_replica_connections: Vec::new(),

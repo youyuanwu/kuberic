@@ -75,6 +75,34 @@ impl KvPod {
         reply_timeout: Duration,
         replicator_options: WalReplicatorOptions,
     ) -> Self {
+        Self::start_with_options_and_data_loss(
+            id,
+            reply_timeout,
+            replicator_options,
+            crate::service::DataLossBehavior::default(),
+        )
+        .await
+    }
+
+    pub async fn start_with_data_loss_behavior(
+        id: i64,
+        behavior: crate::service::DataLossBehavior,
+    ) -> Self {
+        Self::start_with_options_and_data_loss(
+            id,
+            Duration::from_secs(10),
+            WalReplicatorOptions::default(),
+            behavior,
+        )
+        .await
+    }
+
+    async fn start_with_options_and_data_loss(
+        id: i64,
+        reply_timeout: Duration,
+        replicator_options: WalReplicatorOptions,
+        data_loss_behavior: crate::service::DataLossBehavior,
+    ) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data_dir = std::env::temp_dir().join("kv-test").join(format!(
@@ -83,7 +111,14 @@ impl KvPod {
             std::process::id(),
             n
         ));
-        Self::start_with_dir_and_options(id, data_dir, reply_timeout, replicator_options).await
+        Self::start_with_dir_and_options(
+            id,
+            data_dir,
+            reply_timeout,
+            replicator_options,
+            data_loss_behavior,
+        )
+        .await
     }
 
     /// Start with a specific data directory (for restart tests).
@@ -94,6 +129,7 @@ impl KvPod {
             data_dir,
             reply_timeout,
             WalReplicatorOptions::default(),
+            crate::service::DataLossBehavior::default(),
         )
         .await
     }
@@ -103,6 +139,7 @@ impl KvPod {
         data_dir: PathBuf,
         reply_timeout: Duration,
         replicator_options: WalReplicatorOptions,
+        data_loss_behavior: crate::service::DataLossBehavior,
     ) -> Self {
         static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
@@ -133,11 +170,12 @@ impl KvPod {
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle = tokio::spawn(crate::service::run_service_with_options(
+        let service_handle = tokio::spawn(crate::service::run_service_with_options_and_data_loss(
             bundle.lifecycle_rx,
             st,
             bind,
             replicator_options,
+            data_loss_behavior,
         ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -52,6 +52,26 @@ impl SqlitePod {
 
     /// Start with a custom reply timeout.
     pub async fn start_with_timeout(id: i64, reply_timeout: Duration) -> Self {
+        Self::start_with_timeout_and_data_loss(
+            id,
+            reply_timeout,
+            crate::service::DataLossBehavior::default(),
+        )
+        .await
+    }
+
+    pub async fn start_with_data_loss_behavior(
+        id: i64,
+        behavior: crate::service::DataLossBehavior,
+    ) -> Self {
+        Self::start_with_timeout_and_data_loss(id, Duration::from_secs(10), behavior).await
+    }
+
+    async fn start_with_timeout_and_data_loss(
+        id: i64,
+        reply_timeout: Duration,
+        data_loss_behavior: crate::service::DataLossBehavior,
+    ) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data_dir = std::env::temp_dir().join("sqlite-test").join(format!(
@@ -60,11 +80,26 @@ impl SqlitePod {
             std::process::id(),
             n
         ));
-        Self::start_with_dir(id, data_dir, reply_timeout).await
+        Self::start_with_dir_and_data_loss(id, data_dir, reply_timeout, data_loss_behavior).await
     }
 
     /// Start with a specific data directory (for restart tests).
     pub async fn start_with_dir(id: i64, data_dir: PathBuf, reply_timeout: Duration) -> Self {
+        Self::start_with_dir_and_data_loss(
+            id,
+            data_dir,
+            reply_timeout,
+            crate::service::DataLossBehavior::default(),
+        )
+        .await
+    }
+
+    async fn start_with_dir_and_data_loss(
+        id: i64,
+        data_dir: PathBuf,
+        reply_timeout: Duration,
+        data_loss_behavior: crate::service::DataLossBehavior,
+    ) -> Self {
         static INSTANCE_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
         let generation = INSTANCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -91,8 +126,12 @@ impl SqlitePod {
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle =
-            tokio::spawn(crate::service::run_service(bundle.lifecycle_rx, st, bind));
+        let service_handle = tokio::spawn(crate::service::run_service_with_data_loss(
+            bundle.lifecycle_rx,
+            st,
+            bind,
+            data_loss_behavior,
+        ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 

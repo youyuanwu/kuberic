@@ -19,10 +19,12 @@ Implementation status, known gaps, and open questions.
 | Build completes on copy+repl ACKed | ✅ Implemented — PrimarySender buffers ops during copy, replays on connect |
 | mTLS on all gRPC | Deferred — assumes trusted cluster |
 | ReportFault rate limiting | Operator-side, basic |
-| Failover delay | ❌ Not implemented — optional K8s adaptation, default 0 (SF-aligned) |
-| Data loss failover | ❌ Not implemented — SF `on_data_loss()` protocol for quorum loss |
-| Secondary health detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §2 |
-| Missing pod detection | ❌ Not implemented — designed, see operator-failure-scenarios.md §3 |
+| Failover delay | ✅ Implemented — non-negative continuous-failure delay; recovery resets it |
+| Durable Phase-1 failover | ✅ Implemented — live evidence, previous/current read quorum, deterministic best-primary confirmation |
+| Data loss failover | ✅ Implemented — write-ahead data-loss epoch + correlated epoch-fenced `OnDataLoss` |
+| Quorum/best-candidate wait | ✅ Implemented — explicit durable wait with rotating unavailable probes; no premature promotion |
+| Secondary health detection | ✅ Implemented — durable rebuild or force-removal |
+| Missing pod detection | ✅ Implemented — durable eviction/rebuild path |
 | gRPC failure tracking | ❌ Not implemented — K8s adaptation of SF federation heartbeats |
 | Stable Healthy operator restart recovery | ✅ Implemented — authoritative status snapshot + read-only `PartitionDriver::recover()` |
 | Durable initial partition creation | ✅ Implemented — explicit no-previous-topology checkpoint, partial committed bootstrap snapshots, gated routing |
@@ -63,10 +65,10 @@ CNPG patterns we **rejected** (conflict with SF model):
 1. **`R + W > N` quorum formula.** CNPG uses Dynamo-style quorum for PostgreSQL
    sync standbys. We use SF's `WriteQuorum = ⌊N/2⌋+1` which is simpler and
    already handled by `QuorumTracker`.
-2. **Blocking on quorum loss.** CNPG blocks failover indefinitely when quorum
-   check fails. SF waits `QuorumLossWaitDuration` then proceeds via the
-   `on_data_loss()` callback. Our model has the user's state provider as
-   the data loss decision point.
+2. **Timeout-based quorum-loss override.** Kuberic does not let elapsed time
+   discard an unavailable quorum-restoring or possibly better replica. It
+   waits while evidence could change the result, and invokes `OnDataLoss`
+   only after the remaining observations conclusively establish data loss.
 3. **Annotation-based fencing.** CNPG fences instances via a JSON annotation.
    We use SF's epoch-based fencing (replicator-level, stronger).
 4. **pg_rewind for replica rejoin.** CNPG rewinds the old primary's WAL to
@@ -94,13 +96,13 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
    design: one partition per CRD.
 2. **Pod identity and PVC binding** — how to bind recreated pods to correct
    PVCs. Relevant for WAL persistence.
-3. **Remaining mid-reconfiguration recovery** — stable Healthy topology and
-   reconciler-driven creation, switchover, add/rebuild, and removal are
-   recoverable. `FailingOver` and data-loss transitions still need durable
-   operation migration.
-4. **Data loss protocol integration** — the `on_data_loss()` callback exists
-   in our user API but the operator never triggers it. Need to implement
-   quorum loss detection and `data_loss_number` increment in the driver.
+3. **Mid-reconfiguration failover handoff** — the pure election model and
+   status schema support an explicit previous configuration, but production
+   failover currently starts from stable `Healthy` topology where previous
+   configuration is absent.
+4. **Old-primary physical cleanup** — failover fences the serving label and
+   excludes the old incarnation from stable topology; deletion/rebuild remains
+   subsequent topology reconciliation.
 5. **Liveness probe HTTP endpoint** — PodRuntime currently exposes only gRPC.
    The self-fencing liveness probe (K8s-specific addition) needs an HTTP
    health endpoint. This is not an SF pattern — it compensates for K8s

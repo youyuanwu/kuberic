@@ -1,8 +1,9 @@
 use crate::proto;
 use crate::types::{
-    AccessStatus, Epoch, OpenMode, ReplicaConfigurationMemberStatus, ReplicaConfigurationMode,
-    ReplicaConfigurationStatus, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
-    ReplicaSetQuorumMode, ReplicaStatus, Role,
+    AccessStatus, DataLossAction, DurableActionResult, Epoch, OpenMode,
+    ReplicaConfigurationMemberStatus, ReplicaConfigurationMode, ReplicaConfigurationStatus,
+    ReplicaDeactivationInfo, ReplicaElectionConfiguration, ReplicaInfo, ReplicaInstanceId,
+    ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 
 // --- Epoch ---
@@ -188,6 +189,146 @@ impl From<proto::ReplicaConfigurationStatusProto> for ReplicaConfigurationStatus
         }
     }
 }
+
+impl From<ReplicaElectionConfiguration> for proto::ReplicaElectionConfigurationProto {
+    fn from(configuration: ReplicaElectionConfiguration) -> Self {
+        Self {
+            current: Some(configuration.current.into()),
+            previous: configuration.previous.map(Into::into),
+        }
+    }
+}
+
+impl TryFrom<proto::ReplicaElectionConfigurationProto> for ReplicaElectionConfiguration {
+    type Error = String;
+
+    fn try_from(
+        configuration: proto::ReplicaElectionConfigurationProto,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            current: try_configuration_status(
+                configuration
+                    .current
+                    .ok_or_else(|| "missing current election configuration".to_string())?,
+            )?,
+            previous: configuration
+                .previous
+                .map(try_configuration_status)
+                .transpose()?,
+        })
+    }
+}
+
+impl From<ReplicaDeactivationInfo> for proto::ReplicaDeactivationInfoProto {
+    fn from(info: ReplicaDeactivationInfo) -> Self {
+        Self {
+            epoch: Some(info.epoch.into()),
+            catch_up_lsn: info.catch_up_lsn,
+        }
+    }
+}
+
+impl TryFrom<proto::ReplicaDeactivationInfoProto> for ReplicaDeactivationInfo {
+    type Error = String;
+
+    fn try_from(info: proto::ReplicaDeactivationInfoProto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            epoch: info
+                .epoch
+                .ok_or_else(|| "missing deactivation epoch".to_string())?
+                .into(),
+            catch_up_lsn: info.catch_up_lsn,
+        })
+    }
+}
+
+impl From<DurableActionResult> for proto::DurableActionResultProto {
+    fn from(result: DurableActionResult) -> Self {
+        match result {
+            DurableActionResult::DataLoss(DataLossAction::None) => {
+                Self::DurableActionResultDataLossNoStateChange
+            }
+            DurableActionResult::DataLoss(DataLossAction::StateChanged) => {
+                Self::DurableActionResultDataLossStateChanged
+            }
+        }
+    }
+}
+
+impl TryFrom<proto::DurableActionResultProto> for DurableActionResult {
+    type Error = ();
+
+    fn try_from(result: proto::DurableActionResultProto) -> Result<Self, Self::Error> {
+        match result {
+            proto::DurableActionResultProto::DurableActionResultDataLossNoStateChange => {
+                Ok(Self::DataLoss(DataLossAction::None))
+            }
+            proto::DurableActionResultProto::DurableActionResultDataLossStateChanged => {
+                Ok(Self::DataLoss(DataLossAction::StateChanged))
+            }
+            proto::DurableActionResultProto::DurableActionResultNone => Err(()),
+        }
+    }
+}
+
+fn try_configuration_status(
+    status: proto::ReplicaConfigurationStatusProto,
+) -> Result<ReplicaConfigurationStatus, String> {
+    let mode = match proto::ReplicaConfigurationModeProto::try_from(status.mode)
+        .map_err(|_| format!("unknown configuration mode {}", status.mode))?
+    {
+        proto::ReplicaConfigurationModeProto::ConfigurationCatchUp => {
+            ReplicaConfigurationMode::CatchUp
+        }
+        proto::ReplicaConfigurationModeProto::ConfigurationCurrent => {
+            ReplicaConfigurationMode::Current
+        }
+        proto::ReplicaConfigurationModeProto::ConfigurationNone => {
+            return Err("election configuration mode is none".to_string());
+        }
+    };
+    let members = status
+        .members
+        .into_iter()
+        .map(|member| {
+            if member.instance_id.is_empty() {
+                return Err(format!(
+                    "election configuration member {} has empty incarnation",
+                    member.id
+                ));
+            }
+            let role = proto::RoleProto::try_from(member.role)
+                .map_err(|_| format!("unknown role {}", member.role))?;
+            if role == proto::RoleProto::RoleUnknown {
+                return Err(format!(
+                    "election configuration member {} has unknown role",
+                    member.id
+                ));
+            }
+            Ok(ReplicaConfigurationMemberStatus {
+                id: member.id,
+                instance_id: ReplicaInstanceId::new(member.instance_id),
+                role: role.into(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if members.is_empty() {
+        return Err("election configuration has no members".to_string());
+    }
+    if status.write_quorum == 0 || status.write_quorum as usize > members.len() {
+        return Err(format!(
+            "invalid election configuration write quorum {} for {} members",
+            status.write_quorum,
+            members.len()
+        ));
+    }
+    Ok(ReplicaConfigurationStatus {
+        mode,
+        members,
+        write_quorum: status.write_quorum,
+    })
+}
+
 // --- ReplicaInfo ---
 
 impl From<ReplicaInfo> for proto::ReplicaInfoProto {
@@ -274,5 +415,69 @@ mod tests {
         assert_eq!(round_trip.current_progress, original.current_progress);
         assert_eq!(round_trip.catch_up_capability, original.catch_up_capability);
         assert_eq!(round_trip.must_catch_up, original.must_catch_up);
+    }
+
+    #[test]
+    fn election_evidence_and_data_loss_result_round_trip() {
+        let current = ReplicaConfigurationStatus {
+            mode: ReplicaConfigurationMode::Current,
+            members: vec![ReplicaConfigurationMemberStatus {
+                id: 2,
+                instance_id: ReplicaInstanceId::new("two"),
+                role: Role::ActiveSecondary,
+            }],
+            write_quorum: 1,
+        };
+        let configuration = ReplicaElectionConfiguration {
+            previous: Some(current.clone()),
+            current,
+        };
+        let round_trip = ReplicaElectionConfiguration::try_from(
+            proto::ReplicaElectionConfigurationProto::from(configuration.clone()),
+        )
+        .unwrap();
+        assert_eq!(round_trip, configuration);
+
+        let deactivation = ReplicaDeactivationInfo {
+            epoch: Epoch::new(4, 8),
+            catch_up_lsn: 17,
+        };
+        assert_eq!(
+            ReplicaDeactivationInfo::try_from(proto::ReplicaDeactivationInfoProto::from(
+                deactivation,
+            ))
+            .unwrap(),
+            deactivation
+        );
+
+        for result in [
+            DurableActionResult::DataLoss(DataLossAction::None),
+            DurableActionResult::DataLoss(DataLossAction::StateChanged),
+        ] {
+            let encoded = proto::DurableActionResultProto::from(result);
+            assert_eq!(DurableActionResult::try_from(encoded), Ok(result));
+        }
+    }
+
+    #[test]
+    fn malformed_election_evidence_is_rejected() {
+        let missing_current = proto::ReplicaElectionConfigurationProto::default();
+        assert!(ReplicaElectionConfiguration::try_from(missing_current).is_err());
+
+        let missing_epoch = proto::ReplicaDeactivationInfoProto {
+            epoch: None,
+            catch_up_lsn: 1,
+        };
+        assert!(ReplicaDeactivationInfo::try_from(missing_epoch).is_err());
+
+        let malformed = proto::ReplicaElectionConfigurationProto {
+            current: Some(proto::ReplicaConfigurationStatusProto {
+                mode: 999,
+                members: Vec::new(),
+                write_quorum: 0,
+            }),
+            previous: None,
+        };
+        assert!(ReplicaElectionConfiguration::try_from(malformed).is_err());
     }
 }

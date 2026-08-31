@@ -722,12 +722,12 @@ design work needed — just implementation.
 
 | Item | Design Location | Priority |
 |------|----------------|----------|
-| Data loss protocol (`on_data_loss()` + `data_loss_number`) | operator-failure-scenarios.md §1, §7 | P0 |
+| Durable Phase-1/data loss protocol (`on_data_loss()` + `data_loss_number`) | protocols.md §Failover | ✅ Implemented |
 | Stable operator restart recovery (`PartitionDriver::recover()`) | operator-failure-scenarios.md §8, A3 notes above | ✅ Implemented |
 | Secondary health detection + durable rebuild/eviction | operator-failure-scenarios.md §2 | ✅ Implemented |
 | Stable missing secondary detection | operator-failure-scenarios.md §3 | ✅ Implemented |
 | gRPC failure tracking (per-replica counter) | operator-failure-scenarios.md §5 | P1 |
-| Failover delay (`failingSinceTimestamp`) | operator-failure-scenarios.md §1 | P1 |
+| Failover delay (`primaryFailingSince`) | operator-failure-scenarios.md §1 | ✅ Implemented |
 | Durable error-tolerant secondary removal | operator-failure-scenarios.md §3 | ✅ Implemented |
 | CRD conditions (Ready, Degraded, QuorumAvailable) | operator-failure-scenarios.md | P1 |
 | Old primary cleanup after failover | operator-failure-scenarios.md §9 | P1 |
@@ -746,7 +746,7 @@ design work needed — just implementation.
 | A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ✅** |
 | B: Operational Resilience (needs design) | 6 | B0 bounded writes fixed (health reporting remains), **B5 ✅**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 5 | **C0 ✅ fixed**, C1 stale ACKs, **C4 ChangeRole(None) cleanup** |
-| D: Designed capabilities | 14 | Stable operator restart recovery ✅; data loss remains |
+| D: Designed capabilities | 14 | Stable restart and durable Phase-1/data-loss failover ✅ |
 | **Total** | **31** | |
 
 **Recommended order:**
@@ -754,7 +754,7 @@ design work needed — just implementation.
 2. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
 3. B2 (short RPC timeouts) — prevents hangs on control-plane calls
 4. A3 failover candidate retry — failover resilience
-5. Remaining D items P0 (data loss, secondary health)
+5. Remaining D items (health reporting and operational integrations)
 6. B3 + B4 (reconnection, operation locking) — operational maturity
 7. B1 streaming improvement — large dataset support
 8. C1-C3 (refinements) — can be done alongside other work
@@ -1017,8 +1017,8 @@ older instance is removed before a newer build proceeds.
 Compensation is phase-aware: pre-configuration failures remove/demote/close/
 delete the candidate; failures after catch-up configuration restore the
 previous current configuration first; and observed target current configuration
-rolls forward to target snapshot publication. Failover and data-loss migration
-remain open.
+rolls forward to target snapshot publication. Production failover and
+data-loss recovery now use their own durable Phase-1 operation.
 
 ### E6. Replica removal state lost with operator process — ✅ Fixed
 

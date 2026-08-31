@@ -23,7 +23,7 @@ use kuberic_operator::cluster_api::ClusterApi;
 use kuberic_operator::crd::{
     DurableActionKind, DurableAddMode, DurableOperationKind, DurableOperationPhase,
     DurableRemoveMode, KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
-    StableReplicaRoleStatus,
+    ReplicaElectionObservationStatus, StableReplicaRoleStatus,
 };
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
@@ -73,6 +73,7 @@ enum ControlOperation {
     BuildReplica,
     RemoveReplica,
     OnDataLoss,
+    RecordElectionConfiguration,
     RevokeWriteStatus,
     GetStatus,
 }
@@ -208,6 +209,10 @@ impl ReplicaHandle for ObservedHandle {
             }
             DurableReplicaAction::BuildReplica { .. } => ControlOperation::BuildReplica,
             DurableReplicaAction::RemoveReplica { .. } => ControlOperation::RemoveReplica,
+            DurableReplicaAction::OnDataLoss { .. } => ControlOperation::OnDataLoss,
+            DurableReplicaAction::RecordElectionConfiguration { .. } => {
+                ControlOperation::RecordElectionConfiguration
+            }
         };
         self.record(operation);
         if self
@@ -244,9 +249,11 @@ struct KvClusterApi {
     services: Mutex<HashMap<String, Service>>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     fail_next_status_patch: Mutex<bool>,
+    fail_after_next_status_patch: Mutex<bool>,
     fail_next_status_conflict: Mutex<bool>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    data_loss_behavior: service::DataLossBehavior,
 }
 
 impl KvClusterApi {
@@ -260,9 +267,18 @@ impl KvClusterApi {
             services: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(Vec::new())),
             fail_next_status_patch: Mutex::new(false),
+            fail_after_next_status_patch: Mutex::new(false),
             fail_next_status_conflict: Mutex::new(false),
             fail_before_next_durable_action: Arc::new(Mutex::new(None)),
             fail_after_next_durable_action: Arc::new(Mutex::new(None)),
+            data_loss_behavior: service::DataLossBehavior::default(),
+        }
+    }
+
+    fn new_with_data_loss_behavior(behavior: service::DataLossBehavior) -> Self {
+        Self {
+            data_loss_behavior: behavior,
+            ..Self::new()
         }
     }
 
@@ -410,7 +426,13 @@ impl KvClusterApi {
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle = tokio::spawn(service::run_service(bundle.lifecycle_rx, st, bind));
+        let service_handle = tokio::spawn(service::run_service_with_options_and_data_loss(
+            bundle.lifecycle_rx,
+            st,
+            bind,
+            kuberic_core::replicator::WalReplicatorOptions::default(),
+            self.data_loss_behavior.clone(),
+        ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -499,7 +521,13 @@ impl ClusterApi for KvClusterApi {
         let runtime_handle = tokio::spawn(bundle.runtime.serve());
         let st = state.clone();
         let bind = client_address.clone();
-        let service_handle = tokio::spawn(service::run_service(bundle.lifecycle_rx, st, bind));
+        let service_handle = tokio::spawn(service::run_service_with_options_and_data_loss(
+            bundle.lifecycle_rx,
+            st,
+            bind,
+            kuberic_core::replicator::WalReplicatorOptions::default(),
+            self.data_loss_behavior.clone(),
+        ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -574,6 +602,9 @@ impl ClusterApi for KvClusterApi {
             return Err("injected status persistence failure".to_string());
         }
         self.statuses.lock().unwrap().push(status.clone());
+        if std::mem::take(&mut *self.fail_after_next_status_patch.lock().unwrap()) {
+            return Err("injected status response loss after apply".to_string());
+        }
         Ok(())
     }
 
@@ -752,9 +783,19 @@ async fn create_healthy_set(
     )
     .await
     .unwrap();
-    let status =
+    let mut status =
         drive_create_partition(api, state, name, replicas, api.last_status().unwrap()).await;
+    for _ in 0..60 {
+        if status.stable_election_metadata_refresh.is_none() {
+            break;
+        }
+        reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
+            .await
+            .unwrap();
+        status = api.last_status().unwrap();
+    }
     assert_eq!(status.phase, Phase::Healthy);
+    assert!(status.stable_election_metadata_refresh.is_none());
     assert_eq!(
         status
             .stable_snapshot
@@ -763,6 +804,15 @@ async fn create_healthy_set(
             .members
             .len(),
         replicas as usize
+    );
+    assert!(
+        status
+            .stable_snapshot
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.election_metadata.is_some())
     );
     status
 }
@@ -844,7 +894,7 @@ async fn drive_switchover(
             .await
             .unwrap();
         status = api.last_status().unwrap();
-        if status.phase == Phase::Healthy {
+        if status.phase == Phase::Healthy && status.stable_election_metadata_refresh.is_none() {
             return status;
         }
     }
@@ -868,15 +918,16 @@ async fn drive_add_replica(
                 .stable_snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.members.len() == replicas as usize)
+            && status.stable_election_metadata_refresh.is_none()
         {
             reconcile_set(&make_set(name, replicas, Some(status.clone())), api, state)
                 .await
                 .unwrap();
-            return status;
+            return api.last_status().unwrap();
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("durable replica add did not reach a terminal healthy status");
+    panic!("durable replica add did not reach a terminal healthy status: {status:?}");
 }
 
 async fn advance_until_pending_action(
@@ -1011,6 +1062,23 @@ fn control_for_action(kind: DurableActionKind) -> Option<ControlOperation> {
         DurableActionKind::RemovePrimaryConnection => Some(ControlOperation::RemoveReplica),
         DurableActionKind::RemoveDemoteTarget => Some(ControlOperation::ChangeRole),
         DurableActionKind::RemoveCloseTarget => Some(ControlOperation::Close),
+        DurableActionKind::FailoverRecordStartingConfiguration
+        | DurableActionKind::FailoverRecordElectionConfiguration => {
+            Some(ControlOperation::RecordElectionConfiguration)
+        }
+        DurableActionKind::FailoverUpdateCandidateEpoch
+        | DurableActionKind::FailoverUpdateSecondaryEpoch => Some(ControlOperation::UpdateEpoch),
+        DurableActionKind::FailoverOnDataLoss => Some(ControlOperation::OnDataLoss),
+        DurableActionKind::FailoverPromoteCandidate => Some(ControlOperation::ChangeRole),
+        DurableActionKind::FailoverCatchUpConfiguration => {
+            Some(ControlOperation::UpdateCatchUpConfiguration)
+        }
+        DurableActionKind::FailoverWaitForCatchUpQuorum => {
+            Some(ControlOperation::WaitForCatchUpQuorum)
+        }
+        DurableActionKind::FailoverCurrentConfiguration => {
+            Some(ControlOperation::UpdateCurrentConfiguration)
+        }
         _ => None,
     }
 }
@@ -1080,10 +1148,6 @@ async fn live_replica_statuses(
 }
 
 fn assert_status_reads_only(operations: &[ControlOperation]) {
-    assert!(
-        !operations.is_empty(),
-        "recovery should query at least one runtime status"
-    );
     for forbidden in [
         ControlOperation::Open,
         ControlOperation::Close,
@@ -1349,14 +1413,7 @@ async fn test_operator_restart_recovers_unhealthy_primary_then_fails_over() {
     let failing = api.last_status().unwrap();
     assert_eq!(failing.phase, Phase::FailingOver);
 
-    reconcile_set(
-        &make_set("recover-failover", 3, Some(failing)),
-        &api,
-        &recovered_state,
-    )
-    .await
-    .unwrap();
-    let recovered = api.last_status().unwrap();
+    let recovered = drive_operation_to_healthy(&api, "recover-failover", 3, failing).await;
     assert_eq!(recovered.phase, Phase::Healthy);
     assert_ne!(
         recovered.current_primary.as_deref(),
@@ -1404,17 +1461,16 @@ async fn test_recovery_rejects_legacy_and_persisted_live_mismatch_without_mutati
     mismatched.stable_snapshot.as_mut().unwrap().members[0].instance_id =
         "persisted-stale-incarnation".into();
     api.reset_operations();
-    let error = reconcile_set(
+    reconcile_set(
         &make_set("reject-recovery", 3, Some(mismatched)),
         &api,
         &ReconcilerState::default(),
     )
     .await
-    .err()
-    .expect("mismatched recovery should fail");
-    assert!(error.contains("handle incarnation mismatch"));
+    .unwrap();
+    assert_eq!(api.last_status().unwrap().phase, Phase::FailingOver);
     assert!(api.operations().is_empty());
-    assert_eq!(api.statuses.lock().unwrap().len(), status_count);
+    assert_eq!(api.statuses.lock().unwrap().len(), status_count + 1);
 }
 
 #[test_log::test(tokio::test)]
@@ -1442,37 +1498,14 @@ async fn test_post_recovery_pod_identity_drift_is_rejected_before_rpc() {
             .insert("kuberic.io/pod-index".into(), "9".into());
     }
     api.reset_operations();
-    let error = reconcile_set(
+    reconcile_set(
         &make_set("identity-drift", 3, Some(status.clone())),
         &api,
         &recovered_state,
     )
     .await
-    .err()
-    .expect("logical identity drift should fail");
-    assert!(error.contains("current pod for driver replica"));
-    assert!(api.operations().is_empty());
-
-    {
-        let mut pods = api.pods.lock().unwrap();
-        pods[0]
-            .metadata
-            .labels
-            .as_mut()
-            .unwrap()
-            .insert("kuberic.io/pod-index".into(), "0".into());
-        pods[0].metadata.uid = Some("replacement-incarnation".into());
-    }
-    api.reset_operations();
-    let error = reconcile_set(
-        &make_set("identity-drift", 3, Some(status)),
-        &api,
-        &recovered_state,
-    )
-    .await
-    .err()
-    .expect("incarnation drift should fail");
-    assert!(error.contains("current pod incarnation drift"));
+    .unwrap();
+    assert_eq!(api.last_status().unwrap().phase, Phase::FailingOver);
     assert!(api.operations().is_empty());
 }
 
@@ -2880,9 +2913,33 @@ async fn test_reconciler_switchover() {
         }),
     );
     reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Switchover);
+    let mut status = api.last_status().unwrap();
+    for _ in 0..10 {
+        if status.phase == Phase::Switchover {
+            break;
+        }
+        reconcile_set(
+            &make_set(
+                "myapp",
+                3,
+                Some(KubericSetStatus {
+                    current_primary: Some(original_primary.clone()),
+                    target_primary: Some(target_name.clone()),
+                    ..status.clone()
+                }),
+            ),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    assert_eq!(
+        status.phase,
+        Phase::Switchover,
+        "switchover request did not start: {status:?}"
+    );
 
     // Switchover → Healthy: execute the switchover
     let status = drive_switchover(&api, &state, "myapp", 3, status).await;
@@ -3645,13 +3702,26 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::FailingOver);
 
-    // Reconcile FailingOver — should run failover → Healthy with new primary
-    let set = make_set("myapp", 3, Some(status));
-    reconcile_set(&set, &api, &state).await.unwrap();
-
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = drive_operation_to_healthy(&api, "myapp", 3, status).await;
     assert_stable_snapshot(&api, &status, 2);
+    assert!(
+        status
+            .members
+            .iter()
+            .find(|member| member.name == status.current_primary.as_deref().unwrap())
+            .unwrap()
+            .current_progress
+            > 0
+    );
+    assert!(
+        status
+            .stable_snapshot
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .all(|member| member.election_metadata.is_some())
+    );
 
     // New primary should be different from the crashed one
     let new_primary = status.current_primary.clone().unwrap();
@@ -3684,20 +3754,16 @@ async fn test_reconciler_detects_primary_failure_and_fails_over() {
     // or replaced it. The partition is "Healthy" but degraded.
     // TODO: Healthy phase should detect spec.replicas (3) > driver count (2)
     //       and create a replacement. See operator-failure-scenarios.md §2, §9.
-    {
-        let drivers = state.drivers.lock().await;
-        let driver = drivers.get("default/myapp").unwrap();
-        assert_eq!(
-            driver.replica_ids().len(),
-            2,
-            "failed primary removed, not replaced yet"
-        );
-        assert_eq!(
-            api.pods.lock().unwrap().len(),
-            3,
-            "old pod still exists (orphaned)"
-        );
-    }
+    assert_eq!(
+        status.stable_snapshot.as_ref().unwrap().members.len(),
+        2,
+        "failed primary removed from the durable snapshot"
+    );
+    assert_eq!(
+        api.pods.lock().unwrap().len(),
+        3,
+        "old pod still exists (orphaned)"
+    );
 }
 
 #[test_log::test(tokio::test)]
@@ -4055,7 +4121,7 @@ async fn test_durable_rejoin_compensation_recreates_and_retries() {
         &ReconcilerState::default(),
         "rejoin-compensate",
         3,
-        compensated,
+        api.last_status().unwrap(),
     )
     .await;
     assert_eq!(
@@ -4716,9 +4782,18 @@ async fn test_reconciler_scale_down() {
     .unwrap();
 
     // Scale down: change spec to 2 replicas
-    let set = make_set("myapp", 2, Some(status.clone()));
-    reconcile_set(&set, &api, &state).await.unwrap();
-    let status = drive_operation_to_healthy(&api, "myapp", 2, api.last_status().unwrap()).await;
+    let mut status = status;
+    for _ in 0..10 {
+        reconcile_set(&make_set("myapp", 2, Some(status.clone())), &api, &state)
+            .await
+            .unwrap();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::RemovingReplica {
+            break;
+        }
+    }
+    assert_eq!(status.phase, Phase::RemovingReplica);
+    let status = drive_operation_to_healthy(&api, "myapp", 2, status).await;
     assert_stable_snapshot(&api, &status, 2);
     reconcile_set(&make_set("myapp", 2, Some(status.clone())), &api, &state)
         .await
@@ -4776,10 +4851,7 @@ async fn test_reconciler_double_failover() {
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::FailingOver);
 
-    let set = make_set("myapp", 3, Some(status));
-    reconcile_set(&set, &api, &state).await.unwrap();
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = drive_operation_to_healthy(&api, "myapp", 3, status).await;
 
     let second_primary = status.current_primary.clone().unwrap();
     assert_ne!(second_primary, first_primary);
@@ -4804,10 +4876,7 @@ async fn test_reconciler_double_failover() {
     let status = api.last_status().unwrap();
     assert_eq!(status.phase, Phase::FailingOver);
 
-    let set = make_set("myapp", 3, Some(status));
-    reconcile_set(&set, &api, &state).await.unwrap();
-    let status = api.last_status().unwrap();
-    assert_eq!(status.phase, Phase::Healthy);
+    let status = drive_operation_to_healthy(&api, "myapp", 3, status).await;
 
     let third_primary = status.current_primary.clone().unwrap();
     assert_ne!(third_primary, first_primary);
@@ -4826,6 +4895,591 @@ async fn test_reconciler_double_failover() {
         resp.get_ref().found,
         "data from second epoch should survive"
     );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_failover_recovers_lost_replies_and_restarts() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "durable-failover", 3).await;
+    let old_primary = status.current_primary.clone().unwrap();
+    api.crash_pod(&old_primary);
+
+    reconcile_set(&make_set("durable-failover", 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    let started = api.last_status().unwrap();
+    assert_eq!(started.phase, Phase::FailingOver);
+    assert_eq!(
+        started.operation.as_ref().unwrap().kind,
+        DurableOperationKind::Failover
+    );
+
+    let expected = [
+        DurableActionKind::FailoverRecordStartingConfiguration,
+        DurableActionKind::FailoverUpdateCandidateEpoch,
+        DurableActionKind::FailoverPromoteCandidate,
+        DurableActionKind::FailoverUpdateSecondaryEpoch,
+        DurableActionKind::FailoverCatchUpConfiguration,
+        DurableActionKind::FailoverWaitForCatchUpQuorum,
+        DurableActionKind::FailoverCurrentConfiguration,
+        DurableActionKind::FailoverRecordElectionConfiguration,
+    ];
+    let (completed, injected) =
+        drive_operation_with_lost_replies(&api, "durable-failover", 3, started, &expected).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert!(completed.operation.is_none());
+    assert_eq!(completed.epoch.configuration_number, 2);
+    for kind in expected {
+        assert!(injected.contains(&kind), "missing lost reply for {kind:?}");
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_failover_negotiates_data_loss_after_accounted_quorum_loss() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "data-loss-failover", 3).await;
+    let old_primary = status.current_primary.clone().unwrap();
+    let replaced_secondary = status
+        .members
+        .iter()
+        .find(|member| member.name != old_primary)
+        .unwrap()
+        .name
+        .clone();
+    api.restart_pod(&replaced_secondary).await;
+    api.crash_pod(&old_primary);
+
+    reconcile_set(
+        &make_set("data-loss-failover", 3, Some(status)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let started = api.last_status().unwrap();
+    let completed = drive_operation_to_healthy(&api, "data-loss-failover", 3, started).await;
+
+    assert_eq!(completed.epoch.data_loss_number, 1);
+    assert_eq!(completed.epoch.configuration_number, 2);
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 1);
+    assert!(api.operations().contains(&ControlOperation::OnDataLoss));
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_failover_data_loss_state_changed_and_failure() {
+    let api = KvClusterApi::new_with_data_loss_behavior(service::DataLossBehavior::StateChanged);
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "data-loss-changed", 3).await;
+    let old_primary = status.current_primary.clone().unwrap();
+    let replaced_secondary = status
+        .members
+        .iter()
+        .find(|member| member.name != old_primary)
+        .unwrap()
+        .name
+        .clone();
+    api.restart_pod(&replaced_secondary).await;
+    api.crash_pod(&old_primary);
+    reconcile_set(
+        &make_set("data-loss-changed", 3, Some(status)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let completed =
+        drive_operation_to_healthy(&api, "data-loss-changed", 3, api.last_status().unwrap()).await;
+    assert_eq!(completed.epoch.data_loss_number, 1);
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 1);
+    assert!(
+        completed.stable_snapshot.as_ref().unwrap().members[0]
+            .election_metadata
+            .is_some()
+    );
+
+    let failed_api = KvClusterApi::new_with_data_loss_behavior(service::DataLossBehavior::Fail(
+        "reject data loss".to_string(),
+    ));
+    let failed_state = ReconcilerState::default();
+    let failed_status = create_healthy_set(&failed_api, &failed_state, "data-loss-failed", 3).await;
+    let failed_primary = failed_status.current_primary.clone().unwrap();
+    let failed_secondary = failed_status
+        .members
+        .iter()
+        .find(|member| member.name != failed_primary)
+        .unwrap()
+        .name
+        .clone();
+    failed_api.restart_pod(&failed_secondary).await;
+    failed_api.crash_pod(&failed_primary);
+    reconcile_set(
+        &make_set("data-loss-failed", 3, Some(failed_status)),
+        &failed_api,
+        &failed_state,
+    )
+    .await
+    .unwrap();
+    let mut status = failed_api.last_status().unwrap();
+    for _ in 0..100 {
+        if status
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.phase == DurableOperationPhase::Poisoned)
+        {
+            assert_eq!(status.epoch.data_loss_number, 0);
+            assert!(
+                status
+                    .operation
+                    .as_ref()
+                    .unwrap()
+                    .last_error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("reject data loss")
+            );
+            return;
+        }
+
+        reconcile_set(
+            &make_set("data-loss-failed", 3, Some(status.clone())),
+            &failed_api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = failed_api.last_status().unwrap();
+    }
+    panic!("failed data-loss callback did not poison failover");
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_failover_observes_lost_data_loss_reply() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "data-loss-reply", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    let replaced = status
+        .members
+        .iter()
+        .find(|member| member.name != primary)
+        .unwrap()
+        .name
+        .clone();
+    api.restart_pod(&replaced).await;
+    api.crash_pod(&primary);
+    reconcile_set(&make_set("data-loss-reply", 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    let (completed, injected) = drive_operation_with_lost_replies(
+        &api,
+        "data-loss-reply",
+        3,
+        api.last_status().unwrap(),
+        &[DurableActionKind::FailoverOnDataLoss],
+    )
+    .await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.epoch.data_loss_number, 1);
+    assert_eq!(injected, vec![DurableActionKind::FailoverOnDataLoss]);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_failover_waits_for_unavailable_possible_best_replica() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "quorum-wait", 3).await;
+    let old_primary = status.current_primary.clone().unwrap();
+    let unavailable = status
+        .members
+        .iter()
+        .filter(|member| member.name != old_primary)
+        .map(|member| member.name.clone())
+        .collect::<Vec<_>>();
+    api.crash_pod(&old_primary);
+    for pod in unavailable {
+        api.crash_pod(&pod);
+    }
+
+    reconcile_set(&make_set("quorum-wait", 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    let mut status = api.last_status().unwrap();
+    for _ in 0..40 {
+        let phase = status.operation.as_ref().unwrap().phase;
+        if matches!(
+            phase,
+            DurableOperationPhase::FailoverWaitForBestCandidate
+                | DurableOperationPhase::FailoverWaitForReadQuorum
+        ) {
+            assert_eq!(status.epoch.data_loss_number, 0);
+            assert_eq!(status.phase, Phase::FailingOver);
+            let before = status
+                .operation
+                .as_ref()
+                .unwrap()
+                .failover
+                .as_ref()
+                .unwrap()
+                .next_unavailable_index;
+            reconcile_set(
+                &make_set("quorum-wait", 3, Some(status.clone())),
+                &api,
+                &ReconcilerState::default(),
+            )
+            .await
+            .unwrap();
+            let after_status = api.last_status().unwrap();
+            let failover = after_status
+                .operation
+                .as_ref()
+                .unwrap()
+                .failover
+                .as_ref()
+                .unwrap();
+            assert_eq!(failover.unavailable_replicas.len(), 2);
+            assert_ne!(failover.next_unavailable_index, before);
+            return;
+        }
+
+        reconcile_set(
+            &make_set("quorum-wait", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    panic!("failover did not enter explicit quorum/best-candidate wait: {status:?}");
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_failover_delay_requires_continuous_failure_and_rejects_negative() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "failover-delay", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    api.mark_pod_not_ready(&primary);
+
+    let mut delayed = make_set("failover-delay", 3, Some(status));
+    delayed.spec.failover_delay = 5;
+    reconcile_set(&delayed, &api, &state).await.unwrap();
+    let waiting = api.last_status().unwrap();
+    assert_eq!(waiting.phase, Phase::Healthy);
+    assert!(waiting.primary_failing_since.is_some());
+    assert!(
+        waiting
+            .operation
+            .as_ref()
+            .is_none_or(|operation| operation.kind != DurableOperationKind::Failover)
+    );
+
+    api.mark_all_pods_ready();
+    let recovered = make_set("failover-delay", 3, Some(waiting));
+    reconcile_set(&recovered, &api, &state).await.unwrap();
+    let recovered = api.last_status().unwrap();
+    assert_eq!(recovered.phase, Phase::Healthy);
+    assert!(recovered.primary_failing_since.is_none());
+
+    api.mark_pod_not_ready(&primary);
+    let mut invalid = make_set("failover-delay", 3, Some(recovered));
+    invalid.spec.failover_delay = -1;
+    let error = match reconcile_set(&invalid, &api, &state).await {
+        Ok(_) => panic!("negative failover delay unexpectedly reconciled"),
+        Err(error) => error,
+    };
+    assert!(error.contains("non-negative"));
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_failover_final_status_lost_reply_reloads_applied_snapshot() {
+    let api = KvClusterApi::new();
+    let initial_state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &initial_state, "final-status-loss", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    api.crash_pod(&primary);
+    reconcile_set(
+        &make_set("final-status-loss", 3, Some(status)),
+        &api,
+        &initial_state,
+    )
+    .await
+    .unwrap();
+    let mut status = api.last_status().unwrap();
+    for _ in 0..120 {
+        let ready_to_complete = status.operation.as_ref().is_some_and(|operation| {
+            operation.phase == DurableOperationPhase::FailoverAttest
+                && operation.failover.as_ref().is_some_and(|failover| {
+                    failover.final_attestations.len() == operation.target_snapshot.members.len()
+                })
+        });
+        if ready_to_complete {
+            break;
+        }
+
+        reconcile_set(
+            &make_set("final-status-loss", 3, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+    }
+    assert_eq!(
+        status.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::FailoverAttest
+    );
+    *api.fail_after_next_status_patch.lock().unwrap() = true;
+    let completion_state = ReconcilerState::default();
+    assert!(
+        reconcile_set(
+            &make_set("final-status-loss", 3, Some(status)),
+            &api,
+            &completion_state,
+        )
+        .await
+        .is_err()
+    );
+    let applied = api.last_status().unwrap();
+    assert_eq!(applied.phase, Phase::Healthy);
+    assert!(applied.operation.is_none());
+    let count = api.statuses.lock().unwrap().len();
+    reconcile_set(
+        &make_set("final-status-loss", 3, Some(applied.clone())),
+        &api,
+        &completion_state,
+    )
+    .await
+    .unwrap();
+    assert_eq!(api.statuses.lock().unwrap().len(), count);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_failover_incarnation_drift_is_phase_fenced() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "failover-drift", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    api.crash_pod(&primary);
+    reconcile_set(&make_set("failover-drift", 3, Some(status)), &api, &state)
+        .await
+        .unwrap();
+    let confirmed = advance_add_until_phase(
+        &api,
+        &ReconcilerState::default(),
+        "failover-drift",
+        3,
+        api.last_status().unwrap(),
+        DurableOperationPhase::FailoverPersistConfigurationEpoch,
+    )
+    .await;
+    let target_id = confirmed.operation.as_ref().unwrap().target_primary_id;
+    let target_name = format!("failover-drift-{}", target_id - 1);
+    api.restart_pod(&target_name).await;
+    reconcile_set(
+        &make_set("failover-drift", 3, Some(confirmed)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        api.last_status().unwrap().operation.unwrap().phase,
+        DurableOperationPhase::Poisoned
+    );
+
+    let roll_api = KvClusterApi::new();
+    let roll_state = ReconcilerState::default();
+    let roll_status = create_healthy_set(&roll_api, &roll_state, "failover-roll", 3).await;
+    let old_primary = roll_status.current_primary.clone().unwrap();
+    roll_api.crash_pod(&old_primary);
+    reconcile_set(
+        &make_set("failover-roll", 3, Some(roll_status)),
+        &roll_api,
+        &roll_state,
+    )
+    .await
+    .unwrap();
+    let post_commit = advance_add_until_phase(
+        &roll_api,
+        &ReconcilerState::default(),
+        "failover-roll",
+        3,
+        roll_api.last_status().unwrap(),
+        DurableOperationPhase::FailoverDistributeEpoch,
+    )
+    .await;
+    let operation = post_commit.operation.as_ref().unwrap();
+    let secondary = operation
+        .target_snapshot
+        .members
+        .iter()
+        .find(|member| member.id != operation.target_primary_id)
+        .unwrap()
+        .id;
+    roll_api
+        .restart_pod(&format!("failover-roll-{}", secondary - 1))
+        .await;
+    reconcile_set(
+        &make_set("failover-roll", 3, Some(post_commit)),
+        &roll_api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let reduced = roll_api.last_status().unwrap();
+    assert_eq!(
+        reduced
+            .operation
+            .as_ref()
+            .unwrap()
+            .target_snapshot
+            .members
+            .len(),
+        1
+    );
+    let completed = drive_operation_to_healthy(&roll_api, "failover-roll", 3, reduced).await;
+    assert_eq!(completed.stable_snapshot.unwrap().members.len(), 1);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_stable_metadata_refresh_records_live_configuration() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "metadata-refresh", 3).await;
+    assert!(status.stable_election_metadata_refresh.is_none());
+    let snapshot = status.stable_snapshot.as_ref().unwrap();
+    assert!(snapshot.members.iter().all(|member| {
+        member
+            .election_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.deactivation_epoch == snapshot.epoch)
+    }));
+    assert!(
+        live_replica_statuses(&api, "metadata-refresh", 3)
+            .await
+            .iter()
+            .all(|status| status.election_configuration.is_some())
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_failover_reprobes_reachable_transient_observation() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let status = create_healthy_set(&api, &state, "transient-reprobe", 3).await;
+    let primary = status.current_primary.clone().unwrap();
+    api.crash_pod(&primary);
+    reconcile_set(
+        &make_set("transient-reprobe", 3, Some(status)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut collecting = advance_add_until_phase(
+        &api,
+        &ReconcilerState::default(),
+        "transient-reprobe",
+        3,
+        api.last_status().unwrap(),
+        DurableOperationPhase::FailoverCollect,
+    )
+    .await;
+    let operation = collecting.operation.as_mut().unwrap();
+    let epoch = operation.previous_snapshot.as_ref().unwrap().epoch.clone();
+    let instance_2 = operation
+        .failover
+        .as_ref()
+        .unwrap()
+        .current_configuration
+        .members
+        .iter()
+        .find(|member| member.id == 2)
+        .unwrap()
+        .instance_id
+        .clone();
+    let instance_3 = operation
+        .failover
+        .as_ref()
+        .unwrap()
+        .current_configuration
+        .members
+        .iter()
+        .find(|member| member.id == 3)
+        .unwrap()
+        .instance_id
+        .clone();
+    operation.failover.as_mut().unwrap().observations = vec![
+        ReplicaElectionObservationStatus {
+            id: 2,
+            instance_id: instance_2,
+            epoch: epoch.clone(),
+            role: "activeSecondary".to_string(),
+            healthy: true,
+            current_lsn: 10,
+            committed_lsn: 10,
+            first_retained_lsn: Some(0),
+            deactivation_epoch: Some(epoch.clone()),
+            deactivation_catch_up_lsn: Some(10),
+            configuration_matches: true,
+        },
+        ReplicaElectionObservationStatus {
+            id: 3,
+            instance_id: instance_3,
+            epoch: epoch.clone(),
+            role: "activeSecondary".to_string(),
+            healthy: false,
+            current_lsn: 20,
+            committed_lsn: 20,
+            first_retained_lsn: Some(0),
+            deactivation_epoch: Some(epoch),
+            deactivation_catch_up_lsn: Some(20),
+            configuration_matches: true,
+        },
+    ];
+    operation.phase = DurableOperationPhase::FailoverAssess;
+    reconcile_set(
+        &make_set("transient-reprobe", 3, Some(collecting)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let waiting = api.last_status().unwrap();
+    assert!(matches!(
+        waiting.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::FailoverWaitForBestCandidate
+            | DurableOperationPhase::FailoverWaitForReadQuorum
+    ));
+
+    reconcile_set(
+        &make_set("transient-reprobe", 3, Some(waiting)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let refreshed = api.last_status().unwrap();
+    assert_eq!(
+        refreshed.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::FailoverAssess
+    );
+    let completed = drive_operation_to_healthy(&api, "transient-reprobe", 3, refreshed).await;
+    assert_eq!(completed.phase, Phase::Healthy);
 }
 
 /// Verify idempotent creation: reconciling Pending twice doesn't create duplicate PVCs.

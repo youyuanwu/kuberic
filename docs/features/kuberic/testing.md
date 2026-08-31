@@ -154,6 +154,14 @@ Also supports `mark_pod_not_ready()` for testing failure detection paths.
 | `test_reconciler_switchover` | Switchover via targetPrimary change. Verify old primary rejects writes. |
 | `test_reconciler_creating_waits_for_ready` | Creating phase requeues when pods are not ready (no transition to Healthy). |
 | `test_reconciler_detects_primary_failure_and_fails_over` | Healthy detects NotReady primary → FailingOver → failover completes → Healthy with new primary. Verifies pre-crash data survives and new primary accepts writes. |
+| `test_durable_failover_recovers_lost_replies_and_restarts` | Replaces controller state at each step and loses replies for epoch, promotion, configuration, quorum, and election-configuration actions. |
+| `test_durable_failover_negotiates_data_loss_after_accounted_quorum_loss` | Invalid live evidence makes read quorum conclusively unavailable; verifies epoch advance and `OnDataLoss`. |
+| `test_durable_failover_data_loss_state_changed_and_failure` | Exercises real runtime callback no-change/state-changed/error handling and fail-closed rejection. |
+| `test_durable_failover_observes_lost_data_loss_reply` | Loses the callback response after application and resolves typed completion from status. |
+| `test_durable_failover_waits_for_unavailable_possible_best_replica` | Persists explicit wait and rotates probes across unavailable possible-best replicas. |
+| `test_durable_failover_incarnation_drift_is_phase_fenced` | Rejects confirmed-candidate replacement and rolls forward after post-commit secondary replacement. |
+| `test_durable_failover_final_status_lost_reply_reloads_applied_snapshot` | Applies final stable status then loses the API response; authoritative reload prevents duplicate work. |
+| `test_stable_metadata_refresh_records_live_configuration` | Records runtime election configuration and exact epoch/incarnation progress into the stable snapshot. |
 | `test_reconciler_scale_up` | Healthy phase: spec.replicas increased → creates pods → adds replicas to driver. |
 | `test_reconciler_scale_down` | Healthy phase: spec.replicas decreased → removes secondary from driver. |
 
@@ -247,9 +255,8 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 
 | Gap | What's Missing | Difficulty |
 |-----|---------------|------------|
-| `on_data_loss` callback | Never triggered — actor hardcodes `DataLossAction::None`. Need quorum loss scenario. | Medium (needs quorum loss sim) |
 | `remove_replica` (cancel build) | No test cancels an in-progress `build_replica` via `remove_replica`. | Medium |
-| Multiple sequential operations | Failover→failover, switchover→failover, scale-up→failover. Only single operations tested. | Medium |
+| Cross-kind sequential operations | Switchover→failover and scale-up→failover combinations beyond the covered double-failover case. | Medium |
 
 ### Not Tested (Requires Design Work First)
 
@@ -263,10 +270,7 @@ RUST_LOG=info cargo test test_operator_three_replica_failover -- --nocapture
 | Concurrent reconciliation outside durable switchover | Operational | B4 |
 | QuorumTracker stale ACK cleanup | Correctness | C1 |
 | Zombie primary write rejection (epoch fencing on data plane) | Protocol safety | A2 |
-| Data loss protocol (on_data_loss triggered by operator) | Designed, not impl | D |
-| Mid-reconfiguration recovery outside switchover | Stable + switchover recovery implemented; other operations need migration | D |
-| Secondary health detection | Designed, not impl | D |
-| Missing pod detection | Designed, not impl | D |
+| Mid-reconfiguration handoff into failover | Stable failover and other durable operations are implemented; interruption handoff is future work | D |
 | Network partition (pod Ready but gRPC unreachable) | Designed, not impl | D |
 
 ### Intentionally Not Tested
@@ -408,7 +412,19 @@ scale-down, unreachable force-removal, pre-commit configuration restoration,
 post-commit roll-forward, stable-snapshot commit ordering, conflict before
 intent, and same-name/new-UID deletion fencing.
 
-**Pattern 11: Durable creation bootstrap and routing gate** ✅
+**Pattern 11: Durable Phase-1 failover and data loss** ✅
+
+`failover_election` unit matrices cover complete previous/current
+denominators, overlap, unhealthy and unknown observations, stale deactivation,
+catch-up capability, deterministic ties, possible-best waiting, and
+data-loss-required outcomes. Reconciler tests replace controller state,
+inject before/after runtime failures and a final status apply-then-error,
+exercise no-change/state-changed/failed/lost `OnDataLoss`, verify explicit
+quorum wait with rotating probes, fence incarnation drift on both sides of
+promotion commit, and run consecutive failovers. Every persisted failover
+phase also round-trips through serialization.
+
+**Pattern 12: Durable creation bootstrap and routing gate** ✅
 `test_durable_create_survives_state_loss_and_every_lost_runtime_reply`
 replaces controller state at every creation boundary, injects a lost response
 for every correlated runtime activity instance, and verifies exact Open/build

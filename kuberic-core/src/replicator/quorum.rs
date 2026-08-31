@@ -103,6 +103,21 @@ impl QuorumTracker {
         self.committed_lsn = self.committed_lsn.max(committed_lsn);
     }
 
+    /// Replace progress after the state provider accepted a data-loss event.
+    ///
+    /// Unlike promotion seeding, data-loss recovery may move progress
+    /// backwards. Pending operations and catch-up observations belong to the
+    /// discarded history and must not influence the new epoch.
+    pub fn reset_progress_after_data_loss(&mut self, current_progress: Lsn, committed_lsn: Lsn) {
+        self.fail_all(KubericError::Internal(
+            "state changed after data loss".into(),
+        ));
+        self.highest_lsn = current_progress;
+        self.committed_lsn = committed_lsn;
+        self.catch_up_baseline_lsn = current_progress;
+        self.replica_acked_lsn.clear();
+    }
+
     /// Update to dual-config mode (during reconfiguration).
     /// Seeds `replica_acked_lsn` for must_catch_up replicas from their
     /// reported `current_progress` (the operator knows each replica's LSN).
@@ -989,5 +1004,17 @@ mod tests {
         assert_eq!(rx.await.unwrap().unwrap(), 1);
         assert_eq!(tracker.committed_lsn(), 1);
         assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[test]
+    fn data_loss_progress_reset_can_move_backwards() {
+        let mut tracker = QuorumTracker::new();
+        tracker.seed_progress(50, 40);
+
+        tracker.reset_progress_after_data_loss(7, 6);
+
+        assert_eq!(tracker.highest_lsn, 7);
+        assert_eq!(tracker.committed_lsn, 6);
+        assert_eq!(tracker.catch_up_baseline_lsn, 7);
     }
 }

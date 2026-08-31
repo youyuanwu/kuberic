@@ -1,6 +1,7 @@
 use kube::CustomResource;
 use kuberic_core::types::{
-    Epoch, ReplicaInstanceId, Role, StablePartitionSnapshot, StableReplicaSnapshot,
+    Epoch, ReplicaInstanceId, Role, StablePartitionSnapshot, StableReplicaElectionMetadata,
+    StableReplicaSnapshot,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ pub struct KubericSetSpec {
 
     /// Seconds to wait before triggering failover after primary failure.
     #[serde(default)]
+    #[schemars(range(min = 0))]
     pub failover_delay: i32,
 
     /// Max seconds for graceful primary demotion during switchover.
@@ -112,6 +114,21 @@ pub struct KubericSetStatus {
     /// When the primary started failing (for failover delay).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_failing_since: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_election_metadata_refresh: Option<StableElectionMetadataRefreshStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StableElectionMetadataRefreshStatus {
+    pub snapshot_epoch: EpochStatus,
+    #[serde(default)]
+    pub next_member_index: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_members: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_action: Option<PendingActionStatus>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
@@ -160,6 +177,18 @@ pub struct StableReplicaSnapshotStatus {
     pub id: i64,
     pub instance_id: String,
     pub role: StableReplicaRoleStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub election_metadata: Option<StableReplicaElectionMetadataStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StableReplicaElectionMetadataStatus {
+    pub current_lsn: i64,
+    pub committed_lsn: i64,
+    pub first_retained_lsn: i64,
+    pub deactivation_epoch: EpochStatus,
+    pub deactivation_catch_up_lsn: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
@@ -259,6 +288,92 @@ pub struct DurableOperationStatus {
     pub pending_action: Option<PendingActionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover: Option<DurableFailoverStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableFailoverStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_configuration: Option<FailoverConfigurationStatus>,
+    pub current_configuration: FailoverConfigurationStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<ReplicaElectionObservationStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_replicas: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub final_attestations: Vec<ReplicaElectionObservationStatus>,
+    #[serde(default)]
+    pub target_confirmed: bool,
+    #[serde(default)]
+    pub data_loss_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration_epoch_intent: Option<EpochStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_loss_epoch_intent: Option<EpochStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_loss_result: Option<DurableDataLossResultStatus>,
+    #[serde(default)]
+    pub next_configuration_index: u32,
+    #[serde(default)]
+    pub next_secondary_index: u32,
+    #[serde(default)]
+    pub next_label_index: u32,
+    #[serde(default)]
+    pub next_attestation_index: u32,
+    #[serde(default)]
+    pub next_unavailable_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<String>,
+    #[serde(default)]
+    pub promotion_committed: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverConfigurationStatus {
+    pub members: Vec<FailoverMemberStatus>,
+    pub write_quorum: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FailoverMemberStatus {
+    pub id: i64,
+    pub instance_id: String,
+    pub role: StableReplicaRoleStatus,
+    #[serde(default)]
+    pub dropped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_known: Option<StableReplicaElectionMetadataStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaElectionObservationStatus {
+    pub id: i64,
+    pub instance_id: String,
+    pub epoch: EpochStatus,
+    pub role: String,
+    pub healthy: bool,
+    pub current_lsn: i64,
+    pub committed_lsn: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_retained_lsn: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deactivation_epoch: Option<EpochStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deactivation_catch_up_lsn: Option<i64>,
+    #[serde(default)]
+    pub configuration_matches: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum DurableDataLossResultStatus {
+    NoStateChange,
+    StateChanged,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
@@ -268,6 +383,7 @@ pub enum DurableOperationKind {
     Switchover,
     AddReplica,
     RemoveReplica,
+    Failover,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
@@ -356,6 +472,26 @@ pub enum DurableOperationPhase {
     RemoveFinalize,
     RemoveCompensateConfiguration,
     RemoveCompensateFinalize,
+    FailoverRecordStartingConfiguration,
+    FailoverCollect,
+    FailoverAssess,
+    FailoverWaitForBestCandidate,
+    FailoverWaitForReadQuorum,
+    FailoverPersistConfigurationEpoch,
+    FailoverPersistDataLossEpoch,
+    FailoverApplyCandidateEpoch,
+    FailoverNotifyDataLoss,
+    FailoverRefreshCandidate,
+    FailoverPromoteCandidate,
+    FailoverCommitPromotion,
+    FailoverDistributeEpoch,
+    FailoverCatchUpConfiguration,
+    FailoverWaitForCatchUpQuorum,
+    FailoverCurrentConfiguration,
+    FailoverRecordElectionConfiguration,
+    FailoverLabelMembers,
+    FailoverAttest,
+    FailoverFinalize,
     Completed,
     Failed,
     Poisoned,
@@ -376,6 +512,8 @@ pub struct PendingActionStatus {
     pub deadline_unix_seconds: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub dispatch_authorized: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
@@ -439,6 +577,16 @@ pub enum DurableActionKind {
     RemoveCloseTarget,
     RemoveDeleteTarget,
     RemoveCompensateConfiguration,
+    FailoverRecordStartingConfiguration,
+    FailoverUpdateCandidateEpoch,
+    FailoverOnDataLoss,
+    FailoverPromoteCandidate,
+    FailoverUpdateSecondaryEpoch,
+    FailoverCatchUpConfiguration,
+    FailoverWaitForCatchUpQuorum,
+    FailoverCurrentConfiguration,
+    FailoverRecordElectionConfiguration,
+    FailoverLabelMember,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -464,6 +612,8 @@ pub enum DurablePostconditionKind {
     ReplicaRemoved,
     Closed,
     PodDeleted,
+    DataLossCompleted,
+    ElectionConfiguration,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -515,6 +665,18 @@ impl TryFrom<&StableReplicaSnapshotStatus> for StableReplicaSnapshot {
                 StableReplicaRoleStatus::Primary => Role::Primary,
                 StableReplicaRoleStatus::ActiveSecondary => Role::ActiveSecondary,
             },
+            election_metadata: value.election_metadata.as_ref().map(|metadata| {
+                StableReplicaElectionMetadata {
+                    current_lsn: metadata.current_lsn,
+                    committed_lsn: metadata.committed_lsn,
+                    first_retained_lsn: metadata.first_retained_lsn,
+                    deactivation_epoch: Epoch::new(
+                        metadata.deactivation_epoch.data_loss_number,
+                        metadata.deactivation_epoch.configuration_number,
+                    ),
+                    deactivation_catch_up_lsn: metadata.deactivation_catch_up_lsn,
+                }
+            }),
         })
     }
 }
@@ -556,6 +718,18 @@ impl TryFrom<&StableReplicaSnapshot> for StableReplicaSnapshotStatus {
                     ));
                 }
             },
+            election_metadata: value.election_metadata.as_ref().map(|metadata| {
+                StableReplicaElectionMetadataStatus {
+                    current_lsn: metadata.current_lsn,
+                    committed_lsn: metadata.committed_lsn,
+                    first_retained_lsn: metadata.first_retained_lsn,
+                    deactivation_epoch: EpochStatus {
+                        data_loss_number: metadata.deactivation_epoch.data_loss_number,
+                        configuration_number: metadata.deactivation_epoch.configuration_number,
+                    },
+                    deactivation_catch_up_lsn: metadata.deactivation_catch_up_lsn,
+                }
+            }),
         })
     }
 }
@@ -563,6 +737,7 @@ impl TryFrom<&StableReplicaSnapshot> for StableReplicaSnapshotStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kube::CustomResourceExt;
 
     #[test]
     fn stable_snapshot_round_trips_without_changing_incarnations() {
@@ -574,11 +749,19 @@ mod tests {
                     id: 4,
                     instance_id: ReplicaInstanceId::new("pod-uid/exact"),
                     role: Role::Primary,
+                    election_metadata: Some(StableReplicaElectionMetadata {
+                        current_lsn: 12,
+                        committed_lsn: 11,
+                        first_retained_lsn: 3,
+                        deactivation_epoch: Epoch::new(2, 6),
+                        deactivation_catch_up_lsn: 10,
+                    }),
                 },
                 StableReplicaSnapshot {
                     id: 8,
                     instance_id: ReplicaInstanceId::new("another uid"),
                     role: Role::ActiveSecondary,
+                    election_metadata: None,
                 },
             ],
             write_quorum: 2,
@@ -592,7 +775,9 @@ mod tests {
         assert_eq!(json["primaryId"], 4);
         assert_eq!(json["members"][0]["instanceId"], "pod-uid/exact");
         assert_eq!(json["members"][0]["role"], "primary");
+        assert_eq!(json["members"][0]["electionMetadata"]["currentLsn"], 12);
         assert_eq!(json["members"][1]["role"], "activeSecondary");
+        assert!(json["members"][1].get("electionMetadata").is_none());
     }
 
     #[test]
@@ -616,6 +801,7 @@ mod tests {
             id: 1,
             instance_id: String::new(),
             role: StableReplicaRoleStatus::Primary,
+            election_metadata: None,
         };
         assert_eq!(
             StableReplicaSnapshot::try_from(&persisted).unwrap_err(),
@@ -629,11 +815,81 @@ mod tests {
             id: 1,
             instance_id: ReplicaInstanceId::new("one"),
             role: Role::IdleSecondary,
+            election_metadata: None,
         };
         assert_eq!(
             StableReplicaSnapshotStatus::try_from(&core).unwrap_err(),
             "replica 1 has unsupported stable role IdleSecondary"
         );
+    }
+
+    #[test]
+    fn legacy_and_zero_election_metadata_remain_distinct() {
+        let legacy: StableReplicaSnapshotStatus = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "instanceId": "one",
+            "role": "primary"
+        }))
+        .unwrap();
+        assert!(legacy.election_metadata.is_none());
+
+        let core = StableReplicaSnapshot {
+            id: 1,
+            instance_id: ReplicaInstanceId::new("one"),
+            role: Role::Primary,
+            election_metadata: Some(StableReplicaElectionMetadata {
+                current_lsn: 0,
+                committed_lsn: 0,
+                first_retained_lsn: 0,
+                deactivation_epoch: Epoch::new(0, 0),
+                deactivation_catch_up_lsn: 0,
+            }),
+        };
+        let persisted = StableReplicaSnapshotStatus::try_from(&core).unwrap();
+        let recovered = StableReplicaSnapshot::try_from(&persisted).unwrap();
+        assert_eq!(recovered, core);
+        let metadata = serde_json::to_value(persisted).unwrap()["electionMetadata"].clone();
+        assert_eq!(metadata["currentLsn"], 0);
+        assert_eq!(metadata["committedLsn"], 0);
+        assert_eq!(metadata["firstRetainedLsn"], 0);
+        assert_eq!(metadata["deactivationCatchUpLsn"], 0);
+    }
+
+    #[test]
+    fn failover_schema_contains_durable_state_and_nonnegative_delay() {
+        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        for required in [
+            "failoverRecordStartingConfiguration",
+            "failoverWaitForBestCandidate",
+            "failoverPersistDataLossEpoch",
+            "failoverOnDataLoss",
+            "dataLossCompleted",
+            "dispatchAuthorized",
+            "unavailableReplicas",
+            "stableElectionMetadataRefresh",
+        ] {
+            assert!(
+                generated.contains(required),
+                "missing generated schema {required}"
+            );
+        }
+        let deployment = include_str!("../deploy/deployment.yaml");
+        for required in [
+            "failoverRecordStartingConfiguration",
+            "failoverWaitForBestCandidate",
+            "failoverPersistDataLossEpoch",
+            "failoverOnDataLoss",
+            "dataLossCompleted",
+            "dispatchAuthorized",
+            "unavailableReplicas",
+            "stableElectionMetadataRefresh",
+            "minimum: 0",
+        ] {
+            assert!(
+                deployment.contains(required),
+                "missing deployment schema {required}"
+            );
+        }
     }
 }
 

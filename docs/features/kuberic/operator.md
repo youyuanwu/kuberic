@@ -15,23 +15,25 @@ switchover, and scaling via `PartitionDriver`.
 
 **Spec fields:**
 - `spec.replicas`, `spec.minReplicas`
-- `spec.failoverDelay`, `spec.switchoverDelay`, `spec.replacementDelay`
-- `spec.quorumLossWaitDuration`
-- `spec.grpcFailureThreshold`, `spec.maxRecreateAttempts`
-- `spec.podAntiAffinityType`
+- `spec.image`, `spec.storage`, `spec.pvcRetentionPolicy`
+- `spec.failoverDelay`, `spec.switchoverDelay`
+- client, control, and data ports
 
 **Status fields:**
 - `epoch`, `currentPrimary`, `targetPrimary`, `phase`
 - `reconfigurationPhase`
 - optional authoritative `stableSnapshot` with epoch, primary logical ID,
-  complete member logical/incarnation identities and roles, and write quorum
+  complete member logical/incarnation identities and roles, write quorum, and
+  optional last-known election progress/deactivation metadata
 - optional compact versioned `operation` checkpoint for durable creation,
   switchover, replica add/rebuild, and configuration-first replica removal,
-  including optional previous/committed bootstrap topology, target snapshot,
-  and one pending correlated action
-- `failingSinceTimestamp`, `quorumLossSince`
+  plus Phase-1 failover/data-loss recovery, including optional
+  previous/committed topology, target snapshot, one pending correlated action,
+  and failover observations/assessment/epoch intents
+- optional `stableElectionMetadataRefresh` checkpoint for topology-scoped,
+  write-ahead runtime configuration recording and live progress publication
+- `primaryFailingSince`
 - per-member stable replica ID and replica incarnation (Kubernetes Pod UID)
-- `instanceNames`, `instanceStates`
 - `conditions`
 
 **Reconciliation:** Stable workflows use `PartitionDriver` with
@@ -41,12 +43,14 @@ creation persists partial committed bootstrap topology after primary-only and
 each expanded current configuration, so process loss rolls forward from live
 committed authority instead of replaying `Open(New)`.
 
-Reconciler-driven creation, switchover, replica add/rebuild, and replica
-removal persist a versioned operation checkpoint, reconstruct fresh handles
-and observations on every reconcile, and advance one transition or activity
-at a time. Pending action intent is durable before RPC, pod-label, or
-UID-fenced pod-delete mutation. Status patches include the observed Kubernetes
-`resourceVersion`; no lock is held across a durable activity.
+Reconciler-driven creation, switchover, replica add/rebuild, replica removal,
+and failover persist a versioned operation checkpoint, reconstruct fresh
+handles and observations on every reconcile, and advance one status transition
+or one mutating activity at a time. Bounded read observations may precede
+either, but a mutation and status patch never share a reconcile. Pending action
+intent is durable before RPC, pod-label, or UID-fenced pod-delete mutation.
+Status patches include the observed Kubernetes `resourceVersion`; no lock is
+held across a durable activity.
 
 ---
 
@@ -62,9 +66,11 @@ UID-fenced pod-delete mutation. Status patches include the observed Kubernetes
 | `AddingReplica` | Durable scale-up or stale-secondary replacement in progress |
 | `RemovingReplica` | Durable healthy scale-down or stale/dead-secondary eviction in progress |
 
-Note: No `WaitingForQuorum` phase. Following SF's design, the system always
-makes progress during failover. If quorum is lost, the data loss protocol
-kicks in (`on_data_loss()`) rather than blocking.
+Quorum and best-candidate waits are persisted failover sub-phases rather than
+top-level CRD phases. `DurableOperation` conditions use
+`WaitingForBestCandidate` or `QuorumLoss`. Both wait indefinitely while
+missing evidence could change the safe result; elapsed time never promotes a
+lesser replica or authorizes data loss.
 
 ---
 
@@ -79,32 +85,40 @@ Healthy phase:
   │    Pod ready? gRPC reachable?
   │    → If not: enforce failover delay → FailingOver
   │
-  ├─ 2. Switchover detection
+  ├─ 2. Durable Phase-1 failover
+  │    collect progress/incarnation/epoch/role/config/deactivation
+  │    → validate previous/current read quorum
+  │    → wait, confirm target, or negotiate data loss
+  │
+  ├─ 3. Switchover detection
   │    targetPrimary != currentPrimary?
   │    → If yes: → Switchover
   │
-  ├─ 3. Secondary health check
+  ├─ 4. Secondary health check
   │    Ready replacement incarnation? → durable rebuild
   │    Old incarnation unreachable with retained quorum? → durable force-remove
   │
-  ├─ 4. Missing pod detection
+  ├─ 5. Missing pod detection
   │    driver.replica_ids() vs list_pods()
   │    → If replacement is ready: rebuild; otherwise durable force-remove
   │
-  ├─ 5. Scale reconciliation
+  ├─ 6. Scale reconciliation
   │    spec.replicas vs current count
   │    → Scale up: create pods + add_replica
   │    → Scale down: durable configuration-first removal
   │
-  ├─ 6. Node drain detection
+  ├─ 7. Stable election metadata refresh
+  │    topology-scoped correlated config record + exact live progress
+  │
+  ├─ 8. Node drain detection
   │    Any pod's node unschedulable?
   │    → If primary: switchover to healthy node
   │
-  ├─ 7. Multi-primary detection
+  ├─ 9. Multi-primary detection
   │    GetStatus on all replicas
   │    → If multiple primaries: close stale one
   │
-  └─ 8. Condition updates
+  └─ 10. Condition updates
        Set Ready/Degraded/QuorumAvailable conditions
 ```
 
@@ -143,13 +157,14 @@ and the persisted majority write quorum.
 
 The snapshot is authoritative. `currentPrimary` remains compatibility output
 and is refreshed from recovered driver state; it is never recovery input.
-Legacy resources without a snapshot, changed pod identities, and live state
-that is newer or otherwise inconsistent fail closed. Runtime health does not
-invalidate an otherwise consistent snapshot: recovery completes first, then
-the normal health/failover path runs. Stable recovery is intentionally limited to `Healthy` topology. Durable
-`Creating`, `Switchover`, `AddingReplica`, and `RemovingReplica` resume from
-`status.operation`; failover/data-loss migration remains unsupported. See
-`operator-failure-scenarios.md` §8.
+Legacy resources without a snapshot fail closed. A missing or inconsistent
+stable primary routes directly into durable failover before driver recovery;
+non-primary incarnation changes are handled by topology reconciliation or the
+phase-specific failover fence. Durable `Creating`, `Switchover`,
+`AddingReplica`, `RemovingReplica`, and `FailingOver` resume from
+`status.operation`. Completed topology snapshots are refreshed with exact
+election metadata before they are used as unavailable-candidate comparison
+evidence. See `operator-failure-scenarios.md` §8.
 
 ## Durable Partition Creation
 

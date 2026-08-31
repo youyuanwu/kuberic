@@ -113,7 +113,7 @@ message GetStatusResponse {
     RoleProto role = 1;
     EpochProto epoch = 2;
     int64 current_progress = 3;
-    int64 catch_up_capability = 4;
+    optional int64 catch_up_capability = 4;
     int64 committed_lsn = 5;
     bool healthy = 6;
     string instance_id = 7;
@@ -126,6 +126,26 @@ message GetStatusResponse {
     DurableActionStateProto durable_action_state = 14;
     string durable_action_error = 15;
     repeated ReplicaConnectionStatusProto active_replica_connections = 16;
+    ReplicaDeactivationInfoProto deactivation_info = 17;
+    ReplicaElectionConfigurationProto election_configuration = 18;
+    DurableActionResultProto last_completed_action_result = 19;
+    DurableActionResultProto durable_action_result = 20;
+}
+
+message ReplicaDeactivationInfoProto {
+    EpochProto epoch = 1;
+    int64 catch_up_lsn = 2;
+}
+
+message ReplicaElectionConfigurationProto {
+    ReplicaConfigurationStatusProto current = 1;
+    ReplicaConfigurationStatusProto previous = 2;
+}
+
+enum DurableActionResultProto {
+    DURABLE_ACTION_RESULT_NONE = 0;
+    DURABLE_ACTION_RESULT_DATA_LOSS_NO_STATE_CHANGE = 1;
+    DURABLE_ACTION_RESULT_DATA_LOSS_STATE_CHANGED = 2;
 }
 
 message ReplicaConnectionStatusProto {
@@ -173,12 +193,20 @@ message RemoveReplicaRequest {
 message RemoveReplicaResponse {}
 
 message OnDataLossRequest {}
+
+message DurableOnDataLossRequest {
+    EpochProto expected_epoch = 1;
+}
 message OnDataLossResponse {
     bool state_changed = 1;
 }
 
 message RevokeWriteStatusRequest {}
 message RevokeWriteStatusResponse {}
+
+message RecordElectionConfigurationRequest {
+    ReplicaElectionConfigurationProto configuration = 1;
+}
 
 message ExecuteDurableActionRequest {
     string action_id = 1;
@@ -193,6 +221,8 @@ message ExecuteDurableActionRequest {
         CloseRequest close = 9;
         BuildReplicaRequest build_replica = 10;
         RemoveReplicaRequest remove_replica = 11;
+        DurableOnDataLossRequest on_data_loss = 12;
+        RecordElectionConfigurationRequest record_election_configuration = 13;
     }
 }
 message ExecuteDurableActionResponse {}

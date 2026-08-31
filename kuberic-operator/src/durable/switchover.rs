@@ -87,6 +87,7 @@ pub fn start_switchover(
         phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         pending_action: None,
         last_error: None,
+        failover: None,
     })
 }
 
@@ -905,6 +906,7 @@ fn pending_action(
         attempts: 0,
         deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
         last_error: None,
+        dispatch_authorized: false,
     })
 }
 
@@ -1282,11 +1284,13 @@ mod tests {
                     id: 1,
                     instance_id: "one".to_string(),
                     role: StableReplicaRoleStatus::Primary,
+                    election_metadata: None,
                 },
                 StableReplicaSnapshotStatus {
                     id: 2,
                     instance_id: "two".to_string(),
                     role: StableReplicaRoleStatus::ActiveSecondary,
+                    election_metadata: None,
                 },
             ],
             write_quorum: 2,
@@ -1342,9 +1346,13 @@ mod tests {
                     role: Role::Primary,
                     epoch: Epoch::new(1, 5),
                     current_progress: 0,
+                    catch_up_capability: Some(0),
+                    committed_lsn: 0,
                     healthy: true,
                     write_status: AccessStatus::Granted,
                     configuration: None,
+                    election_configuration: None,
+                    deactivation_info: None,
                     last_completed_action: None,
                     durable_action: None,
                     active_replica_connections: Vec::new(),

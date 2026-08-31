@@ -42,6 +42,7 @@ spec:
               failoverDelay:
                 type: integer
                 default: 0
+                minimum: 0
               switchoverDelay:
                 type: integer
                 default: 3600
@@ -87,6 +88,99 @@ spec:
                 type: integer
               primaryFailingSince:
                 type: string
+              stableElectionMetadataRefresh:
+                type: object
+                required:
+                - snapshotEpoch
+                - nextMemberIndex
+                properties:
+                  snapshotEpoch:
+                    type: object
+                    required:
+                    - dataLossNumber
+                    - configurationNumber
+                    properties:
+                      dataLossNumber:
+                        type: integer
+                        format: int64
+                      configurationNumber:
+                        type: integer
+                        format: int64
+                  nextMemberIndex:
+                    type: integer
+                    format: uint32
+                    default: 0
+                  completedMembers:
+                    type: array
+                    items:
+                      type: integer
+                      format: int64
+                  pendingAction:
+                    type: object
+                    required:
+                    - actionId
+                    - sequence
+                    - kind
+                    - targetId
+                    - targetInstanceId
+                    - expectedEpoch
+                    - desiredPostcondition
+                    - attempts
+                    - deadlineUnixSeconds
+                    - dispatchAuthorized
+                    properties:
+                      actionId:
+                        type: string
+                      sequence:
+                        type: integer
+                        format: uint32
+                      kind:
+                        type: string
+                        enum:
+                        - failoverRecordElectionConfiguration
+                      targetId:
+                        type: integer
+                        format: int64
+                      targetInstanceId:
+                        type: string
+                      expectedEpoch:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      desiredPostcondition:
+                        type: object
+                        required:
+                        - kind
+                        properties:
+                          kind:
+                            type: string
+                            enum:
+                            - electionConfiguration
+                          role:
+                            type: string
+                            enum:
+                            - primary
+                            - activeSecondary
+                      attempts:
+                        type: integer
+                        format: uint32
+                      deadlineUnixSeconds:
+                        type: integer
+                        format: int64
+                      lastError:
+                        type: string
+                        maxLength: 512
+                      dispatchAuthorized:
+                        type: boolean
+                        default: false
               members:
                 type: array
                 items:
@@ -145,6 +239,39 @@ spec:
                           format: int64
                         instanceId:
                           type: string
+                        electionMetadata:
+                          type: object
+                          required:
+                          - currentLsn
+                          - committedLsn
+                          - firstRetainedLsn
+                          - deactivationEpoch
+                          - deactivationCatchUpLsn
+                          properties:
+                            currentLsn:
+                              type: integer
+                              format: int64
+                            committedLsn:
+                              type: integer
+                              format: int64
+                            firstRetainedLsn:
+                              type: integer
+                              format: int64
+                            deactivationEpoch:
+                              type: object
+                              required:
+                              - dataLossNumber
+                              - configurationNumber
+                              properties:
+                                dataLossNumber:
+                                  type: integer
+                                  format: int64
+                                configurationNumber:
+                                  type: integer
+                                  format: int64
+                            deactivationCatchUpLsn:
+                              type: integer
+                              format: int64
                         role:
                           type: string
                           enum:
@@ -182,6 +309,7 @@ spec:
                     - switchover
                     - addReplica
                     - removeReplica
+                    - failover
                   phase:
                     type: string
                     enum:
@@ -254,6 +382,26 @@ spec:
                     - removeFinalize
                     - removeCompensateConfiguration
                     - removeCompensateFinalize
+                    - failoverRecordStartingConfiguration
+                    - failoverCollect
+                    - failoverAssess
+                    - failoverWaitForBestCandidate
+                    - failoverWaitForReadQuorum
+                    - failoverPersistConfigurationEpoch
+                    - failoverPersistDataLossEpoch
+                    - failoverApplyCandidateEpoch
+                    - failoverNotifyDataLoss
+                    - failoverRefreshCandidate
+                    - failoverPromoteCandidate
+                    - failoverCommitPromotion
+                    - failoverDistributeEpoch
+                    - failoverCatchUpConfiguration
+                    - failoverWaitForCatchUpQuorum
+                    - failoverCurrentConfiguration
+                    - failoverRecordElectionConfiguration
+                    - failoverLabelMembers
+                    - failoverAttest
+                    - failoverFinalize
                     - completed
                     - failed
                     - poisoned
@@ -294,6 +442,39 @@ spec:
                               format: int64
                             instanceId:
                               type: string
+                            electionMetadata:
+                              type: object
+                              required:
+                              - currentLsn
+                              - committedLsn
+                              - firstRetainedLsn
+                              - deactivationEpoch
+                              - deactivationCatchUpLsn
+                              properties:
+                                currentLsn:
+                                  type: integer
+                                  format: int64
+                                committedLsn:
+                                  type: integer
+                                  format: int64
+                                firstRetainedLsn:
+                                  type: integer
+                                  format: int64
+                                deactivationEpoch:
+                                  type: object
+                                  required:
+                                  - dataLossNumber
+                                  - configurationNumber
+                                  properties:
+                                    dataLossNumber:
+                                      type: integer
+                                      format: int64
+                                    configurationNumber:
+                                      type: integer
+                                      format: int64
+                                deactivationCatchUpLsn:
+                                  type: integer
+                                  format: int64
                             role:
                               type: string
                               enum:
@@ -339,6 +520,39 @@ spec:
                               format: int64
                             instanceId:
                               type: string
+                            electionMetadata:
+                              type: object
+                              required:
+                              - currentLsn
+                              - committedLsn
+                              - firstRetainedLsn
+                              - deactivationEpoch
+                              - deactivationCatchUpLsn
+                              properties:
+                                currentLsn:
+                                  type: integer
+                                  format: int64
+                                committedLsn:
+                                  type: integer
+                                  format: int64
+                                firstRetainedLsn:
+                                  type: integer
+                                  format: int64
+                                deactivationEpoch:
+                                  type: object
+                                  required:
+                                  - dataLossNumber
+                                  - configurationNumber
+                                  properties:
+                                    dataLossNumber:
+                                      type: integer
+                                      format: int64
+                                    configurationNumber:
+                                      type: integer
+                                      format: int64
+                                deactivationCatchUpLsn:
+                                  type: integer
+                                  format: int64
                             role:
                               type: string
                               enum:
@@ -388,6 +602,39 @@ spec:
                               format: int64
                             instanceId:
                               type: string
+                            electionMetadata:
+                              type: object
+                              required:
+                              - currentLsn
+                              - committedLsn
+                              - firstRetainedLsn
+                              - deactivationEpoch
+                              - deactivationCatchUpLsn
+                              properties:
+                                currentLsn:
+                                  type: integer
+                                  format: int64
+                                committedLsn:
+                                  type: integer
+                                  format: int64
+                                firstRetainedLsn:
+                                  type: integer
+                                  format: int64
+                                deactivationEpoch:
+                                  type: object
+                                  required:
+                                  - dataLossNumber
+                                  - configurationNumber
+                                  properties:
+                                    dataLossNumber:
+                                      type: integer
+                                      format: int64
+                                    configurationNumber:
+                                      type: integer
+                                      format: int64
+                                deactivationCatchUpLsn:
+                                  type: integer
+                                  format: int64
                             role:
                               type: string
                               enum:
@@ -514,6 +761,16 @@ spec:
                         - removeCloseTarget
                         - removeDeleteTarget
                         - removeCompensateConfiguration
+                        - failoverRecordStartingConfiguration
+                        - failoverUpdateCandidateEpoch
+                        - failoverOnDataLoss
+                        - failoverPromoteCandidate
+                        - failoverUpdateSecondaryEpoch
+                        - failoverCatchUpConfiguration
+                        - failoverWaitForCatchUpQuorum
+                        - failoverCurrentConfiguration
+                        - failoverRecordElectionConfiguration
+                        - failoverLabelMember
                       targetId:
                         type: integer
                         format: int64
@@ -551,6 +808,8 @@ spec:
                             - replicaRemoved
                             - closed
                             - podDeleted
+                            - dataLossCompleted
+                            - electionConfiguration
                           role:
                             type: string
                             enum:
@@ -565,6 +824,342 @@ spec:
                       lastError:
                         type: string
                         maxLength: 512
+                      dispatchAuthorized:
+                        type: boolean
+                        default: false
+                  failover:
+                    type: object
+                    required:
+                    - currentConfiguration
+                    - targetConfirmed
+                    - dataLossRequired
+                    - nextConfigurationIndex
+                    - nextSecondaryIndex
+                    - nextLabelIndex
+                    - nextAttestationIndex
+                    - nextUnavailableIndex
+                    - promotionCommitted
+                    properties:
+                      previousConfiguration:
+                        type: object
+                        required:
+                        - members
+                        - writeQuorum
+                        properties:
+                          members:
+                            type: array
+                            items:
+                              type: object
+                              required:
+                              - id
+                              - instanceId
+                              - role
+                              - dropped
+                              properties:
+                                id:
+                                  type: integer
+                                  format: int64
+                                instanceId:
+                                  type: string
+                                role:
+                                  type: string
+                                  enum:
+                                  - primary
+                                  - activeSecondary
+                                dropped:
+                                  type: boolean
+                                  default: false
+                                lastKnown:
+                                  type: object
+                                  required:
+                                  - currentLsn
+                                  - committedLsn
+                                  - firstRetainedLsn
+                                  - deactivationEpoch
+                                  - deactivationCatchUpLsn
+                                  properties:
+                                    currentLsn:
+                                      type: integer
+                                      format: int64
+                                    committedLsn:
+                                      type: integer
+                                      format: int64
+                                    firstRetainedLsn:
+                                      type: integer
+                                      format: int64
+                                    deactivationEpoch:
+                                      type: object
+                                      required:
+                                      - dataLossNumber
+                                      - configurationNumber
+                                      properties:
+                                        dataLossNumber:
+                                          type: integer
+                                          format: int64
+                                        configurationNumber:
+                                          type: integer
+                                          format: int64
+                                    deactivationCatchUpLsn:
+                                      type: integer
+                                      format: int64
+                          writeQuorum:
+                            type: integer
+                            format: uint32
+                      currentConfiguration:
+                        type: object
+                        required:
+                        - members
+                        - writeQuorum
+                        properties:
+                          members:
+                            type: array
+                            items:
+                              type: object
+                              required:
+                              - id
+                              - instanceId
+                              - role
+                              - dropped
+                              properties:
+                                id:
+                                  type: integer
+                                  format: int64
+                                instanceId:
+                                  type: string
+                                role:
+                                  type: string
+                                  enum:
+                                  - primary
+                                  - activeSecondary
+                                dropped:
+                                  type: boolean
+                                  default: false
+                                lastKnown:
+                                  type: object
+                                  required:
+                                  - currentLsn
+                                  - committedLsn
+                                  - firstRetainedLsn
+                                  - deactivationEpoch
+                                  - deactivationCatchUpLsn
+                                  properties:
+                                    currentLsn:
+                                      type: integer
+                                      format: int64
+                                    committedLsn:
+                                      type: integer
+                                      format: int64
+                                    firstRetainedLsn:
+                                      type: integer
+                                      format: int64
+                                    deactivationEpoch:
+                                      type: object
+                                      required:
+                                      - dataLossNumber
+                                      - configurationNumber
+                                      properties:
+                                        dataLossNumber:
+                                          type: integer
+                                          format: int64
+                                        configurationNumber:
+                                          type: integer
+                                          format: int64
+                                    deactivationCatchUpLsn:
+                                      type: integer
+                                      format: int64
+                          writeQuorum:
+                            type: integer
+                            format: uint32
+                      observations:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                          - id
+                          - instanceId
+                          - epoch
+                          - role
+                          - healthy
+                          - currentLsn
+                          - committedLsn
+                          - configurationMatches
+                          properties:
+                            id:
+                              type: integer
+                              format: int64
+                            instanceId:
+                              type: string
+                            epoch:
+                              type: object
+                              required:
+                              - dataLossNumber
+                              - configurationNumber
+                              properties:
+                                dataLossNumber:
+                                  type: integer
+                                  format: int64
+                                configurationNumber:
+                                  type: integer
+                                  format: int64
+                            role:
+                              type: string
+                            healthy:
+                              type: boolean
+                            currentLsn:
+                              type: integer
+                              format: int64
+                            committedLsn:
+                              type: integer
+                              format: int64
+                            firstRetainedLsn:
+                              type: integer
+                              format: int64
+                            deactivationEpoch:
+                              type: object
+                              required:
+                              - dataLossNumber
+                              - configurationNumber
+                              properties:
+                                dataLossNumber:
+                                  type: integer
+                                  format: int64
+                                configurationNumber:
+                                  type: integer
+                                  format: int64
+                            deactivationCatchUpLsn:
+                              type: integer
+                              format: int64
+                            configurationMatches:
+                              type: boolean
+                              default: false
+                      unavailableReplicas:
+                        type: array
+                        items:
+                          type: integer
+                          format: int64
+                      finalAttestations:
+                        type: array
+                        items:
+                          type: object
+                          required:
+                          - id
+                          - instanceId
+                          - epoch
+                          - role
+                          - healthy
+                          - currentLsn
+                          - committedLsn
+                          - configurationMatches
+                          properties:
+                            id:
+                              type: integer
+                              format: int64
+                            instanceId:
+                              type: string
+                            epoch:
+                              type: object
+                              required:
+                              - dataLossNumber
+                              - configurationNumber
+                              properties:
+                                dataLossNumber:
+                                  type: integer
+                                  format: int64
+                                configurationNumber:
+                                  type: integer
+                                  format: int64
+                            role:
+                              type: string
+                            healthy:
+                              type: boolean
+                            currentLsn:
+                              type: integer
+                              format: int64
+                            committedLsn:
+                              type: integer
+                              format: int64
+                            firstRetainedLsn:
+                              type: integer
+                              format: int64
+                            deactivationEpoch:
+                              type: object
+                              required:
+                              - dataLossNumber
+                              - configurationNumber
+                              properties:
+                                dataLossNumber:
+                                  type: integer
+                                  format: int64
+                                configurationNumber:
+                                  type: integer
+                                  format: int64
+                            deactivationCatchUpLsn:
+                              type: integer
+                              format: int64
+                            configurationMatches:
+                              type: boolean
+                              default: false
+                      targetConfirmed:
+                        type: boolean
+                        default: false
+                      dataLossRequired:
+                        type: boolean
+                        default: false
+                      configurationEpochIntent:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      dataLossEpochIntent:
+                        type: object
+                        required:
+                        - dataLossNumber
+                        - configurationNumber
+                        properties:
+                          dataLossNumber:
+                            type: integer
+                            format: int64
+                          configurationNumber:
+                            type: integer
+                            format: int64
+                      dataLossResult:
+                        type: string
+                        enum:
+                        - noStateChange
+                        - stateChanged
+                      nextConfigurationIndex:
+                        type: integer
+                        format: uint32
+                        default: 0
+                      nextSecondaryIndex:
+                        type: integer
+                        format: uint32
+                        default: 0
+                      nextLabelIndex:
+                        type: integer
+                        format: uint32
+                        default: 0
+                      nextAttestationIndex:
+                        type: integer
+                        format: uint32
+                        default: 0
+                      nextUnavailableIndex:
+                        type: integer
+                        format: uint32
+                        default: 0
+                      assessment:
+                        type: string
+                        maxLength: 512
+                      promotionCommitted:
+                        type: boolean
+                        default: false
               conditions:
                 type: array
                 items:
