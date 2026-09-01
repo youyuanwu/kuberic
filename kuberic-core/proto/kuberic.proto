@@ -68,10 +68,21 @@ message ReplicaSetConfigProto {
     uint32 write_quorum = 2;
 }
 
-// ---- Control plane: Operator → Pod ----
+// ---- Manager control plane: Operator/FM → ReplicaAgent ----
 
+// ReplicatorControl is the operator-facing management contract for one replica
+// agent. Kubernetes status remains the durable source of global workflow
+// intent; this service reports local evidence and accepts one correlated,
+// generation-fenced command at a time. Agent-to-agent coordination uses the
+// narrower ReplicaAddBuildPeer service below.
 service ReplicatorControl {
+    // Returns runtime and agent observations used to fence dispatch, recover
+    // ambiguous results, and evaluate durable workflow postconditions.
     rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+    // Executes a coarse manager command against the addressed replica agent.
+    // The request must match the replica incarnation, agent generation,
+    // control version, runtime epoch, action ID, and deterministic signature.
     rpc ExecuteCorrelatedControlAction(ExecuteCorrelatedControlActionRequest) returns (ExecuteCorrelatedControlActionResponse);
 }
 
@@ -424,13 +435,27 @@ message ExecuteAddBuildStageResponse {
     PeerStageObservationProto observation = 1;
 }
 
+// ---- Peer control plane: Primary ReplicaAgent → Target ReplicaAgent ----
+
+// ReplicaAddBuildPeer is the restricted RA-to-RA contract used while the
+// primary agent coordinates replica add/build. It shares the pod control
+// listener with ReplicatorControl, but has independent protocol versioning and
+// accepts only target-local Prepare, Activate, and Cleanup stages. It is not an
+// operator workflow API and cannot dispatch arbitrary runtime actions.
 service ReplicaAddBuildPeer {
+    // Observes the exact target incarnation/generation and its bounded peer
+    // stage ledger before a primary retries or advances an ambiguous stage.
     rpc GetAddBuildStatus(GetAddBuildStatusRequest) returns (GetAddBuildStatusResponse);
+
+    // Executes one identity-, authority-, epoch-, and signature-fenced target
+    // stage on behalf of the coordinating primary agent.
     rpc ExecuteAddBuildStage(ExecuteAddBuildStageRequest) returns (ExecuteAddBuildStageResponse);
 }
 
 // ---- Data plane: Pod ↔ Pod (replication + copy) ----
 
+// ReplicatorData carries replicated operations and copy state only. It has no
+// manager or peer-agent authority and is hosted on the separate data listener.
 service ReplicatorData {
     // Incremental replication: primary streams ops, secondary ACKs
     rpc ReplicationStream(stream ReplicationItem) returns (stream ReplicationAck);
