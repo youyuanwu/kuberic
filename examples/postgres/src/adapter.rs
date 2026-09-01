@@ -63,7 +63,12 @@ pub fn create_pg_replicator(
                     let _ = reply.send(Ok(()));
                 }
 
-                ReplicatorControlEvent::BuildReplica { replica, reply } => {
+                ReplicatorControlEvent::BuildReplica {
+                    replica,
+                    cancellation,
+                    reply,
+                    ..
+                } => {
                     tracing::info!(
                         replica_id = replica.id,
                         addr = %replica.replicator_address,
@@ -78,6 +83,9 @@ pub fn create_pg_replicator(
                     let primary_port = instance.port();
                     let secondary_addr = replica.replicator_address.clone();
                     let result = async {
+                        if cancellation.is_cancelled() {
+                            return Err(kuberic_core::KubericError::Cancelled);
+                        }
                         use crate::proto::pg_data_service_client::PgDataServiceClient;
                         let mut client = PgDataServiceClient::connect(secondary_addr)
                             .await
@@ -100,7 +108,7 @@ pub fn create_pg_replicator(
                             })?;
                         let resp = resp.into_inner();
                         if resp.success {
-                            Ok(())
+                            Ok(0)
                         } else {
                             Err(kuberic_core::KubericError::Internal(
                                 format!("CloneFrom failed: {}", resp.error).into(),
@@ -158,6 +166,10 @@ pub fn create_pg_replicator(
                         let result = wait_for_catchup(&inst).await;
                         let _ = reply.send(result);
                     });
+                }
+
+                ReplicatorControlEvent::CancelCatchUpQuorumWait { reply, .. } => {
+                    let _ = reply.send(Ok(()));
                 }
 
                 ReplicatorControlEvent::RemoveReplica {

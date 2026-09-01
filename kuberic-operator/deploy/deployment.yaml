@@ -311,7 +311,6 @@ spec:
                 - targetSnapshot
                 - oldPrimaryId
                 - targetPrimaryId
-                - nextSecondaryIndex
                 - phaseDeadlineUnixSeconds
                 properties:
                   operationId:
@@ -332,6 +331,13 @@ spec:
                   phase:
                     type: string
                     enum:
+                    - addFreezeIntent
+                    - addDispatchIntent
+                    - addAwaitCoordination
+                    - addRecordCommit
+                    - addPublishTarget
+                    - addCommittedDegradedHandoff
+                    - addDeleteCompensatedTarget
                     - createFenceRouting
                     - createOpenPrimary
                     - createPromotePrimary
@@ -374,22 +380,7 @@ spec:
                     - compensateLabelOldPrimary
                     - compensateLabelTargetSecondary
                     - compensateFinalize
-                    - retireOldReplica
-                    - openCandidate
-                    - updateCandidateEpoch
-                    - assignCandidateIdle
-                    - buildCandidate
-                    - assignCandidateActive
-                    - addCatchUpConfiguration
-                    - addWaitForCatchUpQuorum
-                    - addCurrentConfiguration
-                    - labelCandidateSecondary
                     - addFinalize
-                    - compensateRestoreConfiguration
-                    - compensateRemoveCandidate
-                    - compensateDemoteCandidate
-                    - compensateCloseCandidate
-                    - compensateDeleteCandidate
                     - addCompensateFinalize
                     - removeCatchUpConfiguration
                     - removeWaitForCatchUpQuorum
@@ -695,6 +686,7 @@ spec:
                   nextSecondaryIndex:
                     type: integer
                     format: uint32
+                    default: 0
                   phaseDeadlineUnixSeconds:
                     type: integer
                     format: int64
@@ -722,6 +714,7 @@ spec:
                       kind:
                         type: string
                         enum:
+                        - addReplicaIntent
                         - createFencePod
                         - createOpenPrimary
                         - createPromotePrimary
@@ -757,21 +750,6 @@ spec:
                         - compensateCurrentConfiguration
                         - compensateLabelOldPrimary
                         - compensateLabelTargetSecondary
-                        - retireOldReplica
-                        - openCandidate
-                        - updateCandidateEpoch
-                        - assignCandidateIdle
-                        - buildCandidate
-                        - assignCandidateActive
-                        - addCatchUpConfiguration
-                        - addWaitForCatchUpQuorum
-                        - addCurrentConfiguration
-                        - labelCandidateSecondary
-                        - compensateRestoreConfiguration
-                        - compensateRemoveCandidate
-                        - compensateDemoteCandidate
-                        - compensateCloseCandidate
-                        - compensateDeleteCandidate
                         - removeCatchUpConfiguration
                         - removeWaitForCatchUpQuorum
                         - removeCurrentConfiguration
@@ -815,6 +793,7 @@ spec:
                           kind:
                             type: string
                             enum:
+                            - addReplicaCoordinated
                             - writeRevoked
                             - role
                             - epoch
@@ -1198,6 +1177,195 @@ spec:
                       promotionCommitted:
                         type: boolean
                         default: false
+                  addIntent:
+                    type: object
+                    required:
+                    - attempt
+                    - attemptId
+                    - actionId
+                    - primaryInstanceId
+                    - primaryAgentGeneration
+                    - primaryControlAddress
+                    - targetAgentGeneration
+                    - targetControlAddress
+                    - targetReplicatorAddress
+                    - previousConfiguration
+                    - catchUpConfiguration
+                    - currentConfiguration
+                    - deadlineUnixSeconds
+                    - compensationDeadlineUnixSeconds
+                    properties:
+                      attempt:
+                        type: integer
+                        format: uint32
+                      attemptId:
+                        type: string
+                      actionId:
+                        type: string
+                      primaryInstanceId:
+                        type: string
+                      primaryAgentGeneration:
+                        type: string
+                      primaryControlAddress:
+                        type: string
+                      targetAgentGeneration:
+                        type: string
+                      targetControlAddress:
+                        type: string
+                      targetReplicatorAddress:
+                        type: string
+                      previousConfiguration:
+                        type: object
+                        required:
+                        - members
+                        - writeQuorum
+                        properties:
+                          members:
+                            type: array
+                            items:
+                              type: object
+                              required:
+                              - id
+                              - instanceId
+                              - role
+                              - status
+                              - replicatorAddress
+                              - mustCatchUp
+                              - progressSource
+                              - currentProgress
+                              - catchUpCapability
+                              properties:
+                                id:
+                                  type: integer
+                                  format: int64
+                                instanceId:
+                                  type: string
+                                role:
+                                  type: string
+                                status:
+                                  type: string
+                                replicatorAddress:
+                                  type: string
+                                mustCatchUp:
+                                  type: boolean
+                                progressSource:
+                                  type: string
+                                  enum:
+                                  - frozen
+                                  - buildCopyLsn
+                                currentProgress:
+                                  type: integer
+                                  format: int64
+                                catchUpCapability:
+                                  type: integer
+                                  format: int64
+                          writeQuorum:
+                            type: integer
+                            format: uint32
+                      catchUpConfiguration:
+                        type: object
+                        required:
+                        - members
+                        - writeQuorum
+                        properties:
+                          members:
+                            type: array
+                            items:
+                              type: object
+                              required:
+                              - id
+                              - instanceId
+                              - role
+                              - status
+                              - replicatorAddress
+                              - mustCatchUp
+                              - progressSource
+                              - currentProgress
+                              - catchUpCapability
+                              properties:
+                                id:
+                                  type: integer
+                                  format: int64
+                                instanceId:
+                                  type: string
+                                role:
+                                  type: string
+                                status:
+                                  type: string
+                                replicatorAddress:
+                                  type: string
+                                mustCatchUp:
+                                  type: boolean
+                                progressSource:
+                                  type: string
+                                  enum:
+                                  - frozen
+                                  - buildCopyLsn
+                                currentProgress:
+                                  type: integer
+                                  format: int64
+                                catchUpCapability:
+                                  type: integer
+                                  format: int64
+                          writeQuorum:
+                            type: integer
+                            format: uint32
+                      currentConfiguration:
+                        type: object
+                        required:
+                        - members
+                        - writeQuorum
+                        properties:
+                          members:
+                            type: array
+                            items:
+                              type: object
+                              required:
+                              - id
+                              - instanceId
+                              - role
+                              - status
+                              - replicatorAddress
+                              - mustCatchUp
+                              - progressSource
+                              - currentProgress
+                              - catchUpCapability
+                              properties:
+                                id:
+                                  type: integer
+                                  format: int64
+                                instanceId:
+                                  type: string
+                                role:
+                                  type: string
+                                status:
+                                  type: string
+                                replicatorAddress:
+                                  type: string
+                                mustCatchUp:
+                                  type: boolean
+                                progressSource:
+                                  type: string
+                                  enum:
+                                  - frozen
+                                  - buildCopyLsn
+                                currentProgress:
+                                  type: integer
+                                  format: int64
+                                catchUpCapability:
+                                  type: integer
+                                  format: int64
+                          writeQuorum:
+                            type: integer
+                            format: uint32
+                      deadlineUnixSeconds:
+                        type: integer
+                        format: int64
+                      compensationDeadlineUnixSeconds:
+                        type: integer
+                        format: int64
+                      lastObservedPhase:
+                        type: string
               conditions:
                 type: array
                 items:

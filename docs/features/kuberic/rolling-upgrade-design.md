@@ -534,16 +534,21 @@ meaning of `committed_lsn` or quorum calculation changes between
 versions, old and new pods could disagree on what's committed.
 
 The operator-to-pod control boundary is a clean version boundary. Supported
-pods must report replica-agent protocol version 1 and accept only
-`ExecuteCorrelatedControlAction`; missing, malformed, or unsupported status is
-rejected. Individual mutation RPCs and the old correlated method are not
-available.
+pods must report replica-agent control protocol version 2, add/build peer
+protocol version 1, and accept only `ExecuteCorrelatedControlAction` from the
+operator; missing, malformed, or unsupported status is rejected. Individual
+mutation RPCs and the old correlated method are not available.
 
 Operators must quiesce durable topology work and deploy the operator and pod
 runtimes as one coordinated change. Rolling a mixed control-plane version is
 unsupported and cannot fall back to a weaker path. After deployment, the
 operator re-observes and persists generation, control-version, and
 runtime-epoch fences before activity.
+
+Unchanged create/remove/switchover/failover operations retain their current
+durable operation version. Replica add/rebuild uses operation version 2.
+Superseded add phases/actions and status shapes are not supported: deployments
+must quiesce add/rebuild work before the coordinated operator/pod upgrade.
 
 Replication/data-plane semantic compatibility remains deferred. Before
 changing `committed_lsn`, quorum, copy, or replication message meaning, define

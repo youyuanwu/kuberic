@@ -1,3 +1,4 @@
+pub mod add_replica;
 pub mod driver;
 pub mod error;
 pub mod events;

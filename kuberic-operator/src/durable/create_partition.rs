@@ -135,6 +135,7 @@ pub fn start_create_partition(
         pending_action: None,
         last_error: None,
         failover: None,
+        add_intent: None,
     })
 }
 
@@ -1814,9 +1815,12 @@ mod tests {
                 election_configuration: None,
                 deactivation_info: None,
                 active_replica_connections: Vec::new(),
+                build_observation: None,
                 agent: kuberic_core::types::ReplicaAgentStatus {
                     protocol_version:
                         kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                    add_build_peer_protocol_version:
+                        kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
                     generation: kuberic_core::types::AgentGeneration::parse(
                         "0123456789abcdef0123456789abcdef",
                     )
@@ -1827,6 +1831,7 @@ mod tests {
                     local_faults: Vec::new(),
                 },
             },
+            control_address: format!("http://{instance_id}-control"),
             replicator_address: format!("http://{instance_id}"),
             pod_name: instance_id.to_string(),
             pod_role_label: Some(label.to_string()),

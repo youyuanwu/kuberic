@@ -93,6 +93,7 @@ pub fn start_switchover(
         pending_action: None,
         last_error: None,
         failover: None,
+        add_intent: None,
     })
 }
 
@@ -1389,9 +1390,12 @@ mod tests {
                     election_configuration: None,
                     deactivation_info: None,
                     active_replica_connections: Vec::new(),
+                    build_observation: None,
                     agent: kuberic_core::types::ReplicaAgentStatus {
                         protocol_version:
                             kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                        add_build_peer_protocol_version:
+                            kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
                         generation: kuberic_core::types::AgentGeneration::parse(
                             "0123456789abcdef0123456789abcdef",
                         )
@@ -1402,6 +1406,7 @@ mod tests {
                         local_faults: Vec::new(),
                     },
                 },
+                control_address: "http://one-control".to_string(),
                 replicator_address: "http://one".to_string(),
                 pod_name: "set-0".to_string(),
                 pod_role_label: Some("primary".to_string()),

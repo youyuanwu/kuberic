@@ -14,6 +14,8 @@ use crate::types::{
     ReplicaInstanceId,
 };
 
+type CopyBoundaryKey = (ReplicaId, ReplicaInstanceId, Option<String>);
+
 // ---------------------------------------------------------------------------
 // PartitionState — shared atomics written by replicator, read by handles
 // ---------------------------------------------------------------------------
@@ -32,7 +34,7 @@ pub struct PartitionState {
     catch_up_capability: AtomicI64,
     catch_up_capability_known: AtomicBool,
     committed_lsn: AtomicI64,
-    copy_lsn_map: Mutex<HashMap<ReplicaId, Lsn>>,
+    copy_lsn_map: Mutex<HashMap<CopyBoundaryKey, Lsn>>,
     active_replica_connections: Mutex<HashMap<ReplicaId, ReplicaInstanceId>>,
 }
 
@@ -113,15 +115,34 @@ impl PartitionState {
 
     /// Record the copy snapshot LSN for a replica being built.
     /// Called by `run_build_replica_copy` after collecting state.
-    pub fn set_copy_lsn(&self, replica_id: ReplicaId, lsn: Lsn) {
-        self.copy_lsn_map.lock().unwrap().insert(replica_id, lsn);
+    pub fn set_copy_lsn(
+        &self,
+        replica_id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+        build_key: Option<String>,
+        lsn: Lsn,
+    ) {
+        let mut boundaries = self.copy_lsn_map.lock().unwrap();
+        boundaries.retain(|(id, _, _), _| *id != replica_id);
+        boundaries.insert((replica_id, instance_id, build_key), lsn);
     }
 
-    /// Take (read and remove) the copy snapshot LSN for a replica.
-    /// Called by the actor at UpdateCatchUpConfiguration to determine
-    /// the precise replay boundary.
-    pub fn take_copy_lsn(&self, replica_id: &ReplicaId) -> Option<Lsn> {
-        self.copy_lsn_map.lock().unwrap().remove(replica_id)
+    /// Read the exact successful copy boundary without consuming it.
+    pub fn copy_lsn(
+        &self,
+        replica_id: ReplicaId,
+        instance_id: &ReplicaInstanceId,
+        build_key: Option<&str>,
+    ) -> Option<Lsn> {
+        self.copy_lsn_map
+            .lock()
+            .unwrap()
+            .get(&(
+                replica_id,
+                instance_id.clone(),
+                build_key.map(ToOwned::to_owned),
+            ))
+            .copied()
     }
 
     pub fn set_active_replica_connections(

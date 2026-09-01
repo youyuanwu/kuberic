@@ -97,6 +97,8 @@ impl ReplicatorControl for ControlServer {
                 .map(Into::into)
                 .collect(),
             local_faults: agent.local_faults.into_iter().map(Into::into).collect(),
+            build_observation: info.build_observation.map(Into::into),
+            replica_add_build_peer_protocol_version: agent.add_build_peer_protocol_version,
         }))
     }
 

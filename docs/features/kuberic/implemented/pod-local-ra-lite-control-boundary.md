@@ -42,16 +42,16 @@ no manager action ledger.
 ## Status and Fencing
 
 Every supported pod reports required replica-agent status with numeric control
-protocol version 1, `AgentGeneration`, `AgentControlVersion`,
+protocol version 2, `AgentGeneration`, `AgentControlVersion`,
 `current_action`, and `retained_terminal_actions`. Missing, malformed, or
 unsupported agent status is rejected; it is not interpreted as an old peer.
 
 Before dispatch, the operator requires matching addressed, runtime, and
 pending Pod incarnations. It persists the observed generation, control
-version, runtime epoch, and exact encoded action payload in CRD status during
-a no-activity reconcile. Freezing the payload keeps its deterministic
-signature stable even when observed replica progress changes. The next
-reconcile calls only `ExecuteCorrelatedControlAction`.
+version, and runtime epoch during a no-activity reconcile. Direct non-add
+actions also persist an exact encoded payload. Agent-owned add/build uses its
+structured CRD intent directly and has no duplicate payload projection. The
+next reconcile calls only `ExecuteCorrelatedControlAction`.
 
 This is a coordinated operator/runtime deployment boundary. Mixed control
 versions do not interoperate. Deployments must quiesce durable topology work
@@ -83,6 +83,9 @@ evaluates durable postconditions before any at-least-once redrive.
   workflow engine or peer protocol.
 - PodRuntime callback ordering and typed completion remain unchanged.
 - Fault and terminal histories are bounded, volatile evidence.
+- Replica add/build now composes this boundary with the separate
+  `ReplicaAddBuildPeer` v1 service; other workflows retain the same correlated
+  action path.
 
 ## Service Fabric Mapping
 

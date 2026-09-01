@@ -9,13 +9,15 @@ Protocols implemented by the durable operator workflows, with
 
 ## Pod-Local Control Acceptance
 
-Production durable workflows remain operator-owned, but their runtime
-activities now cross a pod-local `ReplicaAgent` boundary:
+Production durable workflows remain operator-owned. Ordinary workflow
+activities cross the pod-local `ReplicaAgent` boundary, while replica
+add/rebuild uses one coarse primary-owned action:
 
 ```
 persist pending action in CRD status
 observe target Pod UID + runtime epoch + agent generation/control version
-persist generation/control-version/runtime-epoch fences + exact action payload
+persist generation/control-version/runtime-epoch fences
+  + exact payload for direct non-add actions
   (no runtime activity)
 dispatch ExecuteCorrelatedControlAction
   → agent validates version, target, generation, signature and fences
@@ -25,6 +27,14 @@ dispatch ExecuteCorrelatedControlAction
 PodRuntime executes ordered service/replicator callbacks
 agent records exact completion; operator observes before advancing
 ```
+
+For add/rebuild, the accepted action starts a non-blocking primary-agent
+coordinator. The coordinator uses the dedicated `ReplicaAddBuildPeer` service
+to prepare, activate, or clean up the target and uses its own `PodRuntime` for
+tracked copy, catch-up, quorum wait, and current configuration. The operator
+does not mutate the target.
+The add payload is constructed directly from structured
+`status.operation.addIntent`; there is no encoded add payload projection.
 
 `ReplicaInstanceId` remains the Pod UID. `AgentGeneration` identifies one
 process inside that Pod, and changes after a container restart.
@@ -41,7 +51,8 @@ redrive remains an operator-owned at-least-once decision after postcondition
 observation. There is no exactly-once claim or durable pod-local history.
 
 Replica-agent status is required and advertises numeric control protocol
-version 1. Missing, malformed, or unsupported status fails closed. The
+version 2 plus replica-add peer protocol version 1. Missing, malformed, or
+unsupported status fails closed. The
 operator and pod runtimes must be deployed together; the control boundary does
 not provide mixed-version interoperability or fallback.
 
@@ -186,25 +197,38 @@ operation.
 
 ```
 1. Operator creates new Pod + waits for Ready
-2. Operator creates GrpcReplicaHandle for the new pod
-3. Persist previous/target snapshots, exact candidate identity, phase, and the
-   first pending action
-4. Execute one write-ahead correlated activity per reconcile:
-   a. Open(New)
-   b. update_epoch
-   c. change_role(IdleSecondary)
-   d. build_replica (primary → idle, copy stream)
-   e. change_role(ActiveSecondary)
-   f. update_catch_up_configuration with `must_catch_up`
-   g. wait_for_catch_up_quorum
-   h. update_current_configuration
-5. Label the candidate secondary and publish the target stable snapshot
+2. Observe exact primary and target identities, generations, endpoints, epoch,
+   peer version, quorum, and minReplicas
+3. Persist one structured AddReplicaIntent and primary dispatch fences
+4. Dispatch AddReplicaIntent only to the current primary ReplicaAgent
+5. Primary coordinator:
+   a. target peer Prepare → Open(New), epoch, IdleSecondary
+   b. tracked primary BuildReplica → acknowledged copy LSN
+   c. target peer Activate → ActiveSecondary
+   d. tracked catch-up configuration with `must_catch_up`
+   e. tracked WaitForCatchUpQuorum(Write)
+   f. primary current configuration commit
+   g. exact primary/target/build attestation
+6. Operator records commit, labels the candidate, and publishes the target
+   stable snapshot
 ```
 
-The pod runtime records scheduled/in-progress/completed/failed state for the
-current correlated activity. `BuildReplica` runs in the background so status
-remains observable during a long copy, and exact duplicate delivery never
-starts a second copy.
+The primary action ledger reports the coarse coordinator phase and typed
+terminal result. The target peer ledger reports accepted/in-progress/
+completed/failed/stale stages. `PodRuntime` tracks copy and quorum work
+asynchronously, so both agent and runtime control remain responsive.
+
+Copy evidence includes the target agent generation. A target process restart
+under the same Pod UID therefore requires a new copy. Copy boundary publication
+occurs only after target acknowledgement; add catch-up consumes the exact
+semantic build key and replays strictly from `copy_lsn + 1`.
+
+Before current-configuration commit, failure restores previous configuration
+when needed, removes the exact target connection, and asks the target peer to
+clean up. If that primary barrier cannot be proven, the operation is poisoned
+and the pod is preserved. After commit, rollback is forbidden. Unattested
+committed membership is published as `CommittedDegraded` without a serving
+label and repaired by existing Healthy/failover/rebuild behavior.
 
 ---
 
@@ -263,12 +287,11 @@ delayed removal for the old incarnation is an idempotent no-op and cannot
 remove the replacement.
 
 The reconciler starts a durable rebuild after it sees a ready pod whose
-incarnation differs from the stable secondary. It first retires the old exact
-primary-side connection, then runs the durable add sequence under the same
-logical replica ID. Before catch-up configuration, compensation removes and
-closes the candidate. After catch-up begins it first restores the previous
-current configuration. Once target current configuration is observed,
-reconciliation rolls forward to target snapshot publication.
+incarnation differs from the stable secondary. It freezes both old and new
+incarnations in one coarse intent. The primary coordinator retires the exact
+old connection before peer preparation and copy; delayed old-incarnation
+removal remains harmless. Commit/compensation follows the same rules as
+scale-up.
 
 ---
 

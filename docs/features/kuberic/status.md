@@ -29,9 +29,10 @@ Implementation status, known gaps, and open questions.
 | Stable Healthy operator restart recovery | ✅ Implemented — authoritative status snapshot + read-only `PartitionDriver::recover()` |
 | Durable initial partition creation | ✅ Implemented — explicit no-previous-topology checkpoint, partial committed bootstrap snapshots, gated routing |
 | Durable switchover restart recovery | ✅ Implemented — compact CRD operation checkpoint, correlated activities, compensation |
-| Durable scale-up and stale-secondary rejoin | ✅ Implemented — correlated lifecycle/build/configuration activities and phase-aware compensation |
+| Durable scale-up and stale-secondary rejoin | ✅ Implemented — one coarse primary-agent intent, target peer stages, tracked copy/quorum, commit-aware compensation |
 | Durable scale-down and stale/dead-secondary eviction | ✅ Implemented — config-first commit, exact connection cleanup, UID-fenced deletion |
-| Pod-local RA-lite boundary | ✅ Implemented — one versioned correlated mutation path with generation/version fencing and bounded replay |
+| Pod-local RA-lite boundary | ✅ Implemented — control v2, one versioned correlated mutation path with generation/version fencing and bounded replay |
+| Add/build peer protocol | ✅ Implemented — versioned Prepare/Activate/Cleanup status and execution on the existing control listener |
 | Primary self-fencing (liveness probe) | ❌ Not implemented — K8s defense-in-depth (from CNPG) |
 | Node drain handling | ❌ Not implemented — K8s adaptation (analogous to SF PLB) |
 | CRD conditions (Ready, Degraded, Quorum) | ❌ Not implemented — K8s addition |
@@ -41,7 +42,8 @@ Implementation status, known gaps, and open questions.
 
 ## Pod-Local Control Status
 
-`GetStatus` requires protocol version 1, `AgentGeneration`,
+`GetStatus` requires control protocol version 2 and add/build peer protocol
+version 1, `AgentGeneration`,
 `AgentControlVersion`, the current generation-qualified action, 16 retained
 terminal observations, and up to 16 successfully received local fault records.
 The current action and retained terminals are the only local correlation
@@ -58,6 +60,16 @@ agent's action/fault history.
 Fault records are best effort because user fault reporting is non-blocking.
 Terminal replay is bounded and volatile. An absent or evicted record is not
 evidence that an action did not execute.
+
+During add/rebuild, the primary action includes coarse coordinator phase and
+typed terminal result. Status also exposes one current/latest tracked build
+observation with exact target generation and acknowledged copy LSN. Target
+process generation change invalidates that copy proof.
+
+CRD `operation.addIntent` is the durable semantic input. `committedSnapshot`
+records irreversible current configuration before serving publication.
+`CommittedDegraded` means membership committed but the target is deliberately
+not serving until Healthy reconciliation re-attests and repairs its label.
 
 ---
 
@@ -137,8 +149,9 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 
 ```
 kuberic-core/
-├── proto/kuberic.proto           # gRPC: ReplicatorControl (2 RPCs) + ReplicatorData (3 RPCs)
+├── proto/kuberic.proto           # gRPC: ReplicatorControl, ReplicaAddBuildPeer, ReplicatorData
 ├── src/
+│   ├── add_replica.rs               # Coarse intent, descriptors, peer/build status types
 │   ├── types.rs                     # Epoch, Role, AccessStatus, ReplicaInfo, Operation, OperationStream
 │   ├── error.rs                     # KubericError enum (NotPrimary, NoWriteQuorum, etc.)
 │   ├── events.rs                    # LifecycleEvent, StateProviderEvent, ReplicatorControlEvent
@@ -147,6 +160,8 @@ kuberic-core/
 │   ├── runtime.rs                   # KubericRuntime (lower-level harness)
 │   ├── replica_agent.rs             # Pod-local admission, correlation, replay, status and faults
 │   ├── pod.rs                       # PodRuntime ordered service/replicator effects
+│   ├── grpc/peer_client.rs           # Strict primary-to-target add/build peer client
+│   ├── grpc/peer_server.rs           # Target peer protocol endpoint
 │   ├── driver.rs                    # Read-only PartitionDriver + ReplicaHandle trait
 │   ├── replicator/
 │   │   ├── quorum.rs                # QuorumTracker (single + dual-config + must_catch_up + baseline)

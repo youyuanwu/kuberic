@@ -22,6 +22,7 @@ pub struct GrpcReplicaHandle {
     id: ReplicaId,
     instance_id: ReplicaInstanceId,
     client: ReplicatorControlClient<Channel>,
+    control_address: String,
     data_address: String,
     current_progress: AtomicI64,
     catch_up_capability: AtomicI64,
@@ -34,7 +35,7 @@ impl GrpcReplicaHandle {
         control_address: String,
         data_address: String,
     ) -> Result<Self> {
-        let channel = Channel::from_shared(control_address)
+        let channel = Channel::from_shared(control_address.clone())
             .map_err(|error| KubericError::Internal(Box::new(error)))?
             .connect_timeout(std::time::Duration::from_secs(5))
             .connect()
@@ -45,6 +46,7 @@ impl GrpcReplicaHandle {
             id,
             instance_id,
             client: ReplicatorControlClient::new(channel),
+            control_address,
             data_address,
             current_progress: AtomicI64::new(0),
             catch_up_capability: AtomicI64::new(0),
@@ -311,6 +313,10 @@ impl ReplicaHandle for GrpcReplicaHandle {
         self.data_address.clone()
     }
 
+    fn control_address(&self) -> String {
+        self.control_address.clone()
+    }
+
     async fn get_status(&self) -> Result<ReplicaStatusInfo> {
         let mut client = self.client.clone();
         let inner = client
@@ -320,6 +326,15 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .into_inner();
 
         Self::validate_protocol_version(inner.replica_agent_protocol_version)?;
+        if inner.replica_add_build_peer_protocol_version
+            != crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION
+        {
+            return Err(KubericError::RemoteControlProtocolUnsupported(format!(
+                "replica add/build peer protocol version must be {}, got {}",
+                crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+                inner.replica_add_build_peer_protocol_version
+            )));
+        }
         if inner.instance_id.is_empty() {
             return Err(Self::invalid_status("missing runtime replica incarnation"));
         }
@@ -350,6 +365,7 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .map_err(Self::invalid_status)?;
         let agent = ReplicaAgentStatus {
             protocol_version: inner.replica_agent_protocol_version,
+            add_build_peer_protocol_version: inner.replica_add_build_peer_protocol_version,
             generation,
             control_version: AgentControlVersion::new(inner.agent_control_version),
             current_action,
@@ -396,6 +412,11 @@ impl ReplicaHandle for GrpcReplicaHandle {
                     instance_id: ReplicaInstanceId::new(connection.instance_id),
                 })
                 .collect(),
+            build_observation: inner
+                .build_observation
+                .map(crate::add_replica::RuntimeBuildObservation::try_from)
+                .transpose()
+                .map_err(Self::invalid_status)?,
             agent,
         })
     }
@@ -440,6 +461,7 @@ mod tests {
                 error_class: None,
                 error: None,
                 result: None,
+                add_replica_progress: None,
             },
         }
     }
@@ -448,6 +470,8 @@ mod tests {
         let generation = AgentGeneration::from_string("generation");
         ReplicaAgentStatus {
             protocol_version: crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+            add_build_peer_protocol_version:
+                crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
             generation: generation.clone(),
             control_version: AgentControlVersion::new(2),
             current_action: Some(observation(

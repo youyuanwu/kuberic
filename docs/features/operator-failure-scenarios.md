@@ -195,7 +195,9 @@ Healthy phase — secondary health check:
     ├─ Pod Ready → OK, reset failure tracking
     │
     ├─ Ready pod with new UID:
-    │    Durable rebuild under the same logical replica ID
+    │    Persist one AddReplicaIntent to the current primary agent
+    │    Primary retires the old exact connection, drives target peer
+    │    Prepare/copy/Activate, catches up, and commits current configuration
     │
     └─ Missing/unreachable old UID:
          Validate non-primary target, minReplicas, and retained quorum
@@ -516,7 +518,8 @@ Operator restart — first reconcile per KubericSet:
   └─ Resume normal reconciliation
 ```
 
-`GetStatus` requires replica-agent protocol version 1 and reports a pod-local
+`GetStatus` requires replica-agent control protocol version 2, add/build peer
+protocol version 1, and reports a pod-local
 `AgentGeneration`. It is distinct from the Pod UID and changes when the
 container/process restarts in place. Missing, malformed, or unsupported agent
 status fails closed. A new generation publishes no inherited correlated action
@@ -540,12 +543,19 @@ During `Creating`, `Switchover`, `AddingReplica`, `RemovingReplica`, and
 explicit no previous topology and an optional committed bootstrap snapshot;
 the other protocols record previous/target stable snapshots. Each operation
 stores exact target incarnations, current phase, and one write-ahead correlated
-action. Each reconcile reconstructs fresh handles, observes
+action. Add/rebuild additionally stores one structured frozen intent with
+primary/target generations and endpoints, configuration descriptors, semantic
+build key, deadlines, and commit evidence. Each reconcile reconstructs fresh handles, observes
 role/epoch/incarnation/progress/write/configuration/activity state, and either
 advances one checkpoint, dispatches one activity, waits, compensates, or
-poisons. Add/rebuild observes long-running copy progress and restores the
-previous current configuration before candidate cleanup when catch-up had
-started. Kubernetes `resourceVersion` rejects stale concurrent advancement. Failover
+poisons. The operator sends only AddReplicaIntent to the primary; peer/runtime
+phases are transient. Add/rebuild observes coarse phase and tracked copy,
+restores previous current configuration before pre-commit cleanup when needed,
+and requires connection absence before deleting the candidate. A target process
+restart under the same Pod UID changes generation and invalidates prior build
+proof. Current-configuration commit is roll-forward only; unattested committed
+membership becomes `CommittedDegraded` without a serving label. Kubernetes
+`resourceVersion` rejects stale concurrent advancement. Failover
 additionally persists Phase-1 observations, unavailable-probe rotation,
 separate configuration/data-loss epoch intents, callback result, promotion
 commit, and final attestations.

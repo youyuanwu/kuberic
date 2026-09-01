@@ -103,6 +103,7 @@ pub fn start_failover(
             assessment: None,
             promotion_committed: false,
         }),
+        add_intent: None,
     })
 }
 
@@ -954,6 +955,9 @@ fn completed_data_loss(
         Some(DurableActionResult::DataLoss(DataLossAction::StateChanged)) => {
             Ok(Some(DurableDataLossResultStatus::StateChanged))
         }
+        Some(DurableActionResult::AddReplica(_)) => {
+            Err("data-loss completion carries an add-replica result".to_string())
+        }
         None => Err("data-loss completion has no result".to_string()),
     }
 }
@@ -1670,8 +1674,11 @@ mod tests {
                 catch_up_lsn: id * 10,
             }),
             active_replica_connections: Vec::<ReplicaConnectionStatus>::new(),
+            build_observation: None,
             agent: kuberic_core::types::ReplicaAgentStatus {
                 protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                add_build_peer_protocol_version:
+                    kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
                 generation: kuberic_core::types::AgentGeneration::parse(
                     "0123456789abcdef0123456789abcdef",
                 )
@@ -1773,6 +1780,7 @@ mod tests {
             3,
             crate::durable::ReplicaObservation {
                 status: live_status(&intent, 3, Epoch::new(2, 7), Role::ActiveSecondary),
+                control_address: "http://three-control".to_string(),
                 replicator_address: "http://three".to_string(),
                 pod_name: "set-2".to_string(),
                 pod_role_label: Some("secondary".to_string()),
@@ -1800,6 +1808,7 @@ mod tests {
             3,
             crate::durable::ReplicaObservation {
                 status: live_status(&authorized, 3, Epoch::new(2, 8), Role::ActiveSecondary),
+                control_address: "http://three-control".to_string(),
                 replicator_address: "http://three".to_string(),
                 pod_name: "set-2".to_string(),
                 pod_role_label: Some("secondary".to_string()),

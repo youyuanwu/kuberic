@@ -14,6 +14,7 @@ pub mod failover_election;
 mod remove_replica;
 mod switchover;
 
+pub(crate) use add_replica::final_attestation as attest_add_replica;
 pub use add_replica::{decide_add_replica, start_add_replica};
 pub use create_partition::{
     CreatePartitionTarget, decide_create_partition, start_create_partition,
@@ -33,6 +34,7 @@ const MAX_ERROR_LENGTH: usize = 512;
 #[derive(Debug)]
 pub struct ReplicaObservation {
     pub status: ReplicaStatusInfo,
+    pub control_address: String,
     pub replicator_address: String,
     pub pod_name: String,
     pub pod_role_label: Option<String>,
@@ -73,7 +75,7 @@ pub(crate) fn pending_action_signature(
     if pending.dispatch_action_payload.is_empty() {
         Ok(derived_action.signature())
     } else {
-        kuberic_core::grpc::convert::decode_correlated_action_payload(
+        kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
             &pending.dispatch_action_payload,
         )
         .map(|action| action.signature())
@@ -105,6 +107,10 @@ pub enum Decision {
         operation: DurableOperationStatus,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+    },
+    CompleteDegraded {
+        operation: DurableOperationStatus,
+        snapshot: StablePartitionSnapshotStatus,
     },
     RestartCreation {
         operation: DurableOperationStatus,
@@ -195,6 +201,31 @@ pub fn operation_condition(operation: &DurableOperationStatus, now: i64) -> Stat
             "True",
             "DataLossNegotiation",
             "advanced data-loss epoch is awaiting correlated callback completion".to_string(),
+        ),
+        DurableOperationPhase::AddFreezeIntent => (
+            "True",
+            "FreezingAddReplicaIntent",
+            "observing exact primary and target fences before persisting one coarse intent"
+                .to_string(),
+        ),
+        DurableOperationPhase::AddDispatchIntent
+        | DurableOperationPhase::AddAwaitCoordination => (
+            "True",
+            "AwaitingPrimaryAgentCoordination",
+            operation
+                .add_intent
+                .as_ref()
+                .and_then(|intent| intent.last_observed_phase.clone())
+                .unwrap_or_else(|| {
+                    "coarse add/build intent is awaiting primary-agent progress".to_string()
+                }),
+        ),
+        DurableOperationPhase::AddRecordCommit
+        | DurableOperationPhase::AddPublishTarget => (
+            "True",
+            "PublishingCommittedReplica",
+            "current configuration is committed; exact target attestation and publication are pending"
+                .to_string(),
         ),
         _ => (
             "True",

@@ -209,6 +209,7 @@ impl WalReplicatorActor {
                         ReplicatorControlEvent::UpdateCatchUpConfiguration {
                             current,
                             previous,
+                            required_build_key,
                             reply,
                         } => {
                             let mut cc_members: HashSet<ReplicaId> =
@@ -255,6 +256,27 @@ impl WalReplicatorActor {
                                             &member.instance_id,
                                         )
                                     {
+                                        let copy_lsn = state.copy_lsn(
+                                            member.id,
+                                            &member.instance_id,
+                                            if member.must_catch_up {
+                                                required_build_key.as_deref()
+                                            } else {
+                                                None
+                                            },
+                                        );
+                                        if member.must_catch_up && copy_lsn.is_none() {
+                                            required_connection_error = Some(
+                                                crate::KubericError::Internal(
+                                                    format!(
+                                                        "missing exact copy boundary for replica {}@{}",
+                                                        member.id, member.instance_id
+                                                    )
+                                                    .into(),
+                                                ),
+                                            );
+                                            break;
+                                        }
                                         if let Err(e) = sender
                                             .add_secondary(
                                                 member.id,
@@ -282,9 +304,7 @@ impl WalReplicatorActor {
                                         // copy_lsn is the snapshot LSN recorded by
                                         // run_build_replica_copy — the secondary
                                         // already has state through this LSN.
-                                        let copy_lsn = state
-                                            .take_copy_lsn(&member.id)
-                                            .unwrap_or(0);
+                                        let copy_lsn = copy_lsn.unwrap_or(0);
                                         let replay_from = copy_lsn + 1;
                                         let pending = replication_queue.ops_from(replay_from);
                                         if !pending.is_empty() {
@@ -339,11 +359,34 @@ impl WalReplicatorActor {
                             let committed = state.committed_lsn();
                             replication_queue.gc(committed);
                         }
-                        ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply } => {
-                            quorum_tracker.lock().await.wait_for_catch_up(mode, reply);
+                        ReplicatorControlEvent::WaitForCatchUpQuorum {
+                            wait_id,
+                            mode,
+                            reply,
+                        } => {
+                            if let Some(wait_id) = wait_id {
+                                quorum_tracker
+                                    .lock()
+                                    .await
+                                    .wait_for_catch_up_tracked(wait_id, mode, reply);
+                            } else {
+                                quorum_tracker.lock().await.wait_for_catch_up(mode, reply);
+                            }
                             expiration_wakeup.notify_one();
                         }
-                        ReplicatorControlEvent::BuildReplica { replica, reply } => {
+                        ReplicatorControlEvent::CancelCatchUpQuorumWait {
+                            wait_id,
+                            reply,
+                        } => {
+                            quorum_tracker.lock().await.cancel_catch_up_wait(&wait_id);
+                            let _ = reply.send(Ok(()));
+                        }
+                        ReplicatorControlEvent::BuildReplica {
+                            replica,
+                            build_key,
+                            cancellation,
+                            reply,
+                        } => {
                             // Replication queue ops are replayed at add_secondary time.
                             // Spawn the copy protocol as a background task.
                             info!(
@@ -356,9 +399,11 @@ impl WalReplicatorActor {
                             tokio::spawn(async move {
                                 let result = crate::replicator::copy::run_build_replica_copy(
                                     replica,
+                                    build_key,
                                     sp_tx,
                                     st,
                                     std::time::Duration::from_secs(600),
+                                    cancellation,
                                 ).await;
                                 let _ = reply.send(result);
                             });
@@ -815,6 +860,7 @@ mod tests {
                     members: Vec::new(),
                     write_quorum: 0,
                 },
+                required_build_key: None,
                 reply: catch_up_tx,
             })
             .await

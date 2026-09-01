@@ -4,6 +4,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::Result;
+use crate::add_replica::{
+    AddReplicaCoordinatorPhase, AddReplicaProgress, AddReplicaTerminalResult, PeerAddBuildStatus,
+    PeerStage, PeerStageObservation, PeerStageRequest, PeerStageState,
+    REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+};
 use crate::error::KubericError;
 use crate::pod::{
     RuntimeControlSnapshot, RuntimeEffect, RuntimeEffectCommand, RuntimeEffectResult,
@@ -13,13 +18,13 @@ use crate::types::{
     CorrelatedActionObservation, CorrelatedControlActionAcknowledgement,
     CorrelatedControlActionRequest, DurableActionErrorClass, DurableActionObservation,
     DurableActionResult, DurableActionState, DurableReplicaAction, FaultType, LocalFaultRecord,
-    ReplicaAgentStatus, ReplicaId, ReplicaInstanceId, ReplicaStatusInfo,
+    Lsn, ReplicaAgentStatus, ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaStatusInfo,
 };
 
 pub const TERMINAL_RETENTION: usize = 16;
 pub const FAULT_RETENTION: usize = 16;
 const MAX_ERROR_BYTES: usize = 1024;
-pub const CORRELATED_CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const CORRELATED_CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 /// Transport-facing commands accepted by the pod-local replica agent.
 pub enum AgentCommand {
@@ -29,6 +34,16 @@ pub enum AgentCommand {
     },
     GetStatus {
         reply: oneshot::Sender<ReplicaStatusInfo>,
+    },
+    ExecuteAddBuildStage {
+        request: Box<PeerStageRequest>,
+        reply: oneshot::Sender<Result<PeerStageObservation>>,
+    },
+    GetAddBuildStatus {
+        target_replica_id: ReplicaId,
+        target_instance_id: ReplicaInstanceId,
+        expected_generation: AgentGeneration,
+        reply: oneshot::Sender<Result<PeerAddBuildStatus>>,
     },
 }
 
@@ -49,6 +64,34 @@ struct RuntimeCompletion {
     result: Result<RuntimeEffectResult>,
 }
 
+struct ActivePeerStage {
+    execution_id: RuntimeEffectExecutionId,
+    observation: PeerStageObservation,
+}
+
+struct PeerStageCompletion {
+    execution_id: RuntimeEffectExecutionId,
+    state: PeerStageState,
+    error: Option<String>,
+}
+
+struct PeerSenderFence {
+    epoch: crate::types::Epoch,
+    sender_replica_id: ReplicaId,
+    sender_instance_id: ReplicaInstanceId,
+    sender_generation: AgentGeneration,
+}
+
+enum CoordinatorUpdate {
+    Progress(AddReplicaProgress),
+    Terminal(std::result::Result<AddReplicaTerminalResult, String>),
+}
+
+struct CoordinatorEvent {
+    execution_id: RuntimeEffectExecutionId,
+    update: CoordinatorUpdate,
+}
+
 /// Pod-local correlated-control owner between gRPC and ordered runtime effects.
 pub struct ReplicaAgent {
     replica_id: ReplicaId,
@@ -66,7 +109,15 @@ pub struct ReplicaAgent {
     shutdown: CancellationToken,
     completion_tx: mpsc::UnboundedSender<RuntimeCompletion>,
     completion_rx: mpsc::UnboundedReceiver<RuntimeCompletion>,
+    peer_completion_tx: mpsc::UnboundedSender<PeerStageCompletion>,
+    peer_completion_rx: mpsc::UnboundedReceiver<PeerStageCompletion>,
+    coordinator_tx: mpsc::UnboundedSender<CoordinatorEvent>,
+    coordinator_rx: mpsc::UnboundedReceiver<CoordinatorEvent>,
     active: Option<ActiveCorrelated>,
+    peer_control_version: u64,
+    peer_sender_fence: Option<PeerSenderFence>,
+    active_peer: Option<ActivePeerStage>,
+    peer_terminals: VecDeque<PeerStageObservation>,
     terminals: VecDeque<CorrelatedActionObservation>,
     faults: VecDeque<LocalFaultRecord>,
     shutting_down: bool,
@@ -85,6 +136,8 @@ impl ReplicaAgent {
     ) -> Self {
         let generation = AgentGeneration::generate();
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+        let (peer_completion_tx, peer_completion_rx) = mpsc::unbounded_channel();
+        let (coordinator_tx, coordinator_rx) = mpsc::unbounded_channel();
         info!(
             replica_id,
             instance_id = %instance_id,
@@ -107,7 +160,15 @@ impl ReplicaAgent {
             shutdown,
             completion_tx,
             completion_rx,
+            peer_completion_tx,
+            peer_completion_rx,
+            coordinator_tx,
+            coordinator_rx,
             active: None,
+            peer_control_version: 0,
+            peer_sender_fence: None,
+            active_peer: None,
+            peer_terminals: VecDeque::with_capacity(crate::add_replica::PEER_TERMINAL_RETENTION),
             terminals: VecDeque::with_capacity(TERMINAL_RETENTION),
             faults: VecDeque::with_capacity(FAULT_RETENTION),
             shutting_down: false,
@@ -121,7 +182,7 @@ impl ReplicaAgent {
             "ReplicaAgent serve loop started"
         );
         loop {
-            if self.shutting_down && self.active.is_none() {
+            if self.shutting_down && self.active.is_none() && self.active_peer.is_none() {
                 break;
             }
             tokio::select! {
@@ -129,6 +190,16 @@ impl ReplicaAgent {
                 completion = self.completion_rx.recv() => {
                     if let Some(completion) = completion {
                         self.handle_completion(completion);
+                    }
+                }
+                completion = self.peer_completion_rx.recv() => {
+                    if let Some(completion) = completion {
+                        self.handle_peer_completion(completion);
+                    }
+                }
+                event = self.coordinator_rx.recv() => {
+                    if let Some(event) = event {
+                        self.handle_coordinator_event(event);
                     }
                 }
                 fault = self.fault_rx.recv(), if self.fault_rx_open => {
@@ -142,11 +213,26 @@ impl ReplicaAgent {
                         Some(AgentCommand::GetStatus { reply }) => {
                             let _ = reply.send(self.status());
                         }
+                        Some(AgentCommand::GetAddBuildStatus {
+                            target_replica_id,
+                            target_instance_id,
+                            expected_generation,
+                            reply,
+                        }) => {
+                            let _ = reply.send(self.peer_status(
+                                target_replica_id,
+                                target_instance_id,
+                                expected_generation,
+                            ));
+                        }
                         Some(command) if self.shutting_down => {
                             reject_agent_command(command, KubericError::Closed);
                         }
                         Some(AgentCommand::ExecuteCorrelatedControlAction { request, reply }) => {
                             self.accept_correlated(*request, reply);
+                        }
+                        Some(AgentCommand::ExecuteAddBuildStage { request, reply }) => {
+                            self.accept_peer_stage(*request, reply);
                         }
                         None => {
                             self.command_rx_open = false;
@@ -241,7 +327,7 @@ impl ReplicaAgent {
             let _ = reply.send(Err(error));
             return;
         }
-        if self.active.is_some() {
+        if self.active.is_some() || self.active_peer.is_some() {
             let _ = reply.send(Err(KubericError::AgentBusy));
             return;
         }
@@ -269,6 +355,7 @@ impl ReplicaAgent {
                 error_class: None,
                 error: None,
                 result: None,
+                add_replica_progress: None,
             },
         };
         debug!(
@@ -277,6 +364,74 @@ impl ReplicaAgent {
             agent_generation = %self.generation,
             "accepted correlated action"
         );
+
+        if let DurableReplicaAction::AddReplicaIntent { intent } = &request.action {
+            if let Err(error) = intent.validate() {
+                self.fail_before_dispatch(observation, reply, error);
+                return;
+            }
+            let runtime = self.runtime_status_rx.borrow();
+            if intent.primary_replica_id != self.replica_id
+                || intent.primary_instance_id != self.instance_id
+                || intent.primary_agent_generation != self.generation
+                || runtime.role != crate::types::Role::Primary
+                || runtime.epoch != intent.epoch
+                || runtime.partition_state.is_none()
+            {
+                drop(runtime);
+                self.fail_before_dispatch(
+                    observation,
+                    reply,
+                    "add-replica intent does not match the active primary runtime",
+                );
+                return;
+            }
+            drop(runtime);
+            observation.action.state = DurableActionState::InProgress;
+            observation.action.add_replica_progress = Some(AddReplicaProgress {
+                phase: AddReplicaCoordinatorPhase::Validating,
+                commit_observed: false,
+                copy_lsn: None,
+            });
+            send_observation(reply, observation.clone());
+            let execution_id = self.next_execution_id();
+            let parent_action_signature = observation.action.signature.clone();
+            self.active = Some(ActiveCorrelated {
+                execution_id: execution_id.clone(),
+                observation,
+                reply: None,
+            });
+            let coordinator_tx = self.coordinator_tx.clone();
+            let runtime_tx = self.runtime_tx.clone();
+            let runtime_status_rx = self.runtime_status_rx.clone();
+            let intent = (**intent).clone();
+            let parent_action_id = request.action_id;
+            let shutdown = self.shutdown.child_token();
+            let cancelled_tx = coordinator_tx.clone();
+            let cancelled_execution_id = execution_id.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        let _ = cancelled_tx.send(CoordinatorEvent {
+                            execution_id: cancelled_execution_id,
+                            update: CoordinatorUpdate::Terminal(Err(
+                                "add-replica coordinator cancelled by agent shutdown".to_string(),
+                            )),
+                        });
+                    }
+                    _ = run_add_replica_coordinator(
+                        execution_id,
+                        intent,
+                        parent_action_id,
+                        parent_action_signature,
+                        runtime_tx,
+                        runtime_status_rx,
+                        coordinator_tx,
+                    ) => {}
+                }
+            });
+            return;
+        }
 
         if let DurableReplicaAction::OnDataLoss { epoch } = request.action {
             let runtime = self.runtime_status_rx.borrow();
@@ -333,6 +488,253 @@ impl ReplicaAgent {
         self.start_effect(observation, Some(reply), effect);
     }
 
+    fn accept_peer_stage(
+        &mut self,
+        request: PeerStageRequest,
+        reply: oneshot::Sender<Result<PeerStageObservation>>,
+    ) {
+        if request.protocol_version != REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION {
+            let _ = reply.send(Err(KubericError::UnsupportedPeerProtocolVersion {
+                got: request.protocol_version,
+            }));
+            return;
+        }
+        if request.target_replica_id != self.replica_id
+            || request.target_instance_id != self.instance_id
+        {
+            let _ = reply.send(Err(KubericError::PeerStageTargetMismatch(format!(
+                "expected {}@{}, got {}@{}",
+                self.replica_id,
+                self.instance_id,
+                request.target_replica_id,
+                request.target_instance_id
+            ))));
+            return;
+        }
+        if request.expected_target_agent_generation != self.generation {
+            let _ = reply.send(Err(KubericError::PeerStageStale(format!(
+                "expected target generation {}, current {}",
+                request.expected_target_agent_generation, self.generation
+            ))));
+            return;
+        }
+        let actual_signature = request.signature();
+        if request.input_signature != actual_signature {
+            let _ = reply.send(Err(KubericError::ActionSignatureMismatch {
+                action_id: request.message_id,
+            }));
+            return;
+        }
+        if let Some(observation) = self.find_peer_stage(&request.message_id) {
+            if observation.input_signature != request.input_signature {
+                let _ = reply.send(Err(KubericError::PeerStageIdConflict {
+                    message_id: request.message_id,
+                }));
+            } else {
+                let _ = reply.send(Ok(observation.clone()));
+            }
+            return;
+        }
+        if request.expected_target_peer_control_version != self.peer_control_version {
+            let _ = reply.send(Err(KubericError::PeerStageStale(format!(
+                "expected peer control version {}, current {}",
+                request.expected_target_peer_control_version, self.peer_control_version
+            ))));
+            return;
+        }
+        if let Some(fence) = &self.peer_sender_fence {
+            if request.epoch < fence.epoch
+                || (request.epoch == fence.epoch
+                    && (request.sender_replica_id != fence.sender_replica_id
+                        || request.sender_instance_id != fence.sender_instance_id
+                        || request.sender_agent_generation != fence.sender_generation))
+            {
+                let _ = reply.send(Err(KubericError::PeerStageStale(
+                    "peer sender conflicts with the pinned primary fence".to_string(),
+                )));
+                return;
+            }
+        }
+        if self.active.is_some() || self.active_peer.is_some() {
+            let _ = reply.send(Err(KubericError::AgentBusy));
+            return;
+        }
+        if request.epoch < self.runtime_status_rx.borrow().epoch {
+            let observation = PeerStageObservation {
+                protocol_version: REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+                message_id: request.message_id,
+                input_signature: request.input_signature,
+                stage: request.stage,
+                state: PeerStageState::Stale,
+                target_agent_generation: self.generation.clone(),
+                target_peer_control_version: self.peer_control_version,
+                error: Some("peer stage epoch is older than target runtime epoch".to_string()),
+            };
+            let _ = reply.send(Ok(observation));
+            return;
+        }
+
+        self.peer_control_version = self.peer_control_version.saturating_add(1);
+        self.peer_sender_fence = Some(PeerSenderFence {
+            epoch: request.epoch,
+            sender_replica_id: request.sender_replica_id,
+            sender_instance_id: request.sender_instance_id.clone(),
+            sender_generation: request.sender_agent_generation.clone(),
+        });
+        let execution_id = self.next_execution_id();
+        let observation = PeerStageObservation {
+            protocol_version: REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+            message_id: request.message_id.clone(),
+            input_signature: request.input_signature.clone(),
+            stage: request.stage,
+            state: PeerStageState::Accepted,
+            target_agent_generation: self.generation.clone(),
+            target_peer_control_version: self.peer_control_version,
+            error: None,
+        };
+        self.active_peer = Some(ActivePeerStage {
+            execution_id: execution_id.clone(),
+            observation: observation.clone(),
+        });
+        let _ = reply.send(Ok(observation));
+        if let Some(active) = self.active_peer.as_mut() {
+            active.observation.state = PeerStageState::InProgress;
+        }
+
+        let completion_tx = self.peer_completion_tx.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        let runtime_status_rx = self.runtime_status_rx.clone();
+        let shutdown = self.shutdown.child_token();
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    Err(PeerStageRunError::Failed(
+                        "peer stage cancelled by agent shutdown".to_string(),
+                    ))
+                }
+                result = run_peer_stage(request, runtime_tx, runtime_status_rx) => result,
+            };
+            let (state, error) = match result {
+                Ok(()) => (PeerStageState::Completed, None),
+                Err(PeerStageRunError::Stale(error)) => {
+                    (PeerStageState::Stale, Some(normalize_error(&error)))
+                }
+                Err(PeerStageRunError::Failed(error)) => {
+                    (PeerStageState::Failed, Some(normalize_error(&error)))
+                }
+            };
+            let _ = completion_tx.send(PeerStageCompletion {
+                execution_id,
+                state,
+                error,
+            });
+        });
+    }
+
+    fn peer_status(
+        &self,
+        target_replica_id: ReplicaId,
+        target_instance_id: ReplicaInstanceId,
+        expected_generation: AgentGeneration,
+    ) -> Result<PeerAddBuildStatus> {
+        if target_replica_id != self.replica_id || target_instance_id != self.instance_id {
+            return Err(KubericError::PeerStageTargetMismatch(format!(
+                "expected {}@{}, got {}@{}",
+                self.replica_id, self.instance_id, target_replica_id, target_instance_id
+            )));
+        }
+        if expected_generation != self.generation {
+            return Err(KubericError::PeerStageStale(format!(
+                "expected target generation {expected_generation}, current {}",
+                self.generation
+            )));
+        }
+        let runtime = self.runtime_status_rx.borrow();
+        Ok(PeerAddBuildStatus {
+            protocol_version: REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+            target_replica_id: self.replica_id,
+            target_instance_id: self.instance_id.clone(),
+            agent_generation: self.generation.clone(),
+            peer_control_version: self.peer_control_version,
+            role: runtime.role,
+            epoch: runtime.epoch,
+            healthy: runtime.partition_state.is_some(),
+            current_progress: runtime
+                .partition_state
+                .as_deref()
+                .map_or(0, |state| state.current_progress()),
+            current_action: self
+                .active_peer
+                .as_ref()
+                .map(|active| active.observation.clone()),
+            retained_terminal_actions: self.peer_terminals.iter().cloned().collect(),
+        })
+    }
+
+    fn handle_peer_completion(&mut self, completion: PeerStageCompletion) {
+        let Some(mut active) = self.active_peer.take() else {
+            warn!("discarding peer completion without active stage");
+            return;
+        };
+        if active.execution_id != completion.execution_id {
+            warn!("discarding stale peer-stage completion");
+            self.active_peer = Some(active);
+            return;
+        }
+        active.observation.state = completion.state;
+        active.observation.error = completion.error;
+        if self.peer_terminals.len() == crate::add_replica::PEER_TERMINAL_RETENTION {
+            self.peer_terminals.pop_front();
+        }
+        self.peer_terminals.push_back(active.observation);
+    }
+
+    fn handle_coordinator_event(&mut self, event: CoordinatorEvent) {
+        let Some(active) = self.active.as_mut() else {
+            warn!("discarding add coordinator event without active action");
+            return;
+        };
+        if active.execution_id != event.execution_id {
+            warn!("discarding stale add coordinator event");
+            return;
+        }
+        match event.update {
+            CoordinatorUpdate::Progress(progress) => {
+                active.observation.action.add_replica_progress = Some(progress);
+            }
+            CoordinatorUpdate::Terminal(result) => {
+                let mut active = self.active.take().unwrap();
+                match result {
+                    Ok(result) => {
+                        active.observation.action.state = DurableActionState::Completed;
+                        active.observation.action.result =
+                            Some(DurableActionResult::AddReplica(result));
+                    }
+                    Err(error) => {
+                        active.observation.action.state = DurableActionState::Failed;
+                        active.observation.action.error_class =
+                            Some(DurableActionErrorClass::Internal);
+                        active.observation.action.error = Some(normalize_error(&error));
+                    }
+                }
+                self.retain_terminal(active.observation);
+            }
+        }
+    }
+
+    fn find_peer_stage(&self, message_id: &str) -> Option<&PeerStageObservation> {
+        self.active_peer
+            .as_ref()
+            .filter(|active| active.observation.message_id == message_id)
+            .map(|active| &active.observation)
+            .or_else(|| {
+                self.peer_terminals
+                    .iter()
+                    .rev()
+                    .find(|observation| observation.message_id == message_id)
+            })
+    }
+
     fn start_effect(
         &mut self,
         observation: CorrelatedActionObservation,
@@ -352,11 +754,12 @@ impl ReplicaAgent {
         &mut self,
         mut observation: CorrelatedActionObservation,
         reply: oneshot::Sender<Result<CorrelatedControlActionAcknowledgement>>,
-        message: &'static str,
+        message: impl Into<String>,
     ) {
+        let message = message.into();
         observation.action.state = DurableActionState::Failed;
         observation.action.error_class = Some(DurableActionErrorClass::Internal);
-        observation.action.error = Some(message.to_string());
+        observation.action.error = Some(message);
         send_observation(reply, observation.clone());
         self.retain_terminal(observation);
     }
@@ -478,8 +881,11 @@ impl ReplicaAgent {
             deactivation_info: runtime.deactivation_info,
             active_replica_connections: state
                 .map_or_else(Vec::new, |state| state.active_replica_connections()),
+            build_observation: runtime.build_observation,
             agent: ReplicaAgentStatus {
                 protocol_version: CORRELATED_CONTROL_PROTOCOL_VERSION,
+                add_build_peer_protocol_version:
+                    crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
                 generation: self.generation.clone(),
                 control_version: self.control_version,
                 current_action: self
@@ -521,8 +927,964 @@ impl ReplicaAgent {
     }
 }
 
+enum PeerStageRunError {
+    Stale(String),
+    Failed(String),
+}
+
+async fn run_peer_stage(
+    request: PeerStageRequest,
+    runtime_tx: mpsc::Sender<RuntimeEffectCommand>,
+    runtime_status_rx: watch::Receiver<RuntimeControlSnapshot>,
+) -> std::result::Result<(), PeerStageRunError> {
+    match request.stage {
+        PeerStage::Prepare => {
+            authorize_peer_sender(&request, false).await?;
+            if runtime_status_rx.borrow().partition_state.is_none() {
+                send_runtime_effect(
+                    &runtime_tx,
+                    RuntimeEffect::Open {
+                        mode: crate::types::OpenMode::New,
+                    },
+                )
+                .await?;
+            }
+
+            authorize_peer_sender(&request, false).await?;
+            let current_epoch = runtime_status_rx.borrow().epoch;
+            if current_epoch > request.epoch {
+                return Err(PeerStageRunError::Stale(format!(
+                    "target epoch {current_epoch:?} is newer than request {:?}",
+                    request.epoch
+                )));
+            }
+            if current_epoch < request.epoch {
+                send_runtime_effect(
+                    &runtime_tx,
+                    RuntimeEffect::UpdateEpoch {
+                        epoch: request.epoch,
+                    },
+                )
+                .await?;
+            }
+
+            authorize_peer_sender(&request, false).await?;
+            let runtime = runtime_status_rx.borrow().clone();
+            if runtime.epoch != request.epoch {
+                return Err(PeerStageRunError::Stale(
+                    "target epoch did not reach peer request epoch".to_string(),
+                ));
+            }
+            match runtime.role {
+                crate::types::Role::IdleSecondary | crate::types::Role::ActiveSecondary => Ok(()),
+                crate::types::Role::Unknown => {
+                    drop(runtime);
+                    send_runtime_effect(
+                        &runtime_tx,
+                        RuntimeEffect::ChangeRole {
+                            epoch: request.epoch,
+                            role: crate::types::Role::IdleSecondary,
+                        },
+                    )
+                    .await
+                }
+                role => Err(PeerStageRunError::Stale(format!(
+                    "target role {role:?} is incompatible with prepare"
+                ))),
+            }
+        }
+        PeerStage::Activate => {
+            authorize_peer_sender(&request, false).await?;
+            let runtime = runtime_status_rx.borrow().clone();
+            if runtime.epoch != request.epoch {
+                return Err(PeerStageRunError::Stale(
+                    "target epoch is incompatible with activation".to_string(),
+                ));
+            }
+            let copy_lsn = request.copy_lsn.ok_or_else(|| {
+                PeerStageRunError::Failed("activation has no copy LSN".to_string())
+            })?;
+            let current_progress = runtime
+                .partition_state
+                .as_deref()
+                .map_or(0, |state| state.current_progress());
+            if current_progress < copy_lsn {
+                return Err(PeerStageRunError::Stale(format!(
+                    "target progress {current_progress} is below copy LSN {copy_lsn}"
+                )));
+            }
+            match runtime.role {
+                crate::types::Role::ActiveSecondary => Ok(()),
+                crate::types::Role::IdleSecondary => {
+                    drop(runtime);
+                    send_runtime_effect(
+                        &runtime_tx,
+                        RuntimeEffect::ChangeRole {
+                            epoch: request.epoch,
+                            role: crate::types::Role::ActiveSecondary,
+                        },
+                    )
+                    .await
+                }
+                role => Err(PeerStageRunError::Stale(format!(
+                    "target role {role:?} is incompatible with activation"
+                ))),
+            }
+        }
+        PeerStage::Cleanup => {
+            authorize_peer_sender(&request, true).await?;
+            let runtime = runtime_status_rx.borrow().clone();
+            if runtime.partition_state.is_none() {
+                return Ok(());
+            }
+            if runtime.epoch != request.epoch {
+                return Err(PeerStageRunError::Stale(
+                    "target epoch is incompatible with cleanup".to_string(),
+                ));
+            }
+            if matches!(
+                runtime.role,
+                crate::types::Role::IdleSecondary | crate::types::Role::ActiveSecondary
+            ) {
+                drop(runtime);
+                send_runtime_effect(
+                    &runtime_tx,
+                    RuntimeEffect::ChangeRole {
+                        epoch: request.epoch,
+                        role: crate::types::Role::None,
+                    },
+                )
+                .await?;
+            }
+            authorize_peer_sender(&request, true).await?;
+            if runtime_status_rx.borrow().partition_state.is_some() {
+                send_runtime_effect(&runtime_tx, RuntimeEffect::Close).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn authorize_peer_sender(
+    request: &PeerStageRequest,
+    cleanup: bool,
+) -> std::result::Result<(), PeerStageRunError> {
+    use crate::driver::ReplicaHandle;
+
+    let handle = crate::grpc::handle::GrpcReplicaHandle::connect(
+        request.sender_replica_id,
+        request.sender_instance_id.clone(),
+        request.sender_control_address.clone(),
+        "http://unused".to_string(),
+    )
+    .await
+    .map_err(|error| PeerStageRunError::Stale(error.to_string()))?;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), handle.get_status())
+        .await
+        .map_err(|_| PeerStageRunError::Stale("sender status timed out".to_string()))?
+        .map_err(|error| PeerStageRunError::Stale(error.to_string()))?;
+    if status.instance_id != request.sender_instance_id
+        || status.agent.generation != request.sender_agent_generation
+        || status.role != crate::types::Role::Primary
+        || status.epoch != request.epoch
+        || status.write_status != AccessStatus::Granted
+    {
+        return Err(PeerStageRunError::Stale(
+            "sender is not the exact active unrevoked primary".to_string(),
+        ));
+    }
+    let parent_matches = status
+        .agent
+        .current_action
+        .as_ref()
+        .is_some_and(|observation| {
+            observation.action.action_id == request.parent_action_id
+                && observation.action.signature == request.parent_action_signature
+                && matches!(
+                    observation.action.state,
+                    DurableActionState::Scheduled | DurableActionState::InProgress
+                )
+        });
+    if !parent_matches {
+        return Err(PeerStageRunError::Stale(
+            "sender does not expose the exact active parent action".to_string(),
+        ));
+    }
+    if cleanup
+        && status.configuration.as_ref().is_some_and(|configuration| {
+            configuration.mode == crate::types::ReplicaConfigurationMode::Current
+                && configuration.members.iter().any(|member| {
+                    member.id == request.target_replica_id
+                        && member.instance_id == request.target_instance_id
+                })
+        })
+    {
+        return Err(PeerStageRunError::Stale(
+            "target is already present in the primary current configuration".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn send_runtime_effect(
+    runtime_tx: &mpsc::Sender<RuntimeEffectCommand>,
+    effect: RuntimeEffect,
+) -> std::result::Result<(), PeerStageRunError> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    runtime_tx
+        .send(RuntimeEffectCommand {
+            effect,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| PeerStageRunError::Failed("target runtime closed".to_string()))?;
+    match reply_rx.await {
+        Ok(Ok(RuntimeEffectResult::Unit)) => Ok(()),
+        Ok(Ok(RuntimeEffectResult::DataLoss(_))) => Err(PeerStageRunError::Failed(
+            "unexpected data-loss result for peer stage".to_string(),
+        )),
+        Ok(Err(error)) => Err(PeerStageRunError::Failed(error.to_string())),
+        Err(_) => Err(PeerStageRunError::Failed(
+            "target runtime reply closed".to_string(),
+        )),
+    }
+}
+
+async fn run_add_replica_coordinator(
+    execution_id: RuntimeEffectExecutionId,
+    intent: crate::add_replica::AddReplicaIntent,
+    parent_action_id: String,
+    parent_action_signature: String,
+    runtime_tx: mpsc::Sender<RuntimeEffectCommand>,
+    mut runtime_status_rx: watch::Receiver<RuntimeControlSnapshot>,
+    coordinator_tx: mpsc::UnboundedSender<CoordinatorEvent>,
+) {
+    let result = run_add_replica_coordinator_inner(
+        &execution_id,
+        &intent,
+        &parent_action_id,
+        &parent_action_signature,
+        &runtime_tx,
+        &mut runtime_status_rx,
+        &coordinator_tx,
+    )
+    .await;
+    let terminal = match result {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            warn!(error = %error, "add-replica coordinator entering compensation");
+            let commit_observed = runtime_status_rx.borrow().configuration.as_ref()
+                == Some(
+                    &intent
+                        .current_configuration
+                        .status(crate::types::ReplicaConfigurationMode::Current),
+                );
+            if commit_observed {
+                Err(error)
+            } else {
+                match compensate_add_replica(
+                    &execution_id,
+                    &intent,
+                    &parent_action_id,
+                    &parent_action_signature,
+                    &runtime_tx,
+                    &mut runtime_status_rx,
+                    &coordinator_tx,
+                )
+                .await
+                {
+                    Ok(()) => Ok(AddReplicaTerminalResult::Compensated),
+                    Err(_compensation_error) => {
+                        let _ = coordinator_tx.send(CoordinatorEvent {
+                            execution_id: execution_id.clone(),
+                            update: CoordinatorUpdate::Progress(AddReplicaProgress {
+                                phase: AddReplicaCoordinatorPhase::Compensating,
+                                commit_observed: false,
+                                copy_lsn: None,
+                            }),
+                        });
+                        Ok(AddReplicaTerminalResult::CompensationIncomplete)
+                    }
+                }
+            }
+        }
+    };
+    let _ = coordinator_tx.send(CoordinatorEvent {
+        execution_id,
+        update: CoordinatorUpdate::Terminal(terminal),
+    });
+}
+
+async fn run_add_replica_coordinator_inner(
+    execution_id: &RuntimeEffectExecutionId,
+    intent: &crate::add_replica::AddReplicaIntent,
+    parent_action_id: &str,
+    parent_action_signature: &str,
+    runtime_tx: &mpsc::Sender<RuntimeEffectCommand>,
+    runtime_status_rx: &mut watch::Receiver<RuntimeControlSnapshot>,
+    coordinator_tx: &mpsc::UnboundedSender<CoordinatorEvent>,
+) -> std::result::Result<AddReplicaTerminalResult, String> {
+    ensure_add_deadline(intent.deadline_unix_seconds)?;
+    let current_status = intent
+        .current_configuration
+        .status(crate::types::ReplicaConfigurationMode::Current);
+    if runtime_status_rx.borrow().configuration.as_ref() == Some(&current_status) {
+        send_add_progress(
+            coordinator_tx,
+            execution_id,
+            AddReplicaCoordinatorPhase::Attesting,
+            true,
+            runtime_status_rx
+                .borrow()
+                .build_observation
+                .as_ref()
+                .and_then(|build| build.copy_lsn),
+        );
+        return attest_add_replica(
+            intent,
+            parent_action_id,
+            parent_action_signature,
+            runtime_status_rx,
+        )
+        .await
+        .map(|_| AddReplicaTerminalResult::Committed);
+    }
+
+    if let Some(retired) = &intent.retired_instance_id
+        && runtime_status_rx
+            .borrow()
+            .partition_state
+            .as_deref()
+            .is_some_and(|state| {
+                state.active_replica_connections().iter().any(|connection| {
+                    connection.id == intent.target_replica_id && &connection.instance_id == retired
+                })
+            })
+    {
+        send_add_progress(
+            coordinator_tx,
+            execution_id,
+            AddReplicaCoordinatorPhase::RetiringOldConnection,
+            false,
+            None,
+        );
+        execute_runtime(
+            runtime_tx,
+            RuntimeEffect::RemoveReplica {
+                replica_id: intent.target_replica_id,
+                instance_id: retired.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    send_add_progress(
+        coordinator_tx,
+        execution_id,
+        AddReplicaCoordinatorPhase::PreparingTarget,
+        false,
+        None,
+    );
+    ensure_peer_stage(
+        intent,
+        parent_action_id,
+        parent_action_signature,
+        PeerStage::Prepare,
+        None,
+        None,
+    )
+    .await?;
+
+    send_add_progress(
+        coordinator_tx,
+        execution_id,
+        AddReplicaCoordinatorPhase::Building,
+        false,
+        None,
+    );
+    let build_key = intent.semantic_build_key();
+    let existing_copy_lsn = {
+        let runtime = runtime_status_rx.borrow();
+        exact_completed_build(runtime.build_observation.as_ref(), intent, &build_key)
+    };
+    let copy_lsn = match existing_copy_lsn {
+        Some(copy_lsn) => copy_lsn,
+        None => {
+            let build_execution_id = format!("{}:build", intent.attempt_id);
+            execute_runtime(
+                runtime_tx,
+                RuntimeEffect::StartTrackedBuild {
+                    execution_id: build_execution_id.clone(),
+                    build_key: build_key.clone(),
+                    target_agent_generation: intent.target_agent_generation.clone(),
+                    replica: ReplicaInfo {
+                        id: intent.target_replica_id,
+                        instance_id: intent.target_instance_id.clone(),
+                        role: crate::types::Role::IdleSecondary,
+                        status: crate::types::ReplicaStatus::Up,
+                        replicator_address: intent.target_replicator_address.clone(),
+                        current_progress: 0,
+                        catch_up_capability: 0,
+                        must_catch_up: false,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            wait_for_build(
+                runtime_tx,
+                runtime_status_rx,
+                intent,
+                &build_key,
+                &build_execution_id,
+            )
+            .await?
+        }
+    };
+
+    send_add_progress(
+        coordinator_tx,
+        execution_id,
+        AddReplicaCoordinatorPhase::ActivatingTarget,
+        false,
+        Some(copy_lsn),
+    );
+    ensure_peer_stage(
+        intent,
+        parent_action_id,
+        parent_action_signature,
+        PeerStage::Activate,
+        Some(build_key.clone()),
+        Some(copy_lsn),
+    )
+    .await?;
+
+    let catch_up_status = intent
+        .catch_up_configuration
+        .status(crate::types::ReplicaConfigurationMode::CatchUp);
+    if runtime_status_rx.borrow().configuration.as_ref() != Some(&catch_up_status)
+        && runtime_status_rx.borrow().configuration.as_ref() != Some(&current_status)
+    {
+        send_add_progress(
+            coordinator_tx,
+            execution_id,
+            AddReplicaCoordinatorPhase::InstallingCatchUpConfiguration,
+            false,
+            Some(copy_lsn),
+        );
+        execute_runtime(
+            runtime_tx,
+            RuntimeEffect::UpdateTrackedCatchUpConfiguration {
+                current: intent.catch_up_configuration.materialize(Some(copy_lsn))?,
+                previous: intent.previous_configuration.materialize(None)?,
+                required_build_key: build_key.clone(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    if runtime_status_rx.borrow().configuration.as_ref() != Some(&current_status) {
+        send_add_progress(
+            coordinator_tx,
+            execution_id,
+            AddReplicaCoordinatorPhase::WaitingForCatchUpQuorum,
+            false,
+            Some(copy_lsn),
+        );
+        let wait_id = format!("{}:wait", intent.attempt_id);
+        execute_runtime(
+            runtime_tx,
+            RuntimeEffect::StartTrackedCatchUpQuorum {
+                execution_id: wait_id.clone(),
+                mode: crate::types::ReplicaSetQuorumMode::Write,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        wait_for_quorum(runtime_tx, runtime_status_rx, intent, &wait_id).await?;
+
+        send_add_progress(
+            coordinator_tx,
+            execution_id,
+            AddReplicaCoordinatorPhase::InstallingCurrentConfiguration,
+            false,
+            Some(copy_lsn),
+        );
+        execute_runtime(
+            runtime_tx,
+            RuntimeEffect::UpdateCurrentConfiguration {
+                current: intent.current_configuration.materialize(Some(copy_lsn))?,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    send_add_progress(
+        coordinator_tx,
+        execution_id,
+        AddReplicaCoordinatorPhase::Attesting,
+        true,
+        Some(copy_lsn),
+    );
+    attest_add_replica(
+        intent,
+        parent_action_id,
+        parent_action_signature,
+        runtime_status_rx,
+    )
+    .await?;
+    Ok(AddReplicaTerminalResult::Committed)
+}
+
+fn exact_completed_build(
+    observation: Option<&crate::add_replica::RuntimeBuildObservation>,
+    intent: &crate::add_replica::AddReplicaIntent,
+    build_key: &str,
+) -> Option<Lsn> {
+    observation
+        .filter(|observation| {
+            observation.build_key == build_key
+                && observation.target_replica_id == intent.target_replica_id
+                && observation.target_instance_id == intent.target_instance_id
+                && observation.target_agent_generation == intent.target_agent_generation
+                && observation.state == crate::add_replica::RuntimeBuildState::Completed
+        })
+        .and_then(|observation| observation.copy_lsn)
+}
+
+async fn wait_for_build(
+    runtime_tx: &mpsc::Sender<RuntimeEffectCommand>,
+    runtime_status_rx: &mut watch::Receiver<RuntimeControlSnapshot>,
+    intent: &crate::add_replica::AddReplicaIntent,
+    build_key: &str,
+    execution_id: &str,
+) -> std::result::Result<Lsn, String> {
+    loop {
+        if let Some(copy_lsn) = exact_completed_build(
+            runtime_status_rx.borrow().build_observation.as_ref(),
+            intent,
+            build_key,
+        ) {
+            return Ok(copy_lsn);
+        }
+        if let Some(observation) = runtime_status_rx.borrow().build_observation.as_ref()
+            && observation.execution_id == execution_id
+            && matches!(
+                observation.state,
+                crate::add_replica::RuntimeBuildState::Failed
+                    | crate::add_replica::RuntimeBuildState::Cancelled
+            )
+        {
+            return Err(observation
+                .error
+                .clone()
+                .unwrap_or_else(|| "tracked build failed".to_string()));
+        }
+        if unix_seconds() >= intent.deadline_unix_seconds {
+            let _ = execute_runtime(
+                runtime_tx,
+                RuntimeEffect::CancelTrackedOperation {
+                    execution_id: execution_id.to_string(),
+                },
+            )
+            .await;
+            return Err("tracked build reached its deadline".to_string());
+        }
+        tokio::select! {
+            _ = runtime_status_rx.changed() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+}
+
+async fn wait_for_quorum(
+    runtime_tx: &mpsc::Sender<RuntimeEffectCommand>,
+    runtime_status_rx: &mut watch::Receiver<RuntimeControlSnapshot>,
+    intent: &crate::add_replica::AddReplicaIntent,
+    execution_id: &str,
+) -> std::result::Result<(), String> {
+    loop {
+        if let Some(observation) = runtime_status_rx.borrow().quorum_wait_observation.as_ref()
+            && observation.execution_id == execution_id
+        {
+            match observation.state {
+                crate::add_replica::RuntimeBuildState::Completed => return Ok(()),
+                crate::add_replica::RuntimeBuildState::Failed
+                | crate::add_replica::RuntimeBuildState::Cancelled => {
+                    return Err(observation
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "tracked quorum wait failed".to_string()));
+                }
+                crate::add_replica::RuntimeBuildState::InProgress => {}
+            }
+        }
+        if unix_seconds() >= intent.deadline_unix_seconds {
+            let _ = execute_runtime(
+                runtime_tx,
+                RuntimeEffect::CancelTrackedOperation {
+                    execution_id: execution_id.to_string(),
+                },
+            )
+            .await;
+            return Err("tracked quorum wait reached its deadline".to_string());
+        }
+        tokio::select! {
+            _ = runtime_status_rx.changed() => {}
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    }
+}
+
+async fn ensure_peer_stage(
+    intent: &crate::add_replica::AddReplicaIntent,
+    parent_action_id: &str,
+    parent_action_signature: &str,
+    stage: PeerStage,
+    build_key: Option<String>,
+    copy_lsn: Option<Lsn>,
+) -> std::result::Result<(), String> {
+    let client = crate::grpc::peer_client::GrpcPeerClient::connect(
+        intent.target_control_address.clone(),
+        intent.target_replica_id,
+        intent.target_instance_id.clone(),
+        intent.target_agent_generation.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    loop {
+        ensure_add_deadline(intent.deadline_unix_seconds)?;
+        let timeout = remaining_peer_timeout(intent.deadline_unix_seconds)?;
+        let status = client
+            .get_status(timeout)
+            .await
+            .map_err(|error| error.to_string())?;
+        let postcondition = match stage {
+            PeerStage::Prepare => {
+                status.epoch == intent.epoch
+                    && matches!(
+                        status.role,
+                        crate::types::Role::IdleSecondary | crate::types::Role::ActiveSecondary
+                    )
+            }
+            PeerStage::Activate => {
+                status.epoch == intent.epoch
+                    && status.role == crate::types::Role::ActiveSecondary
+                    && status.current_progress >= copy_lsn.unwrap_or_default()
+            }
+            PeerStage::Cleanup => !status.healthy,
+        };
+        if postcondition {
+            return Ok(());
+        }
+        let message_id = format!("{}:{stage:?}", intent.attempt_id);
+        if let Some(observation) = status
+            .current_action
+            .as_ref()
+            .into_iter()
+            .chain(status.retained_terminal_actions.iter().rev())
+            .find(|observation| observation.message_id == message_id)
+        {
+            match observation.state {
+                PeerStageState::Completed => {
+                    return Err(
+                        "completed peer stage no longer satisfies its live postcondition"
+                            .to_string(),
+                    );
+                }
+                PeerStageState::Failed | PeerStageState::Stale => {
+                    return Err(observation
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "peer stage failed".to_string()));
+                }
+                PeerStageState::Accepted | PeerStageState::InProgress => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            }
+        }
+        let mut request = PeerStageRequest {
+            protocol_version: REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+            operation_id: intent.operation_id.clone(),
+            attempt_id: intent.attempt_id.clone(),
+            message_id,
+            input_signature: String::new(),
+            stage,
+            sender_replica_id: intent.primary_replica_id,
+            sender_instance_id: intent.primary_instance_id.clone(),
+            sender_agent_generation: intent.primary_agent_generation.clone(),
+            sender_control_address: intent.primary_control_address.clone(),
+            parent_action_id: parent_action_id.to_string(),
+            parent_action_signature: parent_action_signature.to_string(),
+            target_replica_id: intent.target_replica_id,
+            target_instance_id: intent.target_instance_id.clone(),
+            expected_target_agent_generation: intent.target_agent_generation.clone(),
+            expected_target_peer_control_version: status.peer_control_version,
+            epoch: intent.epoch,
+            configuration_fence: intent.configuration_fence(),
+            build_key: build_key.clone(),
+            copy_lsn,
+        };
+        request.input_signature = request.signature();
+        let observation = client
+            .execute_stage(
+                request,
+                remaining_peer_timeout(intent.deadline_unix_seconds)?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        match observation.state {
+            PeerStageState::Completed => return Ok(()),
+            PeerStageState::Failed | PeerStageState::Stale => {
+                return Err(observation
+                    .error
+                    .unwrap_or_else(|| "peer stage failed".to_string()));
+            }
+            PeerStageState::Accepted | PeerStageState::InProgress => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+async fn attest_add_replica(
+    intent: &crate::add_replica::AddReplicaIntent,
+    parent_action_id: &str,
+    parent_action_signature: &str,
+    runtime_status_rx: &watch::Receiver<RuntimeControlSnapshot>,
+) -> std::result::Result<(), String> {
+    let runtime = runtime_status_rx.borrow().clone();
+    if runtime.role != crate::types::Role::Primary
+        || runtime.epoch != intent.epoch
+        || runtime.configuration.as_ref()
+            != Some(
+                &intent
+                    .current_configuration
+                    .status(crate::types::ReplicaConfigurationMode::Current),
+            )
+        || !runtime.partition_state.as_deref().is_some_and(|state| {
+            state.active_replica_connections().iter().any(|connection| {
+                connection.id == intent.target_replica_id
+                    && connection.instance_id == intent.target_instance_id
+            })
+        })
+    {
+        return Err("primary add-replica final attestation failed".to_string());
+    }
+    drop(runtime);
+    let copy_lsn = runtime_status_rx
+        .borrow()
+        .build_observation
+        .as_ref()
+        .and_then(|build| exact_completed_build(Some(build), intent, &intent.semantic_build_key()));
+    ensure_peer_stage(
+        intent,
+        parent_action_id,
+        parent_action_signature,
+        PeerStage::Activate,
+        Some(intent.semantic_build_key()),
+        copy_lsn,
+    )
+    .await
+}
+
+async fn compensate_add_replica(
+    execution_id: &RuntimeEffectExecutionId,
+    intent: &crate::add_replica::AddReplicaIntent,
+    parent_action_id: &str,
+    parent_action_signature: &str,
+    runtime_tx: &mpsc::Sender<RuntimeEffectCommand>,
+    runtime_status_rx: &mut watch::Receiver<RuntimeControlSnapshot>,
+    coordinator_tx: &mpsc::UnboundedSender<CoordinatorEvent>,
+) -> std::result::Result<(), String> {
+    send_add_progress(
+        coordinator_tx,
+        execution_id,
+        AddReplicaCoordinatorPhase::Compensating,
+        false,
+        None,
+    );
+    let active_build = {
+        let runtime = runtime_status_rx.borrow();
+        runtime
+            .build_observation
+            .as_ref()
+            .filter(|build| build.state == crate::add_replica::RuntimeBuildState::InProgress)
+            .map(|build| build.execution_id.clone())
+    };
+    if let Some(execution_id) = active_build {
+        let _ = execute_runtime(
+            runtime_tx,
+            RuntimeEffect::CancelTrackedOperation { execution_id },
+        )
+        .await;
+    }
+    let active_wait = {
+        let runtime = runtime_status_rx.borrow();
+        runtime
+            .quorum_wait_observation
+            .as_ref()
+            .filter(|wait| wait.state == crate::add_replica::RuntimeBuildState::InProgress)
+            .map(|wait| wait.execution_id.clone())
+    };
+    if let Some(execution_id) = active_wait {
+        let _ = execute_runtime(
+            runtime_tx,
+            RuntimeEffect::CancelTrackedOperation { execution_id },
+        )
+        .await;
+    }
+    wait_for_tracked_settlement(runtime_status_rx, intent.compensation_deadline_unix_seconds)
+        .await?;
+    let previous_status = intent
+        .previous_configuration
+        .status(crate::types::ReplicaConfigurationMode::Current);
+    if runtime_status_rx.borrow().configuration.as_ref() != Some(&previous_status) {
+        execute_runtime(
+            runtime_tx,
+            RuntimeEffect::UpdateCurrentConfiguration {
+                current: intent.previous_configuration.materialize(None)?,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+
+    async fn wait_for_tracked_settlement(
+        runtime_status_rx: &mut watch::Receiver<RuntimeControlSnapshot>,
+        deadline: i64,
+    ) -> std::result::Result<(), String> {
+        loop {
+            let settled = {
+                let runtime = runtime_status_rx.borrow();
+                let build_settled = runtime.build_observation.as_ref().is_none_or(|build| {
+                    build.state != crate::add_replica::RuntimeBuildState::InProgress
+                });
+                let wait_settled = runtime.quorum_wait_observation.as_ref().is_none_or(|wait| {
+                    wait.state != crate::add_replica::RuntimeBuildState::InProgress
+                });
+                build_settled && wait_settled
+            };
+            if settled {
+                return Ok(());
+            }
+            if unix_seconds() >= deadline {
+                return Err(
+                    "tracked runtime operation did not settle before compensation deadline"
+                        .to_string(),
+                );
+            }
+            tokio::select! {
+                _ = runtime_status_rx.changed() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+    }
+    execute_runtime(
+        runtime_tx,
+        RuntimeEffect::RemoveReplica {
+            replica_id: intent.target_replica_id,
+            instance_id: intent.target_instance_id.clone(),
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let _ = ensure_peer_stage(
+        intent,
+        parent_action_id,
+        parent_action_signature,
+        PeerStage::Cleanup,
+        None,
+        None,
+    )
+    .await;
+    if unix_seconds() > intent.compensation_deadline_unix_seconds {
+        return Err("add-replica compensation reached its deadline".to_string());
+    }
+    let runtime = runtime_status_rx.borrow();
+    let configuration_restored = runtime.configuration.as_ref() == Some(&previous_status);
+    let connection_absent = runtime.partition_state.as_deref().is_none_or(|state| {
+        !state.active_replica_connections().iter().any(|connection| {
+            connection.id == intent.target_replica_id
+                && connection.instance_id == intent.target_instance_id
+        })
+    });
+    if configuration_restored && connection_absent {
+        Ok(())
+    } else {
+        Err("add-replica compensation barrier is not proven".to_string())
+    }
+}
+
+async fn execute_runtime(
+    runtime_tx: &mpsc::Sender<RuntimeEffectCommand>,
+    effect: RuntimeEffect,
+) -> Result<RuntimeEffectResult> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    runtime_tx
+        .send(RuntimeEffectCommand {
+            effect,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| KubericError::Closed)?;
+    reply_rx.await.unwrap_or(Err(KubericError::Closed))
+}
+
+fn send_add_progress(
+    coordinator_tx: &mpsc::UnboundedSender<CoordinatorEvent>,
+    execution_id: &RuntimeEffectExecutionId,
+    phase: AddReplicaCoordinatorPhase,
+    commit_observed: bool,
+    copy_lsn: Option<Lsn>,
+) {
+    info!(
+        ?phase,
+        commit_observed,
+        ?copy_lsn,
+        "add-replica coordinator phase"
+    );
+    let _ = coordinator_tx.send(CoordinatorEvent {
+        execution_id: execution_id.clone(),
+        update: CoordinatorUpdate::Progress(AddReplicaProgress {
+            phase,
+            commit_observed,
+            copy_lsn,
+        }),
+    });
+}
+
+fn ensure_add_deadline(deadline: i64) -> std::result::Result<(), String> {
+    if unix_seconds() >= deadline {
+        Err("add-replica intent reached its deadline".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn remaining_peer_timeout(deadline: i64) -> std::result::Result<std::time::Duration, String> {
+    let remaining = deadline.saturating_sub(unix_seconds());
+    if remaining <= 0 {
+        return Err("add-replica intent reached its deadline".to_string());
+    }
+    Ok(std::time::Duration::from_secs(remaining as u64).min(std::time::Duration::from_secs(5)))
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
+
 fn correlated_runtime_effect(action: DurableReplicaAction) -> RuntimeEffect {
     match action {
+        DurableReplicaAction::AddReplicaIntent { .. } => {
+            unreachable!("add-replica intent is handled by the coordinator")
+        }
         DurableReplicaAction::Open { mode } => RuntimeEffect::Open { mode },
         DurableReplicaAction::Close => RuntimeEffect::Close,
         DurableReplicaAction::RevokeWriteStatus => RuntimeEffect::RevokeWriteStatus,
@@ -557,8 +1919,17 @@ fn correlated_runtime_effect(action: DurableReplicaAction) -> RuntimeEffect {
 }
 
 fn reject_agent_command(command: AgentCommand, error: KubericError) {
-    if let AgentCommand::ExecuteCorrelatedControlAction { reply, .. } = command {
-        let _ = reply.send(Err(error));
+    match command {
+        AgentCommand::ExecuteCorrelatedControlAction { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        AgentCommand::ExecuteAddBuildStage { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        AgentCommand::GetAddBuildStatus { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        AgentCommand::GetStatus { .. } => {}
     }
 }
 
@@ -615,6 +1986,8 @@ mod tests {
             configuration: None,
             election_configuration: None,
             deactivation_info: None,
+            build_observation: None,
+            quorum_wait_observation: None,
             partition_state: opened.then(|| Arc::new(PartitionState::new())),
         });
         (
@@ -642,6 +2015,7 @@ mod tests {
                 error_class: None,
                 error: None,
                 result: None,
+                add_replica_progress: None,
             },
         }
     }
@@ -670,6 +2044,43 @@ mod tests {
     ) -> Result<CorrelatedControlActionAcknowledgement> {
         let (reply_tx, reply_rx) = oneshot::channel();
         agent.accept_correlated(request, reply_tx);
+        reply_rx.await.unwrap()
+    }
+
+    fn peer_request(agent: &ReplicaAgent, message_id: &str) -> PeerStageRequest {
+        let mut request = PeerStageRequest {
+            protocol_version: REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+            operation_id: "operation".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            message_id: message_id.to_string(),
+            input_signature: String::new(),
+            stage: PeerStage::Prepare,
+            sender_replica_id: 9,
+            sender_instance_id: ReplicaInstanceId::new("sender"),
+            sender_agent_generation: AgentGeneration::parse("11111111111111111111111111111111")
+                .unwrap(),
+            sender_control_address: "http://127.0.0.1:1".to_string(),
+            parent_action_id: "parent".to_string(),
+            parent_action_signature: "parent-signature".to_string(),
+            target_replica_id: agent.replica_id,
+            target_instance_id: agent.instance_id.clone(),
+            expected_target_agent_generation: agent.generation.clone(),
+            expected_target_peer_control_version: agent.peer_control_version,
+            epoch: agent.runtime_status_rx.borrow().epoch,
+            configuration_fence: "configuration".to_string(),
+            build_key: None,
+            copy_lsn: None,
+        };
+        request.input_signature = request.signature();
+        request
+    }
+
+    async fn accept_peer(
+        agent: &mut ReplicaAgent,
+        request: PeerStageRequest,
+    ) -> Result<PeerStageObservation> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        agent.accept_peer_stage(request, reply_tx);
         reply_rx.await.unwrap()
     }
 
@@ -793,6 +2204,7 @@ mod tests {
                 error_class: None,
                 error: None,
                 result: None,
+                add_replica_progress: None,
             },
         });
         let request = request(&agent, "action", DurableReplicaAction::RevokeWriteStatus);
@@ -987,5 +2399,66 @@ mod tests {
             result: Ok(RuntimeEffectResult::Unit),
         });
         assert!(agent.active.is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_duplicate_conflict_and_version_fences_precede_effects() {
+        let (mut agent, mut runtime_rx) = test_agent(Epoch::new(1, 2), false);
+        let request = peer_request(&agent, "peer");
+        let duplicate = request.clone();
+        let accepted = accept_peer(&mut agent, request).await.unwrap();
+        assert_eq!(accepted.state, PeerStageState::Accepted);
+        let replay = accept_peer(&mut agent, duplicate.clone()).await.unwrap();
+        assert_eq!(replay.state, PeerStageState::InProgress);
+        assert_eq!(replay.message_id, accepted.message_id);
+        assert!(runtime_rx.try_recv().is_err());
+
+        let mut conflict = duplicate.clone();
+        conflict.attempt_id = "attempt-2".to_string();
+        conflict.input_signature = conflict.signature();
+        assert!(matches!(
+            accept_peer(&mut agent, conflict).await,
+            Err(KubericError::PeerStageIdConflict { .. })
+        ));
+
+        let mut unsupported = duplicate;
+        unsupported.protocol_version += 1;
+        assert!(matches!(
+            accept_peer(&mut agent, unsupported).await,
+            Err(KubericError::UnsupportedPeerProtocolVersion { .. })
+        ));
+
+        let mut other_sender = peer_request(&agent, "other-sender");
+        other_sender.expected_target_peer_control_version = agent.peer_control_version;
+        other_sender.sender_replica_id = 10;
+        other_sender.sender_instance_id = ReplicaInstanceId::new("other-primary");
+        other_sender.input_signature = other_sender.signature();
+        assert!(matches!(
+            accept_peer(&mut agent, other_sender).await,
+            Err(KubericError::PeerStageStale(_))
+        ));
+    }
+
+    #[test]
+    fn peer_status_is_generation_and_identity_fenced() {
+        let (agent, _runtime_rx) = test_agent(Epoch::new(1, 2), false);
+        assert!(
+            agent
+                .peer_status(
+                    agent.replica_id,
+                    agent.instance_id.clone(),
+                    agent.generation.clone(),
+                )
+                .is_ok()
+        );
+        assert!(
+            agent
+                .peer_status(
+                    agent.replica_id,
+                    ReplicaInstanceId::new("other"),
+                    agent.generation.clone(),
+                )
+                .is_err()
+        );
     }
 }
