@@ -143,13 +143,23 @@ reorder a runtime effect because no individual mutation RPC bypass exists.
 
 ---
 
-### A5. Synchronous BuildReplica and CatchUp Block Operator
+### A5. Synchronous BuildReplica and CatchUp Block Operator — ✅ Fixed for Add/Rebuild
 
 **Severity:** 🔴 Critical (for large datasets) / 🟢 OK for MVP
 **Affects:** Durable add/rebuild and catch-up workflow activities
 **Files:** `driver.rs`, `handle.rs`, `pod.rs`, `server.rs`, `quorum.rs`
 
-**Problem:** Two long-running operations block the operator synchronously:
+Replica add/rebuild no longer blocks the operator on these operations.
+`AddReplicaIntent` is accepted by the primary agent and runs in a background
+coordinator. `PodRuntime` tracks copy and catch-up-quorum waits through a
+command/completion loop, so status, cancellation, and compensation remain
+available.
+
+The direct correlated BuildReplica and quorum actions remain for unchanged
+creation/failover workflows. Their existing ownership is not migrated here.
+
+**Original problem:** Two long-running operations blocked the operator
+synchronously:
 
 1. **`build_replica`** — the operator calls a single gRPC unary RPC that
    holds open for the entire copy duration. For GBs of state, this is
@@ -183,37 +193,11 @@ SF uses a **fire-and-retry** pattern, NOT progress-based polling:
 Key insight: **no progress reporting** — just "done" or "still working."
 The FM monitors overall health (via heartbeats), not build progress.
 
-**Design (SF-aligned fire-and-retry):**
-
-```
-Current (synchronous, blocking):
-  operator ──BuildReplica RPC──► primary (blocks for hours) ──► response
-  operator ──WaitForCatchUp RPC──► primary (blocks until done/timeout) ──► response
-
-SF-aligned (fire-and-retry):
-  operator ──BuildReplica RPC──► primary (returns immediately)
-  operator ──GetStatus RPC──► primary (replica state: InBuild/Ready)
-  operator ──GetStatus RPC──► primary (replica state: Ready → done!)
-
-  Reconciler loop (every 10s):
-    1. Poll GetStatus on primary
-    2. If replica is Ready → proceed to next step
-    3. If replica is InBuild → requeue, keep waiting
-    4. If primary unreachable → cancel build, restart
-```
-
-**Implementation approach (simpler than previous design):**
-- `BuildReplica` RPC returns immediately after starting the background
-  copy task (which already runs in a spawned task — C0 fix).
-- `GetStatus` response adds per-replica build state (InBuild/Ready).
-- `wait_for_catch_up_quorum` stays as-is for now (short for small data),
-  but the reconciler wraps it with a timeout and requeue.
-- No progress fields needed for MVP — just state transitions.
-- Stall detection is the reconciler's health check timeout, not a
-  per-operation progress tracker.
-
-**This is a future architectural change.** Current synchronous approach
-is correct for MVP and small datasets. All tests pass with it.
+**Implemented shape:** The operator sends one coarse action to the primary,
+not BuildReplica or WaitForCatchUpQuorum individually. Primary status exposes
+coordinator phase and one exact build observation. Target stages use a
+dedicated peer protocol. Copy completion publishes its LSN boundary only after
+target acknowledgement; tracked quorum wait supports exact cancellation.
 
 ### A6. Uncommitted Operations Not Rolled Back on Epoch Change — ✅ Fixed
 
@@ -932,16 +916,16 @@ fail closed. Failover and other operations retain their existing paths.
 **Affects:** Reconciler scale-up and stale-secondary rejoin
 
 Replica add and rebuild now use the same bounded CRD-backed durability model as
-switchover, with a separate explicit protocol state machine. The checkpoint
-keeps the previous stable snapshot, candidate logical/incarnation identity,
-target snapshot, phase, pending correlated action, and bounded
-retry/deadline/error metadata.
+switchover, but its runtime sequence is now primary-agent-owned. The checkpoint
+keeps previous/target/committed snapshots, exact candidate identity, one
+structured frozen intent, one coarse pending action, generations/endpoints,
+configuration descriptors, build key, and deadlines.
 
-Open, Close, role/epoch changes, BuildReplica, exact-incarnation RemoveReplica,
-catch-up/current configuration, and quorum wait use correlated runtime
-activities. BuildReplica reports scheduled/in-progress/completed/failed and
-deduplicates exact retry while copy is active. The stable snapshot changes only
-after current configuration commits.
+The operator dispatches one `AddReplicaIntent` only to the current primary.
+That agent coordinates target Prepare/Activate/Cleanup through
+`ReplicaAddBuildPeer`, tracked copy, catch-up/current configuration, and
+quorum wait. Target process generation participates in build proof, so a
+same-Pod process restart recopies rather than activating from stale evidence.
 
 Stale-secondary rejoin removes the old exact primary connection before opening
 the replacement under the same logical ID. This follows Service Fabric's
@@ -950,11 +934,11 @@ BuildIdleReplica instance checks and in-build tracking
 ready instances complete successfully, stale requests are rejected, and an
 older instance is removed before a newer build proceeds.
 
-Compensation is phase-aware: pre-configuration failures remove/demote/close/
-delete the candidate; failures after catch-up configuration restore the
-previous current configuration first; and observed target current configuration
-rolls forward to target snapshot publication. Production failover and
-data-loss recovery now use their own durable Phase-1 operation.
+Compensation is commit-aware: previous configuration and target-connection
+absence must be proven before the operator deletes the pod. Failure to prove
+that barrier poisons and preserves the target. Current-configuration commit is
+roll-forward only; unattested committed membership becomes
+`CommittedDegraded` without a serving label and normal recovery takes over.
 
 ### E6. Replica removal state lost with operator process — ✅ Fixed
 
@@ -1041,6 +1025,12 @@ force-remove/rebuild protocol.
 correlation ledger. Individual mutation RPCs and `ExecuteDurableAction` are
 retired. Required numeric protocol-version mismatch fails closed, so operator
 and runtime deployment must be coordinated.
+
+Replica add/build adds one deliberately narrow peer surface on the same
+listener. The target reverse-observes the exact active parent action and
+primary identity/generation/epoch/role/write status before each local effect.
+This is not a general RA-to-RA reconfiguration framework; other distributed
+protocols remain operator-sequenced.
 
 ### E9. PostgreSQL correlated topology integration
 

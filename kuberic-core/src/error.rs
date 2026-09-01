@@ -112,6 +112,18 @@ pub enum KubericError {
     #[error("unsupported correlated control protocol version {got}")]
     UnsupportedControlProtocolVersion { got: u32 },
 
+    #[error("unsupported replica add/build peer protocol version {got}")]
+    UnsupportedPeerProtocolVersion { got: u32 },
+
+    #[error("peer stage message ID {message_id} was reused with different input")]
+    PeerStageIdConflict { message_id: String },
+
+    #[error("peer stage target mismatch: {0}")]
+    PeerStageTargetMismatch(String),
+
+    #[error("peer stage is stale: {0}")]
+    PeerStageStale(String),
+
     /// The command addresses another replica or replica incarnation.
     #[error(
         "correlated action target mismatch: expected replica {expected_id}@{expected_instance}, got {actual_id}@{actual_instance}"
@@ -160,6 +172,12 @@ pub enum KubericError {
     /// The remote endpoint does not support the requested control protocol.
     #[error("remote replica-agent protocol unsupported: {0}")]
     RemoteControlProtocolUnsupported(String),
+
+    #[error("remote replica add/build peer request rejected: {0}")]
+    RemotePeerRequestRejected(String),
+
+    #[error("remote replica add/build peer is unavailable: {0}")]
+    RemotePeerUnavailable(String),
 
     /// The remote agent retained a terminal action failure with its stable
     /// classification.

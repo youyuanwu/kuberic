@@ -72,7 +72,7 @@ no gRPC). Tests the event loop and handle APIs.
 **Infrastructure:** `KubericRuntime` with `WalReplicatorActor` (real
 quorum tracking, no gRPC).
 
-### PodRuntime (`pod.rs` — 1 test)
+### PodRuntime (`pod.rs`)
 
 | Test | What It Validates |
 |------|-------------------|
@@ -81,6 +81,9 @@ quorum tracking, no gRPC).
 **Infrastructure:** `PodRuntime::builder()` with real gRPC servers. Tests
 the dual-channel event delivery (lifecycle + state_provider) and the
 command routing from gRPC → ReplicaAgent → PodRuntime → replicator + user.
+Tracked background copy/quorum completion, cancellation, and responsive status
+are exercised indirectly by the high-fidelity reconciler add/rebuild tests and
+directly by the quorum tracker cancellation test.
 
 ### ReplicaAgent (`replica_agent.rs`)
 
@@ -95,6 +98,7 @@ checks:
 - 16-entry terminal/fault retention and 1,024-byte UTF-8 error bounds;
 - late execution-token rejection and best-effort fault saturation;
 - same-Pod new-process generation with no inherited action state; and
+- peer duplicate/conflict/version/identity fencing; and
 - missing/malformed/unsupported protocol rejection and transport error
   classes.
 
@@ -374,15 +378,23 @@ changes, terminal stable snapshot recovery, and unsupported checkpoint
 versions with no mutating RPC.
 
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
-`test_durable_add_survives_state_loss_and_every_lost_runtime_reply` replaces
-controller state at every boundary and injects lost responses for Open,
-UpdateEpoch, both role changes, BuildReplica, catch-up/current configuration,
-and quorum wait. Companion tests cover exact old-incarnation retirement,
-status conflict before intent, pre-configuration and dual-configuration
-compensation, and roll-forward after current configuration commits.
+`test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the
+single coarse operator-to-primary reply, replaces controller state, and proves
+one `AddReplicaIntent` with zero operator-to-target mutations. Companion tests
+cover exact old-incarnation retirement, status conflict before intent,
+primary-owned compensation, and roll-forward after current configuration
+commits.
 `test_scale_up_replays_writes_buffered_during_copy` additionally writes during
 the real copy window and verifies all buffered operations on the new
-secondary.
+secondary. `test_add_target_same_pod_process_restart_invalidates_build_proof`
+keeps the Pod UID, changes target process generation, and verifies that the old
+semantic build proof is not reused.
+
+Core coverage verifies peer accepted/in-progress replay, conflicting message
+IDs, target generation fences, configuration descriptor signatures, add
+protocol conversion, and execution-qualified quorum-wait cancellation.
+Schema tests assert that superseded fine-grained add phases/actions and
+compatibility sentinels are absent.
 
 **Adapter data-plane coverage** ✅
 `examples/sqlite/tests/correlated_replication.rs` covers multi-page WAL

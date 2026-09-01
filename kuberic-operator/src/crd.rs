@@ -243,6 +243,11 @@ pub enum StableReplicaRoleStatus {
 }
 
 pub const DURABLE_OPERATION_VERSION: u32 = 1;
+pub const ADD_REPLICA_OPERATION_VERSION: u32 = 2;
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -281,7 +286,7 @@ pub struct DurableOperationStatus {
     pub retired_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frozen_lsn: Option<i64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub next_secondary_index: u32,
     pub phase_deadline_unix_seconds: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,6 +295,57 @@ pub struct DurableOperationStatus {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failover: Option<DurableFailoverStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub add_intent: Option<Box<AddReplicaIntentStatus>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AddReplicaIntentStatus {
+    pub attempt: u32,
+    pub attempt_id: String,
+    pub action_id: String,
+    pub primary_instance_id: String,
+    pub primary_agent_generation: String,
+    pub primary_control_address: String,
+    pub target_agent_generation: String,
+    pub target_control_address: String,
+    pub target_replicator_address: String,
+    pub previous_configuration: ConfigurationDescriptorStatus,
+    pub catch_up_configuration: ConfigurationDescriptorStatus,
+    pub current_configuration: ConfigurationDescriptorStatus,
+    pub deadline_unix_seconds: i64,
+    pub compensation_deadline_unix_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_phase: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigurationDescriptorStatus {
+    pub members: Vec<ConfigurationMemberDescriptorStatus>,
+    pub write_quorum: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigurationMemberDescriptorStatus {
+    pub id: i64,
+    pub instance_id: String,
+    pub role: String,
+    pub status: String,
+    pub replicator_address: String,
+    pub must_catch_up: bool,
+    pub progress_source: ConfigurationProgressSourceStatus,
+    pub current_progress: i64,
+    pub catch_up_capability: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigurationProgressSourceStatus {
+    Frozen,
+    BuildCopyLsn,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -403,6 +459,13 @@ pub enum DurableRemoveMode {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DurableOperationPhase {
+    AddFreezeIntent,
+    AddDispatchIntent,
+    AddAwaitCoordination,
+    AddRecordCommit,
+    AddPublishTarget,
+    AddCommittedDegradedHandoff,
+    AddDeleteCompensatedTarget,
     CreateFenceRouting,
     CreateOpenPrimary,
     CreatePromotePrimary,
@@ -445,22 +508,7 @@ pub enum DurableOperationPhase {
     CompensateLabelOldPrimary,
     CompensateLabelTargetSecondary,
     CompensateFinalize,
-    RetireOldReplica,
-    OpenCandidate,
-    UpdateCandidateEpoch,
-    AssignCandidateIdle,
-    BuildCandidate,
-    AssignCandidateActive,
-    AddCatchUpConfiguration,
-    AddWaitForCatchUpQuorum,
-    AddCurrentConfiguration,
-    LabelCandidateSecondary,
     AddFinalize,
-    CompensateRestoreConfiguration,
-    CompensateRemoveCandidate,
-    CompensateDemoteCandidate,
-    CompensateCloseCandidate,
-    CompensateDeleteCandidate,
     AddCompensateFinalize,
     RemoveCatchUpConfiguration,
     RemoveWaitForCatchUpQuorum,
@@ -527,6 +575,7 @@ pub struct PendingActionStatus {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DurableActionKind {
+    AddReplicaIntent,
     CreateFencePod,
     CreateOpenPrimary,
     CreatePromotePrimary,
@@ -562,21 +611,6 @@ pub enum DurableActionKind {
     CompensateCurrentConfiguration,
     CompensateLabelOldPrimary,
     CompensateLabelTargetSecondary,
-    RetireOldReplica,
-    OpenCandidate,
-    UpdateCandidateEpoch,
-    AssignCandidateIdle,
-    BuildCandidate,
-    AssignCandidateActive,
-    AddCatchUpConfiguration,
-    AddWaitForCatchUpQuorum,
-    AddCurrentConfiguration,
-    LabelCandidateSecondary,
-    CompensateRestoreConfiguration,
-    CompensateRemoveCandidate,
-    CompensateDemoteCandidate,
-    CompensateCloseCandidate,
-    CompensateDeleteCandidate,
     RemoveCatchUpConfiguration,
     RemoveWaitForCatchUpQuorum,
     RemoveCurrentConfiguration,
@@ -608,6 +642,7 @@ pub struct DurablePostconditionStatus {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum DurablePostconditionKind {
+    AddReplicaCoordinated,
     WriteRevoked,
     Role,
     Epoch,
@@ -952,6 +987,61 @@ mod tests {
             serialized["dispatchActionPayload"],
             serde_json::json!("010203")
         );
+    }
+
+    #[test]
+    fn add_replica_schema_contains_coarse_intent_and_removes_fine_grained_cursor() {
+        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        let deployment = include_str!("../deploy/deployment.yaml");
+        for required in [
+            "addIntent",
+            "attemptId",
+            "actionId",
+            "primaryAgentGeneration",
+            "primaryControlAddress",
+            "targetAgentGeneration",
+            "targetControlAddress",
+            "targetReplicatorAddress",
+            "previousConfiguration",
+            "catchUpConfiguration",
+            "currentConfiguration",
+            "compensationDeadlineUnixSeconds",
+            "addFreezeIntent",
+            "addDispatchIntent",
+            "addAwaitCoordination",
+            "addRecordCommit",
+            "addPublishTarget",
+            "addCommittedDegradedHandoff",
+            "addDeleteCompensatedTarget",
+            "addReplicaIntent",
+            "addReplicaCoordinated",
+        ] {
+            assert!(generated.contains(required), "missing generated {required}");
+            assert!(
+                deployment.contains(required),
+                "missing deployment {required}"
+            );
+        }
+        for removed in [
+            "retireOldReplica",
+            "openCandidate",
+            "buildCandidate",
+            "assignCandidateActive",
+            "addCatchUpConfiguration",
+            "addWaitForCatchUpQuorum",
+            "addCurrentConfiguration",
+            "compensateRemoveCandidate",
+            "compensateCloseCandidate",
+        ] {
+            assert!(
+                !generated.contains(removed),
+                "generated schema retained {removed}"
+            );
+            assert!(
+                !deployment.contains(removed),
+                "deployment schema retained {removed}"
+            );
+        }
     }
 }
 

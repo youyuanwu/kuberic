@@ -6,9 +6,11 @@ Kubernetes operator for [Kuberic](../README.md). Manages `KubericSet` custom res
 
 1. Watches `KubericSet` CRDs (desired replica count, image, ports)
 2. Creates/deletes bare pods to match desired state
-3. Drives each pod through: Open → IdleSecondary → ActiveSecondary → Primary
+3. Persists durable topology intent and delegates ordered effects through each
+   pod's `ReplicaAgent`
 4. Detects pod failures and triggers automatic failover
-5. Supports scale up/down with copy-based replica building
+5. Sends one coarse scale-up/rebuild intent to the primary agent; scale-down
+   remains configuration-first and operator-sequenced
 
 ## CRD Example
 

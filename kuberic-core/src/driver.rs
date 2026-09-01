@@ -23,6 +23,7 @@ pub trait ReplicaHandle: Send + Sync {
     fn current_progress(&self) -> Lsn;
     fn catch_up_capability(&self) -> Lsn;
 
+    fn control_address(&self) -> String;
     fn replicator_address(&self) -> String;
 
     async fn get_status(&self) -> Result<ReplicaStatusInfo>;
@@ -380,6 +381,10 @@ mod tests {
             self.status.catch_up_capability.unwrap_or_default()
         }
 
+        fn control_address(&self) -> String {
+            format!("http://replica-{}-control", self.id)
+        }
+
         fn replicator_address(&self) -> String {
             format!("http://replica-{}", self.id)
         }
@@ -415,8 +420,11 @@ mod tests {
             election_configuration: None,
             deactivation_info: None,
             active_replica_connections: Vec::new(),
+            build_observation: None,
             agent: ReplicaAgentStatus {
                 protocol_version: CORRELATED_CONTROL_PROTOCOL_VERSION,
+                add_build_peer_protocol_version:
+                    crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
                 generation: AgentGeneration::from_string(format!("generation-{id}")),
                 control_version: AgentControlVersion::default(),
                 current_action: None,

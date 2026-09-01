@@ -116,6 +116,8 @@ message GetStatusResponse {
     CorrelatedActionObservationProto current_agent_action = 24;
     repeated CorrelatedActionObservationProto retained_terminal_actions = 25;
     repeated LocalFaultRecordProto local_faults = 26;
+    RuntimeBuildObservationProto build_observation = 27;
+    uint32 replica_add_build_peer_protocol_version = 28;
 }
 
 message ReplicaDeactivationInfoProto {
@@ -132,6 +134,13 @@ enum DurableActionResultProto {
     DURABLE_ACTION_RESULT_NONE = 0;
     DURABLE_ACTION_RESULT_DATA_LOSS_NO_STATE_CHANGE = 1;
     DURABLE_ACTION_RESULT_DATA_LOSS_STATE_CHANGED = 2;
+    DURABLE_ACTION_RESULT_ADD_REPLICA_COMMITTED = 3;
+    DURABLE_ACTION_RESULT_ADD_REPLICA_COMPENSATED = 4;
+    reserved 5;
+    reserved "DURABLE_ACTION_RESULT_ADD_REPLICA_REDRIVE_REQUIRED";
+    DURABLE_ACTION_RESULT_ADD_REPLICA_COMPENSATION_INCOMPLETE = 6;
+    reserved 7;
+    reserved "DURABLE_ACTION_RESULT_ADD_REPLICA_COMMITTED_DEGRADED";
 }
 
 enum DurableActionErrorClassProto {
@@ -211,6 +220,7 @@ message CorrelatedActionObservationProto {
     string error = 7;
     DurableActionResultProto result = 8;
     DurableActionErrorClassProto error_class = 9;
+    AddReplicaProgressProto add_replica_progress = 10;
 }
 
 message LocalFaultRecordProto {
@@ -240,11 +250,183 @@ message ExecuteCorrelatedControlActionRequest {
         RemoveReplicaRequest remove_replica = 29;
         DurableOnDataLossRequest on_data_loss = 30;
         RecordElectionConfigurationRequest record_election_configuration = 31;
+        AddReplicaIntentProto add_replica_intent = 32;
     }
 }
 
 message ExecuteCorrelatedControlActionResponse {
     CorrelatedActionObservationProto observation = 1;
+}
+
+enum AddReplicaModeProto {
+    ADD_REPLICA_MODE_UNKNOWN = 0;
+    ADD_REPLICA_MODE_SCALE_UP = 1;
+    ADD_REPLICA_MODE_REBUILD = 2;
+}
+
+enum ConfigurationProgressSourceProto {
+    CONFIGURATION_PROGRESS_UNKNOWN = 0;
+    CONFIGURATION_PROGRESS_FROZEN = 1;
+    CONFIGURATION_PROGRESS_BUILD_COPY_LSN = 2;
+}
+
+message ConfigurationMemberDescriptorProto {
+    int64 id = 1;
+    string instance_id = 2;
+    RoleProto role = 3;
+    ReplicaStatusProto status = 4;
+    string replicator_address = 5;
+    bool must_catch_up = 6;
+    ConfigurationProgressSourceProto progress_source = 7;
+    int64 current_progress = 8;
+    int64 catch_up_capability = 9;
+}
+
+message ConfigurationDescriptorProto {
+    repeated ConfigurationMemberDescriptorProto members = 1;
+    uint32 write_quorum = 2;
+}
+
+message AddReplicaIntentProto {
+    string operation_id = 1;
+    string attempt_id = 2;
+    AddReplicaModeProto mode = 3;
+    EpochProto epoch = 4;
+    int64 primary_replica_id = 5;
+    string primary_instance_id = 6;
+    string primary_agent_generation = 7;
+    string primary_control_address = 8;
+    int64 target_replica_id = 9;
+    string target_instance_id = 10;
+    string target_agent_generation = 11;
+    string target_control_address = 12;
+    string target_replicator_address = 13;
+    optional string retired_instance_id = 14;
+    ConfigurationDescriptorProto previous_configuration = 15;
+    ConfigurationDescriptorProto catch_up_configuration = 16;
+    ConfigurationDescriptorProto current_configuration = 17;
+    uint32 minimum_committed_replicas = 18;
+    int64 deadline_unix_seconds = 19;
+    int64 compensation_deadline_unix_seconds = 20;
+}
+
+enum AddReplicaCoordinatorPhaseProto {
+    ADD_REPLICA_PHASE_UNKNOWN = 0;
+    ADD_REPLICA_PHASE_VALIDATING = 1;
+    ADD_REPLICA_PHASE_RETIRING_OLD_CONNECTION = 2;
+    ADD_REPLICA_PHASE_PREPARING_TARGET = 3;
+    ADD_REPLICA_PHASE_BUILDING = 4;
+    ADD_REPLICA_PHASE_ACTIVATING_TARGET = 5;
+    ADD_REPLICA_PHASE_INSTALLING_CATCH_UP_CONFIGURATION = 6;
+    ADD_REPLICA_PHASE_WAITING_FOR_CATCH_UP_QUORUM = 7;
+    ADD_REPLICA_PHASE_INSTALLING_CURRENT_CONFIGURATION = 8;
+    ADD_REPLICA_PHASE_ATTESTING = 9;
+    ADD_REPLICA_PHASE_COMPENSATING = 10;
+}
+
+message AddReplicaProgressProto {
+    AddReplicaCoordinatorPhaseProto phase = 1;
+    bool commit_observed = 2;
+    optional int64 copy_lsn = 3;
+}
+
+enum RuntimeBuildStateProto {
+    RUNTIME_BUILD_STATE_UNKNOWN = 0;
+    RUNTIME_BUILD_STATE_IN_PROGRESS = 1;
+    RUNTIME_BUILD_STATE_COMPLETED = 2;
+    RUNTIME_BUILD_STATE_FAILED = 3;
+    RUNTIME_BUILD_STATE_CANCELLED = 4;
+}
+
+message RuntimeBuildObservationProto {
+    string execution_id = 1;
+    string build_key = 2;
+    int64 target_replica_id = 3;
+    string target_instance_id = 4;
+    string target_agent_generation = 5;
+    RuntimeBuildStateProto state = 6;
+    optional int64 copy_lsn = 7;
+    optional string error = 8;
+}
+
+enum PeerStageProto {
+    PEER_STAGE_UNKNOWN = 0;
+    PEER_STAGE_PREPARE = 1;
+    PEER_STAGE_ACTIVATE = 2;
+    PEER_STAGE_CLEANUP = 3;
+}
+
+enum PeerStageStateProto {
+    PEER_STAGE_STATE_UNKNOWN = 0;
+    PEER_STAGE_STATE_ACCEPTED = 1;
+    PEER_STAGE_STATE_IN_PROGRESS = 2;
+    PEER_STAGE_STATE_COMPLETED = 3;
+    PEER_STAGE_STATE_FAILED = 4;
+    PEER_STAGE_STATE_STALE = 5;
+}
+
+message PeerStageObservationProto {
+    uint32 protocol_version = 1;
+    string message_id = 2;
+    string input_signature = 3;
+    PeerStageProto stage = 4;
+    PeerStageStateProto state = 5;
+    string target_agent_generation = 6;
+    uint64 target_peer_control_version = 7;
+    optional string error = 8;
+}
+
+message GetAddBuildStatusRequest {
+    uint32 protocol_version = 1;
+    int64 target_replica_id = 2;
+    string target_instance_id = 3;
+    string expected_target_agent_generation = 4;
+}
+
+message GetAddBuildStatusResponse {
+    uint32 protocol_version = 1;
+    int64 target_replica_id = 2;
+    string target_instance_id = 3;
+    string agent_generation = 4;
+    uint64 peer_control_version = 5;
+    RoleProto role = 6;
+    EpochProto epoch = 7;
+    bool healthy = 8;
+    int64 current_progress = 9;
+    PeerStageObservationProto current_action = 10;
+    repeated PeerStageObservationProto retained_terminal_actions = 11;
+}
+
+message ExecuteAddBuildStageRequest {
+    uint32 protocol_version = 1;
+    string operation_id = 2;
+    string attempt_id = 3;
+    string message_id = 4;
+    string input_signature = 5;
+    PeerStageProto stage = 6;
+    int64 sender_replica_id = 7;
+    string sender_instance_id = 8;
+    string sender_agent_generation = 9;
+    string sender_control_address = 10;
+    string parent_action_id = 11;
+    string parent_action_signature = 12;
+    int64 target_replica_id = 13;
+    string target_instance_id = 14;
+    string expected_target_agent_generation = 15;
+    uint64 expected_target_peer_control_version = 16;
+    EpochProto epoch = 17;
+    string configuration_fence = 18;
+    optional string build_key = 19;
+    optional int64 copy_lsn = 20;
+}
+
+message ExecuteAddBuildStageResponse {
+    PeerStageObservationProto observation = 1;
+}
+
+service ReplicaAddBuildPeer {
+    rpc GetAddBuildStatus(GetAddBuildStatusRequest) returns (GetAddBuildStatusResponse);
+    rpc ExecuteAddBuildStage(ExecuteAddBuildStageRequest) returns (ExecuteAddBuildStageResponse);
 }
 
 // ---- Data plane: Pod ↔ Pod (replication + copy) ----

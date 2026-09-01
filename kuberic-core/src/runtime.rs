@@ -288,6 +288,7 @@ impl KubericRuntime {
         self.send_control(|reply| ReplicatorControlEvent::UpdateCatchUpConfiguration {
             current,
             previous,
+            required_build_key: None,
             reply,
         })
         .await
@@ -308,13 +309,23 @@ impl KubericRuntime {
         &self,
         mode: crate::types::ReplicaSetQuorumMode,
     ) -> Result<()> {
-        self.send_control(|reply| ReplicatorControlEvent::WaitForCatchUpQuorum { mode, reply })
-            .await
+        self.send_control(|reply| ReplicatorControlEvent::WaitForCatchUpQuorum {
+            wait_id: None,
+            mode,
+            reply,
+        })
+        .await
     }
 
     pub async fn build_replica(&self, replica: crate::types::ReplicaInfo) -> Result<()> {
-        self.send_control(|reply| ReplicatorControlEvent::BuildReplica { replica, reply })
-            .await
+        self.send_control(|reply| ReplicatorControlEvent::BuildReplica {
+            replica,
+            build_key: None,
+            cancellation: CancellationToken::new(),
+            reply,
+        })
+        .await
+        .map(|_| ())
     }
 
     pub async fn remove_replica(

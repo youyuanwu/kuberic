@@ -42,6 +42,7 @@ pub enum ReplicatorControlEvent {
     UpdateCatchUpConfiguration {
         current: ReplicaSetConfig,
         previous: ReplicaSetConfig,
+        required_build_key: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
     UpdateCurrentConfiguration {
@@ -49,12 +50,19 @@ pub enum ReplicatorControlEvent {
         reply: oneshot::Sender<Result<()>>,
     },
     WaitForCatchUpQuorum {
+        wait_id: Option<String>,
         mode: ReplicaSetQuorumMode,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    CancelCatchUpQuorumWait {
+        wait_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
     BuildReplica {
         replica: ReplicaInfo,
-        reply: oneshot::Sender<Result<()>>,
+        build_key: Option<String>,
+        cancellation: crate::types::CancellationToken,
+        reply: oneshot::Sender<Result<Lsn>>,
     },
     RemoveReplica {
         replica_id: ReplicaId,

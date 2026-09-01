@@ -245,15 +245,21 @@ created at Open time (`ReplicatorHandle::data_address()`).
 ## Pod-Local Control Boundary
 
 `PodRuntimeBuilder::build()` starts both `ReplicaAgent` and `PodRuntime`
-without changing `PodRuntimeBundle`. The gRPC server exposes `GetStatus` and
-`ExecuteCorrelatedControlAction`; only effect commands from the agent reach
-the runtime.
+without changing `PodRuntimeBundle`. The control listener hosts
+`ReplicatorControl` (`GetStatus` and `ExecuteCorrelatedControlAction`) plus the
+internal add/build-only `ReplicaAddBuildPeer` service. Only effect commands
+from the local agent reach the runtime.
 
 `ReplicaHandle::execute_correlated_control_action()` is the sole public
-mutation method. Its request includes required protocol version 1, target Pod
+operator mutation method. Its request includes required protocol version 2, target Pod
 UID, agent generation, agent control version, observed runtime epoch,
 deterministic action ID/signature, and the coarse `DurableReplicaAction`.
 Individual mutation RPCs and `execute_durable_action()` are retired.
+
+`AddReplicaIntent` is the only compound action. It is addressed to the current
+primary and freezes the target identity/generation, peer and data endpoints,
+old incarnation for rebuild, structural configuration, quorum, minimum, and
+deadlines. The target peer protocol is version 1 and is not an application API.
 
 The agent serializes correlated actions and keeps status readable while an
 effect runs. It does not change the lifecycle ordering below: `PodRuntime`

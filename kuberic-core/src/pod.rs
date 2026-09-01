@@ -10,9 +10,10 @@ use crate::events::{LifecycleEvent, ReplicatorControlEvent};
 use crate::handles::PartitionState;
 use crate::replicator::{OpenContext, ReplicatorHandle};
 use crate::types::{
-    AccessStatus, CancellationToken, DataLossAction, Epoch, OpenMode, ReplicaConfigurationMode,
-    ReplicaConfigurationStatus, ReplicaDeactivationInfo, ReplicaElectionConfiguration, ReplicaId,
-    ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    AccessStatus, CancellationToken, DataLossAction, Epoch, Lsn, OpenMode,
+    ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaDeactivationInfo,
+    ReplicaElectionConfiguration, ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
+    ReplicaSetQuorumMode, Role,
 };
 
 const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,6 +40,11 @@ pub enum RuntimeEffect {
         current: ReplicaSetConfig,
         previous: ReplicaSetConfig,
     },
+    UpdateTrackedCatchUpConfiguration {
+        current: ReplicaSetConfig,
+        previous: ReplicaSetConfig,
+        required_build_key: String,
+    },
     UpdateCurrentConfiguration {
         current: ReplicaSetConfig,
     },
@@ -47,6 +53,19 @@ pub enum RuntimeEffect {
     },
     BuildReplica {
         replica: ReplicaInfo,
+    },
+    StartTrackedBuild {
+        execution_id: String,
+        build_key: String,
+        target_agent_generation: crate::types::AgentGeneration,
+        replica: ReplicaInfo,
+    },
+    StartTrackedCatchUpQuorum {
+        execution_id: String,
+        mode: ReplicaSetQuorumMode,
+    },
+    CancelTrackedOperation {
+        execution_id: String,
     },
     RemoveReplica {
         replica_id: ReplicaId,
@@ -81,7 +100,29 @@ pub struct RuntimeControlSnapshot {
     pub configuration: Option<ReplicaConfigurationStatus>,
     pub election_configuration: Option<ReplicaElectionConfiguration>,
     pub deactivation_info: Option<ReplicaDeactivationInfo>,
+    pub build_observation: Option<crate::add_replica::RuntimeBuildObservation>,
+    pub quorum_wait_observation: Option<crate::add_replica::RuntimeQuorumWaitObservation>,
     pub partition_state: Option<Arc<PartitionState>>,
+}
+
+enum TrackedRuntimeKind {
+    Build { cancellation: CancellationToken },
+    CatchUpQuorum,
+}
+
+struct ActiveTrackedRuntime {
+    execution_id: String,
+    kind: TrackedRuntimeKind,
+}
+
+enum TrackedRuntimeResult {
+    Build(Result<Lsn>),
+    CatchUpQuorum(Result<()>),
+}
+
+struct TrackedRuntimeCompletion {
+    execution_id: String,
+    result: TrackedRuntimeResult,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +143,11 @@ pub struct PodRuntime {
     configuration: Option<ReplicaConfigurationStatus>,
     election_configuration: Option<ReplicaElectionConfiguration>,
     deactivation_info: Option<ReplicaDeactivationInfo>,
+    build_observation: Option<crate::add_replica::RuntimeBuildObservation>,
+    quorum_wait_observation: Option<crate::add_replica::RuntimeQuorumWaitObservation>,
+    active_tracked: Option<ActiveTrackedRuntime>,
+    tracked_completion_tx: mpsc::UnboundedSender<TrackedRuntimeCompletion>,
+    tracked_completion_rx: mpsc::UnboundedReceiver<TrackedRuntimeCompletion>,
     fault_tx: mpsc::Sender<crate::types::FaultType>,
     status_tx: watch::Sender<RuntimeControlSnapshot>,
 }
@@ -165,14 +211,18 @@ impl PodRuntimeBuilder {
             configuration: None,
             election_configuration: None,
             deactivation_info: None,
+            build_observation: None,
+            quorum_wait_observation: None,
             partition_state: None,
         };
         let (status_tx, status_rx) = watch::channel(initial_status);
+        let (tracked_completion_tx, tracked_completion_rx) = mpsc::unbounded_channel();
 
         // Control plane gRPC server routes through the pod-local agent.
         // PartitionState is not available yet — it's created by the replicator
         // at Open time. ControlServer needs to work without it initially.
-        let control_server = crate::grpc::server::ControlServer::new(agent_tx);
+        let control_server = crate::grpc::server::ControlServer::new(agent_tx.clone());
+        let peer_server = crate::grpc::peer_server::PeerServer::new(agent_tx);
         let replica_agent = crate::replica_agent::ReplicaAgent::new(
             self.replica_id,
             self.instance_id.clone(),
@@ -195,6 +245,11 @@ impl PodRuntimeBuilder {
                 .add_service(
                     crate::proto::replicator_control_server::ReplicatorControlServer::new(
                         control_server,
+                    ),
+                )
+                .add_service(
+                    crate::proto::replica_add_build_peer_server::ReplicaAddBuildPeerServer::new(
+                        peer_server,
                     ),
                 )
                 .serve_with_incoming_shutdown(
@@ -226,6 +281,11 @@ impl PodRuntimeBuilder {
             configuration: None,
             election_configuration: None,
             deactivation_info: None,
+            build_observation: None,
+            quorum_wait_observation: None,
+            active_tracked: None,
+            tracked_completion_tx,
+            tracked_completion_rx,
             fault_tx,
             status_tx,
         };
@@ -253,10 +313,44 @@ impl PodRuntime {
     /// Blocks until shutdown.
     pub async fn serve(mut self) {
         info!("PodRuntime serve loop started");
-        while let Some(command) = self.cmd_rx.recv().await {
-            let result = self.execute_effect(command.effect).await;
-            self.publish_status();
-            let _ = command.reply.send(result);
+        loop {
+            tokio::select! {
+                biased;
+                completion = self.tracked_completion_rx.recv() => {
+                    let Some(completion) = completion else {
+                        break;
+                    };
+                    self.handle_tracked_completion(completion);
+                    self.publish_status();
+                }
+                command = self.cmd_rx.recv() => {
+                    let Some(command) = command else {
+                        break;
+                    };
+                    let result = match command.effect {
+                        RuntimeEffect::StartTrackedBuild {
+                            execution_id,
+                            build_key,
+                            target_agent_generation,
+                            replica,
+                        } => self.start_tracked_build(
+                            execution_id,
+                            build_key,
+                            target_agent_generation,
+                            replica,
+                        ),
+                        RuntimeEffect::StartTrackedCatchUpQuorum { execution_id, mode } => {
+                            self.start_tracked_catch_up_quorum(execution_id, mode)
+                        }
+                        RuntimeEffect::CancelTrackedOperation { execution_id } => {
+                            self.cancel_tracked_operation(&execution_id).await
+                        }
+                        effect => self.execute_effect(effect).await,
+                    };
+                    self.publish_status();
+                    let _ = command.reply.send(result);
+                }
+            }
         }
         self.shutdown.cancel();
     }
@@ -280,6 +374,36 @@ impl PodRuntime {
                         ReplicatorControlEvent::UpdateCatchUpConfiguration {
                             current,
                             previous,
+                            required_build_key: None,
+                            reply,
+                        }
+                    })
+                    .await;
+                if result.is_ok() && self.role == Role::Primary {
+                    self.require_handle()?
+                        .state()
+                        .set_write_status(AccessStatus::Granted);
+                }
+                if result.is_ok() {
+                    self.configuration = Some(observed_configuration);
+                }
+                result
+            }
+            RuntimeEffect::UpdateTrackedCatchUpConfiguration {
+                current,
+                previous,
+                required_build_key,
+            } => {
+                let observed_configuration = ReplicaConfigurationStatus::from_config(
+                    ReplicaConfigurationMode::CatchUp,
+                    &current,
+                );
+                let result = self
+                    .send_replicator_control(|reply| {
+                        ReplicatorControlEvent::UpdateCatchUpConfiguration {
+                            current,
+                            previous,
+                            required_build_key: Some(required_build_key),
                             reply,
                         }
                     })
@@ -316,18 +440,24 @@ impl PodRuntime {
             }
             RuntimeEffect::WaitForCatchUpQuorum { mode } => {
                 self.send_replicator_control(|reply| ReplicatorControlEvent::WaitForCatchUpQuorum {
+                    wait_id: None,
                     mode,
                     reply,
                 })
                 .await
             }
-            RuntimeEffect::BuildReplica { replica } => {
-                self.send_replicator_control_with_timeout(
-                    |reply| ReplicatorControlEvent::BuildReplica { replica, reply },
+            RuntimeEffect::BuildReplica { replica } => self
+                .send_replicator_control_with_timeout(
+                    |reply| ReplicatorControlEvent::BuildReplica {
+                        replica,
+                        build_key: None,
+                        cancellation: CancellationToken::new(),
+                        reply,
+                    },
                     BUILD_REPLY_TIMEOUT,
                 )
                 .await
-            }
+                .map(|_| ()),
             RuntimeEffect::RemoveReplica {
                 replica_id,
                 instance_id,
@@ -356,8 +486,243 @@ impl PodRuntime {
                 self.election_configuration = Some(configuration);
                 Ok(())
             }
+            RuntimeEffect::StartTrackedBuild { .. }
+            | RuntimeEffect::StartTrackedCatchUpQuorum { .. }
+            | RuntimeEffect::CancelTrackedOperation { .. } => {
+                unreachable!("tracked runtime effects are handled by the serve loop")
+            }
         };
         result.map(|()| RuntimeEffectResult::Unit)
+    }
+
+    fn start_tracked_build(
+        &mut self,
+        execution_id: String,
+        build_key: String,
+        target_agent_generation: crate::types::AgentGeneration,
+        replica: ReplicaInfo,
+    ) -> Result<RuntimeEffectResult> {
+        if execution_id.is_empty() || build_key.is_empty() {
+            return Err(KubericError::Internal(
+                "tracked build identity must not be empty".into(),
+            ));
+        }
+        if let Some(observation) = &self.build_observation {
+            let exact = observation.build_key == build_key
+                && observation.target_replica_id == replica.id
+                && observation.target_instance_id == replica.instance_id
+                && observation.target_agent_generation == target_agent_generation;
+            if exact {
+                return match observation.state {
+                    crate::add_replica::RuntimeBuildState::InProgress
+                    | crate::add_replica::RuntimeBuildState::Completed => {
+                        Ok(RuntimeEffectResult::Unit)
+                    }
+                    crate::add_replica::RuntimeBuildState::Failed
+                    | crate::add_replica::RuntimeBuildState::Cancelled => {
+                        Err(KubericError::Internal(
+                            observation
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "tracked build did not complete".to_string())
+                                .into(),
+                        ))
+                    }
+                };
+            }
+            if observation.execution_id == execution_id {
+                return Err(KubericError::ActionIdConflict {
+                    action_id: execution_id,
+                });
+            }
+        }
+        if self.active_tracked.is_some() {
+            return Err(KubericError::AgentBusy);
+        }
+        let handle = self.require_handle()?.clone();
+        let cancellation = CancellationToken::new();
+        self.build_observation = Some(crate::add_replica::RuntimeBuildObservation {
+            execution_id: execution_id.clone(),
+            build_key: build_key.clone(),
+            target_replica_id: replica.id,
+            target_instance_id: replica.instance_id.clone(),
+            target_agent_generation,
+            state: crate::add_replica::RuntimeBuildState::InProgress,
+            copy_lsn: None,
+            error: None,
+        });
+        self.active_tracked = Some(ActiveTrackedRuntime {
+            execution_id: execution_id.clone(),
+            kind: TrackedRuntimeKind::Build {
+                cancellation: cancellation.clone(),
+            },
+        });
+        let completion_tx = self.tracked_completion_tx.clone();
+        tokio::spawn(async move {
+            let result = handle
+                .send_control(
+                    |reply| ReplicatorControlEvent::BuildReplica {
+                        replica,
+                        build_key: Some(build_key),
+                        cancellation,
+                        reply,
+                    },
+                    BUILD_REPLY_TIMEOUT,
+                )
+                .await;
+            let _ = completion_tx.send(TrackedRuntimeCompletion {
+                execution_id,
+                result: TrackedRuntimeResult::Build(result),
+            });
+        });
+        Ok(RuntimeEffectResult::Unit)
+    }
+
+    fn start_tracked_catch_up_quorum(
+        &mut self,
+        execution_id: String,
+        mode: ReplicaSetQuorumMode,
+    ) -> Result<RuntimeEffectResult> {
+        if execution_id.is_empty() {
+            return Err(KubericError::Internal(
+                "tracked quorum wait identity must not be empty".into(),
+            ));
+        }
+        if let Some(observation) = &self.quorum_wait_observation
+            && observation.execution_id == execution_id
+        {
+            return match observation.state {
+                crate::add_replica::RuntimeBuildState::InProgress
+                | crate::add_replica::RuntimeBuildState::Completed => Ok(RuntimeEffectResult::Unit),
+                crate::add_replica::RuntimeBuildState::Failed
+                | crate::add_replica::RuntimeBuildState::Cancelled => Err(KubericError::Internal(
+                    observation
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "tracked quorum wait did not complete".to_string())
+                        .into(),
+                )),
+            };
+        }
+        if self.active_tracked.is_some() {
+            return Err(KubericError::AgentBusy);
+        }
+        let handle = self.require_handle()?.clone();
+        self.quorum_wait_observation = Some(crate::add_replica::RuntimeQuorumWaitObservation {
+            execution_id: execution_id.clone(),
+            state: crate::add_replica::RuntimeBuildState::InProgress,
+            error: None,
+        });
+        self.active_tracked = Some(ActiveTrackedRuntime {
+            execution_id: execution_id.clone(),
+            kind: TrackedRuntimeKind::CatchUpQuorum,
+        });
+        let completion_tx = self.tracked_completion_tx.clone();
+        tokio::spawn(async move {
+            let wait_id = execution_id.clone();
+            let result = handle
+                .send_control(
+                    |reply| ReplicatorControlEvent::WaitForCatchUpQuorum {
+                        wait_id: Some(wait_id),
+                        mode,
+                        reply,
+                    },
+                    BUILD_REPLY_TIMEOUT,
+                )
+                .await;
+            let _ = completion_tx.send(TrackedRuntimeCompletion {
+                execution_id,
+                result: TrackedRuntimeResult::CatchUpQuorum(result),
+            });
+        });
+        Ok(RuntimeEffectResult::Unit)
+    }
+
+    async fn cancel_tracked_operation(
+        &mut self,
+        execution_id: &str,
+    ) -> Result<RuntimeEffectResult> {
+        let Some(active) = &self.active_tracked else {
+            return Ok(RuntimeEffectResult::Unit);
+        };
+        if active.execution_id != execution_id {
+            return Err(KubericError::AgentBusy);
+        }
+        match &active.kind {
+            TrackedRuntimeKind::Build { cancellation } => cancellation.cancel(),
+            TrackedRuntimeKind::CatchUpQuorum => {
+                self.send_replicator_control(|reply| {
+                    ReplicatorControlEvent::CancelCatchUpQuorumWait {
+                        wait_id: execution_id.to_string(),
+                        reply,
+                    }
+                })
+                .await?;
+            }
+        }
+        Ok(RuntimeEffectResult::Unit)
+    }
+
+    fn handle_tracked_completion(&mut self, completion: TrackedRuntimeCompletion) {
+        let Some(active) = self.active_tracked.take() else {
+            warn!(
+                execution_id = completion.execution_id,
+                "discarding tracked runtime completion without active operation"
+            );
+            return;
+        };
+        if active.execution_id != completion.execution_id {
+            warn!(
+                expected = active.execution_id,
+                actual = completion.execution_id,
+                "discarding stale tracked runtime completion"
+            );
+            self.active_tracked = Some(active);
+            return;
+        }
+        match completion.result {
+            TrackedRuntimeResult::Build(result) => {
+                let Some(observation) = self.build_observation.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(copy_lsn) => {
+                        observation.state = crate::add_replica::RuntimeBuildState::Completed;
+                        observation.copy_lsn = Some(copy_lsn);
+                        observation.error = None;
+                    }
+                    Err(error) => {
+                        observation.state = if matches!(error, KubericError::Cancelled) {
+                            crate::add_replica::RuntimeBuildState::Cancelled
+                        } else {
+                            crate::add_replica::RuntimeBuildState::Failed
+                        };
+                        observation.error =
+                            Some(crate::add_replica::normalize_add_error(&error.to_string()));
+                    }
+                }
+            }
+            TrackedRuntimeResult::CatchUpQuorum(result) => {
+                let Some(observation) = self.quorum_wait_observation.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(()) => {
+                        observation.state = crate::add_replica::RuntimeBuildState::Completed;
+                        observation.error = None;
+                    }
+                    Err(error) => {
+                        observation.state = if matches!(error, KubericError::Cancelled) {
+                            crate::add_replica::RuntimeBuildState::Cancelled
+                        } else {
+                            crate::add_replica::RuntimeBuildState::Failed
+                        };
+                        observation.error =
+                            Some(crate::add_replica::normalize_add_error(&error.to_string()));
+                    }
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -619,6 +984,8 @@ impl PodRuntime {
             configuration: self.configuration.clone(),
             election_configuration: self.election_configuration.clone(),
             deactivation_info: self.deactivation_info,
+            build_observation: self.build_observation.clone(),
+            quorum_wait_observation: self.quorum_wait_observation.clone(),
             partition_state: self
                 .replicator_handle
                 .as_ref()

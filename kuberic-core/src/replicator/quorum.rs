@@ -54,6 +54,7 @@ pub struct QuorumTracker {
 }
 
 struct CatchUpWaiter {
+    id: Option<String>,
     mode: crate::types::ReplicaSetQuorumMode,
     reply: oneshot::Sender<Result<()>>,
     deadline: Instant,
@@ -302,17 +303,57 @@ impl QuorumTracker {
         mode: crate::types::ReplicaSetQuorumMode,
         reply: oneshot::Sender<Result<()>>,
     ) {
+        self.wait_for_catch_up_inner(None, mode, reply);
+    }
+
+    pub fn wait_for_catch_up_tracked(
+        &mut self,
+        id: String,
+        mode: crate::types::ReplicaSetQuorumMode,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
+        if let Some(index) = self
+            .catch_up_waiters
+            .iter()
+            .position(|waiter| waiter.id.as_deref() == Some(id.as_str()))
+        {
+            let old = self.catch_up_waiters.remove(index);
+            let _ = old.reply.send(Err(KubericError::Cancelled));
+        }
+        self.wait_for_catch_up_inner(Some(id), mode, reply);
+    }
+
+    fn wait_for_catch_up_inner(
+        &mut self,
+        id: Option<String>,
+        mode: crate::types::ReplicaSetQuorumMode,
+        reply: oneshot::Sender<Result<()>>,
+    ) {
         if self.catch_up_attempt_failed() {
             let _ = reply.send(Err(KubericError::NoWriteQuorum));
         } else if self.is_caught_up(mode) {
             let _ = reply.send(Ok(()));
         } else {
             self.catch_up_waiters.push(CatchUpWaiter {
+                id,
                 mode,
                 reply,
                 deadline: Instant::now() + self.quorum_timeout,
             });
         }
+    }
+
+    pub fn cancel_catch_up_wait(&mut self, id: &str) -> bool {
+        let Some(index) = self
+            .catch_up_waiters
+            .iter()
+            .position(|waiter| waiter.id.as_deref() == Some(id))
+        else {
+            return false;
+        };
+        let waiter = self.catch_up_waiters.remove(index);
+        let _ = waiter.reply.send(Err(KubericError::Cancelled));
+        true
     }
 
     /// Earliest pending operation or catch-up deadline.
@@ -819,6 +860,43 @@ mod tests {
             wait_rx.await.unwrap(),
             Err(KubericError::NoWriteQuorum)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tracked_catch_up_waiter_can_be_cancelled_without_accumulating() {
+        let mut tracker = QuorumTracker::with_timeout(Duration::from_secs(30));
+        tracker.set_catch_up_configuration(
+            HashSet::from([1, 2]),
+            2,
+            HashSet::from([1]),
+            1,
+            HashSet::from([2]),
+            HashMap::from([(2, 0)]),
+        );
+        tracker.highest_lsn = 1;
+        tracker.catch_up_baseline_lsn = 0;
+
+        let (first_tx, first_rx) = oneshot::channel();
+        tracker.wait_for_catch_up_tracked(
+            "wait".to_string(),
+            crate::types::ReplicaSetQuorumMode::Write,
+            first_tx,
+        );
+        assert_eq!(tracker.catch_up_waiters.len(), 1);
+        assert!(tracker.cancel_catch_up_wait("wait"));
+        assert!(matches!(
+            first_rx.await.unwrap(),
+            Err(KubericError::Cancelled)
+        ));
+        assert!(tracker.catch_up_waiters.is_empty());
+
+        let (second_tx, _second_rx) = oneshot::channel();
+        tracker.wait_for_catch_up_tracked(
+            "wait".to_string(),
+            crate::types::ReplicaSetQuorumMode::Write,
+            second_tx,
+        );
+        assert_eq!(tracker.catch_up_waiters.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

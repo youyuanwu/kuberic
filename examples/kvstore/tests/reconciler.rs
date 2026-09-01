@@ -62,6 +62,7 @@ struct LivePod {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlOperation {
+    AddReplicaIntent,
     Open,
     Close,
     ChangeRole,
@@ -81,6 +82,7 @@ enum ControlOperation {
 enum InjectedStatusError {
     UnsupportedProtocol,
     MalformedAgentStatus,
+    Unavailable,
 }
 
 struct ObservedHandle {
@@ -98,6 +100,7 @@ impl ObservedHandle {
 
     fn operation_for(action: &DurableReplicaAction) -> ControlOperation {
         match action {
+            DurableReplicaAction::AddReplicaIntent { .. } => ControlOperation::AddReplicaIntent,
             DurableReplicaAction::Open { .. } => ControlOperation::Open,
             DurableReplicaAction::Close => ControlOperation::Close,
             DurableReplicaAction::RevokeWriteStatus => ControlOperation::RevokeWriteStatus,
@@ -140,6 +143,10 @@ impl ReplicaHandle for ObservedHandle {
         self.inner.catch_up_capability()
     }
 
+    fn control_address(&self) -> String {
+        self.inner.control_address()
+    }
+
     fn replicator_address(&self) -> String {
         self.inner.replicator_address()
     }
@@ -157,6 +164,9 @@ impl ReplicaHandle for ObservedHandle {
                     KubericError::RemoteAgentRequestRejected(
                         "injected malformed replica-agent status".to_string(),
                     )
+                }
+                InjectedStatusError::Unavailable => {
+                    KubericError::Internal("injected transient status loss".into())
                 }
             });
         }
@@ -802,7 +812,7 @@ async fn create_healthy_set(
             .unwrap();
         status = api.last_status().unwrap();
     }
-    assert_eq!(status.phase, Phase::Healthy);
+    assert_eq!(status.phase, Phase::Healthy, "{status:?}");
     assert!(status.stable_election_metadata_refresh.is_none());
     assert_eq!(
         status
@@ -1017,6 +1027,7 @@ async fn drive_operation_to_healthy(
 
 fn control_for_action(kind: DurableActionKind) -> Option<ControlOperation> {
     match kind {
+        DurableActionKind::AddReplicaIntent => Some(ControlOperation::AddReplicaIntent),
         DurableActionKind::CreateOpenPrimary | DurableActionKind::CreateOpenSecondary => {
             Some(ControlOperation::Open)
         }
@@ -1039,24 +1050,6 @@ fn control_for_action(kind: DurableActionKind) -> Option<ControlOperation> {
         }
         DurableActionKind::CreateCompensateRemoveCandidate => Some(ControlOperation::RemoveReplica),
         DurableActionKind::CreateCompensateCloseCandidate => Some(ControlOperation::Close),
-        DurableActionKind::RetireOldReplica | DurableActionKind::CompensateRemoveCandidate => {
-            Some(ControlOperation::RemoveReplica)
-        }
-        DurableActionKind::OpenCandidate => Some(ControlOperation::Open),
-        DurableActionKind::UpdateCandidateEpoch => Some(ControlOperation::UpdateEpoch),
-        DurableActionKind::AssignCandidateIdle
-        | DurableActionKind::AssignCandidateActive
-        | DurableActionKind::CompensateDemoteCandidate => Some(ControlOperation::ChangeRole),
-        DurableActionKind::BuildCandidate => Some(ControlOperation::BuildReplica),
-        DurableActionKind::AddCatchUpConfiguration => {
-            Some(ControlOperation::UpdateCatchUpConfiguration)
-        }
-        DurableActionKind::AddWaitForCatchUpQuorum => Some(ControlOperation::WaitForCatchUpQuorum),
-        DurableActionKind::AddCurrentConfiguration
-        | DurableActionKind::CompensateRestoreConfiguration => {
-            Some(ControlOperation::UpdateCurrentConfiguration)
-        }
-        DurableActionKind::CompensateCloseCandidate => Some(ControlOperation::Close),
         DurableActionKind::RemoveCatchUpConfiguration => {
             Some(ControlOperation::UpdateCatchUpConfiguration)
         }
@@ -3808,41 +3801,31 @@ async fn test_durable_add_survives_state_loss_and_every_lost_runtime_reply() {
         Some(DurableAddMode::ScaleUp)
     );
 
+    status = advance_until_pending_action(
+        &api,
+        "durable-add",
+        2,
+        status,
+        DurableActionKind::AddReplicaIntent,
+    )
+    .await;
     api.reset_operations();
-    let mut injected = Vec::new();
-    for _ in 0..120 {
-        if let Some(pending) = status
-            .operation
-            .as_ref()
-            .and_then(|operation| operation.pending_action.as_ref())
-            && pending.attempts == 0
-            && !injected.contains(&pending.kind)
-        {
-            let control = control_for_action(pending.kind);
-            if let Some(control) = control {
-                api.fail_after_next_durable_action(control);
-                injected.push(pending.kind);
-            }
-        }
-
-        reconcile_set(
-            &make_set("durable-add", 2, Some(status.clone())),
-            &api,
-            &ReconcilerState::default(),
-        )
-        .await
-        .unwrap();
-        status = api.last_status().unwrap();
-        if status.phase == Phase::Healthy {
-            break;
-        }
-        assert_eq!(
-            status.stable_snapshot.as_ref(),
-            Some(&previous_snapshot),
-            "stable snapshot changed before durable add completion"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    api.fail_after_next_durable_action(ControlOperation::AddReplicaIntent);
+    reconcile_set(
+        &make_set("durable-add", 2, Some(status)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    status = drive_add_replica(
+        &api,
+        &ReconcilerState::default(),
+        "durable-add",
+        2,
+        api.last_status().unwrap(),
+    )
+    .await;
 
     assert_eq!(status.phase, Phase::Healthy);
     assert_eq!(
@@ -3850,43 +3833,22 @@ async fn test_durable_add_survives_state_loss_and_every_lost_runtime_reply() {
         DurableOperationPhase::Completed
     );
     assert_stable_snapshot(&api, &status, 2);
-    for kind in [
-        DurableActionKind::OpenCandidate,
-        DurableActionKind::UpdateCandidateEpoch,
-        DurableActionKind::AssignCandidateIdle,
-        DurableActionKind::BuildCandidate,
-        DurableActionKind::AssignCandidateActive,
-        DurableActionKind::AddCatchUpConfiguration,
-        DurableActionKind::AddWaitForCatchUpQuorum,
-        DurableActionKind::AddCurrentConfiguration,
-    ] {
-        assert!(
-            injected.contains(&kind),
-            "missing lost-reply window {kind:?}"
-        );
-    }
+    assert_ne!(status.stable_snapshot.as_ref(), Some(&previous_snapshot));
     let operations = api.operations();
     assert_eq!(
         operations
             .iter()
-            .filter(|operation| **operation == ControlOperation::Open)
+            .filter(|operation| **operation == ControlOperation::AddReplicaIntent)
             .count(),
         1
     );
     assert_eq!(
         operations
             .iter()
-            .filter(|operation| **operation == ControlOperation::BuildReplica)
+            .filter(|operation| **operation == ControlOperation::Open)
             .count(),
-        1,
-        "ambiguous build scheduling must not start a second copy"
-    );
-    assert_eq!(
-        operations
-            .iter()
-            .filter(|operation| **operation == ControlOperation::ChangeRole)
-            .count(),
-        2
+        0,
+        "operator must not send target runtime actions"
     );
 }
 
@@ -3969,18 +3931,9 @@ async fn test_durable_rejoin_retires_old_incarnation_once() {
         "durable-rejoin",
         3,
         status,
-        DurableActionKind::RetireOldReplica,
+        DurableActionKind::AddReplicaIntent,
     )
     .await;
-    let retire_action_id = status
-        .operation
-        .as_ref()
-        .unwrap()
-        .pending_action
-        .as_ref()
-        .unwrap()
-        .action_id
-        .clone();
     let target_replica_id = status
         .operation
         .as_ref()
@@ -3988,7 +3941,7 @@ async fn test_durable_rejoin_retires_old_incarnation_once() {
         .target_replica_id
         .unwrap();
     api.reset_operations();
-    api.fail_after_next_durable_action(ControlOperation::RemoveReplica);
+    api.fail_after_next_durable_action(ControlOperation::AddReplicaIntent);
     reconcile_set(
         &make_set("durable-rejoin", 3, Some(status)),
         &api,
@@ -4001,7 +3954,7 @@ async fn test_durable_rejoin_retires_old_incarnation_once() {
     assert_eq!(
         api.operations()
             .iter()
-            .filter(|operation| **operation == ControlOperation::RemoveReplica)
+            .filter(|operation| **operation == ControlOperation::AddReplicaIntent)
             .count(),
         1
     );
@@ -4042,7 +3995,7 @@ async fn test_durable_rejoin_retires_old_incarnation_once() {
         .unwrap();
     execute_with_fresh_fences(
         primary_handle.as_ref(),
-        &retire_action_id,
+        "delayed-old-removal",
         DurableReplicaAction::RemoveReplica {
             replica_id: target_replica_id,
             instance_id: ReplicaInstanceId::new(old_instance),
@@ -4084,22 +4037,15 @@ async fn test_durable_rejoin_compensation_recreates_and_retries() {
     )
     .await
     .unwrap();
-    let mut pending = advance_until_pending_action(
+    let pending = advance_until_pending_action(
         &api,
         "rejoin-compensate",
         3,
         api.last_status().unwrap(),
-        DurableActionKind::OpenCandidate,
+        DurableActionKind::AddReplicaIntent,
     )
     .await;
-    pending
-        .operation
-        .as_mut()
-        .unwrap()
-        .pending_action
-        .as_mut()
-        .unwrap()
-        .deadline_unix_seconds = 0;
+    api.crash_pod(&target);
     reconcile_set(
         &make_set("rejoin-compensate", 3, Some(pending)),
         &api,
@@ -4183,6 +4129,117 @@ async fn test_durable_add_status_conflict_prevents_open() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+async fn test_durable_add_uses_structured_intent_without_payload_projection() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "add-payload-conflict", 1).await;
+    reconcile_set(
+        &make_set("add-payload-conflict", 2, Some(previous.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set("add-payload-conflict", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "add-payload-conflict",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::AddReplicaIntent,
+    )
+    .await;
+    assert!(
+        pending
+            .operation
+            .as_ref()
+            .unwrap()
+            .pending_action
+            .as_ref()
+            .unwrap()
+            .dispatch_action_payload
+            .is_empty(),
+        "coarse add dispatch must derive directly from structured addIntent"
+    );
+    let json = serde_json::to_value(pending.operation.as_ref().unwrap()).unwrap();
+    assert!(
+        json["pendingAction"].get("dispatchActionPayload").is_none(),
+        "coarse add CRD status must not project an encoded action payload"
+    );
+    api.reset_operations();
+    reconcile_set(
+        &make_set("add-payload-conflict", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.operations()
+            .contains(&ControlOperation::AddReplicaIntent)
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_add_transient_primary_status_loss_preserves_target() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "add-primary-status-loss", 1).await;
+    reconcile_set(
+        &make_set("add-primary-status-loss", 2, Some(previous.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set("add-primary-status-loss", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "add-primary-status-loss",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::AddReplicaIntent,
+    )
+    .await;
+    api.reset_operations();
+    api.fail_next_status(InjectedStatusError::Unavailable);
+    reconcile_set(
+        &make_set("add-primary-status-loss", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    let status = api.last_status().unwrap();
+    assert_eq!(status.phase, Phase::AddingReplica);
+    assert_ne!(
+        status.operation.as_ref().unwrap().phase,
+        DurableOperationPhase::AddDeleteCompensatedTarget
+    );
+    assert_eq!(api.pods.lock().unwrap().len(), 2);
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::AddReplicaIntent)
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
 async fn test_durable_add_compensates_before_and_during_configuration() {
     async fn prepare(api: &KvClusterApi, state: &ReconcilerState, name: &str) -> KubericSetStatus {
         let previous = create_healthy_set(api, state, name, 1).await;
@@ -4199,22 +4256,22 @@ async fn test_durable_add_compensates_before_and_during_configuration() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
     let status = prepare(&api, &state, "add-preconfig-compensate").await;
-    let mut pending = advance_until_pending_action(
+    let pending = advance_until_pending_action(
         &api,
         "add-preconfig-compensate",
         2,
         status,
-        DurableActionKind::BuildCandidate,
+        DurableActionKind::AddReplicaIntent,
     )
     .await;
-    pending
+    let target_name = pending
         .operation
-        .as_mut()
+        .as_ref()
         .unwrap()
-        .pending_action
-        .as_mut()
-        .unwrap()
-        .deadline_unix_seconds = 0;
+        .target_pod_name
+        .clone()
+        .unwrap();
+    api.crash_pod(&target_name);
     reconcile_set(
         &make_set("add-preconfig-compensate", 2, Some(pending)),
         &api,
@@ -4222,70 +4279,13 @@ async fn test_durable_add_compensates_before_and_during_configuration() {
     )
     .await
     .unwrap();
-    let expected = [
-        DurableActionKind::CompensateRemoveCandidate,
-        DurableActionKind::CompensateDemoteCandidate,
-        DurableActionKind::CompensateCloseCandidate,
-    ];
-    let (compensated, injected) = drive_operation_with_lost_replies(
+    let compensated = drive_operation_to_healthy(
         &api,
         "add-preconfig-compensate",
         2,
         api.last_status().unwrap(),
-        &expected,
     )
     .await;
-    assert_eq!(injected, expected);
-    assert_eq!(
-        compensated.stable_snapshot.as_ref().unwrap().members.len(),
-        1
-    );
-    assert_eq!(
-        compensated.operation.as_ref().unwrap().phase,
-        DurableOperationPhase::Failed
-    );
-
-    let api = KvClusterApi::new();
-    let state = ReconcilerState::default();
-    let status = prepare(&api, &state, "add-config-compensate").await;
-    let mut pending = advance_until_pending_action(
-        &api,
-        "add-config-compensate",
-        2,
-        status,
-        DurableActionKind::AddWaitForCatchUpQuorum,
-    )
-    .await;
-    pending
-        .operation
-        .as_mut()
-        .unwrap()
-        .pending_action
-        .as_mut()
-        .unwrap()
-        .deadline_unix_seconds = 0;
-    reconcile_set(
-        &make_set("add-config-compensate", 2, Some(pending)),
-        &api,
-        &ReconcilerState::default(),
-    )
-    .await
-    .unwrap();
-    let expected = [
-        DurableActionKind::CompensateRestoreConfiguration,
-        DurableActionKind::CompensateRemoveCandidate,
-        DurableActionKind::CompensateDemoteCandidate,
-        DurableActionKind::CompensateCloseCandidate,
-    ];
-    let (compensated, injected) = drive_operation_with_lost_replies(
-        &api,
-        "add-config-compensate",
-        2,
-        api.last_status().unwrap(),
-        &expected,
-    )
-    .await;
-    assert_eq!(injected, expected);
     assert_eq!(
         compensated.stable_snapshot.as_ref().unwrap().members.len(),
         1
@@ -4317,29 +4317,110 @@ async fn test_durable_add_rolls_forward_after_current_configuration_commit() {
     )
     .await
     .unwrap();
-    let pending = advance_until_pending_action(
+    let committed = advance_add_until_phase(
         &api,
+        &ReconcilerState::default(),
         "add-roll-forward",
         2,
         api.last_status().unwrap(),
-        DurableActionKind::AddCurrentConfiguration,
+        DurableOperationPhase::AddRecordCommit,
     )
     .await;
-    api.fail_after_next_durable_action(ControlOperation::UpdateCurrentConfiguration);
-    reconcile_set(
-        &make_set("add-roll-forward", 2, Some(pending)),
-        &api,
-        &ReconcilerState::default(),
-    )
-    .await
-    .unwrap();
-    let completed =
-        drive_operation_to_healthy(&api, "add-roll-forward", 2, api.last_status().unwrap()).await;
+    let completed = drive_operation_to_healthy(&api, "add-roll-forward", 2, committed).await;
     assert_eq!(
         completed.operation.as_ref().unwrap().phase,
         DurableOperationPhase::Completed
     );
     assert_stable_snapshot(&api, &completed, 2);
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_committed_degraded_fences_unreachable_target_from_serving() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "add-degraded-fence", 1).await;
+    reconcile_set(
+        &make_set("add-degraded-fence", 2, Some(previous.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(
+        &make_set("add-degraded-fence", 2, Some(previous)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let publishing = advance_add_until_phase(
+        &api,
+        &state,
+        "add-degraded-fence",
+        2,
+        api.last_status().unwrap(),
+        DurableOperationPhase::AddPublishTarget,
+    )
+    .await;
+    reconcile_set(
+        &make_set("add-degraded-fence", 2, Some(publishing)),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let mut labelled = api.last_status().unwrap();
+    let target_name = labelled
+        .operation
+        .as_ref()
+        .unwrap()
+        .target_pod_name
+        .clone()
+        .unwrap();
+    assert_eq!(
+        api.pods
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pod| pod.metadata.name.as_deref() == Some(target_name.as_str()))
+            .and_then(|pod| pod.metadata.labels.as_ref())
+            .and_then(|labels| labels.get("kuberic.io/role"))
+            .map(String::as_str),
+        Some("secondary")
+    );
+    api.crash_pod(&target_name);
+    labelled
+        .operation
+        .as_mut()
+        .unwrap()
+        .phase_deadline_unix_seconds = 0;
+    reconcile_set(
+        &make_set("add-degraded-fence", 2, Some(labelled.clone())),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        api.pods
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pod| pod.metadata.name.as_deref() == Some(target_name.as_str()))
+            .and_then(|pod| pod.metadata.labels.as_ref())
+            .and_then(|labels| labels.get("kuberic.io/role"))
+            .map(String::as_str),
+        Some("bootstrap")
+    );
+    let completed = drive_operation_to_healthy(&api, "add-degraded-fence", 2, labelled).await;
+    assert!(
+        completed
+            .conditions
+            .iter()
+            .any(|condition| { condition.reason == "CommittedDegraded" })
+    );
 }
 
 #[test_log::test(tokio::test)]
@@ -4836,7 +4917,7 @@ async fn test_scale_up_replays_writes_buffered_during_copy() {
         "buffered-scale",
         2,
         api.last_status().unwrap(),
-        DurableActionKind::BuildCandidate,
+        DurableActionKind::AddReplicaIntent,
     )
     .await;
 
@@ -6041,6 +6122,131 @@ async fn test_same_pod_process_restart_changes_agent_generation_not_incarnation(
             .iter()
             .all(|operation| *operation == ControlOperation::GetStatus),
         "operator restart must persist durable recovery intent before mutation"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_add_target_same_pod_process_restart_invalidates_build_proof() {
+    let api = KvClusterApi::new();
+    let state = ReconcilerState::default();
+    let previous = create_healthy_set(&api, &state, "same-pod-add", 1).await;
+    reconcile_set(
+        &make_set("same-pod-add", 2, Some(previous.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    api.mark_all_pods_ready();
+    reconcile_set(&make_set("same-pod-add", 2, Some(previous)), &api, &state)
+        .await
+        .unwrap();
+    let pending = advance_until_pending_action(
+        &api,
+        "same-pod-add",
+        2,
+        api.last_status().unwrap(),
+        DurableActionKind::AddReplicaIntent,
+    )
+    .await;
+    let target_name = pending
+        .operation
+        .as_ref()
+        .unwrap()
+        .target_pod_name
+        .clone()
+        .unwrap();
+    let target_uid = pending
+        .operation
+        .as_ref()
+        .unwrap()
+        .target_instance_id
+        .clone()
+        .unwrap();
+    let original_generation = pending
+        .operation
+        .as_ref()
+        .unwrap()
+        .add_intent
+        .as_ref()
+        .unwrap()
+        .target_agent_generation
+        .clone();
+
+    reconcile_set(
+        &make_set("same-pod-add", 2, Some(pending)),
+        &api,
+        &ReconcilerState::default(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    api.crash_pod(&target_name);
+    api.restart_process_same_pod_uid(&target_name).await;
+    assert_eq!(
+        api.pods
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pod| pod.metadata.name.as_deref() == Some(target_name.as_str()))
+            .unwrap()
+            .metadata
+            .uid
+            .as_deref(),
+        Some(target_uid.as_str())
+    );
+
+    let mut status = api.last_status().unwrap();
+    for _ in 0..360 {
+        reconcile_set(
+            &make_set("same-pod-add", 2, Some(status.clone())),
+            &api,
+            &ReconcilerState::default(),
+        )
+        .await
+        .unwrap();
+        api.mark_all_pods_ready();
+        status = api.last_status().unwrap();
+        if status.phase == Phase::Healthy
+            && status
+                .stable_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.members.len() == 2)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status.phase, Phase::Healthy, "{status:?}");
+    assert_stable_snapshot(&api, &status, 2);
+
+    let primary_name = status.current_primary.clone().unwrap();
+    let primary_pod = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(primary_name.as_str()))
+        .unwrap()
+        .clone();
+    let final_primary = api
+        .create_replica_handle(
+            status.stable_snapshot.as_ref().unwrap().primary_id,
+            &primary_pod,
+            &make_set("same-pod-add", 2, Some(status.clone())).spec,
+        )
+        .await
+        .unwrap()
+        .get_status()
+        .await
+        .unwrap();
+    let final_build = final_primary.build_observation.unwrap();
+    assert_ne!(
+        final_build.target_agent_generation.to_string(),
+        original_generation,
+        "same-Pod process restart must invalidate the old target-generation build proof"
     );
 }
 

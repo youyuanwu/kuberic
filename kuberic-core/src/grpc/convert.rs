@@ -2,6 +2,12 @@ use std::collections::HashSet;
 
 use prost::Message;
 
+use crate::add_replica::{
+    AddReplicaCoordinatorPhase, AddReplicaIntent, AddReplicaMode, AddReplicaProgress,
+    AddReplicaTerminalResult, ConfigurationDescriptor, ConfigurationMemberDescriptor,
+    ConfigurationProgressSource, PeerAddBuildStatus, PeerStage, PeerStageObservation,
+    PeerStageRequest, PeerStageState, RuntimeBuildObservation, RuntimeBuildState,
+};
 use crate::proto;
 use crate::types::{
     AccessStatus, AgentControlVersion, AgentGeneration, CorrelatedActionObservation,
@@ -293,6 +299,15 @@ impl From<DurableActionResult> for proto::DurableActionResultProto {
             DurableActionResult::DataLoss(DataLossAction::StateChanged) => {
                 Self::DurableActionResultDataLossStateChanged
             }
+            DurableActionResult::AddReplica(AddReplicaTerminalResult::Committed) => {
+                Self::DurableActionResultAddReplicaCommitted
+            }
+            DurableActionResult::AddReplica(AddReplicaTerminalResult::Compensated) => {
+                Self::DurableActionResultAddReplicaCompensated
+            }
+            DurableActionResult::AddReplica(AddReplicaTerminalResult::CompensationIncomplete) => {
+                Self::DurableActionResultAddReplicaCompensationIncomplete
+            }
         }
     }
 }
@@ -308,6 +323,17 @@ impl TryFrom<proto::DurableActionResultProto> for DurableActionResult {
 
             proto::DurableActionResultProto::DurableActionResultDataLossStateChanged => {
                 Ok(Self::DataLoss(DataLossAction::StateChanged))
+            }
+            proto::DurableActionResultProto::DurableActionResultAddReplicaCommitted => Ok(
+                Self::AddReplica(AddReplicaTerminalResult::Committed),
+            ),
+            proto::DurableActionResultProto::DurableActionResultAddReplicaCompensated => Ok(
+                Self::AddReplica(AddReplicaTerminalResult::Compensated),
+            ),
+            proto::DurableActionResultProto::DurableActionResultAddReplicaCompensationIncomplete => {
+                Ok(Self::AddReplica(
+                    AddReplicaTerminalResult::CompensationIncomplete,
+                ))
             }
             proto::DurableActionResultProto::DurableActionResultNone => Err(()),
         }
@@ -472,9 +498,668 @@ impl From<proto::ReplicaSetConfigProto> for ReplicaSetConfig {
     }
 }
 
-/// Serialize the exact correlated action payload for durable operator
-/// write-ahead intent. Envelope fences are persisted separately.
-pub fn encode_correlated_action_payload(action: &DurableReplicaAction) -> String {
+fn configuration_descriptor_proto(
+    descriptor: ConfigurationDescriptor,
+) -> proto::ConfigurationDescriptorProto {
+    proto::ConfigurationDescriptorProto {
+        members: descriptor
+            .members
+            .into_iter()
+            .map(|member| {
+                let (progress_source, current_progress, catch_up_capability) = match member.progress
+                {
+                    ConfigurationProgressSource::Frozen {
+                        current_progress,
+                        catch_up_capability,
+                    } => (
+                        proto::ConfigurationProgressSourceProto::ConfigurationProgressFrozen,
+                        current_progress,
+                        catch_up_capability,
+                    ),
+                    ConfigurationProgressSource::BuildCopyLsn => (
+                        proto::ConfigurationProgressSourceProto::ConfigurationProgressBuildCopyLsn,
+                        0,
+                        0,
+                    ),
+                };
+                proto::ConfigurationMemberDescriptorProto {
+                    id: member.id,
+                    instance_id: member.instance_id.to_string(),
+                    role: proto::RoleProto::from(member.role) as i32,
+                    status: match member.status {
+                        ReplicaStatus::Up => proto::ReplicaStatusProto::StatusUp as i32,
+                        ReplicaStatus::Down => proto::ReplicaStatusProto::StatusDown as i32,
+                    },
+                    replicator_address: member.replicator_address,
+                    must_catch_up: member.must_catch_up,
+                    progress_source: progress_source as i32,
+                    current_progress,
+                    catch_up_capability,
+                }
+            })
+            .collect(),
+        write_quorum: descriptor.write_quorum,
+    }
+}
+
+fn try_configuration_descriptor(
+    descriptor: proto::ConfigurationDescriptorProto,
+) -> Result<ConfigurationDescriptor, String> {
+    let mut ids = HashSet::new();
+    let mut instances = HashSet::new();
+    let members = descriptor
+        .members
+        .into_iter()
+        .map(|member| {
+            if member.id <= 0 || !ids.insert(member.id) {
+                return Err(format!(
+                    "configuration descriptor has invalid or duplicate replica ID {}",
+                    member.id
+                ));
+            }
+            if member.instance_id.is_empty() || !instances.insert(member.instance_id.clone()) {
+                return Err(format!(
+                    "configuration descriptor replica {} has missing or duplicate incarnation",
+                    member.id
+                ));
+            }
+            if member.replicator_address.is_empty() {
+                return Err(format!(
+                    "configuration descriptor replica {} has no replicator address",
+                    member.id
+                ));
+            }
+            let role = proto::RoleProto::try_from(member.role)
+                .map_err(|_| format!("unknown descriptor role {}", member.role))?;
+            if role == proto::RoleProto::RoleUnknown || role == proto::RoleProto::RolePrimary {
+                return Err(format!(
+                    "configuration descriptor replica {} has invalid remote role",
+                    member.id
+                ));
+            }
+            let status = match proto::ReplicaStatusProto::try_from(member.status)
+                .map_err(|_| format!("unknown descriptor status {}", member.status))?
+            {
+                proto::ReplicaStatusProto::StatusUp => ReplicaStatus::Up,
+                proto::ReplicaStatusProto::StatusDown => ReplicaStatus::Down,
+            };
+            let progress =
+                match proto::ConfigurationProgressSourceProto::try_from(member.progress_source)
+                    .map_err(|_| {
+                        format!(
+                            "unknown configuration progress source {}",
+                            member.progress_source
+                        )
+                    })? {
+                    proto::ConfigurationProgressSourceProto::ConfigurationProgressFrozen => {
+                        ConfigurationProgressSource::Frozen {
+                            current_progress: member.current_progress,
+                            catch_up_capability: member.catch_up_capability,
+                        }
+                    }
+                    proto::ConfigurationProgressSourceProto::ConfigurationProgressBuildCopyLsn => {
+                        if member.current_progress != 0 || member.catch_up_capability != 0 {
+                            return Err(format!(
+                                "build-copy progress member {} carries frozen progress",
+                                member.id
+                            ));
+                        }
+                        ConfigurationProgressSource::BuildCopyLsn
+                    }
+                    proto::ConfigurationProgressSourceProto::ConfigurationProgressUnknown => {
+                        return Err("configuration progress source is unknown".to_string());
+                    }
+                };
+            Ok(ConfigurationMemberDescriptor {
+                id: member.id,
+                instance_id: ReplicaInstanceId::new(member.instance_id),
+                role: role.into(),
+                status,
+                replicator_address: member.replicator_address,
+                must_catch_up: member.must_catch_up,
+                progress,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if descriptor.write_quorum == 0 {
+        return Err("configuration descriptor write quorum must be positive".to_string());
+    }
+    Ok(ConfigurationDescriptor {
+        members,
+        write_quorum: descriptor.write_quorum,
+    })
+}
+
+impl From<AddReplicaIntent> for proto::AddReplicaIntentProto {
+    fn from(intent: AddReplicaIntent) -> Self {
+        Self {
+            operation_id: intent.operation_id,
+            attempt_id: intent.attempt_id,
+            mode: match intent.mode {
+                AddReplicaMode::ScaleUp => proto::AddReplicaModeProto::AddReplicaModeScaleUp,
+                AddReplicaMode::Rebuild => proto::AddReplicaModeProto::AddReplicaModeRebuild,
+            } as i32,
+            epoch: Some(intent.epoch.into()),
+            primary_replica_id: intent.primary_replica_id,
+            primary_instance_id: intent.primary_instance_id.to_string(),
+            primary_agent_generation: intent.primary_agent_generation.to_string(),
+            primary_control_address: intent.primary_control_address,
+            target_replica_id: intent.target_replica_id,
+            target_instance_id: intent.target_instance_id.to_string(),
+            target_agent_generation: intent.target_agent_generation.to_string(),
+            target_control_address: intent.target_control_address,
+            target_replicator_address: intent.target_replicator_address,
+            retired_instance_id: intent.retired_instance_id.map(|value| value.to_string()),
+            previous_configuration: Some(configuration_descriptor_proto(
+                intent.previous_configuration,
+            )),
+            catch_up_configuration: Some(configuration_descriptor_proto(
+                intent.catch_up_configuration,
+            )),
+            current_configuration: Some(configuration_descriptor_proto(
+                intent.current_configuration,
+            )),
+            minimum_committed_replicas: intent.minimum_committed_replicas,
+            deadline_unix_seconds: intent.deadline_unix_seconds,
+            compensation_deadline_unix_seconds: intent.compensation_deadline_unix_seconds,
+        }
+    }
+}
+
+impl TryFrom<proto::AddReplicaIntentProto> for AddReplicaIntent {
+    type Error = String;
+
+    fn try_from(intent: proto::AddReplicaIntentProto) -> Result<Self, Self::Error> {
+        if intent.operation_id.is_empty() || intent.attempt_id.is_empty() {
+            return Err("add-replica intent identity is missing".to_string());
+        }
+        if intent.primary_replica_id <= 0
+            || intent.target_replica_id <= 0
+            || intent.primary_replica_id == intent.target_replica_id
+        {
+            return Err("add-replica primary/target identity is invalid".to_string());
+        }
+        if intent.primary_instance_id.is_empty()
+            || intent.target_instance_id.is_empty()
+            || intent.primary_control_address.is_empty()
+            || intent.target_control_address.is_empty()
+            || intent.target_replicator_address.is_empty()
+        {
+            return Err("add-replica intent has missing identity or endpoint".to_string());
+        }
+        let mode = match proto::AddReplicaModeProto::try_from(intent.mode)
+            .map_err(|_| format!("unknown add-replica mode {}", intent.mode))?
+        {
+            proto::AddReplicaModeProto::AddReplicaModeScaleUp => AddReplicaMode::ScaleUp,
+            proto::AddReplicaModeProto::AddReplicaModeRebuild => AddReplicaMode::Rebuild,
+            proto::AddReplicaModeProto::AddReplicaModeUnknown => {
+                return Err("add-replica mode is unknown".to_string());
+            }
+        };
+        let retired_instance_id = intent.retired_instance_id.map(ReplicaInstanceId::new);
+        if mode == AddReplicaMode::Rebuild && retired_instance_id.is_none() {
+            return Err("rebuild intent has no retired incarnation".to_string());
+        }
+        if mode == AddReplicaMode::ScaleUp && retired_instance_id.is_some() {
+            return Err("scale-up intent unexpectedly has a retired incarnation".to_string());
+        }
+        if intent.minimum_committed_replicas == 0
+            || intent.deadline_unix_seconds <= 0
+            || intent.compensation_deadline_unix_seconds < intent.deadline_unix_seconds
+        {
+            return Err("add-replica intent has invalid limits or deadlines".to_string());
+        }
+        let intent = Self {
+            operation_id: intent.operation_id,
+            attempt_id: intent.attempt_id,
+            mode,
+            epoch: intent
+                .epoch
+                .ok_or_else(|| "add-replica intent has no epoch".to_string())?
+                .into(),
+            primary_replica_id: intent.primary_replica_id,
+            primary_instance_id: ReplicaInstanceId::new(intent.primary_instance_id),
+            primary_agent_generation: AgentGeneration::parse(intent.primary_agent_generation)?,
+            primary_control_address: intent.primary_control_address,
+            target_replica_id: intent.target_replica_id,
+            target_instance_id: ReplicaInstanceId::new(intent.target_instance_id),
+            target_agent_generation: AgentGeneration::parse(intent.target_agent_generation)?,
+            target_control_address: intent.target_control_address,
+            target_replicator_address: intent.target_replicator_address,
+            retired_instance_id,
+            previous_configuration: try_configuration_descriptor(
+                intent
+                    .previous_configuration
+                    .ok_or_else(|| "missing previous configuration descriptor".to_string())?,
+            )?,
+            catch_up_configuration: try_configuration_descriptor(
+                intent
+                    .catch_up_configuration
+                    .ok_or_else(|| "missing catch-up configuration descriptor".to_string())?,
+            )?,
+            current_configuration: try_configuration_descriptor(
+                intent
+                    .current_configuration
+                    .ok_or_else(|| "missing current configuration descriptor".to_string())?,
+            )?,
+            minimum_committed_replicas: intent.minimum_committed_replicas,
+            deadline_unix_seconds: intent.deadline_unix_seconds,
+            compensation_deadline_unix_seconds: intent.compensation_deadline_unix_seconds,
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+}
+
+impl From<AddReplicaProgress> for proto::AddReplicaProgressProto {
+    fn from(progress: AddReplicaProgress) -> Self {
+        Self {
+                phase: match progress.phase {
+                    AddReplicaCoordinatorPhase::Validating => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseValidating
+                    }
+                    AddReplicaCoordinatorPhase::RetiringOldConnection => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseRetiringOldConnection
+                    }
+                    AddReplicaCoordinatorPhase::PreparingTarget => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhasePreparingTarget
+                    }
+                    AddReplicaCoordinatorPhase::Building => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseBuilding
+                    }
+                    AddReplicaCoordinatorPhase::ActivatingTarget => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseActivatingTarget
+                    }
+                    AddReplicaCoordinatorPhase::InstallingCatchUpConfiguration => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseInstallingCatchUpConfiguration
+                    }
+                    AddReplicaCoordinatorPhase::WaitingForCatchUpQuorum => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseWaitingForCatchUpQuorum
+                    }
+                    AddReplicaCoordinatorPhase::InstallingCurrentConfiguration => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseInstallingCurrentConfiguration
+                    }
+                    AddReplicaCoordinatorPhase::Attesting => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseAttesting
+                    }
+                    AddReplicaCoordinatorPhase::Compensating => {
+                        proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseCompensating
+                    }
+                } as i32,
+                commit_observed: progress.commit_observed,
+                copy_lsn: progress.copy_lsn,
+            }
+    }
+}
+
+impl TryFrom<proto::AddReplicaProgressProto> for AddReplicaProgress {
+    type Error = String;
+
+    fn try_from(progress: proto::AddReplicaProgressProto) -> Result<Self, Self::Error> {
+        let phase = match proto::AddReplicaCoordinatorPhaseProto::try_from(progress.phase)
+                .map_err(|_| format!("unknown add-replica phase {}", progress.phase))?
+            {
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseValidating => {
+                    AddReplicaCoordinatorPhase::Validating
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseRetiringOldConnection => {
+                    AddReplicaCoordinatorPhase::RetiringOldConnection
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhasePreparingTarget => {
+                    AddReplicaCoordinatorPhase::PreparingTarget
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseBuilding => {
+                    AddReplicaCoordinatorPhase::Building
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseActivatingTarget => {
+                    AddReplicaCoordinatorPhase::ActivatingTarget
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseInstallingCatchUpConfiguration => {
+                    AddReplicaCoordinatorPhase::InstallingCatchUpConfiguration
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseWaitingForCatchUpQuorum => {
+                    AddReplicaCoordinatorPhase::WaitingForCatchUpQuorum
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseInstallingCurrentConfiguration => {
+                    AddReplicaCoordinatorPhase::InstallingCurrentConfiguration
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseAttesting => {
+                    AddReplicaCoordinatorPhase::Attesting
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseCompensating => {
+                    AddReplicaCoordinatorPhase::Compensating
+                }
+                proto::AddReplicaCoordinatorPhaseProto::AddReplicaPhaseUnknown => {
+                    return Err("add-replica progress phase is unknown".to_string());
+                }
+            };
+        Ok(Self {
+            phase,
+            commit_observed: progress.commit_observed,
+            copy_lsn: progress.copy_lsn,
+        })
+    }
+}
+
+impl From<RuntimeBuildObservation> for proto::RuntimeBuildObservationProto {
+    fn from(observation: RuntimeBuildObservation) -> Self {
+        Self {
+            execution_id: observation.execution_id,
+            build_key: observation.build_key,
+            target_replica_id: observation.target_replica_id,
+            target_instance_id: observation.target_instance_id.to_string(),
+            target_agent_generation: observation.target_agent_generation.to_string(),
+            state: match observation.state {
+                RuntimeBuildState::InProgress => {
+                    proto::RuntimeBuildStateProto::RuntimeBuildStateInProgress
+                }
+                RuntimeBuildState::Completed => {
+                    proto::RuntimeBuildStateProto::RuntimeBuildStateCompleted
+                }
+                RuntimeBuildState::Failed => proto::RuntimeBuildStateProto::RuntimeBuildStateFailed,
+                RuntimeBuildState::Cancelled => {
+                    proto::RuntimeBuildStateProto::RuntimeBuildStateCancelled
+                }
+            } as i32,
+            copy_lsn: observation.copy_lsn,
+            error: observation.error,
+        }
+    }
+}
+
+impl TryFrom<proto::RuntimeBuildObservationProto> for RuntimeBuildObservation {
+    type Error = String;
+
+    fn try_from(observation: proto::RuntimeBuildObservationProto) -> Result<Self, Self::Error> {
+        if observation.execution_id.is_empty()
+            || observation.build_key.is_empty()
+            || observation.target_replica_id <= 0
+            || observation.target_instance_id.is_empty()
+        {
+            return Err("runtime build observation identity is invalid".to_string());
+        }
+        let state = match proto::RuntimeBuildStateProto::try_from(observation.state)
+            .map_err(|_| format!("unknown runtime build state {}", observation.state))?
+        {
+            proto::RuntimeBuildStateProto::RuntimeBuildStateInProgress => {
+                RuntimeBuildState::InProgress
+            }
+            proto::RuntimeBuildStateProto::RuntimeBuildStateCompleted => {
+                RuntimeBuildState::Completed
+            }
+            proto::RuntimeBuildStateProto::RuntimeBuildStateFailed => RuntimeBuildState::Failed,
+            proto::RuntimeBuildStateProto::RuntimeBuildStateCancelled => {
+                RuntimeBuildState::Cancelled
+            }
+            proto::RuntimeBuildStateProto::RuntimeBuildStateUnknown => {
+                return Err("runtime build state is unknown".to_string());
+            }
+        };
+        if state == RuntimeBuildState::Completed && observation.copy_lsn.is_none() {
+            return Err("completed runtime build has no copy LSN".to_string());
+        }
+        if observation
+            .error
+            .as_ref()
+            .is_some_and(|error| error.len() > crate::add_replica::MAX_ADD_ERROR_BYTES)
+        {
+            return Err("runtime build error exceeds the protocol bound".to_string());
+        }
+        Ok(Self {
+            execution_id: observation.execution_id,
+            build_key: observation.build_key,
+            target_replica_id: observation.target_replica_id,
+            target_instance_id: ReplicaInstanceId::new(observation.target_instance_id),
+            target_agent_generation: AgentGeneration::parse(observation.target_agent_generation)?,
+            state,
+            copy_lsn: observation.copy_lsn,
+            error: observation.error,
+        })
+    }
+}
+
+fn peer_stage_proto(stage: PeerStage) -> proto::PeerStageProto {
+    match stage {
+        PeerStage::Prepare => proto::PeerStageProto::PeerStagePrepare,
+        PeerStage::Activate => proto::PeerStageProto::PeerStageActivate,
+        PeerStage::Cleanup => proto::PeerStageProto::PeerStageCleanup,
+    }
+}
+
+fn try_peer_stage(value: i32) -> Result<PeerStage, String> {
+    match proto::PeerStageProto::try_from(value)
+        .map_err(|_| format!("unknown peer stage {value}"))?
+    {
+        proto::PeerStageProto::PeerStagePrepare => Ok(PeerStage::Prepare),
+        proto::PeerStageProto::PeerStageActivate => Ok(PeerStage::Activate),
+        proto::PeerStageProto::PeerStageCleanup => Ok(PeerStage::Cleanup),
+        proto::PeerStageProto::PeerStageUnknown => Err("peer stage is unknown".to_string()),
+    }
+}
+
+impl From<PeerStageRequest> for proto::ExecuteAddBuildStageRequest {
+    fn from(request: PeerStageRequest) -> Self {
+        Self {
+            protocol_version: request.protocol_version,
+            operation_id: request.operation_id,
+            attempt_id: request.attempt_id,
+            message_id: request.message_id,
+            input_signature: request.input_signature,
+            stage: peer_stage_proto(request.stage) as i32,
+            sender_replica_id: request.sender_replica_id,
+            sender_instance_id: request.sender_instance_id.to_string(),
+            sender_agent_generation: request.sender_agent_generation.to_string(),
+            sender_control_address: request.sender_control_address,
+            parent_action_id: request.parent_action_id,
+            parent_action_signature: request.parent_action_signature,
+            target_replica_id: request.target_replica_id,
+            target_instance_id: request.target_instance_id.to_string(),
+            expected_target_agent_generation: request.expected_target_agent_generation.to_string(),
+            expected_target_peer_control_version: request.expected_target_peer_control_version,
+            epoch: Some(request.epoch.into()),
+            configuration_fence: request.configuration_fence,
+            build_key: request.build_key,
+            copy_lsn: request.copy_lsn,
+        }
+    }
+}
+
+impl TryFrom<proto::ExecuteAddBuildStageRequest> for PeerStageRequest {
+    type Error = String;
+
+    fn try_from(request: proto::ExecuteAddBuildStageRequest) -> Result<Self, Self::Error> {
+        if request.operation_id.is_empty()
+            || request.attempt_id.is_empty()
+            || request.message_id.is_empty()
+            || request.input_signature.is_empty()
+            || request.parent_action_id.is_empty()
+            || request.parent_action_signature.is_empty()
+            || request.sender_control_address.is_empty()
+            || request.configuration_fence.is_empty()
+        {
+            return Err("peer stage request has missing required text".to_string());
+        }
+        if request.sender_replica_id <= 0
+            || request.target_replica_id <= 0
+            || request.sender_instance_id.is_empty()
+            || request.target_instance_id.is_empty()
+        {
+            return Err("peer stage request identity is invalid".to_string());
+        }
+        let stage = try_peer_stage(request.stage)?;
+        if stage == PeerStage::Activate
+            && (request.build_key.as_deref().is_none_or(str::is_empty)
+                || request.copy_lsn.is_none())
+        {
+            return Err("activate peer stage requires build proof".to_string());
+        }
+        if stage != PeerStage::Activate
+            && (request.build_key.is_some() || request.copy_lsn.is_some())
+        {
+            return Err("non-activate peer stage carries build proof".to_string());
+        }
+        Ok(Self {
+            protocol_version: request.protocol_version,
+            operation_id: request.operation_id,
+            attempt_id: request.attempt_id,
+            message_id: request.message_id,
+            input_signature: request.input_signature,
+            stage,
+            sender_replica_id: request.sender_replica_id,
+            sender_instance_id: ReplicaInstanceId::new(request.sender_instance_id),
+            sender_agent_generation: AgentGeneration::parse(request.sender_agent_generation)?,
+            sender_control_address: request.sender_control_address,
+            parent_action_id: request.parent_action_id,
+            parent_action_signature: request.parent_action_signature,
+            target_replica_id: request.target_replica_id,
+            target_instance_id: ReplicaInstanceId::new(request.target_instance_id),
+            expected_target_agent_generation: AgentGeneration::parse(
+                request.expected_target_agent_generation,
+            )?,
+            expected_target_peer_control_version: request.expected_target_peer_control_version,
+            epoch: request
+                .epoch
+                .ok_or_else(|| "peer stage request has no epoch".to_string())?
+                .into(),
+            configuration_fence: request.configuration_fence,
+            build_key: request.build_key,
+            copy_lsn: request.copy_lsn,
+        })
+    }
+}
+
+impl From<PeerStageObservation> for proto::PeerStageObservationProto {
+    fn from(observation: PeerStageObservation) -> Self {
+        Self {
+            protocol_version: observation.protocol_version,
+            message_id: observation.message_id,
+            input_signature: observation.input_signature,
+            stage: peer_stage_proto(observation.stage) as i32,
+            state: match observation.state {
+                PeerStageState::Accepted => proto::PeerStageStateProto::PeerStageStateAccepted,
+                PeerStageState::InProgress => proto::PeerStageStateProto::PeerStageStateInProgress,
+                PeerStageState::Completed => proto::PeerStageStateProto::PeerStageStateCompleted,
+                PeerStageState::Failed => proto::PeerStageStateProto::PeerStageStateFailed,
+                PeerStageState::Stale => proto::PeerStageStateProto::PeerStageStateStale,
+            } as i32,
+            target_agent_generation: observation.target_agent_generation.to_string(),
+            target_peer_control_version: observation.target_peer_control_version,
+            error: observation.error,
+        }
+    }
+}
+
+impl TryFrom<proto::PeerStageObservationProto> for PeerStageObservation {
+    type Error = String;
+
+    fn try_from(observation: proto::PeerStageObservationProto) -> Result<Self, Self::Error> {
+        if observation.message_id.is_empty() || observation.input_signature.is_empty() {
+            return Err("peer stage observation identity is missing".to_string());
+        }
+        let state = match proto::PeerStageStateProto::try_from(observation.state)
+            .map_err(|_| format!("unknown peer stage state {}", observation.state))?
+        {
+            proto::PeerStageStateProto::PeerStageStateAccepted => PeerStageState::Accepted,
+            proto::PeerStageStateProto::PeerStageStateInProgress => PeerStageState::InProgress,
+            proto::PeerStageStateProto::PeerStageStateCompleted => PeerStageState::Completed,
+            proto::PeerStageStateProto::PeerStageStateFailed => PeerStageState::Failed,
+            proto::PeerStageStateProto::PeerStageStateStale => PeerStageState::Stale,
+            proto::PeerStageStateProto::PeerStageStateUnknown => {
+                return Err("peer stage observation state is unknown".to_string());
+            }
+        };
+        if matches!(state, PeerStageState::Failed | PeerStageState::Stale)
+            != observation.error.is_some()
+        {
+            return Err("peer stage observation terminal error is malformed".to_string());
+        }
+        if observation
+            .error
+            .as_ref()
+            .is_some_and(|error| error.len() > crate::add_replica::MAX_ADD_ERROR_BYTES)
+        {
+            return Err("peer stage error exceeds the protocol bound".to_string());
+        }
+        Ok(Self {
+            protocol_version: observation.protocol_version,
+            message_id: observation.message_id,
+            input_signature: observation.input_signature,
+            stage: try_peer_stage(observation.stage)?,
+            state,
+            target_agent_generation: AgentGeneration::parse(observation.target_agent_generation)?,
+            target_peer_control_version: observation.target_peer_control_version,
+            error: observation.error,
+        })
+    }
+}
+
+impl From<PeerAddBuildStatus> for proto::GetAddBuildStatusResponse {
+    fn from(status: PeerAddBuildStatus) -> Self {
+        Self {
+            protocol_version: status.protocol_version,
+            target_replica_id: status.target_replica_id,
+            target_instance_id: status.target_instance_id.to_string(),
+            agent_generation: status.agent_generation.to_string(),
+            peer_control_version: status.peer_control_version,
+            role: proto::RoleProto::from(status.role) as i32,
+            epoch: Some(status.epoch.into()),
+            healthy: status.healthy,
+            current_progress: status.current_progress,
+            current_action: status.current_action.map(Into::into),
+            retained_terminal_actions: status
+                .retained_terminal_actions
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<proto::GetAddBuildStatusResponse> for PeerAddBuildStatus {
+    type Error = String;
+
+    fn try_from(status: proto::GetAddBuildStatusResponse) -> Result<Self, Self::Error> {
+        if status.target_replica_id <= 0 || status.target_instance_id.is_empty() {
+            return Err("peer status target identity is invalid".to_string());
+        }
+        let role = proto::RoleProto::try_from(status.role)
+            .map_err(|_| format!("unknown peer runtime role {}", status.role))?;
+        let current_action = status
+            .current_action
+            .map(PeerStageObservation::try_from)
+            .transpose()?;
+        let retained_terminal_actions = status
+            .retained_terminal_actions
+            .into_iter()
+            .map(PeerStageObservation::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            protocol_version: status.protocol_version,
+            target_replica_id: status.target_replica_id,
+            target_instance_id: ReplicaInstanceId::new(status.target_instance_id),
+            agent_generation: AgentGeneration::parse(status.agent_generation)?,
+            peer_control_version: status.peer_control_version,
+            role: role.into(),
+            epoch: status
+                .epoch
+                .ok_or_else(|| "peer status has no epoch".to_string())?
+                .into(),
+            healthy: status.healthy,
+            current_progress: status.current_progress,
+            current_action,
+            retained_terminal_actions,
+        })
+    }
+}
+
+/// Serialize a direct non-add correlated action for durable operator
+/// write-ahead intent. Agent-owned add/build uses structured CRD intent
+/// directly and must not use this projection.
+pub fn encode_direct_correlated_action_payload(action: &DurableReplicaAction) -> String {
+    assert!(
+        !matches!(action, DurableReplicaAction::AddReplicaIntent { .. }),
+        "agent-owned add/build has no encoded payload projection"
+    );
     proto::ExecuteCorrelatedControlActionRequest {
         protocol_version: 0,
         action_id: String::new(),
@@ -492,8 +1177,10 @@ pub fn encode_correlated_action_payload(action: &DurableReplicaAction) -> String
     .collect()
 }
 
-/// Decode a previously persisted exact correlated action payload.
-pub fn decode_correlated_action_payload(encoded: &str) -> Result<DurableReplicaAction, String> {
+/// Decode a persisted direct non-add correlated action payload.
+pub fn decode_direct_correlated_action_payload(
+    encoded: &str,
+) -> Result<DurableReplicaAction, String> {
     let encoded = encoded.as_bytes();
     if encoded.is_empty()
         || encoded.len() % 2 != 0
@@ -518,11 +1205,15 @@ pub fn decode_correlated_action_payload(encoded: &str) -> Result<DurableReplicaA
         .collect::<Vec<_>>();
     let request = proto::ExecuteCorrelatedControlActionRequest::decode(bytes.as_slice())
         .map_err(|error| format!("invalid persisted correlated action payload: {error}"))?;
-    strict_correlated_action(
+    let action = strict_correlated_action(
         request
             .action
             .ok_or_else(|| "persisted correlated action payload is missing action".to_string())?,
-    )
+    )?;
+    if matches!(action, DurableReplicaAction::AddReplicaIntent { .. }) {
+        return Err("persisted add-replica payload projection is unsupported".to_string());
+    }
+    Ok(action)
 }
 
 impl TryFrom<proto::ExecuteCorrelatedControlActionRequest> for CorrelatedControlActionRequest {
@@ -622,6 +1313,7 @@ impl From<CorrelatedActionObservation> for proto::CorrelatedActionObservationPro
                 .map(proto::DurableActionErrorClassProto::from)
                 .unwrap_or(proto::DurableActionErrorClassProto::DurableActionErrorNone)
                 as i32,
+            add_replica_progress: observation.action.add_replica_progress.map(Into::into),
         }
     }
 }
@@ -668,6 +1360,10 @@ impl TryFrom<proto::CorrelatedActionObservationProto> for CorrelatedActionObserv
                 )
             };
         let error = (!observation.error.is_empty()).then_some(observation.error);
+        let add_replica_progress = observation
+            .add_replica_progress
+            .map(AddReplicaProgress::try_from)
+            .transpose()?;
         let result = if result == proto::DurableActionResultProto::DurableActionResultNone {
             None
         } else {
@@ -702,6 +1398,7 @@ impl TryFrom<proto::CorrelatedActionObservationProto> for CorrelatedActionObserv
                 error_class,
                 error,
                 result,
+                add_replica_progress,
             },
         })
     }
@@ -744,6 +1441,9 @@ fn strict_correlated_action(
 ) -> Result<DurableReplicaAction, String> {
     use proto::execute_correlated_control_action_request::Action;
     match action {
+        Action::AddReplicaIntent(intent) => Ok(DurableReplicaAction::AddReplicaIntent {
+            intent: Box::new((*intent).try_into()?),
+        }),
         Action::RevokeWriteStatus(_) => Ok(DurableReplicaAction::RevokeWriteStatus),
         Action::ChangeRole(request) => {
             let role = proto::RoleProto::try_from(request.role)
@@ -838,6 +1538,9 @@ fn correlated_action_proto(
 ) -> proto::execute_correlated_control_action_request::Action {
     use proto::execute_correlated_control_action_request::Action;
     match action {
+        DurableReplicaAction::AddReplicaIntent { intent } => {
+            Action::AddReplicaIntent(Box::new((*intent).into()))
+        }
         DurableReplicaAction::Open { mode } => Action::Open(proto::OpenRequest {
             mode: proto::OpenModeProto::from(mode) as i32,
         }),
@@ -1082,6 +1785,7 @@ mod tests {
                 error_class: None,
                 error: None,
                 result: Some(DurableActionResult::DataLoss(DataLossAction::StateChanged)),
+                add_replica_progress: None,
             },
         };
         let round_trip = CorrelatedActionObservation::try_from(
@@ -1100,6 +1804,7 @@ mod tests {
                 error_class: Some(DurableActionErrorClass::NoWriteQuorum),
                 error: Some("no write quorum".to_string()),
                 result: None,
+                add_replica_progress: None,
             },
         };
         let failed_round_trip = CorrelatedActionObservation::try_from(
@@ -1111,8 +1816,8 @@ mod tests {
 
     #[test]
     fn persisted_correlated_action_payload_round_trips_exact_progress() {
-        assert!(decode_correlated_action_payload("éé").is_err());
-        assert!(decode_correlated_action_payload("0g").is_err());
+        assert!(decode_direct_correlated_action_payload("éé").is_err());
+        assert!(decode_direct_correlated_action_payload("0g").is_err());
 
         let action = DurableReplicaAction::UpdateCurrentConfiguration {
             current: ReplicaSetConfig {
@@ -1130,8 +1835,10 @@ mod tests {
             },
         };
         let signature = action.signature();
-        let decoded =
-            decode_correlated_action_payload(&encode_correlated_action_payload(&action)).unwrap();
+        let decoded = decode_direct_correlated_action_payload(
+            &encode_direct_correlated_action_payload(&action),
+        )
+        .unwrap();
 
         assert_eq!(decoded.signature(), signature);
         let DurableReplicaAction::UpdateCurrentConfiguration { current } = decoded else {
@@ -1177,5 +1884,106 @@ mod tests {
                 .unwrap_err()
                 .contains("missing correlated control action")
         );
+    }
+
+    #[test]
+    fn add_replica_and_peer_protocol_round_trip_strictly() {
+        let generation = AgentGeneration::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let target_generation = AgentGeneration::parse("11111111111111111111111111111111").unwrap();
+        let descriptor = ConfigurationDescriptor {
+            members: vec![ConfigurationMemberDescriptor {
+                id: 2,
+                instance_id: ReplicaInstanceId::new("target"),
+                role: Role::ActiveSecondary,
+                status: ReplicaStatus::Up,
+                replicator_address: "http://target-data".to_string(),
+                must_catch_up: true,
+                progress: ConfigurationProgressSource::BuildCopyLsn,
+            }],
+            write_quorum: 2,
+        };
+        let intent = AddReplicaIntent {
+            operation_id: "operation".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            mode: AddReplicaMode::ScaleUp,
+            epoch: Epoch::new(1, 2),
+            primary_replica_id: 1,
+            primary_instance_id: ReplicaInstanceId::new("primary"),
+            primary_agent_generation: generation.clone(),
+            primary_control_address: "http://primary".to_string(),
+            target_replica_id: 2,
+            target_instance_id: ReplicaInstanceId::new("target"),
+            target_agent_generation: target_generation.clone(),
+            target_control_address: "http://target".to_string(),
+            target_replicator_address: "http://target-data".to_string(),
+            retired_instance_id: None,
+            previous_configuration: ConfigurationDescriptor {
+                members: Vec::new(),
+                write_quorum: 1,
+            },
+            catch_up_configuration: descriptor.clone(),
+            current_configuration: ConfigurationDescriptor {
+                members: descriptor
+                    .members
+                    .iter()
+                    .cloned()
+                    .map(|mut member| {
+                        member.must_catch_up = false;
+                        member
+                    })
+                    .collect(),
+                write_quorum: 2,
+            },
+            minimum_committed_replicas: 1,
+            deadline_unix_seconds: 100,
+            compensation_deadline_unix_seconds: 110,
+        };
+        let action = DurableReplicaAction::AddReplicaIntent {
+            intent: Box::new(intent.clone()),
+        };
+        let request = CorrelatedControlActionRequest {
+            protocol_version: crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+            action_id: "add-action".to_string(),
+            input_signature: action.signature(),
+            target_replica_id: 1,
+            target_instance_id: ReplicaInstanceId::new("primary"),
+            expected_agent_generation: generation.clone(),
+            expected_control_version: AgentControlVersion::new(0),
+            observed_runtime_epoch: Epoch::new(1, 2),
+            action: action.clone(),
+        };
+        let decoded = CorrelatedControlActionRequest::try_from(
+            proto::ExecuteCorrelatedControlActionRequest::from(request),
+        )
+        .unwrap();
+        assert_eq!(decoded.action.signature(), action.signature());
+
+        let mut peer = PeerStageRequest {
+            protocol_version: crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+            operation_id: intent.operation_id,
+            attempt_id: intent.attempt_id,
+            message_id: "prepare".to_string(),
+            input_signature: String::new(),
+            stage: PeerStage::Prepare,
+            sender_replica_id: 1,
+            sender_instance_id: ReplicaInstanceId::new("primary"),
+            sender_agent_generation: generation,
+            sender_control_address: "http://primary".to_string(),
+            parent_action_id: "parent".to_string(),
+            parent_action_signature: action.signature(),
+            target_replica_id: 2,
+            target_instance_id: ReplicaInstanceId::new("target"),
+            expected_target_agent_generation: target_generation,
+            expected_target_peer_control_version: 0,
+            epoch: Epoch::new(1, 2),
+            configuration_fence: "fence".to_string(),
+            build_key: None,
+            copy_lsn: None,
+        };
+        peer.input_signature = peer.signature();
+        let round_trip =
+            PeerStageRequest::try_from(proto::ExecuteAddBuildStageRequest::from(peer.clone()))
+                .unwrap();
+        assert_eq!(round_trip, peer);
     }
 }

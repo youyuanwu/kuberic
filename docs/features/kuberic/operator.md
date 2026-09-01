@@ -27,6 +27,9 @@ switchover, and scaling through CRD-backed durable workflows.
   optional last-known election progress/deactivation metadata
 - optional compact versioned `operation` checkpoint for durable creation,
   switchover, replica add/rebuild, and configuration-first replica removal,
+- structured add-replica attempt with frozen primary/target generations,
+  endpoints, configuration descriptors, semantic build key, deadlines, and
+  commit observation,
   plus Phase-1 failover/data-loss recovery, including optional
   previous/committed topology, target snapshot, one pending correlated action,
   failover observations/assessment/epoch intents, and optional pod-local
@@ -154,11 +157,12 @@ effects. This is intentionally narrower than Service Fabric RA: CRD status and
 the operator remain the only owners of distributed workflow state.
 
 Before a pending runtime action is dispatched, reconciliation requires
-replica-agent control protocol version 1 and exact agreement among the
+replica-agent control protocol version 2 and exact agreement among the
 addressed, runtime, and pending Pod incarnations. It persists the observed
 agent generation, agent control version, and runtime epoch.
-The same write freezes the exact encoded action payload so observation and
-retry signatures cannot drift with live progress.
+Direct non-add actions also freeze their exact encoded payload so observation
+and retry signatures cannot drift with live progress. Add/rebuild uses the
+structured `operation.addIntent` as its only payload authority.
 
 Missing, malformed, or unsupported agent status fails closed. There is no
 capability negotiation or old-peer fallback.
@@ -258,23 +262,39 @@ operation without publishing a new stable snapshot.
 When `spec.replicas > current stable member count`:
 1. Create new Pod (with ownership labels)
 2. Wait for Pod Ready
-3. Persist a versioned add operation containing the previous stable snapshot
-   and the exact candidate pod UID
-4. Advance one correlated activity per reconcile:
-   Open(New) → UpdateEpoch → IdleSecondary → BuildReplica on the primary →
-   ActiveSecondary
-5. Install catch-up configuration with the candidate marked `must_catch_up`,
-   wait for write quorum, then install current configuration
-6. Update the candidate label and publish the target stable snapshot
+3. Observe exact primary/target identities, agent generations, control/data
+   endpoints, peer version, epoch, quorum, and `minReplicas`
+4. Persist one structured add attempt and one coarse pending
+   `AddReplicaIntent`
+5. Dispatch only to the current primary ReplicaAgent
+6. Observe primary coordinator phase, target peer/runtime postconditions, and
+   current-configuration commit
+7. Label the candidate and publish the target stable snapshot after exact
+   attestation
 
-`BuildReplica` is scheduled asynchronously by the pod runtime. Status reports
-scheduled, in-progress, completed, or failed, so retries and controller
-replacement do not start a concurrent second copy.
+The primary agent owns target Prepare, tracked copy, target Activate, catch-up
+configuration, write-quorum wait, current configuration, and compensation.
+The operator never sends a production mutation to the add target.
+
+The structured attempt is the semantic source of truth. It freezes structural
+configuration and derives the target progress from the acknowledged copy LSN.
+No fine-grained add cursor or encoded add action payload is retained.
+Copy and quorum wait are tracked asynchronously by `PodRuntime`; status remains
+available and exact duplicate copy is suppressed only while target generation
+continuity still matches.
 
 Stale-secondary replacement uses the same operation after first removing the
-old exact `(ReplicaId, ReplicaInstanceId)` connection from the primary. The
-previous stable snapshot remains unchanged until the replacement's current
-configuration commits.
+old exact `(ReplicaId, ReplicaInstanceId)` connection from the primary. That
+retirement is now primary-agent-owned and frozen together with the replacement
+identity. The previous stable snapshot remains unchanged until the
+replacement's current configuration commits.
+
+Before commit, `Compensated` requires observed previous current configuration
+and exact target-connection absence; otherwise status becomes poisoned and the
+operator does not delete the target. After commit, recovery is roll-forward
+only. If final serving attestation cannot be restored, the operator removes any
+target serving label, publishes the proven topology with a
+`CommittedDegraded` condition, and lets existing recovery repair it.
 
 ---
 

@@ -65,8 +65,11 @@ impl NoopReplicator {
                         ReplicatorControlEvent::WaitForCatchUpQuorum { reply, .. } => {
                             let _ = reply.send(Ok(()));
                         }
-                        ReplicatorControlEvent::BuildReplica { reply, .. } => {
+                        ReplicatorControlEvent::CancelCatchUpQuorumWait { reply, .. } => {
                             let _ = reply.send(Ok(()));
+                        }
+                        ReplicatorControlEvent::BuildReplica { reply, .. } => {
+                            let _ = reply.send(Ok(state.committed_lsn()));
                         }
                         ReplicatorControlEvent::RemoveReplica { reply, .. } => {
                             let _ = reply.send(Ok(()));

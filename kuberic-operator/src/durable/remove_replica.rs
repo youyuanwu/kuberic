@@ -113,6 +113,7 @@ pub fn start_remove_replica(
         pending_action: None,
         last_error: None,
         failover: None,
+        add_intent: None,
     })
 }
 
@@ -1184,9 +1185,12 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                build_observation: None,
                 agent: kuberic_core::types::ReplicaAgentStatus {
                     protocol_version:
                         kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                    add_build_peer_protocol_version:
+                        kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
                     generation: kuberic_core::types::AgentGeneration::parse(
                         "0123456789abcdef0123456789abcdef",
                     )
@@ -1197,6 +1201,7 @@ mod tests {
                     local_faults: Vec::new(),
                 },
             },
+            control_address: format!("http://{instance}-control"),
             replicator_address: format!("http://{instance}"),
             pod_name: format!("set-{}", id - 1),
             pod_role_label: None,

@@ -32,11 +32,11 @@ use crate::crd::{
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
     RemoveReplicaTarget, ReplicaObservation, adopt_replacement_before_confirmation,
-    correlated_action_observation, decide, decide_add_replica, decide_create_partition,
-    decide_failover, decide_remove_replica, fail_closed, failover_action_for,
-    failover_pending_label, operation_condition, record_activity_error, record_observation,
-    start_add_replica, start_create_partition, start_failover, start_remove_replica,
-    start_switchover,
+    attest_add_replica, correlated_action_observation, decide, decide_add_replica,
+    decide_create_partition, decide_failover, decide_remove_replica, fail_closed,
+    failover_action_for, failover_pending_label, operation_condition, record_activity_error,
+    record_observation, start_add_replica, start_create_partition, start_failover,
+    start_remove_replica, start_switchover,
 };
 
 /// Shared state across reconciliation loops.
@@ -74,6 +74,7 @@ fn plan_dispatch_evidence(
     observed: &ReplicaStatusInfo,
     addressed_instance: &ReplicaInstanceId,
     action: &DurableReplicaAction,
+    persist_action_payload: bool,
 ) -> DispatchEvidencePlan {
     let mut planned = pending.clone();
     let exact_incarnation = addressed_instance.as_str() == pending.target_instance_id
@@ -98,9 +99,14 @@ fn plan_dispatch_evidence(
     planned.dispatch_agent_control_version = Some(control_version);
     planned.dispatch_observed_runtime_epoch = Some(runtime_epoch);
     let local_record_exists = correlated_action_observation(observed, &pending.action_id).is_some();
-    if planned.dispatch_action_payload.is_empty() || (!evidence_matches && !local_record_exists) {
-        planned.dispatch_action_payload =
-            kuberic_core::grpc::convert::encode_correlated_action_payload(action);
+    if persist_action_payload {
+        if planned.dispatch_action_payload.is_empty() || (!evidence_matches && !local_record_exists)
+        {
+            planned.dispatch_action_payload =
+                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(action);
+        }
+    } else {
+        planned.dispatch_action_payload.clear();
     }
 
     if planned == *pending {
@@ -113,11 +119,15 @@ fn plan_dispatch_evidence(
 async fn execute_planned_control_action(
     handle: &dyn ReplicaHandle,
     pending: &PendingActionStatus,
+    authoritative_action: Option<DurableReplicaAction>,
 ) -> kuberic_core::Result<()> {
-    let action = kuberic_core::grpc::convert::decode_correlated_action_payload(
-        &pending.dispatch_action_payload,
-    )
-    .map_err(|error| KubericError::Internal(error.into()))?;
+    let action = match authoritative_action {
+        Some(action) => action,
+        None => kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+            &pending.dispatch_action_payload,
+        )
+        .map_err(|error| KubericError::Internal(error.into()))?,
+    };
     let generation = pending
         .dispatch_agent_generation
         .as_deref()
@@ -657,6 +667,7 @@ pub async fn reconcile_set(
                     target_instance.to_string(),
                     target_pod.name_any(),
                     DurableAddMode::Rebuild,
+                    set.spec.min_replicas as usize,
                     now,
                 )?;
                 let mut status = KubericSetStatus {
@@ -1178,6 +1189,7 @@ pub async fn reconcile_set(
                     instance_id.to_string(),
                     pod.name_any(),
                     DurableAddMode::ScaleUp,
+                    set.spec.min_replicas as usize,
                     now,
                 )?;
                 let mut status = KubericSetStatus {
@@ -1239,6 +1251,74 @@ pub async fn reconcile_set(
                 .await?;
                 state.drivers.lock().await.remove(&set_key);
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+
+            let degraded_add = set.status.as_ref().and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.reason == "CommittedDegraded")
+                    .then_some(status.operation.as_ref())
+                    .flatten()
+                    .filter(|operation| operation.kind == DurableOperationKind::AddReplica)
+            });
+            if let Some(operation) = degraded_add {
+                let mut add_observations = OperationObservations::new();
+                for member in &persisted_snapshot.members {
+                    let Some((_, _, pod)) = current_pods.iter().find(|(id, _, _)| *id == member.id)
+                    else {
+                        continue;
+                    };
+                    let Ok(handle) = api.create_replica_handle(member.id, pod, &set.spec).await
+                    else {
+                        continue;
+                    };
+                    let Ok(status) = handle.get_status().await else {
+                        continue;
+                    };
+                    add_observations.insert(
+                        member.id,
+                        ReplicaObservation {
+                            status,
+                            control_address: handle.control_address(),
+                            replicator_address: handle.replicator_address(),
+                            pod_name: pod.name_any(),
+                            pod_role_label: pod
+                                .metadata
+                                .labels
+                                .as_ref()
+                                .and_then(|labels| labels.get("kuberic.io/role"))
+                                .cloned(),
+                        },
+                    );
+                }
+                if attest_add_replica(operation, &add_observations).is_ok() {
+                    let target_id = operation
+                        .target_replica_id
+                        .ok_or_else(|| "degraded add has no target replica ID".to_string())?;
+                    let target = add_observations
+                        .get(&target_id)
+                        .ok_or_else(|| "degraded add target is unavailable".to_string())?;
+                    if target.pod_role_label.as_deref() != Some("secondary") {
+                        let mut labels = BTreeMap::new();
+                        labels.insert("kuberic.io/role".to_string(), "secondary".to_string());
+                        api.patch_pod_labels(&namespace, &target.pod_name, labels)
+                            .await?;
+                    } else {
+                        let mut status = set.status.clone().unwrap_or_default();
+                        status
+                            .conditions
+                            .retain(|condition| condition.reason != "CommittedDegraded");
+                        api.patch_set_status(
+                            &namespace,
+                            &name,
+                            &status,
+                            set.metadata.resource_version.as_deref(),
+                        )
+                        .await?;
+                    }
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
             }
 
             if let Some(action) =
@@ -1485,7 +1565,7 @@ async fn reconcile_stable_election_metadata(
     let action = DurableReplicaAction::RecordElectionConfiguration {
         configuration: expected,
     };
-    match plan_dispatch_evidence(pending, &observed, &handle.instance_id(), &action) {
+    match plan_dispatch_evidence(pending, &observed, &handle.instance_id(), &action, true) {
         DispatchEvidencePlan::Persist(planned) => {
             refresh.pending_action = Some(*planned);
             let mut status = set.status.clone().unwrap_or_default();
@@ -1506,7 +1586,7 @@ async fn reconcile_stable_election_metadata(
         DispatchEvidencePlan::Ready => {}
     }
     let pending = refresh.pending_action.as_ref().unwrap();
-    let result = execute_planned_control_action(handle.as_ref(), pending).await;
+    let result = execute_planned_control_action(handle.as_ref(), pending, None).await;
     if let Err(error) = result {
         let pending = refresh.pending_action.as_mut().unwrap();
         if dispatch_rejection_requires_refresh(&error) {
@@ -1689,6 +1769,7 @@ async fn reconcile_failover_operation(
                     probe_id,
                     ReplicaObservation {
                         status,
+                        control_address: handle.control_address(),
                         replicator_address: handle.replicator_address(),
                         pod_name: pod.name_any(),
                         pod_role_label: pod
@@ -1936,8 +2017,13 @@ async fn reconcile_failover_operation(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             };
             let action = failover_action_for(&operation, pending, &handles)?;
-            match plan_dispatch_evidence(pending, &observed.status, &handle.instance_id(), &action)
-            {
+            match plan_dispatch_evidence(
+                pending,
+                &observed.status,
+                &handle.instance_id(),
+                &action,
+                true,
+            ) {
                 DispatchEvidencePlan::Persist(planned) => {
                     let mut next = operation.clone();
                     next.pending_action = Some(*planned);
@@ -1951,7 +2037,8 @@ async fn reconcile_failover_operation(
                 DispatchEvidencePlan::Ready => {}
             }
             let pending = operation.pending_action.as_ref().unwrap();
-            if let Err(error) = execute_planned_control_action(handle.as_ref(), pending).await {
+            if let Err(error) = execute_planned_control_action(handle.as_ref(), pending, None).await
+            {
                 let next = operation_after_dispatch_error(&operation, &error);
                 return persist_failover_operation(set, api, &next, Duration::from_secs(1)).await;
             }
@@ -2235,6 +2322,7 @@ async fn apply_failover_decision(
         Decision::Execute { .. }
         | Decision::PatchPodRole { .. }
         | Decision::DeletePod { .. }
+        | Decision::CompleteDegraded { .. }
         | Decision::RestartCreation { .. } => {
             Err("failover emitted an activity without persisted dispatch authorization".to_string())
         }
@@ -2289,7 +2377,10 @@ async fn reconcile_durable_operation(
             .target_snapshot
             .members
             .iter()
-            .filter(|member| Some(member.id) != operation.target_replica_id)
+            .filter(|member| {
+                Some(member.id) != operation.target_replica_id
+                    && member.id != operation.old_primary_id
+            })
             .cloned()
             .collect(),
         DurableOperationKind::RemoveReplica => operation.target_snapshot.members.clone(),
@@ -2353,6 +2444,7 @@ async fn reconcile_durable_operation(
                     *replica_id,
                     ReplicaObservation {
                         status,
+                        control_address: handle.control_address(),
                         replicator_address: handle.replicator_address(),
                         pod_name: pod.name_any(),
                         pod_role_label: pod
@@ -2383,7 +2475,27 @@ async fn reconcile_durable_operation(
             decide_create_partition(&operation, &observations, &pod_identities, now)
         }
         DurableOperationKind::Switchover => decide(&operation, &observations, now),
-        DurableOperationKind::AddReplica => decide_add_replica(&operation, &observations, now),
+        DurableOperationKind::AddReplica => {
+            let target_pod_role_label = operation.target_replica_id.and_then(|target_id| {
+                current_pods
+                    .iter()
+                    .find(|(id, _, _)| *id == target_id)
+                    .and_then(|(_, _, pod)| {
+                        pod.metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|labels| labels.get("kuberic.io/role"))
+                    })
+                    .map(String::as_str)
+            });
+            decide_add_replica(
+                &operation,
+                &observations,
+                &pod_identities,
+                target_pod_role_label,
+                now,
+            )
+        }
         DurableOperationKind::RemoveReplica => {
             decide_remove_replica(&operation, &observations, &pod_identities, now)
         }
@@ -2449,8 +2561,15 @@ async fn reconcile_durable_operation(
             let Some(handle) = handles.get(&target_id) else {
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             };
-            match plan_dispatch_evidence(pending, &observed.status, &handle.instance_id(), &action)
-            {
+            let coarse_add = operation.kind == DurableOperationKind::AddReplica
+                && pending.kind == crate::crd::DurableActionKind::AddReplicaIntent;
+            match plan_dispatch_evidence(
+                pending,
+                &observed.status,
+                &handle.instance_id(),
+                &action,
+                !coarse_add,
+            ) {
                 DispatchEvidencePlan::Persist(planned) => {
                     let mut next_operation = operation.clone();
                     next_operation.pending_action = Some(*planned);
@@ -2472,7 +2591,12 @@ async fn reconcile_durable_operation(
                 }
                 DispatchEvidencePlan::Ready => {}
             }
-            let result = execute_planned_control_action(handle.as_ref(), pending).await;
+            let result = execute_planned_control_action(
+                handle.as_ref(),
+                pending,
+                coarse_add.then_some(action),
+            )
+            .await;
             if let Err(error) = result {
                 let next_operation = operation_after_dispatch_error(&operation, &error);
                 let mut status = set.status.clone().unwrap_or_default();
@@ -2488,15 +2612,27 @@ async fn reconcile_durable_operation(
             }
         }
         Decision::PatchPodRole { target_id, role } => {
-            let Some(observation) = observations.get(&target_id) else {
+            let pod_name = observations
+                .get(&target_id)
+                .map(|observation| observation.pod_name.clone())
+                .or_else(|| {
+                    (operation.kind == DurableOperationKind::AddReplica)
+                        .then(|| {
+                            current_pods.iter().find_map(|(id, instance_id, pod)| {
+                                (*id == target_id
+                                    && operation.target_instance_id.as_deref()
+                                        == Some(instance_id.as_str()))
+                                .then(|| pod.name_any())
+                            })
+                        })
+                        .flatten()
+                });
+            let Some(pod_name) = pod_name else {
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             };
             let mut labels = BTreeMap::new();
             labels.insert("kuberic.io/role".to_string(), role);
-            if let Err(error) = api
-                .patch_pod_labels(&namespace, &observation.pod_name, labels)
-                .await
-            {
+            if let Err(error) = api.patch_pod_labels(&namespace, &pod_name, labels).await {
                 let next_operation = record_activity_error(&operation, &error);
                 let mut status = set.status.clone().unwrap_or_default();
                 status.operation = Some(next_operation.clone());
@@ -2618,6 +2754,46 @@ async fn reconcile_durable_operation(
             } else {
                 state.drivers.lock().await.remove(set_key);
             }
+        }
+        Decision::CompleteDegraded {
+            operation,
+            snapshot,
+        } => {
+            let snapshot = snapshot_with_observed_metadata(snapshot, &observations);
+            let primary_name = pod_name_for_id(&current_pods, snapshot.primary_id);
+            let mut status = set.status.clone().unwrap_or_default();
+            status.epoch = snapshot.epoch.clone();
+            status.current_primary = primary_name.clone();
+            status.target_primary = primary_name;
+            status.phase = Phase::Healthy;
+            status.reconfiguration_phase = ReconfigurationPhase::None;
+            status.ready_replicas = ready_pods.len() as i32;
+            status.replicas = pods.len() as i32;
+            status.members = build_member_status_for_snapshot(pods, &set.spec, &snapshot);
+            status.stable_snapshot = Some(snapshot);
+            status.operation = Some(operation);
+            status.primary_failing_since = None;
+            set_operation_condition(
+                &mut status,
+                StatusCondition {
+                    type_: "DurableOperation".to_string(),
+                    status: "True".to_string(),
+                    reason: "CommittedDegraded".to_string(),
+                    message: "replica add current configuration committed; final serving attestation is pending recovery".to_string(),
+                    last_transition_time: now.to_string(),
+                },
+            );
+            persist_committed_status(
+                api,
+                state,
+                set_key,
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+            state.drivers.lock().await.remove(set_key);
         }
         Decision::RestartCreation { operation } => {
             let mut status = set.status.clone().unwrap_or_default();
@@ -3247,8 +3423,11 @@ mod dispatch_planning_tests {
             election_configuration: None,
             deactivation_info: None,
             active_replica_connections: Vec::new(),
+            build_observation: None,
             agent: ReplicaAgentStatus {
                 protocol_version,
+                add_build_peer_protocol_version:
+                    kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
                 generation: AgentGeneration::parse("0123456789abcdef0123456789abcdef").unwrap(),
                 control_version: AgentControlVersion::new(7),
                 current_action: None,
@@ -3300,6 +3479,7 @@ mod dispatch_planning_tests {
             &observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION),
             &addressed,
             &action(),
+            true,
         ));
         assert_eq!(
             planned.dispatch_agent_generation.as_deref(),
@@ -3324,6 +3504,7 @@ mod dispatch_planning_tests {
                 &observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION),
                 &addressed,
                 &action(),
+                true,
             ),
             DispatchEvidencePlan::Ready
         ));
@@ -3338,6 +3519,7 @@ mod dispatch_planning_tests {
             &observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION),
             &addressed,
             &first_action,
+            true,
         ));
         let changed_action = configuration_action(11);
 
@@ -3347,10 +3529,11 @@ mod dispatch_planning_tests {
                 &observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION),
                 &addressed,
                 &changed_action,
+                true,
             ),
             DispatchEvidencePlan::Ready
         ));
-        let frozen = kuberic_core::grpc::convert::decode_correlated_action_payload(
+        let frozen = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
             &planned.dispatch_action_payload,
         )
         .unwrap();
@@ -3370,6 +3553,7 @@ mod dispatch_planning_tests {
                 error_class: None,
                 error: None,
                 result: None,
+                add_replica_progress: None,
             },
         });
         let replay_planned = persisted(plan_dispatch_evidence(
@@ -3377,6 +3561,7 @@ mod dispatch_planning_tests {
             &replay_observation,
             &addressed,
             &changed_action,
+            true,
         ));
         assert_eq!(
             replay_planned.dispatch_action_payload,
@@ -3399,6 +3584,7 @@ mod dispatch_planning_tests {
                         error_class: Some(DurableActionErrorClass::NoWriteQuorum),
                         error: Some("no write quorum".to_string()),
                         result: None,
+                        add_replica_progress: None,
                     },
                 },
             },
@@ -3428,6 +3614,7 @@ mod dispatch_planning_tests {
                         error_class: None,
                         error: None,
                         result: None,
+                        add_replica_progress: None,
                     },
                 },
             },
@@ -3453,6 +3640,7 @@ mod dispatch_planning_tests {
                         error_class: None,
                         error: None,
                         result: None,
+                        add_replica_progress: None,
                     },
                 },
             },
@@ -3472,6 +3660,7 @@ mod dispatch_planning_tests {
                 &observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION + 1),
                 &ReplicaInstanceId::new("pod-uid"),
                 &action(),
+                true,
             ),
             DispatchEvidencePlan::WaitForSupportedProtocol
         ));
@@ -3485,6 +3674,7 @@ mod dispatch_planning_tests {
                 &observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION),
                 &ReplicaInstanceId::new("replacement-pod"),
                 &action(),
+                true,
             ),
             DispatchEvidencePlan::WaitForExactIncarnation
         ));
@@ -3504,6 +3694,7 @@ mod dispatch_planning_tests {
             &observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION),
             &ReplicaInstanceId::new("pod-uid"),
             &action(),
+            true,
         ));
         assert_eq!(
             planned.dispatch_agent_generation.as_deref(),

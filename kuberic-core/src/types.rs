@@ -1,6 +1,10 @@
 use bytes::Bytes;
 use std::fmt;
 
+use crate::add_replica::{
+    AddReplicaIntent, AddReplicaProgress, AddReplicaTerminalResult, RuntimeBuildObservation,
+};
+
 pub type CancellationToken = tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -284,6 +288,7 @@ pub struct LocalFaultRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaAgentStatus {
     pub protocol_version: u32,
+    pub add_build_peer_protocol_version: u32,
     pub generation: AgentGeneration,
     pub control_version: AgentControlVersion,
     pub current_action: Option<CorrelatedActionObservation>,
@@ -307,6 +312,7 @@ pub struct ReplicaStatusInfo {
     pub election_configuration: Option<ReplicaElectionConfiguration>,
     pub deactivation_info: Option<ReplicaDeactivationInfo>,
     pub active_replica_connections: Vec<ReplicaConnectionStatus>,
+    pub build_observation: Option<RuntimeBuildObservation>,
     pub agent: ReplicaAgentStatus,
 }
 
@@ -400,6 +406,7 @@ pub struct ReplicaDeactivationInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurableActionResult {
     DataLoss(DataLossAction),
+    AddReplica(AddReplicaTerminalResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,10 +436,14 @@ pub struct DurableActionObservation {
     pub error_class: Option<DurableActionErrorClass>,
     pub error: Option<String>,
     pub result: Option<DurableActionResult>,
+    pub add_replica_progress: Option<AddReplicaProgress>,
 }
 
 #[derive(Debug, Clone)]
 pub enum DurableReplicaAction {
+    AddReplicaIntent {
+        intent: Box<AddReplicaIntent>,
+    },
     Open {
         mode: OpenMode,
     },
@@ -473,6 +484,7 @@ pub enum DurableReplicaAction {
 impl DurableReplicaAction {
     pub fn signature(&self) -> String {
         match self {
+            Self::AddReplicaIntent { intent } => intent.signature(),
             Self::Open { mode } => format!("open:{mode:?}"),
             Self::Close => "close".to_string(),
             Self::RevokeWriteStatus => "revoke-write-status".to_string(),
