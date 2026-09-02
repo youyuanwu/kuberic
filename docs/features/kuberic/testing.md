@@ -98,7 +98,11 @@ checks:
 - 16-entry terminal/fault retention and 1,024-byte UTF-8 error bounds;
 - late execution-token rejection and best-effort fault saturation;
 - same-Pod new-process generation with no inherited action state; and
-- peer duplicate/conflict/version/identity fencing; and
+- lifecycle-peer duplicate/conflict/version/identity fencing;
+- coarse removal admission, progress/result validation, pre/post-commit
+  sequencing, exact connection cleanup, compensation, and responsive status;
+- Retire ordering, sender/parent/target/epoch/configuration/deadline fences,
+  exact duplicate replay, restart recovery, and bounded peer retention; and
 - missing/malformed/unsupported protocol rejection and transport error
   classes.
 
@@ -196,21 +200,27 @@ impl ClusterApi for KvClusterApi {
 ## How to Run Tests
 
 ```bash
-# All tests
-cargo test -p kuberic-core -p kvstore
+# Meaningful non-cluster suites
+cargo test -p kuberic-core -p kuberic-operator -p kvstore -p sqlite-replicated
+
+# Documentation tests
+cargo test --doc --workspace
 
 # Core crate only
 cargo test -p kuberic-core
 
-# KV example only
-cargo test -p kvstore
+# High-fidelity reconciler
+cargo test -p kvstore --test reconciler
 
 # Specific durable workflow test
-cargo test -p kvstore --test reconciler test_durable_failover
+cargo test -p kvstore --test reconciler test_durable_remove_coarse_activation
 
 # With logging (requires test-log crate)
-RUST_LOG=info cargo test -p kvstore --test reconciler test_durable_failover -- --nocapture
+RUST_LOG=info cargo test -p kvstore --test reconciler test_durable_remove_coarse_activation -- --nocapture
 ```
+
+`kuberic-tests` requires an existing Kubernetes cluster and is not part of the
+normal local documentation or workflow gate.
 
 ---
 
@@ -393,7 +403,7 @@ semantic build proof is not reused.
 Core coverage verifies peer accepted/in-progress replay, conflicting message
 IDs, target generation fences, configuration descriptor signatures, add
 protocol conversion, and execution-qualified quorum-wait cancellation.
-Schema tests assert that superseded fine-grained add phases/actions and
+Schema tests assert that superseded per-step add phases/actions and
 compatibility sentinels are absent.
 
 **Adapter data-plane coverage** ✅
@@ -401,13 +411,35 @@ compatibility sentinels are absent.
 shipping, schema changes, switchover, and failover through correlated actions.
 
 **Pattern 9: Durable removal boundary and fencing** ✅
-`test_durable_remove_survives_state_loss_and_every_lost_runtime_reply`
-replaces controller state at every persisted removal phase and injects lost
-responses for catch-up/current configuration, quorum wait, exact primary
-connection removal, demotion, and close. Companion tests cover healthy
-scale-down, unreachable force-removal, pre-commit configuration restoration,
-post-commit roll-forward, stable-snapshot commit ordering, conflict before
-intent, and same-name/new-UID deletion fencing.
+`test_durable_remove_coarse_activation` proves production dispatches one
+`RemoveReplicaIntent` to the primary and no per-step removal controls.
+`test_durable_force_remove_unreachable_secondary_with_retained_quorum`,
+`test_scale_down_preadmission_and_minimum_are_mutation_free`, and
+`test_scale_down_target_loss_after_dispatch_never_changes_to_force` cover
+healthy/force admission and identical global quorum safety.
+
+`test_precommit_quorum_loss_compensates_without_reduced_publication`, the
+three-attempt/invalid-state unit matrices, and
+`test_primary_process_restart_matrix_never_restores_same_epoch_primary` cover
+pre-commit compensation, exact current-install ambiguity, and all primary
+restart phases. `test_primary_process_restart_poison_is_durable_and_operator_restart_is_a_no_op`
+proves `AmbiguousPrimaryRestart` remains terminal across controller restart.
+Post-commit restart rolls forward from the workflow-scoped committed snapshot
+and never reintroduces the removed member.
+
+Real lifecycle-peer tests lose stage replies, return a temporarily unavailable
+target before expiry, stall retirement while status remains responsive, and
+restart the target at role-none/close boundaries. Core tests additionally
+cover explicitly unsupported older control/peer generations, exact duplicate
+and signature conflict,
+sender/parent/epoch/configuration/generation fences, same-ID replacement
+protection, 10/30/60/600-second budgets, and bounded terminal retention.
+
+Commit/publication resource-version conflicts are refetched without duplicate
+mutation. Exact-UID label/delete tests prove a same-name replacement is not
+relabelled or deleted. Schema and source searches require remove operation v2,
+control v3, lifecycle peer v2, add operation v3, and no superseded removal
+cursor or peer alias.
 
 **Pattern 10: Durable Phase-1 failover and data loss** ✅
 

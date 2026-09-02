@@ -2,12 +2,13 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
 use crate::error::KubericError;
-use crate::proto::replica_add_build_peer_server::ReplicaAddBuildPeer;
+use crate::proto::replica_lifecycle_peer_server::ReplicaLifecyclePeer;
 use crate::proto::{
-    ExecuteAddBuildStageRequest, ExecuteAddBuildStageResponse, GetAddBuildStatusRequest,
-    GetAddBuildStatusResponse,
+    ExecuteLifecycleStageRequest, ExecuteLifecycleStageResponse, GetLifecycleStatusRequest,
+    GetLifecycleStatusResponse,
 };
 use crate::replica_agent::AgentCommand;
+use crate::replica_lifecycle::{PeerStageRequest, REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION};
 use crate::types::{AgentGeneration, ReplicaInstanceId};
 
 pub struct PeerServer {
@@ -38,15 +39,15 @@ fn peer_error_status(error: KubericError) -> Status {
 }
 
 #[tonic::async_trait]
-impl ReplicaAddBuildPeer for PeerServer {
-    async fn get_add_build_status(
+impl ReplicaLifecyclePeer for PeerServer {
+    async fn get_lifecycle_status(
         &self,
-        request: Request<GetAddBuildStatusRequest>,
-    ) -> Result<Response<GetAddBuildStatusResponse>, Status> {
+        request: Request<GetLifecycleStatusRequest>,
+    ) -> Result<Response<GetLifecycleStatusResponse>, Status> {
         let request = request.into_inner();
-        if request.protocol_version != crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION {
+        if request.protocol_version != REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION {
             return Err(Status::unimplemented(format!(
-                "unsupported replica add/build peer protocol version {}",
+                "unsupported replica lifecycle peer protocol version {}",
                 request.protocol_version
             )));
         }
@@ -54,7 +55,7 @@ impl ReplicaAddBuildPeer for PeerServer {
             .map_err(Status::invalid_argument)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(AgentCommand::GetAddBuildStatus {
+            .send(AgentCommand::GetLifecycleStatus {
                 target_replica_id: request.target_replica_id,
                 target_instance_id: ReplicaInstanceId::new(request.target_instance_id),
                 expected_generation: generation,
@@ -69,15 +70,15 @@ impl ReplicaAddBuildPeer for PeerServer {
         Ok(Response::new(status.into()))
     }
 
-    async fn execute_add_build_stage(
+    async fn execute_lifecycle_stage(
         &self,
-        request: Request<ExecuteAddBuildStageRequest>,
-    ) -> Result<Response<ExecuteAddBuildStageResponse>, Status> {
-        let request = crate::add_replica::PeerStageRequest::try_from(request.into_inner())
-            .map_err(Status::invalid_argument)?;
+        request: Request<ExecuteLifecycleStageRequest>,
+    ) -> Result<Response<ExecuteLifecycleStageResponse>, Status> {
+        let request =
+            PeerStageRequest::try_from(request.into_inner()).map_err(Status::invalid_argument)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
-            .send(AgentCommand::ExecuteAddBuildStage {
+            .send(AgentCommand::ExecuteLifecycleStage {
                 request: Box::new(request),
                 reply: reply_tx,
             })
@@ -87,7 +88,7 @@ impl ReplicaAddBuildPeer for PeerServer {
             .await
             .map_err(|_| Status::unavailable("replica agent closed"))?
             .map_err(peer_error_status)?;
-        Ok(Response::new(ExecuteAddBuildStageResponse {
+        Ok(Response::new(ExecuteLifecycleStageResponse {
             observation: Some(observation.into()),
         }))
     }

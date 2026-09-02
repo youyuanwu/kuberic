@@ -128,6 +128,8 @@ pub fn start_create_partition(
         target_instance_id: Some(current.instance_id.clone()),
         target_pod_name: Some(current.pod_name.clone()),
         target_pod_uid: Some(current.instance_id.clone()),
+        remove_target_replicator_address: None,
+        remove_target_agent_generation: None,
         retired_instance_id: None,
         frozen_lsn: None,
         next_secondary_index: 0,
@@ -136,6 +138,10 @@ pub fn start_create_partition(
         last_error: None,
         failover: None,
         add_intent: None,
+        remove_intent: None,
+        remove_commit_evidence: None,
+        remove_cleanup: None,
+        removal_disposition: None,
     })
 }
 
@@ -1819,8 +1825,8 @@ mod tests {
                 agent: kuberic_core::types::ReplicaAgentStatus {
                     protocol_version:
                         kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-                    add_build_peer_protocol_version:
-                        kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+                    lifecycle_peer_protocol_version:
+                        kuberic_core::replica_lifecycle::REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
                     generation: kuberic_core::types::AgentGeneration::parse(
                         "0123456789abcdef0123456789abcdef",
                     )

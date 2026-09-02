@@ -42,16 +42,17 @@ no manager action ledger.
 ## Status and Fencing
 
 Every supported pod reports required replica-agent status with numeric control
-protocol version 2, `AgentGeneration`, `AgentControlVersion`,
+protocol version 3, `AgentGeneration`, `AgentControlVersion`,
 `current_action`, and `retained_terminal_actions`. Missing, malformed, or
 unsupported agent status is rejected; it is not interpreted as an old peer.
 
 Before dispatch, the operator requires matching addressed, runtime, and
 pending Pod incarnations. It persists the observed generation, control
 version, and runtime epoch during a no-activity reconcile. Direct non-add
-actions also persist an exact encoded payload. Agent-owned add/build uses its
-structured CRD intent directly and has no duplicate payload projection. The
-next reconcile calls only `ExecuteCorrelatedControlAction`.
+and non-remove actions also persist an exact encoded payload. Agent-owned
+add/build and removal use their structured CRD intents directly and have no
+duplicate payload projection. The next reconcile calls only
+`ExecuteCorrelatedControlAction`.
 
 This is a coordinated operator/runtime deployment boundary. Mixed control
 versions do not interoperate. Deployments must quiesce durable topology work
@@ -79,13 +80,17 @@ evaluates durable postconditions before any at-least-once redrive.
 
 - There is one fenced mutation API and one local observation ledger.
 - Old control-plane clients and runtimes require coordinated replacement.
-- ReplicaAgent remains a local acceptance/replay boundary, not a distributed
-  workflow engine or peer protocol.
+- ReplicaAgent remains a local acceptance/replay and bounded transient
+  coordinator boundary, not a durable distributed workflow engine or global
+  topology authority.
 - PodRuntime callback ordering and typed completion remain unchanged.
 - Fault and terminal histories are bounded, volatile evidence.
-- Replica add/build now composes this boundary with the separate
-  `ReplicaAddBuildPeer` v1 service; other workflows retain the same correlated
-  action path.
+- Replica add/build and removal compose this boundary with the internal
+  `ReplicaLifecyclePeer` v2 service. Add/build uses
+  Prepare/Activate/Cleanup; removal uses Retire. Shared peer primitives do not
+  merge their workflows or expose arbitrary remote runtime actions.
+- Primary-agent add/build and removal coordination is transient and bounded;
+  it does not add a durable local workflow store.
 
 ## Service Fabric Mapping
 

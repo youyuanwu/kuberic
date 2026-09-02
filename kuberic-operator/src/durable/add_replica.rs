@@ -1,8 +1,11 @@
 use std::collections::HashSet;
 
 use kuberic_core::add_replica::{
-    AddReplicaIntent, AddReplicaMode, AddReplicaTerminalResult, ConfigurationDescriptor,
-    ConfigurationMemberDescriptor, ConfigurationProgressSource, RuntimeBuildState,
+    AddReplicaIntent, AddReplicaMode, AddReplicaTerminalResult, RuntimeBuildState,
+};
+use kuberic_core::replica_lifecycle::{
+    ConfigurationDescriptor, ConfigurationMemberDescriptor, ConfigurationProgressSource,
+    REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
 };
 use kuberic_core::types::{
     DurableActionResult, DurableActionState, DurableReplicaAction, Epoch, ReplicaConfigurationMode,
@@ -123,6 +126,8 @@ pub fn start_add_replica(
         target_instance_id: Some(target_instance_id.clone()),
         target_pod_name: Some(target_pod_name),
         target_pod_uid: None,
+        remove_target_replicator_address: None,
+        remove_target_agent_generation: None,
         retired_instance_id,
         previous_snapshot: previous.into(),
         target_snapshot: target,
@@ -135,6 +140,10 @@ pub fn start_add_replica(
         last_error: None,
         failover: None,
         add_intent: None,
+        remove_intent: None,
+        remove_commit_evidence: None,
+        remove_cleanup: None,
+        removal_disposition: None,
     })
 }
 
@@ -413,8 +422,8 @@ fn freeze_intent(
         return Err("stable primary observation cannot freeze add intent".to_string());
     }
     if target.status.instance_id.as_str() != target_instance_id(operation)?
-        || target.status.agent.add_build_peer_protocol_version
-            != kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION
+        || target.status.agent.lifecycle_peer_protocol_version
+            != REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION
     {
         return Err("target observation cannot freeze add intent".to_string());
     }
@@ -459,6 +468,7 @@ fn freeze_intent(
         minimum_committed_replicas: operation.minimum_committed_replicas.unwrap_or(1),
         deadline_unix_seconds: now + ADD_DEADLINE_SECONDS,
         compensation_deadline_unix_seconds: now + ADD_DEADLINE_SECONDS + COMPENSATION_GRACE_SECONDS,
+        target_lifecycle_peer_protocol_version: REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
     };
     let intent = AddReplicaIntentStatus {
         attempt,
@@ -470,6 +480,7 @@ fn freeze_intent(
         target_agent_generation: core.target_agent_generation.to_string(),
         target_control_address: core.target_control_address.clone(),
         target_replicator_address: core.target_replicator_address.clone(),
+        target_lifecycle_peer_protocol_version: core.target_lifecycle_peer_protocol_version,
         previous_configuration: descriptor_status(&previous_configuration),
         catch_up_configuration: descriptor_status(&catch_up_configuration),
         current_configuration: descriptor_status(&current_configuration),
@@ -591,7 +602,9 @@ fn decide_await_coordination(
                         "coarse add compensation could not prove its safety barrier",
                     )));
                 }
-                Some(DurableActionResult::DataLoss(_)) | None => {
+                Some(DurableActionResult::DataLoss(_))
+                | Some(DurableActionResult::RemoveReplica(_))
+                | None => {
                     return Ok(Decision::Persist(poison(
                         operation,
                         "coarse add completion has no typed add result",
@@ -884,6 +897,7 @@ pub(crate) fn core_intent(operation: &DurableOperationStatus) -> Result<AddRepli
         minimum_committed_replicas: operation.minimum_committed_replicas.unwrap_or(1),
         deadline_unix_seconds: intent.deadline_unix_seconds,
         compensation_deadline_unix_seconds: intent.compensation_deadline_unix_seconds,
+        target_lifecycle_peer_protocol_version: intent.target_lifecycle_peer_protocol_version,
     };
     core.validate()?;
     Ok(core)
@@ -1042,8 +1056,7 @@ mod tests {
                 agent: ReplicaAgentStatus {
                     protocol_version:
                         kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-                    add_build_peer_protocol_version:
-                        kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+                    lifecycle_peer_protocol_version: REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
                     generation: AgentGeneration::parse("0123456789abcdef0123456789abcdef").unwrap(),
                     control_version: AgentControlVersion::default(),
                     current_action: None,
@@ -1101,7 +1114,7 @@ mod tests {
             10,
         )
         .unwrap();
-        operation.version = crate::crd::DURABLE_OPERATION_VERSION;
+        operation.version = 2;
         assert!(
             decide_add_replica(
                 &operation,

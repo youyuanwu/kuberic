@@ -67,6 +67,17 @@ impl ReplicatorControl for ControlServer {
             .await
             .map_err(|_| Status::unavailable("runtime closed"))?;
         let agent = info.agent;
+        let current_agent_action = agent
+            .current_action
+            .map(crate::proto::CorrelatedActionObservationProto::try_from)
+            .transpose()
+            .map_err(Status::failed_precondition)?;
+        let retained_terminal_actions = agent
+            .retained_terminal_actions
+            .into_iter()
+            .map(crate::proto::CorrelatedActionObservationProto::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Status::failed_precondition)?;
         Ok(Response::new(GetStatusResponse {
             role: crate::proto::RoleProto::from(info.role) as i32,
             epoch: Some(info.epoch.into()),
@@ -90,15 +101,11 @@ impl ReplicatorControl for ControlServer {
             replica_agent_protocol_version: agent.protocol_version,
             agent_generation: agent.generation.to_string(),
             agent_control_version: agent.control_version.value(),
-            current_agent_action: agent.current_action.map(Into::into),
-            retained_terminal_actions: agent
-                .retained_terminal_actions
-                .into_iter()
-                .map(Into::into)
-                .collect(),
+            current_agent_action,
+            retained_terminal_actions,
             local_faults: agent.local_faults.into_iter().map(Into::into).collect(),
             build_observation: info.build_observation.map(Into::into),
-            replica_add_build_peer_protocol_version: agent.add_build_peer_protocol_version,
+            replica_lifecycle_peer_protocol_version: agent.lifecycle_peer_protocol_version,
         }))
     }
 
@@ -115,7 +122,12 @@ impl ReplicatorControl for ControlServer {
             })
             .await?;
         Ok(Response::new(ExecuteCorrelatedControlActionResponse {
-            observation: Some(acknowledgement.observation.into()),
+            observation: Some(
+                crate::proto::CorrelatedActionObservationProto::try_from(
+                    acknowledgement.observation,
+                )
+                .map_err(Status::failed_precondition)?,
+            ),
         }))
     }
 }

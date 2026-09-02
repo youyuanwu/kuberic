@@ -30,20 +30,20 @@ Implementation status, known gaps, and open questions.
 | Durable initial partition creation | ✅ Implemented — explicit no-previous-topology checkpoint, partial committed bootstrap snapshots, gated routing |
 | Durable switchover restart recovery | ✅ Implemented — compact CRD operation checkpoint, correlated activities, compensation |
 | Durable scale-up and stale-secondary rejoin | ✅ Implemented — one coarse primary-agent intent, target peer stages, tracked copy/quorum, commit-aware compensation |
-| Durable scale-down and stale/dead-secondary eviction | ✅ Implemented — config-first commit, exact connection cleanup, UID-fenced deletion |
-| Pod-local RA-lite boundary | ✅ Implemented — control v2, one versioned correlated mutation path with generation/version fencing and bounded replay |
-| Add/build peer protocol | ✅ Implemented — versioned Prepare/Activate/Cleanup status and execution on the existing control listener |
+| Durable scale-down and stale/dead-secondary eviction | ✅ Implemented — one coarse primary-agent intent, config-first commit, lifecycle-peer retirement, exact connection cleanup, UID-fenced deletion |
+| Pod-local RA-lite boundary | ✅ Implemented — control v3, one versioned correlated mutation path with generation/version fencing and bounded replay |
+| Lifecycle peer protocol | ✅ Implemented — v2 typed AddBuild Prepare/Activate/Cleanup and Remove Retire on the existing control listener |
 | Primary self-fencing (liveness probe) | ❌ Not implemented — K8s defense-in-depth (from CNPG) |
 | Node drain handling | ❌ Not implemented — K8s adaptation (analogous to SF PLB) |
 | CRD conditions (Ready, Degraded, Quorum) | ❌ Not implemented — K8s addition |
-| force_remove_secondary | ✅ Implemented in the operator durable remove protocol |
+| force_remove_secondary | ✅ Implemented through the coarse agent-owned durable remove protocol |
 
 ---
 
 ## Pod-Local Control Status
 
-`GetStatus` requires control protocol version 2 and add/build peer protocol
-version 1, `AgentGeneration`,
+`GetStatus` requires control protocol version 3 and lifecycle-peer protocol
+version 2, `AgentGeneration`,
 `AgentControlVersion`, the current generation-qualified action, 16 retained
 terminal observations, and up to 16 successfully received local fault records.
 The current action and retained terminals are the only local correlation
@@ -70,6 +70,25 @@ CRD `operation.addIntent` is the durable semantic input. `committedSnapshot`
 records irreversible current configuration before serving publication.
 `CommittedDegraded` means membership committed but the target is deliberately
 not serving until Healthy reconciliation re-attests and repairs its label.
+
+During removal, the primary action exposes one bounded phase from
+Validating through Attesting or Compensating, the attempt ID,
+`current_install_dispatched`, exact commit time, connection absence, target
+retirement observation, signed expiries, and a typed terminal result.
+`operation.removeIntent` is the durable semantic input. The operator persists
+the primary's commit timestamp and reduced-configuration signature in
+`removeCommitEvidence`; the reduced `committedSnapshot` is scoped to the
+active workflow and does not replace `stableSnapshot` until exact-UID cleanup
+and final publication complete.
+
+Removal terminal coordinator results are `CommittedClean`,
+`CommittedDegraded`, `Compensated`, and `CompensationIncomplete`. Separate
+operator dispositions pin the operation in `Poisoned`:
+`FailedPreCommitIncomplete`, `InvalidRemovalState`, and
+`AmbiguousPrimaryRestart`. The first records known pre-commit exhaustion; the
+second records structurally impossible or post-dispatch ambiguous state; the
+third records evidence erased by a complete same-Pod primary process restart.
+They are durable global decisions, unlike the volatile coordinator ledger.
 
 ---
 
@@ -142,6 +161,11 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
    The self-fencing liveness probe (K8s-specific addition) needs an HTTP
    health endpoint. This is not an SF pattern — it compensates for K8s
    lacking SF's federation-level failure detection.
+6. **Agent-owned switchover** — add/build and removal now delegate their local
+   reconfiguration sequence through one coarse primary intent. Switchover is
+   the next candidate; it still persists and dispatches its revoke, catch-up,
+   demotion, promotion, epoch, configuration, and compensation activities from
+   the operator checkpoint.
 
 ---
 
@@ -149,9 +173,11 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 
 ```
 kuberic-core/
-├── proto/kuberic.proto           # gRPC: ReplicatorControl, ReplicaAddBuildPeer, ReplicatorData
+├── proto/kuberic.proto           # gRPC: ReplicatorControl, ReplicaLifecyclePeer, ReplicatorData
 ├── src/
-│   ├── add_replica.rs               # Coarse intent, descriptors, peer/build status types
+│   ├── add_replica.rs               # Coarse add intent and tracked-build contracts
+│   ├── remove_replica.rs            # Coarse removal intent, progress, results, deadlines
+│   ├── replica_lifecycle.rs          # Shared typed lifecycle-peer contracts
 │   ├── types.rs                     # Epoch, Role, AccessStatus, ReplicaInfo, Operation, OperationStream
 │   ├── error.rs                     # KubericError enum (NotPrimary, NoWriteQuorum, etc.)
 │   ├── events.rs                    # LifecycleEvent, StateProviderEvent, ReplicatorControlEvent
@@ -160,7 +186,7 @@ kuberic-core/
 │   ├── runtime.rs                   # KubericRuntime (lower-level harness)
 │   ├── replica_agent.rs             # Pod-local admission, correlation, replay, status and faults
 │   ├── pod.rs                       # PodRuntime ordered service/replicator effects
-│   ├── grpc/peer_client.rs           # Strict primary-to-target add/build peer client
+│   ├── grpc/peer_client.rs           # Strict primary-to-target lifecycle peer client
 │   ├── grpc/peer_server.rs           # Target peer protocol endpoint
 │   ├── driver.rs                    # Read-only PartitionDriver + ReplicaHandle trait
 │   ├── replicator/
@@ -180,7 +206,8 @@ kuberic-operator/
 │   ├── main.rs                      # Binary entry point (kube controller)
 │   ├── crd.rs                       # KubericSet CRD with spec/status/enums
 │   ├── cluster_api.rs               # ClusterApi trait + KubeClusterApi impl
-│   ├── reconciler.rs                # Reconcile loop (Pending→Creating→Healthy→FailingOver→Switchover)
+│   ├── durable/remove_replica.rs     # Coarse intent freeze/redrive, commit, cleanup, dispositions
+│   ├── reconciler.rs                # Reconcile loop and Kubernetes-owned cleanup/publication
 │   └── tests.rs                     # Mock reconciler tests
 
 examples/kvstore/

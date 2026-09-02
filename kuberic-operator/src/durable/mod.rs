@@ -94,6 +94,11 @@ pub enum Decision {
         target_id: i64,
         role: String,
     },
+    PatchPodRoleExactUid {
+        target_id: i64,
+        expected_uid: String,
+        role: String,
+    },
     DeletePod {
         pod_name: String,
         expected_uid: String,
@@ -102,6 +107,7 @@ pub enum Decision {
         operation: DurableOperationStatus,
         snapshot: StablePartitionSnapshotStatus,
     },
+    RecordCommitEvidence(DurableOperationStatus),
     Wait,
     Complete {
         operation: DurableOperationStatus,
@@ -225,6 +231,44 @@ pub fn operation_condition(operation: &DurableOperationStatus, now: i64) -> Stat
             "True",
             "PublishingCommittedReplica",
             "current configuration is committed; exact target attestation and publication are pending"
+                .to_string(),
+        ),
+        DurableOperationPhase::RemoveFreezeIntent => (
+            "True",
+            "FreezingRemoveReplicaIntent",
+            "observing exact primary, target capability, and structural configuration fences"
+                .to_string(),
+        ),
+        DurableOperationPhase::RemoveDispatchIntent
+        | DurableOperationPhase::RemoveAwaitCoordination => (
+            "True",
+            "AwaitingPrimaryAgentRemoval",
+            operation
+                .remove_intent
+                .as_ref()
+                .and_then(|intent| intent.last_observed_phase)
+                .map(|phase| format!("coarse removal coordinator is {phase:?}"))
+                .unwrap_or_else(|| {
+                    "coarse remove intent is awaiting primary-agent progress".to_string()
+                }),
+        ),
+        DurableOperationPhase::RemoveCompensateFinalize => (
+            "True",
+            "FinalizingCompensatedRemoval",
+            operation
+                .last_error
+                .as_deref()
+                .unwrap_or("previous Current is restored; final compensated status is pending")
+                .to_string(),
+        ),
+        DurableOperationPhase::RemoveRecordCommit
+        | DurableOperationPhase::RemoveAwaitCleanup
+        | DurableOperationPhase::RemoveDeleteTargetPod
+        | DurableOperationPhase::RemovePublishTopology
+        | DurableOperationPhase::RemoveFinalize => (
+            "True",
+            "PublishingCommittedRemoval",
+            "reduced Current is committed; exact cleanup and final publication are pending"
                 .to_string(),
         ),
         _ => (

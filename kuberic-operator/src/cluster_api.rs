@@ -8,6 +8,40 @@ use kuberic_core::types::{ReplicaId, ReplicaInstanceId};
 
 use crate::crd::{KubericSetSpec, KubericSetStatus};
 
+fn uid_fenced_label_patch(
+    pod: &Pod,
+    expected_uid: &str,
+    labels: BTreeMap<String, String>,
+) -> Result<serde_json::Value, String> {
+    if pod.metadata.uid.as_deref() != Some(expected_uid) {
+        return Err("pod UID precondition failed".to_string());
+    }
+    let resource_version = pod
+        .metadata
+        .resource_version
+        .as_deref()
+        .ok_or_else(|| "pod has no resource version".to_string())?;
+    let mut merged_labels = pod.metadata.labels.clone().unwrap_or_default();
+    merged_labels.extend(labels);
+    Ok(serde_json::json!([
+        {
+            "op": "test",
+            "path": "/metadata/uid",
+            "value": expected_uid
+        },
+        {
+            "op": "test",
+            "path": "/metadata/resourceVersion",
+            "value": resource_version
+        },
+        {
+            "op": "add",
+            "path": "/metadata/labels",
+            "value": merged_labels
+        }
+    ]))
+}
+
 /// Abstraction over Kubernetes API and replica creation.
 /// Real impl uses kube::Client; test impl uses in-memory state.
 #[async_trait]
@@ -31,6 +65,15 @@ pub trait ClusterApi: Send + Sync {
         &self,
         namespace: &str,
         pod_name: &str,
+        labels: BTreeMap<String, String>,
+    ) -> Result<(), String>;
+
+    /// Update labels only if the named pod still has the exact expected UID.
+    async fn patch_pod_labels_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        expected_uid: &str,
         labels: BTreeMap<String, String>,
     ) -> Result<(), String>;
 
@@ -142,6 +185,28 @@ impl ClusterApi for KubeClusterApi {
             pod_name,
             &kube::api::PatchParams::apply("kuberic-operator"),
             &kube::api::Patch::Merge(&patch),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
+    async fn patch_pod_labels_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        expected_uid: &str,
+        labels: BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        let api: kube::Api<Pod> = kube::Api::namespaced(self.client.clone(), namespace);
+        let pod = api.get(pod_name).await.map_err(|e| e.to_string())?;
+        let operations = uid_fenced_label_patch(&pod, expected_uid, labels)?;
+        api.patch(
+            pod_name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Json::<serde_json::Value>(
+                serde_json::from_value(operations).map_err(|error| error.to_string())?,
+            ),
         )
         .await
         .map(|_| ())
@@ -274,5 +339,52 @@ impl ClusterApi for KubeClusterApi {
             Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
             Err(e) => Err(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pod(labels: Option<BTreeMap<String, String>>) -> Pod {
+        Pod {
+            metadata: kube::api::ObjectMeta {
+                uid: Some("expected-uid".to_string()),
+                resource_version: Some("42".to_string()),
+                labels,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uid_fenced_label_patch_preserves_existing_labels_and_creates_missing_map() {
+        let existing = BTreeMap::from([
+            ("app".to_string(), "kvstore".to_string()),
+            ("kuberic.io/role".to_string(), "secondary".to_string()),
+        ]);
+        let patch = uid_fenced_label_patch(
+            &pod(Some(existing)),
+            "expected-uid",
+            BTreeMap::from([("kuberic.io/role".to_string(), "retired".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(patch[0]["path"], "/metadata/uid");
+        assert_eq!(patch[0]["value"], "expected-uid");
+        assert_eq!(patch[1]["path"], "/metadata/resourceVersion");
+        assert_eq!(patch[1]["value"], "42");
+        assert_eq!(patch[2]["path"], "/metadata/labels");
+        assert_eq!(patch[2]["value"]["app"], "kvstore");
+        assert_eq!(patch[2]["value"]["kuberic.io/role"], "retired");
+
+        let patch = uid_fenced_label_patch(
+            &pod(None),
+            "expected-uid",
+            BTreeMap::from([("kuberic.io/role".to_string(), "retired".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(patch[2]["value"]["kuberic.io/role"], "retired");
+        assert!(uid_fenced_label_patch(&pod(None), "replacement-uid", BTreeMap::new()).is_err());
     }
 }

@@ -74,7 +74,7 @@ message ReplicaSetConfigProto {
 // agent. Kubernetes status remains the durable source of global workflow
 // intent; this service reports local evidence and accepts one correlated,
 // generation-fenced command at a time. Agent-to-agent coordination uses the
-// narrower ReplicaAddBuildPeer service below.
+// narrower ReplicaLifecyclePeer service below.
 service ReplicatorControl {
     // Returns runtime and agent observations used to fence dispatch, recover
     // ambiguous results, and evaluate durable workflow postconditions.
@@ -128,7 +128,7 @@ message GetStatusResponse {
     repeated CorrelatedActionObservationProto retained_terminal_actions = 25;
     repeated LocalFaultRecordProto local_faults = 26;
     RuntimeBuildObservationProto build_observation = 27;
-    uint32 replica_add_build_peer_protocol_version = 28;
+    uint32 replica_lifecycle_peer_protocol_version = 28;
 }
 
 message ReplicaDeactivationInfoProto {
@@ -152,6 +152,10 @@ enum DurableActionResultProto {
     DURABLE_ACTION_RESULT_ADD_REPLICA_COMPENSATION_INCOMPLETE = 6;
     reserved 7;
     reserved "DURABLE_ACTION_RESULT_ADD_REPLICA_COMMITTED_DEGRADED";
+    DURABLE_ACTION_RESULT_REMOVE_REPLICA_COMMITTED_CLEAN = 8;
+    DURABLE_ACTION_RESULT_REMOVE_REPLICA_COMMITTED_DEGRADED = 9;
+    DURABLE_ACTION_RESULT_REMOVE_REPLICA_COMPENSATED = 10;
+    DURABLE_ACTION_RESULT_REMOVE_REPLICA_COMPENSATION_INCOMPLETE = 11;
 }
 
 enum DurableActionErrorClassProto {
@@ -232,6 +236,7 @@ message CorrelatedActionObservationProto {
     DurableActionResultProto result = 8;
     DurableActionErrorClassProto error_class = 9;
     AddReplicaProgressProto add_replica_progress = 10;
+    RemoveReplicaProgressProto remove_replica_progress = 11;
 }
 
 message LocalFaultRecordProto {
@@ -262,6 +267,7 @@ message ExecuteCorrelatedControlActionRequest {
         DurableOnDataLossRequest on_data_loss = 30;
         RecordElectionConfigurationRequest record_election_configuration = 31;
         AddReplicaIntentProto add_replica_intent = 32;
+        RemoveReplicaIntentProto remove_replica_intent = 33;
     }
 }
 
@@ -319,6 +325,7 @@ message AddReplicaIntentProto {
     uint32 minimum_committed_replicas = 18;
     int64 deadline_unix_seconds = 19;
     int64 compensation_deadline_unix_seconds = 20;
+    uint32 target_lifecycle_peer_protocol_version = 21;
 }
 
 enum AddReplicaCoordinatorPhaseProto {
@@ -339,6 +346,97 @@ message AddReplicaProgressProto {
     AddReplicaCoordinatorPhaseProto phase = 1;
     bool commit_observed = 2;
     optional int64 copy_lsn = 3;
+}
+
+enum RemoveReplicaModeProto {
+    REMOVE_REPLICA_MODE_UNKNOWN = 0;
+    REMOVE_REPLICA_MODE_SCALE_DOWN = 1;
+    REMOVE_REPLICA_MODE_FORCE = 2;
+}
+
+message RemoveReplicaIntentProto {
+    uint32 protocol_version = 1;
+    string operation_id = 2;
+    string action_id = 3;
+    uint32 attempt_number = 4;
+    string attempt_id = 5;
+    string input_signature = 6;
+    RemoveReplicaModeProto mode = 7;
+    EpochProto epoch = 8;
+    int64 primary_replica_id = 9;
+    string primary_instance_id = 10;
+    string primary_agent_generation = 11;
+    optional uint64 primary_agent_control_version = 12;
+    string primary_control_address = 13;
+    string primary_replicator_address = 14;
+    int64 target_replica_id = 15;
+    string target_instance_id = 16;
+    string expected_target_pod_uid = 17;
+    string target_pod_name = 18;
+    optional string expected_target_agent_generation = 19;
+    optional string target_control_address = 20;
+    optional string target_replicator_address = 21;
+    optional uint32 target_lifecycle_peer_protocol_version = 22;
+    ConfigurationDescriptorProto previous_configuration = 23;
+    ConfigurationDescriptorProto reduced_catch_up_configuration = 24;
+    ConfigurationDescriptorProto reduced_current_configuration = 25;
+    uint32 required_write_quorum = 26;
+    uint32 minimum_committed_replicas = 27;
+    uint32 maximum_pre_commit_attempts = 28;
+    int64 overall_deadline_unix_seconds = 29;
+    int64 compensation_grace_seconds = 30;
+    int64 compensation_deadline_cap_unix_seconds = 31;
+    int64 call_timeout_seconds = 32;
+    int64 target_retirement_timeout_seconds = 33;
+}
+
+enum RemoveReplicaCoordinatorPhaseProto {
+    REMOVE_REPLICA_PHASE_UNKNOWN = 0;
+    REMOVE_REPLICA_PHASE_VALIDATING = 1;
+    REMOVE_REPLICA_PHASE_INSTALLING_CATCH_UP_CONFIGURATION = 2;
+    REMOVE_REPLICA_PHASE_WAITING_FOR_CATCH_UP_QUORUM = 3;
+    REMOVE_REPLICA_PHASE_INSTALLING_CURRENT_CONFIGURATION = 4;
+    REMOVE_REPLICA_PHASE_REMOVING_CONNECTION = 5;
+    REMOVE_REPLICA_PHASE_RETIRING_TARGET = 6;
+    REMOVE_REPLICA_PHASE_ATTESTING = 7;
+    REMOVE_REPLICA_PHASE_COMPENSATING = 8;
+}
+
+enum TargetRetirementObservationProto {
+    TARGET_RETIREMENT_OBSERVATION_UNKNOWN = 0;
+    TARGET_RETIREMENT_OBSERVATION_NOT_ATTEMPTED = 1;
+    TARGET_RETIREMENT_OBSERVATION_IN_PROGRESS = 2;
+    TARGET_RETIREMENT_OBSERVATION_COMPLETED = 3;
+    TARGET_RETIREMENT_OBSERVATION_UNAVAILABLE = 4;
+    TARGET_RETIREMENT_OBSERVATION_STALE = 5;
+    TARGET_RETIREMENT_OBSERVATION_FAILED = 6;
+}
+
+message RemoveReplicaProgressProto {
+    RemoveReplicaCoordinatorPhaseProto phase = 1;
+    string attempt_id = 2;
+    bool commit_observed = 3;
+    optional int64 commit_observed_unix_seconds = 4;
+    bool connection_absent = 5;
+    TargetRetirementObservationProto target_retirement = 6;
+    optional int64 retirement_expiry_unix_seconds = 7;
+    optional int64 compensation_expiry_unix_seconds = 8;
+    optional string error = 9;
+    bool current_install_dispatched = 10;
+}
+
+enum RemoveReplicaTerminalResultProto {
+    REMOVE_REPLICA_TERMINAL_RESULT_UNKNOWN = 0;
+    REMOVE_REPLICA_TERMINAL_RESULT_COMMITTED_CLEAN = 1;
+    REMOVE_REPLICA_TERMINAL_RESULT_COMMITTED_DEGRADED = 2;
+    REMOVE_REPLICA_TERMINAL_RESULT_COMPENSATED = 3;
+    REMOVE_REPLICA_TERMINAL_RESULT_COMPENSATION_INCOMPLETE = 4;
+}
+
+message ReducedCurrentConfigurationProjectionProto {
+    ReplicaConfigurationModeProto mode = 1;
+    repeated ReplicaConfigurationMemberStatusProto members = 2;
+    uint32 write_quorum = 3;
 }
 
 enum RuntimeBuildStateProto {
@@ -365,6 +463,13 @@ enum PeerStageProto {
     PEER_STAGE_PREPARE = 1;
     PEER_STAGE_ACTIVATE = 2;
     PEER_STAGE_CLEANUP = 3;
+    PEER_STAGE_RETIRE = 4;
+}
+
+enum PeerOperationKindProto {
+    PEER_OPERATION_KIND_UNKNOWN = 0;
+    PEER_OPERATION_KIND_ADD_BUILD = 1;
+    PEER_OPERATION_KIND_REMOVE = 2;
 }
 
 enum PeerStageStateProto {
@@ -374,27 +479,31 @@ enum PeerStageStateProto {
     PEER_STAGE_STATE_COMPLETED = 3;
     PEER_STAGE_STATE_FAILED = 4;
     PEER_STAGE_STATE_STALE = 5;
+    PEER_STAGE_STATE_REJECTED = 6;
+    PEER_STAGE_STATE_CONFLICT = 7;
 }
 
 message PeerStageObservationProto {
     uint32 protocol_version = 1;
-    string message_id = 2;
-    string input_signature = 3;
-    PeerStageProto stage = 4;
-    PeerStageStateProto state = 5;
-    string target_agent_generation = 6;
-    uint64 target_peer_control_version = 7;
-    optional string error = 8;
+    PeerOperationKindProto operation_kind = 2;
+    uint32 stage_semantic_version = 3;
+    string message_id = 4;
+    string input_signature = 5;
+    PeerStageProto stage = 6;
+    PeerStageStateProto state = 7;
+    string target_agent_generation = 8;
+    uint64 target_peer_control_version = 9;
+    optional string error = 10;
 }
 
-message GetAddBuildStatusRequest {
+message GetLifecycleStatusRequest {
     uint32 protocol_version = 1;
     int64 target_replica_id = 2;
     string target_instance_id = 3;
     string expected_target_agent_generation = 4;
 }
 
-message GetAddBuildStatusResponse {
+message GetLifecycleStatusResponse {
     uint32 protocol_version = 1;
     int64 target_replica_id = 2;
     string target_instance_id = 3;
@@ -408,48 +517,53 @@ message GetAddBuildStatusResponse {
     repeated PeerStageObservationProto retained_terminal_actions = 11;
 }
 
-message ExecuteAddBuildStageRequest {
+message ExecuteLifecycleStageRequest {
     uint32 protocol_version = 1;
-    string operation_id = 2;
-    string attempt_id = 3;
-    string message_id = 4;
-    string input_signature = 5;
-    PeerStageProto stage = 6;
-    int64 sender_replica_id = 7;
-    string sender_instance_id = 8;
-    string sender_agent_generation = 9;
-    string sender_control_address = 10;
-    string parent_action_id = 11;
-    string parent_action_signature = 12;
-    int64 target_replica_id = 13;
-    string target_instance_id = 14;
-    string expected_target_agent_generation = 15;
-    uint64 expected_target_peer_control_version = 16;
-    EpochProto epoch = 17;
-    string configuration_fence = 18;
-    optional string build_key = 19;
-    optional int64 copy_lsn = 20;
+    PeerOperationKindProto operation_kind = 2;
+    uint32 stage_semantic_version = 3;
+    string operation_id = 4;
+    string attempt_id = 5;
+    string message_id = 6;
+    string input_signature = 7;
+    PeerStageProto stage = 8;
+    int64 sender_replica_id = 9;
+    string sender_instance_id = 10;
+    string sender_agent_generation = 11;
+    string sender_control_address = 12;
+    string parent_action_id = 13;
+    string parent_action_signature = 14;
+    int64 target_replica_id = 15;
+    string target_instance_id = 16;
+    string expected_target_agent_generation = 17;
+    uint64 expected_target_peer_control_version = 18;
+    EpochProto epoch = 19;
+    string configuration_fence = 20;
+    optional string build_key = 21;
+    optional int64 copy_lsn = 22;
+    optional RemoveReplicaModeProto removal_mode = 23;
+    optional int64 commit_observed_unix_seconds = 24;
+    optional int64 retirement_expiry_unix_seconds = 25;
+    ReducedCurrentConfigurationProjectionProto reduced_current_projection = 26;
 }
 
-message ExecuteAddBuildStageResponse {
+message ExecuteLifecycleStageResponse {
     PeerStageObservationProto observation = 1;
 }
 
 // ---- Peer control plane: Primary ReplicaAgent → Target ReplicaAgent ----
 
-// ReplicaAddBuildPeer is the restricted RA-to-RA contract used while the
-// primary agent coordinates replica add/build. It shares the pod control
-// listener with ReplicatorControl, but has independent protocol versioning and
-// accepts only target-local Prepare, Activate, and Cleanup stages. It is not an
-// operator workflow API and cannot dispatch arbitrary runtime actions.
-service ReplicaAddBuildPeer {
+// ReplicaLifecyclePeer is the restricted RA-to-RA contract used while the
+// primary agent coordinates replica add/build or exact target retirement. It
+// shares the pod control listener with ReplicatorControl, has independent
+// protocol versioning, and accepts only typed lifecycle stages.
+service ReplicaLifecyclePeer {
     // Observes the exact target incarnation/generation and its bounded peer
     // stage ledger before a primary retries or advances an ambiguous stage.
-    rpc GetAddBuildStatus(GetAddBuildStatusRequest) returns (GetAddBuildStatusResponse);
+    rpc GetLifecycleStatus(GetLifecycleStatusRequest) returns (GetLifecycleStatusResponse);
 
     // Executes one identity-, authority-, epoch-, and signature-fenced target
     // stage on behalf of the coordinating primary agent.
-    rpc ExecuteAddBuildStage(ExecuteAddBuildStageRequest) returns (ExecuteAddBuildStageResponse);
+    rpc ExecuteLifecycleStage(ExecuteLifecycleStageRequest) returns (ExecuteLifecycleStageResponse);
 }
 
 // ---- Data plane: Pod ↔ Pod (replication + copy) ----

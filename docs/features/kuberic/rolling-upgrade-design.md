@@ -247,7 +247,7 @@ through CRD-backed durable workflows:
 | Durable failover | Confirm and promote the best eligible survivor |
 | Durable switchover | Gracefully move primary with compensation |
 | Durable add/rebuild | Open, build, catch up, and commit a replica |
-| Durable remove | Config-first, exact-incarnation removal |
+| Durable remove | One coarse primary-agent intent, config-first commit, exact-incarnation/UID cleanup |
 
 `PartitionDriver` is read-only and reconstructs the committed stable topology.
 Upgrade design must compose the durable state machines rather than introduce a
@@ -318,11 +318,14 @@ every step, never proceed if the partition would lose quorum.
 3. For each SECONDARY (most-lagged first):
    a. SAFETY CHECK: verify removing this secondary won't break
       write quorum (remaining replicas ≥ write_quorum)
-   b. Delete the old pod
-   c. Create new pod with updated spec
+   b. Advance durable ScaleDown removal before deleting a serving pod
+      └─ One primary-agent intent → reduced Current commit
+         → exact connection/Retire → UID-fenced deletion
+   c. Create new pod with updated spec under the same logical replica ID
    d. Wait for new pod to become ready (gRPC control port)
-   e. Advance the durable exact-incarnation remove/rebuild workflow
-      └─ Config-first removal → UID-fenced replacement → correlated build
+   e. Advance durable add/rebuild
+      └─ One primary-agent add intent → peer prepare/copy/activate
+         → catch-up/current commit
    f. POST-UPGRADE CHECK: verify new replica is replicating
       (WaitForCatchUpQuorum — SF's PostUpgradeSafetyCheck equivalent)
    g. Proceed to next secondary
@@ -340,9 +343,10 @@ every step, never proceed if the partition would lose quorum.
       - Advance the durable switchover workflow to the selected target
         └─ Revoke → catch-up → demote → promote → converge configuration
       - Old primary is now a secondary
-      - Delete old primary pod
+      - Run durable ScaleDown removal for the old-primary incarnation
+      - Let exact-UID cleanup delete the old pod
       - Create new pod with updated spec
-      - Advance durable removal/rebuild for the old primary incarnation
+      - Advance durable add/rebuild for the old logical replica ID
       - Wait for catch-up
    b. If primaryUpdateMethod == restart:
       - Delete primary pod directly
@@ -355,7 +359,9 @@ every step, never proceed if the partition would lose quorum.
 
 Durable exact-incarnation removal followed by durable add/rebuild preserves
 the logical replica ID while making every partial state explicit in CRD
-status.
+status. The reduced membership is committed before any serving pod deletion.
+Removal's workflow-scoped committed snapshot protects post-commit restart
+recovery until UID cleanup and final stable publication finish.
 
 ### Pod Spec Drift Detection
 
@@ -534,8 +540,8 @@ meaning of `committed_lsn` or quorum calculation changes between
 versions, old and new pods could disagree on what's committed.
 
 The operator-to-pod control boundary is a clean version boundary. Supported
-pods must report replica-agent control protocol version 2, add/build peer
-protocol version 1, and accept only `ExecuteCorrelatedControlAction` from the
+pods must report replica-agent control protocol version 3, lifecycle-peer
+protocol version 2, and accept only `ExecuteCorrelatedControlAction` from the
 operator; missing, malformed, or unsupported status is rejected. Individual
 mutation RPCs and the old correlated method are not available.
 
@@ -545,10 +551,17 @@ unsupported and cannot fall back to a weaker path. After deployment, the
 operator re-observes and persists generation, control-version, and
 runtime-epoch fences before activity.
 
-Unchanged create/remove/switchover/failover operations retain their current
-durable operation version. Replica add/rebuild uses operation version 2.
-Superseded add phases/actions and status shapes are not supported: deployments
-must quiesce add/rebuild work before the coordinated operator/pod upgrade.
+Replica add/rebuild requires operation version 3; replica removal requires
+operation version 2 and `RemoveReplicaIntent` v1. Create, switchover, and
+failover retain their existing operation-specific versions. Superseded add
+and remove operation generations, earlier control/lifecycle-peer generations,
+peer aliases, per-step removal cursors/actions, and old status shapes are not
+migrated or resumed.
+
+The protocol upgrade itself is therefore not an ordinary live mixed-version
+rolling update. Quiesce create/add/remove/switchover/failover work, update the
+operator and all runtimes together, then resume topology changes only after
+every pod advertises control v3 and lifecycle peer v2.
 
 Replication/data-plane semantic compatibility remains deferred. Before
 changing `committed_lsn`, quorum, copy, or replication message meaning, define
@@ -759,7 +772,9 @@ rather than reconstructing mutation from driver memory.
 **Sources**: architecture, correctness, edge-cases (5 specialists flagged independently)
 
 The upgrade design must not delete a serving secondary before durable
-config-first removal commits. Use the existing durable remove workflow, then
+config-first removal commits. Use the coarse agent-owned remove workflow:
+persist global intent, let the current primary commit exact reduced Current
+and retire the exact old connection/target, then let the operator perform
 UID-fenced deletion, replacement, and durable add/rebuild.
 
 #### RF-6: 2-replica write stall

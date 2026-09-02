@@ -247,19 +247,25 @@ created at Open time (`ReplicatorHandle::data_address()`).
 `PodRuntimeBuilder::build()` starts both `ReplicaAgent` and `PodRuntime`
 without changing `PodRuntimeBundle`. The control listener hosts
 `ReplicatorControl` (`GetStatus` and `ExecuteCorrelatedControlAction`) plus the
-internal add/build-only `ReplicaAddBuildPeer` service. Only effect commands
-from the local agent reach the runtime.
+internal `ReplicaLifecyclePeer` service. Only effect commands from the local
+agent reach the runtime.
 
 `ReplicaHandle::execute_correlated_control_action()` is the sole public
-operator mutation method. Its request includes required protocol version 2, target Pod
-UID, agent generation, agent control version, observed runtime epoch,
-deterministic action ID/signature, and the coarse `DurableReplicaAction`.
+operator mutation method. Its request includes required protocol version 3,
+target Pod UID, agent generation, agent control version, observed runtime
+epoch, deterministic action ID/signature, and the coarse
+`DurableReplicaAction`.
 Individual mutation RPCs and `execute_durable_action()` are retired.
 
-`AddReplicaIntent` is the only compound action. It is addressed to the current
-primary and freezes the target identity/generation, peer and data endpoints,
-old incarnation for rebuild, structural configuration, quorum, minimum, and
-deadlines. The target peer protocol is version 1 and is not an application API.
+`AddReplicaIntent` and `RemoveReplicaIntent` are the compound actions. Each is
+addressed to the exact current primary and freezes its own identities,
+configuration semantics, safety constraints, and deadlines. Their primary
+coordinators are transient; CRD status remains the durable authority.
+
+The internal lifecycle-peer protocol is version 2. Add/build uses typed
+Prepare/Activate/Cleanup stages; removal uses typed Retire. Sharing the peer
+transport and fencing primitives does not merge the workflows or expose peer
+control to user services. `ReplicaLifecyclePeer` is not an application API.
 
 The agent serializes correlated actions and keeps status readable while an
 effect runs. It does not change the lifecycle ordering below: `PodRuntime`

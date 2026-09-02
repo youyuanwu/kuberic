@@ -9,15 +9,16 @@ Protocols implemented by the durable operator workflows, with
 
 ## Pod-Local Control Acceptance
 
-Production durable workflows remain operator-owned. Ordinary workflow
-activities cross the pod-local `ReplicaAgent` boundary, while replica
-add/rebuild uses one coarse primary-owned action:
+Production durable workflows remain globally operator-owned. Ordinary
+workflow activities cross the pod-local `ReplicaAgent` boundary, while
+replica add/rebuild and removal use separate coarse primary-agent-owned
+actions:
 
 ```
 persist pending action in CRD status
 observe target Pod UID + runtime epoch + agent generation/control version
 persist generation/control-version/runtime-epoch fences
-  + exact payload for direct non-add actions
+  + exact payload for direct non-coarse actions
   (no runtime activity)
 dispatch ExecuteCorrelatedControlAction
   → agent validates version, target, generation, signature and fences
@@ -28,13 +29,15 @@ PodRuntime executes ordered service/replicator callbacks
 agent records exact completion; operator observes before advancing
 ```
 
-For add/rebuild, the accepted action starts a non-blocking primary-agent
-coordinator. The coordinator uses the dedicated `ReplicaAddBuildPeer` service
-to prepare, activate, or clean up the target and uses its own `PodRuntime` for
-tracked copy, catch-up, quorum wait, and current configuration. The operator
-does not mutate the target.
-The add payload is constructed directly from structured
-`status.operation.addIntent`; there is no encoded add payload projection.
+For add/rebuild or removal, the accepted action starts its corresponding
+non-blocking primary-agent coordinator. Both use the internal
+`ReplicaLifecyclePeer` v2 service: add/build uses
+Prepare/Activate/Cleanup, while removal uses Retire. The primary's
+`PodRuntime` performs ordered local copy, configuration, quorum, or exact
+connection effects. The operator does not mutate either target runtime.
+Coarse payloads are constructed directly from structured
+`status.operation.addIntent` or `status.operation.removeIntent`; there is no
+second encoded payload projection.
 
 `ReplicaInstanceId` remains the Pod UID. `AgentGeneration` identifies one
 process inside that Pod, and changes after a container restart.
@@ -51,7 +54,7 @@ redrive remains an operator-owned at-least-once decision after postcondition
 observation. There is no exactly-once claim or durable pod-local history.
 
 Replica-agent status is required and advertises numeric control protocol
-version 2 plus replica-add peer protocol version 1. Missing, malformed, or
+version 3 plus lifecycle-peer protocol version 2. Missing, malformed, or
 unsupported status fails closed. The
 operator and pod runtimes must be deployed together; the control boundary does
 not provide mixed-version interoperability or fallback.
@@ -238,25 +241,74 @@ Healthy scale-down and permanent stale/dead-secondary eviction use one durable
 `RemovingReplica` operation with `ScaleDown` or `Force` mode.
 
 ```
-1. Validate a stable non-primary target, minReplicas, and retained old/target
-   quorum
-2. Persist previous and target snapshots plus exact runtime and pod UID
-3. update_catch_up_configuration(target, previous) on the primary
-4. wait_for_catch_up_quorum using the retained set
-5. update_current_configuration(target)
-6. Persist the target stable snapshot immediately after observing commit
-7. RemoveReplica(target ID, exact old incarnation) on the primary
-8. If the exact target is reachable: change_role(None), then Close
-9. Delete the pod with its exact Kubernetes UID precondition
-10. Complete cleanup and return to Healthy
+1. Validate one stable non-primary target, minReplicas, retained previous
+   write quorum, and exact historical runtime/pod UID
+2. For ScaleDown, prove exact target lifecycle-peer v2 reachability before
+   persisting an operation; Force may freeze no target peer authority
+3. Persist remove operation v2 with previous/reduced snapshots, mode, exact
+   identities, deadlines, and attempt bound
+4. Freeze and dispatch one RemoveReplicaIntent v1 to the exact current
+   primary through correlated control v3
+5. Primary coordinator:
+   a. observe previous Current / reduced CatchUp / reduced Current
+   b. install reduced CatchUp with the frozen previous configuration
+   c. run tracked WaitForCatchUpQuorum(Write)
+   d. mark current-install dispatch and install exact reduced Current
+   e. timestamp exact reduced-Current commit
+   f. remove only the exact old-incarnation primary connection
+   g. after commit, send ReplicaLifecyclePeer Retire stage v1 when authorized
+   h. attest CommittedClean or CommittedDegraded
+6. Operator persists commit evidence plus the reduced workflow-scoped
+   committedSnapshot; stableSnapshot remains previous
+7. Operator observes cleanup, exact-UID labels the old pod role=retired,
+   exact-UID deletes it, then publishes the reduced stableSnapshot
 ```
 
-Failures before step 5 restore the previous current configuration and previous
-stable snapshot. Once target current configuration is observed, reconciliation
-never republishes removed membership. Exact primary sender connections are
-observable in `GetStatus`, so lost removal responses resume from connection
-absence. Target lifecycle cleanup is conditional after membership commit; an
-unreachable target does not block removal.
+Exact reduced Current is the irreversible commit. Before current-install
+dispatch, failure can restore exact previous Current. After dispatch, a
+failed or ambiguous re-observation never authorizes previous-configuration
+mutation; exact positive configuration evidence is required. Reduced Current
+rolls forward, exact previous Current completes compensation, reduced CatchUp
+may redrive within the three-attempt limit, and unclassifiable state poisons.
+
+The frozen deadlines are 600 seconds overall, 10 seconds per runtime/peer
+call, 30 seconds of compensation grace with a cap at overall plus 30, and
+60 seconds for target retirement capped by the overall deadline. At most three
+pre-commit attempts are frozen. These bounds apply independently to each
+attempt: the pre-commit worst case is 3 × (600 + 30) = 1,890 seconds, not one
+shared 630-second operation budget. Post-commit exact connection, UID cleanup,
+and publication are not attempt-capped. In particular, a temporarily missing
+status response from the exact still-present primary does not prove connection
+absence; only an exact observation or primary process absence/replacement can
+cross that barrier. Retirement expiry may degrade peer cleanup only.
+
+Primary progress phases are Validating, InstallingCatchUpConfiguration,
+WaitingForCatchUpQuorum, InstallingCurrentConfiguration,
+RemovingConnection, RetiringTarget, Attesting, and Compensating. Bounded
+terminal results are CommittedClean, CommittedDegraded, Compensated, and
+CompensationIncomplete. Agent evidence is volatile; only CRD commit evidence
+and snapshots are durable global authority.
+
+`ScaleDown` and `Force` share identical quorum, minimum, commit, connection,
+and publication safety. `ScaleDown` requires reachable target peer authority
+at admission and never silently converts to `Force`. `Force` treats target
+retirement as best effort, but a reachable target still validates exact
+sender, parent, target, generation, epoch, reduced Current projection, and
+signed deadline. It has no target-epoch bypass.
+
+Three operator dispositions pin ambiguous or exhausted work in `Poisoned`:
+`FailedPreCommitIncomplete`, `InvalidRemovalState`, and
+`AmbiguousPrimaryRestart`. They respectively mean known pre-commit exhaustion,
+structurally invalid/ambiguous state after current-install dispatch, and a
+complete same-Pod primary restart that erased commit-boundary evidence. None
+authorizes inferred commit or rollback.
+
+The target `Retire` request is operation/attempt/message/signature fenced and
+contains sender/parent authority, exact target generation/control version,
+epoch, configuration fence, mode, the primary commit timestamp, retirement
+expiry, and exact reduced Current projection. The target observes first,
+executes `ChangeRole(None)` then `Close`, and replays exact duplicate stage
+messages from bounded status.
 
 A ready replacement incarnation that is still required by desired capacity
 uses durable rebuild instead. An unreachable old incarnation with no ready
@@ -271,13 +323,12 @@ workflow.
 
 ```
 1. Identify the old replica incarnation (Kubernetes Pod UID in production)
-2. Close the old secondary handle
-3. Remove the primary-side replication connection only when both the stable
-   replica ID and old incarnation match
-4. Operator deletes old Pod + creates new Pod
-5. Wait for Ready
-6. Add the new incarnation under the same stable replica ID
-7. add_replica (full build from primary)
+2. If no ready replacement exists, coarse Force removal commits reduced
+   membership, retires the exact connection, and exact-UID deletes the pod
+3. Create or observe the replacement Pod under the same logical replica ID
+4. Wait for Ready
+5. Coarse add/rebuild retires any remaining exact old connection, prepares the
+   new generation, performs the full build, and commits it
 ```
 
 Replica-set configuration and status carry both `ReplicaId` and
@@ -314,29 +365,6 @@ or write-status RPC is legal during recovery. Missing legacy snapshots and
 all persisted/live mismatches fail closed. Recovery covers stable topology
 only; it does not infer state for an in-progress reconfiguration or reopen a
 restarted pod runtime.
-
----
-
-## Protocol: Scale-Down (Remove Secondary)
-
-Remove a replica through the operator's durable `RemoveReplica` workflow.
-
-Design follows SF's config-first approach (remove from quorum before closing):
-
-```
-1. Verify replica_count > min_replicas (safety)
-2. update_catch_up_configuration (new config WITHOUT the replica)
-3. wait_for_catch_up_quorum(Write)
-4. update_current_configuration (finalize)
-5. change_role(None) on removed replica
-6. close removed replica
-7. Remove handle from driver
-```
-
-**Safety:**
-- Cannot scale below `spec.minReplicas`
-- Config update happens BEFORE close — write quorum is maintained
-- If primary is targeted, operator must switchover first
 
 ---
 
@@ -649,8 +677,9 @@ Step 3: update_current_configuration(new_config)
   Done — configuration change is finalized
 ```
 
-This sequence is issued as correlated actions by the durable add, remove,
-failover, and switchover workflows.
+For add and removal, the primary-agent coordinator issues these runtime
+effects behind one coarse operator action. Failover and switchover still issue
+their ordered correlated activities from the operator checkpoint.
 
 ### QuorumTracker Internals
 

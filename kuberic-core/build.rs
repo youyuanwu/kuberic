@@ -5,6 +5,9 @@ fn main() {
         .boxed(
             ".kuberic.replication.v1.ExecuteCorrelatedControlActionRequest.action.add_replica_intent",
         )
+        .boxed(
+            ".kuberic.replication.v1.ExecuteCorrelatedControlActionRequest.action.remove_replica_intent",
+        )
         .compile_protos(&["proto/kuberic.proto"], &["proto"])
         .expect("Failed to compile proto files");
 }

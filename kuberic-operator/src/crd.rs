@@ -17,7 +17,12 @@ use std::ops::Deref;
     shortname = "kls",
     derive = "PartialEq",
     namespaced,
-    status = "KubericSetStatus"
+    status = "KubericSetStatus",
+    printcolumn = r#"{"name":"Replicas","type":"integer","jsonPath":".spec.replicas"}"#,
+    printcolumn = r#"{"name":"Ready","type":"integer","jsonPath":".status.readyReplicas"}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"Primary","type":"string","jsonPath":".status.currentPrimary"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct KubericSetSpec {
@@ -243,7 +248,8 @@ pub enum StableReplicaRoleStatus {
 }
 
 pub const DURABLE_OPERATION_VERSION: u32 = 1;
-pub const ADD_REPLICA_OPERATION_VERSION: u32 = 2;
+pub const ADD_REPLICA_OPERATION_VERSION: u32 = 3;
+pub const REMOVE_REPLICA_OPERATION_VERSION: u32 = 2;
 
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
@@ -283,6 +289,10 @@ pub struct DurableOperationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_pod_uid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_target_replicator_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_target_agent_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retired_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frozen_lsn: Option<i64>,
@@ -297,6 +307,14 @@ pub struct DurableOperationStatus {
     pub failover: Option<DurableFailoverStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub add_intent: Option<Box<AddReplicaIntentStatus>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_intent: Option<Box<RemoveReplicaIntentStatus>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_commit_evidence: Option<RemoveReplicaCommitEvidenceStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_cleanup: Option<RemoveReplicaCleanupStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal_disposition: Option<RemoveReplicaDispositionStatus>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -311,6 +329,7 @@ pub struct AddReplicaIntentStatus {
     pub target_agent_generation: String,
     pub target_control_address: String,
     pub target_replicator_address: String,
+    pub target_lifecycle_peer_protocol_version: u32,
     pub previous_configuration: ConfigurationDescriptorStatus,
     pub catch_up_configuration: ConfigurationDescriptorStatus,
     pub current_configuration: ConfigurationDescriptorStatus,
@@ -318,6 +337,130 @@ pub struct AddReplicaIntentStatus {
     pub compensation_deadline_unix_seconds: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_observed_phase: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveReplicaIntentStatus {
+    pub attempt: u32,
+    pub attempt_id: String,
+    pub action_id: String,
+    pub input_signature: String,
+    pub primary_instance_id: String,
+    pub primary_agent_generation: String,
+    pub primary_agent_control_version: u64,
+    pub primary_control_address: String,
+    pub primary_replicator_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_agent_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_control_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_replicator_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_lifecycle_peer_protocol_version: Option<u32>,
+    pub previous_configuration: ConfigurationDescriptorStatus,
+    pub reduced_catch_up_configuration: ConfigurationDescriptorStatus,
+    pub reduced_current_configuration: ConfigurationDescriptorStatus,
+    pub required_write_quorum: u32,
+    pub maximum_pre_commit_attempts: u32,
+    pub overall_deadline_unix_seconds: i64,
+    pub compensation_grace_seconds: i64,
+    pub compensation_deadline_cap_unix_seconds: i64,
+    pub call_timeout_seconds: i64,
+    pub target_retirement_timeout_seconds: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compensation_expiry_unix_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_phase: Option<RemoveReplicaCoordinatorPhaseStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_result: Option<RemoveReplicaTerminalResultStatus>,
+    #[serde(default)]
+    pub current_install_dispatched: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveReplicaCommitEvidenceStatus {
+    pub attempt_id: String,
+    pub action_id: String,
+    pub primary_agent_generation: String,
+    pub configuration_signature: String,
+    pub observed_unix_seconds: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveReplicaCleanupStatus {
+    #[serde(default)]
+    pub connection_absent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_retirement: Option<TargetRetirementObservationStatus>,
+    #[serde(default)]
+    pub target_labels_fenced: bool,
+    #[serde(default)]
+    pub target_pod_deleted: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoveReplicaCoordinatorPhaseStatus {
+    Validating,
+    InstallingCatchUpConfiguration,
+    WaitingForCatchUpQuorum,
+    InstallingCurrentConfiguration,
+    RemovingConnection,
+    RetiringTarget,
+    Attesting,
+    Compensating,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TargetRetirementObservationStatus {
+    NotAttempted,
+    InProgress,
+    Completed,
+    Unavailable,
+    Stale,
+    Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoveReplicaTerminalResultStatus {
+    CommittedClean,
+    CommittedDegraded,
+    Compensated,
+    CompensationIncomplete,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoveReplicaDispositionStatus {
+    FailedPreCommitIncomplete {
+        attempt: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_observed_phase: Option<RemoveReplicaCoordinatorPhaseStatus>,
+        reason: String,
+    },
+    InvalidRemovalState {
+        attempt: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_observed_phase: Option<RemoveReplicaCoordinatorPhaseStatus>,
+        previous_configuration_signature: String,
+        reduced_configuration_signature: String,
+        reason: String,
+    },
+    AmbiguousPrimaryRestart {
+        old_generation: String,
+        new_generation: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_observed_phase: Option<RemoveReplicaCoordinatorPhaseStatus>,
+        previous_configuration_signature: String,
+        reduced_configuration_signature: String,
+        missing_evidence_reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -510,15 +653,14 @@ pub enum DurableOperationPhase {
     CompensateFinalize,
     AddFinalize,
     AddCompensateFinalize,
-    RemoveCatchUpConfiguration,
-    RemoveWaitForCatchUpQuorum,
-    RemoveCurrentConfiguration,
-    RemovePrimaryConnection,
-    RemoveDemoteTarget,
-    RemoveCloseTarget,
-    RemoveDeleteTarget,
+    RemoveFreezeIntent,
+    RemoveDispatchIntent,
+    RemoveAwaitCoordination,
+    RemoveRecordCommit,
+    RemoveAwaitCleanup,
+    RemoveDeleteTargetPod,
+    RemovePublishTopology,
     RemoveFinalize,
-    RemoveCompensateConfiguration,
     RemoveCompensateFinalize,
     FailoverRecordStartingConfiguration,
     FailoverCollect,
@@ -576,6 +718,7 @@ pub struct PendingActionStatus {
 #[serde(rename_all = "camelCase")]
 pub enum DurableActionKind {
     AddReplicaIntent,
+    RemoveReplicaIntent,
     CreateFencePod,
     CreateOpenPrimary,
     CreatePromotePrimary,
@@ -611,14 +754,6 @@ pub enum DurableActionKind {
     CompensateCurrentConfiguration,
     CompensateLabelOldPrimary,
     CompensateLabelTargetSecondary,
-    RemoveCatchUpConfiguration,
-    RemoveWaitForCatchUpQuorum,
-    RemoveCurrentConfiguration,
-    RemovePrimaryConnection,
-    RemoveDemoteTarget,
-    RemoveCloseTarget,
-    RemoveDeleteTarget,
-    RemoveCompensateConfiguration,
     FailoverRecordStartingConfiguration,
     FailoverUpdateCandidateEpoch,
     FailoverOnDataLoss,
@@ -643,6 +778,7 @@ pub struct DurablePostconditionStatus {
 #[serde(rename_all = "camelCase")]
 pub enum DurablePostconditionKind {
     AddReplicaCoordinated,
+    RemoveReplicaCoordinated,
     WriteRevoked,
     Role,
     Epoch,
@@ -1042,6 +1178,115 @@ mod tests {
                 "deployment schema retained {removed}"
             );
         }
+    }
+
+    #[test]
+    fn remove_replica_schema_is_coarse_v2_and_rejects_deleted_surfaces() {
+        let generated_crd = serde_json::to_value(KubericSet::crd()).unwrap();
+        let generated = serde_json::to_string(&generated_crd).unwrap();
+        let deployment = include_str!("../deploy/deployment.yaml");
+        assert_eq!(
+            generated_crd.pointer("/spec/names/kind"),
+            Some(&serde_json::json!("KubericSet"))
+        );
+        let columns = generated_crd
+            .pointer("/spec/versions/0/additionalPrinterColumns")
+            .and_then(serde_json::Value::as_array)
+            .expect("generated CRD must retain kubectl printer columns");
+        assert_eq!(
+            columns
+                .iter()
+                .map(|column| {
+                    (
+                        column["name"].as_str().unwrap(),
+                        column["type"].as_str().unwrap(),
+                        column["jsonPath"].as_str().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("Replicas", "integer", ".spec.replicas"),
+                ("Ready", "integer", ".status.readyReplicas"),
+                ("Phase", "string", ".status.phase"),
+                ("Primary", "string", ".status.currentPrimary"),
+                ("Age", "date", ".metadata.creationTimestamp"),
+            ]
+        );
+        for required in [
+            "listKind: KubericSetList",
+            "additionalPrinterColumns:",
+            "jsonPath: .spec.replicas",
+            "jsonPath: .status.readyReplicas",
+            "jsonPath: .status.phase",
+            "jsonPath: .status.currentPrimary",
+            "jsonPath: .metadata.creationTimestamp",
+        ] {
+            assert!(
+                deployment.contains(required),
+                "deployment CRD metadata is missing {required}"
+            );
+        }
+        for required in [
+            "removeIntent",
+            "removeCommitEvidence",
+            "removeCleanup",
+            "removalDisposition",
+            "committedSnapshot",
+            "removeTargetAgentGeneration",
+            "maximumPreCommitAttempts",
+            "currentInstallDispatched",
+            "removeFreezeIntent",
+            "removeDispatchIntent",
+            "removeAwaitCoordination",
+            "removeRecordCommit",
+            "removeAwaitCleanup",
+            "removeDeleteTargetPod",
+            "removePublishTopology",
+            "removeFinalize",
+            "removeCompensateFinalize",
+            "removeReplicaIntent",
+            "removeReplicaCoordinated",
+            "failedPreCommitIncomplete",
+            "invalidRemovalState",
+            "ambiguousPrimaryRestart",
+        ] {
+            assert!(generated.contains(required), "missing generated {required}");
+            assert!(
+                deployment.contains(required),
+                "missing deployment {required}"
+            );
+        }
+        for removed in [
+            "removeCatchUpConfiguration",
+            "removeWaitForCatchUpQuorum",
+            "removeCurrentConfiguration",
+            "removePrimaryConnection",
+            "removeDemoteTarget",
+            "removeCloseTarget",
+            "removeCompensateConfiguration",
+            "replicaAddBuildPeerProtocolVersion",
+        ] {
+            assert!(
+                !generated.contains(removed),
+                "generated schema retained {removed}"
+            );
+            assert!(
+                !deployment.contains(removed),
+                "deployment schema retained {removed}"
+            );
+        }
+        assert!(generated.contains("\"removeDeleteTargetPod\""));
+        assert!(!generated.contains("\"removeDeleteTarget\""));
+        assert!(
+            deployment
+                .lines()
+                .any(|line| line.trim() == "- removeDeleteTargetPod")
+        );
+        assert!(
+            !deployment
+                .lines()
+                .any(|line| line.trim() == "- removeDeleteTarget")
+        );
     }
 }
 

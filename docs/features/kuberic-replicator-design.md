@@ -64,6 +64,8 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 │  │  │ (events)    │  │ (standby)   │  │ (standby)   │   │       │
 │  │  └─────────────┘  └─────────────┘  └─────────────┘   │       │
 │  └───────────────────────────────────────────────────────┘       │
+│          ReplicaLifecyclePeer: primary agent → target agent      │
+│          (typed add/build stages and exact removal Retire)       │
 │                                                                  │
 │  Services:                                                       │
 │    {name}-rw  ──► Primary       (label: role=primary)            │
@@ -79,8 +81,10 @@ See [Status & Roadmap](kuberic/status.md) for LOC counts and
 |---|---|---|
 | **No StatefulSets** | Operator manages Pods directly | LSN-based primary selection, per-instance control |
 | **Replicator is in-process** | Library linked into app, not sidecar | No coordination overhead, shared memory |
-| **Operator-managed membership** | Operator pushes ReplicaSetConfig | Dual-config quorum, must-catch-up markers, idle/active gating |
+| **Durable global membership authority** | Operator/CRD freezes topology intent and publishes committed snapshots | Keeps Kubernetes placement and global commit authority outside volatile agents |
 | **Pod-local RA-lite boundary** | `ControlServer → ReplicaAgent → PodRuntime` | Agent owns local admission/fencing/correlation; runtime owns ordered effects |
+| **Agent-owned add/remove coordination** | Current primary `ReplicaAgent` sequences transient local/peer work from one coarse intent | Removes the operator as a runtime step sequencer without creating a second durable store |
+| **Narrow lifecycle peer** | `ReplicaLifecyclePeer` v2 supports add/build stages and removal `Retire` | Reuses exact fencing and replay without exposing arbitrary RA-to-RA runtime actions |
 | **Event-based APIs** | Both replicator and user use mpsc channels | Owned `&mut` state, no `Arc<Mutex<...>>` |
 | **Dual-channel replicator** | Separate control (low-freq) and data (high-freq) channels | Control events don't block write path |
 | **Atomic status reads** | PartitionState uses AtomicU8/AtomicI64 | Zero-cost read_status()/write_status() polling |

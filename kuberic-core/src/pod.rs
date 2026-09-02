@@ -164,6 +164,7 @@ pub struct PodRuntimeBuilder {
     reply_timeout: Duration,
     control_bind: String,
     data_bind: String,
+    removal_clock: Arc<dyn crate::remove_replica::RemoveReplicaClock>,
 }
 
 impl PodRuntimeBuilder {
@@ -175,6 +176,7 @@ impl PodRuntimeBuilder {
             reply_timeout: DEFAULT_REPLY_TIMEOUT,
             control_bind: "127.0.0.1:0".to_string(),
             data_bind: "127.0.0.1:0".to_string(),
+            removal_clock: Arc::new(crate::remove_replica::SystemRemoveReplicaClock),
         }
     }
 
@@ -195,6 +197,14 @@ impl PodRuntimeBuilder {
 
     pub fn data_bind(mut self, addr: String) -> Self {
         self.data_bind = addr;
+        self
+    }
+
+    pub fn removal_clock(
+        mut self,
+        clock: Arc<dyn crate::remove_replica::RemoveReplicaClock>,
+    ) -> Self {
+        self.removal_clock = clock;
         self
     }
 
@@ -223,7 +233,7 @@ impl PodRuntimeBuilder {
         // at Open time. ControlServer needs to work without it initially.
         let control_server = crate::grpc::server::ControlServer::new(agent_tx.clone());
         let peer_server = crate::grpc::peer_server::PeerServer::new(agent_tx);
-        let replica_agent = crate::replica_agent::ReplicaAgent::new(
+        let replica_agent = crate::replica_agent::ReplicaAgent::new_with_clock(
             self.replica_id,
             self.instance_id.clone(),
             agent_rx,
@@ -231,6 +241,7 @@ impl PodRuntimeBuilder {
             status_rx,
             fault_rx,
             shutdown.child_token(),
+            self.removal_clock,
         );
         tokio::spawn(replica_agent.serve());
         let control_listener = tokio::net::TcpListener::bind(&self.control_bind)
@@ -248,7 +259,7 @@ impl PodRuntimeBuilder {
                     ),
                 )
                 .add_service(
-                    crate::proto::replica_add_build_peer_server::ReplicaAddBuildPeerServer::new(
+                    crate::proto::replica_lifecycle_peer_server::ReplicaLifecyclePeerServer::new(
                         peer_server,
                     ),
                 )
