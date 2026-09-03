@@ -2617,29 +2617,14 @@ async fn recover_remove_pre_commit_failure(
             .await?;
             return Ok(CompensationOutcome::Committed);
         }
-        Ok(RemoveConfigurationObservation::PreviousCurrent) if state.current_install_dispatched => {
-            enter_remove_compensation(
-                execution,
-                intent,
-                state,
-                authority_rx,
-                coordinator_tx,
-                remove_clock,
-                &failure,
-            )
-            .await?;
-            return Ok(CompensationOutcome::Terminal(
-                RemoveReplicaTerminalResult::Compensated,
-            ));
-        }
-        Ok(_) if state.current_install_dispatched => {
-            return Err(normalize_remove_error(
-                "reduced-current installation was dispatched and exact commit state is ambiguous; previous-configuration rollback is forbidden",
-            ));
+        Ok(configuration) if state.current_install_dispatched => {
+            return Err(normalize_remove_error(&format!(
+                "reduced-current installation was dispatched and exact commit state is ambiguous after observing {configuration:?}; previous-configuration rollback is forbidden without cancellation or quiescence proof"
+            )));
         }
         Err(error) if state.current_install_dispatched => {
             return Err(normalize_remove_error(&format!(
-                "reduced-current installation was dispatched and configuration observation is invalid; previous-configuration rollback is forbidden: {error}"
+                "reduced-current installation was dispatched and configuration observation is invalid or unavailable; previous-configuration rollback is forbidden without cancellation or quiescence proof: {error}"
             )));
         }
         _ => {}
@@ -6129,6 +6114,76 @@ mod tests {
             Some(running.intent.reduced_catch_up_status())
         );
         assert!(running.runtime_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_out_current_install_with_previous_current_fails_closed_while_effect_is_outstanding()
+     {
+        let clock = ManualRemoveReplicaClock::new(1_000);
+        let mut running = RunningRemoveAgent::start(
+            InitialRemoveConfiguration::CatchUp,
+            RemoveReplicaMode::Force,
+            false,
+            HashMap::new(),
+            clock.clone(),
+            Arc::new(UnavailableLifecyclePeerTransport),
+        )
+        .await;
+        let quorum = running.next_effect().await;
+        let wait_id = match &quorum.effect {
+            RuntimeEffect::StartTrackedCatchUpQuorum { execution_id, .. } => execution_id.clone(),
+            _ => panic!("expected tracked quorum start"),
+        };
+        running.set_quorum_observation(
+            &wait_id,
+            crate::add_replica::RuntimeBuildState::Completed,
+            None,
+        );
+        quorum.reply.send(Ok(RuntimeEffectResult::Unit)).unwrap();
+
+        let current = running.next_effect().await;
+        assert!(matches!(
+            current.effect,
+            RuntimeEffect::UpdateCurrentConfiguration { .. }
+        ));
+
+        // The queued command is still held by the runtime while the agent's
+        // bounded receiver wait expires. Seeing PreviousCurrent at this point
+        // cannot prove that the command will not execute later.
+        running.set_configuration(running.intent.previous_status());
+        clock.advance(running.intent.call_timeout_seconds);
+        let terminal = running.wait_for_terminal().await;
+        assert_eq!(terminal.action.state, DurableActionState::Failed);
+        assert_eq!(terminal.action.result, None);
+        assert!(
+            terminal
+                .action
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("without cancellation or quiescence proof")
+        );
+        let progress = terminal.action.remove_replica_progress.as_ref().unwrap();
+        assert!(progress.current_install_dispatched);
+        assert_eq!(
+            progress.phase,
+            RemoveReplicaCoordinatorPhase::InstallingCurrentConfiguration
+        );
+        assert!(running.runtime_rx.try_recv().is_err());
+
+        // Model the already-queued runtime command committing after the
+        // coordinator has failed closed. Its oneshot receiver is gone, but the
+        // effect itself remained executable.
+        running.set_configuration(running.intent.reduced_current_status());
+        assert!(current.reply.send(Ok(RuntimeEffectResult::Unit)).is_err());
+        assert_eq!(
+            running.status_tx.borrow().configuration,
+            Some(running.intent.reduced_current_status())
+        );
+        assert_eq!(
+            running.wait_for_terminal().await.action.state,
+            DurableActionState::Failed
+        );
     }
 
     #[tokio::test]

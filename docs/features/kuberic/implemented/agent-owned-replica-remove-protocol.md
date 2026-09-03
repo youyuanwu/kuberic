@@ -81,9 +81,12 @@ previous Current configuration and report `Compensated`. After it, neither
 agent nor operator may restore the removed member.
 
 The primary marks current-install dispatch before the effect. Once that flag
-is observable, a failed or ambiguous re-observation does not authorize a
-previous-configuration effect. Exact positive configuration evidence is
-required; otherwise the operator poisons the operation.
+is observable, only exact reduced Current proves commit and permits
+roll-forward. Previous Current, reduced CatchUp, invalid, or unavailable
+configuration remains ambiguous because a timed-out queued effect may still
+commit later. None authorizes compensation or a previous-configuration effect
+without explicit tracked-effect cancellation or quiescence proof; the
+operator poisons the operation.
 
 The operator first persists `removeCommitEvidence` and the exact reduced
 `committedSnapshot`. That snapshot is scoped to the active workflow:
@@ -123,8 +126,10 @@ overall deadline plus 30 seconds, and a 60-second target-retirement budget.
 Retirement expires at `min(commit time + 60, overall deadline)`.
 
 One durable removal permits at most three pre-commit attempts, including the
-initial attempt. A new attempt is frozen only for a new primary generation
-whose exact live configuration is previous Current or reduced CatchUp.
+initial attempt. No new attempt is frozen after current-install dispatch is
+observable. Before dispatch, a new attempt may be frozen when a terminated
+same-generation attempt leaves exact reduced CatchUp installed, or when a new
+primary generation exposes exact previous Current or reduced CatchUp.
 The deadline and compensation cap are per attempt, not shared across the
 operation: one pre-commit attempt can consume 600 + 30 = 630 seconds, so three
 attempts can consume up to 3 × 630 = 1,890 seconds before a pre-commit terminal

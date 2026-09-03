@@ -394,9 +394,13 @@ impl RemoveReplicaProgress {
             RemoveReplicaTerminalResult::Compensated
                 if self.commit_observed
                     || self.phase != RemoveReplicaCoordinatorPhase::Compensating
-                    || self.compensation_expiry_unix_seconds.is_none() =>
+                    || self.compensation_expiry_unix_seconds.is_none()
+                    || self.current_install_dispatched =>
             {
-                Err("compensated removal result lacks restoration evidence".to_string())
+                Err(
+                    "compensated removal result lacks safe undispatched restoration evidence"
+                        .to_string(),
+                )
             }
             RemoveReplicaTerminalResult::CompensationIncomplete
                 if self.commit_observed
@@ -983,9 +987,18 @@ mod tests {
         compensated.target_retirement = TargetRetirementObservation::NotAttempted;
         compensated.retirement_expiry_unix_seconds = None;
         compensated.compensation_expiry_unix_seconds = Some(130);
+        compensated.current_install_dispatched = false;
         compensated
             .validate_terminal(RemoveReplicaTerminalResult::Compensated)
             .unwrap();
+        let mut dispatched_compensation = compensated.clone();
+        dispatched_compensation.current_install_dispatched = true;
+        assert!(
+            dispatched_compensation
+                .validate_terminal(RemoveReplicaTerminalResult::Compensated)
+                .unwrap_err()
+                .contains("undispatched")
+        );
         compensated.error = Some("restoration not observed".to_string());
         compensated
             .validate_terminal(RemoveReplicaTerminalResult::CompensationIncomplete)

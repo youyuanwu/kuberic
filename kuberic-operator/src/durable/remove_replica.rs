@@ -526,6 +526,14 @@ fn classify_new_primary_generation(
             now,
             exact_connection_absent(operation, &primary.status),
         ),
+        ConfigurationObservation::PreviousCurrent | ConfigurationObservation::ReducedCatchUp
+            if intent.current_install_dispatched =>
+        {
+            Ok(Decision::Persist(invalid_removal(
+                operation,
+                "the previous generation dispatched reduced-current installation without cancellation or quiescence proof",
+            )))
+        }
         ConfigurationObservation::PreviousCurrent | ConfigurationObservation::ReducedCatchUp => {
             if intent.attempt >= MAX_REMOVE_REPLICA_PRE_COMMIT_ATTEMPTS
                 && primary.status.configuration.as_ref()
@@ -554,6 +562,12 @@ fn persist_progress_if_changed(
     observed: &kuberic_core::types::DurableActionObservation,
 ) -> Result<Option<Decision>, String> {
     let intent = operation.remove_intent.as_ref().unwrap();
+    if intent.current_install_dispatched && !progress.current_install_dispatched {
+        return Ok(Some(Decision::Persist(invalid_removal(
+            operation,
+            "remove coordinator regressed durable reduced-current installation dispatch evidence",
+        ))));
+    }
     if let Some(persisted_expiry) = intent.compensation_expiry_unix_seconds
         && progress.compensation_expiry_unix_seconds != Some(persisted_expiry)
     {
@@ -612,6 +626,7 @@ fn classify_terminal(
                 .remove_intent
                 .as_ref()
                 .is_some_and(|intent| intent.current_install_dispatched)
+                || progress.is_some_and(|progress| progress.current_install_dispatched)
             {
                 return Ok(Decision::Persist(invalid_removal(
                     operation,
@@ -2185,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_current_cannot_compensate_after_current_install_dispatch() {
+    fn malformed_compensated_terminal_after_dispatch_is_poisoned_defense_in_depth() {
         let (operation, mut observations) = freeze_and_dispatch(DurableRemoveMode::ScaleDown);
         let intent = operation.remove_intent.as_ref().unwrap().clone();
         let progress = RemoveReplicaProgress {
@@ -2234,6 +2249,112 @@ mod tests {
             Some(RemoveReplicaDispositionStatus::InvalidRemovalState { .. })
         ));
         assert!(poisoned.committed_snapshot.is_none());
+    }
+
+    #[test]
+    fn failed_agent_after_lost_current_response_and_previous_current_is_poisoned() {
+        let (operation, mut observations) = freeze_and_dispatch(DurableRemoveMode::ScaleDown);
+        let intent = operation.remove_intent.as_ref().unwrap().clone();
+        let progress = RemoveReplicaProgress {
+            phase: RemoveReplicaCoordinatorPhase::InstallingCurrentConfiguration,
+            attempt_id: intent.attempt_id,
+            commit_observed: false,
+            commit_observed_unix_seconds: None,
+            connection_absent: false,
+            target_retirement: TargetRetirementObservation::NotAttempted,
+            retirement_expiry_unix_seconds: None,
+            compensation_expiry_unix_seconds: None,
+            error: None,
+            current_install_dispatched: true,
+        };
+        set_remove_action_progress(
+            &operation,
+            &mut observations,
+            progress,
+            DurableActionState::Failed,
+            None,
+        );
+
+        let Decision::Persist(observed) = decide_remove_replica(
+            &operation,
+            &observations,
+            &OperationPodIdentities::new(),
+            None,
+            20,
+        )
+        .unwrap() else {
+            panic!("expected current-install dispatch evidence to be persisted");
+        };
+        assert!(
+            observed
+                .remove_intent
+                .as_ref()
+                .unwrap()
+                .current_install_dispatched
+        );
+
+        let Decision::Persist(poisoned) = decide_remove_replica(
+            &observed,
+            &observations,
+            &OperationPodIdentities::new(),
+            None,
+            20,
+        )
+        .unwrap() else {
+            panic!("expected the ambiguous agent failure to poison removal");
+        };
+        assert_eq!(poisoned.phase, DurableOperationPhase::Poisoned);
+        assert!(matches!(
+            poisoned.removal_disposition,
+            Some(RemoveReplicaDispositionStatus::InvalidRemovalState { .. })
+        ));
+        assert!(poisoned.committed_snapshot.is_none());
+    }
+
+    #[test]
+    fn persisted_current_install_dispatch_evidence_cannot_regress() {
+        let (mut operation, mut observations) = freeze_and_dispatch(DurableRemoveMode::Force);
+        operation
+            .remove_intent
+            .as_mut()
+            .unwrap()
+            .current_install_dispatched = true;
+        let intent = operation.remove_intent.as_ref().unwrap().clone();
+        let progress = RemoveReplicaProgress {
+            phase: RemoveReplicaCoordinatorPhase::Compensating,
+            attempt_id: intent.attempt_id,
+            commit_observed: false,
+            commit_observed_unix_seconds: None,
+            connection_absent: false,
+            target_retirement: TargetRetirementObservation::NotAttempted,
+            retirement_expiry_unix_seconds: None,
+            compensation_expiry_unix_seconds: Some(50),
+            error: Some("malformed regressed progress".to_string()),
+            current_install_dispatched: false,
+        };
+        set_remove_action_progress(
+            &operation,
+            &mut observations,
+            progress,
+            DurableActionState::Failed,
+            None,
+        );
+
+        let Decision::Persist(poisoned) = decide_remove_replica(
+            &operation,
+            &observations,
+            &OperationPodIdentities::new(),
+            None,
+            20,
+        )
+        .unwrap() else {
+            panic!("expected regressed dispatch evidence to poison removal");
+        };
+        assert_eq!(poisoned.phase, DurableOperationPhase::Poisoned);
+        assert!(matches!(
+            poisoned.removal_disposition,
+            Some(RemoveReplicaDispositionStatus::InvalidRemovalState { .. })
+        ));
     }
 
     #[test]
@@ -2724,6 +2845,31 @@ mod tests {
         };
         assert!(matches!(
             invalid.removal_disposition,
+            Some(RemoveReplicaDispositionStatus::InvalidRemovalState { .. })
+        ));
+    }
+
+    #[test]
+    fn new_generation_previous_current_after_dispatch_is_invalid() {
+        let (mut operation, mut observations) = freeze_and_dispatch(DurableRemoveMode::Force);
+        operation
+            .remove_intent
+            .as_mut()
+            .unwrap()
+            .current_install_dispatched = true;
+        let primary = observations.get_mut(&operation.old_primary_id).unwrap();
+        primary.status.agent.generation =
+            AgentGeneration::parse("ffffffffffffffffffffffffffffffff").unwrap();
+        let pod_identities = OperationPodIdentities::from([(1, "one".to_string())]);
+
+        let Decision::Persist(ambiguous) =
+            decide_remove_replica(&operation, &observations, &pod_identities, None, 20).unwrap()
+        else {
+            panic!("expected post-dispatch generation change to fail closed");
+        };
+        assert_eq!(ambiguous.phase, DurableOperationPhase::Poisoned);
+        assert!(matches!(
+            ambiguous.removal_disposition,
             Some(RemoveReplicaDispositionStatus::InvalidRemovalState { .. })
         ));
     }
