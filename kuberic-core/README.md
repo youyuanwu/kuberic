@@ -7,12 +7,14 @@ Core replication framework for [Kuberic](../README.md). Provides the building bl
 | Module | Purpose |
 |--------|---------|
 | `ReplicaAgent` | Pod-local correlated control admission, fencing, replay, and serialization |
-| `add_replica` | Coarse add intent, structural configuration, peer-stage, and tracked-build contracts |
+| `add_replica` | Coarse add intent, coordinator progress/results, and tracked-build contracts |
+| `remove_replica` | Coarse removal intent, coordinator progress/results, deadlines, and commit semantics |
+| `replica_lifecycle` | Internal typed add/build and removal peer-stage contracts |
 | `PodRuntime` | Per-pod async runtime — executes ordered service and replicator effects |
 | `WalReplicator` | Quorum-based replicator — manages primary→secondary data flow, copy protocol, epoch tracking |
 | `PartitionDriver` | Read-only reconstruction of a durably committed stable topology |
 | `ReplicaHandle` | Status access plus the single correlated control-action mutation method |
-| `ReplicaAddBuildPeer` | Internal primary-agent→target-agent Prepare/Activate/Cleanup protocol |
+| `ReplicaLifecyclePeer` | Internal primary-agent→target-agent Prepare/Activate/Cleanup/Retire protocol |
 
 ## Usage
 

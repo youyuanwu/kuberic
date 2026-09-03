@@ -9,8 +9,8 @@ Kubernetes operator for [Kuberic](../README.md). Manages `KubericSet` custom res
 3. Persists durable topology intent and delegates ordered effects through each
    pod's `ReplicaAgent`
 4. Detects pod failures and triggers automatic failover
-5. Sends one coarse scale-up/rebuild intent to the primary agent; scale-down
-   remains configuration-first and operator-sequenced
+5. Sends one coarse scale-up/rebuild or scale-down/force-remove intent to the
+   primary agent while retaining durable topology and Kubernetes ownership
 
 ## CRD Example
 

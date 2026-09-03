@@ -1,127 +1,13 @@
-use crate::types::{
-    AgentGeneration, Epoch, Lsn, ReplicaConfigurationMemberStatus, ReplicaConfigurationMode,
-    ReplicaConfigurationStatus, ReplicaId, ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig,
-    ReplicaStatus, Role,
+use crate::replica_lifecycle::{
+    ConfigurationDescriptor, ConfigurationProgressSource, MAX_LIFECYCLE_ERROR_BYTES,
+    REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
 };
-
-pub const REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION: u32 = 1;
-pub const PEER_TERMINAL_RETENTION: usize = 16;
-pub const MAX_ADD_ERROR_BYTES: usize = 1024;
+use crate::types::{AgentGeneration, Epoch, Lsn, ReplicaId, ReplicaInstanceId, Role};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddReplicaMode {
     ScaleUp,
     Rebuild,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConfigurationProgressSource {
-    Frozen {
-        current_progress: Lsn,
-        catch_up_capability: Lsn,
-    },
-    BuildCopyLsn,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigurationMemberDescriptor {
-    pub id: ReplicaId,
-    pub instance_id: ReplicaInstanceId,
-    pub role: Role,
-    pub status: ReplicaStatus,
-    pub replicator_address: String,
-    pub must_catch_up: bool,
-    pub progress: ConfigurationProgressSource,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigurationDescriptor {
-    pub members: Vec<ConfigurationMemberDescriptor>,
-    pub write_quorum: u32,
-}
-
-impl ConfigurationDescriptor {
-    pub fn signature(&self) -> String {
-        let mut members = self
-            .members
-            .iter()
-            .map(|member| {
-                let progress = match member.progress {
-                    ConfigurationProgressSource::Frozen {
-                        current_progress,
-                        catch_up_capability,
-                    } => format!("frozen:{current_progress}:{catch_up_capability}"),
-                    ConfigurationProgressSource::BuildCopyLsn => "build-copy-lsn".to_string(),
-                };
-                format!(
-                    "{}@{}:{:?}:{:?}:{}:{}:{}",
-                    member.id,
-                    member.instance_id,
-                    member.role,
-                    member.status,
-                    member.replicator_address,
-                    member.must_catch_up,
-                    progress
-                )
-            })
-            .collect::<Vec<_>>();
-        members.sort();
-        format!("q{}[{}]", self.write_quorum, members.join(","))
-    }
-
-    pub fn materialize(&self, copy_lsn: Option<Lsn>) -> Result<ReplicaSetConfig, String> {
-        let mut members = Vec::with_capacity(self.members.len());
-        for member in &self.members {
-            let (current_progress, catch_up_capability) = match member.progress {
-                ConfigurationProgressSource::Frozen {
-                    current_progress,
-                    catch_up_capability,
-                } => (current_progress, catch_up_capability),
-                ConfigurationProgressSource::BuildCopyLsn => {
-                    let copy_lsn = copy_lsn.ok_or_else(|| {
-                        format!(
-                            "configuration member {} requires a completed copy LSN",
-                            member.id
-                        )
-                    })?;
-                    (copy_lsn, copy_lsn)
-                }
-            };
-            members.push(ReplicaInfo {
-                id: member.id,
-                instance_id: member.instance_id.clone(),
-                role: member.role,
-                status: member.status,
-                replicator_address: member.replicator_address.clone(),
-                current_progress,
-                catch_up_capability,
-                must_catch_up: member.must_catch_up,
-            });
-        }
-        members.sort_by_key(|member| member.id);
-        Ok(ReplicaSetConfig {
-            members,
-            write_quorum: self.write_quorum,
-        })
-    }
-
-    pub fn status(&self, mode: ReplicaConfigurationMode) -> ReplicaConfigurationStatus {
-        let mut members = self
-            .members
-            .iter()
-            .map(|member| ReplicaConfigurationMemberStatus {
-                id: member.id,
-                instance_id: member.instance_id.clone(),
-                role: member.role,
-            })
-            .collect::<Vec<_>>();
-        members.sort_by_key(|member| member.id);
-        ReplicaConfigurationStatus {
-            mode,
-            members,
-            write_quorum: self.write_quorum,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +32,7 @@ pub struct AddReplicaIntent {
     pub minimum_committed_replicas: u32,
     pub deadline_unix_seconds: i64,
     pub compensation_deadline_unix_seconds: i64,
+    pub target_lifecycle_peer_protocol_version: u32,
 }
 
 impl AddReplicaIntent {
@@ -163,6 +50,8 @@ impl AddReplicaIntent {
             || self.minimum_committed_replicas == 0
             || self.deadline_unix_seconds <= 0
             || self.compensation_deadline_unix_seconds < self.deadline_unix_seconds
+            || self.target_lifecycle_peer_protocol_version
+                != REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION
         {
             return Err("add-replica intent has invalid identity, endpoint, or limit".to_string());
         }
@@ -275,7 +164,7 @@ impl AddReplicaIntent {
 
     pub fn signature(&self) -> String {
         format!(
-            "add-replica:{}:{}:{:?}:{}:{}:{}@{}:{}:{}:{}@{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "add-replica:{}:{}:{:?}:{}:{}:{}@{}:{}:{}:{}@{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.operation_id,
             self.attempt_id,
             self.mode,
@@ -297,7 +186,8 @@ impl AddReplicaIntent {
             self.configuration_fence(),
             self.minimum_committed_replicas,
             self.deadline_unix_seconds,
-            self.compensation_deadline_unix_seconds
+            self.compensation_deadline_unix_seconds,
+            self.target_lifecycle_peer_protocol_version
         )
     }
 }
@@ -357,107 +247,11 @@ pub struct RuntimeQuorumWaitObservation {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerStage {
-    Prepare,
-    Activate,
-    Cleanup,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerStageState {
-    Accepted,
-    InProgress,
-    Completed,
-    Failed,
-    Stale,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerStageRequest {
-    pub protocol_version: u32,
-    pub operation_id: String,
-    pub attempt_id: String,
-    pub message_id: String,
-    pub input_signature: String,
-    pub stage: PeerStage,
-    pub sender_replica_id: ReplicaId,
-    pub sender_instance_id: ReplicaInstanceId,
-    pub sender_agent_generation: AgentGeneration,
-    pub sender_control_address: String,
-    pub parent_action_id: String,
-    pub parent_action_signature: String,
-    pub target_replica_id: ReplicaId,
-    pub target_instance_id: ReplicaInstanceId,
-    pub expected_target_agent_generation: AgentGeneration,
-    pub expected_target_peer_control_version: u64,
-    pub epoch: Epoch,
-    pub configuration_fence: String,
-    pub build_key: Option<String>,
-    pub copy_lsn: Option<Lsn>,
-}
-
-impl PeerStageRequest {
-    pub fn signature(&self) -> String {
-        format!(
-            "peer:{}:{}:{}:{:?}:{}@{}:{}:{}:{}:{}:{}@{}:{}:{}:{}:{}:{}:{}:{}",
-            self.operation_id,
-            self.attempt_id,
-            self.message_id,
-            self.stage,
-            self.sender_replica_id,
-            self.sender_instance_id,
-            self.sender_agent_generation,
-            self.sender_control_address,
-            self.parent_action_id,
-            self.parent_action_signature,
-            self.target_replica_id,
-            self.target_instance_id,
-            self.expected_target_agent_generation,
-            self.expected_target_peer_control_version,
-            self.epoch.data_loss_number,
-            self.epoch.configuration_number,
-            self.configuration_fence,
-            self.build_key.as_deref().unwrap_or("none"),
-            self.copy_lsn
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerStageObservation {
-    pub protocol_version: u32,
-    pub message_id: String,
-    pub input_signature: String,
-    pub stage: PeerStage,
-    pub state: PeerStageState,
-    pub target_agent_generation: AgentGeneration,
-    pub target_peer_control_version: u64,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerAddBuildStatus {
-    pub protocol_version: u32,
-    pub target_replica_id: ReplicaId,
-    pub target_instance_id: ReplicaInstanceId,
-    pub agent_generation: AgentGeneration,
-    pub peer_control_version: u64,
-    pub role: Role,
-    pub epoch: Epoch,
-    pub healthy: bool,
-    pub current_progress: Lsn,
-    pub current_action: Option<PeerStageObservation>,
-    pub retained_terminal_actions: Vec<PeerStageObservation>,
-}
-
 pub fn normalize_add_error(error: &str) -> String {
-    if error.len() <= MAX_ADD_ERROR_BYTES {
+    if error.len() <= MAX_LIFECYCLE_ERROR_BYTES {
         return error.to_string();
     }
-    let mut boundary = MAX_ADD_ERROR_BYTES;
+    let mut boundary = MAX_LIFECYCLE_ERROR_BYTES;
     while !error.is_char_boundary(boundary) {
         boundary -= 1;
     }
@@ -467,6 +261,8 @@ pub fn normalize_add_error(error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replica_lifecycle::ConfigurationMemberDescriptor;
+    use crate::types::ReplicaStatus;
 
     fn generation(value: char) -> AgentGeneration {
         AgentGeneration::parse(value.to_string().repeat(32)).unwrap()
@@ -519,6 +315,7 @@ mod tests {
             minimum_committed_replicas: 1,
             deadline_unix_seconds: 100,
             compensation_deadline_unix_seconds: 110,
+            target_lifecycle_peer_protocol_version: REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
         }
     }
 
@@ -528,32 +325,5 @@ mod tests {
         let mut second = first.clone();
         second.target_agent_generation = generation('c');
         assert_ne!(first.semantic_build_key(), second.semantic_build_key());
-    }
-
-    #[test]
-    fn descriptor_materializes_copy_progress() {
-        let config = descriptor(true).materialize(Some(42)).unwrap();
-        assert_eq!(config.members[0].current_progress, 42);
-        assert_eq!(config.members[0].catch_up_capability, 42);
-    }
-
-    #[test]
-    fn descriptor_signature_is_member_order_independent() {
-        let mut first = descriptor(false);
-        first.members.push(ConfigurationMemberDescriptor {
-            id: 3,
-            instance_id: ReplicaInstanceId::new("three"),
-            role: Role::ActiveSecondary,
-            status: ReplicaStatus::Up,
-            replicator_address: "http://three".to_string(),
-            must_catch_up: false,
-            progress: ConfigurationProgressSource::Frozen {
-                current_progress: 3,
-                catch_up_capability: 3,
-            },
-        });
-        let mut second = first.clone();
-        second.members.reverse();
-        assert_eq!(first.signature(), second.signature());
     }
 }

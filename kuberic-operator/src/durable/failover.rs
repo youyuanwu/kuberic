@@ -78,6 +78,8 @@ pub fn start_failover(
         target_instance_id: None,
         target_pod_name: None,
         target_pod_uid: None,
+        remove_target_replicator_address: None,
+        remove_target_agent_generation: None,
         retired_instance_id: None,
         frozen_lsn: None,
         next_secondary_index: 0,
@@ -104,6 +106,10 @@ pub fn start_failover(
             promotion_committed: false,
         }),
         add_intent: None,
+        remove_intent: None,
+        remove_commit_evidence: None,
+        remove_cleanup: None,
+        removal_disposition: None,
     })
 }
 
@@ -955,8 +961,8 @@ fn completed_data_loss(
         Some(DurableActionResult::DataLoss(DataLossAction::StateChanged)) => {
             Ok(Some(DurableDataLossResultStatus::StateChanged))
         }
-        Some(DurableActionResult::AddReplica(_)) => {
-            Err("data-loss completion carries an add-replica result".to_string())
+        Some(DurableActionResult::AddReplica(_)) | Some(DurableActionResult::RemoveReplica(_)) => {
+            Err("data-loss completion carries a non-data-loss result".to_string())
         }
         None => Err("data-loss completion has no result".to_string()),
     }
@@ -1677,8 +1683,8 @@ mod tests {
             build_observation: None,
             agent: kuberic_core::types::ReplicaAgentStatus {
                 protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-                add_build_peer_protocol_version:
-                    kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+                lifecycle_peer_protocol_version:
+                    kuberic_core::replica_lifecycle::REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
                 generation: kuberic_core::types::AgentGeneration::parse(
                     "0123456789abcdef0123456789abcdef",
                 )

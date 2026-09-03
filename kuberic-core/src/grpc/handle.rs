@@ -8,6 +8,7 @@ use crate::driver::ReplicaHandle;
 use crate::error::{KubericError, Result};
 use crate::proto::replicator_control_client::ReplicatorControlClient;
 use crate::proto::*;
+use crate::replica_lifecycle::REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION;
 use crate::types::{
     AgentControlVersion, AgentGeneration, CorrelatedActionObservation,
     CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest, DurableActionState,
@@ -23,7 +24,7 @@ pub struct GrpcReplicaHandle {
     instance_id: ReplicaInstanceId,
     client: ReplicatorControlClient<Channel>,
     control_address: String,
-    data_address: String,
+    data_address: Option<String>,
     current_progress: AtomicI64,
     catch_up_capability: AtomicI64,
 }
@@ -35,9 +36,35 @@ impl GrpcReplicaHandle {
         control_address: String,
         data_address: String,
     ) -> Result<Self> {
+        Self::connect_inner(
+            id,
+            instance_id,
+            control_address,
+            Some(data_address),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_control_only(
+        id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+        control_address: String,
+        connect_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        Self::connect_inner(id, instance_id, control_address, None, connect_timeout).await
+    }
+
+    async fn connect_inner(
+        id: ReplicaId,
+        instance_id: ReplicaInstanceId,
+        control_address: String,
+        data_address: Option<String>,
+        connect_timeout: std::time::Duration,
+    ) -> Result<Self> {
         let channel = Channel::from_shared(control_address.clone())
             .map_err(|error| KubericError::Internal(Box::new(error)))?
-            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(connect_timeout)
             .connect()
             .await
             .map_err(|error| KubericError::Internal(Box::new(error)))?;
@@ -310,7 +337,7 @@ impl ReplicaHandle for GrpcReplicaHandle {
     }
 
     fn replicator_address(&self) -> String {
-        self.data_address.clone()
+        self.data_address.clone().unwrap_or_default()
     }
 
     fn control_address(&self) -> String {
@@ -326,13 +353,12 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .into_inner();
 
         Self::validate_protocol_version(inner.replica_agent_protocol_version)?;
-        if inner.replica_add_build_peer_protocol_version
-            != crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION
+        if inner.replica_lifecycle_peer_protocol_version != REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION
         {
             return Err(KubericError::RemoteControlProtocolUnsupported(format!(
-                "replica add/build peer protocol version must be {}, got {}",
-                crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
-                inner.replica_add_build_peer_protocol_version
+                "replica lifecycle peer protocol version must be {}, got {}",
+                REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
+                inner.replica_lifecycle_peer_protocol_version
             )));
         }
         if inner.instance_id.is_empty() {
@@ -365,7 +391,7 @@ impl ReplicaHandle for GrpcReplicaHandle {
             .map_err(Self::invalid_status)?;
         let agent = ReplicaAgentStatus {
             protocol_version: inner.replica_agent_protocol_version,
-            add_build_peer_protocol_version: inner.replica_add_build_peer_protocol_version,
+            lifecycle_peer_protocol_version: inner.replica_lifecycle_peer_protocol_version,
             generation,
             control_version: AgentControlVersion::new(inner.agent_control_version),
             current_action,
@@ -426,8 +452,10 @@ impl ReplicaHandle for GrpcReplicaHandle {
         request: CorrelatedControlActionRequest,
     ) -> Result<CorrelatedControlActionAcknowledgement> {
         let mut client = self.client.clone();
+        let request = ExecuteCorrelatedControlActionRequest::try_from(request)
+            .map_err(|error| Self::invalid_status(error.as_str()))?;
         let response = client
-            .execute_correlated_control_action(ExecuteCorrelatedControlActionRequest::from(request))
+            .execute_correlated_control_action(request)
             .await
             .map_err(Self::map_err)?
             .into_inner();
@@ -462,6 +490,7 @@ mod tests {
                 error: None,
                 result: None,
                 add_replica_progress: None,
+                remove_replica_progress: None,
             },
         }
     }
@@ -470,8 +499,7 @@ mod tests {
         let generation = AgentGeneration::from_string("generation");
         ReplicaAgentStatus {
             protocol_version: crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-            add_build_peer_protocol_version:
-                crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+            lifecycle_peer_protocol_version: REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
             generation: generation.clone(),
             control_version: AgentControlVersion::new(2),
             current_action: Some(observation(

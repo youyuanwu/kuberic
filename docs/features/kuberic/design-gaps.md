@@ -4,8 +4,8 @@ Gaps identified by reviewing the design docs against the implementation.
 Categorized by severity and whether additional design work is needed
 vs simple implementation of existing designs.
 
-> Related: [Status & Roadmap](kuberic/status.md),
-> [Failure Scenarios](operator-failure-scenarios.md)
+> Related: [Status & Roadmap](status.md),
+> [Failure Scenarios](../operator-failure-scenarios.md)
 
 ---
 
@@ -143,10 +143,10 @@ reorder a runtime effect because no individual mutation RPC bypass exists.
 
 ---
 
-### A5. Synchronous BuildReplica and CatchUp Block Operator — ✅ Fixed for Add/Rebuild
+### A5. Synchronous BuildReplica and CatchUp Block Operator — ✅ Fixed for Add/Rebuild and Removal
 
 **Severity:** 🔴 Critical (for large datasets) / 🟢 OK for MVP
-**Affects:** Durable add/rebuild and catch-up workflow activities
+**Affects:** Durable add/rebuild, removal, and catch-up workflow activities
 **Files:** `driver.rs`, `handle.rs`, `pod.rs`, `server.rs`, `quorum.rs`
 
 Replica add/rebuild no longer blocks the operator on these operations.
@@ -155,8 +155,12 @@ coordinator. `PodRuntime` tracks copy and catch-up-quorum waits through a
 command/completion loop, so status, cancellation, and compensation remain
 available.
 
+Replica removal likewise runs behind one `RemoveReplicaIntent`; the primary
+agent tracks its quorum wait asynchronously while status remains responsive.
+
 The direct correlated BuildReplica and quorum actions remain for unchanged
-creation/failover workflows. Their existing ownership is not migrated here.
+creation/failover/switchover workflows. Their existing ownership is not
+migrated here.
 
 **Original problem:** Two long-running operations blocked the operator
 synchronously:
@@ -661,7 +665,7 @@ design work needed — just implementation.
 | Stable missing secondary detection | operator-failure-scenarios.md §3 | ✅ Implemented |
 | gRPC failure tracking (per-replica counter) | operator-failure-scenarios.md §5 | P1 |
 | Failover delay (`primaryFailingSince`) | operator-failure-scenarios.md §1 | ✅ Implemented |
-| Durable error-tolerant secondary removal | operator-failure-scenarios.md §3 | ✅ Implemented |
+| Durable agent-owned secondary removal | operator-failure-scenarios.md §3 | ✅ Implemented |
 | CRD conditions (Ready, Degraded, QuorumAvailable) | operator-failure-scenarios.md | P1 |
 | Old primary cleanup after failover | operator-failure-scenarios.md §9 | P1 |
 | Primary self-fencing liveness probe | operator-failure-scenarios.md §5 | P2 |
@@ -676,7 +680,7 @@ design work needed — just implementation.
 
 | Category | Count | Top Priority |
 |----------|-------|-------------|
-| A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, A5 async build, **A6 ✅** |
+| A: Protocol Safety | 6 | **A1 ✅**, **A2 ✅**, **A3 ✅ (switchover)**, **A4 ✅ (not an issue)**, **A5 ✅ (add/removal)**, **A6 ✅** |
 | B: Operational Resilience (needs design) | 6 | B0 bounded writes fixed (health reporting remains), **B5 ✅**, B2 timeouts |
 | C: Correctness Refinements (needs design) | 5 | **C0 ✅ fixed**, C1 stale ACKs, **C4 ChangeRole(None) cleanup** |
 | D: Designed capabilities | 14 | Stable restart and durable Phase-1/data-loss failover ✅ |
@@ -684,13 +688,12 @@ design work needed — just implementation.
 
 **Recommended order:**
 1. **B0 QuorumTracker timeout ✅** — bounded writes and catch-up waits implemented; replication health reporting remains
-2. **A5 (async build, SF fire-and-retry)** — blocks reconciler on large datasets
-3. B2 (short RPC timeouts) — prevents hangs on control-plane calls
-4. A3 failover candidate retry — failover resilience
-5. Remaining D items (health reporting and operational integrations)
-6. B3 + B4 (reconnection, operation locking) — operational maturity
-7. B1 streaming improvement — large dataset support
-8. C1-C3 (refinements) — can be done alongside other work
+2. B2 (short RPC timeouts) — prevents hangs on unchanged control-plane calls
+3. A3 failover candidate retry — failover resilience
+4. Remaining D items (health reporting and operational integrations)
+5. B3 + B4 (reconnection, operation locking) — operational maturity
+6. B1 streaming improvement — large dataset support
+7. C1-C3 (refinements) — can be done alongside other work
 
 ---
 
@@ -923,7 +926,7 @@ configuration descriptors, build key, and deadlines.
 
 The operator dispatches one `AddReplicaIntent` only to the current primary.
 That agent coordinates target Prepare/Activate/Cleanup through
-`ReplicaAddBuildPeer`, tracked copy, catch-up/current configuration, and
+`ReplicaLifecyclePeer` v2, tracked copy, catch-up/current configuration, and
 quorum wait. Target process generation participates in build proof, so a
 same-Pod process restart recopies rather than activating from stale evidence.
 
@@ -944,22 +947,46 @@ roll-forward only; unattested committed membership becomes
 
 **Affects:** Healthy scale-down and stale/dead-secondary eviction
 
-The operator now uses one durable configuration-first removal protocol with
-typed `ScaleDown` and `Force` modes. It persists previous and reduced target
-snapshots plus the exact target replica ID, runtime incarnation, pod name, and
-pod UID before activity.
+The operator now freezes one remove operation v2 and dispatches one
+`RemoveReplicaIntent` v1 to the exact current primary through correlated
+control v3. CRD status retains desired topology, `ScaleDown`/`Force`
+authorization, frozen previous/reduced descriptors, attempt/deadline state,
+commit recognition, Kubernetes cleanup, and final stable publication.
 
-The primary installs target/previous catch-up configuration, waits for retained
-write quorum, and commits target current configuration. The reduced stable
-snapshot is persisted immediately when that commit is observed. Failures
-before commit restore the previous current configuration and snapshot;
-post-commit processing only rolls forward.
+The primary `ReplicaAgent` transiently installs reduced CatchUp with the
+previous configuration, waits for the frozen write quorum, installs reduced
+Current, removes the exact old-incarnation connection, and coordinates target
+`Retire` through `ReplicaLifecyclePeer` v2. `PodRuntime` executes ordered
+effects only. Primary/target phases and their 16-entry terminal ledgers are
+volatile evidence, not a second durable workflow store.
 
-`GetStatus` exposes exact primary sender connections, making old-incarnation
-absence observable after ambiguous removal responses. Reachable targets are
-demoted and closed after membership commit; unreachable targets do not block
-progress. Kubernetes deletion uses the recorded UID precondition, so delayed
-cleanup cannot delete a same-name replacement pod.
+Exact reduced Current is the irreversible boundary. Before current-install
+dispatch, observed failure may restore previous Current. Once dispatch is
+recorded, failed or ambiguous re-observation never authorizes rollback without
+positive exact configuration evidence. The operator first persists the
+primary commit timestamp and reduced workflow-scoped `committedSnapshot`;
+`stableSnapshot` remains previous until exact connection/retirement evidence,
+UID-qualified `role=retired` fencing, and UID-qualified pod deletion complete.
+Every post-commit path rolls forward.
+
+`ScaleDown` requires exact target reachability before operation persistence.
+`Force` permits unavailable target retirement but does not bypass
+`minReplicas`, quorum, identity, generation, epoch, or committed-configuration
+checks. The 10/30/60/600-second budgets and maximum three pre-commit attempts
+are frozen. Exhausted known pre-commit work, structurally impossible
+post-dispatch evidence, and a complete evidence-erasing primary restart are
+durably distinguished as `FailedPreCommitIncomplete`,
+`InvalidRemovalState`, and `AmbiguousPrimaryRestart`.
+
+This aligns with SF's manager-owned topology and primary/target RA-owned local
+removal responsibilities. The deliberate transport difference is that SF
+sends `DeleteReplica` directly FM→target, while Kuberic sends
+primary-agent→target-agent `Retire` and leaves physical deletion with the
+operator
+(`/data/code/service-fabric/src/prod/src/Reliability/Failover/fm/PendingTask.cpp:112-160`,
+`/data/code/service-fabric/src/prod/src/Reliability/Failover/fm/SendMessageAction.cpp:174-216`).
+Kuberic `Force` has no SF `Obliterate` target epoch bypass
+(`/data/code/service-fabric/src/prod/src/Reliability/Failover/ra/ReconfigurationAgent.cpp:780-834`).
 
 ### E7. Initial creation state lost with operator process — ✅ Fixed
 
@@ -1023,14 +1050,16 @@ force-remove/rebuild protocol.
 `ExecuteCorrelatedControlAction` is the only production mutation path, and
 `current_action` plus `retained_terminal_actions` is the only local
 correlation ledger. Individual mutation RPCs and `ExecuteDurableAction` are
-retired. Required numeric protocol-version mismatch fails closed, so operator
+retired. Required numeric control v3 mismatch fails closed, so operator
 and runtime deployment must be coordinated.
 
-Replica add/build adds one deliberately narrow peer surface on the same
-listener. The target reverse-observes the exact active parent action and
-primary identity/generation/epoch/role/write status before each local effect.
-This is not a general RA-to-RA reconfiguration framework; other distributed
-protocols remain operator-sequenced.
+Replica add/build and removal share one deliberately narrow
+`ReplicaLifecyclePeer` v2 surface on the same listener. The target
+reverse-observes exact parent/sender authority and local
+identity/generation/epoch before typed Prepare/Activate/Cleanup/Retire effects.
+Shared peer primitives do not merge the workflows and do not create a general
+RA-to-RA reconfiguration framework. Switchover remains the next
+operator-sequenced local reconfiguration candidate.
 
 ### E9. PostgreSQL correlated topology integration
 

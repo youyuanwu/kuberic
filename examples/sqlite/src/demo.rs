@@ -28,7 +28,7 @@ async fn execute_action(
     let signature = action.signature();
     let observation = client
         .execute_correlated_control_action(
-            kuberic_core::proto::ExecuteCorrelatedControlActionRequest::from(
+            kuberic_core::proto::ExecuteCorrelatedControlActionRequest::try_from(
                 CorrelatedControlActionRequest {
                     protocol_version:
                         kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
@@ -44,7 +44,8 @@ async fn execute_action(
                     observed_runtime_epoch: runtime_epoch.into(),
                     action,
                 },
-            ),
+            )
+            .expect("active correlated action must serialize"),
         )
         .await
         .unwrap()

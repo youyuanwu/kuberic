@@ -28,9 +28,9 @@ Use this production flow:
 operator
   → one versioned AddReplicaIntent
   → current primary ReplicaAgent coordinator
-      → target ReplicaAddBuildPeer Prepare
+      → target ReplicaLifecyclePeer Prepare
       → primary PodRuntime tracked copy
-      → target ReplicaAddBuildPeer Activate
+      → target ReplicaLifecyclePeer Activate
       → primary catch-up / quorum / current configuration
   → operator commit recognition, label, stable publication
 ```
@@ -44,17 +44,23 @@ and stable publication. Agents retain only bounded transient coordination.
 
 - `ReplicatorControl` still exposes only `GetStatus` and
   `ExecuteCorrelatedControlAction`.
-- Required correlated control protocol: **2**.
-- `ReplicaAddBuildPeer` shares the control listener and exposes only status and
-  one stage-execution RPC.
-- Required peer protocol: **1**.
-- Add durable operation version: **2**. Non-add durable workflows remain
-  version 1.
+- Required correlated control protocol: **3**.
+- `ReplicaLifecyclePeer` shares the control listener and exposes only status
+  and one typed stage-execution RPC.
+- Required lifecycle-peer protocol: **2**. Add/build uses stage semantic
+  version **1**.
+- Add durable operation version: **3**. Coarse remove uses operation version
+  2; other durable workflows retain their existing versions.
 
 No compatibility fallback or direct target mutation path exists.
-Superseded fine-grained add phases, action kinds, and encoded add payload
+Superseded per-step add phases, action kinds, and encoded add payload
 status are removed; operators must quiesce add/rebuild before coordinated
 deployment.
+
+The lifecycle peer also carries removal's typed `Retire` stage. Sharing
+identity, signature, duplicate replay, status, and transport primitives does
+not merge the workflows: add/build and removal retain separate intents,
+coordinators, configuration semantics, commit rules, and terminal results.
 
 ## Safety Decisions
 
@@ -116,5 +122,6 @@ agent-local failover-unit store.
 
 SF can reopen a persisted standby during CreateReplica. Kuberic retains its
 existing `Open(New)` add/rebuild behavior. SF also has broader RA-to-RA
-Deactivate/Activate/GetLSN protocols; Kuberic's peer service is deliberately
-limited to add/build.
+Deactivate/Activate/GetLSN protocols. Kuberic's peer service remains
+deliberately limited to add/build lifecycle stages and the exact removal
+`Retire` stage; it is not a general reconfiguration API.

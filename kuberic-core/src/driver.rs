@@ -351,6 +351,7 @@ mod tests {
     use super::*;
     use crate::error::KubericError;
     use crate::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION;
+    use crate::replica_lifecycle::REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION;
     use crate::types::{
         AccessStatus, AgentControlVersion, AgentGeneration, Epoch, ReplicaAgentStatus,
         ReplicaStatusInfo,
@@ -423,8 +424,7 @@ mod tests {
             build_observation: None,
             agent: ReplicaAgentStatus {
                 protocol_version: CORRELATED_CONTROL_PROTOCOL_VERSION,
-                add_build_peer_protocol_version:
-                    crate::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+                lifecycle_peer_protocol_version: REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
                 generation: AgentGeneration::from_string(format!("generation-{id}")),
                 control_version: AgentControlVersion::default(),
                 current_action: None,

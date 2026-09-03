@@ -26,11 +26,15 @@ switchover, and scaling through CRD-backed durable workflows.
   complete member logical/incarnation identities and roles, write quorum, and
   optional last-known election progress/deactivation metadata
 - optional compact versioned `operation` checkpoint for durable creation,
-  switchover, replica add/rebuild, and configuration-first replica removal,
+  switchover, replica add/rebuild, and configuration-first replica removal
 - structured add-replica attempt with frozen primary/target generations,
   endpoints, configuration descriptors, semantic build key, deadlines, and
-  commit observation,
-  plus Phase-1 failover/data-loss recovery, including optional
+  commit observation
+- structured remove-replica attempt with exact primary/target authority,
+  previous/reduced configuration descriptors, three-attempt and deadline
+  bounds, bounded coordinator phase/result, exact commit evidence,
+  post-commit cleanup, and typed poison disposition
+- Phase-1 failover/data-loss recovery, including optional
   previous/committed topology, target snapshot, one pending correlated action,
   failover observations/assessment/epoch intents, and optional pod-local
   generation/control-version/runtime-epoch fences and a frozen action payload
@@ -143,10 +147,11 @@ recreation. Each concrete pod uses its Kubernetes UID as
 configurations, and CRD member status carry that incarnation.
 
 Health reconciliation compares the runtime-reported incarnation with the
-handle's expected pod UID. Before a stale secondary is removed from driver
-state, the driver sends a precise `(replica ID, incarnation)` removal to the
-primary. Re-adding the ordinal installs the new endpoint and cancels the old
-connection's drain and acknowledgement tasks.
+handle's expected pod UID. A ready replacement enters coarse add/rebuild,
+whose primary coordinator retires the exact old connection before building
+the new incarnation. A missing or unreachable old incarnation enters coarse
+`Force` removal. In both paths, delayed cleanup for the old
+`(ReplicaId, ReplicaInstanceId)` cannot remove a replacement connection.
 
 ### ReplicaAgent Dispatch Boundary
 
@@ -157,12 +162,13 @@ effects. This is intentionally narrower than Service Fabric RA: CRD status and
 the operator remain the only owners of distributed workflow state.
 
 Before a pending runtime action is dispatched, reconciliation requires
-replica-agent control protocol version 2 and exact agreement among the
+replica-agent control protocol version 3 and exact agreement among the
 addressed, runtime, and pending Pod incarnations. It persists the observed
 agent generation, agent control version, and runtime epoch.
-Direct non-add actions also freeze their exact encoded payload so observation
-and retry signatures cannot drift with live progress. Add/rebuild uses the
-structured `operation.addIntent` as its only payload authority.
+Direct non-add/non-remove actions also freeze their exact encoded payload so
+observation and retry signatures cannot drift with live progress. Add/rebuild
+and removal use structured `operation.addIntent` and
+`operation.removeIntent` as their payload authority.
 
 Missing, malformed, or unsupported agent status fails closed. There is no
 capability negotiation or old-peer fallback.
@@ -275,13 +281,18 @@ When `spec.replicas > current stable member count`:
 The primary agent owns target Prepare, tracked copy, target Activate, catch-up
 configuration, write-quorum wait, current configuration, and compensation.
 The operator never sends a production mutation to the add target.
+Prepare, Activate, and compensation Cleanup use the internal
+`ReplicaLifecyclePeer` v2 service.
 
 The structured attempt is the semantic source of truth. It freezes structural
 configuration and derives the target progress from the acknowledged copy LSN.
-No fine-grained add cursor or encoded add action payload is retained.
+No per-step add cursor or encoded add action payload is retained.
 Copy and quorum wait are tracked asynchronously by `PodRuntime`; status remains
 available and exact duplicate copy is suppressed only while target generation
 continuity still matches.
+Ordinary control effects retain the default 30-second reply bound; a direct
+durable `BuildReplica` effect retains the 10-minute copy window used by
+unchanged workflows while remaining observable through `GetStatus`.
 
 Stale-secondary replacement uses the same operation after first removing the
 old exact `(ReplicaId, ReplicaInstanceId)` connection from the primary. That
@@ -300,34 +311,83 @@ target serving label, publishes the proven topology with a
 
 ## Scale-Down Reconciliation
 
-When `spec.replicas < current pod count`:
+When `spec.replicas` is lower than stable membership, the operator selects the
+highest-ID stable secondary. It never removes a primary; switchover must make
+that replica a secondary first.
 
-Design follows SF's config-first approach (remove from quorum before closing):
+For healthy `ScaleDown`, the operator first requires an exact target
+generation, endpoint, and lifecycle-peer v2 observation. If that pre-admission
+fails, the set remains `Healthy`, no operation is persisted, and
+`ScaleDownTargetUnavailable` is published without repeatedly rewriting
+unchanged status. The stale/dead/missing-secondary health paths separately
+authorize `Force`.
+
+The operator then:
+
+1. validates `minReplicas` and retained previous-write-quorum safety;
+2. persists remove operation v2 with the previous and frozen reduced
+   snapshots, exact target incarnation/pod UID, mode, deadlines, and a maximum
+   of three pre-commit attempts;
+3. freezes one generation-qualified `RemoveReplicaIntent` v1 and dispatches it
+   only to the exact current primary through correlated control v3;
+4. observes bounded primary coordinator evidence until the exact reduced
+   Current configuration commits, compensation succeeds, redrive is safe, or
+   the operation poisons;
+5. persists the primary's exact commit timestamp, configuration signature, and
+   the reduced workflow-scoped `committedSnapshot` before global cleanup;
+6. fences the old pod's role label to `retired`, deletes only the frozen UID,
+   and publishes the reduced `stableSnapshot`.
+
+The primary `ReplicaAgent` owns the transient sequence:
 
 ```
-1. Operator selects secondary to remove (prefer newest, never primary)
-2. Advance the durable remove checkpoint one correlated action at a time:
-   a. Verify replica_count > min_replicas (safety)
-   b. `UpdateCatchUpConfiguration` (new config WITHOUT the replica)
-   c. `WaitForCatchUpQuorum(Write)`
-   d. `UpdateCurrentConfiguration` (irreversible membership commit)
-   e. exact-incarnation primary connection cleanup
-   f. `ChangeRole(None)` and `Close` on the removed replica
-3. Operator deletes Pod + PVC
-4. Update CRD status
+reduced CatchUp + previous configuration
+  → tracked WaitForCatchUpQuorum(Write)
+  → reduced Current
+  → remove exact old-incarnation connection
+  → ReplicaLifecyclePeer Retire
+  → final attestation
 ```
 
-**Safety:**
-- Cannot scale below `spec.minReplicas`
-- Config update happens BEFORE close — write quorum is maintained
-  because the old config still includes the replica until finalized
-- If primary is targeted, operator must switchover first, then remove
-  the demoted secondary
+The target agent admits `Retire` only after validating exact sender, parent
+action, target incarnation/generation, epoch, committed reduced projection,
+and signed expiry. `PodRuntime` performs `ChangeRole(None)` and `Close` in
+order. The operator never sends those production removal actions directly to
+the target.
+
+Exact reduced Current is the irreversible commit. Before commit, failure may
+restore previous Current. After current-install dispatch, rollback requires
+positive exact configuration evidence; ambiguous state poisons instead of
+guessing. After commit, every path rolls forward and never republishes the
+removed member.
+
+`ScaleDown` and `Force` have identical quorum, minimum, commit, connection, and
+publication safety. Only target retirement differs: `ScaleDown` starts with
+frozen reachable peer authority, while `Force` permits missing authority and
+degraded post-commit retirement. Neither mode weakens exact target admission
+or quorum.
+
+Primary progress is volatile and bounded; CRD status is the durable authority.
+A new primary-agent generation may receive a new pre-commit attempt only when
+exact previous Current or reduced CatchUp survives, up to three attempts.
+The three terminal operator dispositions are:
+
+- `FailedPreCommitIncomplete` for a known pre-commit state after deadline or
+  attempt exhaustion;
+- `InvalidRemovalState` for structurally impossible evidence or ambiguity
+  after reduced-current dispatch; and
+- `AmbiguousPrimaryRestart` when a complete same-Pod primary restart erases
+  all commit-boundary evidence.
+
+All pin the operation in `Poisoned`; their evidence and recovery meaning are
+distinct. Post-commit cleanup is not attempt-capped.
 
 **Selection heuristic:** Prefer the secondary with the highest replica ID
 (newest). CNPG uses the same approach. SF uses PLB load balancing which
 is more sophisticated but unnecessary for our initial implementation.
 
-**All gRPC calls have timeouts.** Ordinary control calls use the default 30s
-bound; durable BuildReplica allows a 10-minute copy window while remaining
-observable through GetStatus. One reconfiguration runs at a time.
+Removal freezes a 600-second overall deadline, 10-second call bounds,
+30-second compensation grace (capped at overall plus 30), and a 60-second
+post-commit retirement budget capped by the overall deadline. Status remains
+responsive because quorum and peer work is tracked asynchronously. One
+reconfiguration runs at a time.

@@ -82,6 +82,8 @@ pub fn start_switchover(
         target_instance_id: None,
         target_pod_name: None,
         target_pod_uid: None,
+        remove_target_replicator_address: None,
+        remove_target_agent_generation: None,
         retired_instance_id: None,
         previous_snapshot: previous.into(),
         target_snapshot: target,
@@ -94,6 +96,10 @@ pub fn start_switchover(
         last_error: None,
         failover: None,
         add_intent: None,
+        remove_intent: None,
+        remove_commit_evidence: None,
+        remove_cleanup: None,
+        removal_disposition: None,
     })
 }
 
@@ -1394,8 +1400,8 @@ mod tests {
                     agent: kuberic_core::types::ReplicaAgentStatus {
                         protocol_version:
                             kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-                        add_build_peer_protocol_version:
-                            kuberic_core::add_replica::REPLICA_ADD_BUILD_PEER_PROTOCOL_VERSION,
+                        lifecycle_peer_protocol_version:
+                            kuberic_core::replica_lifecycle::REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
                         generation: kuberic_core::types::AgentGeneration::parse(
                             "0123456789abcdef0123456789abcdef",
                         )

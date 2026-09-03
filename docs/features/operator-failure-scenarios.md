@@ -201,12 +201,11 @@ Healthy phase — secondary health check:
     │
     └─ Missing/unreachable old UID:
          Validate non-primary target, minReplicas, and retained quorum
-         Durable target/previous catch-up configuration
-         Wait retained quorum + commit reduced current configuration
-         Persist reduced stable snapshot
-         Remove exact old primary connection
-         Best-effort target demote/close
-         Delete old pod with UID precondition
+         Persist one Force RemoveReplicaIntent to the current primary
+         Primary drives reduced CatchUp → tracked quorum → reduced Current
+         Persist commit evidence and workflow-scoped reduced snapshot
+         Primary removes exact old connection and best-effort Retire
+         Operator exact-UID labels/deletes old pod, then publishes topology
     │
     └─ Pod missing → scenario 3
 ```
@@ -239,16 +238,17 @@ Healthy phase — missing pod check:
       └─ Stable pod not found:
            ├─ Primary → FailingOver
            └─ Secondary → persist durable Force removal
-                target/previous configuration → retained quorum
-                → current configuration → reduced stable snapshot
-                → exact sender cleanup → UID-fenced pod cleanup
+                one primary-agent coarse intent
+                → reduced CatchUp → retained quorum → reduced Current
+                → exact sender cleanup → lifecycle-peer retirement
+                → UID-fenced pod cleanup → reduced stable snapshot
                 → later durable scale-up restores desired capacity
 ```
 
-The operator does not call a monolithic force-remove driver method. It
-persists the durable operation first, reconfigures the primary using retained
-replicas, and treats target lifecycle calls as conditional after membership
-commit.
+The operator does not call a force-remove driver method or sequence target
+runtime actions. It persists durable global authority first and sends one
+coarse intent to the exact current primary. Target lifecycle work is
+primary-agent-owned and conditional after membership commit.
 
 ---
 
@@ -518,8 +518,8 @@ Operator restart — first reconcile per KubericSet:
   └─ Resume normal reconciliation
 ```
 
-`GetStatus` requires replica-agent control protocol version 2, add/build peer
-protocol version 1, and reports a pod-local
+`GetStatus` requires replica-agent control protocol version 3,
+lifecycle-peer protocol version 2, and reports a pod-local
 `AgentGeneration`. It is distinct from the Pod UID and changes when the
 container/process restarts in place. Missing, malformed, or unsupported agent
 status fails closed. A new generation publishes no inherited correlated action
@@ -543,13 +543,14 @@ During `Creating`, `Switchover`, `AddingReplica`, `RemovingReplica`, and
 explicit no previous topology and an optional committed bootstrap snapshot;
 the other protocols record previous/target stable snapshots. Each operation
 stores exact target incarnations, current phase, and one write-ahead correlated
-action. Add/rebuild additionally stores one structured frozen intent with
-primary/target generations and endpoints, configuration descriptors, semantic
-build key, deadlines, and commit evidence. Each reconcile reconstructs fresh handles, observes
+action. Add/rebuild and removal additionally store structured frozen intents
+with primary/target generations and endpoints, exact configuration
+descriptors, deadlines, and commit evidence. Each reconcile reconstructs fresh handles, observes
 role/epoch/incarnation/progress/write/configuration/activity state, and either
 advances one checkpoint, dispatches one activity, waits, compensates, or
-poisons. The operator sends only AddReplicaIntent to the primary; peer/runtime
-phases are transient. Add/rebuild observes coarse phase and tracked copy,
+poisons. The operator sends only the appropriate `AddReplicaIntent` or
+`RemoveReplicaIntent` to the primary; peer/runtime phases are transient.
+Add/rebuild observes coarse phase and tracked copy,
 restores previous current configuration before pre-commit cleanup when needed,
 and requires connection absence before deleting the candidate. A target process
 restart under the same Pod UID changes generation and invalidates prior build
@@ -559,6 +560,39 @@ membership becomes `CommittedDegraded` without a serving label. Kubernetes
 additionally persists Phase-1 observations, unavailable-probe rotation,
 separate configuration/data-loss epoch intents, callback result, promotion
 commit, and final attestations.
+
+Removal freezes `ScaleDown` or `Force`, exact primary/target authority,
+previous/reduced descriptors, a 600-second overall deadline, 10-second call
+bounds, 30-second compensation grace, 60-second retirement budget, and at
+most three pre-commit attempts. The primary agent owns reduced
+CatchUp/quorum/reduced Current, exact connection cleanup, and
+`ReplicaLifecyclePeer` Retire. Exact reduced Current is irreversible.
+The 600-second deadline plus 30-second compensation cap is per attempt, so
+three attempts may consume up to 3 × 630 = 1,890 seconds before pre-commit
+termination. Post-commit connection cleanup is deliberately unbounded:
+temporary loss of exact primary status is not absence evidence, and retirement
+expiry cannot waive the connection barrier.
+
+Before commit, exact previous Current can finish compensation and exact
+reduced CatchUp can redrive on a new primary generation within the attempt
+limit. After current-install dispatch, an ambiguous observation cannot
+authorize rollback. After commit, `operation.committedSnapshot` is the scoped
+recovery authority while `stableSnapshot` stays previous until exact-UID
+labels/deletion and publication complete.
+
+A complete primary restart with no surviving configuration before durable
+commit evidence produces `AmbiguousPrimaryRestart`. Structurally impossible
+or post-current-dispatch ambiguous evidence produces `InvalidRemovalState`.
+Known pre-commit exhaustion produces `FailedPreCommitIncomplete`. All are
+durable `Poisoned` dispositions, but their evidence and recovery meaning are
+different. No disposition permits inferred commit, rollback, cleanup,
+failover handoff, or publication.
+
+Target peer replies are accepted only for the exact frozen generation,
+incarnation, parent, epoch, and reduced Current projection. A same-name Pod
+replacement is protected by exact-UID label and delete operations. If commit
+evidence already exists, loss of the coordinator or primary process cannot
+restore removed membership; cleanup rolls forward.
 
 Creation commits primary-only and expanded partial bootstrap snapshots before
 starting later members. Pods remain on a non-serving bootstrap label until the
@@ -626,7 +660,7 @@ After failover completes:
 | P2 | Primary self-fencing liveness probe | Medium | K8s addition (from CNPG isolation check) |
 | P2 | Node drain detection | Medium | K8s addition (from CNPG, analogous to SF PLB) |
 | P2 | Multi-primary detection | Small | K8s addition (epoch comparison) |
-| Done | Durable scale-down + force-remove secondary | Implemented | SF (`RemoveReplica`, `RemoveFromCurrentConfiguration`) |
+| Done | Agent-owned scale-down + force-remove secondary | Implemented | SF (`RemoveReplica`, `RemoveFromCurrentConfiguration`, target `DeleteReplica`) |
 | P3 | CrashLoop retry capping | Small | K8s addition |
 | P3 | Pod anti-affinity in CRD | Small | K8s addition (analogous to SF fault domains) |
 
@@ -664,7 +698,7 @@ After failover completes:
           └────────┘      │       └─────────────────────┘
                           │
                     scale-up: durable add
-                    scale-down: durable config-first remove
+                    scale-down: coarse agent-owned config-first remove
                     secondary health: durable rebuild or force-remove
                     node drain: switchover primary off draining node
 ```
