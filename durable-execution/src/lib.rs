@@ -40,7 +40,9 @@ pub use identity::{
 pub use in_memory::{InMemoryCheckpointStore, InMemoryFault};
 #[cfg(feature = "kubernetes")]
 pub use kubernetes::{
-    KubernetesCheckpointMetrics, KubernetesCheckpointMetricsSnapshot, KubernetesCheckpointStore,
+    DEFAULT_CONFIG_MAP_DATA_BUDGET_BYTES, KubernetesCheckpointMetrics,
+    KubernetesCheckpointMetricsSnapshot, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
+    KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, MAX_CONFIG_MAP_DATA_BUDGET_BYTES,
 };
 pub use replay::{Evaluation, Nondeterminism, evaluate};
 pub use store::{
