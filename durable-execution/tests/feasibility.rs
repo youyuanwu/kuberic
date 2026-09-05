@@ -498,6 +498,47 @@ fn checkpoint_rbac_examples_are_structural_and_lifecycle_specific() {
     );
 }
 
+#[test]
+fn checkpoint_provider_readiness_contract_is_user_visible() {
+    let readme = include_str!("../README.md");
+    let roadmap = include_str!("../../docs/features/kuberic/durable-execution-roadmap.md");
+    let workflow = include_str!("../../.github/workflows/checkpoint-kubernetes-real.yml");
+
+    for required in [
+        "independently retained checkpoints",
+        "786,432-byte ConfigMap data budget",
+        "1 through 983,040",
+        "metadata, managed fields",
+        "owner references, admission mutation, and API-server policy",
+        "checkpoint-writer-rbac.yaml",
+        "checkpoint-cleanup-rbac.yaml",
+        "runs do not select the ignored test",
+    ] {
+        assert!(
+            readme.contains(required),
+            "provider documentation must retain {required:?}"
+        );
+    }
+    for required in [
+        "retention contract",
+        "separately authorized",
+        "configurable 786,432-byte default",
+        "operator workflow pilot",
+        "switchover",
+        "workflow-ownership change",
+    ] {
+        assert!(
+            roadmap.contains(required),
+            "roadmap must retain {required:?}"
+        );
+    }
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("CARGO_BUILD_JOBS: 2"));
+    assert!(workflow.contains("--test kubernetes_checkpoint_real"));
+    assert!(workflow.contains("-- --ignored --nocapture"));
+    assert!(workflow.contains("if: ${{ always() }}"));
+}
+
 const fn status(passed: bool) -> &'static str {
     if passed { "pass" } else { "fail" }
 }
