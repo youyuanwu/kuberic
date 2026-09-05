@@ -80,6 +80,7 @@ impl fmt::Display for ExecutionId {
 
 /// Immutable caller authority for one durable execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionSpec {
     execution_id: ExecutionId,
     workflow_input: ExactBytes,

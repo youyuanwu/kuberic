@@ -11,7 +11,12 @@ use crate::{
 
 /// Exact terminal result of one workflow execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "status",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum TerminalOutcome {
     Succeeded(ExactBytes),
     Failed(ExactBytes),

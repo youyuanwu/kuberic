@@ -657,8 +657,17 @@ mod tests {
             TerminalOutcome::succeeded(ExactBytes::new(b"done")),
             4,
         );
-        let mut value = serde_json::to_value(payload).unwrap();
-        value["state"]["activities"] = serde_json::json!([]);
-        assert!(serde_json::from_value::<CheckpointPayload>(value).is_err());
+        for path in ["state", "outcome", "execution"] {
+            let mut value = serde_json::to_value(&payload).unwrap();
+            match path {
+                "state" => value["state"]["activities"] = serde_json::json!([]),
+                "outcome" => value["state"]["outcome"]["activities"] = serde_json::json!([]),
+                "execution" => {
+                    value["execution"]["spec"]["unexpected"] = serde_json::json!(true);
+                }
+                _ => unreachable!(),
+            }
+            assert!(serde_json::from_value::<CheckpointPayload>(value).is_err());
+        }
     }
 }

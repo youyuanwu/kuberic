@@ -3082,6 +3082,77 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     )
     .await;
 
+    let active_unknown_polls = Cell::new(0);
+    let active_unknown_caller = execution_spec(execution(165), bytes(b"active-unknown"));
+    let mut active_unknown_value = serde_json::to_value(CheckpointPayload::active(
+        ExecutionContract::new(
+            active_unknown_caller.clone(),
+            generous_limits().max_encoded_bytes() as u64,
+        ),
+        Vec::new(),
+    ))
+    .unwrap();
+    active_unknown_value["execution"]["spec"]["unexpected"] = serde_json::json!(true);
+    let active_unknown = turn_injected_checkpoint(
+        CheckpointEnvelope::new(
+            CHECKPOINT_FORMAT_VERSION,
+            ExactBytes::new(serde_json::to_vec(&active_unknown_value).unwrap()),
+        ),
+        active_unknown_caller.execution_id(),
+        active_unknown_caller,
+        165,
+        &active_unknown_polls,
+    )
+    .await;
+
+    let terminal_unknown_polls = Cell::new(0);
+    let terminal_unknown_caller = execution_spec(execution(166), bytes(b"terminal-unknown"));
+    let mut terminal_unknown_value = serde_json::to_value(CheckpointPayload::terminal(
+        ExecutionContract::new(
+            terminal_unknown_caller.clone(),
+            generous_limits().max_encoded_bytes() as u64,
+        ),
+        TerminalOutcome::succeeded(bytes(b"done")),
+        0,
+    ))
+    .unwrap();
+    terminal_unknown_value["execution"]["spec"]["unexpected"] = serde_json::json!(true);
+    let terminal_unknown = turn_injected_checkpoint(
+        CheckpointEnvelope::new(
+            CHECKPOINT_FORMAT_VERSION,
+            ExactBytes::new(serde_json::to_vec(&terminal_unknown_value).unwrap()),
+        ),
+        terminal_unknown_caller.execution_id(),
+        terminal_unknown_caller,
+        166,
+        &terminal_unknown_polls,
+    )
+    .await;
+
+    let nested_history_polls = Cell::new(0);
+    let nested_history_caller = execution_spec(execution(167), bytes(b"nested-history"));
+    let mut nested_history_value = serde_json::to_value(CheckpointPayload::terminal(
+        ExecutionContract::new(
+            nested_history_caller.clone(),
+            generous_limits().max_encoded_bytes() as u64,
+        ),
+        TerminalOutcome::succeeded(bytes(b"done")),
+        0,
+    ))
+    .unwrap();
+    nested_history_value["state"]["outcome"]["activities"] = serde_json::json!([]);
+    let nested_history = turn_injected_checkpoint(
+        CheckpointEnvelope::new(
+            CHECKPOINT_FORMAT_VERSION,
+            ExactBytes::new(serde_json::to_vec(&nested_history_value).unwrap()),
+        ),
+        nested_history_caller.execution_id(),
+        nested_history_caller,
+        167,
+        &nested_history_polls,
+    )
+    .await;
+
     ScenarioEvidence::new(
         id,
         "reject changed, missing, inconsistent, or downgraded execution contracts before polling",
@@ -3168,15 +3239,27 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                 ) && matches!(
                     terminal_missing,
                     HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
+                ) && matches!(
+                    active_unknown,
+                    HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
+                ) && matches!(
+                    terminal_unknown,
+                    HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
                 ) && missing_polls.get() == 0
-                    && terminal_missing_polls.get() == 0,
+                    && terminal_missing_polls.get() == 0
+                    && active_unknown_polls.get() == 0
+                    && terminal_unknown_polls.get() == 0,
             ),
             (
                 "terminal state rejects retained active-history fields before polling",
                 matches!(
                     mixed_terminal,
                     HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
-                ) && mixed_terminal_polls.get() == 0,
+                ) && matches!(
+                    nested_history,
+                    HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
+                ) && mixed_terminal_polls.get() == 0
+                    && nested_history_polls.get() == 0,
             ),
         ],
     )
