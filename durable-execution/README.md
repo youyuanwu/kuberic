@@ -142,17 +142,45 @@ observation's trust source or transport.
 Run the bounded feasibility evidence and the complete crate/workspace gates:
 
 ```console
-cargo test -p kuberic-durable-execution --test feasibility -- --nocapture
-cargo test -p kuberic-durable-execution --all-targets
-cargo test -p kuberic-durable-execution --doc
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --test feasibility -- --nocapture
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --all-targets
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --doc
 cargo fmt --all -- --check
-cargo check --workspace
-cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
+CARGO_BUILD_JOBS=2 cargo check --workspace
+CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
 ```
 
 The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
-three-way classifier.
+three-way classifier. The revised evidence contains 28 unique contiguous
+scenarios and 81 structured assertions; all pass. All five FR-012 authoring
+predicates and all four provider/bounding/documentation predicates also pass,
+so the mechanically derived result remains **feasible** within this kernel's
+stated boundary.
+
+## Deferred usability roadmap
+
+The current crate intentionally stops at the durable-execution kernel. The
+following capabilities are ordered follow-up possibilities, not commitments,
+and none is implemented here:
+
+1. Typed serde activity and workflow adapters, plus durable activity failure
+   results.
+2. An activity registry/dispatch adapter and a passive convergence resolver.
+3. Replay-aware tracing and checkpoint inspection.
+4. Durable timers and retry policy only when a concrete Kuberic workflow
+   demonstrates the need.
+5. Instance lifecycle and query APIs, external events, parallel/join/select,
+   child workflows, and worker/queue/lease facilities only on demonstrated
+   need.
+6. A Kubernetes checkpoint provider and one operator-workflow pilot only
+   after the kernel/provider contract is proven.
+
+This ordering is informed by the broader orchestration and provider surfaces
+documented by
+[Azure Durable Task Framework](https://github.com/Azure/durabletask) and
+[microsoft/duroxide](https://github.com/microsoft/duroxide). It does not claim
+API compatibility with either project.
 
 ## Limitations and exclusions
 
@@ -169,9 +197,12 @@ outcomes indistinguishable to the host. The lost-effect-reply fixture still
 invokes one synthetic effect under an opaque permit and discards its returned
 result before restart.
 
-Timers, parallel activities, retries or backoff policy, cancellation, child
-workflows, external events, compensation, migrations, upgrade guarantees,
-rollout, or diagnostics are excluded. The experiment changes no Kuberic CRD,
-operator reconciliation, durable topology workflow, status persistence,
-ReplicaAgent, gRPC protocol, or deployment manifest. Its classification is
-not a production-readiness, current-operator-parity, or adoption claim.
+Typed adapters, durable activity failures, dispatch registries, passive
+convergence, tracing/inspection, timers, retries, parallelism, lifecycle,
+queries, external events, child workflows, workers, queues, leases, and
+Kubernetes/operator integration are excluded. So are compensation, migrations,
+upgrade guarantees, rollout, and diagnostics. The experiment changes no
+Kuberic CRD, operator reconciliation, durable topology workflow, status
+persistence, ReplicaAgent, gRPC protocol, or deployment manifest. Its
+classification is not a production-readiness, current-operator-parity, or
+adoption claim.

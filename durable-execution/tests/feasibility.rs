@@ -9,7 +9,7 @@ use kuberic_durable_execution::{
     FeasibilityClassification, FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome,
     InMemoryCheckpointStore, Workflow, WorkflowContext, classify_feasibility,
 };
-use support::scenarios::{ScenarioId, run_conformance_matrix};
+use support::scenarios::{ScenarioEvidence, ScenarioId, run_conformance_matrix};
 
 const EXPECTED_FR_013_SCENARIOS: usize = 28;
 
@@ -128,6 +128,59 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         },
     ];
 
+    let scenario_passed = |id| {
+        scenarios
+            .iter()
+            .find(|scenario| scenario.id == id)
+            .is_some_and(|scenario| scenario.passed())
+    };
+    let provider_contract_pass = [
+        ScenarioId::LoadAbsenceAndProviderFailures,
+        ScenarioId::OpaqueStorageRevisions,
+        ScenarioId::OutcomeUnknownApplyStateHidden,
+    ]
+    .into_iter()
+    .all(scenario_passed);
+    let bounded_checkpoint_pass = [
+        ScenarioId::ChangedResultBound,
+        ScenarioId::ActivityCountAndGrowingHistory,
+        ScenarioId::EncodedByteReservation,
+        ScenarioId::OversizedObservation,
+        ScenarioId::Base64ExactBytes,
+    ]
+    .into_iter()
+    .all(scenario_passed);
+    let store_source = include_str!("../src/store.rs");
+    let host_source = include_str!("../src/host.rs");
+    let crate_manifest = include_str!("../Cargo.toml");
+    let async_runtime_neutral_pass = store_source.contains("async fn load")
+        && store_source.contains("async fn compare_and_swap")
+        && host_source.contains("pub async fn turn")
+        && host_source.contains("pub async fn observe")
+        && !crate_manifest.contains("tokio");
+    let readme = include_str!("../README.md");
+    let kernel_scope_documented = readme.contains("not an end-user runtime")
+        && readme.contains("Deferred usability roadmap")
+        && readme.contains("Kubernetes checkpoint provider");
+    let revision_contract = [
+        PredicateEvidence {
+            name: "async provider and host contract is runtime neutral",
+            passed: async_runtime_neutral_pass,
+        },
+        PredicateEvidence {
+            name: "provider failure and uncertainty scenarios pass",
+            passed: provider_contract_pass,
+        },
+        PredicateEvidence {
+            name: "bounded checkpoint and base64 scenarios pass",
+            passed: bounded_checkpoint_pass,
+        },
+        PredicateEvidence {
+            name: "kernel scope and deferred roadmap are documented",
+            passed: kernel_scope_documented,
+        },
+    ];
+
     let assertion_count = scenarios
         .iter()
         .map(|scenario| scenario.assertions.len())
@@ -165,6 +218,13 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
             predicate.name
         );
     }
+    for predicate in revision_contract {
+        println!(
+            "REVISION status={} predicate={:?}",
+            status(predicate.passed),
+            predicate.name
+        );
+    }
     for scenario in &scenarios {
         println!(
             "SCENARIO id={} status={} assertions={} setup={:?}",
@@ -175,23 +235,32 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         );
         for (index, assertion) in scenario.assertions.iter().enumerate() {
             println!(
-                "ASSERTION scenario={} index={} status={} text={:?}",
+                "ASSERTION scenario={} index={} class={} status={} text={:?}",
                 scenario.id.stable_id(),
                 index + 1,
+                if assertion.safety_or_determinism {
+                    "safety-or-determinism"
+                } else {
+                    "conformance"
+                },
                 status(assertion.passed),
                 assertion.assertion
             );
         }
     }
 
-    let safety_and_determinism_pass = scenarios.iter().all(|scenario| scenario.passed());
+    let safety_and_determinism_pass = scenarios
+        .iter()
+        .flat_map(|scenario| &scenario.assertions)
+        .filter(|assertion| assertion.safety_or_determinism)
+        .all(|assertion| assertion.passed);
     let all_conformance_pass = passed_scenarios == EXPECTED_FR_013_SCENARIOS
         && passed_assertions == assertion_count
         && scenarios
             .iter()
             .all(|scenario| !scenario.assertions.is_empty());
     let authoring_simplicity_pass = fr_012.iter().all(|predicate| predicate.passed);
-    let has_in_scope_limitation = false;
+    let has_in_scope_limitation = revision_contract.iter().any(|predicate| !predicate.passed);
     let classification = classify_feasibility(FeasibilityInputs {
         safety_and_determinism_pass,
         all_conformance_pass,
@@ -235,6 +304,38 @@ fn fr_014_classifier_matches_all_truth_table_cases() {
             }
         }
     }
+}
+
+#[test]
+fn non_safety_conformance_failure_is_conditionally_feasible() {
+    let mut scenarios = block_on(run_conformance_matrix());
+    let size_evidence = scenarios
+        .iter_mut()
+        .find(|scenario| scenario.id == ScenarioId::Base64ExactBytes)
+        .unwrap()
+        .assertions
+        .iter_mut()
+        .find(|assertion| !assertion.safety_or_determinism)
+        .unwrap();
+    size_evidence.passed = false;
+
+    let safety_and_determinism_pass = scenarios
+        .iter()
+        .flat_map(|scenario| &scenario.assertions)
+        .filter(|assertion| assertion.safety_or_determinism)
+        .all(|assertion| assertion.passed);
+    let all_conformance_pass = scenarios.iter().all(ScenarioEvidence::passed);
+    assert!(safety_and_determinism_pass);
+    assert!(!all_conformance_pass);
+    assert_eq!(
+        classify_feasibility(FeasibilityInputs {
+            safety_and_determinism_pass,
+            all_conformance_pass,
+            authoring_simplicity_pass: true,
+            has_in_scope_limitation: false,
+        }),
+        FeasibilityClassification::ConditionallyFeasible
+    );
 }
 
 const fn status(passed: bool) -> &'static str {

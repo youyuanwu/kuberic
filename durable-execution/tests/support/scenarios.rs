@@ -111,6 +111,7 @@ impl ScenarioId {
 pub struct AssertionEvidence {
     pub assertion: &'static str,
     pub passed: bool,
+    pub safety_or_determinism: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -135,9 +136,23 @@ impl ScenarioEvidence {
             setup,
             assertions: assertions
                 .into_iter()
-                .map(|(assertion, passed)| AssertionEvidence { assertion, passed })
+                .map(|(assertion, passed)| AssertionEvidence {
+                    assertion,
+                    passed,
+                    safety_or_determinism: true,
+                })
                 .collect(),
         }
+    }
+
+    fn mark_conformance_only(mut self, assertion: &'static str) -> Self {
+        let evidence = self
+            .assertions
+            .iter_mut()
+            .find(|evidence| evidence.assertion == assertion)
+            .expect("conformance-only assertion must exist in the scenario");
+        evidence.safety_or_determinism = false;
+        self
     }
 }
 
@@ -1975,6 +1990,7 @@ async fn base64_exact_bytes(id: ScenarioId) -> ScenarioEvidence {
             ),
         ],
     )
+    .mark_conformance_only("representative base64 JSON is less than half the integer-array JSON")
 }
 
 use std::{
