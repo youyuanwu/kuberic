@@ -158,29 +158,13 @@ predicates and all four provider/bounding/documentation predicates also pass,
 so the mechanically derived result remains **feasible** within this kernel's
 stated boundary.
 
-## Deferred usability roadmap
+## Deferred work
 
-The current crate intentionally stops at the durable-execution kernel. The
-following capabilities are ordered follow-up possibilities, not commitments,
-and none is implemented here:
-
-1. Typed serde activity and workflow adapters, plus durable activity failure
-   results.
-2. An activity registry/dispatch adapter and a passive convergence resolver.
-3. Replay-aware tracing and checkpoint inspection.
-4. Durable timers and retry policy only when a concrete Kuberic workflow
-   demonstrates the need.
-5. Instance lifecycle and query APIs, external events, parallel/join/select,
-   child workflows, and worker/queue/lease facilities only on demonstrated
-   need.
-6. A Kubernetes checkpoint provider and one operator-workflow pilot only
-   after the kernel/provider contract is proven.
-
-This ordering is informed by the broader orchestration and provider surfaces
-documented by
-[Azure Durable Task Framework](https://github.com/Azure/durabletask) and
-[microsoft/duroxide](https://github.com/microsoft/duroxide). It does not claim
-API compatibility with either project.
+The crate intentionally stops at the durable-execution kernel. History
+lifecycle work and the ordered usability roadmap are tracked in
+[Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
+The next history-lifecycle design is completion-only compaction; generic
+mid-operation compaction remains excluded.
 
 ## Limitations and exclusions
 
