@@ -1,0 +1,549 @@
+use std::cell::Cell;
+
+use async_trait::async_trait;
+use kuberic_durable_execution::{
+    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, AttemptId,
+    CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload, Evaluation,
+    ExactBytes, ExecutionId, HostEpoch, IdentityError, LogicalActivityId, Nondeterminism, Workflow,
+    WorkflowContext, evaluate,
+};
+
+const MAX_RESULT_BYTES: u64 = 1024;
+
+fn execution(byte: u8) -> ExecutionId {
+    ExecutionId::from_bytes([byte; 16])
+}
+
+fn name(value: &str, version: u32) -> ActivityName {
+    ActivityName::new(value, version).unwrap()
+}
+
+fn bytes(value: &[u8]) -> ExactBytes {
+    ExactBytes::new(value)
+}
+
+fn spec(value: &str, version: u32, input: &[u8]) -> ActivitySpec {
+    ActivitySpec::new(name(value, version), bytes(input), MAX_RESULT_BYTES)
+}
+
+fn limits() -> CheckpointLimits {
+    CheckpointLimits::new(128, 1_000_000).unwrap()
+}
+
+#[derive(Clone)]
+struct LinearWorkflow {
+    activities: Vec<ActivitySpec>,
+}
+
+#[async_trait(?Send)]
+impl Workflow for LinearWorkflow {
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> ExactBytes {
+        let mut results = Vec::new();
+        for spec in &self.activities {
+            results.extend(context.activity(spec.clone()).await.as_slice());
+        }
+        ExactBytes::new(results)
+    }
+}
+
+fn envelope(
+    execution_id: ExecutionId,
+    workflow_input: ExactBytes,
+    activities: Vec<ActivityRecord>,
+) -> CheckpointEnvelope {
+    CheckpointEnvelope::encode(&CheckpointPayload::new(
+        execution_id,
+        workflow_input,
+        activities,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn first_turn_schedules_exactly_one_activity() {
+    let workflow = LinearWorkflow {
+        activities: vec![spec("greeting", 1, b"A")],
+    };
+
+    let Evaluation::Scheduled {
+        activity,
+        checkpoint,
+    } = evaluate(&workflow, execution(1), bytes(b"workflow"), None, limits())
+    else {
+        panic!("first turn did not schedule");
+    };
+
+    assert_eq!(activity.execution_id(), execution(1));
+    assert_eq!(activity.sequence(), ActivitySequence::new(0));
+    assert_eq!(activity.name(), &name("greeting", 1));
+    assert_eq!(activity.input(), &bytes(b"A"));
+    assert_eq!(activity.max_result_bytes(), MAX_RESULT_BYTES);
+    let payload = checkpoint
+        .decode_and_validate(execution(1), &bytes(b"workflow"), limits())
+        .unwrap();
+    assert_eq!(payload.activities().len(), 1);
+    assert_eq!(payload.activities()[0].state(), &ActivityState::Scheduled);
+}
+
+#[test]
+fn completed_result_replays_without_rescheduling() {
+    let workflow = LinearWorkflow {
+        activities: vec![spec("greeting", 1, b"A")],
+    };
+    let checkpoint = envelope(
+        execution(2),
+        bytes(b"workflow"),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            spec("greeting", 1, b"A"),
+            bytes(b"recorded-result"),
+        )],
+    );
+
+    let first = evaluate(
+        &workflow,
+        execution(2),
+        bytes(b"workflow"),
+        Some(&checkpoint),
+        limits(),
+    );
+    let second = evaluate(
+        &workflow,
+        execution(2),
+        bytes(b"workflow"),
+        Some(&checkpoint),
+        limits(),
+    );
+
+    assert_eq!(first, second);
+    let Evaluation::Complete {
+        result,
+        checkpoint: replayed,
+    } = first
+    else {
+        panic!("completed history did not complete");
+    };
+    assert_eq!(result, bytes(b"recorded-result"));
+    assert_eq!(
+        replayed
+            .decode_and_validate(execution(2), &bytes(b"workflow"), limits())
+            .unwrap(),
+        checkpoint
+            .decode_and_validate(execution(2), &bytes(b"workflow"), limits())
+            .unwrap()
+    );
+}
+
+#[test]
+fn completed_prefix_can_schedule_one_next_activity() {
+    let workflow = LinearWorkflow {
+        activities: vec![spec("first", 1, b"A"), spec("second", 2, b"B")],
+    };
+    let checkpoint = envelope(
+        execution(3),
+        bytes(b"workflow"),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            spec("first", 1, b"A"),
+            bytes(b"done"),
+        )],
+    );
+
+    let Evaluation::Scheduled {
+        activity,
+        checkpoint,
+    } = evaluate(
+        &workflow,
+        execution(3),
+        bytes(b"workflow"),
+        Some(&checkpoint),
+        limits(),
+    )
+    else {
+        panic!("next activity was not scheduled");
+    };
+
+    assert_eq!(activity.sequence(), ActivitySequence::new(1));
+    let decoded = checkpoint
+        .decode_and_validate(execution(3), &bytes(b"workflow"), limits())
+        .unwrap();
+    assert_eq!(decoded.activities().len(), 2);
+    assert_eq!(decoded.activities()[1].state(), &ActivityState::Scheduled);
+}
+
+#[test]
+fn changed_order_name_or_exact_input_is_nondeterminism() {
+    let cases = [
+        spec("second", 1, b"A"),
+        spec("first", 2, b"A"),
+        spec("first", 1, b"a"),
+        ActivitySpec::new(name("first", 1), bytes(b"A"), MAX_RESULT_BYTES + 1),
+    ];
+    let checkpoint = envelope(
+        execution(4),
+        bytes(b"workflow"),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            spec("first", 1, b"A"),
+            bytes(b"done"),
+        )],
+    );
+
+    for requested in cases {
+        let workflow = LinearWorkflow {
+            activities: vec![requested],
+        };
+        assert!(matches!(
+            evaluate(
+                &workflow,
+                execution(4),
+                bytes(b"workflow"),
+                Some(&checkpoint),
+                limits()
+            ),
+            Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn unused_otherwise_valid_history_is_nondeterminism() {
+    let workflow = LinearWorkflow { activities: vec![] };
+    let checkpoint = envelope(
+        execution(5),
+        bytes(b"workflow"),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            spec("old", 1, b"A"),
+            bytes(b"done"),
+        )],
+    );
+
+    assert_eq!(
+        evaluate(
+            &workflow,
+            execution(5),
+            bytes(b"workflow"),
+            Some(&checkpoint),
+            limits()
+        ),
+        Evaluation::Nondeterminism(Nondeterminism::UnusedHistory {
+            consumed: 0,
+            remaining: 1,
+        })
+    );
+}
+
+#[test]
+fn logical_identity_equality_and_rendering_cover_the_full_semantic_tuple() {
+    let base = LogicalActivityId::new(
+        execution(6),
+        ActivitySequence::new(7),
+        spec("write", 3, &[0, 1, 255]),
+    );
+    let same = LogicalActivityId::new(
+        execution(6),
+        ActivitySequence::new(7),
+        spec("write", 3, &[0, 1, 255]),
+    );
+    assert_eq!(base, same);
+    assert_eq!(base.to_external_id(), same.to_external_id());
+
+    let variants = [
+        LogicalActivityId::new(
+            execution(7),
+            ActivitySequence::new(7),
+            spec("write", 3, &[0, 1, 255]),
+        ),
+        LogicalActivityId::new(
+            execution(6),
+            ActivitySequence::new(8),
+            spec("write", 3, &[0, 1, 255]),
+        ),
+        LogicalActivityId::new(
+            execution(6),
+            ActivitySequence::new(7),
+            spec("write-other", 3, &[0, 1, 255]),
+        ),
+        LogicalActivityId::new(
+            execution(6),
+            ActivitySequence::new(7),
+            spec("write", 4, &[0, 1, 255]),
+        ),
+        LogicalActivityId::new(
+            execution(6),
+            ActivitySequence::new(7),
+            spec("write", 3, &[0, 1, 254]),
+        ),
+        LogicalActivityId::new(
+            execution(6),
+            ActivitySequence::new(7),
+            ActivitySpec::new(name("write", 3), bytes(&[0, 1, 255]), MAX_RESULT_BYTES + 1),
+        ),
+    ];
+    for variant in variants {
+        assert_ne!(base, variant);
+        assert_ne!(base.to_external_id(), variant.to_external_id());
+    }
+    assert!(base.to_external_id().ends_with(":3:0001ff:1024"));
+}
+
+#[test]
+fn changed_name_and_input_cannot_alias_a_logical_external_id() {
+    let original = LogicalActivityId::new(
+        execution(8),
+        ActivitySequence::new(0),
+        spec("effect", 1, b"input"),
+    );
+    let renamed = LogicalActivityId::new(
+        execution(8),
+        ActivitySequence::new(0),
+        spec("effect", 2, b"input"),
+    );
+    let changed_input = LogicalActivityId::new(
+        execution(8),
+        ActivitySequence::new(0),
+        spec("effect", 1, b"Input"),
+    );
+
+    assert_ne!(original.to_external_id(), renamed.to_external_id());
+    assert_ne!(original.to_external_id(), changed_input.to_external_id());
+}
+
+#[test]
+fn name_and_attempt_identifiers_reject_unversioned_or_reserved_values() {
+    assert_eq!(
+        ActivityName::new("", 1),
+        Err(IdentityError::EmptyActivityName)
+    );
+    assert_eq!(
+        ActivityName::new("effect", 0),
+        Err(IdentityError::ZeroActivityVersion)
+    );
+    assert_eq!(
+        AttemptId::new(HostEpoch::from_bytes([1; 16]), 0),
+        Err(IdentityError::ZeroAttemptCounter)
+    );
+}
+
+#[test]
+fn rejects_invalid_sequence_and_pending_shapes() {
+    let workflow = LinearWorkflow {
+        activities: vec![spec("first", 1, b"A")],
+    };
+    let invalid_sequence = envelope(
+        execution(9),
+        bytes(b"workflow"),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(1),
+            spec("first", 1, b"A"),
+            bytes(b"done"),
+        )],
+    );
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution(9),
+            bytes(b"workflow"),
+            Some(&invalid_sequence),
+            limits()
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::NonContiguousSequence { .. })
+    ));
+
+    let invalid_pending = envelope(
+        execution(9),
+        bytes(b"workflow"),
+        vec![
+            ActivityRecord::scheduled(ActivitySequence::new(0), spec("first", 1, b"A")),
+            ActivityRecord::completed(
+                ActivitySequence::new(1),
+                spec("second", 1, b"B"),
+                bytes(b"done"),
+            ),
+        ],
+    );
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution(9),
+            bytes(b"workflow"),
+            Some(&invalid_pending),
+            limits()
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::PendingActivityNotFinal { .. })
+    ));
+}
+
+struct PollCountingWorkflow {
+    polls: Cell<u32>,
+}
+
+#[async_trait(?Send)]
+impl Workflow for PollCountingWorkflow {
+    async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> ExactBytes {
+        self.polls.set(self.polls.get() + 1);
+        bytes(b"complete")
+    }
+}
+
+#[test]
+fn identity_input_and_format_validation_happen_before_workflow_polling() {
+    let workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    let valid_payload = CheckpointPayload::new(execution(10), bytes(b"expected"), vec![]);
+    let unsupported = CheckpointEnvelope::new(
+        1,
+        CheckpointEnvelope::encode(&valid_payload)
+            .unwrap()
+            .payload()
+            .clone(),
+    );
+
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution(10),
+            bytes(b"expected"),
+            Some(&unsupported),
+            limits()
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::UnsupportedFormat { .. })
+    ));
+    assert_eq!(workflow.polls.get(), 0);
+
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution(10),
+            bytes(b"expected"),
+            Some(&unsupported),
+            CheckpointLimits::new(1, 1).unwrap()
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::UnsupportedFormat { .. })
+    ));
+    assert_eq!(workflow.polls.get(), 0);
+
+    let wrong_execution = envelope(execution(11), bytes(b"expected"), vec![]);
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution(10),
+            bytes(b"expected"),
+            Some(&wrong_execution),
+            limits()
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::ExecutionMismatch { .. })
+    ));
+    assert_eq!(workflow.polls.get(), 0);
+
+    let wrong_input = envelope(execution(10), bytes(b"different"), vec![]);
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution(10),
+            bytes(b"expected"),
+            Some(&wrong_input),
+            limits()
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::WorkflowInputMismatch { .. })
+    ));
+    assert_eq!(workflow.polls.get(), 0);
+}
+
+#[test]
+fn configured_limits_reject_loaded_checkpoints_before_workflow_polling() {
+    let workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    let execution_id = execution(12);
+    let input = bytes(b"workflow");
+    let oversized_history = envelope(
+        execution_id,
+        input.clone(),
+        vec![
+            ActivityRecord::completed(
+                ActivitySequence::new(0),
+                spec("first", 1, b"A"),
+                bytes(b"one"),
+            ),
+            ActivityRecord::completed(
+                ActivitySequence::new(1),
+                spec("second", 1, b"B"),
+                bytes(b"two"),
+            ),
+        ],
+    );
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution_id,
+            input.clone(),
+            Some(&oversized_history),
+            CheckpointLimits::new(1, 1_000_000).unwrap(),
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::ActivityRecordLimitExceeded {
+            actual: 2,
+            maximum: 1
+        })
+    ));
+    assert_eq!(workflow.polls.get(), 0);
+
+    let empty = envelope(execution_id, input.clone(), Vec::new());
+    let exact_encoded = empty.encoded_len().unwrap();
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution_id,
+            input.clone(),
+            Some(&empty),
+            CheckpointLimits::new(1, exact_encoded - 1).unwrap(),
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::EncodedCheckpointLimitExceeded {
+            actual,
+            maximum
+        }) if actual == exact_encoded && maximum + 1 == exact_encoded
+    ));
+    assert_eq!(workflow.polls.get(), 0);
+
+    assert!(matches!(
+        evaluate(
+            &workflow,
+            execution_id,
+            input,
+            Some(&empty),
+            CheckpointLimits::new(1, exact_encoded).unwrap(),
+        ),
+        Evaluation::Complete { .. }
+    ));
+    assert_eq!(workflow.polls.get(), 1);
+}
+
+#[test]
+fn loaded_completed_result_must_respect_its_declared_bound() {
+    let workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    let execution_id = execution(13);
+    let input = bytes(b"workflow");
+    let checkpoint = envelope(
+        execution_id,
+        input.clone(),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            ActivitySpec::new(name("bounded", 1), bytes(b"input"), 2),
+            bytes(b"three"),
+        )],
+    );
+
+    assert!(matches!(
+        evaluate(&workflow, execution_id, input, Some(&checkpoint), limits(),),
+        Evaluation::CheckpointRejected(CheckpointError::CompletedResultExceedsDeclared {
+            actual: 5,
+            maximum: 2,
+            ..
+        })
+    ));
+    assert_eq!(workflow.polls.get(), 0);
+}

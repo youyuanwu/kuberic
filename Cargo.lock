@@ -1364,6 +1364,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuberic-durable-execution"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kuberic-operator"
 version = "0.0.1"
 dependencies = [

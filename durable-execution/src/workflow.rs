@@ -1,0 +1,100 @@
+use std::task::Poll;
+
+use async_trait::async_trait;
+use futures::future::poll_fn;
+
+use crate::{
+    ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, ExactBytes, ExecutionId,
+    LogicalActivityId, Nondeterminism,
+};
+
+/// Provisional ordinary-async workflow authoring surface.
+#[async_trait(?Send)]
+pub trait Workflow {
+    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes;
+}
+
+/// Linear replay context. `activity` is its only workflow-body operation.
+pub struct WorkflowContext<'history> {
+    execution_id: ExecutionId,
+    history: &'history [ActivityRecord],
+    cursor: usize,
+    pub(crate) decision: Option<ContextDecision>,
+}
+
+impl<'history> WorkflowContext<'history> {
+    pub(crate) fn new(execution_id: ExecutionId, history: &'history [ActivityRecord]) -> Self {
+        Self {
+            execution_id,
+            history,
+            cursor: 0,
+            decision: None,
+        }
+    }
+
+    pub async fn activity(&mut self, spec: ActivitySpec) -> ExactBytes {
+        poll_fn(|_| self.poll_activity(&spec)).await
+    }
+
+    pub(crate) const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    fn poll_activity(&mut self, spec: &ActivitySpec) -> Poll<ExactBytes> {
+        if self.decision.is_some() {
+            return Poll::Pending;
+        }
+
+        let sequence = ActivitySequence::new(
+            u64::try_from(self.cursor).expect("validated history length fits in u64"),
+        );
+        let requested_id = LogicalActivityId::new(self.execution_id, sequence, spec.clone());
+
+        let Some(record) = self.history.get(self.cursor) else {
+            self.decision = Some(ContextDecision::Schedule {
+                sequence,
+                spec: spec.clone(),
+                logical_id: requested_id,
+            });
+            return Poll::Pending;
+        };
+
+        if record.spec() != spec {
+            self.decision = Some(ContextDecision::Nondeterminism(
+                Nondeterminism::ActivityMismatch {
+                    sequence,
+                    recorded: record.spec().clone(),
+                    requested: spec.clone(),
+                },
+            ));
+            return Poll::Pending;
+        }
+
+        match record.state() {
+            ActivityState::Completed { result } => {
+                self.cursor += 1;
+                Poll::Ready(result.clone())
+            }
+            state @ (ActivityState::Scheduled | ActivityState::DispatchExposed { .. }) => {
+                self.decision = Some(ContextDecision::ExistingPending {
+                    logical_id: requested_id,
+                    state: state.clone(),
+                });
+                Poll::Pending
+            }
+        }
+    }
+}
+
+pub(crate) enum ContextDecision {
+    Schedule {
+        sequence: ActivitySequence,
+        spec: ActivitySpec,
+        logical_id: LogicalActivityId,
+    },
+    ExistingPending {
+        logical_id: LogicalActivityId,
+        state: ActivityState,
+    },
+    Nondeterminism(Nondeterminism),
+}
