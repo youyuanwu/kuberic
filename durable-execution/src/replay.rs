@@ -44,6 +44,8 @@ pub enum Nondeterminism {
         "workflow completed after consuming {consumed} activities with {remaining} history records unused"
     )]
     UnusedHistory { consumed: u64, remaining: u64 },
+    #[error("workflow suspended without requesting its next durable activity")]
+    UnsupportedSuspension,
 }
 
 /// Validate a checkpoint, then poll the workflow exactly once with a no-op waker.
