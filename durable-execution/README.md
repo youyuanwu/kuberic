@@ -128,7 +128,8 @@ the mutation.
 Awaiting `DurableHost::turn` evaluates and commits no more than one persistence
 boundary:
 
-1. The first turn accepts a `Scheduled` checkpoint and returns no permit.
+1. For an activity-bearing workflow, the first turn accepts a `Scheduled`
+   checkpoint and returns no permit.
 2. A later turn prepares an attempt, accepts a separate `DispatchExposed`
    checkpoint revision, and only then returns an opaque `DispatchPermit`.
 3. After observations make active replay complete, the host CAS-replaces the
@@ -136,6 +137,10 @@ boundary:
 4. `WorkflowCompleted` is returned only after that CAS is accepted or a later
    load observes terminal state. It carries the exact success/failure outcome
    and accepted/observed opaque revision.
+
+A zero-activity workflow skips schedule, exposure, and observation. Its first
+turn validates terminal capacity and CAS-creates terminal state directly from
+absence before returning `WorkflowCompleted`.
 
 Construction requires the checkpoint store, caller-supplied host epoch, and
 validated `CheckpointLimits`; callers supply the executor used to await turns
