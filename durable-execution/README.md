@@ -151,7 +151,10 @@ assertion. A namespaced owner must name the checkpoint namespace. Required
 identity fields and the immutable UID must be nonempty, and controlling or
 deletion-blocking references are rejected before any request. The provider
 does not fetch the owner, so the caller remains responsible for the accuracy
-of its scope, GVK, name, and UID.
+of its scope, GVK, name, and UID. Before a replacement, the provider reads the
+current object and rejects a stale revision or owner relationship that differs
+from the store configuration, so reconstruction cannot silently change a
+checkpoint between independent and owner-based retention.
 
 Each execution maps to
 `kuberic-checkpoint-<32-lowercase-execution-id-hex>` in that namespace. The

@@ -22,10 +22,7 @@ use k8s_openapi::{
     api::core::v1::ConfigMap,
     apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference},
 };
-use kube::{
-    Api, Client, Error,
-    api::{PostParams, ResourceExt},
-};
+use kube::{Api, Client, Error, api::PostParams};
 
 use crate::{
     CasOutcome, CheckpointEnvelope, CheckpointStore, ExecutionId, StorageRevision, StoreError,
@@ -327,9 +324,38 @@ impl CheckpointStore for KubernetesCheckpointStore {
             ));
         }
 
+        let name = Self::object_name(execution_id);
+        if let Some(expected_revision) = expected.as_ref() {
+            let existing = self
+                .api
+                .get_opt(&name)
+                .await
+                .map_err(|error| load_error("compare-and-swap ownership preflight", error))?;
+            let Some(existing) = existing else {
+                return Ok(CasOutcome::Conflict);
+            };
+            let Some(existing_revision) = response_revision(&existing) else {
+                return Err(StoreError::new(
+                    StoreErrorKind::MalformedResponse,
+                    "compare-and-swap ownership preflight returned a ConfigMap without a usable resourceVersion",
+                ));
+            };
+            if &existing_revision != expected_revision {
+                return Ok(CasOutcome::Conflict);
+            }
+            if !owner_relationship_matches(
+                self.owner_reference.as_ref(),
+                existing.metadata.owner_references.as_deref(),
+            ) {
+                return Err(StoreError::new(
+                    StoreErrorKind::Other,
+                    "compare-and-swap refused to change the checkpoint owner relationship",
+                ));
+            }
+        }
+
         let checkpoint_bytes = checkpoint_json.len();
         let object = self.object(execution_id, expected.as_ref(), checkpoint_json);
-        let name = object.name_any();
         let result = if expected.is_some() {
             self.api
                 .replace(&name, &PostParams::default(), &object)
@@ -348,6 +374,25 @@ impl CheckpointStore for KubernetesCheckpointStore {
             }
             Err(error) => classify_mutation_error(expected.is_some(), error),
         }
+    }
+}
+
+fn owner_relationship_matches(
+    configured: Option<&OwnerReference>,
+    persisted: Option<&[OwnerReference]>,
+) -> bool {
+    match (configured, persisted.unwrap_or_default()) {
+        (None, []) => true,
+        (Some(configured), [persisted]) => {
+            configured.api_version == persisted.api_version
+                && configured.kind == persisted.kind
+                && configured.name == persisted.name
+                && configured.uid == persisted.uid
+                && configured.controller.unwrap_or(false) == persisted.controller.unwrap_or(false)
+                && configured.block_owner_deletion.unwrap_or(false)
+                    == persisted.block_owner_deletion.unwrap_or(false)
+        }
+        _ => false,
     }
 }
 

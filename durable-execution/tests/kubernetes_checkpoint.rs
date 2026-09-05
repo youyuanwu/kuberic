@@ -127,12 +127,24 @@ fn config_map_response(
     revision: Option<&str>,
     checkpoint: Option<&CheckpointEnvelope>,
 ) -> Value {
+    config_map_response_with_owner(execution_id, revision, checkpoint, None)
+}
+
+fn config_map_response_with_owner(
+    execution_id: ExecutionId,
+    revision: Option<&str>,
+    checkpoint: Option<&CheckpointEnvelope>,
+    owner: Option<&OwnerReference>,
+) -> Value {
     let mut metadata = json!({
         "name": KubernetesCheckpointStore::object_name(execution_id),
         "namespace": "checkpoint-tests"
     });
     if let Some(revision) = revision {
         metadata["resourceVersion"] = json!(revision);
+    }
+    if let Some(owner) = owner {
+        metadata["ownerReferences"] = json!([owner]);
     }
     let mut object = json!({
         "apiVersion": "v1",
@@ -203,6 +215,10 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
         ),
         Step::Response(
             StatusCode::OK,
+            config_map_response(execution_id, Some("opaque-alpha"), Some(&first)),
+        ),
+        Step::Response(
+            StatusCode::OK,
             config_map_response(execution_id, Some("rv/not-a-number"), Some(&second)),
         ),
     ]);
@@ -231,9 +247,10 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
     );
 
     let requests = harness.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].method, Method::POST);
-    assert_eq!(requests[1].method, Method::PUT);
+    assert_eq!(requests[1].method, Method::GET);
+    assert_eq!(requests[2].method, Method::PUT);
     assert!(
         requests[0]
             .uri
@@ -242,7 +259,7 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
     assert!(requests[0].body["metadata"]["resourceVersion"].is_null());
     assert!(requests[0].body["metadata"]["ownerReferences"].is_null());
     assert_eq!(
-        requests[1].body["metadata"]["resourceVersion"],
+        requests[2].body["metadata"]["resourceVersion"],
         "opaque-alpha"
     );
     assert_eq!(
@@ -250,7 +267,7 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
         serde_json::to_string(&first).expect("checkpoint JSON")
     );
     assert_eq!(
-        requests[1].body["data"]["checkpoint.json"],
+        requests[2].body["data"]["checkpoint.json"],
         serde_json::to_string(&second).expect("checkpoint JSON")
     );
 
@@ -271,18 +288,38 @@ async fn owner_reference_is_validated_locally_and_preserved_across_writes() {
     let execution_id = execution(0x12);
     let first = checkpoint(b"owned-first");
     let second = checkpoint(b"owned-second");
+    let owner_reference = owner_reference();
     let harness = Harness::new([
         Step::Response(
             StatusCode::CREATED,
-            config_map_response(execution_id, Some("owned-alpha"), Some(&first)),
+            config_map_response_with_owner(
+                execution_id,
+                Some("owned-alpha"),
+                Some(&first),
+                Some(&owner_reference),
+            ),
         ),
         Step::Response(
             StatusCode::OK,
-            config_map_response(execution_id, Some("owned-beta"), Some(&second)),
+            config_map_response_with_owner(
+                execution_id,
+                Some("owned-alpha"),
+                Some(&first),
+                Some(&owner_reference),
+            ),
+        ),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response_with_owner(
+                execution_id,
+                Some("owned-beta"),
+                Some(&second),
+                Some(&owner_reference),
+            ),
         ),
     ]);
     let owner = KubernetesCheckpointOwner::new(
-        owner_reference(),
+        owner_reference,
         KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
     );
     let store = KubernetesCheckpointStore::with_options(
@@ -314,8 +351,12 @@ async fn owner_reference_is_validated_locally_and_preserved_across_writes() {
     );
 
     let requests = harness.requests();
-    assert_eq!(requests.len(), 2);
-    for request in requests {
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].method, Method::GET);
+    for request in requests
+        .iter()
+        .filter(|request| matches!(request.method, Method::POST | Method::PUT))
+    {
         let owner = &request.body["metadata"]["ownerReferences"][0];
         assert_eq!(owner["apiVersion"], "kuberic.io/v1alpha1");
         assert_eq!(owner["kind"], "WorkflowRun");
@@ -325,6 +366,70 @@ async fn owner_reference_is_validated_locally_and_preserved_across_writes() {
         assert!(owner["blockOwnerDeletion"].is_null());
     }
     harness.assert_consumed();
+}
+
+#[tokio::test]
+async fn replacement_rejects_lifecycle_owner_changes_without_mutation() {
+    let execution_id = execution(0x13);
+    let persisted_checkpoint = checkpoint(b"persisted");
+    let configured_owner = owner_reference();
+    let mut different_owner = owner_reference();
+    different_owner.uid = "different-owner-uid".to_string();
+
+    let cases = [
+        (
+            None,
+            Some(owner_reference()),
+            "owned checkpoint must not become independent",
+        ),
+        (
+            Some(configured_owner.clone()),
+            None,
+            "independent checkpoint must not become owned",
+        ),
+        (
+            Some(different_owner),
+            Some(owner_reference()),
+            "checkpoint owner must not change",
+        ),
+    ];
+
+    for (configured, persisted, description) in cases {
+        let harness = Harness::new([Step::Response(
+            StatusCode::OK,
+            config_map_response_with_owner(
+                execution_id,
+                Some("stable-owner-revision"),
+                Some(&persisted_checkpoint),
+                persisted.as_ref(),
+            ),
+        )]);
+        let mut options = KubernetesCheckpointStoreOptions::default();
+        if let Some(owner) = configured {
+            options = options.with_owner(KubernetesCheckpointOwner::new(
+                owner,
+                KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
+            ));
+        }
+        let store =
+            KubernetesCheckpointStore::with_options(harness.client(), "checkpoint-tests", options)
+                .expect("store");
+
+        let error = store
+            .compare_and_swap(
+                execution_id,
+                Some(StorageRevision::new("stable-owner-revision").expect("revision")),
+                checkpoint(description.as_bytes()),
+            )
+            .await
+            .expect_err(description);
+        assert_eq!(error.kind(), StoreErrorKind::Other);
+        assert!(error.description().contains("owner relationship"));
+        let requests = harness.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::GET);
+        harness.assert_consumed();
+    }
 }
 
 #[tokio::test]
@@ -463,7 +568,23 @@ async fn conflicts_cover_create_stale_replace_and_deleted_object_without_recreat
     let execution_id = execution(0x33);
     let harness = Harness::new([
         api_error(409, "AlreadyExists"),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(
+                execution_id,
+                Some("stale"),
+                Some(&checkpoint(b"current-stale")),
+            ),
+        ),
         api_error(409, "Conflict"),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(
+                execution_id,
+                Some("deleted"),
+                Some(&checkpoint(b"current-deleted")),
+            ),
+        ),
         api_error(404, "NotFound"),
     ]);
     let store =
@@ -496,7 +617,13 @@ async fn conflicts_cover_create_stale_replace_and_deleted_object_without_recreat
             .iter()
             .map(|request| request.method.clone())
             .collect::<Vec<_>>(),
-        [Method::POST, Method::PUT, Method::PUT]
+        [
+            Method::POST,
+            Method::GET,
+            Method::PUT,
+            Method::GET,
+            Method::PUT
+        ]
     );
     assert_eq!(store.metrics().snapshot(), Default::default());
     harness.assert_consumed();
@@ -526,6 +653,10 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
         api_error(422, "Invalid"),
         api_error(429, "TooManyRequests"),
         api_error(500, "InternalError"),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(execution_id, Some("timeout"), Some(&secret_checkpoint)),
+        ),
         api_error(504, "Timeout"),
         Step::TransportFailure("sensitive-mutation-transport-marker"),
         Step::Response(
