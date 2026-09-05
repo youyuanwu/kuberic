@@ -1,0 +1,38 @@
+# Optional identity for a separate lifecycle actor. Before deletion, that actor
+# must list only kuberic.io/component=durable-checkpoint objects and apply an
+# operator-defined retention rule that protects checkpoints needed for recovery.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kuberic-checkpoint-cleanup
+  namespace: kuberic-checkpoints
+  annotations:
+    kuberic.io/checkpoint-lifecycle: explicit-orphan-cleanup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kuberic-checkpoint-cleanup
+  namespace: kuberic-checkpoints
+  annotations:
+    kuberic.io/checkpoint-lifecycle: explicit-orphan-cleanup
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kuberic-checkpoint-cleanup
+  namespace: kuberic-checkpoints
+  annotations:
+    kuberic.io/checkpoint-lifecycle: explicit-orphan-cleanup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kuberic-checkpoint-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: kuberic-checkpoint-cleanup
+    namespace: kuberic-checkpoints
