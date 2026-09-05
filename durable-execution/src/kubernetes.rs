@@ -196,12 +196,20 @@ impl CheckpointStore for KubernetesCheckpointStore {
                 format!("compare-and-swap request serialization failed: {error}"),
             )
         })?;
-        if checkpoint_json.len() > CONFIG_MAP_DATA_LIMIT {
+        let config_map_data_bytes = CHECKPOINT_DATA_KEY
+            .len()
+            .checked_add(checkpoint_json.len())
+            .ok_or_else(|| {
+                StoreError::new(
+                    StoreErrorKind::Other,
+                    "compare-and-swap ConfigMap data size overflowed",
+                )
+            })?;
+        if config_map_data_bytes > CONFIG_MAP_DATA_LIMIT {
             return Err(StoreError::new(
                 StoreErrorKind::Other,
                 format!(
-                    "compare-and-swap checkpoint data is {} bytes, exceeding the ConfigMap data limit of {CONFIG_MAP_DATA_LIMIT} bytes",
-                    checkpoint_json.len()
+                    "compare-and-swap ConfigMap data is {config_map_data_bytes} bytes, exceeding the ConfigMap data limit of {CONFIG_MAP_DATA_LIMIT} bytes"
                 ),
             ));
         }

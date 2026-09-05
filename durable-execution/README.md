@@ -123,6 +123,50 @@ returns `StoreFailed`. None grants dispatch permission. The included
 opaque tokens, and can return the same unknown result with or without applying
 the mutation.
 
+## Kubernetes checkpoint provider spike
+
+The default-off `kubernetes` feature adds `KubernetesCheckpointStore`. A caller
+supplies a `kube::Client` and a namespace, retaining ownership of credential
+discovery, the async runtime, namespace lifecycle, retries, and all workflow
+effects:
+
+```rust,no_run
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use kuberic_durable_execution::KubernetesCheckpointStore;
+
+let client = kube::Client::try_default().await?;
+let store = KubernetesCheckpointStore::new(client, "durable-checkpoints")?;
+# let _ = store;
+# Ok(())
+# }
+```
+
+Each execution maps to
+`kuberic-checkpoint-<32-lowercase-execution-id-hex>` in that namespace. The
+format-3 envelope's canonical JSON is stored in
+`data["checkpoint.json"]`; the object is labeled
+`kuberic.io/component=durable-checkpoint`. Initial CAS uses create-if-absent.
+Successor CAS uses replace with the caller's exact, opaque
+`metadata.resourceVersion`. Already-existing creates, stale replacements, and
+replacements racing with deletion return the portable unit `Conflict`; the
+host's next load obtains authoritative state.
+
+Explicit API rejections map to portable `StoreError` kinds and diagnostics
+retain only the operation plus API code/reason. Mutation transport failures,
+5xx responses, and successful responses without a usable revision are
+`OutcomeUnknown`, because acceptance cannot be disproved. The provider never
+embeds Kubernetes error types, credentials, checkpoint contents, or arbitrary
+transport text in its public errors. ConfigMap data is checked against the
+1 MiB data limit before dispatch.
+
+`store.metrics().snapshot()` reports only writes confirmed by a response with a
+usable authoritative revision. It includes accepted-write count, canonical
+checkpoint JSON bytes, canonical typed server-returned ConfigMap JSON bytes,
+and measurement failures. Object bytes include server metadata and are not raw
+HTTP-wire bytes. The validation watch measurement similarly canonicalizes each
+delivered typed `WatchEvent<ConfigMap>` and excludes HTTP framing and transport
+overhead.
+
 ## Turns and dispatch permission
 
 Awaiting `DurableHost::turn` evaluates and commits no more than one persistence
@@ -191,6 +235,27 @@ CARGO_BUILD_JOBS=2 cargo check --workspace
 CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
 ```
 
+Enable the optional provider for deterministic client-surface validation:
+
+```console
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint -- --nocapture
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --all-targets
+CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --features kubernetes --all-targets -- -D warnings
+```
+
+An explicit ignored test performs authorization preflight, creates a temporary
+namespace, validates the provider against the configured real Kubernetes API,
+prints its measurement report, and waits for namespace deletion:
+
+```console
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real -- --ignored --nocapture
+```
+
+The test reports a failed endpoint or authorization precondition rather than
+claiming real-API coverage. Its apply-then-unknown and no-apply-unknown cases
+mask the store result around real persisted state; they validate host recovery,
+not reproduction of an actual network fault.
+
 The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
 three-way classifier. The revised evidence contains 38 unique contiguous
@@ -202,18 +267,18 @@ within this kernel's stated boundary.
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.
-Completion-only compaction is implemented; generic active-history compaction
-and continuation remain excluded. A Kubernetes checkpoint provider and the
-remaining ordered deferred work are tracked in
+Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
+are implemented; generic active-history compaction, continuation, and operator
+adoption remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
 
 ## Limitations and exclusions
 
-The result is limited to an in-memory synthetic model. The crate supplies no
-production persistence, distributed execution ownership, worker, queue,
-lease, activity handler, automatic observation polling, or passive-observation
-transport. It does not establish a canonical exact-byte representation across
-versions.
+The kernel result remains experimental. Its opt-in ConfigMap provider and
+real-API spike do not establish production persistence fitness, distributed
+execution ownership, a worker, queue, lease, activity handler, automatic
+observation polling, or passive-observation transport. It does not establish a
+canonical exact-byte representation across versions.
 
 The classifier is recomputed from the current registry rather than assuming a
 positive result. Provider cases distinguish absence from every portable error
@@ -225,8 +290,8 @@ result before restart.
 Typed adapters, durable activity failures, dispatch registries, passive
 convergence, tracing/inspection, timers, retries, parallelism, lifecycle,
 queries, external events, child workflows, workers, queues, leases, and
-Kubernetes/operator integration are excluded. So are compensation, migrations,
-upgrade guarantees, rollout, and diagnostics. The experiment changes no
+operator integration are excluded. So are compensation, migrations, upgrade
+guarantees, rollout, and production diagnostics. The experiment changes no
 Kuberic CRD, operator reconciliation, durable topology workflow, status
 persistence, ReplicaAgent, gRPC protocol, or deployment manifest. Its
 classification is not a production-readiness, current-operator-parity, or
