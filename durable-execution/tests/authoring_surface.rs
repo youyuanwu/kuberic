@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::executor::block_on;
 use kuberic_durable_execution::{
     ActivityName, ActivitySpec, CheckpointLimits, DurableHost, ExactBytes, ExecutionId,
-    HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore, Workflow,
-    WorkflowContext,
+    ExecutionSpec, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore,
+    TerminalOutcome, Workflow, WorkflowContext,
 };
 use support::scenarios::{ScenarioId, run_conformance_matrix};
 
@@ -14,14 +14,16 @@ struct OrdinaryAsyncWorkflow;
 // FR012_WORKFLOW_START
 #[async_trait(?Send)]
 impl Workflow for OrdinaryAsyncWorkflow {
-    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes {
-        context
-            .activity(ActivitySpec::new(
-                ActivityName::new("ordinary-async", 1).unwrap(),
-                input,
-                1024,
-            ))
-            .await
+    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
+        TerminalOutcome::succeeded(
+            context
+                .activity(ActivitySpec::new(
+                    ActivityName::new("ordinary-async", 1).unwrap(),
+                    input,
+                    1024,
+                ))
+                .await,
+        )
     }
 }
 // FR012_WORKFLOW_END
@@ -49,8 +51,11 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
     );
     let first_turn = block_on(host.turn(
         &OrdinaryAsyncWorkflow,
-        ExecutionId::from_bytes([1; 16]),
-        ExactBytes::new(b"input"),
+        ExecutionSpec::new(
+            ExecutionId::from_bytes([1; 16]),
+            ExactBytes::new(b"input"),
+            1024,
+        ),
     ));
     let all_scenarios = block_on(run_conformance_matrix());
     for scenario in &all_scenarios {
@@ -62,7 +67,7 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
     }
     let library_exports = include_str!("../src/lib.rs");
     let async_surface_exported =
-        library_exports.contains("pub use workflow::{Workflow, WorkflowContext};");
+        library_exports.contains("pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};");
     let fallback_surface_exported = library_exports.contains(concat!("mod po", "ll;"))
         || library_exports.contains("ReplayWorkflow")
         || library_exports.contains("ReplayContext");

@@ -2,16 +2,41 @@ use std::task::Poll;
 
 use async_trait::async_trait;
 use futures::future::poll_fn;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, ExactBytes, ExecutionId,
     LogicalActivityId, Nondeterminism,
 };
 
+/// Exact terminal result of one workflow execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "payload", rename_all = "snake_case")]
+pub enum TerminalOutcome {
+    Succeeded(ExactBytes),
+    Failed(ExactBytes),
+}
+
+impl TerminalOutcome {
+    pub fn succeeded(payload: impl Into<ExactBytes>) -> Self {
+        Self::Succeeded(payload.into())
+    }
+
+    pub fn failed(payload: impl Into<ExactBytes>) -> Self {
+        Self::Failed(payload.into())
+    }
+
+    pub const fn payload(&self) -> &ExactBytes {
+        match self {
+            Self::Succeeded(payload) | Self::Failed(payload) => payload,
+        }
+    }
+}
+
 /// Provisional ordinary-async workflow authoring surface.
 #[async_trait(?Send)]
 pub trait Workflow {
-    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes;
+    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome;
 }
 
 /// Linear replay context. `activity` is its only workflow-body operation.

@@ -1,7 +1,8 @@
 use crate::{
     ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError,
     CheckpointLimits, CheckpointPayload, CheckpointStore, Evaluation, ExactBytes, ExecutionId,
-    HostEpoch, LogicalActivityId, Nondeterminism, StorageRevision, StoreError, Workflow, evaluate,
+    ExecutionSpec, HostEpoch, LogicalActivityId, Nondeterminism, StorageRevision, StoreError,
+    TerminalOutcome, Workflow, evaluate,
 };
 
 /// The persistence boundary that must be reloaded after an uncertain CAS result.
@@ -10,6 +11,7 @@ pub enum PersistenceBoundary {
     Schedule,
     Exposure,
     Observation,
+    Completion,
 }
 
 /// Why the caller must reload instead of acting on a proposal.
@@ -137,7 +139,8 @@ define_host_outcomes! {
         revision: StorageRevision,
     },
     WorkflowCompleted {
-        result: ExactBytes,
+        outcome: TerminalOutcome,
+        revision: StorageRevision,
     },
     Quarantined {
         activity: LogicalActivityId,
@@ -182,9 +185,9 @@ impl<S: CheckpointStore> DurableHost<S> {
     pub async fn turn<W: Workflow>(
         &mut self,
         workflow: &W,
-        execution_id: ExecutionId,
-        workflow_input: ExactBytes,
+        execution: ExecutionSpec,
     ) -> HostOutcome {
+        let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -196,15 +199,22 @@ impl<S: CheckpointStore> DurableHost<S> {
         };
         let expected_revision = loaded.as_ref().map(|stored| stored.revision().clone());
         if let Some(stored) = loaded.as_ref() {
-            let payload = match stored.checkpoint().decode_and_validate(
-                execution_id,
-                &workflow_input,
-                self.limits,
-            ) {
+            let payload = match stored
+                .checkpoint()
+                .decode_and_validate(&execution, self.limits)
+            {
                 Ok(payload) => payload,
                 Err(error) => return HostOutcome::CheckpointRejected(error),
             };
-            if let Some(record) = payload.activities().last()
+            if let Some((outcome, _)) = payload.terminal_outcome() {
+                return HostOutcome::WorkflowCompleted {
+                    outcome: outcome.clone(),
+                    revision: stored.revision().clone(),
+                };
+            }
+            if let Some(record) = payload
+                .active_activities()
+                .and_then(|activities| activities.last())
                 && let ActivityState::DispatchExposed { attempt_id } = record.state()
             {
                 return HostOutcome::Quarantined {
@@ -215,8 +225,7 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
         let evaluation = evaluate(
             workflow,
-            execution_id,
-            workflow_input.clone(),
+            &execution,
             loaded.as_ref().map(|stored| stored.checkpoint()),
             self.limits,
         );
@@ -235,8 +244,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             } => {
                 let stored = loaded.expect("pending evaluation requires a loaded checkpoint");
                 match self.prepare_exposure(
-                    execution_id,
-                    workflow_input,
+                    &execution,
                     stored.revision(),
                     stored.checkpoint(),
                     activity,
@@ -256,7 +264,28 @@ impl<S: CheckpointStore> DurableHost<S> {
                 state: ActivityState::Completed { .. },
                 ..
             } => unreachable!("completed activities are replayed rather than pending"),
-            Evaluation::Complete { result, .. } => HostOutcome::WorkflowCompleted { result },
+            Evaluation::Complete {
+                outcome,
+                completed_activity_count,
+                checkpoint,
+            } => {
+                self.commit_completion(
+                    execution_id,
+                    expected_revision,
+                    &execution,
+                    outcome,
+                    completed_activity_count,
+                    checkpoint,
+                )
+                .await
+            }
+            Evaluation::Terminal { outcome, .. } => {
+                let stored = loaded.expect("terminal evaluation requires a loaded checkpoint");
+                HostOutcome::WorkflowCompleted {
+                    outcome,
+                    revision: stored.revision().clone(),
+                }
+            }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
             Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
             Evaluation::WorkflowStalled => {
@@ -268,10 +297,10 @@ impl<S: CheckpointStore> DurableHost<S> {
     /// Persist an authoritative result only for the currently exposed activity.
     pub async fn observe(
         &self,
-        execution_id: ExecutionId,
-        workflow_input: &ExactBytes,
+        execution: &ExecutionSpec,
         observation: ActivityObservation,
     ) -> HostOutcome {
+        let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -284,15 +313,18 @@ impl<S: CheckpointStore> DurableHost<S> {
         let Some(stored) = loaded else {
             return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
         };
-        let mut payload =
-            match stored
-                .checkpoint()
-                .decode_and_validate(execution_id, workflow_input, self.limits)
-            {
-                Ok(payload) => payload,
-                Err(error) => return HostOutcome::CheckpointRejected(error),
-            };
-        let Some(record) = payload.activities().last().cloned() else {
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
             return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
         };
         let expected_activity = record.logical_id(execution_id);
@@ -371,20 +403,18 @@ impl<S: CheckpointStore> DurableHost<S> {
 
     fn prepare_exposure(
         &mut self,
-        execution_id: ExecutionId,
-        workflow_input: ExactBytes,
+        execution: &ExecutionSpec,
         expected_revision: &StorageRevision,
         checkpoint: &CheckpointEnvelope,
         activity: LogicalActivityId,
     ) -> Result<PreparedExposure, CheckpointError> {
-        let mut payload =
-            checkpoint.decode_and_validate(execution_id, &workflow_input, self.limits)?;
+        let mut payload = checkpoint.decode_and_validate(execution, self.limits)?;
         let record = payload
-            .activities()
-            .last()
+            .active_activities()
+            .and_then(|activities| activities.last())
             .cloned()
             .expect("scheduled evaluation requires an activity record");
-        let reserved_encoded_bytes = payload.maximum_completed_encoded_len()?;
+        let reserved_encoded_bytes = payload.maximum_activity_completed_encoded_len()?;
         if reserved_encoded_bytes > self.limits.max_encoded_bytes() {
             return Err(CheckpointError::EncodedCheckpointLimitExceeded {
                 actual: reserved_encoded_bytes,
@@ -397,7 +427,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             ActivityRecord::dispatch_exposed(record.sequence(), record.spec().clone(), attempt_id),
         );
         Ok(PreparedExposure {
-            execution_id,
+            execution_id: execution.execution_id(),
             expected_revision: expected_revision.clone(),
             checkpoint: CheckpointEnvelope::encode_with_limits(&payload, self.limits)?,
             activity,
@@ -424,6 +454,40 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
     }
 
+    async fn commit_completion(
+        &self,
+        execution_id: ExecutionId,
+        expected_revision: Option<StorageRevision>,
+        execution: &ExecutionSpec,
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
+        active_checkpoint: CheckpointEnvelope,
+    ) -> HostOutcome {
+        let active = match active_checkpoint.decode_and_validate(execution, self.limits) {
+            Ok(active) => active,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let terminal = match active.into_terminal(outcome.clone(), completed_activity_count) {
+            Ok(terminal) => terminal,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&terminal, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, expected_revision, checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(revision)) => {
+                HostOutcome::WorkflowCompleted { outcome, revision }
+            }
+            Ok(other) => reload_outcome(PersistenceBoundary::Completion, other),
+            Err(error) => store_failed(PersistenceBoundary::Completion, error),
+        }
+    }
+
     fn next_attempt(&mut self) -> AttemptId {
         let counter = self.next_attempt_counter;
         self.next_attempt_counter = counter
@@ -444,7 +508,8 @@ struct PreparedExposure {
 
 fn replace_final_record(payload: &mut CheckpointPayload, replacement: ActivityRecord) {
     *payload
-        .activities_mut()
+        .active_activities_mut()
+        .expect("replacement requires active state")
         .last_mut()
         .expect("replacement requires a final activity") = replacement;
 }
@@ -480,14 +545,20 @@ mod tests {
 
     #[async_trait(?Send)]
     impl Workflow for OneActivity {
-        async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes {
-            context
-                .activity(ActivitySpec::new(
-                    ActivityName::new("unit", 1).unwrap(),
-                    input,
-                    1024,
-                ))
-                .await
+        async fn run(
+            &self,
+            context: &mut WorkflowContext<'_>,
+            input: ExactBytes,
+        ) -> TerminalOutcome {
+            TerminalOutcome::succeeded(
+                context
+                    .activity(ActivitySpec::new(
+                        ActivityName::new("unit", 1).unwrap(),
+                        input,
+                        1024,
+                    ))
+                    .await,
+            )
         }
     }
 
@@ -497,13 +568,14 @@ mod tests {
             let store = InMemoryCheckpointStore::new();
             let execution_id = ExecutionId::from_bytes([2; 16]);
             let input = ExactBytes::new(b"unit");
+            let execution = || ExecutionSpec::new(execution_id, input.clone(), 1024);
             let mut host = DurableHost::new(
                 store.clone(),
                 HostEpoch::from_bytes([1; 16]),
                 CheckpointLimits::new(16, 100_000).unwrap(),
             );
             assert!(matches!(
-                host.turn(&OneActivity, execution_id, input.clone()).await,
+                host.turn(&OneActivity, execution()).await,
                 HostOutcome::ScheduleAccepted { .. }
             ));
 
@@ -513,11 +585,11 @@ mod tests {
                 InMemoryFault::OutcomeUnknownAfterApply,
             ] {
                 store.fail_next_compare_and_swap(fault);
-                let outcome = host.turn(&OneActivity, execution_id, input.clone()).await;
+                let outcome = host.turn(&OneActivity, execution()).await;
                 assert!(!matches!(outcome, HostOutcome::DispatchPermitted { .. }));
                 if fault == InMemoryFault::OutcomeUnknownAfterApply {
                     assert!(matches!(
-                        host.turn(&OneActivity, execution_id, input.clone()).await,
+                        host.turn(&OneActivity, execution()).await,
                         HostOutcome::Quarantined { .. }
                     ));
                     return;

@@ -4,10 +4,10 @@ use thiserror::Error;
 
 use crate::{
     ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,
-    LogicalActivityId,
+    ExecutionSpec, LogicalActivityId, TerminalOutcome,
 };
 
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
 
 /// Required limits for every loaded or proposed checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +44,7 @@ impl CheckpointLimits {
 
 /// Version discriminator and opaque JSON payload bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointEnvelope {
     format_version: u32,
     payload: ExactBytes,
@@ -68,7 +69,7 @@ impl CheckpointEnvelope {
         payload: &CheckpointPayload,
         limits: CheckpointLimits,
     ) -> Result<Self, CheckpointError> {
-        validate_activity_count(payload, limits)?;
+        payload.validate_internal(limits)?;
         let checkpoint = Self::encode(payload)?;
         checkpoint.validate_encoded_size(limits)?;
         Ok(checkpoint)
@@ -97,8 +98,7 @@ impl CheckpointEnvelope {
 
     pub fn decode_and_validate(
         &self,
-        expected_execution_id: ExecutionId,
-        expected_workflow_input: &ExactBytes,
+        expected: &ExecutionSpec,
         limits: CheckpointLimits,
     ) -> Result<CheckpointPayload, CheckpointError> {
         if self.format_version != CHECKPOINT_FORMAT_VERSION {
@@ -111,7 +111,7 @@ impl CheckpointEnvelope {
 
         let payload: CheckpointPayload =
             serde_json::from_slice(self.payload.as_slice()).map_err(invalid_json)?;
-        payload.validate(expected_execution_id, expected_workflow_input, limits)?;
+        payload.validate(expected, limits)?;
         Ok(payload)
     }
 
@@ -127,95 +127,191 @@ impl CheckpointEnvelope {
     }
 }
 
-/// Decoded checkpoint state for one execution.
+/// Immutable execution-level checkpoint authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckpointPayload {
-    execution_id: ExecutionId,
-    workflow_input: ExactBytes,
-    activities: Vec<ActivityRecord>,
+#[serde(deny_unknown_fields)]
+pub struct ExecutionContract {
+    spec: ExecutionSpec,
+    admitted_max_encoded_checkpoint_bytes: u64,
 }
 
-impl CheckpointPayload {
-    pub fn new(
-        execution_id: ExecutionId,
-        workflow_input: ExactBytes,
-        activities: Vec<ActivityRecord>,
-    ) -> Self {
+impl ExecutionContract {
+    pub const fn new(spec: ExecutionSpec, admitted_max_encoded_checkpoint_bytes: u64) -> Self {
         Self {
-            execution_id,
-            workflow_input,
-            activities,
+            spec,
+            admitted_max_encoded_checkpoint_bytes,
         }
     }
 
-    pub const fn execution_id(&self) -> ExecutionId {
-        self.execution_id
+    pub const fn spec(&self) -> &ExecutionSpec {
+        &self.spec
     }
 
-    pub fn workflow_input(&self) -> &ExactBytes {
-        &self.workflow_input
+    pub const fn admitted_max_encoded_checkpoint_bytes(&self) -> u64 {
+        self.admitted_max_encoded_checkpoint_bytes
+    }
+}
+
+/// Explicit lifecycle state for one execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "lifecycle", rename_all = "snake_case")]
+pub enum CheckpointState {
+    Active {
+        activities: Vec<ActivityRecord>,
+    },
+    Terminal {
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
+    },
+}
+
+/// Decoded checkpoint state for one execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointPayload {
+    execution: ExecutionContract,
+    state: CheckpointState,
+}
+
+impl CheckpointPayload {
+    pub const fn active(execution: ExecutionContract, activities: Vec<ActivityRecord>) -> Self {
+        Self {
+            execution,
+            state: CheckpointState::Active { activities },
+        }
     }
 
-    pub fn activities(&self) -> &[ActivityRecord] {
-        &self.activities
+    pub const fn terminal(
+        execution: ExecutionContract,
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
+    ) -> Self {
+        Self {
+            execution,
+            state: CheckpointState::Terminal {
+                outcome,
+                completed_activity_count,
+            },
+        }
     }
 
-    pub(crate) fn activities_mut(&mut self) -> &mut Vec<ActivityRecord> {
-        &mut self.activities
+    pub const fn execution(&self) -> &ExecutionContract {
+        &self.execution
+    }
+
+    pub const fn state(&self) -> &CheckpointState {
+        &self.state
+    }
+
+    pub fn active_activities(&self) -> Option<&[ActivityRecord]> {
+        match &self.state {
+            CheckpointState::Active { activities } => Some(activities),
+            CheckpointState::Terminal { .. } => None,
+        }
+    }
+
+    pub fn terminal_outcome(&self) -> Option<(&TerminalOutcome, u64)> {
+        match &self.state {
+            CheckpointState::Terminal {
+                outcome,
+                completed_activity_count,
+            } => Some((outcome, *completed_activity_count)),
+            CheckpointState::Active { .. } => None,
+        }
+    }
+
+    pub(crate) fn active_activities_mut(&mut self) -> Option<&mut Vec<ActivityRecord>> {
+        match &mut self.state {
+            CheckpointState::Active { activities } => Some(activities),
+            CheckpointState::Terminal { .. } => None,
+        }
+    }
+
+    pub(crate) fn into_terminal(
+        self,
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
+    ) -> Result<Self, CheckpointError> {
+        if !matches!(self.state, CheckpointState::Active { .. }) {
+            return Err(CheckpointError::ExpectedActiveCheckpoint);
+        }
+        validate_terminal_outcome(&outcome, self.execution.spec.max_terminal_payload_bytes())?;
+        Ok(Self::terminal(
+            self.execution,
+            outcome,
+            completed_activity_count,
+        ))
     }
 
     pub fn validate(
         &self,
-        expected_execution_id: ExecutionId,
-        expected_workflow_input: &ExactBytes,
+        expected: &ExecutionSpec,
         limits: CheckpointLimits,
     ) -> Result<(), CheckpointError> {
-        validate_activity_count(self, limits)?;
-        if self.execution_id != expected_execution_id {
+        if self.execution.spec.execution_id() != expected.execution_id() {
             return Err(CheckpointError::ExecutionMismatch {
-                expected: expected_execution_id,
-                actual: self.execution_id,
+                expected: expected.execution_id(),
+                actual: self.execution.spec.execution_id(),
             });
         }
-        if self.workflow_input != *expected_workflow_input {
+        if self.execution.spec.workflow_input() != expected.workflow_input() {
             return Err(CheckpointError::WorkflowInputMismatch {
-                expected: expected_workflow_input.clone(),
-                actual: self.workflow_input.clone(),
+                expected: expected.workflow_input().clone(),
+                actual: self.execution.spec.workflow_input().clone(),
             });
         }
-
-        for (index, record) in self.activities.iter().enumerate() {
-            let expected = u64::try_from(index).map_err(|_| CheckpointError::HistoryTooLong)?;
-            if record.sequence.get() != expected {
-                return Err(CheckpointError::NonContiguousSequence {
-                    expected: ActivitySequence::new(expected),
-                    actual: record.sequence,
-                });
-            }
-            if let ActivityState::Completed { result } = &record.state {
-                let actual = u64::try_from(result.as_slice().len())
-                    .map_err(|_| CheckpointError::ResultLengthUnrepresentable)?;
-                if actual > record.spec.max_result_bytes() {
-                    return Err(CheckpointError::CompletedResultExceedsDeclared {
-                        sequence: record.sequence,
-                        actual,
-                        maximum: record.spec.max_result_bytes(),
-                    });
-                }
-            } else if index + 1 != self.activities.len() {
-                return Err(CheckpointError::PendingActivityNotFinal {
-                    sequence: record.sequence,
-                });
-            }
+        if self.execution.spec.max_terminal_payload_bytes() != expected.max_terminal_payload_bytes()
+        {
+            return Err(CheckpointError::TerminalPayloadBoundMismatch {
+                expected: expected.max_terminal_payload_bytes(),
+                actual: self.execution.spec.max_terminal_payload_bytes(),
+            });
         }
-        Ok(())
+        self.validate_internal(limits)
     }
 
-    /// Exact encoded envelope size for completing the final record with a
-    /// result at its declared maximum, without allocating that result.
-    pub(crate) fn maximum_completed_encoded_len(&self) -> Result<usize, CheckpointError> {
-        let record = self
-            .activities
+    /// Exact encoded envelope size of the larger terminal outcome at the
+    /// declared payload maximum, without allocating that payload.
+    pub fn maximum_terminal_encoded_len(&self) -> Result<usize, CheckpointError> {
+        let declared_len = usize::try_from(self.execution.spec.max_terminal_payload_bytes())
+            .map_err(|_| CheckpointError::TerminalPayloadLengthUnrepresentable)?;
+        let payload_base64_len =
+            encoded_len(declared_len, true).ok_or(CheckpointError::EncodedLengthOverflow)?;
+
+        [
+            TerminalOutcome::succeeded(ExactBytes::default()),
+            TerminalOutcome::failed(ExactBytes::default()),
+        ]
+        .into_iter()
+        .map(|outcome| {
+            let empty_terminal = Self::terminal(self.execution.clone(), outcome, u64::MAX);
+            let empty_inner_len = serde_json::to_vec(&empty_terminal)
+                .map_err(invalid_json)?
+                .len();
+            let projected_inner_len = empty_inner_len
+                .checked_add(payload_base64_len)
+                .ok_or(CheckpointError::EncodedLengthOverflow)?;
+            let projected_envelope_payload_len = encoded_len(projected_inner_len, true)
+                .ok_or(CheckpointError::EncodedLengthOverflow)?;
+            let empty_envelope_len =
+                CheckpointEnvelope::new(CHECKPOINT_FORMAT_VERSION, ExactBytes::default())
+                    .encoded_len()?;
+            empty_envelope_len
+                .checked_add(projected_envelope_payload_len)
+                .ok_or(CheckpointError::EncodedLengthOverflow)
+        })
+        .try_fold(0, |largest, projected| {
+            projected.map(|value| largest.max(value))
+        })
+    }
+
+    /// Exact encoded envelope size for completing the final activity at its
+    /// declared maximum, without allocating that result.
+    pub fn maximum_activity_completed_encoded_len(&self) -> Result<usize, CheckpointError> {
+        let activities = self
+            .active_activities()
+            .ok_or(CheckpointError::ExpectedActiveCheckpoint)?;
+        let record = activities
             .last()
             .ok_or(CheckpointError::MissingPendingActivity)?;
         let result_len = usize::try_from(record.spec.max_result_bytes())
@@ -225,9 +321,9 @@ impl CheckpointPayload {
 
         let mut empty_completion = self.clone();
         let final_record = empty_completion
-            .activities
-            .last_mut()
-            .expect("final record was checked above");
+            .active_activities_mut()
+            .and_then(|activities| activities.last_mut())
+            .expect("final active record was checked above");
         final_record.state = ActivityState::Completed {
             result: ExactBytes::default(),
         };
@@ -246,10 +342,42 @@ impl CheckpointPayload {
             .checked_add(projected_payload_base64_len)
             .ok_or(CheckpointError::EncodedLengthOverflow)
     }
+
+    fn validate_internal(&self, limits: CheckpointLimits) -> Result<(), CheckpointError> {
+        let configured = u64::try_from(limits.max_encoded_bytes)
+            .map_err(|_| CheckpointError::EncodedLengthOverflow)?;
+        let admitted = self.execution.admitted_max_encoded_checkpoint_bytes;
+        if configured < admitted {
+            return Err(CheckpointError::ConfiguredCapacityBelowAdmission {
+                configured,
+                admitted,
+            });
+        }
+        let required = self.maximum_terminal_encoded_len()?;
+        let required =
+            u64::try_from(required).map_err(|_| CheckpointError::EncodedLengthOverflow)?;
+        if required > admitted {
+            return Err(CheckpointError::AdmittedTerminalCapacityInsufficient {
+                required,
+                admitted,
+            });
+        }
+
+        match &self.state {
+            CheckpointState::Active { activities } => {
+                validate_activity_count(activities, limits)?;
+                validate_active_history(activities)
+            }
+            CheckpointState::Terminal { outcome, .. } => {
+                validate_terminal_outcome(outcome, self.execution.spec.max_terminal_payload_bytes())
+            }
+        }
+    }
 }
 
 /// One activity in contiguous zero-based workflow history.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ActivityRecord {
     sequence: ActivitySequence,
     spec: ActivitySpec,
@@ -343,6 +471,8 @@ pub enum CheckpointError {
         expected: ExactBytes,
         actual: ExactBytes,
     },
+    #[error("checkpoint terminal payload bound {actual} differs from requested bound {expected}")]
+    TerminalPayloadBoundMismatch { expected: u64, actual: u64 },
     #[error("maximum activity records must be greater than zero")]
     ZeroActivityRecordLimit,
     #[error("maximum encoded checkpoint bytes must be greater than zero")]
@@ -351,18 +481,32 @@ pub enum CheckpointError {
     ActivityRecordLimitExceeded { actual: usize, maximum: usize },
     #[error("encoded checkpoint uses {actual} bytes; configured maximum is {maximum}")]
     EncodedCheckpointLimitExceeded { actual: usize, maximum: usize },
+    #[error(
+        "configured encoded checkpoint capacity {configured} is below admitted capacity {admitted}"
+    )]
+    ConfiguredCapacityBelowAdmission { configured: u64, admitted: u64 },
+    #[error(
+        "admitted terminal checkpoint capacity {admitted} is below required capacity {required}"
+    )]
+    AdmittedTerminalCapacityInsufficient { required: u64, admitted: u64 },
     #[error("activity result length cannot be represented on this platform")]
     ResultLengthUnrepresentable,
+    #[error("terminal payload length cannot be represented on this platform")]
+    TerminalPayloadLengthUnrepresentable,
     #[error("encoded checkpoint length overflow")]
     EncodedLengthOverflow,
     #[error("capacity reservation requires a final pending activity")]
     MissingPendingActivity,
+    #[error("operation requires an active checkpoint")]
+    ExpectedActiveCheckpoint,
     #[error("activity {sequence} result uses {actual} bytes; declared maximum is {maximum}")]
     CompletedResultExceedsDeclared {
         sequence: ActivitySequence,
         actual: u64,
         maximum: u64,
     },
+    #[error("terminal payload uses {actual} bytes; declared maximum is {maximum}")]
+    TerminalPayloadExceedsDeclared { actual: u64, maximum: u64 },
     #[error("activity history is too long to address with a u64 sequence")]
     HistoryTooLong,
     #[error("expected activity sequence {expected}, found {actual}")]
@@ -375,15 +519,55 @@ pub enum CheckpointError {
 }
 
 fn validate_activity_count(
-    payload: &CheckpointPayload,
+    activities: &[ActivityRecord],
     limits: CheckpointLimits,
 ) -> Result<(), CheckpointError> {
-    let actual = payload.activities.len();
+    let actual = activities.len();
     if actual > limits.max_activity_records {
         return Err(CheckpointError::ActivityRecordLimitExceeded {
             actual,
             maximum: limits.max_activity_records,
         });
+    }
+    Ok(())
+}
+
+fn validate_active_history(activities: &[ActivityRecord]) -> Result<(), CheckpointError> {
+    for (index, record) in activities.iter().enumerate() {
+        let expected = u64::try_from(index).map_err(|_| CheckpointError::HistoryTooLong)?;
+        if record.sequence.get() != expected {
+            return Err(CheckpointError::NonContiguousSequence {
+                expected: ActivitySequence::new(expected),
+                actual: record.sequence,
+            });
+        }
+        if let ActivityState::Completed { result } = &record.state {
+            let actual = u64::try_from(result.as_slice().len())
+                .map_err(|_| CheckpointError::ResultLengthUnrepresentable)?;
+            if actual > record.spec.max_result_bytes() {
+                return Err(CheckpointError::CompletedResultExceedsDeclared {
+                    sequence: record.sequence,
+                    actual,
+                    maximum: record.spec.max_result_bytes(),
+                });
+            }
+        } else if index + 1 != activities.len() {
+            return Err(CheckpointError::PendingActivityNotFinal {
+                sequence: record.sequence,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_terminal_outcome(
+    outcome: &TerminalOutcome,
+    maximum: u64,
+) -> Result<(), CheckpointError> {
+    let actual = u64::try_from(outcome.payload().as_slice().len())
+        .map_err(|_| CheckpointError::TerminalPayloadLengthUnrepresentable)?;
+    if actual > maximum {
+        return Err(CheckpointError::TerminalPayloadExceedsDeclared { actual, maximum });
     }
     Ok(())
 }
@@ -395,6 +579,18 @@ fn invalid_json(error: serde_json::Error) -> CheckpointError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec(max_terminal_payload_bytes: u64) -> ExecutionSpec {
+        ExecutionSpec::new(
+            ExecutionId::from_bytes([1; 16]),
+            ExactBytes::new(b"input"),
+            max_terminal_payload_bytes,
+        )
+    }
+
+    fn contract(max_terminal_payload_bytes: u64, admitted: u64) -> ExecutionContract {
+        ExecutionContract::new(spec(max_terminal_payload_bytes), admitted)
+    }
 
     #[test]
     fn nonallocating_encoded_length_matches_canonical_json() {
@@ -408,5 +604,49 @@ mod tests {
                 serde_json::to_vec(&checkpoint).unwrap().len()
             );
         }
+    }
+
+    #[test]
+    fn terminal_projection_covers_both_variants_and_maximum_count() {
+        for maximum in [0, 1, 2, 3, 1024] {
+            let payload = CheckpointPayload::active(contract(maximum, 1_000_000), Vec::new());
+            let projected = payload.maximum_terminal_encoded_len().unwrap();
+            for outcome in [
+                TerminalOutcome::succeeded(ExactBytes::new(vec![7; maximum as usize])),
+                TerminalOutcome::failed(ExactBytes::new(vec![7; maximum as usize])),
+            ] {
+                let terminal =
+                    CheckpointPayload::terminal(payload.execution.clone(), outcome, u64::MAX);
+                assert!(
+                    CheckpointEnvelope::encode(&terminal)
+                        .unwrap()
+                        .encoded_len()
+                        .unwrap()
+                        <= projected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_projection_rejects_unrepresentable_length_without_allocating() {
+        let payload = CheckpointPayload::active(contract(u64::MAX, u64::MAX), Vec::new());
+        assert!(matches!(
+            payload.maximum_terminal_encoded_len(),
+            Err(CheckpointError::EncodedLengthOverflow)
+        ));
+    }
+
+    #[test]
+    fn terminal_state_has_no_serialized_history_field() {
+        let payload = CheckpointPayload::terminal(
+            contract(16, 1_000_000),
+            TerminalOutcome::succeeded(ExactBytes::new(b"done")),
+            4,
+        );
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("activities"));
+        assert!(!json.contains("history"));
+        assert!(!json.contains("digest"));
     }
 }

@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use futures::{FutureExt, future::poll_fn, join, task::AtomicWaker};
 use kuberic_durable_execution::{
-    ActivityName, ActivityObservation, ActivitySequence, ActivitySpec, AttemptId, CasOutcome,
-    CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload, CheckpointStore,
-    DispatchPermit, DurableHost, ExactBytes, ExecutionId, HostEpoch, HostOutcome,
-    InMemoryCheckpointStore, InMemoryFault, LogicalActivityId, Nondeterminism,
-    ObservationRejection, PersistenceBoundary, ReloadReason, StorageRevision, StoreError,
-    StoreErrorKind, StoredCheckpoint, Workflow, WorkflowContext,
+    ActivityName, ActivityObservation, ActivitySequence, ActivitySpec, AttemptId,
+    CHECKPOINT_FORMAT_VERSION, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits,
+    CheckpointPayload, CheckpointState, CheckpointStore, DispatchPermit, DurableHost, ExactBytes,
+    ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore,
+    InMemoryFault, LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
+    ReloadReason, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint, TerminalOutcome,
+    Workflow, WorkflowContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,10 +40,20 @@ pub enum ScenarioId {
     EncodedByteReservation,
     OversizedObservation,
     Base64ExactBytes,
+    ActiveToTerminalCompaction,
+    TerminalReloadWithoutWorkflowPoll,
+    ZeroActivityTerminalization,
+    TerminalOutcomeBounds,
+    TerminalCapacityAdmission,
+    CompletionConflict,
+    CompletionOutcomeUnknownAfterApply,
+    CompletionOutcomeUnknownWithoutApply,
+    CompletionStoreFailures,
+    ExecutionContractValidation,
 }
 
 impl ScenarioId {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 38] = [
         Self::RestartBeforeSchedulePersistence,
         Self::RestartAfterSchedulePersistence,
         Self::RestartAfterDispatchExposure,
@@ -71,6 +82,16 @@ impl ScenarioId {
         Self::EncodedByteReservation,
         Self::OversizedObservation,
         Self::Base64ExactBytes,
+        Self::ActiveToTerminalCompaction,
+        Self::TerminalReloadWithoutWorkflowPoll,
+        Self::ZeroActivityTerminalization,
+        Self::TerminalOutcomeBounds,
+        Self::TerminalCapacityAdmission,
+        Self::CompletionConflict,
+        Self::CompletionOutcomeUnknownAfterApply,
+        Self::CompletionOutcomeUnknownWithoutApply,
+        Self::CompletionStoreFailures,
+        Self::ExecutionContractValidation,
     ];
 
     pub const fn stable_id(self) -> &'static str {
@@ -103,6 +124,16 @@ impl ScenarioId {
             Self::EncodedByteReservation => "FR-013-26",
             Self::OversizedObservation => "FR-013-27",
             Self::Base64ExactBytes => "FR-013-28",
+            Self::ActiveToTerminalCompaction => "FR-013-29",
+            Self::TerminalReloadWithoutWorkflowPoll => "FR-013-30",
+            Self::ZeroActivityTerminalization => "FR-013-31",
+            Self::TerminalOutcomeBounds => "FR-013-32",
+            Self::TerminalCapacityAdmission => "FR-013-33",
+            Self::CompletionConflict => "FR-013-34",
+            Self::CompletionOutcomeUnknownAfterApply => "FR-013-35",
+            Self::CompletionOutcomeUnknownWithoutApply => "FR-013-36",
+            Self::CompletionStoreFailures => "FR-013-37",
+            Self::ExecutionContractValidation => "FR-013-38",
         }
     }
 }
@@ -213,6 +244,20 @@ async fn run_scenario_inner(id: ScenarioId) -> ScenarioEvidence {
         ScenarioId::EncodedByteReservation => encoded_byte_reservation(id).await,
         ScenarioId::OversizedObservation => oversized_observation(id).await,
         ScenarioId::Base64ExactBytes => base64_exact_bytes(id).await,
+        ScenarioId::ActiveToTerminalCompaction => active_to_terminal_compaction(id).await,
+        ScenarioId::TerminalReloadWithoutWorkflowPoll => terminal_reload_without_poll(id).await,
+        ScenarioId::ZeroActivityTerminalization => zero_activity_terminalization(id).await,
+        ScenarioId::TerminalOutcomeBounds => terminal_outcome_bounds(id).await,
+        ScenarioId::TerminalCapacityAdmission => terminal_capacity_admission(id).await,
+        ScenarioId::CompletionConflict => completion_conflict(id).await,
+        ScenarioId::CompletionOutcomeUnknownAfterApply => {
+            completion_outcome_unknown_after_apply(id).await
+        }
+        ScenarioId::CompletionOutcomeUnknownWithoutApply => {
+            completion_outcome_unknown_without_apply(id).await
+        }
+        ScenarioId::CompletionStoreFailures => completion_store_failures(id).await,
+        ScenarioId::ExecutionContractValidation => execution_contract_validation(id).await,
     }
 }
 
@@ -303,8 +348,8 @@ async fn contending_turns(
     let first_workflow = workflow.clone();
     let first_input = input.clone();
     let (first, second) = join!(
-        first_host.turn(&first_workflow, execution_id, first_input),
-        second_host.turn(&workflow, execution_id, input)
+        first_host.turn(&first_workflow, execution_spec(execution_id, first_input)),
+        second_host.turn(&workflow, execution_spec(execution_id, input))
     );
     [first, second]
 }
@@ -337,12 +382,36 @@ impl LinearWorkflow {
 
 #[async_trait(?Send)]
 impl Workflow for LinearWorkflow {
-    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> ExactBytes {
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         let mut result = Vec::new();
         for spec in &self.activities {
             result.extend(context.activity(spec.clone()).await.as_slice());
         }
-        ExactBytes::new(result)
+        TerminalOutcome::succeeded(ExactBytes::new(result))
+    }
+}
+
+#[derive(Clone)]
+struct TerminalWorkflow {
+    outcome: TerminalOutcome,
+}
+
+#[async_trait(?Send)]
+impl Workflow for TerminalWorkflow {
+    async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
+        self.outcome.clone()
+    }
+}
+
+struct PollSentinelWorkflow<'a> {
+    polls: &'a Cell<usize>,
+}
+
+#[async_trait(?Send)]
+impl Workflow for PollSentinelWorkflow<'_> {
+    async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
+        self.polls.set(self.polls.get() + 1);
+        TerminalOutcome::failed(bytes(b"workflow was polled"))
     }
 }
 
@@ -356,6 +425,12 @@ fn epoch(value: u8) -> HostEpoch {
 
 fn bytes(value: &[u8]) -> ExactBytes {
     ExactBytes::new(value)
+}
+
+const MAX_TERMINAL_PAYLOAD_BYTES: u64 = 4096;
+
+fn execution_spec(execution_id: ExecutionId, input: ExactBytes) -> ExecutionSpec {
+    ExecutionSpec::new(execution_id, input, MAX_TERMINAL_PAYLOAD_BYTES)
 }
 
 fn activity_name(value: &str, version: u32) -> ActivityName {
@@ -380,7 +455,10 @@ async fn schedule(
     execution_id: ExecutionId,
     input: &ExactBytes,
 ) -> Option<LogicalActivityId> {
-    match host.turn(workflow, execution_id, input.clone()).await {
+    match host
+        .turn(workflow, execution_spec(execution_id, input.clone()))
+        .await
+    {
         HostOutcome::ScheduleAccepted { activity, .. } => Some(activity),
         _ => None,
     }
@@ -392,7 +470,10 @@ async fn expose(
     execution_id: ExecutionId,
     input: &ExactBytes,
 ) -> Option<DispatchPermit> {
-    match host.turn(workflow, execution_id, input.clone()).await {
+    match host
+        .turn(workflow, execution_spec(execution_id, input.clone()))
+        .await
+    {
         HostOutcome::DispatchPermitted { permit, .. } => Some(permit),
         _ => None,
     }
@@ -461,14 +542,18 @@ async fn restart_before_schedule(id: ScenarioId) -> ScenarioEvidence {
     store.fail_next_compare_and_swap(InMemoryFault::FailBeforeRequest(
         StoreErrorKind::Unavailable,
     ));
-    let rejected = first.turn(&workflow, execution_id, input.clone()).await;
+    let rejected = first
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
+        .await;
     let absent = store
         .load(execution_id)
         .await
         .expect("scenario load must not fail")
         .is_none();
     let mut restarted = host(store.clone(), 2);
-    let accepted = restarted.turn(&workflow, execution_id, input).await;
+    let accepted = restarted
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "fail schedule before request, discard host, and replay",
@@ -501,18 +586,20 @@ async fn restart_after_schedule(id: ScenarioId) -> ScenarioEvidence {
     let input = bytes(b"workflow");
     let mut first = host(store.clone(), 1);
     let (logical, schedule_revision) = match first
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await
     {
         HostOutcome::ScheduleAccepted { activity, revision } => (Some(activity), Some(revision)),
         _ => (None, None),
     };
     let mut restarted = host(store, 2);
-    let (permit, exposure_revision) =
-        match restarted.turn(&workflow, execution_id, input.clone()).await {
-            HostOutcome::DispatchPermitted { permit, revision } => (Some(permit), Some(revision)),
-            _ => (None, None),
-        };
+    let (permit, exposure_revision) = match restarted
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
+        .await
+    {
+        HostOutcome::DispatchPermitted { permit, revision } => (Some(permit), Some(revision)),
+        _ => (None, None),
+    };
     ScenarioEvidence::new(
         id,
         "persist schedule, discard host, and prepare exposure in a new epoch",
@@ -546,7 +633,9 @@ async fn restart_after_exposure(id: ScenarioId) -> ScenarioEvidence {
         .await
         .expect("scenario load must not fail");
     let mut restarted = host(store.clone(), 9);
-    let outcome = restarted.turn(&workflow, execution_id, input).await;
+    let outcome = restarted
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     let after = store
         .load(execution_id)
         .await
@@ -582,15 +671,18 @@ async fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
     let lost_effect_reply = effect.invoke(permit);
     drop(lost_effect_reply);
     let mut restarted = host(store, 40);
-    let quarantined = restarted.turn(&workflow, execution_id, input.clone()).await;
+    let quarantined = restarted
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
+        .await;
     let observed = restarted
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical.clone(), bytes(b"effect-result")),
         )
         .await;
-    let completed = restarted.turn(&workflow, execution_id, input).await;
+    let completed = restarted
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "invoke one permitted external effect, discard its reply, restart into quarantine, then inject an authoritative observation",
@@ -621,8 +713,10 @@ async fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
                 "observed result replays to workflow completion",
                 matches!(
                     completed,
-                    HostOutcome::WorkflowCompleted { result }
-                        if result == bytes(b"effect-result")
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Succeeded(result),
+                        ..
+                    } if result == bytes(b"effect-result")
                 ),
             ),
         ],
@@ -657,7 +751,9 @@ async fn schedule_conflict(id: ScenarioId) -> ScenarioEvidence {
         .filter(|outcome| matches!(outcome, HostOutcome::DispatchPermitted { .. }))
         .count();
     let mut after_race = host(store, 5);
-    let exposed = after_race.turn(&workflow, execution_id, input).await;
+    let exposed = after_race
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "race two hosts loaded at the missing-checkpoint schedule revision",
@@ -709,7 +805,9 @@ async fn exposure_conflict(id: ScenarioId) -> ScenarioEvidence {
         })
         .count();
     let mut after_race = host(store, 6);
-    let duplicate = after_race.turn(&workflow, execution_id, input).await;
+    let duplicate = after_race
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "race two hosts loaded at the same accepted schedule revision",
@@ -746,8 +844,7 @@ async fn changed_order(id: ScenarioId) -> ScenarioEvidence {
         .unwrap();
     durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical, bytes(b"done")),
         )
         .await;
@@ -757,7 +854,9 @@ async fn changed_order(id: ScenarioId) -> ScenarioEvidence {
             activity_spec("first", 1, b"A", 1024),
         ],
     };
-    let outcome = durable_host.turn(&reordered, execution_id, input).await;
+    let outcome = durable_host
+        .turn(&reordered, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "complete the first recorded activity and replay a reordered definition",
@@ -811,12 +910,13 @@ async fn changed_definition(
         .unwrap();
     durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical, bytes(b"done")),
         )
         .await;
-    let outcome = durable_host.turn(&changed, execution_id, input).await;
+    let outcome = durable_host
+        .turn(&changed, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         setup,
@@ -843,9 +943,11 @@ async fn refreshed_attempt(id: ScenarioId) -> ScenarioEvidence {
         StoreErrorKind::Unavailable,
     ));
     let rejected = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
-    let accepted = durable_host.turn(&workflow, execution_id, input).await;
+    let accepted = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "discard a pre-exposure attempt after rejection and prepare a fresh attempt",
@@ -891,13 +993,13 @@ async fn quarantine(id: ScenarioId) -> ScenarioEvidence {
         .await
         .expect("scenario load must not fail");
     let first = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let changed_while_unresolved = durable_host
-        .turn(&changed, execution_id, input.clone())
+        .turn(&changed, execution_spec(execution_id, input.clone()))
         .await;
     let second = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let after = store
         .load(execution_id)
@@ -905,12 +1007,13 @@ async fn quarantine(id: ScenarioId) -> ScenarioEvidence {
         .expect("scenario load must not fail");
     let observed = durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical.clone(), bytes(b"resolved")),
         )
         .await;
-    let changed_after_resolution = durable_host.turn(&changed, execution_id, input).await;
+    let changed_after_resolution = durable_host
+        .turn(&changed, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "poll exposed unresolved work repeatedly and with a changed workflow definition",
@@ -947,15 +1050,16 @@ async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
     let (_, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(12).await;
     durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical, bytes(b"recorded")),
         )
         .await;
     let first = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
-    let second = durable_host.turn(&workflow, execution_id, input).await;
+    let second = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "replay the same completed checkpoint twice",
@@ -964,7 +1068,10 @@ async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
                 "first replay returns the recorded result",
                 matches!(
                     &first,
-                    HostOutcome::WorkflowCompleted { result } if result == &bytes(b"recorded")
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Succeeded(result),
+                        ..
+                    } if result == &bytes(b"recorded")
                 ),
             ),
             ("second replay is semantically identical", first == second),
@@ -982,18 +1089,22 @@ async fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(13);
     let input = bytes(b"workflow");
-    let valid = CheckpointEnvelope::encode(&CheckpointPayload::new(
-        execution_id,
-        input.clone(),
+    let valid = CheckpointEnvelope::encode(&CheckpointPayload::active(
+        ExecutionContract::new(
+            execution_spec(execution_id, input.clone()),
+            generous_limits().max_encoded_bytes() as u64,
+        ),
         Vec::new(),
     ))
     .unwrap();
-    let unsupported = CheckpointEnvelope::new(999, valid.payload().clone());
+    let unsupported = CheckpointEnvelope::new(2, valid.payload().clone());
     let stored = store
         .compare_and_swap(execution_id, None, unsupported)
         .await;
     let mut durable_host = host(store, 13);
-    let outcome = durable_host.turn(&workflow, execution_id, input).await;
+    let outcome = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "load a checkpoint with an unsupported envelope version",
@@ -1018,13 +1129,15 @@ async fn schedule_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvidenc
     let mut durable_host = host(store.clone(), 14);
     store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
     let lost = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let loaded = store
         .load(execution_id)
         .await
         .expect("scenario load must not fail");
-    let next = durable_host.turn(&workflow, execution_id, input).await;
+    let next = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "lose the response after applying the schedule CAS",
@@ -1061,9 +1174,11 @@ async fn exposure_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvidenc
         .store()
         .fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
     let lost = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
-    let next = durable_host.turn(&workflow, execution_id, input).await;
+    let next = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "lose the response after applying dispatch exposure",
@@ -1092,12 +1207,13 @@ async fn observation_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvid
     store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
     let lost = durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical, bytes(b"observed")),
         )
         .await;
-    let next = durable_host.turn(&workflow, execution_id, input).await;
+    let next = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "lose the response after applying an authoritative observation",
@@ -1116,7 +1232,10 @@ async fn observation_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvid
                 "reload replays the applied observed result",
                 matches!(
                     next,
-                    HostOutcome::WorkflowCompleted { result } if result == bytes(b"observed")
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Succeeded(result),
+                        ..
+                    } if result == bytes(b"observed")
                 ),
             ),
         ],
@@ -1132,12 +1251,13 @@ async fn mismatched_observation(id: ScenarioId) -> ScenarioEvidence {
     );
     let rejected = durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(mismatched, bytes(b"result")),
         )
         .await;
-    let next = durable_host.turn(&workflow, execution_id, input).await;
+    let next = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "inject a result for a different exact logical activity",
@@ -1169,15 +1289,15 @@ async fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
     let second_host = DurableHost::new(second_store, epoch(204), generous_limits());
     let first_result = bytes(b"first");
     let second_result = bytes(b"second");
+    let first_execution = execution_spec(execution_id, input_for_first);
+    let second_execution = execution_spec(execution_id, input.clone());
     let (first_outcome, second_outcome) = join!(
         first_host.observe(
-            execution_id,
-            &input_for_first,
+            &first_execution,
             ActivityObservation::new(logical_for_first, first_result.clone()),
         ),
         second_host.observe(
-            execution_id,
-            &input,
+            &second_execution,
             ActivityObservation::new(logical, second_result.clone()),
         )
     );
@@ -1205,7 +1325,7 @@ async fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
         .count();
     let mut durable_host = host(store, 18);
     let completed = durable_host
-        .turn(&workflow, execution_id, replay_input)
+        .turn(&workflow, execution_spec(execution_id, replay_input))
         .await;
     ScenarioEvidence::new(
         id,
@@ -1219,8 +1339,10 @@ async fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
                 "the accepted observation remains authoritative",
                 matches!(
                     completed,
-                    HostOutcome::WorkflowCompleted { result }
-                        if accepted_results.first().is_some_and(|accepted| &result == *accepted)
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Succeeded(result),
+                        ..
+                    } if accepted_results.first().is_some_and(|accepted| &result == *accepted)
                 ),
             ),
         ],
@@ -1231,12 +1353,11 @@ async fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
     let (store, mut durable_host, workflow, execution_id, input, logical, permit) =
         prepared_one(19).await;
     let quarantined = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let accepted = durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical.clone(), bytes(b"resolved")),
         )
         .await;
@@ -1246,8 +1367,7 @@ async fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
         .expect("scenario load must not fail");
     let stale = durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical.clone(), bytes(b"stale")),
         )
         .await;
@@ -1256,7 +1376,9 @@ async fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
             .load(execution_id)
             .await
             .expect("scenario load must not fail");
-    let completed = durable_host.turn(&workflow, execution_id, input).await;
+    let completed = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "resolve quarantined work only through the public observation API",
@@ -1310,10 +1432,10 @@ async fn quarantine_blocks_progress(id: ScenarioId) -> ScenarioEvidence {
         .await
         .expect("scenario load must not fail");
     let blocked_one = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let blocked_two = durable_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let still_same = before
         == store
@@ -1322,12 +1444,13 @@ async fn quarantine_blocks_progress(id: ScenarioId) -> ScenarioEvidence {
             .expect("scenario load must not fail");
     durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(first_logical, bytes(b"first-result")),
         )
         .await;
-    let after_observation = durable_host.turn(&workflow, execution_id, input).await;
+    let after_observation = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
     ScenarioEvidence::new(
         id,
         "replay a two-activity workflow while the first exposure is unresolved",
@@ -1377,7 +1500,7 @@ async fn load_absence_and_provider_failures(id: ScenarioId) -> ScenarioEvidence 
         store.fail_next_load(StoreError::new(kind, format!("{kind} provider detail")));
         let mut durable_host = host(store.clone(), 21);
         let outcome = durable_host
-            .turn(&workflow, execution_id, input.clone())
+            .turn(&workflow, execution_spec(execution_id, input.clone()))
             .await;
         kinds_preserved &= matches!(
             &outcome,
@@ -1402,8 +1525,7 @@ async fn load_absence_and_provider_failures(id: ScenarioId) -> ScenarioEvidence 
     ));
     let observation_failure = durable_host
         .observe(
-            observed_execution,
-            &observed_input,
+            &execution_spec(observed_execution, observed_input),
             ActivityObservation::new(logical, bytes(b"result")),
         )
         .await;
@@ -1445,7 +1567,10 @@ async fn opaque_storage_revisions(id: ScenarioId) -> ScenarioEvidence {
     let execution_id = execution(22);
     let input = bytes(b"workflow");
     let mut durable_host = host(store, 22);
-    let revision = match durable_host.turn(&workflow, execution_id, input).await {
+    let revision = match durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await
+    {
         HostOutcome::ScheduleAccepted { revision, .. } => Some(revision),
         _ => None,
     };
@@ -1487,7 +1612,7 @@ async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence 
     schedule_unapplied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
     let mut schedule_unapplied_host = host(schedule_unapplied_store.clone(), 23);
     let schedule_unapplied = schedule_unapplied_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let schedule_remained_absent = schedule_unapplied_store
         .load(execution_id)
@@ -1499,7 +1624,7 @@ async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence 
     schedule_applied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
     let mut schedule_applied_host = host(schedule_applied_store.clone(), 24);
     let schedule_applied = schedule_applied_host
-        .turn(&workflow, execution_id, input.clone())
+        .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await;
     let schedule_became_present = schedule_applied_store
         .load(execution_id)
@@ -1523,7 +1648,7 @@ async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence 
         .expect("scenario load must not fail");
     exposure_unapplied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
     let exposure_unapplied = exposure_unapplied_host
-        .turn(&workflow, execution(123), input.clone())
+        .turn(&workflow, execution_spec(execution(123), input.clone()))
         .await;
     let exposure_unapplied_after = exposure_unapplied_store
         .load(execution(123))
@@ -1546,7 +1671,7 @@ async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence 
         .expect("scenario load must not fail");
     exposure_applied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
     let exposure_applied = exposure_applied_host
-        .turn(&workflow, execution(124), input.clone())
+        .turn(&workflow, execution_spec(execution(124), input.clone()))
         .await;
     let exposure_applied_after = exposure_applied_store
         .load(execution(124))
@@ -1570,8 +1695,7 @@ async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence 
         .fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
     let observation_unapplied = observation_unapplied_host
         .observe(
-            observation_unapplied_execution,
-            &observation_unapplied_input,
+            &execution_spec(observation_unapplied_execution, observation_unapplied_input),
             ActivityObservation::new(observation_unapplied_logical, bytes(b"result")),
         )
         .await;
@@ -1596,8 +1720,7 @@ async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence 
     observation_applied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
     let observation_applied = observation_applied_host
         .observe(
-            observation_applied_execution,
-            &observation_applied_input,
+            &execution_spec(observation_applied_execution, observation_applied_input),
             ActivityObservation::new(observation_applied_logical, bytes(b"result")),
         )
         .await;
@@ -1663,8 +1786,7 @@ async fn changed_result_bound(id: ScenarioId) -> ScenarioEvidence {
     let (_, mut durable_host, _workflow, execution_id, input, logical, _) = prepared_one(127).await;
     durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical.clone(), bytes(b"done")),
         )
         .await;
@@ -1674,7 +1796,9 @@ async fn changed_result_bound(id: ScenarioId) -> ScenarioEvidence {
         ActivitySequence::new(0),
         activity_spec("effect", 1, b"activity", 1025),
     );
-    let outcome = durable_host.turn(&changed, execution_id, input).await;
+    let outcome = durable_host
+        .turn(&changed, execution_spec(execution_id, input))
+        .await;
 
     ScenarioEvidence::new(
         id,
@@ -1712,7 +1836,7 @@ async fn activity_count_and_growing_history(id: ScenarioId) -> ScenarioEvidence 
     let mut all_observations_accepted = true;
     for result in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
         let logical = match durable_host
-            .turn(&workflow, execution_id, input.clone())
+            .turn(&workflow, execution_spec(execution_id, input.clone()))
             .await
         {
             HostOutcome::ScheduleAccepted { activity, .. } => activity,
@@ -1729,38 +1853,43 @@ async fn activity_count_and_growing_history(id: ScenarioId) -> ScenarioEvidence 
         };
         let permitted = matches!(
             durable_host
-                .turn(&workflow, execution_id, input.clone())
+                .turn(&workflow, execution_spec(execution_id, input.clone()))
                 .await,
             HostOutcome::DispatchPermitted { .. }
         );
         let observed = durable_host
             .observe(
-                execution_id,
-                &input,
+                &execution_spec(execution_id, input.clone()),
                 ActivityObservation::new(logical, bytes(result)),
             )
             .await;
         all_observations_accepted &=
             permitted && matches!(observed, HostOutcome::ObservationAccepted { .. });
     }
-    let completed = durable_host
-        .turn(&workflow, execution_id, input.clone())
-        .await;
-    let persisted_count = store
+    let persisted_active_count = store
         .load(execution_id)
         .await
         .expect("scenario load must not fail")
         .and_then(|stored| {
             stored
                 .checkpoint()
-                .decode_and_validate(execution_id, &input, limits)
+                .decode_and_validate(&execution_spec(execution_id, input.clone()), limits)
                 .ok()
-                .map(|payload| payload.activities().len())
+                .and_then(|payload| {
+                    payload
+                        .active_activities()
+                        .map(|activities| activities.len())
+                })
         });
 
     let mut four = workflow.clone();
     four.activities.push(activity_spec("fourth", 1, b"D", 16));
-    let first_excess = durable_host.turn(&four, execution_id, input).await;
+    let first_excess = durable_host
+        .turn(&four, execution_spec(execution_id, input.clone()))
+        .await;
+    let completed = durable_host
+        .turn(&workflow, execution_spec(execution_id, input))
+        .await;
 
     ScenarioEvidence::new(
         id,
@@ -1769,7 +1898,7 @@ async fn activity_count_and_growing_history(id: ScenarioId) -> ScenarioEvidence 
             (
                 "completed history grows successfully through the exact count boundary",
                 all_observations_accepted
-                    && persisted_count == Some(3)
+                    && persisted_active_count == Some(3)
                     && matches!(completed, HostOutcome::WorkflowCompleted { .. }),
             ),
             (
@@ -1795,18 +1924,27 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
     let execution_id = execution(129);
     let input = bytes(b"workflow");
     let activity = activity_spec("bounded", 1, b"input", MAX_RESULT as u64);
-    let exact_completed = CheckpointEnvelope::encode(&CheckpointPayload::new(
-        execution_id,
-        input.clone(),
-        vec![kuberic_durable_execution::ActivityRecord::completed(
-            ActivitySequence::new(0),
-            activity.clone(),
-            ExactBytes::new(vec![0; MAX_RESULT]),
-        )],
-    ))
-    .unwrap()
-    .encoded_len()
-    .unwrap();
+    let exact_execution = ExecutionSpec::new(execution_id, input.clone(), MAX_RESULT as u64);
+    let mut exact_completed = 1_000_000_u64;
+    for _ in 0..8 {
+        let probe = CheckpointPayload::active(
+            ExecutionContract::new(exact_execution.clone(), exact_completed),
+            vec![kuberic_durable_execution::ActivityRecord::scheduled(
+                ActivitySequence::new(0),
+                activity.clone(),
+            )],
+        );
+        let required = probe
+            .maximum_activity_completed_encoded_len()
+            .unwrap()
+            .max(probe.maximum_terminal_encoded_len().unwrap());
+        let required = u64::try_from(required).unwrap();
+        if required == exact_completed {
+            break;
+        }
+        exact_completed = required;
+    }
+    let exact_completed = usize::try_from(exact_completed).unwrap();
 
     let exact_store = InMemoryCheckpointStore::new();
     let exact_limits = CheckpointLimits::new(1, exact_completed).unwrap();
@@ -1814,23 +1952,18 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
         activities: vec![activity.clone()],
     };
     let mut exact_host = DurableHost::new(exact_store.clone(), epoch(129), exact_limits);
-    let scheduled = exact_host
-        .turn(&workflow, execution_id, input.clone())
-        .await;
+    let scheduled = exact_host.turn(&workflow, exact_execution.clone()).await;
     let logical = match &scheduled {
         HostOutcome::ScheduleAccepted { activity, .. } => Some(activity.clone()),
         _ => None,
     };
-    let exposure = exact_host
-        .turn(&workflow, execution_id, input.clone())
-        .await;
+    let exposure = exact_host.turn(&workflow, exact_execution.clone()).await;
     let exact_result = ExactBytes::new(vec![0; MAX_RESULT]);
     let observation = match logical {
         Some(logical) => {
             exact_host
                 .observe(
-                    execution_id,
-                    &input,
+                    &exact_execution,
                     ActivityObservation::new(logical, exact_result),
                 )
                 .await
@@ -1846,10 +1979,9 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
     let tight_store = InMemoryCheckpointStore::new();
     let tight_limits = CheckpointLimits::new(1, exact_completed - 1).unwrap();
     let mut tight_host = DurableHost::new(tight_store, epoch(130), tight_limits);
-    let tight_schedule = tight_host
-        .turn(&workflow, execution_id, input.clone())
-        .await;
-    let tight_exposure = tight_host.turn(&workflow, execution_id, input).await;
+    let tight_execution = ExecutionSpec::new(execution_id, input.clone(), MAX_RESULT as u64);
+    let tight_schedule = tight_host.turn(&workflow, tight_execution.clone()).await;
+    let tight_exposure = tight_host.turn(&workflow, tight_execution).await;
 
     let huge_store = InMemoryCheckpointStore::new();
     let huge_workflow = LinearWorkflow::one_with_bound("bounded", 1, b"input", u64::MAX);
@@ -1858,12 +1990,13 @@ async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
         epoch(132),
         CheckpointLimits::new(1, 100_000).unwrap(),
     );
-    let huge_schedule = huge_host
-        .turn(&huge_workflow, execution(131), bytes(b"workflow"))
-        .await;
-    let huge_exposure = huge_host
-        .turn(&huge_workflow, execution(131), bytes(b"workflow"))
-        .await;
+    let huge_execution = ExecutionSpec::new(
+        execution(131),
+        bytes(b"workflow"),
+        MAX_TERMINAL_PAYLOAD_BYTES,
+    );
+    let huge_schedule = huge_host.turn(&huge_workflow, huge_execution.clone()).await;
+    let huge_exposure = huge_host.turn(&huge_workflow, huge_execution).await;
 
     ScenarioEvidence::new(
         id,
@@ -1924,8 +2057,7 @@ async fn oversized_observation(id: ScenarioId) -> ScenarioEvidence {
         .expect("scenario load must not fail");
     let oversized = durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input.clone()),
             ActivityObservation::new(logical.clone(), bytes(b"four")),
         )
         .await;
@@ -1936,8 +2068,7 @@ async fn oversized_observation(id: ScenarioId) -> ScenarioEvidence {
             .expect("scenario load must not fail");
     let exact = durable_host
         .observe(
-            execution_id,
-            &input,
+            &execution_spec(execution_id, input),
             ActivityObservation::new(logical, bytes(b"tri")),
         )
         .await;
@@ -1962,6 +2093,885 @@ async fn oversized_observation(id: ScenarioId) -> ScenarioEvidence {
             (
                 "a result exactly at the declared bound is accepted",
                 matches!(exact, HostOutcome::ObservationAccepted { .. }),
+            ),
+        ],
+    )
+}
+
+async fn active_to_terminal_compaction(id: ScenarioId) -> ScenarioEvidence {
+    let (store, mut durable_host, workflow, execution_id, input, logical, _) =
+        prepared_one(132).await;
+    let execution = execution_spec(execution_id, input.clone());
+    let observed = durable_host
+        .observe(
+            &execution,
+            ActivityObservation::new(logical, bytes(b"compacted")),
+        )
+        .await;
+    let active_before = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .and_then(|stored| {
+            stored
+                .checkpoint()
+                .decode_and_validate(&execution, generous_limits())
+                .ok()
+        });
+    let completed = durable_host.turn(&workflow, execution.clone()).await;
+    let stored_terminal = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let decoded_terminal = stored_terminal.as_ref().and_then(|stored| {
+        stored
+            .checkpoint()
+            .decode_and_validate(&execution, generous_limits())
+            .ok()
+    });
+    let terminal_json = stored_terminal
+        .as_ref()
+        .and_then(|stored| std::str::from_utf8(stored.checkpoint().payload().as_slice()).ok())
+        .unwrap_or_default();
+    let accepted_revision_matches = match (&completed, &stored_terminal) {
+        (HostOutcome::WorkflowCompleted { revision, .. }, Some(stored)) => {
+            revision == stored.revision()
+        }
+        _ => false,
+    };
+
+    ScenarioEvidence::new(
+        id,
+        "complete one observed activity and CAS-replace active history with terminal state",
+        [
+            (
+                "authoritative activity result is accepted before completion",
+                matches!(observed, HostOutcome::ObservationAccepted { .. }),
+            ),
+            (
+                "active checkpoint retains the complete activity before terminalization",
+                active_before
+                    .as_ref()
+                    .and_then(CheckpointPayload::active_activities)
+                    .is_some_and(|activities| activities.len() == 1),
+            ),
+            (
+                "accepted completion returns exact outcome and accepted revision",
+                matches!(
+                    &completed,
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Succeeded(result),
+                        ..
+                    } if result == &bytes(b"compacted")
+                ) && accepted_revision_matches,
+            ),
+            (
+                "terminal checkpoint contains outcome and completed count but no activity history",
+                matches!(
+                    decoded_terminal.as_ref().map(CheckpointPayload::state),
+                    Some(CheckpointState::Terminal {
+                        outcome: TerminalOutcome::Succeeded(result),
+                        completed_activity_count: 1,
+                    }) if result == &bytes(b"compacted")
+                ) && !terminal_json.contains("activities")
+                    && !terminal_json.contains("history")
+                    && !terminal_json.contains("digest"),
+            ),
+        ],
+    )
+}
+
+async fn terminal_reload_without_poll(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let execution_id = execution(133);
+    let execution = execution_spec(execution_id, bytes(b"workflow"));
+    let outcome = TerminalOutcome::failed(bytes(b"terminal-error"));
+    let mut writer = host(store.clone(), 133);
+    let accepted = writer
+        .turn(
+            &TerminalWorkflow {
+                outcome: outcome.clone(),
+            },
+            execution.clone(),
+        )
+        .await;
+    let polls = Cell::new(0);
+    let mut reader = host(store, 134);
+    let reloaded = reader
+        .turn(&PollSentinelWorkflow { polls: &polls }, execution)
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "reload an accepted failed terminal outcome through a workflow-poll sentinel",
+        [
+            (
+                "zero-activity failure terminalization was accepted",
+                matches!(
+                    &accepted,
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Failed(payload),
+                        ..
+                    } if payload == &bytes(b"terminal-error")
+                ),
+            ),
+            (
+                "terminal reload returns the same outcome and revision",
+                accepted == reloaded,
+            ),
+            (
+                "terminal reload does not poll workflow code",
+                polls.get() == 0,
+            ),
+        ],
+    )
+}
+
+async fn zero_activity_terminalization(id: ScenarioId) -> ScenarioEvidence {
+    let success_store = InMemoryCheckpointStore::new();
+    let success_execution = execution_spec(execution(134), bytes(b"zero-success"));
+    let mut success_host = host(success_store.clone(), 135);
+    let success = success_host
+        .turn(
+            &TerminalWorkflow {
+                outcome: TerminalOutcome::succeeded(bytes(b"done")),
+            },
+            success_execution.clone(),
+        )
+        .await;
+    let success_count = success_store
+        .load(success_execution.execution_id())
+        .await
+        .expect("scenario load must not fail")
+        .and_then(|stored| {
+            stored
+                .checkpoint()
+                .decode_and_validate(&success_execution, generous_limits())
+                .ok()
+        })
+        .and_then(|payload| {
+            payload
+                .terminal_outcome()
+                .map(|(_, completed_activity_count)| completed_activity_count)
+        });
+
+    let failure_store = InMemoryCheckpointStore::new();
+    let failure_execution = execution_spec(execution(135), bytes(b"zero-failure"));
+    let mut failure_host = host(failure_store.clone(), 136);
+    let failure = failure_host
+        .turn(
+            &TerminalWorkflow {
+                outcome: TerminalOutcome::failed(bytes(b"failed")),
+            },
+            failure_execution.clone(),
+        )
+        .await;
+    let failure_count = failure_store
+        .load(failure_execution.execution_id())
+        .await
+        .expect("scenario load must not fail")
+        .and_then(|stored| {
+            stored
+                .checkpoint()
+                .decode_and_validate(&failure_execution, generous_limits())
+                .ok()
+        })
+        .and_then(|payload| {
+            payload
+                .terminal_outcome()
+                .map(|(_, completed_activity_count)| completed_activity_count)
+        });
+
+    ScenarioEvidence::new(
+        id,
+        "terminalize zero-activity success and failure workflows directly from absent state",
+        [
+            (
+                "zero-activity success is durably completed",
+                matches!(
+                    success,
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Succeeded(_),
+                        ..
+                    }
+                ) && success_count == Some(0),
+            ),
+            (
+                "zero-activity failure is durably completed",
+                matches!(
+                    failure,
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Failed(_),
+                        ..
+                    }
+                ) && failure_count == Some(0),
+            ),
+        ],
+    )
+}
+
+async fn terminal_outcome_bounds(id: ScenarioId) -> ScenarioEvidence {
+    async fn run_case(
+        execution_id: ExecutionId,
+        outcome: TerminalOutcome,
+        maximum: u64,
+    ) -> (HostOutcome, bool) {
+        let store = InMemoryCheckpointStore::new();
+        let execution = ExecutionSpec::new(execution_id, bytes(b"bounds"), maximum);
+        let mut durable_host = host(store.clone(), execution_id.as_bytes()[0]);
+        let result = durable_host
+            .turn(&TerminalWorkflow { outcome }, execution)
+            .await;
+        let absent = store
+            .load(execution_id)
+            .await
+            .expect("scenario load must not fail")
+            .is_none();
+        (result, absent)
+    }
+
+    let (empty, _) = run_case(
+        execution(136),
+        TerminalOutcome::succeeded(ExactBytes::default()),
+        0,
+    )
+    .await;
+    let (success_exact, _) = run_case(
+        execution(137),
+        TerminalOutcome::succeeded(bytes(b"four")),
+        4,
+    )
+    .await;
+    let (failure_exact, _) =
+        run_case(execution(138), TerminalOutcome::failed(bytes(b"four")), 4).await;
+    let (success_oversized, success_absent) = run_case(
+        execution(139),
+        TerminalOutcome::succeeded(bytes(b"five!")),
+        4,
+    )
+    .await;
+    let (failure_oversized, failure_absent) =
+        run_case(execution(140), TerminalOutcome::failed(bytes(b"five!")), 4).await;
+
+    ScenarioEvidence::new(
+        id,
+        "enforce zero, exact, and maximum-plus-one terminal payload contracts for both outcomes",
+        [
+            (
+                "zero terminal bound accepts an empty payload",
+                matches!(empty, HostOutcome::WorkflowCompleted { .. }),
+            ),
+            (
+                "success and failure payloads at the exact bound are accepted",
+                matches!(success_exact, HostOutcome::WorkflowCompleted { .. })
+                    && matches!(failure_exact, HostOutcome::WorkflowCompleted { .. }),
+            ),
+            (
+                "success payload above the declaration is rejected without persistence",
+                matches!(
+                    success_oversized,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::TerminalPayloadExceedsDeclared {
+                            actual: 5,
+                            maximum: 4
+                        }
+                    )
+                ) && success_absent,
+            ),
+            (
+                "failure payload above the declaration is rejected without persistence",
+                matches!(
+                    failure_oversized,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::TerminalPayloadExceedsDeclared {
+                            actual: 5,
+                            maximum: 4
+                        }
+                    )
+                ) && failure_absent,
+            ),
+        ],
+    )
+}
+
+fn exact_terminal_capacity(execution: &ExecutionSpec) -> usize {
+    let mut admitted = 1_000_000_u64;
+    for _ in 0..16 {
+        let payload = CheckpointPayload::active(
+            ExecutionContract::new(execution.clone(), admitted),
+            Vec::new(),
+        );
+        let required = u64::try_from(payload.maximum_terminal_encoded_len().unwrap()).unwrap();
+        if required == admitted {
+            return usize::try_from(required).unwrap();
+        }
+        admitted = required;
+    }
+    panic!("terminal capacity projection did not converge")
+}
+
+async fn terminal_capacity_admission(id: ScenarioId) -> ScenarioEvidence {
+    let exact_execution = ExecutionSpec::new(execution(141), bytes(b"capacity"), 8);
+    let exact_capacity = exact_terminal_capacity(&exact_execution);
+    let exact_store = InMemoryCheckpointStore::new();
+    let mut exact_host = DurableHost::new(
+        exact_store,
+        epoch(141),
+        CheckpointLimits::new(1, exact_capacity).unwrap(),
+    );
+    let exact = exact_host
+        .turn(
+            &TerminalWorkflow {
+                outcome: TerminalOutcome::succeeded(ExactBytes::new([7; 8])),
+            },
+            exact_execution,
+        )
+        .await;
+
+    let tight_store = InMemoryCheckpointStore::new();
+    let tight_execution = ExecutionSpec::new(execution(142), bytes(b"capacity"), 8);
+    let tight_polls = Cell::new(0);
+    let mut tight_host = DurableHost::new(
+        tight_store.clone(),
+        epoch(142),
+        CheckpointLimits::new(1, exact_capacity - 1).unwrap(),
+    );
+    let tight = tight_host
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &tight_polls,
+            },
+            tight_execution.clone(),
+        )
+        .await;
+    let tight_absent = tight_store
+        .load(tight_execution.execution_id())
+        .await
+        .expect("scenario load must not fail")
+        .is_none();
+
+    let huge_store = InMemoryCheckpointStore::new();
+    let huge_execution = ExecutionSpec::new(execution(143), bytes(b"capacity"), u64::MAX);
+    let huge_polls = Cell::new(0);
+    let mut huge_host = host(huge_store.clone(), 143);
+    let huge = huge_host
+        .turn(&PollSentinelWorkflow { polls: &huge_polls }, huge_execution)
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "admit canonical maximum terminal capacity before workflow polling or effects",
+        [
+            (
+                "the exact projected terminal capacity is accepted",
+                matches!(exact, HostOutcome::WorkflowCompleted { .. }),
+            ),
+            (
+                "one byte below projected capacity rejects before polling, persistence, or permit",
+                matches!(
+                    tight,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::AdmittedTerminalCapacityInsufficient { .. }
+                    )
+                ) && tight_polls.get() == 0
+                    && tight_absent
+                    && !matches!(tight, HostOutcome::DispatchPermitted { .. }),
+            ),
+            (
+                "largest declaration rejects without proportional allocation or polling",
+                matches!(
+                    huge,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::EncodedLengthOverflow
+                            | CheckpointError::TerminalPayloadLengthUnrepresentable
+                    )
+                ) && huge_polls.get() == 0,
+            ),
+        ],
+    )
+}
+
+async fn completion_conflict(id: ScenarioId) -> ScenarioEvidence {
+    let (store, durable_host, workflow, execution_id, input, logical, _) = prepared_one(144).await;
+    let execution = execution_spec(execution_id, input);
+    let observed = durable_host
+        .observe(
+            &execution,
+            ActivityObservation::new(logical, bytes(b"complete")),
+        )
+        .await;
+    let (first_store, second_store) = ContendedStore::pair(store.clone());
+    let mut first = DurableHost::new(first_store, epoch(145), generous_limits());
+    let mut second = DurableHost::new(second_store, epoch(146), generous_limits());
+    let (first_outcome, second_outcome) = join!(
+        first.turn(&workflow, execution.clone()),
+        second.turn(&workflow, execution.clone())
+    );
+    let outcomes = [first_outcome, second_outcome];
+    let completed = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, HostOutcome::WorkflowCompleted { .. }))
+        .count();
+    let conflicts = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome,
+                HostOutcome::ReloadRequired {
+                    boundary: PersistenceBoundary::Completion,
+                    reason: ReloadReason::Conflict
+                }
+            )
+        })
+        .count();
+    let terminal = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .and_then(|stored| {
+            stored
+                .checkpoint()
+                .decode_and_validate(&execution, generous_limits())
+                .ok()
+        })
+        .is_some_and(|payload| matches!(payload.state(), CheckpointState::Terminal { .. }));
+
+    ScenarioEvidence::new(
+        id,
+        "race two completion CAS operations from the same active revision",
+        [
+            (
+                "activity observation prepared completed active history",
+                matches!(observed, HostOutcome::ObservationAccepted { .. }),
+            ),
+            (
+                "exactly one completion CAS is accepted and one conflicts",
+                completed == 1 && conflicts == 1,
+            ),
+            (
+                "completion conflict grants no permit or false second completion",
+                outcomes
+                    .iter()
+                    .all(|outcome| !matches!(outcome, HostOutcome::DispatchPermitted { .. })),
+            ),
+            (
+                "accepted contender leaves one terminal checkpoint",
+                terminal,
+            ),
+        ],
+    )
+}
+
+async fn completion_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvidence {
+    let (store, mut durable_host, workflow, execution_id, input, logical, _) =
+        prepared_one(147).await;
+    let execution = execution_spec(execution_id, input);
+    durable_host
+        .observe(
+            &execution,
+            ActivityObservation::new(logical, bytes(b"applied")),
+        )
+        .await;
+    store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    let uncertain = durable_host.turn(&workflow, execution.clone()).await;
+    let stored_terminal = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .and_then(|stored| {
+            stored
+                .checkpoint()
+                .decode_and_validate(&execution, generous_limits())
+                .ok()
+        })
+        .is_some_and(|payload| matches!(payload.state(), CheckpointState::Terminal { .. }));
+    let polls = Cell::new(0);
+    let recovered = durable_host
+        .turn(&PollSentinelWorkflow { polls: &polls }, execution)
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "lose the response after the completion CAS is applied",
+        [
+            (
+                "applied completion uncertainty requires reload with no permit or completion",
+                matches!(
+                    uncertain,
+                    HostOutcome::ReloadRequired {
+                        boundary: PersistenceBoundary::Completion,
+                        reason: ReloadReason::OutcomeUnknown
+                    }
+                ),
+            ),
+            (
+                "unknown write actually left terminal state",
+                stored_terminal,
+            ),
+            (
+                "reload returns accepted terminal outcome without workflow polling",
+                matches!(recovered, HostOutcome::WorkflowCompleted { .. }) && polls.get() == 0,
+            ),
+        ],
+    )
+}
+
+async fn completion_outcome_unknown_without_apply(id: ScenarioId) -> ScenarioEvidence {
+    let (store, mut durable_host, workflow, execution_id, input, logical, _) =
+        prepared_one(148).await;
+    let execution = execution_spec(execution_id, input);
+    durable_host
+        .observe(
+            &execution,
+            ActivityObservation::new(logical, bytes(b"unapplied")),
+        )
+        .await;
+    let before = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
+    let uncertain = durable_host.turn(&workflow, execution.clone()).await;
+    let after_unknown = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let retried = durable_host.turn(&workflow, execution.clone()).await;
+    let reloaded = durable_host.turn(&workflow, execution).await;
+
+    ScenarioEvidence::new(
+        id,
+        "lose the response without applying completion, then retry from active completed history",
+        [
+            (
+                "unapplied completion uncertainty requires reload",
+                matches!(
+                    uncertain,
+                    HostOutcome::ReloadRequired {
+                        boundary: PersistenceBoundary::Completion,
+                        reason: ReloadReason::OutcomeUnknown
+                    }
+                ),
+            ),
+            (
+                "unapplied uncertainty leaves active completed state unchanged",
+                before == after_unknown,
+            ),
+            (
+                "retry compacts without dispatch and later reload remains terminal",
+                matches!(retried, HostOutcome::WorkflowCompleted { .. })
+                    && matches!(reloaded, HostOutcome::WorkflowCompleted { .. })
+                    && !matches!(retried, HostOutcome::DispatchPermitted { .. }),
+            ),
+        ],
+    )
+}
+
+async fn completion_store_failures(id: ScenarioId) -> ScenarioEvidence {
+    let (store, mut durable_host, workflow, execution_id, input, logical, _) =
+        prepared_one(149).await;
+    let execution = execution_spec(execution_id, input);
+    durable_host
+        .observe(
+            &execution,
+            ActivityObservation::new(logical, bytes(b"stored")),
+        )
+        .await;
+    let before = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    store.fail_next_compare_and_swap(InMemoryFault::FailBeforeRequest(
+        StoreErrorKind::Unavailable,
+    ));
+    let failed_write = durable_host.turn(&workflow, execution.clone()).await;
+    let unchanged = before
+        == store
+            .load(execution_id)
+            .await
+            .expect("scenario load must not fail");
+    let retried = durable_host.turn(&workflow, execution.clone()).await;
+    store.fail_next_load(StoreError::new(
+        StoreErrorKind::Timeout,
+        "terminal reload timed out",
+    ));
+    let failed_load = durable_host.turn(&workflow, execution.clone()).await;
+    let recovered = durable_host.turn(&workflow, execution).await;
+
+    ScenarioEvidence::new(
+        id,
+        "fail a completion write before request and a later terminal load",
+        [
+            (
+                "completion store error reports the completion boundary without completion",
+                matches!(
+                    failed_write,
+                    HostOutcome::StoreFailed {
+                        operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(
+                            PersistenceBoundary::Completion
+                        ),
+                        ..
+                    }
+                ) && unchanged,
+            ),
+            (
+                "fresh retry terminalizes completed active history without a permit",
+                matches!(retried, HostOutcome::WorkflowCompleted { .. })
+                    && !matches!(retried, HostOutcome::DispatchPermitted { .. }),
+            ),
+            (
+                "terminal load failure reports no false completion and a later fresh load recovers",
+                matches!(
+                    failed_load,
+                    HostOutcome::StoreFailed {
+                        operation: kuberic_durable_execution::StoreOperation::Load,
+                        ..
+                    }
+                ) && matches!(recovered, HostOutcome::WorkflowCompleted { .. }),
+            ),
+        ],
+    )
+}
+
+async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
+    let active_store = InMemoryCheckpointStore::new();
+    let workflow = LinearWorkflow::one("effect", 1, b"A");
+    let active_execution = execution_spec(execution(150), bytes(b"active"));
+    let mut active_writer = host(active_store.clone(), 150);
+    let active_created = active_writer
+        .turn(&workflow, active_execution.clone())
+        .await;
+    let active_polls = Cell::new(0);
+    let active_mismatch = active_writer
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &active_polls,
+            },
+            ExecutionSpec::new(
+                active_execution.execution_id(),
+                active_execution.workflow_input().clone(),
+                MAX_TERMINAL_PAYLOAD_BYTES + 1,
+            ),
+        )
+        .await;
+
+    let terminal_store = InMemoryCheckpointStore::new();
+    let terminal_execution = execution_spec(execution(151), bytes(b"terminal"));
+    let mut terminal_writer = host(terminal_store.clone(), 151);
+    terminal_writer
+        .turn(
+            &TerminalWorkflow {
+                outcome: TerminalOutcome::succeeded(bytes(b"done")),
+            },
+            terminal_execution.clone(),
+        )
+        .await;
+    let terminal_polls = Cell::new(0);
+    let terminal_mismatch = terminal_writer
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &terminal_polls,
+            },
+            ExecutionSpec::new(
+                terminal_execution.execution_id(),
+                terminal_execution.workflow_input().clone(),
+                MAX_TERMINAL_PAYLOAD_BYTES + 1,
+            ),
+        )
+        .await;
+
+    let missing_store = InMemoryCheckpointStore::new();
+    let missing_execution = execution_spec(execution(152), bytes(b"missing"));
+    let valid_payload = CheckpointPayload::active(
+        ExecutionContract::new(
+            missing_execution.clone(),
+            generous_limits().max_encoded_bytes() as u64,
+        ),
+        Vec::new(),
+    );
+    let mut value = serde_json::to_value(&valid_payload).unwrap();
+    value["execution"]["spec"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_terminal_payload_bytes");
+    let missing_envelope = CheckpointEnvelope::new(
+        CHECKPOINT_FORMAT_VERSION,
+        ExactBytes::new(serde_json::to_vec(&value).unwrap()),
+    );
+    missing_store
+        .compare_and_swap(missing_execution.execution_id(), None, missing_envelope)
+        .await
+        .unwrap();
+    let missing_polls = Cell::new(0);
+    let mut missing_host = host(missing_store, 152);
+    let missing = missing_host
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &missing_polls,
+            },
+            missing_execution,
+        )
+        .await;
+
+    let inconsistent_active_store = InMemoryCheckpointStore::new();
+    let inconsistent_active_execution = execution_spec(execution(153), bytes(b"inconsistent"));
+    let inconsistent_active = CheckpointEnvelope::encode(&CheckpointPayload::active(
+        ExecutionContract::new(inconsistent_active_execution.clone(), 1),
+        Vec::new(),
+    ))
+    .unwrap();
+    inconsistent_active_store
+        .compare_and_swap(
+            inconsistent_active_execution.execution_id(),
+            None,
+            inconsistent_active,
+        )
+        .await
+        .unwrap();
+    let inconsistent_active_polls = Cell::new(0);
+    let mut inconsistent_active_host = host(inconsistent_active_store, 153);
+    let inconsistent_active_result = inconsistent_active_host
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &inconsistent_active_polls,
+            },
+            inconsistent_active_execution,
+        )
+        .await;
+
+    let inconsistent_terminal_store = InMemoryCheckpointStore::new();
+    let inconsistent_terminal_execution =
+        execution_spec(execution(154), bytes(b"inconsistent-terminal"));
+    let inconsistent_terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
+        ExecutionContract::new(inconsistent_terminal_execution.clone(), 1),
+        TerminalOutcome::succeeded(bytes(b"done")),
+        0,
+    ))
+    .unwrap();
+    inconsistent_terminal_store
+        .compare_and_swap(
+            inconsistent_terminal_execution.execution_id(),
+            None,
+            inconsistent_terminal,
+        )
+        .await
+        .unwrap();
+    let inconsistent_terminal_polls = Cell::new(0);
+    let mut inconsistent_terminal_host = host(inconsistent_terminal_store, 154);
+    let inconsistent_terminal_result = inconsistent_terminal_host
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &inconsistent_terminal_polls,
+            },
+            inconsistent_terminal_execution,
+        )
+        .await;
+
+    let active_downgrade_store = InMemoryCheckpointStore::new();
+    let active_downgrade_execution = execution_spec(execution(155), bytes(b"downgrade-active"));
+    let mut active_downgrade_writer = host(active_downgrade_store.clone(), 155);
+    active_downgrade_writer
+        .turn(&workflow, active_downgrade_execution.clone())
+        .await;
+    let mut active_downgrade_host = DurableHost::new(
+        active_downgrade_store,
+        epoch(156),
+        CheckpointLimits::new(128, generous_limits().max_encoded_bytes() - 1).unwrap(),
+    );
+    let active_downgrade_polls = Cell::new(0);
+    let active_downgrade = active_downgrade_host
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &active_downgrade_polls,
+            },
+            active_downgrade_execution,
+        )
+        .await;
+
+    let terminal_downgrade_store = InMemoryCheckpointStore::new();
+    let terminal_downgrade_execution = execution_spec(execution(156), bytes(b"downgrade-terminal"));
+    let mut terminal_downgrade_writer = host(terminal_downgrade_store.clone(), 157);
+    terminal_downgrade_writer
+        .turn(
+            &TerminalWorkflow {
+                outcome: TerminalOutcome::succeeded(bytes(b"done")),
+            },
+            terminal_downgrade_execution.clone(),
+        )
+        .await;
+    let mut terminal_downgrade_host = DurableHost::new(
+        terminal_downgrade_store,
+        epoch(158),
+        CheckpointLimits::new(128, generous_limits().max_encoded_bytes() - 1).unwrap(),
+    );
+    let terminal_downgrade_polls = Cell::new(0);
+    let terminal_downgrade = terminal_downgrade_host
+        .turn(
+            &PollSentinelWorkflow {
+                polls: &terminal_downgrade_polls,
+            },
+            terminal_downgrade_execution,
+        )
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "reject changed, missing, inconsistent, or downgraded execution contracts before polling",
+        [
+            (
+                "active and terminal caller-bound mismatches reject before polling",
+                matches!(active_created, HostOutcome::ScheduleAccepted { .. })
+                    && matches!(
+                        active_mismatch,
+                        HostOutcome::CheckpointRejected(
+                            CheckpointError::TerminalPayloadBoundMismatch { .. }
+                        )
+                    )
+                    && matches!(
+                        terminal_mismatch,
+                        HostOutcome::CheckpointRejected(
+                            CheckpointError::TerminalPayloadBoundMismatch { .. }
+                        )
+                    )
+                    && active_polls.get() == 0
+                    && terminal_polls.get() == 0,
+            ),
+            (
+                "missing persisted declaration is malformed and rejected before polling",
+                matches!(
+                    missing,
+                    HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
+                ) && missing_polls.get() == 0,
+            ),
+            (
+                "self-inconsistent admitted capacity rejects active and terminal state",
+                matches!(
+                    inconsistent_active_result,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::AdmittedTerminalCapacityInsufficient { .. }
+                    )
+                ) && matches!(
+                    inconsistent_terminal_result,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::AdmittedTerminalCapacityInsufficient { .. }
+                    )
+                ) && inconsistent_active_polls.get() == 0
+                    && inconsistent_terminal_polls.get() == 0,
+            ),
+            (
+                "configured capacity downgrade rejects active and terminal state before polling",
+                matches!(
+                    active_downgrade,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::ConfiguredCapacityBelowAdmission { .. }
+                    )
+                ) && matches!(
+                    terminal_downgrade,
+                    HostOutcome::CheckpointRejected(
+                        CheckpointError::ConfiguredCapacityBelowAdmission { .. }
+                    )
+                ) && active_downgrade_polls.get() == 0
+                    && terminal_downgrade_polls.get() == 0,
             ),
         ],
     )
@@ -1994,6 +3004,7 @@ async fn base64_exact_bytes(id: ScenarioId) -> ScenarioEvidence {
 }
 
 use std::{
+    cell::Cell,
     panic::AssertUnwindSafe,
     sync::{
         Arc,

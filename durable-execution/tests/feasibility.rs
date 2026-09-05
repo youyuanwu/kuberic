@@ -6,26 +6,29 @@ use async_trait::async_trait;
 use futures::executor::block_on;
 use kuberic_durable_execution::{
     ActivityName, ActivitySpec, CheckpointLimits, DurableHost, ExactBytes, ExecutionId,
-    FeasibilityClassification, FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome,
-    InMemoryCheckpointStore, Workflow, WorkflowContext, classify_feasibility,
+    ExecutionSpec, FeasibilityClassification, FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch,
+    HostOutcome, InMemoryCheckpointStore, TerminalOutcome, Workflow, WorkflowContext,
+    classify_feasibility,
 };
 use support::scenarios::{ScenarioEvidence, ScenarioId, run_conformance_matrix};
 
-const EXPECTED_FR_013_SCENARIOS: usize = 28;
+const EXPECTED_FR_013_SCENARIOS: usize = 38;
 
 struct SelectedOrdinaryAsyncSurface;
 
 // FR012_SELECTED_WORKFLOW_START
 #[async_trait(?Send)]
 impl Workflow for SelectedOrdinaryAsyncSurface {
-    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes {
-        context
-            .activity(ActivitySpec::new(
-                ActivityName::new("ordinary-async", 1).unwrap(),
-                input,
-                1024,
-            ))
-            .await
+    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
+        TerminalOutcome::succeeded(
+            context
+                .activity(ActivitySpec::new(
+                    ActivityName::new("ordinary-async", 1).unwrap(),
+                    input,
+                    1024,
+                ))
+                .await,
+        )
     }
 }
 // FR012_SELECTED_WORKFLOW_END
@@ -80,7 +83,7 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
 
     let library_exports = include_str!("../src/lib.rs");
     let ordinary_async_exported =
-        library_exports.contains("pub use workflow::{Workflow, WorkflowContext};");
+        library_exports.contains("pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};");
     let fallback_exported = library_exports.contains(concat!("mod po", "ll;"))
         || library_exports.contains("ReplayWorkflow")
         || library_exports.contains("ReplayContext");
@@ -95,8 +98,11 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
     );
     let first_turn = block_on(host.turn(
         &SelectedOrdinaryAsyncSurface,
-        ExecutionId::from_bytes([1; 16]),
-        ExactBytes::new(b"input"),
+        ExecutionSpec::new(
+            ExecutionId::from_bytes([1; 16]),
+            ExactBytes::new(b"input"),
+            1024,
+        ),
     ));
 
     let fr_012 = [
@@ -150,6 +156,20 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
     ]
     .into_iter()
     .all(scenario_passed);
+    let terminal_lifecycle_pass = [
+        ScenarioId::ActiveToTerminalCompaction,
+        ScenarioId::TerminalReloadWithoutWorkflowPoll,
+        ScenarioId::ZeroActivityTerminalization,
+        ScenarioId::TerminalOutcomeBounds,
+        ScenarioId::TerminalCapacityAdmission,
+        ScenarioId::CompletionConflict,
+        ScenarioId::CompletionOutcomeUnknownAfterApply,
+        ScenarioId::CompletionOutcomeUnknownWithoutApply,
+        ScenarioId::CompletionStoreFailures,
+        ScenarioId::ExecutionContractValidation,
+    ]
+    .into_iter()
+    .all(scenario_passed);
     let store_source = include_str!("../src/store.rs");
     let host_source = include_str!("../src/host.rs");
     let crate_manifest = include_str!("../Cargo.toml");
@@ -174,6 +194,10 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         PredicateEvidence {
             name: "bounded checkpoint and base64 scenarios pass",
             passed: bounded_checkpoint_pass,
+        },
+        PredicateEvidence {
+            name: "completion-only terminal lifecycle scenarios pass",
+            passed: terminal_lifecycle_pass,
         },
         PredicateEvidence {
             name: "kernel scope and deferred roadmap are documented",

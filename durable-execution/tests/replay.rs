@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use kuberic_durable_execution::{
     ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, AttemptId,
     CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload, Evaluation,
-    ExactBytes, ExecutionId, HostEpoch, IdentityError, LogicalActivityId, Nondeterminism, Workflow,
-    WorkflowContext, evaluate,
+    ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError,
+    LogicalActivityId, Nondeterminism, TerminalOutcome, Workflow, WorkflowContext,
+    evaluate as evaluate_with_spec,
 };
 
 const MAX_RESULT_BYTES: u64 = 1024;
@@ -37,13 +38,32 @@ struct LinearWorkflow {
 
 #[async_trait(?Send)]
 impl Workflow for LinearWorkflow {
-    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> ExactBytes {
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         let mut results = Vec::new();
         for spec in &self.activities {
             results.extend(context.activity(spec.clone()).await.as_slice());
         }
-        ExactBytes::new(results)
+        TerminalOutcome::succeeded(ExactBytes::new(results))
     }
+}
+
+fn execution_spec(execution_id: ExecutionId, workflow_input: ExactBytes) -> ExecutionSpec {
+    ExecutionSpec::new(execution_id, workflow_input, MAX_RESULT_BYTES)
+}
+
+fn evaluate<W: Workflow>(
+    workflow: &W,
+    execution_id: ExecutionId,
+    workflow_input: ExactBytes,
+    checkpoint: Option<&CheckpointEnvelope>,
+    limits: CheckpointLimits,
+) -> Evaluation {
+    evaluate_with_spec(
+        workflow,
+        &execution_spec(execution_id, workflow_input),
+        checkpoint,
+        limits,
+    )
 }
 
 fn envelope(
@@ -51,9 +71,11 @@ fn envelope(
     workflow_input: ExactBytes,
     activities: Vec<ActivityRecord>,
 ) -> CheckpointEnvelope {
-    CheckpointEnvelope::encode(&CheckpointPayload::new(
-        execution_id,
-        workflow_input,
+    CheckpointEnvelope::encode(&CheckpointPayload::active(
+        ExecutionContract::new(
+            execution_spec(execution_id, workflow_input),
+            limits().max_encoded_bytes() as u64,
+        ),
         activities,
     ))
     .unwrap()
@@ -79,10 +101,13 @@ fn first_turn_schedules_exactly_one_activity() {
     assert_eq!(activity.input(), &bytes(b"A"));
     assert_eq!(activity.max_result_bytes(), MAX_RESULT_BYTES);
     let payload = checkpoint
-        .decode_and_validate(execution(1), &bytes(b"workflow"), limits())
+        .decode_and_validate(&execution_spec(execution(1), bytes(b"workflow")), limits())
         .unwrap();
-    assert_eq!(payload.activities().len(), 1);
-    assert_eq!(payload.activities()[0].state(), &ActivityState::Scheduled);
+    assert_eq!(payload.active_activities().unwrap().len(), 1);
+    assert_eq!(
+        payload.active_activities().unwrap()[0].state(),
+        &ActivityState::Scheduled
+    );
 }
 
 #[test]
@@ -117,19 +142,23 @@ fn completed_result_replays_without_rescheduling() {
 
     assert_eq!(first, second);
     let Evaluation::Complete {
-        result,
+        outcome,
         checkpoint: replayed,
+        ..
     } = first
     else {
         panic!("completed history did not complete");
     };
-    assert_eq!(result, bytes(b"recorded-result"));
+    assert_eq!(
+        outcome,
+        TerminalOutcome::succeeded(bytes(b"recorded-result"))
+    );
     assert_eq!(
         replayed
-            .decode_and_validate(execution(2), &bytes(b"workflow"), limits())
+            .decode_and_validate(&execution_spec(execution(2), bytes(b"workflow")), limits(),)
             .unwrap(),
         checkpoint
-            .decode_and_validate(execution(2), &bytes(b"workflow"), limits())
+            .decode_and_validate(&execution_spec(execution(2), bytes(b"workflow")), limits(),)
             .unwrap()
     );
 }
@@ -165,10 +194,13 @@ fn completed_prefix_can_schedule_one_next_activity() {
 
     assert_eq!(activity.sequence(), ActivitySequence::new(1));
     let decoded = checkpoint
-        .decode_and_validate(execution(3), &bytes(b"workflow"), limits())
+        .decode_and_validate(&execution_spec(execution(3), bytes(b"workflow")), limits())
         .unwrap();
-    assert_eq!(decoded.activities().len(), 2);
-    assert_eq!(decoded.activities()[1].state(), &ActivityState::Scheduled);
+    assert_eq!(decoded.active_activities().unwrap().len(), 2);
+    assert_eq!(
+        decoded.active_activities().unwrap()[1].state(),
+        &ActivityState::Scheduled
+    );
 }
 
 #[test]
@@ -381,9 +413,9 @@ struct PollCountingWorkflow {
 
 #[async_trait(?Send)]
 impl Workflow for PollCountingWorkflow {
-    async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> ExactBytes {
+    async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         self.polls.set(self.polls.get() + 1);
-        bytes(b"complete")
+        TerminalOutcome::succeeded(bytes(b"complete"))
     }
 }
 
@@ -392,7 +424,13 @@ fn identity_input_and_format_validation_happen_before_workflow_polling() {
     let workflow = PollCountingWorkflow {
         polls: Cell::new(0),
     };
-    let valid_payload = CheckpointPayload::new(execution(10), bytes(b"expected"), vec![]);
+    let valid_payload = CheckpointPayload::active(
+        ExecutionContract::new(
+            execution_spec(execution(10), bytes(b"expected")),
+            limits().max_encoded_bytes() as u64,
+        ),
+        vec![],
+    );
     let unsupported = CheckpointEnvelope::new(
         1,
         CheckpointEnvelope::encode(&valid_payload)
@@ -508,13 +546,7 @@ fn configured_limits_reject_loaded_checkpoints_before_workflow_polling() {
     assert_eq!(workflow.polls.get(), 0);
 
     assert!(matches!(
-        evaluate(
-            &workflow,
-            execution_id,
-            input,
-            Some(&empty),
-            CheckpointLimits::new(1, exact_encoded).unwrap(),
-        ),
+        evaluate(&workflow, execution_id, input, Some(&empty), limits(),),
         Evaluation::Complete { .. }
     ));
     assert_eq!(workflow.polls.get(), 1);

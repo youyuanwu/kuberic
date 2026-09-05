@@ -25,19 +25,19 @@ mod workflow;
 pub use assessment::{FeasibilityClassification, FeasibilityInputs, classify_feasibility};
 pub use checkpoint::{
     ActivityRecord, ActivityState, CHECKPOINT_FORMAT_VERSION, CheckpointEnvelope, CheckpointError,
-    CheckpointLimits, CheckpointPayload,
+    CheckpointLimits, CheckpointPayload, CheckpointState, ExecutionContract,
 };
 pub use host::{
     ActivityObservation, DispatchPermit, DurableHost, HOST_OUTCOME_VARIANTS, HostOutcome,
     ObservationRejection, PersistenceBoundary, ReloadReason, StoreOperation,
 };
 pub use identity::{
-    ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId, HostEpoch,
-    IdentityError, LogicalActivityId,
+    ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,
+    ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
 };
 pub use in_memory::{InMemoryCheckpointStore, InMemoryFault};
 pub use replay::{Evaluation, Nondeterminism, evaluate};
 pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
 };
-pub use workflow::{Workflow, WorkflowContext};
+pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};
