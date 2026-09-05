@@ -1,0 +1,17 @@
+[package]
+name = "kuberic-durable-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Experimental deterministic replay framework for Kuberic feasibility evaluation"
+readme = "README.md"
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
