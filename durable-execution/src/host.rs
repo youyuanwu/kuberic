@@ -1,7 +1,7 @@
 use crate::{
     ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError,
-    CheckpointPayload, CheckpointStore, Evaluation, ExactBytes, ExecutionId, HostEpoch,
-    LogicalActivityId, Nondeterminism, StorageRevision, StoreError, Workflow, evaluate,
+    CheckpointLimits, CheckpointPayload, CheckpointStore, Evaluation, ExactBytes, ExecutionId,
+    HostEpoch, LogicalActivityId, Nondeterminism, StorageRevision, StoreError, Workflow, evaluate,
 };
 
 /// The persistence boundary that must be reloaded after an uncertain CAS result.
@@ -35,6 +35,10 @@ pub enum ObservationRejection {
         expected: LogicalActivityId,
         observed: LogicalActivityId,
     },
+    ResultExceedsDeclaredBound {
+        actual: u64,
+        maximum: u64,
+    },
 }
 
 /// An authoritative result for one exact logical activity.
@@ -64,15 +68,18 @@ impl ActivityObservation {
 ///
 /// ```compile_fail
 /// use kuberic_durable_execution::{
-///     ActivityName, ActivitySequence, AttemptId, DispatchPermit, ExactBytes, ExecutionId,
-///     HostEpoch, LogicalActivityId,
+///     ActivityName, ActivitySequence, ActivitySpec, AttemptId, DispatchPermit, ExactBytes,
+///     ExecutionId, HostEpoch, LogicalActivityId,
 /// };
 ///
 /// let activity = LogicalActivityId::new(
 ///     ExecutionId::from_bytes([1; 16]),
 ///     ActivitySequence::new(0),
-///     ActivityName::new("effect", 1).unwrap(),
-///     ExactBytes::new(b"input"),
+///     ActivitySpec::new(
+///         ActivityName::new("effect", 1).unwrap(),
+///         ExactBytes::new(b"input"),
+///         1024,
+///     ),
 /// );
 /// let attempt_id = AttemptId::new(HostEpoch::from_bytes([2; 16]), 1).unwrap();
 /// let forged = DispatchPermit {
@@ -154,14 +161,16 @@ pub struct DurableHost<S> {
     store: S,
     host_epoch: HostEpoch,
     next_attempt_counter: u64,
+    limits: CheckpointLimits,
 }
 
 impl<S: CheckpointStore> DurableHost<S> {
-    pub fn new(store: S, host_epoch: HostEpoch) -> Self {
+    pub fn new(store: S, host_epoch: HostEpoch, limits: CheckpointLimits) -> Self {
         Self {
             store,
             host_epoch,
             next_attempt_counter: 1,
+            limits,
         }
     }
 
@@ -187,10 +196,11 @@ impl<S: CheckpointStore> DurableHost<S> {
         };
         let expected_revision = loaded.as_ref().map(|stored| stored.revision().clone());
         if let Some(stored) = loaded.as_ref() {
-            let payload = match stored
-                .checkpoint()
-                .decode_and_validate(execution_id, &workflow_input)
-            {
+            let payload = match stored.checkpoint().decode_and_validate(
+                execution_id,
+                &workflow_input,
+                self.limits,
+            ) {
                 Ok(payload) => payload,
                 Err(error) => return HostOutcome::CheckpointRejected(error),
             };
@@ -208,6 +218,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             execution_id,
             workflow_input.clone(),
             loaded.as_ref().map(|stored| stored.checkpoint()),
+            self.limits,
         );
 
         match evaluation {
@@ -273,13 +284,14 @@ impl<S: CheckpointStore> DurableHost<S> {
         let Some(stored) = loaded else {
             return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
         };
-        let mut payload = match stored
-            .checkpoint()
-            .decode_and_validate(execution_id, workflow_input)
-        {
-            Ok(payload) => payload,
-            Err(error) => return HostOutcome::CheckpointRejected(error),
-        };
+        let mut payload =
+            match stored
+                .checkpoint()
+                .decode_and_validate(execution_id, workflow_input, self.limits)
+            {
+                Ok(payload) => payload,
+                Err(error) => return HostOutcome::CheckpointRejected(error),
+            };
         let Some(record) = payload.activities().last().cloned() else {
             return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
         };
@@ -295,18 +307,32 @@ impl<S: CheckpointStore> DurableHost<S> {
         if !matches!(record.state(), ActivityState::DispatchExposed { .. }) {
             return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
         }
+        let actual_result_bytes = match u64::try_from(observation.result().as_slice().len()) {
+            Ok(actual) => actual,
+            Err(_) => {
+                return HostOutcome::ObservationRejected(
+                    ObservationRejection::ResultExceedsDeclaredBound {
+                        actual: u64::MAX,
+                        maximum: record.max_result_bytes(),
+                    },
+                );
+            }
+        };
+        if actual_result_bytes > record.max_result_bytes() {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::ResultExceedsDeclaredBound {
+                    actual: actual_result_bytes,
+                    maximum: record.max_result_bytes(),
+                },
+            );
+        }
 
         let activity = expected_activity;
         replace_final_record(
             &mut payload,
-            ActivityRecord::completed(
-                record.sequence(),
-                record.name().clone(),
-                record.input().clone(),
-                observation.result,
-            ),
+            ActivityRecord::completed(record.sequence(), record.spec().clone(), observation.result),
         );
-        let checkpoint = match CheckpointEnvelope::encode(&payload) {
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
             Ok(checkpoint) => checkpoint,
             Err(error) => return HostOutcome::CheckpointRejected(error),
         };
@@ -351,26 +377,29 @@ impl<S: CheckpointStore> DurableHost<S> {
         checkpoint: &CheckpointEnvelope,
         activity: LogicalActivityId,
     ) -> Result<PreparedExposure, CheckpointError> {
-        let mut payload = checkpoint.decode_and_validate(execution_id, &workflow_input)?;
+        let mut payload =
+            checkpoint.decode_and_validate(execution_id, &workflow_input, self.limits)?;
         let record = payload
             .activities()
             .last()
             .cloned()
             .expect("scheduled evaluation requires an activity record");
+        let reserved_encoded_bytes = payload.maximum_completed_encoded_len()?;
+        if reserved_encoded_bytes > self.limits.max_encoded_bytes() {
+            return Err(CheckpointError::EncodedCheckpointLimitExceeded {
+                actual: reserved_encoded_bytes,
+                maximum: self.limits.max_encoded_bytes(),
+            });
+        }
         let attempt_id = self.next_attempt();
         replace_final_record(
             &mut payload,
-            ActivityRecord::dispatch_exposed(
-                record.sequence(),
-                record.name().clone(),
-                record.input().clone(),
-                attempt_id,
-            ),
+            ActivityRecord::dispatch_exposed(record.sequence(), record.spec().clone(), attempt_id),
         );
         Ok(PreparedExposure {
             execution_id,
             expected_revision: expected_revision.clone(),
-            checkpoint: CheckpointEnvelope::encode(&payload)?,
+            checkpoint: CheckpointEnvelope::encode_with_limits(&payload, self.limits)?,
             activity,
             attempt_id,
         })
@@ -443,7 +472,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActivityName, InMemoryCheckpointStore, InMemoryFault, StoreErrorKind, WorkflowContext,
+        ActivityName, ActivitySpec, CheckpointLimits, InMemoryCheckpointStore, InMemoryFault,
+        StoreErrorKind, WorkflowContext,
     };
 
     struct OneActivity;
@@ -452,7 +482,11 @@ mod tests {
     impl Workflow for OneActivity {
         async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes {
             context
-                .activity(ActivityName::new("unit", 1).unwrap(), input)
+                .activity(ActivitySpec::new(
+                    ActivityName::new("unit", 1).unwrap(),
+                    input,
+                    1024,
+                ))
                 .await
         }
     }
@@ -463,7 +497,11 @@ mod tests {
             let store = InMemoryCheckpointStore::new();
             let execution_id = ExecutionId::from_bytes([2; 16]);
             let input = ExactBytes::new(b"unit");
-            let mut host = DurableHost::new(store.clone(), HostEpoch::from_bytes([1; 16]));
+            let mut host = DurableHost::new(
+                store.clone(),
+                HostEpoch::from_bytes([1; 16]),
+                CheckpointLimits::new(16, 100_000).unwrap(),
+            );
             assert!(matches!(
                 host.turn(&OneActivity, execution_id, input.clone()).await,
                 HostOutcome::ScheduleAccepted { .. }

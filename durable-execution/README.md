@@ -10,12 +10,13 @@ for evaluating replay and provider contracts, not an end-user runtime.
 The feasibility evaluation selected the ordinary async surface. A workflow is
 an `#[async_trait(?Send)]` implementation of `Workflow::run`; its only
 framework-specific workflow-body operation is
-`WorkflowContext::activity(name, input).await`.
+`WorkflowContext::activity(spec).await`. An immutable `ActivitySpec` combines
+the versioned name, exact input, and declared maximum result bytes.
 
 ```rust
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityName, ExactBytes, Workflow, WorkflowContext,
+    ActivityName, ActivitySpec, ExactBytes, Workflow, WorkflowContext,
 };
 
 struct Greeting;
@@ -28,7 +29,11 @@ impl Workflow for Greeting {
         input: ExactBytes,
     ) -> ExactBytes {
         context
-            .activity(ActivityName::new("greeting", 1).unwrap(), input)
+            .activity(ActivitySpec::new(
+                ActivityName::new("greeting", 1).unwrap(),
+                input,
+                4096,
+            ))
             .await
     }
 }
@@ -41,25 +46,43 @@ also exported.
 
 ## Replay and checkpoint semantics
 
-`ExactBytes` are compared and persisted without normalization. Workflow
-history is a contiguous, zero-based sequence with a completed prefix and at
-most one final pending activity. A requested activity must match the recorded
-sequence, immutable positive-versioned name, and exact input; a mismatch is
-nondeterminism rather than a new dispatch.
+`ExactBytes` are compared without normalization and encoded as validated base64
+JSON strings. Workflow history is a contiguous, zero-based sequence with a
+completed prefix and at most one final pending activity. A requested activity
+must match the recorded sequence, immutable positive-versioned name, exact
+input, and declared result bound; a mismatch is nondeterminism rather than a
+new dispatch.
 
-Format version 1 stores JSON payload bytes in a versioned
+Format version 2 stores JSON payload bytes in a versioned
 `CheckpointEnvelope`. The payload contains execution identity, exact workflow
-input, and linear activity records in `Scheduled`, `DispatchExposed`, or
-`Completed` state. Envelope version and payload shape are validated before the
-workflow is polled. Unsupported versions are compatibility errors, not storage
-conflicts. Completed results replay into workflow code and do not create a new
-dispatch permit.
+input, declared activity specifications, and linear records in `Scheduled`,
+`DispatchExposed`, or `Completed` state. Envelope version, payload shape,
+activity count, encoded size, and completed-result bounds are validated before
+the workflow is polled. Unsupported versions are compatibility errors, not
+storage conflicts. Completed results replay into workflow code and do not
+create a new dispatch permit.
 
 Logical activity identity is the complete tuple of execution ID, sequence,
-versioned activity name, and exact activity input. Its external rendering
-contains the complete tuple without hashing or normalization. `AttemptId` is a
-separate host-epoch and monotonic-counter identity, so a discarded
-pre-exposure attempt may change without changing the logical activity.
+versioned activity name, exact activity input, and declared maximum result
+bytes. Its external rendering contains the complete tuple without hashing or
+normalization. `AttemptId` is a separate host-epoch and monotonic-counter
+identity, so a discarded pre-exposure attempt may change without changing the
+logical activity.
+
+## Checkpoint limits and result reservation
+
+Every `DurableHost` requires `CheckpointLimits` for maximum activity records
+and maximum canonical encoded checkpoint bytes. Exact configured boundaries
+are accepted; loaded or proposed checkpoints beyond either boundary are
+rejected before workflow progress.
+
+Before committing dispatch exposure, the host projects the completed
+checkpoint containing a result at exactly the activity's declared maximum.
+The projection calculates base64 and JSON lengths without allocating that
+maximum result. If it cannot fit, exposure is rejected and no permit exists.
+An observation larger than the declaration is rejected without mutation. This
+ensures that a permitted activity result within its declaration cannot later
+fail solely because its completed checkpoint lacks capacity.
 
 ## Storage revisions
 
@@ -88,6 +111,10 @@ boundary:
 2. A later turn prepares an attempt, accepts a separate `DispatchExposed`
    checkpoint revision, and only then returns an opaque `DispatchPermit`.
 3. A completed checkpoint replays the recorded result.
+
+Construction requires the checkpoint store, caller-supplied host epoch, and
+validated `CheckpointLimits`; callers supply the executor used to await turns
+and observations.
 
 The permit is evidence that this in-process host observed acceptance of both
 persistence boundaries. It is **not** proof of exactly-once execution: a crash

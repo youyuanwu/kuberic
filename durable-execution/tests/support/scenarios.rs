@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use futures::{FutureExt, future::poll_fn, join, task::AtomicWaker};
 use kuberic_durable_execution::{
-    ActivityName, ActivityObservation, ActivitySequence, AttemptId, CasOutcome, CheckpointEnvelope,
-    CheckpointPayload, CheckpointStore, DispatchPermit, DurableHost, ExactBytes, ExecutionId,
-    HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault, LogicalActivityId,
-    Nondeterminism, ObservationRejection, PersistenceBoundary, ReloadReason, StorageRevision,
-    StoreError, StoreErrorKind, StoredCheckpoint, Workflow, WorkflowContext,
+    ActivityName, ActivityObservation, ActivitySequence, ActivitySpec, AttemptId, CasOutcome,
+    CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload, CheckpointStore,
+    DispatchPermit, DurableHost, ExactBytes, ExecutionId, HostEpoch, HostOutcome,
+    InMemoryCheckpointStore, InMemoryFault, LogicalActivityId, Nondeterminism,
+    ObservationRejection, PersistenceBoundary, ReloadReason, StorageRevision, StoreError,
+    StoreErrorKind, StoredCheckpoint, Workflow, WorkflowContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,10 +34,15 @@ pub enum ScenarioId {
     LoadAbsenceAndProviderFailures,
     OpaqueStorageRevisions,
     OutcomeUnknownApplyStateHidden,
+    ChangedResultBound,
+    ActivityCountAndGrowingHistory,
+    EncodedByteReservation,
+    OversizedObservation,
+    Base64ExactBytes,
 }
 
 impl ScenarioId {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 28] = [
         Self::RestartBeforeSchedulePersistence,
         Self::RestartAfterSchedulePersistence,
         Self::RestartAfterDispatchExposure,
@@ -60,6 +66,11 @@ impl ScenarioId {
         Self::LoadAbsenceAndProviderFailures,
         Self::OpaqueStorageRevisions,
         Self::OutcomeUnknownApplyStateHidden,
+        Self::ChangedResultBound,
+        Self::ActivityCountAndGrowingHistory,
+        Self::EncodedByteReservation,
+        Self::OversizedObservation,
+        Self::Base64ExactBytes,
     ];
 
     pub const fn stable_id(self) -> &'static str {
@@ -87,6 +98,11 @@ impl ScenarioId {
             Self::LoadAbsenceAndProviderFailures => "FR-013-21",
             Self::OpaqueStorageRevisions => "FR-013-22",
             Self::OutcomeUnknownApplyStateHidden => "FR-013-23",
+            Self::ChangedResultBound => "FR-013-24",
+            Self::ActivityCountAndGrowingHistory => "FR-013-25",
+            Self::EncodedByteReservation => "FR-013-26",
+            Self::OversizedObservation => "FR-013-27",
+            Self::Base64ExactBytes => "FR-013-28",
         }
     }
 }
@@ -177,6 +193,11 @@ async fn run_scenario_inner(id: ScenarioId) -> ScenarioEvidence {
         ScenarioId::LoadAbsenceAndProviderFailures => load_absence_and_provider_failures(id).await,
         ScenarioId::OpaqueStorageRevisions => opaque_storage_revisions(id).await,
         ScenarioId::OutcomeUnknownApplyStateHidden => outcome_unknown_apply_state_hidden(id).await,
+        ScenarioId::ChangedResultBound => changed_result_bound(id).await,
+        ScenarioId::ActivityCountAndGrowingHistory => activity_count_and_growing_history(id).await,
+        ScenarioId::EncodedByteReservation => encoded_byte_reservation(id).await,
+        ScenarioId::OversizedObservation => oversized_observation(id).await,
+        ScenarioId::Base64ExactBytes => base64_exact_bytes(id).await,
     }
 }
 
@@ -262,8 +283,8 @@ async fn contending_turns(
     input: ExactBytes,
 ) -> [HostOutcome; 2] {
     let (first_store, second_store) = ContendedStore::pair(store);
-    let mut first_host = DurableHost::new(first_store, epoch(201));
-    let mut second_host = DurableHost::new(second_store, epoch(202));
+    let mut first_host = DurableHost::new(first_store, epoch(201), generous_limits());
+    let mut second_host = DurableHost::new(second_store, epoch(202), generous_limits());
     let first_workflow = workflow.clone();
     let first_input = input.clone();
     let (first, second) = join!(
@@ -275,21 +296,25 @@ async fn contending_turns(
 
 #[derive(Clone)]
 pub struct LinearWorkflow {
-    activities: Vec<(ActivityName, ExactBytes)>,
+    activities: Vec<ActivitySpec>,
 }
 
 impl LinearWorkflow {
     pub fn one(name: &str, version: u32, input: &[u8]) -> Self {
+        Self::one_with_bound(name, version, input, 1024)
+    }
+
+    fn one_with_bound(name: &str, version: u32, input: &[u8], max_result_bytes: u64) -> Self {
         Self {
-            activities: vec![(activity_name(name, version), bytes(input))],
+            activities: vec![activity_spec(name, version, input, max_result_bytes)],
         }
     }
 
     fn two() -> Self {
         Self {
             activities: vec![
-                (activity_name("first", 1), bytes(b"A")),
-                (activity_name("second", 1), bytes(b"B")),
+                activity_spec("first", 1, b"A", 1024),
+                activity_spec("second", 1, b"B", 1024),
             ],
         }
     }
@@ -299,13 +324,8 @@ impl LinearWorkflow {
 impl Workflow for LinearWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> ExactBytes {
         let mut result = Vec::new();
-        for (name, input) in &self.activities {
-            result.extend(
-                context
-                    .activity(name.clone(), input.clone())
-                    .await
-                    .as_slice(),
-            );
+        for spec in &self.activities {
+            result.extend(context.activity(spec.clone()).await.as_slice());
         }
         ExactBytes::new(result)
     }
@@ -327,8 +347,16 @@ fn activity_name(value: &str, version: u32) -> ActivityName {
     ActivityName::new(value, version).unwrap()
 }
 
+fn activity_spec(name: &str, version: u32, input: &[u8], max_result_bytes: u64) -> ActivitySpec {
+    ActivitySpec::new(activity_name(name, version), bytes(input), max_result_bytes)
+}
+
+fn generous_limits() -> CheckpointLimits {
+    CheckpointLimits::new(128, 1_000_000).unwrap()
+}
+
 fn host(store: InMemoryCheckpointStore, epoch_value: u8) -> DurableHost<InMemoryCheckpointStore> {
-    DurableHost::new(store, epoch(epoch_value))
+    DurableHost::new(store, epoch(epoch_value), generous_limits())
 }
 
 async fn schedule(
@@ -710,8 +738,8 @@ async fn changed_order(id: ScenarioId) -> ScenarioEvidence {
         .await;
     let reordered = LinearWorkflow {
         activities: vec![
-            (activity_name("second", 1), bytes(b"B")),
-            (activity_name("first", 1), bytes(b"A")),
+            activity_spec("second", 1, b"B", 1024),
+            activity_spec("first", 1, b"A", 1024),
         ],
     };
     let outcome = durable_host.turn(&reordered, execution_id, input).await;
@@ -1085,8 +1113,7 @@ async fn mismatched_observation(id: ScenarioId) -> ScenarioEvidence {
     let mismatched = LogicalActivityId::new(
         execution_id,
         ActivitySequence::new(0),
-        activity_name("effect", 1),
-        bytes(b"different"),
+        activity_spec("effect", 1, b"different", 1024),
     );
     let rejected = durable_host
         .observe(
@@ -1123,8 +1150,8 @@ async fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
     let logical_for_first = logical.clone();
     let input_for_first = input.clone();
     let replay_input = input.clone();
-    let first_host = DurableHost::new(first_store, epoch(203));
-    let second_host = DurableHost::new(second_store, epoch(204));
+    let first_host = DurableHost::new(first_store, epoch(203), generous_limits());
+    let second_host = DurableHost::new(second_store, epoch(204), generous_limits());
     let first_result = bytes(b"first");
     let second_result = bytes(b"second");
     let (first_outcome, second_outcome) = join!(
@@ -1612,6 +1639,339 @@ async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence 
                 !matches!(schedule_applied, HostOutcome::DispatchPermitted { .. })
                     && !matches!(exposure_applied, HostOutcome::DispatchPermitted { .. })
                     && !matches!(observation_applied, HostOutcome::DispatchPermitted { .. }),
+            ),
+        ],
+    )
+}
+
+async fn changed_result_bound(id: ScenarioId) -> ScenarioEvidence {
+    let (_, mut durable_host, _workflow, execution_id, input, logical, _) = prepared_one(127).await;
+    durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical.clone(), bytes(b"done")),
+        )
+        .await;
+    let changed = LinearWorkflow::one_with_bound("effect", 1, b"activity", 1025);
+    let changed_logical = LogicalActivityId::new(
+        execution_id,
+        ActivitySequence::new(0),
+        activity_spec("effect", 1, b"activity", 1025),
+    );
+    let outcome = durable_host.turn(&changed, execution_id, input).await;
+
+    ScenarioEvidence::new(
+        id,
+        "replay a completed activity with only its declared result bound changed",
+        [
+            (
+                "changed result bound is nondeterminism before dispatch",
+                matches!(
+                    outcome,
+                    HostOutcome::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+                ),
+            ),
+            (
+                "declared result bound participates in logical identity",
+                logical != changed_logical
+                    && logical.to_external_id() != changed_logical.to_external_id(),
+            ),
+        ],
+    )
+}
+
+async fn activity_count_and_growing_history(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let execution_id = execution(128);
+    let input = bytes(b"workflow");
+    let limits = CheckpointLimits::new(3, 1_000_000).unwrap();
+    let workflow = LinearWorkflow {
+        activities: vec![
+            activity_spec("first", 1, b"A", 16),
+            activity_spec("second", 1, b"B", 16),
+            activity_spec("third", 1, b"C", 16),
+        ],
+    };
+    let mut durable_host = DurableHost::new(store.clone(), epoch(128), limits);
+    let mut all_observations_accepted = true;
+    for result in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+        let logical = match durable_host
+            .turn(&workflow, execution_id, input.clone())
+            .await
+        {
+            HostOutcome::ScheduleAccepted { activity, .. } => activity,
+            other => {
+                return ScenarioEvidence::new(
+                    id,
+                    "grow completed history to the exact configured activity count",
+                    [(
+                        "every activity through the exact count boundary schedules",
+                        matches!(other, HostOutcome::ScheduleAccepted { .. }),
+                    )],
+                );
+            }
+        };
+        let permitted = matches!(
+            durable_host
+                .turn(&workflow, execution_id, input.clone())
+                .await,
+            HostOutcome::DispatchPermitted { .. }
+        );
+        let observed = durable_host
+            .observe(
+                execution_id,
+                &input,
+                ActivityObservation::new(logical, bytes(result)),
+            )
+            .await;
+        all_observations_accepted &=
+            permitted && matches!(observed, HostOutcome::ObservationAccepted { .. });
+    }
+    let completed = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let persisted_count = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .and_then(|stored| {
+            stored
+                .checkpoint()
+                .decode_and_validate(execution_id, &input, limits)
+                .ok()
+                .map(|payload| payload.activities().len())
+        });
+
+    let mut four = workflow.clone();
+    four.activities.push(activity_spec("fourth", 1, b"D", 16));
+    let first_excess = durable_host.turn(&four, execution_id, input).await;
+
+    ScenarioEvidence::new(
+        id,
+        "grow completed history to the exact activity limit and request one more record",
+        [
+            (
+                "completed history grows successfully through the exact count boundary",
+                all_observations_accepted
+                    && persisted_count == Some(3)
+                    && matches!(completed, HostOutcome::WorkflowCompleted { .. }),
+            ),
+            (
+                "the first record beyond the configured maximum is rejected",
+                matches!(
+                    first_excess,
+                    HostOutcome::CheckpointRejected(CheckpointError::ActivityRecordLimitExceeded {
+                        actual: 4,
+                        maximum: 3
+                    })
+                ),
+            ),
+            (
+                "count-capacity rejection grants no dispatch permit",
+                !matches!(first_excess, HostOutcome::DispatchPermitted { .. }),
+            ),
+        ],
+    )
+}
+
+async fn encoded_byte_reservation(id: ScenarioId) -> ScenarioEvidence {
+    const MAX_RESULT: usize = 256;
+    let execution_id = execution(129);
+    let input = bytes(b"workflow");
+    let activity = activity_spec("bounded", 1, b"input", MAX_RESULT as u64);
+    let exact_completed = CheckpointEnvelope::encode(&CheckpointPayload::new(
+        execution_id,
+        input.clone(),
+        vec![kuberic_durable_execution::ActivityRecord::completed(
+            ActivitySequence::new(0),
+            activity.clone(),
+            ExactBytes::new(vec![0; MAX_RESULT]),
+        )],
+    ))
+    .unwrap()
+    .encoded_len()
+    .unwrap();
+
+    let exact_store = InMemoryCheckpointStore::new();
+    let exact_limits = CheckpointLimits::new(1, exact_completed).unwrap();
+    let workflow = LinearWorkflow {
+        activities: vec![activity.clone()],
+    };
+    let mut exact_host = DurableHost::new(exact_store.clone(), epoch(129), exact_limits);
+    let scheduled = exact_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let logical = match &scheduled {
+        HostOutcome::ScheduleAccepted { activity, .. } => Some(activity.clone()),
+        _ => None,
+    };
+    let exposure = exact_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let exact_result = ExactBytes::new(vec![0; MAX_RESULT]);
+    let observation = match logical {
+        Some(logical) => {
+            exact_host
+                .observe(
+                    execution_id,
+                    &input,
+                    ActivityObservation::new(logical, exact_result),
+                )
+                .await
+        }
+        None => HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing),
+    };
+    let final_size = exact_store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .and_then(|stored| stored.checkpoint().encoded_len().ok());
+
+    let tight_store = InMemoryCheckpointStore::new();
+    let tight_limits = CheckpointLimits::new(1, exact_completed - 1).unwrap();
+    let mut tight_host = DurableHost::new(tight_store, epoch(130), tight_limits);
+    let tight_schedule = tight_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let tight_exposure = tight_host.turn(&workflow, execution_id, input).await;
+
+    let huge_store = InMemoryCheckpointStore::new();
+    let huge_workflow = LinearWorkflow::one_with_bound("bounded", 1, b"input", u64::MAX);
+    let mut huge_host = DurableHost::new(
+        huge_store,
+        epoch(132),
+        CheckpointLimits::new(1, 100_000).unwrap(),
+    );
+    let huge_schedule = huge_host
+        .turn(&huge_workflow, execution(131), bytes(b"workflow"))
+        .await;
+    let huge_exposure = huge_host
+        .turn(&huge_workflow, execution(131), bytes(b"workflow"))
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "reserve the exact maximum completed checkpoint before exposure",
+        [
+            (
+                "the exact encoded-byte boundary accepts schedule and exposure",
+                matches!(scheduled, HostOutcome::ScheduleAccepted { .. })
+                    && matches!(exposure, HostOutcome::DispatchPermitted { .. }),
+            ),
+            (
+                "a permitted result at its declared maximum persists at the exact boundary",
+                matches!(observation, HostOutcome::ObservationAccepted { .. })
+                    && final_size == Some(exact_completed),
+            ),
+            (
+                "one byte below reserved capacity rejects before a permit",
+                matches!(tight_schedule, HostOutcome::ScheduleAccepted { .. })
+                    && matches!(
+                        tight_exposure,
+                        HostOutcome::CheckpointRejected(
+                            CheckpointError::EncodedCheckpointLimitExceeded { .. }
+                        )
+                    )
+                    && !matches!(tight_exposure, HostOutcome::DispatchPermitted { .. }),
+            ),
+            (
+                "an unrepresentable declaration is rejected without allocating or permitting",
+                matches!(huge_schedule, HostOutcome::ScheduleAccepted { .. })
+                    && matches!(
+                        huge_exposure,
+                        HostOutcome::CheckpointRejected(
+                            CheckpointError::EncodedLengthOverflow
+                                | CheckpointError::ResultLengthUnrepresentable
+                        )
+                    )
+                    && !matches!(huge_exposure, HostOutcome::DispatchPermitted { .. }),
+            ),
+        ],
+    )
+}
+
+async fn oversized_observation(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let execution_id = execution(130);
+    let input = bytes(b"workflow");
+    let workflow = LinearWorkflow::one_with_bound("bounded", 1, b"input", 3);
+    let mut durable_host = DurableHost::new(store.clone(), epoch(131), generous_limits());
+    let logical = schedule(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
+    let permit = expose(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .is_some();
+    let before = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let oversized = durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical.clone(), bytes(b"four")),
+        )
+        .await;
+    let unchanged = before
+        == store
+            .load(execution_id)
+            .await
+            .expect("scenario load must not fail");
+    let exact = durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical, bytes(b"tri")),
+        )
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "reject an observation above its reservation and accept the exact result bound",
+        [
+            ("capacity was reserved before a dispatch permit", permit),
+            (
+                "one byte over the declared result bound is rejected without mutation",
+                matches!(
+                    oversized,
+                    HostOutcome::ObservationRejected(
+                        ObservationRejection::ResultExceedsDeclaredBound {
+                            actual: 4,
+                            maximum: 3
+                        }
+                    )
+                ) && unchanged,
+            ),
+            (
+                "a result exactly at the declared bound is accepted",
+                matches!(exact, HostOutcome::ObservationAccepted { .. }),
+            ),
+        ],
+    )
+}
+
+async fn base64_exact_bytes(id: ScenarioId) -> ScenarioEvidence {
+    let representative: Vec<u8> = (0..=255).collect();
+    let exact = ExactBytes::new(representative.clone());
+    let encoded = serde_json::to_vec(&exact).unwrap();
+    let decoded = serde_json::from_slice::<ExactBytes>(&encoded).ok();
+    let integer_array = serde_json::to_vec(&representative).unwrap();
+    let invalid_rejected = serde_json::from_str::<ExactBytes>(r#""not base64!""#).is_err();
+
+    ScenarioEvidence::new(
+        id,
+        "round-trip representative exact bytes through compact validated base64 JSON",
+        [
+            (
+                "base64 JSON round-trips exact binary equality",
+                decoded == Some(exact),
+            ),
+            ("invalid base64 is rejected", invalid_rejected),
+            (
+                "representative base64 JSON is less than half the integer-array JSON",
+                encoded.len() * 2 < integer_array.len(),
             ),
         ],
     )

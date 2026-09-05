@@ -4,9 +4,9 @@ use futures::task::noop_waker_ref;
 use thiserror::Error;
 
 use crate::{
-    ActivityName, ActivityRecord, ActivitySequence, ActivityState, CheckpointEnvelope,
-    CheckpointError, CheckpointPayload, ExactBytes, ExecutionId, LogicalActivityId, Workflow,
-    WorkflowContext, workflow::ContextDecision,
+    ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, CheckpointEnvelope,
+    CheckpointError, CheckpointLimits, CheckpointPayload, ExactBytes, ExecutionId,
+    LogicalActivityId, Workflow, WorkflowContext, workflow::ContextDecision,
 };
 
 /// Result of deterministically polling one workflow turn.
@@ -32,13 +32,11 @@ pub enum Evaluation {
 /// A valid checkpoint that cannot be replayed by the supplied workflow.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum Nondeterminism {
-    #[error("activity {sequence} differs from recorded exact name or input")]
+    #[error("activity {sequence} differs from its recorded immutable specification")]
     ActivityMismatch {
         sequence: ActivitySequence,
-        recorded_name: ActivityName,
-        requested_name: ActivityName,
-        recorded_input: ExactBytes,
-        requested_input: ExactBytes,
+        recorded: ActivitySpec,
+        requested: ActivitySpec,
     },
     #[error(
         "workflow completed after consuming {consumed} activities with {remaining} history records unused"
@@ -54,9 +52,11 @@ pub fn evaluate<W: Workflow>(
     execution_id: ExecutionId,
     workflow_input: ExactBytes,
     checkpoint: Option<&CheckpointEnvelope>,
+    limits: CheckpointLimits,
 ) -> Evaluation {
     let mut payload = match checkpoint {
-        Some(envelope) => match envelope.decode_and_validate(execution_id, &workflow_input) {
+        Some(envelope) => match envelope.decode_and_validate(execution_id, &workflow_input, limits)
+        {
             Ok(payload) => payload,
             Err(error) => return Evaluation::CheckpointRejected(error),
         },
@@ -76,14 +76,13 @@ pub fn evaluate<W: Workflow>(
     match decision {
         Some(ContextDecision::Schedule {
             sequence,
-            name,
-            input,
+            spec,
             logical_id,
         }) => {
             payload
                 .activities_mut()
-                .push(ActivityRecord::scheduled(sequence, name, input));
-            match CheckpointEnvelope::encode(&payload) {
+                .push(ActivityRecord::scheduled(sequence, spec));
+            match CheckpointEnvelope::encode_with_limits(&payload, limits) {
                 Ok(checkpoint) => Evaluation::Scheduled {
                     activity: logical_id,
                     checkpoint,
@@ -107,7 +106,7 @@ pub fn evaluate<W: Workflow>(
                             .expect("validated history length fits in u64"),
                     });
                 }
-                match CheckpointEnvelope::encode(&payload) {
+                match CheckpointEnvelope::encode_with_limits(&payload, limits) {
                     Ok(checkpoint) => Evaluation::Complete { result, checkpoint },
                     Err(error) => Evaluation::CheckpointRejected(error),
                 }

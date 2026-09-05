@@ -1,11 +1,46 @@
+use base64::encoded_len;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ActivityName, ActivitySequence, AttemptId, ExactBytes, ExecutionId, LogicalActivityId,
+    ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,
+    LogicalActivityId,
 };
 
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+
+/// Required limits for every loaded or proposed checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointLimits {
+    max_activity_records: usize,
+    max_encoded_bytes: usize,
+}
+
+impl CheckpointLimits {
+    pub fn new(
+        max_activity_records: usize,
+        max_encoded_bytes: usize,
+    ) -> Result<Self, CheckpointError> {
+        if max_activity_records == 0 {
+            return Err(CheckpointError::ZeroActivityRecordLimit);
+        }
+        if max_encoded_bytes == 0 {
+            return Err(CheckpointError::ZeroEncodedCheckpointLimit);
+        }
+        Ok(Self {
+            max_activity_records,
+            max_encoded_bytes,
+        })
+    }
+
+    pub const fn max_activity_records(self) -> usize {
+        self.max_activity_records
+    }
+
+    pub const fn max_encoded_bytes(self) -> usize {
+        self.max_encoded_bytes
+    }
+}
 
 /// Version discriminator and opaque JSON payload bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -26,7 +61,17 @@ impl CheckpointEnvelope {
         serde_json::to_vec(payload)
             .map(ExactBytes::new)
             .map(|payload| Self::new(CHECKPOINT_FORMAT_VERSION, payload))
-            .map_err(|error| CheckpointError::InvalidJson(error.to_string()))
+            .map_err(invalid_json)
+    }
+
+    pub fn encode_with_limits(
+        payload: &CheckpointPayload,
+        limits: CheckpointLimits,
+    ) -> Result<Self, CheckpointError> {
+        validate_activity_count(payload, limits)?;
+        let checkpoint = Self::encode(payload)?;
+        checkpoint.validate_encoded_size(limits)?;
+        Ok(checkpoint)
     }
 
     pub const fn format_version(&self) -> u32 {
@@ -37,10 +82,18 @@ impl CheckpointEnvelope {
         &self.payload
     }
 
+    /// Canonical JSON bytes required to persist this complete envelope.
+    pub fn encoded_len(&self) -> Result<usize, CheckpointError> {
+        serde_json::to_vec(self)
+            .map(|encoded| encoded.len())
+            .map_err(invalid_json)
+    }
+
     pub fn decode_and_validate(
         &self,
         expected_execution_id: ExecutionId,
         expected_workflow_input: &ExactBytes,
+        limits: CheckpointLimits,
     ) -> Result<CheckpointPayload, CheckpointError> {
         if self.format_version != CHECKPOINT_FORMAT_VERSION {
             return Err(CheckpointError::UnsupportedFormat {
@@ -48,11 +101,23 @@ impl CheckpointEnvelope {
                 supported: CHECKPOINT_FORMAT_VERSION,
             });
         }
+        self.validate_encoded_size(limits)?;
 
-        let payload: CheckpointPayload = serde_json::from_slice(self.payload.as_slice())
-            .map_err(|error| CheckpointError::InvalidJson(error.to_string()))?;
-        payload.validate(expected_execution_id, expected_workflow_input)?;
+        let payload: CheckpointPayload =
+            serde_json::from_slice(self.payload.as_slice()).map_err(invalid_json)?;
+        payload.validate(expected_execution_id, expected_workflow_input, limits)?;
         Ok(payload)
+    }
+
+    fn validate_encoded_size(&self, limits: CheckpointLimits) -> Result<(), CheckpointError> {
+        let actual = self.encoded_len()?;
+        if actual > limits.max_encoded_bytes {
+            return Err(CheckpointError::EncodedCheckpointLimitExceeded {
+                actual,
+                maximum: limits.max_encoded_bytes,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -97,7 +162,9 @@ impl CheckpointPayload {
         &self,
         expected_execution_id: ExecutionId,
         expected_workflow_input: &ExactBytes,
+        limits: CheckpointLimits,
     ) -> Result<(), CheckpointError> {
+        validate_activity_count(self, limits)?;
         if self.execution_id != expected_execution_id {
             return Err(CheckpointError::ExecutionMismatch {
                 expected: expected_execution_id,
@@ -119,9 +186,17 @@ impl CheckpointPayload {
                     actual: record.sequence,
                 });
             }
-            if !matches!(record.state, ActivityState::Completed { .. })
-                && index + 1 != self.activities.len()
-            {
+            if let ActivityState::Completed { result } = &record.state {
+                let actual = u64::try_from(result.as_slice().len())
+                    .map_err(|_| CheckpointError::ResultLengthUnrepresentable)?;
+                if actual > record.spec.max_result_bytes() {
+                    return Err(CheckpointError::CompletedResultExceedsDeclared {
+                        sequence: record.sequence,
+                        actual,
+                        maximum: record.spec.max_result_bytes(),
+                    });
+                }
+            } else if index + 1 != self.activities.len() {
                 return Err(CheckpointError::PendingActivityNotFinal {
                     sequence: record.sequence,
                 });
@@ -129,55 +204,81 @@ impl CheckpointPayload {
         }
         Ok(())
     }
+
+    /// Exact encoded envelope size for completing the final record with a
+    /// result at its declared maximum, without allocating that result.
+    pub(crate) fn maximum_completed_encoded_len(&self) -> Result<usize, CheckpointError> {
+        let record = self
+            .activities
+            .last()
+            .ok_or(CheckpointError::MissingPendingActivity)?;
+        let result_len = usize::try_from(record.spec.max_result_bytes())
+            .map_err(|_| CheckpointError::ResultLengthUnrepresentable)?;
+        let result_base64_len =
+            encoded_len(result_len, true).ok_or(CheckpointError::EncodedLengthOverflow)?;
+
+        let mut empty_completion = self.clone();
+        let final_record = empty_completion
+            .activities
+            .last_mut()
+            .expect("final record was checked above");
+        final_record.state = ActivityState::Completed {
+            result: ExactBytes::default(),
+        };
+        let empty_inner_len = serde_json::to_vec(&empty_completion)
+            .map_err(invalid_json)?
+            .len();
+        let projected_inner_len = empty_inner_len
+            .checked_add(result_base64_len)
+            .ok_or(CheckpointError::EncodedLengthOverflow)?;
+        let projected_payload_base64_len =
+            encoded_len(projected_inner_len, true).ok_or(CheckpointError::EncodedLengthOverflow)?;
+        let empty_envelope_len =
+            CheckpointEnvelope::new(CHECKPOINT_FORMAT_VERSION, ExactBytes::default())
+                .encoded_len()?;
+        empty_envelope_len
+            .checked_add(projected_payload_base64_len)
+            .ok_or(CheckpointError::EncodedLengthOverflow)
+    }
 }
 
 /// One activity in contiguous zero-based workflow history.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActivityRecord {
     sequence: ActivitySequence,
-    name: ActivityName,
-    input: ExactBytes,
+    spec: ActivitySpec,
     state: ActivityState,
 }
 
 impl ActivityRecord {
-    pub fn new(
-        sequence: ActivitySequence,
-        name: ActivityName,
-        input: ExactBytes,
-        state: ActivityState,
-    ) -> Self {
+    pub const fn new(sequence: ActivitySequence, spec: ActivitySpec, state: ActivityState) -> Self {
         Self {
             sequence,
-            name,
-            input,
+            spec,
             state,
         }
     }
 
-    pub fn scheduled(sequence: ActivitySequence, name: ActivityName, input: ExactBytes) -> Self {
-        Self::new(sequence, name, input, ActivityState::Scheduled)
+    pub const fn scheduled(sequence: ActivitySequence, spec: ActivitySpec) -> Self {
+        Self::new(sequence, spec, ActivityState::Scheduled)
     }
 
-    pub fn completed(
+    pub const fn completed(
         sequence: ActivitySequence,
-        name: ActivityName,
-        input: ExactBytes,
+        spec: ActivitySpec,
         result: ExactBytes,
     ) -> Self {
-        Self::new(sequence, name, input, ActivityState::Completed { result })
+        Self::new(sequence, spec, ActivityState::Completed { result })
     }
 
-    pub fn dispatch_exposed(
+    pub const fn dispatch_exposed(
         sequence: ActivitySequence,
-        name: ActivityName,
-        input: ExactBytes,
+        spec: ActivitySpec,
         attempt_id: AttemptId,
     ) -> Self {
         Self::new(
             sequence,
-            name,
-            input,
+            spec,
             ActivityState::DispatchExposed { attempt_id },
         )
     }
@@ -186,25 +287,28 @@ impl ActivityRecord {
         self.sequence
     }
 
-    pub fn name(&self) -> &ActivityName {
-        &self.name
+    pub const fn spec(&self) -> &ActivitySpec {
+        &self.spec
     }
 
-    pub fn input(&self) -> &ExactBytes {
-        &self.input
+    pub const fn name(&self) -> &ActivityName {
+        self.spec.name()
     }
 
-    pub fn state(&self) -> &ActivityState {
+    pub const fn input(&self) -> &ExactBytes {
+        self.spec.input()
+    }
+
+    pub const fn max_result_bytes(&self) -> u64 {
+        self.spec.max_result_bytes()
+    }
+
+    pub const fn state(&self) -> &ActivityState {
         &self.state
     }
 
     pub fn logical_id(&self, execution_id: ExecutionId) -> LogicalActivityId {
-        LogicalActivityId::new(
-            execution_id,
-            self.sequence,
-            self.name.clone(),
-            self.input.clone(),
-        )
+        LogicalActivityId::new(execution_id, self.sequence, self.spec.clone())
     }
 }
 
@@ -233,6 +337,26 @@ pub enum CheckpointError {
         expected: ExactBytes,
         actual: ExactBytes,
     },
+    #[error("maximum activity records must be greater than zero")]
+    ZeroActivityRecordLimit,
+    #[error("maximum encoded checkpoint bytes must be greater than zero")]
+    ZeroEncodedCheckpointLimit,
+    #[error("checkpoint has {actual} activity records; configured maximum is {maximum}")]
+    ActivityRecordLimitExceeded { actual: usize, maximum: usize },
+    #[error("encoded checkpoint uses {actual} bytes; configured maximum is {maximum}")]
+    EncodedCheckpointLimitExceeded { actual: usize, maximum: usize },
+    #[error("activity result length cannot be represented on this platform")]
+    ResultLengthUnrepresentable,
+    #[error("encoded checkpoint length overflow")]
+    EncodedLengthOverflow,
+    #[error("capacity reservation requires a final pending activity")]
+    MissingPendingActivity,
+    #[error("activity {sequence} result uses {actual} bytes; declared maximum is {maximum}")]
+    CompletedResultExceedsDeclared {
+        sequence: ActivitySequence,
+        actual: u64,
+        maximum: u64,
+    },
     #[error("activity history is too long to address with a u64 sequence")]
     HistoryTooLong,
     #[error("expected activity sequence {expected}, found {actual}")]
@@ -242,4 +366,22 @@ pub enum CheckpointError {
     },
     #[error("pending activity {sequence} must be the final history record")]
     PendingActivityNotFinal { sequence: ActivitySequence },
+}
+
+fn validate_activity_count(
+    payload: &CheckpointPayload,
+    limits: CheckpointLimits,
+) -> Result<(), CheckpointError> {
+    let actual = payload.activities.len();
+    if actual > limits.max_activity_records {
+        return Err(CheckpointError::ActivityRecordLimitExceeded {
+            actual,
+            maximum: limits.max_activity_records,
+        });
+    }
+    Ok(())
+}
+
+fn invalid_json(error: serde_json::Error) -> CheckpointError {
+    CheckpointError::InvalidJson(error.to_string())
 }

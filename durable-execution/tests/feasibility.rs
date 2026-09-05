@@ -5,13 +5,13 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use futures::executor::block_on;
 use kuberic_durable_execution::{
-    ActivityName, DurableHost, ExactBytes, ExecutionId, FeasibilityClassification,
-    FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore,
-    Workflow, WorkflowContext, classify_feasibility,
+    ActivityName, ActivitySpec, CheckpointLimits, DurableHost, ExactBytes, ExecutionId,
+    FeasibilityClassification, FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome,
+    InMemoryCheckpointStore, Workflow, WorkflowContext, classify_feasibility,
 };
 use support::scenarios::{ScenarioId, run_conformance_matrix};
 
-const EXPECTED_FR_013_SCENARIOS: usize = 23;
+const EXPECTED_FR_013_SCENARIOS: usize = 28;
 
 struct SelectedOrdinaryAsyncSurface;
 
@@ -20,7 +20,11 @@ struct SelectedOrdinaryAsyncSurface;
 impl Workflow for SelectedOrdinaryAsyncSurface {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes {
         context
-            .activity(ActivityName::new("ordinary-async", 1).unwrap(), input)
+            .activity(ActivitySpec::new(
+                ActivityName::new("ordinary-async", 1).unwrap(),
+                input,
+                1024,
+            ))
             .await
     }
 }
@@ -84,7 +88,11 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         usize::from(ordinary_async_exported) + usize::from(fallback_exported);
 
     let store = InMemoryCheckpointStore::new();
-    let mut host = DurableHost::new(store, HostEpoch::from_bytes([1; 16]));
+    let mut host = DurableHost::new(
+        store,
+        HostEpoch::from_bytes([1; 16]),
+        CheckpointLimits::new(16, 100_000).unwrap(),
+    );
     let first_turn = block_on(host.turn(
         &SelectedOrdinaryAsyncSurface,
         ExecutionId::from_bytes([1; 16]),

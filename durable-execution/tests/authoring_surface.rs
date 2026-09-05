@@ -3,8 +3,9 @@ mod support;
 use async_trait::async_trait;
 use futures::executor::block_on;
 use kuberic_durable_execution::{
-    ActivityName, DurableHost, ExactBytes, ExecutionId, HOST_OUTCOME_VARIANTS, HostEpoch,
-    HostOutcome, InMemoryCheckpointStore, Workflow, WorkflowContext,
+    ActivityName, ActivitySpec, CheckpointLimits, DurableHost, ExactBytes, ExecutionId,
+    HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore, Workflow,
+    WorkflowContext,
 };
 use support::scenarios::{ScenarioId, run_conformance_matrix};
 
@@ -15,7 +16,11 @@ struct OrdinaryAsyncWorkflow;
 impl Workflow for OrdinaryAsyncWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes {
         context
-            .activity(ActivityName::new("ordinary-async", 1).unwrap(), input)
+            .activity(ActivitySpec::new(
+                ActivityName::new("ordinary-async", 1).unwrap(),
+                input,
+                1024,
+            ))
             .await
     }
 }
@@ -37,7 +42,11 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
         || body.contains(concat!("state_", "machine"));
 
     let store = InMemoryCheckpointStore::new();
-    let mut host = DurableHost::new(store, HostEpoch::from_bytes([1; 16]));
+    let mut host = DurableHost::new(
+        store,
+        HostEpoch::from_bytes([1; 16]),
+        CheckpointLimits::new(16, 100_000).unwrap(),
+    );
     let first_turn = block_on(host.turn(
         &OrdinaryAsyncWorkflow,
         ExecutionId::from_bytes([1; 16]),

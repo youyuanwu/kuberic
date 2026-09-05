@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures::future::poll_fn;
 
 use crate::{
-    ActivityName, ActivityRecord, ActivitySequence, ActivityState, ExactBytes, ExecutionId,
+    ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, ExactBytes, ExecutionId,
     LogicalActivityId, Nondeterminism,
 };
 
@@ -32,15 +32,15 @@ impl<'history> WorkflowContext<'history> {
         }
     }
 
-    pub async fn activity(&mut self, name: ActivityName, input: ExactBytes) -> ExactBytes {
-        poll_fn(|_| self.poll_activity(&name, &input)).await
+    pub async fn activity(&mut self, spec: ActivitySpec) -> ExactBytes {
+        poll_fn(|_| self.poll_activity(&spec)).await
     }
 
     pub(crate) const fn cursor(&self) -> usize {
         self.cursor
     }
 
-    fn poll_activity(&mut self, name: &ActivityName, input: &ExactBytes) -> Poll<ExactBytes> {
+    fn poll_activity(&mut self, spec: &ActivitySpec) -> Poll<ExactBytes> {
         if self.decision.is_some() {
             return Poll::Pending;
         }
@@ -48,27 +48,23 @@ impl<'history> WorkflowContext<'history> {
         let sequence = ActivitySequence::new(
             u64::try_from(self.cursor).expect("validated history length fits in u64"),
         );
-        let requested_id =
-            LogicalActivityId::new(self.execution_id, sequence, name.clone(), input.clone());
+        let requested_id = LogicalActivityId::new(self.execution_id, sequence, spec.clone());
 
         let Some(record) = self.history.get(self.cursor) else {
             self.decision = Some(ContextDecision::Schedule {
                 sequence,
-                name: name.clone(),
-                input: input.clone(),
+                spec: spec.clone(),
                 logical_id: requested_id,
             });
             return Poll::Pending;
         };
 
-        if record.name() != name || record.input() != input {
+        if record.spec() != spec {
             self.decision = Some(ContextDecision::Nondeterminism(
                 Nondeterminism::ActivityMismatch {
                     sequence,
-                    recorded_name: record.name().clone(),
-                    requested_name: name.clone(),
-                    recorded_input: record.input().clone(),
-                    requested_input: input.clone(),
+                    recorded: record.spec().clone(),
+                    requested: spec.clone(),
                 },
             ));
             return Poll::Pending;
@@ -93,8 +89,7 @@ impl<'history> WorkflowContext<'history> {
 pub(crate) enum ContextDecision {
     Schedule {
         sequence: ActivitySequence,
-        name: ActivityName,
-        input: ExactBytes,
+        spec: ActivitySpec,
         logical_id: LogicalActivityId,
     },
     ExistingPending {
