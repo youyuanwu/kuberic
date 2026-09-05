@@ -84,9 +84,15 @@ impl CheckpointEnvelope {
 
     /// Canonical JSON bytes required to persist this complete envelope.
     pub fn encoded_len(&self) -> Result<usize, CheckpointError> {
-        serde_json::to_vec(self)
-            .map(|encoded| encoded.len())
-            .map_err(invalid_json)
+        let payload_base64_len = encoded_len(self.payload.as_slice().len(), true)
+            .ok_or(CheckpointError::EncodedLengthOverflow)?;
+        let fixed_envelope_len =
+            serde_json::to_vec(&Self::new(self.format_version, ExactBytes::default()))
+                .map_err(invalid_json)?
+                .len();
+        fixed_envelope_len
+            .checked_add(payload_base64_len)
+            .ok_or(CheckpointError::EncodedLengthOverflow)
     }
 
     pub fn decode_and_validate(
@@ -384,4 +390,23 @@ fn validate_activity_count(
 
 fn invalid_json(error: serde_json::Error) -> CheckpointError {
     CheckpointError::InvalidJson(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonallocating_encoded_length_matches_canonical_json() {
+        for payload_len in [0, 1, 2, 3, 4, 255, 1024] {
+            let checkpoint = CheckpointEnvelope::new(
+                CHECKPOINT_FORMAT_VERSION,
+                ExactBytes::new(vec![7; payload_len]),
+            );
+            assert_eq!(
+                checkpoint.encoded_len().unwrap(),
+                serde_json::to_vec(&checkpoint).unwrap().len()
+            );
+        }
+    }
 }
