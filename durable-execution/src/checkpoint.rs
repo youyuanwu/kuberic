@@ -154,7 +154,7 @@ impl ExecutionContract {
 
 /// Explicit lifecycle state for one execution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "lifecycle", rename_all = "snake_case")]
+#[serde(tag = "lifecycle", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CheckpointState {
     Active {
         activities: Vec<ActivityRecord>,
@@ -648,5 +648,17 @@ mod tests {
         assert!(!json.contains("activities"));
         assert!(!json.contains("history"));
         assert!(!json.contains("digest"));
+    }
+
+    #[test]
+    fn terminal_state_rejects_ignored_active_history_fields() {
+        let payload = CheckpointPayload::terminal(
+            contract(16, 1_000_000),
+            TerminalOutcome::succeeded(ExactBytes::new(b"done")),
+            4,
+        );
+        let mut value = serde_json::to_value(payload).unwrap();
+        value["state"]["activities"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<CheckpointPayload>(value).is_err());
     }
 }

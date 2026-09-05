@@ -1086,7 +1086,6 @@ async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
 
 async fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
-    let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(13);
     let input = bytes(b"workflow");
     let valid = CheckpointEnvelope::encode(&CheckpointPayload::active(
@@ -1102,8 +1101,12 @@ async fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
         .compare_and_swap(execution_id, None, unsupported)
         .await;
     let mut durable_host = host(store, 13);
+    let polls = Cell::new(0);
     let outcome = durable_host
-        .turn(&workflow, execution_spec(execution_id, input))
+        .turn(
+            &PollSentinelWorkflow { polls: &polls },
+            execution_spec(execution_id, input),
+        )
         .await;
     ScenarioEvidence::new(
         id,
@@ -1115,7 +1118,13 @@ async fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
             ),
             (
                 "host rejects format before workflow or dispatch",
-                matches!(outcome, HostOutcome::CheckpointRejected(_)),
+                matches!(
+                    outcome,
+                    HostOutcome::CheckpointRejected(CheckpointError::UnsupportedFormat {
+                        actual: 2,
+                        supported: CHECKPOINT_FORMAT_VERSION
+                    })
+                ) && polls.get() == 0,
             ),
         ],
     )
@@ -2733,6 +2742,24 @@ async fn completion_store_failures(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
+async fn turn_injected_checkpoint(
+    checkpoint: CheckpointEnvelope,
+    storage_key: ExecutionId,
+    caller: ExecutionSpec,
+    epoch_value: u8,
+    polls: &Cell<usize>,
+) -> HostOutcome {
+    let store = InMemoryCheckpointStore::new();
+    store
+        .compare_and_swap(storage_key, None, checkpoint)
+        .await
+        .unwrap();
+    let mut durable_host = host(store, epoch_value);
+    durable_host
+        .turn(&PollSentinelWorkflow { polls }, caller)
+        .await
+}
+
 async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
     let active_store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
@@ -2914,6 +2941,147 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
         )
         .await;
 
+    let active_identity_polls = Cell::new(0);
+    let active_identity_caller = execution_spec(execution(157), bytes(b"active-identity"));
+    let active_identity = turn_injected_checkpoint(
+        CheckpointEnvelope::encode(&CheckpointPayload::active(
+            ExecutionContract::new(
+                ExecutionSpec::new(
+                    execution(158),
+                    active_identity_caller.workflow_input().clone(),
+                    MAX_TERMINAL_PAYLOAD_BYTES,
+                ),
+                generous_limits().max_encoded_bytes() as u64,
+            ),
+            Vec::new(),
+        ))
+        .unwrap(),
+        active_identity_caller.execution_id(),
+        active_identity_caller,
+        157,
+        &active_identity_polls,
+    )
+    .await;
+
+    let active_input_polls = Cell::new(0);
+    let active_input_caller = execution_spec(execution(159), bytes(b"active-input"));
+    let active_input = turn_injected_checkpoint(
+        CheckpointEnvelope::encode(&CheckpointPayload::active(
+            ExecutionContract::new(
+                ExecutionSpec::new(
+                    active_input_caller.execution_id(),
+                    bytes(b"different-active-input"),
+                    MAX_TERMINAL_PAYLOAD_BYTES,
+                ),
+                generous_limits().max_encoded_bytes() as u64,
+            ),
+            Vec::new(),
+        ))
+        .unwrap(),
+        active_input_caller.execution_id(),
+        active_input_caller,
+        159,
+        &active_input_polls,
+    )
+    .await;
+
+    let terminal_identity_polls = Cell::new(0);
+    let terminal_identity_caller = execution_spec(execution(160), bytes(b"terminal-identity"));
+    let terminal_identity = turn_injected_checkpoint(
+        CheckpointEnvelope::encode(&CheckpointPayload::terminal(
+            ExecutionContract::new(
+                ExecutionSpec::new(
+                    execution(161),
+                    terminal_identity_caller.workflow_input().clone(),
+                    MAX_TERMINAL_PAYLOAD_BYTES,
+                ),
+                generous_limits().max_encoded_bytes() as u64,
+            ),
+            TerminalOutcome::succeeded(bytes(b"done")),
+            0,
+        ))
+        .unwrap(),
+        terminal_identity_caller.execution_id(),
+        terminal_identity_caller,
+        160,
+        &terminal_identity_polls,
+    )
+    .await;
+
+    let terminal_input_polls = Cell::new(0);
+    let terminal_input_caller = execution_spec(execution(162), bytes(b"terminal-input"));
+    let terminal_input = turn_injected_checkpoint(
+        CheckpointEnvelope::encode(&CheckpointPayload::terminal(
+            ExecutionContract::new(
+                ExecutionSpec::new(
+                    terminal_input_caller.execution_id(),
+                    bytes(b"different-terminal-input"),
+                    MAX_TERMINAL_PAYLOAD_BYTES,
+                ),
+                generous_limits().max_encoded_bytes() as u64,
+            ),
+            TerminalOutcome::succeeded(bytes(b"done")),
+            0,
+        ))
+        .unwrap(),
+        terminal_input_caller.execution_id(),
+        terminal_input_caller,
+        162,
+        &terminal_input_polls,
+    )
+    .await;
+
+    let terminal_missing_polls = Cell::new(0);
+    let terminal_missing_caller = execution_spec(execution(163), bytes(b"terminal-missing"));
+    let mut terminal_missing_value = serde_json::to_value(CheckpointPayload::terminal(
+        ExecutionContract::new(
+            terminal_missing_caller.clone(),
+            generous_limits().max_encoded_bytes() as u64,
+        ),
+        TerminalOutcome::succeeded(bytes(b"done")),
+        0,
+    ))
+    .unwrap();
+    terminal_missing_value["execution"]["spec"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_terminal_payload_bytes");
+    let terminal_missing = turn_injected_checkpoint(
+        CheckpointEnvelope::new(
+            CHECKPOINT_FORMAT_VERSION,
+            ExactBytes::new(serde_json::to_vec(&terminal_missing_value).unwrap()),
+        ),
+        terminal_missing_caller.execution_id(),
+        terminal_missing_caller,
+        163,
+        &terminal_missing_polls,
+    )
+    .await;
+
+    let mixed_terminal_polls = Cell::new(0);
+    let mixed_terminal_caller = execution_spec(execution(164), bytes(b"mixed-terminal"));
+    let mut mixed_terminal_value = serde_json::to_value(CheckpointPayload::terminal(
+        ExecutionContract::new(
+            mixed_terminal_caller.clone(),
+            generous_limits().max_encoded_bytes() as u64,
+        ),
+        TerminalOutcome::succeeded(bytes(b"done")),
+        0,
+    ))
+    .unwrap();
+    mixed_terminal_value["state"]["activities"] = serde_json::json!([]);
+    let mixed_terminal = turn_injected_checkpoint(
+        CheckpointEnvelope::new(
+            CHECKPOINT_FORMAT_VERSION,
+            ExactBytes::new(serde_json::to_vec(&mixed_terminal_value).unwrap()),
+        ),
+        mixed_terminal_caller.execution_id(),
+        mixed_terminal_caller,
+        164,
+        &mixed_terminal_polls,
+    )
+    .await;
+
     ScenarioEvidence::new(
         id,
         "reject changed, missing, inconsistent, or downgraded execution contracts before polling",
@@ -2939,7 +3107,7 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
             (
                 "missing persisted declaration is malformed and rejected before polling",
                 matches!(
-                    missing,
+                    &missing,
                     HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
                 ) && missing_polls.get() == 0,
             ),
@@ -2972,6 +3140,43 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                     )
                 ) && active_downgrade_polls.get() == 0
                     && terminal_downgrade_polls.get() == 0,
+            ),
+            (
+                "caller identity and input mismatches reject active and terminal state before polling",
+                matches!(
+                    active_identity,
+                    HostOutcome::CheckpointRejected(CheckpointError::ExecutionMismatch { .. })
+                ) && matches!(
+                    active_input,
+                    HostOutcome::CheckpointRejected(CheckpointError::WorkflowInputMismatch { .. })
+                ) && matches!(
+                    terminal_identity,
+                    HostOutcome::CheckpointRejected(CheckpointError::ExecutionMismatch { .. })
+                ) && matches!(
+                    terminal_input,
+                    HostOutcome::CheckpointRejected(CheckpointError::WorkflowInputMismatch { .. })
+                ) && active_identity_polls.get() == 0
+                    && active_input_polls.get() == 0
+                    && terminal_identity_polls.get() == 0
+                    && terminal_input_polls.get() == 0,
+            ),
+            (
+                "malformed declarations reject active and terminal state before polling",
+                matches!(
+                    &missing,
+                    HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
+                ) && matches!(
+                    terminal_missing,
+                    HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
+                ) && missing_polls.get() == 0
+                    && terminal_missing_polls.get() == 0,
+            ),
+            (
+                "terminal state rejects retained active-history fields before polling",
+                matches!(
+                    mixed_terminal,
+                    HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
+                ) && mixed_terminal_polls.get() == 0,
             ),
         ],
     )
