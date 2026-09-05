@@ -157,10 +157,13 @@ async fn validates_real_api_cas_watch_compaction_and_ambiguous_recovery() -> Tes
         .await?;
 
     let result = run_real_api_scenarios(client.clone(), &namespace).await;
-    let cleanup = namespaces
-        .delete(&namespace, &DeleteParams::default())
-        .await
-        .map(|_| ());
+    let cleanup = async {
+        namespaces
+            .delete(&namespace, &DeleteParams::default())
+            .await?;
+        wait_for_namespace_absence(&namespaces, &namespace).await
+    }
+    .await;
     match cleanup {
         Ok(()) => println!("KUBERNETES_PREFLIGHT namespace_cleanup=passed"),
         Err(ref error) => eprintln!("KUBERNETES_PREFLIGHT namespace_cleanup=failed error={error}"),
@@ -231,7 +234,8 @@ async fn run_real_api_scenarios(client: Client, namespace: &str) -> TestResult<(
          active_checkpoint_bytes={} active_object_bytes={} \
          terminal_checkpoint_bytes={} terminal_object_bytes={} \
          accepted_writes={} measurement_failures={} \
-         watch_events={} watch_delivered_bytes={} \
+         watch_events={} watch_typed_event_json_bytes={} \
+         watch_byte_boundary=canonical_typed_WatchEvent_ConfigMap_JSON_excludes_HTTP_framing \
          apply_then_unknown_recovery=successor \
          no_apply_unknown_recovery=predecessor_then_terminal \
          ambiguity_evidence=store-boundary-mask",
@@ -539,6 +543,20 @@ async fn wait_for_absence(api: &Api<ConfigMap>, name: &str) -> TestResult<()> {
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!("ConfigMap {name} was not deleted"),
+    )
+    .into())
+}
+
+async fn wait_for_namespace_absence(api: &Api<Namespace>, name: &str) -> TestResult<()> {
+    for _ in 0..100 {
+        if api.get_opt(name).await?.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("Namespace {name} was not deleted"),
     )
     .into())
 }
