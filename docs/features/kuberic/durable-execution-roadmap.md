@@ -21,34 +21,39 @@ The implemented kernel provides:
 - separately persisted schedule and dispatch exposure;
 - bounded activity count and encoded checkpoint size;
 - maximum-result capacity reservation before dispatch;
+- immutable execution-level terminal payload and admitted capacity;
+- completion-only active-to-terminal checkpoint compaction;
+- direct terminal outcome reload without workflow polling;
 - ambiguity quarantine and authoritative observation recovery.
 
 The bounds prevent unlimited growth and ensure a declared-valid result remains
-persistable after dispatch. They do not compact active history: every completed
+persistable after dispatch. Active history is never compacted: every completed
 activity input and result remains in the checkpoint until the workflow
-terminates or reaches a configured limit.
+terminalizes or reaches a configured limit.
 
 ## History Lifecycle
 
-### Next: Completion-Only Compaction
+### Implemented: Completion-Only Compaction
 
-The first lifecycle extension should compact only terminal workflows:
+The as-built lifecycle compacts only completed workflows:
 
 1. Keep complete bounded history while a workflow is active.
 2. When replay reaches terminal completion, compare-and-swap the active
    checkpoint to a bounded terminal record.
-3. Retain only execution and workflow version identity, terminal outcome,
-   bounded result or error summary, completed activity count, and optional
-   history digest.
+3. Retain only the immutable execution contract, exact success or failure
+   outcome, and completed activity count. The terminal shape has no activity
+   history or digest.
 4. Report durable completion only after the terminal transition is accepted or
    subsequently observed.
 5. Return the terminal result directly on later loads without replaying the
    discarded history.
 
-The terminal representation needs its own fixed result/error bounds. Those
-bounds must be admitted before the first external effect, or the integration
-must retain a separately bounded domain summary instead of an arbitrary
-workflow result.
+The execution contract declares one immutable terminal payload bound and
+persists the encoded-checkpoint capacity under which it was admitted. Before
+workflow evaluation can approach its first external effect, the kernel proves
+that both terminal variants at the declared maximum fit that capacity. A later
+smaller configured capacity is rejected. Exact-bound outcomes succeed;
+oversized outcomes violate the predeclared contract.
 
 ### No Generic Mid-Operation Compaction
 
