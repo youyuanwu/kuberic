@@ -1,10 +1,11 @@
 use async_trait::async_trait;
+use futures::{FutureExt, future::poll_fn, join, task::AtomicWaker};
 use kuberic_durable_execution::{
-    ActivityName, ActivityObservation, ActivitySequence, AttemptId, CheckpointEnvelope,
-    CheckpointPayload, CheckpointStore, CompareAndSwap, DispatchPermit, DurableHost, ExactBytes,
-    ExecutionId, HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault, LogicalActivityId,
-    Nondeterminism, ObservationRejection, PersistenceBoundary, ReloadReason, Workflow,
-    WorkflowContext,
+    ActivityName, ActivityObservation, ActivitySequence, AttemptId, CasOutcome, CheckpointEnvelope,
+    CheckpointPayload, CheckpointStore, DispatchPermit, DurableHost, ExactBytes, ExecutionId,
+    HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault, LogicalActivityId,
+    Nondeterminism, ObservationRejection, PersistenceBoundary, ReloadReason, StorageRevision,
+    StoreError, StoreErrorKind, StoredCheckpoint, Workflow, WorkflowContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,17 +23,20 @@ pub enum ScenarioId {
     AmbiguityQuarantine,
     DeterministicCompletedReplay,
     UnsupportedCheckpointFormat,
-    ScheduleResponseLostAfterApply,
-    ExposureResponseLostAfterApply,
-    ObservationResponseLostAfterApply,
+    ScheduleOutcomeUnknownAfterApply,
+    ExposureOutcomeUnknownAfterApply,
+    ObservationOutcomeUnknownAfterApply,
     MismatchedObservation,
     CompetingObservations,
     QuarantineResolution,
     QuarantineBlocksAllProgress,
+    LoadAbsenceAndProviderFailures,
+    OpaqueStorageRevisions,
+    OutcomeUnknownApplyStateHidden,
 }
 
 impl ScenarioId {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 23] = [
         Self::RestartBeforeSchedulePersistence,
         Self::RestartAfterSchedulePersistence,
         Self::RestartAfterDispatchExposure,
@@ -46,13 +50,16 @@ impl ScenarioId {
         Self::AmbiguityQuarantine,
         Self::DeterministicCompletedReplay,
         Self::UnsupportedCheckpointFormat,
-        Self::ScheduleResponseLostAfterApply,
-        Self::ExposureResponseLostAfterApply,
-        Self::ObservationResponseLostAfterApply,
+        Self::ScheduleOutcomeUnknownAfterApply,
+        Self::ExposureOutcomeUnknownAfterApply,
+        Self::ObservationOutcomeUnknownAfterApply,
         Self::MismatchedObservation,
         Self::CompetingObservations,
         Self::QuarantineResolution,
         Self::QuarantineBlocksAllProgress,
+        Self::LoadAbsenceAndProviderFailures,
+        Self::OpaqueStorageRevisions,
+        Self::OutcomeUnknownApplyStateHidden,
     ];
 
     pub const fn stable_id(self) -> &'static str {
@@ -70,13 +77,16 @@ impl ScenarioId {
             Self::AmbiguityQuarantine => "FR-013-11",
             Self::DeterministicCompletedReplay => "FR-013-12",
             Self::UnsupportedCheckpointFormat => "FR-013-13",
-            Self::ScheduleResponseLostAfterApply => "FR-013-14",
-            Self::ExposureResponseLostAfterApply => "FR-013-15",
-            Self::ObservationResponseLostAfterApply => "FR-013-16",
+            Self::ScheduleOutcomeUnknownAfterApply => "FR-013-14",
+            Self::ExposureOutcomeUnknownAfterApply => "FR-013-15",
+            Self::ObservationOutcomeUnknownAfterApply => "FR-013-16",
             Self::MismatchedObservation => "FR-013-17",
             Self::CompetingObservations => "FR-013-18",
             Self::QuarantineResolution => "FR-013-19",
             Self::QuarantineBlocksAllProgress => "FR-013-20",
+            Self::LoadAbsenceAndProviderFailures => "FR-013-21",
+            Self::OpaqueStorageRevisions => "FR-013-22",
+            Self::OutcomeUnknownApplyStateHidden => "FR-013-23",
         }
     }
 }
@@ -115,54 +125,102 @@ impl ScenarioEvidence {
     }
 }
 
-pub fn run_conformance_matrix() -> Vec<ScenarioEvidence> {
-    ScenarioId::ALL.into_iter().map(run_scenario).collect()
+pub async fn run_conformance_matrix() -> Vec<ScenarioEvidence> {
+    let mut evidence = Vec::with_capacity(ScenarioId::ALL.len());
+    for id in ScenarioId::ALL {
+        evidence.push(run_scenario(id).await);
+    }
+    evidence
 }
 
-fn run_scenario(id: ScenarioId) -> ScenarioEvidence {
-    catch_unwind(AssertUnwindSafe(|| run_scenario_inner(id))).unwrap_or_else(|_| {
-        ScenarioEvidence::new(
-            id,
-            "scenario setup or execution panicked",
-            [("scenario completed and emitted structured evidence", false)],
-        )
-    })
+async fn run_scenario(id: ScenarioId) -> ScenarioEvidence {
+    AssertUnwindSafe(run_scenario_inner(id))
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            ScenarioEvidence::new(
+                id,
+                "scenario setup or execution panicked",
+                [("scenario completed and emitted structured evidence", false)],
+            )
+        })
 }
 
-fn run_scenario_inner(id: ScenarioId) -> ScenarioEvidence {
+async fn run_scenario_inner(id: ScenarioId) -> ScenarioEvidence {
     match id {
-        ScenarioId::RestartBeforeSchedulePersistence => restart_before_schedule(id),
-        ScenarioId::RestartAfterSchedulePersistence => restart_after_schedule(id),
-        ScenarioId::RestartAfterDispatchExposure => restart_after_exposure(id),
-        ScenarioId::LostReplyFollowedByObservation => lost_reply_then_observation(id),
-        ScenarioId::DuplicateSchedulePollAndConflict => schedule_conflict(id),
-        ScenarioId::DuplicateExposurePollAndConflict => exposure_conflict(id),
-        ScenarioId::ChangedActivityOrder => changed_order(id),
-        ScenarioId::ChangedActivityName => changed_name(id),
-        ScenarioId::ChangedExactInput => changed_input(id),
-        ScenarioId::RefreshedAttemptStableLogicalIdentity => refreshed_attempt(id),
-        ScenarioId::AmbiguityQuarantine => quarantine(id),
-        ScenarioId::DeterministicCompletedReplay => completed_replay(id),
-        ScenarioId::UnsupportedCheckpointFormat => unsupported_format(id),
-        ScenarioId::ScheduleResponseLostAfterApply => schedule_response_lost(id),
-        ScenarioId::ExposureResponseLostAfterApply => exposure_response_lost(id),
-        ScenarioId::ObservationResponseLostAfterApply => observation_response_lost(id),
-        ScenarioId::MismatchedObservation => mismatched_observation(id),
-        ScenarioId::CompetingObservations => competing_observations(id),
-        ScenarioId::QuarantineResolution => quarantine_resolution(id),
-        ScenarioId::QuarantineBlocksAllProgress => quarantine_blocks_progress(id),
+        ScenarioId::RestartBeforeSchedulePersistence => restart_before_schedule(id).await,
+        ScenarioId::RestartAfterSchedulePersistence => restart_after_schedule(id).await,
+        ScenarioId::RestartAfterDispatchExposure => restart_after_exposure(id).await,
+        ScenarioId::LostReplyFollowedByObservation => lost_reply_then_observation(id).await,
+        ScenarioId::DuplicateSchedulePollAndConflict => schedule_conflict(id).await,
+        ScenarioId::DuplicateExposurePollAndConflict => exposure_conflict(id).await,
+        ScenarioId::ChangedActivityOrder => changed_order(id).await,
+        ScenarioId::ChangedActivityName => changed_name(id).await,
+        ScenarioId::ChangedExactInput => changed_input(id).await,
+        ScenarioId::RefreshedAttemptStableLogicalIdentity => refreshed_attempt(id).await,
+        ScenarioId::AmbiguityQuarantine => quarantine(id).await,
+        ScenarioId::DeterministicCompletedReplay => completed_replay(id).await,
+        ScenarioId::UnsupportedCheckpointFormat => unsupported_format(id).await,
+        ScenarioId::ScheduleOutcomeUnknownAfterApply => {
+            schedule_outcome_unknown_after_apply(id).await
+        }
+        ScenarioId::ExposureOutcomeUnknownAfterApply => {
+            exposure_outcome_unknown_after_apply(id).await
+        }
+        ScenarioId::ObservationOutcomeUnknownAfterApply => {
+            observation_outcome_unknown_after_apply(id).await
+        }
+        ScenarioId::MismatchedObservation => mismatched_observation(id).await,
+        ScenarioId::CompetingObservations => competing_observations(id).await,
+        ScenarioId::QuarantineResolution => quarantine_resolution(id).await,
+        ScenarioId::QuarantineBlocksAllProgress => quarantine_blocks_progress(id).await,
+        ScenarioId::LoadAbsenceAndProviderFailures => load_absence_and_provider_failures(id).await,
+        ScenarioId::OpaqueStorageRevisions => opaque_storage_revisions(id).await,
+        ScenarioId::OutcomeUnknownApplyStateHidden => outcome_unknown_apply_state_hidden(id).await,
+    }
+}
+
+#[derive(Default)]
+struct AsyncBarrier {
+    arrivals: AtomicUsize,
+    waiter: AtomicWaker,
+}
+
+impl AsyncBarrier {
+    async fn wait(&self) {
+        let mut arrived = false;
+        poll_fn(|context| {
+            if !arrived {
+                arrived = true;
+                if self.arrivals.fetch_add(1, Ordering::AcqRel) + 1 == 2 {
+                    self.waiter.wake();
+                    return Poll::Ready(());
+                }
+            }
+            if self.arrivals.load(Ordering::Acquire) >= 2 {
+                Poll::Ready(())
+            } else {
+                self.waiter.register(context.waker());
+                if self.arrivals.load(Ordering::Acquire) >= 2 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        })
+        .await;
     }
 }
 
 #[derive(Clone)]
 struct ContendedStore {
     inner: InMemoryCheckpointStore,
-    compare_barrier: Arc<Barrier>,
+    compare_barrier: Arc<AsyncBarrier>,
 }
 
 impl ContendedStore {
     fn pair(inner: InMemoryCheckpointStore) -> (Self, Self) {
-        let compare_barrier = Arc::new(Barrier::new(2));
+        let compare_barrier = Arc::new(AsyncBarrier::default());
         let first = Self {
             inner: inner.clone(),
             compare_barrier: compare_barrier.clone(),
@@ -175,46 +233,44 @@ impl ContendedStore {
     }
 }
 
+#[async_trait(?Send)]
 impl CheckpointStore for ContendedStore {
-    fn load(
+    async fn load(
         &self,
         execution_id: ExecutionId,
-    ) -> Option<kuberic_durable_execution::StoredCheckpoint> {
-        self.inner.load(execution_id)
+    ) -> Result<Option<StoredCheckpoint>, StoreError> {
+        self.inner.load(execution_id).await
     }
 
-    fn compare_and_swap(
+    async fn compare_and_swap(
         &self,
         execution_id: ExecutionId,
-        expected: Option<kuberic_durable_execution::StorageRevision>,
+        expected: Option<StorageRevision>,
         checkpoint: CheckpointEnvelope,
-    ) -> CompareAndSwap {
-        self.compare_barrier.wait();
+    ) -> Result<CasOutcome, StoreError> {
+        self.compare_barrier.wait().await;
         self.inner
             .compare_and_swap(execution_id, expected, checkpoint)
+            .await
     }
 }
 
-fn contending_turns(
+async fn contending_turns(
     store: InMemoryCheckpointStore,
     workflow: LinearWorkflow,
     execution_id: ExecutionId,
     input: ExactBytes,
 ) -> [HostOutcome; 2] {
     let (first_store, second_store) = ContendedStore::pair(store);
-    thread::scope(|scope| {
-        let first_workflow = workflow.clone();
-        let first_input = input.clone();
-        let first = scope.spawn(move || {
-            let mut durable_host = DurableHost::new(first_store, epoch(201));
-            durable_host.turn(&first_workflow, execution_id, first_input)
-        });
-        let second = scope.spawn(move || {
-            let mut durable_host = DurableHost::new(second_store, epoch(202));
-            durable_host.turn(&workflow, execution_id, input)
-        });
-        [first.join().unwrap(), second.join().unwrap()]
-    })
+    let mut first_host = DurableHost::new(first_store, epoch(201));
+    let mut second_host = DurableHost::new(second_store, epoch(202));
+    let first_workflow = workflow.clone();
+    let first_input = input.clone();
+    let (first, second) = join!(
+        first_host.turn(&first_workflow, execution_id, first_input),
+        second_host.turn(&workflow, execution_id, input)
+    );
+    [first, second]
 }
 
 #[derive(Clone)]
@@ -275,31 +331,31 @@ fn host(store: InMemoryCheckpointStore, epoch_value: u8) -> DurableHost<InMemory
     DurableHost::new(store, epoch(epoch_value))
 }
 
-fn schedule(
+async fn schedule(
     host: &mut DurableHost<InMemoryCheckpointStore>,
     workflow: &LinearWorkflow,
     execution_id: ExecutionId,
     input: &ExactBytes,
 ) -> Option<LogicalActivityId> {
-    match host.turn(workflow, execution_id, input.clone()) {
+    match host.turn(workflow, execution_id, input.clone()).await {
         HostOutcome::ScheduleAccepted { activity, .. } => Some(activity),
         _ => None,
     }
 }
 
-fn expose(
+async fn expose(
     host: &mut DurableHost<InMemoryCheckpointStore>,
     workflow: &LinearWorkflow,
     execution_id: ExecutionId,
     input: &ExactBytes,
 ) -> Option<DispatchPermit> {
-    match host.turn(workflow, execution_id, input.clone()) {
+    match host.turn(workflow, execution_id, input.clone()).await {
         HostOutcome::DispatchPermitted { permit, .. } => Some(permit),
         _ => None,
     }
 }
 
-fn prepared_one(
+async fn prepared_one(
     value: u8,
 ) -> (
     InMemoryCheckpointStore,
@@ -315,8 +371,12 @@ fn prepared_one(
     let execution_id = execution(value);
     let input = bytes(b"workflow");
     let mut durable_host = host(store.clone(), value);
-    let logical = schedule(&mut durable_host, &workflow, execution_id, &input).unwrap();
-    let permit = expose(&mut durable_host, &workflow, execution_id, &input).unwrap();
+    let logical = schedule(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
+    let permit = expose(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
     (
         store,
         durable_host,
@@ -349,28 +409,36 @@ impl SyntheticEffect {
     }
 }
 
-fn restart_before_schedule(id: ScenarioId) -> ScenarioEvidence {
+async fn restart_before_schedule(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(1);
     let input = bytes(b"workflow");
     let mut first = host(store.clone(), 1);
-    store.fail_next_compare_and_swap(InMemoryFault::RejectBeforeApply);
-    let rejected = first.turn(&workflow, execution_id, input.clone());
-    let absent = store.load(execution_id).is_none();
+    store.fail_next_compare_and_swap(InMemoryFault::FailBeforeRequest(
+        StoreErrorKind::Unavailable,
+    ));
+    let rejected = first.turn(&workflow, execution_id, input.clone()).await;
+    let absent = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .is_none();
     let mut restarted = host(store.clone(), 2);
-    let accepted = restarted.turn(&workflow, execution_id, input);
+    let accepted = restarted.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
-        "reject schedule before apply, discard host, and replay",
+        "fail schedule before request, discard host, and replay",
         [
             (
                 "rejected schedule requires reload and grants no permit",
                 matches!(
                     rejected,
-                    HostOutcome::ReloadRequired {
-                        boundary: PersistenceBoundary::Schedule,
-                        reason: ReloadReason::RejectedBeforeApply
+                    HostOutcome::StoreFailed {
+                        operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(
+                            PersistenceBoundary::Schedule
+                        ),
+                        ..
                     }
                 ),
             ),
@@ -383,21 +451,25 @@ fn restart_before_schedule(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn restart_after_schedule(id: ScenarioId) -> ScenarioEvidence {
+async fn restart_after_schedule(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(2);
     let input = bytes(b"workflow");
     let mut first = host(store.clone(), 1);
-    let (logical, schedule_revision) = match first.turn(&workflow, execution_id, input.clone()) {
+    let (logical, schedule_revision) = match first
+        .turn(&workflow, execution_id, input.clone())
+        .await
+    {
         HostOutcome::ScheduleAccepted { activity, revision } => (Some(activity), Some(revision)),
         _ => (None, None),
     };
     let mut restarted = host(store, 2);
-    let (permit, exposure_revision) = match restarted.turn(&workflow, execution_id, input.clone()) {
-        HostOutcome::DispatchPermitted { permit, revision } => (Some(permit), Some(revision)),
-        _ => (None, None),
-    };
+    let (permit, exposure_revision) =
+        match restarted.turn(&workflow, execution_id, input.clone()).await {
+            HostOutcome::DispatchPermitted { permit, revision } => (Some(permit), Some(revision)),
+            _ => (None, None),
+        };
     ScenarioEvidence::new(
         id,
         "persist schedule, discard host, and prepare exposure in a new epoch",
@@ -424,12 +496,18 @@ fn restart_after_schedule(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn restart_after_exposure(id: ScenarioId) -> ScenarioEvidence {
-    let (store, _, workflow, execution_id, input, logical, permit) = prepared_one(3);
-    let before = store.load(execution_id);
+async fn restart_after_exposure(id: ScenarioId) -> ScenarioEvidence {
+    let (store, _, workflow, execution_id, input, logical, permit) = prepared_one(3).await;
+    let before = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
     let mut restarted = host(store.clone(), 9);
-    let outcome = restarted.turn(&workflow, execution_id, input);
-    let after = store.load(execution_id);
+    let outcome = restarted.turn(&workflow, execution_id, input).await;
+    let after = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
     ScenarioEvidence::new(
         id,
         "persist dispatch exposure, discard host, and replay unresolved work",
@@ -454,20 +532,22 @@ fn restart_after_exposure(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
-    let (store, _, workflow, execution_id, input, logical, permit) = prepared_one(4);
+async fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
+    let (store, _, workflow, execution_id, input, logical, permit) = prepared_one(4).await;
     let expected_attempt = permit.attempt_id();
     let mut effect = SyntheticEffect::default();
     let lost_effect_reply = effect.invoke(permit);
     drop(lost_effect_reply);
     let mut restarted = host(store, 40);
-    let quarantined = restarted.turn(&workflow, execution_id, input.clone());
-    let observed = restarted.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical.clone(), bytes(b"effect-result")),
-    );
-    let completed = restarted.turn(&workflow, execution_id, input);
+    let quarantined = restarted.turn(&workflow, execution_id, input.clone()).await;
+    let observed = restarted
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical.clone(), bytes(b"effect-result")),
+        )
+        .await;
+    let completed = restarted.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "invoke one permitted external effect, discard its reply, restart into quarantine, then inject an authoritative observation",
@@ -506,12 +586,13 @@ fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn schedule_conflict(id: ScenarioId) -> ScenarioEvidence {
+async fn schedule_conflict(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(5);
     let input = bytes(b"workflow");
-    let outcomes = contending_turns(store.clone(), workflow.clone(), execution_id, input.clone());
+    let outcomes =
+        contending_turns(store.clone(), workflow.clone(), execution_id, input.clone()).await;
     let accepted = outcomes
         .iter()
         .filter(|outcome| matches!(outcome, HostOutcome::ScheduleAccepted { .. }))
@@ -533,7 +614,7 @@ fn schedule_conflict(id: ScenarioId) -> ScenarioEvidence {
         .filter(|outcome| matches!(outcome, HostOutcome::DispatchPermitted { .. }))
         .count();
     let mut after_race = host(store, 5);
-    let exposed = after_race.turn(&workflow, execution_id, input);
+    let exposed = after_race.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "race two hosts loaded at the missing-checkpoint schedule revision",
@@ -554,14 +635,17 @@ fn schedule_conflict(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn exposure_conflict(id: ScenarioId) -> ScenarioEvidence {
+async fn exposure_conflict(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(6);
     let input = bytes(b"workflow");
     let mut scheduling_host = host(store.clone(), 6);
-    let logical = schedule(&mut scheduling_host, &workflow, execution_id, &input).unwrap();
-    let outcomes = contending_turns(store.clone(), workflow.clone(), execution_id, input.clone());
+    let logical = schedule(&mut scheduling_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
+    let outcomes =
+        contending_turns(store.clone(), workflow.clone(), execution_id, input.clone()).await;
     let accepted_permits: Vec<_> = outcomes
         .iter()
         .filter_map(|outcome| match outcome {
@@ -582,7 +666,7 @@ fn exposure_conflict(id: ScenarioId) -> ScenarioEvidence {
         })
         .count();
     let mut after_race = host(store, 6);
-    let duplicate = after_race.turn(&workflow, execution_id, input);
+    let duplicate = after_race.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "race two hosts loaded at the same accepted schedule revision",
@@ -605,26 +689,32 @@ fn exposure_conflict(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn changed_order(id: ScenarioId) -> ScenarioEvidence {
+async fn changed_order(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let original = LinearWorkflow::two();
     let execution_id = execution(7);
     let input = bytes(b"workflow");
     let mut durable_host = host(store, 7);
-    let logical = schedule(&mut durable_host, &original, execution_id, &input).unwrap();
-    expose(&mut durable_host, &original, execution_id, &input).unwrap();
-    durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical, bytes(b"done")),
-    );
+    let logical = schedule(&mut durable_host, &original, execution_id, &input)
+        .await
+        .unwrap();
+    expose(&mut durable_host, &original, execution_id, &input)
+        .await
+        .unwrap();
+    durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical, bytes(b"done")),
+        )
+        .await;
     let reordered = LinearWorkflow {
         activities: vec![
             (activity_name("second", 1), bytes(b"B")),
             (activity_name("first", 1), bytes(b"A")),
         ],
     };
-    let outcome = durable_host.turn(&reordered, execution_id, input);
+    let outcome = durable_host.turn(&reordered, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "complete the first recorded activity and replay a reordered definition",
@@ -638,23 +728,25 @@ fn changed_order(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn changed_name(id: ScenarioId) -> ScenarioEvidence {
+async fn changed_name(id: ScenarioId) -> ScenarioEvidence {
     changed_definition(
         id,
         "replay a completed activity with a changed versioned name",
         LinearWorkflow::one("effect", 2, b"A"),
     )
+    .await
 }
 
-fn changed_input(id: ScenarioId) -> ScenarioEvidence {
+async fn changed_input(id: ScenarioId) -> ScenarioEvidence {
     changed_definition(
         id,
         "replay a completed activity with changed exact bytes",
         LinearWorkflow::one("effect", 1, b"a"),
     )
+    .await
 }
 
-fn changed_definition(
+async fn changed_definition(
     id: ScenarioId,
     setup: &'static str,
     changed: LinearWorkflow,
@@ -668,14 +760,20 @@ fn changed_definition(
     });
     let input = bytes(b"workflow");
     let mut durable_host = host(store, 8);
-    let logical = schedule(&mut durable_host, &original, execution_id, &input).unwrap();
-    expose(&mut durable_host, &original, execution_id, &input).unwrap();
-    durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical, bytes(b"done")),
-    );
-    let outcome = durable_host.turn(&changed, execution_id, input);
+    let logical = schedule(&mut durable_host, &original, execution_id, &input)
+        .await
+        .unwrap();
+    expose(&mut durable_host, &original, execution_id, &input)
+        .await
+        .unwrap();
+    durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical, bytes(b"done")),
+        )
+        .await;
+    let outcome = durable_host.turn(&changed, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         setup,
@@ -689,16 +787,22 @@ fn changed_definition(
     )
 }
 
-fn refreshed_attempt(id: ScenarioId) -> ScenarioEvidence {
+async fn refreshed_attempt(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(10);
     let input = bytes(b"workflow");
     let mut durable_host = host(store.clone(), 10);
-    let logical = schedule(&mut durable_host, &workflow, execution_id, &input).unwrap();
-    store.fail_next_compare_and_swap(InMemoryFault::RejectBeforeApply);
-    let rejected = durable_host.turn(&workflow, execution_id, input.clone());
-    let accepted = durable_host.turn(&workflow, execution_id, input);
+    let logical = schedule(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
+    store.fail_next_compare_and_swap(InMemoryFault::FailBeforeRequest(
+        StoreErrorKind::Unavailable,
+    ));
+    let rejected = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let accepted = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "discard a pre-exposure attempt after rejection and prepare a fresh attempt",
@@ -707,9 +811,11 @@ fn refreshed_attempt(id: ScenarioId) -> ScenarioEvidence {
                 "discarded attempt confers no permit",
                 matches!(
                     rejected,
-                    HostOutcome::ReloadRequired {
-                        boundary: PersistenceBoundary::Exposure,
-                        reason: ReloadReason::RejectedBeforeApply
+                    HostOutcome::StoreFailed {
+                        operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(
+                            PersistenceBoundary::Exposure
+                        ),
+                        ..
                     }
                 ),
             ),
@@ -733,20 +839,35 @@ fn refreshed_attempt(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn quarantine(id: ScenarioId) -> ScenarioEvidence {
-    let (store, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(11);
+async fn quarantine(id: ScenarioId) -> ScenarioEvidence {
+    let (store, mut durable_host, workflow, execution_id, input, logical, _) =
+        prepared_one(11).await;
     let changed = LinearWorkflow::one("changed-effect", 1, b"A");
-    let before = store.load(execution_id);
-    let first = durable_host.turn(&workflow, execution_id, input.clone());
-    let changed_while_unresolved = durable_host.turn(&changed, execution_id, input.clone());
-    let second = durable_host.turn(&workflow, execution_id, input.clone());
-    let after = store.load(execution_id);
-    let observed = durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical.clone(), bytes(b"resolved")),
-    );
-    let changed_after_resolution = durable_host.turn(&changed, execution_id, input);
+    let before = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let first = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let changed_while_unresolved = durable_host
+        .turn(&changed, execution_id, input.clone())
+        .await;
+    let second = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let after = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let observed = durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical.clone(), bytes(b"resolved")),
+        )
+        .await;
+    let changed_after_resolution = durable_host.turn(&changed, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "poll exposed unresolved work repeatedly and with a changed workflow definition",
@@ -779,15 +900,19 @@ fn quarantine(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
-    let (_, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(12);
-    durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical, bytes(b"recorded")),
-    );
-    let first = durable_host.turn(&workflow, execution_id, input.clone());
-    let second = durable_host.turn(&workflow, execution_id, input);
+async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
+    let (_, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(12).await;
+    durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical, bytes(b"recorded")),
+        )
+        .await;
+    let first = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let second = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "replay the same completed checkpoint twice",
@@ -809,7 +934,7 @@ fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
+async fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(13);
@@ -821,16 +946,18 @@ fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
     ))
     .unwrap();
     let unsupported = CheckpointEnvelope::new(999, valid.payload().clone());
-    let stored = store.compare_and_swap(execution_id, None, unsupported);
+    let stored = store
+        .compare_and_swap(execution_id, None, unsupported)
+        .await;
     let mut durable_host = host(store, 13);
-    let outcome = durable_host.turn(&workflow, execution_id, input);
+    let outcome = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "load a checkpoint with an unsupported envelope version",
         [
             (
                 "test checkpoint was accepted by opaque storage",
-                matches!(stored, CompareAndSwap::Accepted(_)),
+                matches!(stored, Ok(CasOutcome::Accepted(_))),
             ),
             (
                 "host rejects format before workflow or dispatch",
@@ -840,16 +967,21 @@ fn unsupported_format(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn schedule_response_lost(id: ScenarioId) -> ScenarioEvidence {
+async fn schedule_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(14);
     let input = bytes(b"workflow");
     let mut durable_host = host(store.clone(), 14);
-    store.fail_next_compare_and_swap(InMemoryFault::LoseResponseAfterApply);
-    let lost = durable_host.turn(&workflow, execution_id, input.clone());
-    let loaded = store.load(execution_id);
-    let next = durable_host.turn(&workflow, execution_id, input);
+    store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    let lost = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let loaded = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let next = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "lose the response after applying the schedule CAS",
@@ -860,7 +992,7 @@ fn schedule_response_lost(id: ScenarioId) -> ScenarioEvidence {
                     lost,
                     HostOutcome::ReloadRequired {
                         boundary: PersistenceBoundary::Schedule,
-                        reason: ReloadReason::ResponseLostAfterApply
+                        reason: ReloadReason::OutcomeUnknown
                     }
                 ),
             ),
@@ -873,18 +1005,22 @@ fn schedule_response_lost(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn exposure_response_lost(id: ScenarioId) -> ScenarioEvidence {
+async fn exposure_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
     let execution_id = execution(15);
     let input = bytes(b"workflow");
     let mut durable_host = host(store, 15);
-    schedule(&mut durable_host, &workflow, execution_id, &input).unwrap();
+    schedule(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
     durable_host
         .store()
-        .fail_next_compare_and_swap(InMemoryFault::LoseResponseAfterApply);
-    let lost = durable_host.turn(&workflow, execution_id, input.clone());
-    let next = durable_host.turn(&workflow, execution_id, input);
+        .fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    let lost = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let next = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "lose the response after applying dispatch exposure",
@@ -895,7 +1031,7 @@ fn exposure_response_lost(id: ScenarioId) -> ScenarioEvidence {
                     lost,
                     HostOutcome::ReloadRequired {
                         boundary: PersistenceBoundary::Exposure,
-                        reason: ReloadReason::ResponseLostAfterApply
+                        reason: ReloadReason::OutcomeUnknown
                     }
                 ),
             ),
@@ -907,15 +1043,18 @@ fn exposure_response_lost(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn observation_response_lost(id: ScenarioId) -> ScenarioEvidence {
-    let (store, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(16);
-    store.fail_next_compare_and_swap(InMemoryFault::LoseResponseAfterApply);
-    let lost = durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical, bytes(b"observed")),
-    );
-    let next = durable_host.turn(&workflow, execution_id, input);
+async fn observation_outcome_unknown_after_apply(id: ScenarioId) -> ScenarioEvidence {
+    let (store, mut durable_host, workflow, execution_id, input, logical, _) =
+        prepared_one(16).await;
+    store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    let lost = durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical, bytes(b"observed")),
+        )
+        .await;
+    let next = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "lose the response after applying an authoritative observation",
@@ -926,7 +1065,7 @@ fn observation_response_lost(id: ScenarioId) -> ScenarioEvidence {
                     lost,
                     HostOutcome::ReloadRequired {
                         boundary: PersistenceBoundary::Observation,
-                        reason: ReloadReason::ResponseLostAfterApply
+                        reason: ReloadReason::OutcomeUnknown
                     }
                 ),
             ),
@@ -941,20 +1080,22 @@ fn observation_response_lost(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn mismatched_observation(id: ScenarioId) -> ScenarioEvidence {
-    let (_, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(17);
+async fn mismatched_observation(id: ScenarioId) -> ScenarioEvidence {
+    let (_, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(17).await;
     let mismatched = LogicalActivityId::new(
         execution_id,
         ActivitySequence::new(0),
         activity_name("effect", 1),
         bytes(b"different"),
     );
-    let rejected = durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(mismatched, bytes(b"result")),
-    );
-    let next = durable_host.turn(&workflow, execution_id, input);
+    let rejected = durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(mismatched, bytes(b"result")),
+        )
+        .await;
+    let next = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "inject a result for a different exact logical activity",
@@ -976,35 +1117,32 @@ fn mismatched_observation(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
-    let (store, _, workflow, execution_id, input, logical, _) = prepared_one(18);
+async fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
+    let (store, _, workflow, execution_id, input, logical, _) = prepared_one(18).await;
     let (first_store, second_store) = ContendedStore::pair(store.clone());
     let logical_for_first = logical.clone();
     let input_for_first = input.clone();
     let replay_input = input.clone();
-    let observations = thread::scope(|scope| {
-        let first = scope.spawn(move || {
-            let durable_host = DurableHost::new(first_store, epoch(203));
-            let result = bytes(b"first");
-            let outcome = durable_host.observe(
-                execution_id,
-                &input_for_first,
-                ActivityObservation::new(logical_for_first, result.clone()),
-            );
-            (result, outcome)
-        });
-        let second = scope.spawn(move || {
-            let durable_host = DurableHost::new(second_store, epoch(204));
-            let result = bytes(b"second");
-            let outcome = durable_host.observe(
-                execution_id,
-                &input,
-                ActivityObservation::new(logical, result.clone()),
-            );
-            (result, outcome)
-        });
-        [first.join().unwrap(), second.join().unwrap()]
-    });
+    let first_host = DurableHost::new(first_store, epoch(203));
+    let second_host = DurableHost::new(second_store, epoch(204));
+    let first_result = bytes(b"first");
+    let second_result = bytes(b"second");
+    let (first_outcome, second_outcome) = join!(
+        first_host.observe(
+            execution_id,
+            &input_for_first,
+            ActivityObservation::new(logical_for_first, first_result.clone()),
+        ),
+        second_host.observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical, second_result.clone()),
+        )
+    );
+    let observations = [
+        (first_result, first_outcome),
+        (second_result, second_outcome),
+    ];
     let accepted_results: Vec<_> = observations
         .iter()
         .filter_map(|(result, outcome)| {
@@ -1024,7 +1162,9 @@ fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
         })
         .count();
     let mut durable_host = host(store, 18);
-    let completed = durable_host.turn(&workflow, execution_id, replay_input);
+    let completed = durable_host
+        .turn(&workflow, execution_id, replay_input)
+        .await;
     ScenarioEvidence::new(
         id,
         "race two observations loaded from the same exposed revision",
@@ -1045,23 +1185,36 @@ fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
+async fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
     let (store, mut durable_host, workflow, execution_id, input, logical, permit) =
-        prepared_one(19);
-    let quarantined = durable_host.turn(&workflow, execution_id, input.clone());
-    let accepted = durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical.clone(), bytes(b"resolved")),
-    );
-    let before_stale = store.load(execution_id);
-    let stale = durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(logical.clone(), bytes(b"stale")),
-    );
-    let stale_left_checkpoint_unchanged = before_stale == store.load(execution_id);
-    let completed = durable_host.turn(&workflow, execution_id, input);
+        prepared_one(19).await;
+    let quarantined = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let accepted = durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical.clone(), bytes(b"resolved")),
+        )
+        .await;
+    let before_stale = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let stale = durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(logical.clone(), bytes(b"stale")),
+        )
+        .await;
+    let stale_left_checkpoint_unchanged = before_stale
+        == store
+            .load(execution_id)
+            .await
+            .expect("scenario load must not fail");
+    let completed = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "resolve quarantined work only through the public observation API",
@@ -1098,24 +1251,41 @@ fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
     )
 }
 
-fn quarantine_blocks_progress(id: ScenarioId) -> ScenarioEvidence {
+async fn quarantine_blocks_progress(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::two();
     let execution_id = execution(20);
     let input = bytes(b"workflow");
     let mut durable_host = host(store.clone(), 20);
-    let first_logical = schedule(&mut durable_host, &workflow, execution_id, &input).unwrap();
-    expose(&mut durable_host, &workflow, execution_id, &input).unwrap();
-    let before = store.load(execution_id);
-    let blocked_one = durable_host.turn(&workflow, execution_id, input.clone());
-    let blocked_two = durable_host.turn(&workflow, execution_id, input.clone());
-    let still_same = before == store.load(execution_id);
-    durable_host.observe(
-        execution_id,
-        &input,
-        ActivityObservation::new(first_logical, bytes(b"first-result")),
-    );
-    let after_observation = durable_host.turn(&workflow, execution_id, input);
+    let first_logical = schedule(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
+    expose(&mut durable_host, &workflow, execution_id, &input)
+        .await
+        .unwrap();
+    let before = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail");
+    let blocked_one = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let blocked_two = durable_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let still_same = before
+        == store
+            .load(execution_id)
+            .await
+            .expect("scenario load must not fail");
+    durable_host
+        .observe(
+            execution_id,
+            &input,
+            ActivityObservation::new(first_logical, bytes(b"first-result")),
+        )
+        .await;
+    let after_observation = durable_host.turn(&workflow, execution_id, input).await;
     ScenarioEvidence::new(
         id,
         "replay a two-activity workflow while the first exposure is unresolved",
@@ -1140,8 +1310,318 @@ fn quarantine_blocks_progress(id: ScenarioId) -> ScenarioEvidence {
         ],
     )
 }
+
+async fn load_absence_and_provider_failures(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let workflow = LinearWorkflow::one("effect", 1, b"A");
+    let execution_id = execution(21);
+    let input = bytes(b"workflow");
+    let absence_is_distinct = store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .is_none();
+
+    let mut kinds_preserved = true;
+    let mut descriptions_preserved = true;
+    let mut failures_granted_no_permit = true;
+    for kind in [
+        StoreErrorKind::Authorization,
+        StoreErrorKind::Unavailable,
+        StoreErrorKind::Timeout,
+        StoreErrorKind::MalformedResponse,
+        StoreErrorKind::Other,
+    ] {
+        store.fail_next_load(StoreError::new(kind, format!("{kind} provider detail")));
+        let mut durable_host = host(store.clone(), 21);
+        let outcome = durable_host
+            .turn(&workflow, execution_id, input.clone())
+            .await;
+        kinds_preserved &= matches!(
+            &outcome,
+            HostOutcome::StoreFailed {
+                operation: kuberic_durable_execution::StoreOperation::Load,
+                error
+            } if error.kind() == kind
+        );
+        descriptions_preserved &= matches!(
+            &outcome,
+            HostOutcome::StoreFailed { error, .. }
+                if error.description().contains("provider detail")
+        );
+        failures_granted_no_permit &= !matches!(outcome, HostOutcome::DispatchPermitted { .. });
+    }
+
+    let (observation_store, durable_host, _, observed_execution, observed_input, logical, _) =
+        prepared_one(121).await;
+    observation_store.fail_next_load(StoreError::new(
+        StoreErrorKind::Timeout,
+        "observation load timed out",
+    ));
+    let observation_failure = durable_host
+        .observe(
+            observed_execution,
+            &observed_input,
+            ActivityObservation::new(logical, bytes(b"result")),
+        )
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "distinguish missing checkpoints from portable provider failures on async host paths",
+        [
+            ("missing checkpoint loads as absence", absence_is_distinct),
+            (
+                "all portable load failure classes reach the host unchanged",
+                kinds_preserved,
+            ),
+            (
+                "provider source descriptions remain available as text",
+                descriptions_preserved,
+            ),
+            (
+                "load failures grant no dispatch permit",
+                failures_granted_no_permit,
+            ),
+            (
+                "observation load failure is propagated without mutation",
+                matches!(
+                    observation_failure,
+                    HostOutcome::StoreFailed {
+                        operation: kuberic_durable_execution::StoreOperation::Load,
+                        error
+                    } if error.kind() == StoreErrorKind::Timeout
+                ),
+            ),
+        ],
+    )
+}
+
+async fn opaque_storage_revisions(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let workflow = LinearWorkflow::one("effect", 1, b"A");
+    let execution_id = execution(22);
+    let input = bytes(b"workflow");
+    let mut durable_host = host(store, 22);
+    let revision = match durable_host.turn(&workflow, execution_id, input).await {
+        HostOutcome::ScheduleAccepted { revision, .. } => Some(revision),
+        _ => None,
+    };
+    let round_trip = revision.as_ref().and_then(|revision| {
+        StorageRevision::new(revision.as_str())
+            .ok()
+            .map(|decoded| decoded == *revision)
+    });
+    let empty = StorageRevision::new("").unwrap_err();
+
+    ScenarioEvidence::new(
+        id,
+        "round-trip a nonnumeric opaque provider revision and reject an empty token",
+        [
+            (
+                "in-memory revision is an opaque nonnumeric string",
+                revision
+                    .as_ref()
+                    .is_some_and(|revision| revision.as_str().parse::<u64>().is_err()),
+            ),
+            (
+                "revision equality survives provider string round-trip",
+                round_trip == Some(true),
+            ),
+            (
+                "empty provider revision is a malformed response",
+                empty.kind() == StoreErrorKind::MalformedResponse,
+            ),
+        ],
+    )
+}
+
+async fn outcome_unknown_apply_state_hidden(id: ScenarioId) -> ScenarioEvidence {
+    let workflow = LinearWorkflow::one("effect", 1, b"A");
+    let execution_id = execution(23);
+    let input = bytes(b"workflow");
+
+    let schedule_unapplied_store = InMemoryCheckpointStore::new();
+    schedule_unapplied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
+    let mut schedule_unapplied_host = host(schedule_unapplied_store.clone(), 23);
+    let schedule_unapplied = schedule_unapplied_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let schedule_remained_absent = schedule_unapplied_store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .is_none();
+
+    let schedule_applied_store = InMemoryCheckpointStore::new();
+    schedule_applied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    let mut schedule_applied_host = host(schedule_applied_store.clone(), 24);
+    let schedule_applied = schedule_applied_host
+        .turn(&workflow, execution_id, input.clone())
+        .await;
+    let schedule_became_present = schedule_applied_store
+        .load(execution_id)
+        .await
+        .expect("scenario load must not fail")
+        .is_some();
+
+    let exposure_unapplied_store = InMemoryCheckpointStore::new();
+    let mut exposure_unapplied_host = host(exposure_unapplied_store.clone(), 25);
+    schedule(
+        &mut exposure_unapplied_host,
+        &workflow,
+        execution(123),
+        &input,
+    )
+    .await
+    .unwrap();
+    let exposure_unapplied_before = exposure_unapplied_store
+        .load(execution(123))
+        .await
+        .expect("scenario load must not fail");
+    exposure_unapplied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
+    let exposure_unapplied = exposure_unapplied_host
+        .turn(&workflow, execution(123), input.clone())
+        .await;
+    let exposure_unapplied_after = exposure_unapplied_store
+        .load(execution(123))
+        .await
+        .expect("scenario load must not fail");
+
+    let exposure_applied_store = InMemoryCheckpointStore::new();
+    let mut exposure_applied_host = host(exposure_applied_store.clone(), 26);
+    schedule(
+        &mut exposure_applied_host,
+        &workflow,
+        execution(124),
+        &input,
+    )
+    .await
+    .unwrap();
+    let exposure_applied_before = exposure_applied_store
+        .load(execution(124))
+        .await
+        .expect("scenario load must not fail");
+    exposure_applied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    let exposure_applied = exposure_applied_host
+        .turn(&workflow, execution(124), input.clone())
+        .await;
+    let exposure_applied_after = exposure_applied_store
+        .load(execution(124))
+        .await
+        .expect("scenario load must not fail");
+
+    let (
+        observation_unapplied_store,
+        observation_unapplied_host,
+        _,
+        observation_unapplied_execution,
+        observation_unapplied_input,
+        observation_unapplied_logical,
+        _,
+    ) = prepared_one(125).await;
+    let observation_unapplied_before = observation_unapplied_store
+        .load(observation_unapplied_execution)
+        .await
+        .expect("scenario load must not fail");
+    observation_unapplied_store
+        .fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
+    let observation_unapplied = observation_unapplied_host
+        .observe(
+            observation_unapplied_execution,
+            &observation_unapplied_input,
+            ActivityObservation::new(observation_unapplied_logical, bytes(b"result")),
+        )
+        .await;
+    let observation_unapplied_after = observation_unapplied_store
+        .load(observation_unapplied_execution)
+        .await
+        .expect("scenario load must not fail");
+
+    let (
+        observation_applied_store,
+        observation_applied_host,
+        _,
+        observation_applied_execution,
+        observation_applied_input,
+        observation_applied_logical,
+        _,
+    ) = prepared_one(126).await;
+    let observation_applied_before = observation_applied_store
+        .load(observation_applied_execution)
+        .await
+        .expect("scenario load must not fail");
+    observation_applied_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    let observation_applied = observation_applied_host
+        .observe(
+            observation_applied_execution,
+            &observation_applied_input,
+            ActivityObservation::new(observation_applied_logical, bytes(b"result")),
+        )
+        .await;
+    let observation_applied_after = observation_applied_store
+        .load(observation_applied_execution)
+        .await
+        .expect("scenario load must not fail");
+
+    ScenarioEvidence::new(
+        id,
+        "inject the same outcome-unknown result with and without applying each CAS boundary",
+        [
+            (
+                "schedule uncertainty hides whether the mutation applied",
+                schedule_unapplied == schedule_applied
+                    && matches!(
+                        schedule_unapplied,
+                        HostOutcome::ReloadRequired {
+                            boundary: PersistenceBoundary::Schedule,
+                            reason: ReloadReason::OutcomeUnknown
+                        }
+                    )
+                    && schedule_remained_absent
+                    && schedule_became_present,
+            ),
+            (
+                "exposure uncertainty hides whether the mutation applied",
+                exposure_unapplied == exposure_applied
+                    && matches!(
+                        exposure_unapplied,
+                        HostOutcome::ReloadRequired {
+                            boundary: PersistenceBoundary::Exposure,
+                            reason: ReloadReason::OutcomeUnknown
+                        }
+                    )
+                    && exposure_unapplied_before == exposure_unapplied_after
+                    && exposure_applied_before != exposure_applied_after,
+            ),
+            (
+                "observation uncertainty hides whether the mutation applied",
+                observation_unapplied == observation_applied
+                    && matches!(
+                        observation_unapplied,
+                        HostOutcome::ReloadRequired {
+                            boundary: PersistenceBoundary::Observation,
+                            reason: ReloadReason::OutcomeUnknown
+                        }
+                    )
+                    && observation_unapplied_before == observation_unapplied_after
+                    && observation_applied_before != observation_applied_after,
+            ),
+            (
+                "no uncertain CAS outcome grants a dispatch permit",
+                !matches!(schedule_applied, HostOutcome::DispatchPermitted { .. })
+                    && !matches!(exposure_applied, HostOutcome::DispatchPermitted { .. })
+                    && !matches!(observation_applied, HostOutcome::DispatchPermitted { .. }),
+            ),
+        ],
+    )
+}
+
 use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Barrier},
-    thread,
+    panic::AssertUnwindSafe,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::Poll,
 };

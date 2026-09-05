@@ -1,7 +1,7 @@
 use crate::{
-    ActivityRecord, ActivityState, AttemptId, CheckpointEnvelope, CheckpointError,
-    CheckpointPayload, CheckpointStore, CompareAndSwap, Evaluation, ExactBytes, ExecutionId,
-    HostEpoch, LogicalActivityId, Nondeterminism, StorageRevision, Workflow, evaluate,
+    ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError,
+    CheckpointPayload, CheckpointStore, Evaluation, ExactBytes, ExecutionId, HostEpoch,
+    LogicalActivityId, Nondeterminism, StorageRevision, StoreError, Workflow, evaluate,
 };
 
 /// The persistence boundary that must be reloaded after an uncertain CAS result.
@@ -16,8 +16,14 @@ pub enum PersistenceBoundary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReloadReason {
     Conflict,
-    RejectedBeforeApply,
-    ResponseLostAfterApply,
+    OutcomeUnknown,
+}
+
+/// Provider operation that failed before its result could be classified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreOperation {
+    Load,
+    CompareAndSwap(PersistenceBoundary),
 }
 
 /// Rejection of an authoritative result observation.
@@ -137,6 +143,10 @@ define_host_outcomes! {
         boundary: PersistenceBoundary,
         reason: ReloadReason,
     },
+    StoreFailed {
+        operation: StoreOperation,
+        error: StoreError,
+    },
 }
 
 /// Public in-process host for one-turn replay, persistence, and observation.
@@ -160,14 +170,22 @@ impl<S: CheckpointStore> DurableHost<S> {
     }
 
     /// Evaluate and, when needed, commit exactly one schedule or exposure turn.
-    pub fn turn<W: Workflow>(
+    pub async fn turn<W: Workflow>(
         &mut self,
         workflow: &W,
         execution_id: ExecutionId,
         workflow_input: ExactBytes,
     ) -> HostOutcome {
-        let loaded = self.store.load(execution_id);
-        let expected_revision = loaded.as_ref().map(|stored| stored.revision());
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let expected_revision = loaded.as_ref().map(|stored| stored.revision().clone());
         if let Some(stored) = loaded.as_ref() {
             let payload = match stored
                 .checkpoint()
@@ -196,7 +214,10 @@ impl<S: CheckpointStore> DurableHost<S> {
             Evaluation::Scheduled {
                 activity,
                 checkpoint,
-            } => self.commit_schedule(execution_id, expected_revision, activity, checkpoint),
+            } => {
+                self.commit_schedule(execution_id, expected_revision, activity, checkpoint)
+                    .await
+            }
             Evaluation::Pending {
                 activity,
                 state: ActivityState::Scheduled,
@@ -209,7 +230,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                     stored.checkpoint(),
                     activity,
                 ) {
-                    Ok(proposal) => self.commit_exposure(proposal),
+                    Ok(proposal) => self.commit_exposure(proposal).await,
                     Err(error) => HostOutcome::CheckpointRejected(error),
                 }
             }
@@ -234,13 +255,22 @@ impl<S: CheckpointStore> DurableHost<S> {
     }
 
     /// Persist an authoritative result only for the currently exposed activity.
-    pub fn observe(
+    pub async fn observe(
         &self,
         execution_id: ExecutionId,
         workflow_input: &ExactBytes,
         observation: ActivityObservation,
     ) -> HostOutcome {
-        let Some(stored) = self.store.load(execution_id) else {
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
             return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
         };
         let mut payload = match stored
@@ -282,16 +312,18 @@ impl<S: CheckpointStore> DurableHost<S> {
         };
         match self
             .store
-            .compare_and_swap(execution_id, Some(stored.revision()), checkpoint)
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
         {
-            CompareAndSwap::Accepted(revision) => {
+            Ok(CasOutcome::Accepted(revision)) => {
                 HostOutcome::ObservationAccepted { activity, revision }
             }
-            other => reload_outcome(PersistenceBoundary::Observation, other),
+            Ok(other) => reload_outcome(PersistenceBoundary::Observation, other),
+            Err(error) => store_failed(PersistenceBoundary::Observation, error),
         }
     }
 
-    fn commit_schedule(
+    async fn commit_schedule(
         &self,
         execution_id: ExecutionId,
         expected_revision: Option<StorageRevision>,
@@ -301,11 +333,13 @@ impl<S: CheckpointStore> DurableHost<S> {
         match self
             .store
             .compare_and_swap(execution_id, expected_revision, checkpoint)
+            .await
         {
-            CompareAndSwap::Accepted(revision) => {
+            Ok(CasOutcome::Accepted(revision)) => {
                 HostOutcome::ScheduleAccepted { activity, revision }
             }
-            other => reload_outcome(PersistenceBoundary::Schedule, other),
+            Ok(other) => reload_outcome(PersistenceBoundary::Schedule, other),
+            Err(error) => store_failed(PersistenceBoundary::Schedule, error),
         }
     }
 
@@ -313,7 +347,7 @@ impl<S: CheckpointStore> DurableHost<S> {
         &mut self,
         execution_id: ExecutionId,
         workflow_input: ExactBytes,
-        expected_revision: StorageRevision,
+        expected_revision: &StorageRevision,
         checkpoint: &CheckpointEnvelope,
         activity: LogicalActivityId,
     ) -> Result<PreparedExposure, CheckpointError> {
@@ -335,24 +369,29 @@ impl<S: CheckpointStore> DurableHost<S> {
         );
         Ok(PreparedExposure {
             execution_id,
-            expected_revision,
+            expected_revision: expected_revision.clone(),
             checkpoint: CheckpointEnvelope::encode(&payload)?,
             activity,
             attempt_id,
         })
     }
 
-    fn commit_exposure(&self, proposal: PreparedExposure) -> HostOutcome {
-        match self.store.compare_and_swap(
-            proposal.execution_id,
-            Some(proposal.expected_revision),
-            proposal.checkpoint,
-        ) {
-            CompareAndSwap::Accepted(revision) => HostOutcome::DispatchPermitted {
+    async fn commit_exposure(&self, proposal: PreparedExposure) -> HostOutcome {
+        match self
+            .store
+            .compare_and_swap(
+                proposal.execution_id,
+                Some(proposal.expected_revision),
+                proposal.checkpoint,
+            )
+            .await
+        {
+            Ok(CasOutcome::Accepted(revision)) => HostOutcome::DispatchPermitted {
                 permit: DispatchPermit::new(proposal.activity, proposal.attempt_id),
                 revision,
             },
-            other => reload_outcome(PersistenceBoundary::Exposure, other),
+            Ok(other) => reload_outcome(PersistenceBoundary::Exposure, other),
+            Err(error) => store_failed(PersistenceBoundary::Exposure, error),
         }
     }
 
@@ -381,22 +420,31 @@ fn replace_final_record(payload: &mut CheckpointPayload, replacement: ActivityRe
         .expect("replacement requires a final activity") = replacement;
 }
 
-fn reload_outcome(boundary: PersistenceBoundary, result: CompareAndSwap) -> HostOutcome {
+fn reload_outcome(boundary: PersistenceBoundary, result: CasOutcome) -> HostOutcome {
     let reason = match result {
-        CompareAndSwap::Conflict => ReloadReason::Conflict,
-        CompareAndSwap::RejectedBeforeApply => ReloadReason::RejectedBeforeApply,
-        CompareAndSwap::ResponseLostAfterApply => ReloadReason::ResponseLostAfterApply,
-        CompareAndSwap::Accepted(_) => unreachable!("accepted CAS handled by caller"),
+        CasOutcome::Conflict => ReloadReason::Conflict,
+        CasOutcome::OutcomeUnknown => ReloadReason::OutcomeUnknown,
+        CasOutcome::Accepted(_) => unreachable!("accepted CAS handled by caller"),
     };
     HostOutcome::ReloadRequired { boundary, reason }
+}
+
+fn store_failed(boundary: PersistenceBoundary, error: StoreError) -> HostOutcome {
+    HostOutcome::StoreFailed {
+        operation: StoreOperation::CompareAndSwap(boundary),
+        error,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use futures::executor::block_on;
 
     use super::*;
-    use crate::{ActivityName, InMemoryCheckpointStore, InMemoryFault, WorkflowContext};
+    use crate::{
+        ActivityName, InMemoryCheckpointStore, InMemoryFault, StoreErrorKind, WorkflowContext,
+    };
 
     struct OneActivity;
 
@@ -411,30 +459,33 @@ mod tests {
 
     #[test]
     fn only_an_accepted_consumed_exposure_proposal_constructs_a_permit() {
-        let store = InMemoryCheckpointStore::new();
-        let execution_id = ExecutionId::from_bytes([2; 16]);
-        let input = ExactBytes::new(b"unit");
-        let mut host = DurableHost::new(store.clone(), HostEpoch::from_bytes([1; 16]));
-        assert!(matches!(
-            host.turn(&OneActivity, execution_id, input.clone()),
-            HostOutcome::ScheduleAccepted { .. }
-        ));
+        block_on(async {
+            let store = InMemoryCheckpointStore::new();
+            let execution_id = ExecutionId::from_bytes([2; 16]);
+            let input = ExactBytes::new(b"unit");
+            let mut host = DurableHost::new(store.clone(), HostEpoch::from_bytes([1; 16]));
+            assert!(matches!(
+                host.turn(&OneActivity, execution_id, input.clone()).await,
+                HostOutcome::ScheduleAccepted { .. }
+            ));
 
-        for fault in [
-            InMemoryFault::RejectBeforeApply,
-            InMemoryFault::LoseResponseAfterApply,
-        ] {
-            store.fail_next_compare_and_swap(fault);
-            let outcome = host.turn(&OneActivity, execution_id, input.clone());
-            assert!(!matches!(outcome, HostOutcome::DispatchPermitted { .. }));
-            if fault == InMemoryFault::LoseResponseAfterApply {
-                assert!(matches!(
-                    host.turn(&OneActivity, execution_id, input.clone()),
-                    HostOutcome::Quarantined { .. }
-                ));
-                return;
+            for fault in [
+                InMemoryFault::FailBeforeRequest(StoreErrorKind::Unavailable),
+                InMemoryFault::OutcomeUnknownWithoutApply,
+                InMemoryFault::OutcomeUnknownAfterApply,
+            ] {
+                store.fail_next_compare_and_swap(fault);
+                let outcome = host.turn(&OneActivity, execution_id, input.clone()).await;
+                assert!(!matches!(outcome, HostOutcome::DispatchPermitted { .. }));
+                if fault == InMemoryFault::OutcomeUnknownAfterApply {
+                    assert!(matches!(
+                        host.turn(&OneActivity, execution_id, input.clone()).await,
+                        HostOutcome::Quarantined { .. }
+                    ));
+                    return;
+                }
             }
-        }
-        panic!("post-apply response-loss case did not execute");
+            panic!("applied outcome-unknown case did not execute");
+        });
     }
 }

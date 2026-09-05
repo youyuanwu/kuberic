@@ -1,9 +1,10 @@
-//! Experimental deterministic replay primitives.
+//! Experimental durable-execution kernel primitives.
 //!
 //! This crate is isolated from Kuberic production components. Its current
-//! ordinary-async authoring API is paired with a synchronous in-memory durable
-//! host. Dispatch permission is available only after separate accepted
-//! schedule and exposure checkpoint transitions.
+//! ordinary-async authoring API is paired with a runtime-neutral asynchronous
+//! provider and host contract. Dispatch permission is available only after
+//! separate accepted schedule and exposure checkpoint transitions. The crate
+//! owns no executor and does not depend on Tokio.
 //!
 //! The crate README documents the selected
 //! [ordinary-async authoring surface](../README.md#selected-authoring-surface),
@@ -28,7 +29,7 @@ pub use checkpoint::{
 };
 pub use host::{
     ActivityObservation, DispatchPermit, DurableHost, HOST_OUTCOME_VARIANTS, HostOutcome,
-    ObservationRejection, PersistenceBoundary, ReloadReason,
+    ObservationRejection, PersistenceBoundary, ReloadReason, StoreOperation,
 };
 pub use identity::{
     ActivityName, ActivitySequence, AttemptId, ExactBytes, ExecutionId, HostEpoch, IdentityError,
@@ -36,5 +37,7 @@ pub use identity::{
 };
 pub use in_memory::{InMemoryCheckpointStore, InMemoryFault};
 pub use replay::{Evaluation, Nondeterminism, evaluate};
-pub use store::{CheckpointStore, CompareAndSwap, StorageRevision, StoredCheckpoint};
+pub use store::{
+    CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
+};
 pub use workflow::{Workflow, WorkflowContext};

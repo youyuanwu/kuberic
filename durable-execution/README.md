@@ -1,8 +1,9 @@
-# Kuberic Durable Execution Experiment
+# Kuberic Durable Execution Kernel
 
 `kuberic-durable-execution` is an isolated feasibility crate for deterministic,
 linear workflow replay. It has no dependency on `kuberic-core` or
-`kuberic-operator`, and neither production crate depends on it.
+`kuberic-operator`, and neither production crate depends on it. It is a kernel
+for evaluating replay and provider contracts, not an end-user runtime.
 
 ## Selected authoring surface
 
@@ -34,8 +35,9 @@ impl Workflow for Greeting {
 ```
 
 The measured workflow body uses one framework operation against an FR-012
-maximum of two. The public host reports nine turn/observation outcome variants.
-No explicit poll/replay authoring surface is also exported.
+maximum of two. The public host reports ten turn/observation outcome variants,
+including portable store failure. No explicit poll/replay authoring surface is
+also exported.
 
 ## Replay and checkpoint semantics
 
@@ -61,20 +63,26 @@ pre-exposure attempt may change without changing the logical activity.
 
 ## Storage revisions
 
-`CheckpointStore` exposes synchronous `load` and `compare_and_swap`
-operations. `StorageRevision` is an opaque concurrency token and is unrelated
-to checkpoint format version. The included `InMemoryCheckpointStore` assigns
-the first accepted checkpoint a nonzero revision and advances it once for each
-accepted replacement. Its one-shot faults model rejection before apply and
-response loss after apply.
+`CheckpointStore` exposes runtime-neutral asynchronous `load` and
+`compare_and_swap` operations. `load` distinguishes an absent checkpoint from
+a portable classified `StoreError`; errors preserve a provider description
+without exposing provider-specific types. `StorageRevision` is a validated
+nonempty opaque string token with equality semantics and is unrelated to
+checkpoint format version. It exposes no numeric, ordering, or increment API.
 
-A conflict, pre-apply rejection, or lost response returns `ReloadRequired`.
-None of those responses is dispatch permission, even when a lost response
-means the state was applied.
+CAS returns only `Accepted`, `Conflict`, or `OutcomeUnknown`. A provider must
+classify any result whose acceptance cannot be proven as `OutcomeUnknown`;
+`StoreError` is reserved for definitely local or pre-request failures. A
+conflict or unknown outcome returns `ReloadRequired`, while a provider error
+returns `StoreFailed`. None grants dispatch permission. The included
+`InMemoryCheckpointStore` keeps its numeric revision counter private, renders
+opaque tokens, and can return the same unknown result with or without applying
+the mutation.
 
 ## Turns and dispatch permission
 
-`DurableHost::turn` evaluates and commits no more than one persistence boundary:
+Awaiting `DurableHost::turn` evaluates and commits no more than one persistence
+boundary:
 
 1. The first turn accepts a `Scheduled` checkpoint and returns no permit.
 2. A later turn prepares an attempt, accepts a separate `DispatchExposed`
@@ -115,7 +123,7 @@ cargo check --workspace
 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
 ```
 
-The feasibility test reruns the sole 20-scenario FR-013 registry, emits every
+The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
 three-way classifier.
 
@@ -127,12 +135,12 @@ lease, activity handler, automatic observation polling, or passive-observation
 transport. It does not establish a canonical exact-byte representation across
 versions.
 
-The bounded classifier reports `feasible`: all 20 registered FR-013 scenarios
-and 54 structured assertions pass, all five FR-012 predicates pass, and no
-in-scope limitation remains. The lost-reply fixture invokes one synthetic
-effect under an opaque permit and discards its returned result before restart;
-separate cases retain schedule, exposure, and observation CAS response-loss
-coverage.
+The classifier is recomputed from the current registry rather than assuming a
+positive result. Provider cases distinguish absence from every portable error
+class, exercise opaque revisions, and make applied and unapplied unknown CAS
+outcomes indistinguishable to the host. The lost-effect-reply fixture still
+invokes one synthetic effect under an opaque permit and discards its returned
+result before restart.
 
 Timers, parallel activities, retries or backoff policy, cancellation, child
 workflows, external events, compensation, migrations, upgrade guarantees,

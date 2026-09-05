@@ -3,6 +3,7 @@ mod support;
 use std::collections::BTreeSet;
 
 use async_trait::async_trait;
+use futures::executor::block_on;
 use kuberic_durable_execution::{
     ActivityName, DurableHost, ExactBytes, ExecutionId, FeasibilityClassification,
     FeasibilityInputs, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore,
@@ -10,7 +11,7 @@ use kuberic_durable_execution::{
 };
 use support::scenarios::{ScenarioId, run_conformance_matrix};
 
-const EXPECTED_FR_013_SCENARIOS: usize = 20;
+const EXPECTED_FR_013_SCENARIOS: usize = 23;
 
 struct SelectedOrdinaryAsyncSurface;
 
@@ -33,7 +34,7 @@ struct PredicateEvidence {
 
 #[test]
 fn mechanically_assesses_the_selected_surface_and_full_denominator() {
-    let scenarios = run_conformance_matrix();
+    let scenarios = block_on(run_conformance_matrix());
     let registry_ids: Vec<_> = ScenarioId::ALL.iter().map(|id| id.stable_id()).collect();
     let unique_registry_ids: BTreeSet<_> = registry_ids.iter().copied().collect();
 
@@ -84,11 +85,11 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
 
     let store = InMemoryCheckpointStore::new();
     let mut host = DurableHost::new(store, HostEpoch::from_bytes([1; 16]));
-    let first_turn = host.turn(
+    let first_turn = block_on(host.turn(
         &SelectedOrdinaryAsyncSurface,
         ExecutionId::from_bytes([1; 16]),
         ExactBytes::new(b"input"),
-    );
+    ));
 
     let fr_012 = [
         PredicateEvidence {

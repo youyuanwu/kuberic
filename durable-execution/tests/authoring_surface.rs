@@ -1,6 +1,7 @@
 mod support;
 
 use async_trait::async_trait;
+use futures::executor::block_on;
 use kuberic_durable_execution::{
     ActivityName, DurableHost, ExactBytes, ExecutionId, HOST_OUTCOME_VARIANTS, HostEpoch,
     HostOutcome, InMemoryCheckpointStore, Workflow, WorkflowContext,
@@ -37,12 +38,12 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
 
     let store = InMemoryCheckpointStore::new();
     let mut host = DurableHost::new(store, HostEpoch::from_bytes([1; 16]));
-    let first_turn = host.turn(
+    let first_turn = block_on(host.turn(
         &OrdinaryAsyncWorkflow,
         ExecutionId::from_bytes([1; 16]),
         ExactBytes::new(b"input"),
-    );
-    let all_scenarios = run_conformance_matrix();
+    ));
+    let all_scenarios = block_on(run_conformance_matrix());
     for scenario in &all_scenarios {
         println!(
             "{} public-API fixture: {}",
@@ -82,7 +83,7 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
     println!("workflow-body framework operations: {framework_operation_count}");
     let outcome_count = HOST_OUTCOME_VARIANTS.len();
     println!("public HostOutcome variants: {outcome_count}");
-    assert_eq!(outcome_count, 9);
+    assert_eq!(outcome_count, 10);
     for (predicate, passed) in predicates {
         println!("[{}] {predicate}", if passed { "PASS" } else { "FAIL" });
         assert!(passed, "FR-012 predicate failed: {predicate}");

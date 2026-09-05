@@ -1,10 +1,12 @@
 mod support;
 
+use futures::executor::block_on;
+
 use support::scenarios::{ScenarioId, run_conformance_matrix};
 
 #[test]
 fn fr_013_conformance_matrix() {
-    let evidence = run_conformance_matrix();
+    let evidence = block_on(run_conformance_matrix());
     assert_eq!(evidence.len(), ScenarioId::ALL.len());
 
     for scenario in &evidence {
