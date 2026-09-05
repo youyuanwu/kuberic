@@ -130,12 +130,14 @@ mod tests {
     use futures::executor::block_on;
 
     use super::*;
-    use crate::{CheckpointPayload, ExactBytes};
+    use crate::{CheckpointPayload, ExactBytes, ExecutionContract, ExecutionSpec};
 
     fn checkpoint(execution_id: ExecutionId, marker: u8) -> CheckpointEnvelope {
-        CheckpointEnvelope::encode(&CheckpointPayload::new(
-            execution_id,
-            ExactBytes::new([marker]),
+        CheckpointEnvelope::encode(&CheckpointPayload::active(
+            ExecutionContract::new(
+                ExecutionSpec::new(execution_id, ExactBytes::new([marker]), 16),
+                1_000_000,
+            ),
             Vec::new(),
         ))
         .unwrap()

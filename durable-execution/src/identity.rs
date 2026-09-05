@@ -78,6 +78,41 @@ impl fmt::Display for ExecutionId {
     }
 }
 
+/// Immutable caller authority for one durable execution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSpec {
+    execution_id: ExecutionId,
+    workflow_input: ExactBytes,
+    max_terminal_payload_bytes: u64,
+}
+
+impl ExecutionSpec {
+    pub fn new(
+        execution_id: ExecutionId,
+        workflow_input: ExactBytes,
+        max_terminal_payload_bytes: u64,
+    ) -> Self {
+        Self {
+            execution_id,
+            workflow_input,
+            max_terminal_payload_bytes,
+        }
+    }
+
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
+    pub const fn workflow_input(&self) -> &ExactBytes {
+        &self.workflow_input
+    }
+
+    pub const fn max_terminal_payload_bytes(&self) -> u64 {
+        self.max_terminal_payload_bytes
+    }
+}
+
 /// Caller-supplied identity for one host epoch.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]

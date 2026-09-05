@@ -16,7 +16,8 @@ the versioned name, exact input, and declared maximum result bytes.
 ```rust
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityName, ActivitySpec, ExactBytes, Workflow, WorkflowContext,
+    ActivityName, ActivitySpec, ExactBytes, TerminalOutcome, Workflow,
+    WorkflowContext,
 };
 
 struct Greeting;
@@ -27,14 +28,15 @@ impl Workflow for Greeting {
         &self,
         context: &mut WorkflowContext<'_>,
         input: ExactBytes,
-    ) -> ExactBytes {
-        context
-            .activity(ActivitySpec::new(
+    ) -> TerminalOutcome {
+        TerminalOutcome::succeeded(
+            context.activity(ActivitySpec::new(
                 ActivityName::new("greeting", 1).unwrap(),
                 input,
                 4096,
             ))
-            .await
+            .await,
+        )
     }
 }
 ```
@@ -53,14 +55,24 @@ must match the recorded sequence, immutable positive-versioned name, exact
 input, and declared result bound; a mismatch is nondeterminism rather than a
 new dispatch.
 
-Format version 2 stores JSON payload bytes in a versioned
-`CheckpointEnvelope`. The payload contains execution identity, exact workflow
-input, declared activity specifications, and linear records in `Scheduled`,
-`DispatchExposed`, or `Completed` state. Envelope version, payload shape,
-activity count, encoded size, and completed-result bounds are validated before
-the workflow is polled. Unsupported versions are compatibility errors, not
-storage conflicts. Completed results replay into workflow code and do not
-create a new dispatch permit.
+Format version 3 stores JSON payload bytes in a versioned
+`CheckpointEnvelope`. An immutable `ExecutionSpec` declares execution
+identity, exact workflow input, and the maximum exact-byte terminal payload.
+The persisted execution contract also records the encoded-checkpoint capacity
+under which terminal state was admitted. Every load validates that authority
+and rejects a smaller current limit before workflow polling.
+
+The payload has exactly one explicit lifecycle state:
+
+- `Active` contains the complete bounded linear history, with records in
+  `Scheduled`, `DispatchExposed`, or `Completed` state.
+- `Terminal` contains `Succeeded` or `Failed` exact bytes and the completed
+  activity count. It has no activity history or digest.
+
+Unsupported and prior formats are compatibility errors, not storage
+conflicts. While active, completed activity results replay into workflow code
+without a dispatch permit. Once terminal, a turn returns the stored outcome
+and observed revision directly without polling workflow code.
 
 Logical activity identity is the complete tuple of execution ID, sequence,
 versioned activity name, exact activity input, and declared maximum result
@@ -75,6 +87,15 @@ Every `DurableHost` requires `CheckpointLimits` for maximum activity records
 and maximum canonical encoded checkpoint bytes. Exact configured boundaries
 are accepted; loaded or proposed checkpoints beyond either boundary are
 rejected before workflow progress.
+
+Before an absent execution is evaluated, the host projects both success and
+failure terminal checkpoints at the execution's declared maximum payload and
+a maximum-width completed activity count. The projection uses checked
+base64/JSON length arithmetic without allocating the declared payload. The
+larger form must fit the configured encoded limit, which is then persisted as
+the execution's immutable admission authority. Capacity failure therefore
+precedes even the first schedule and every possible external-effect permit.
+Later hosts may use an equal or larger limit, but not a smaller one.
 
 Before committing dispatch exposure, the host projects the completed
 checkpoint containing a result at exactly the activity's declared maximum.
@@ -107,10 +128,19 @@ the mutation.
 Awaiting `DurableHost::turn` evaluates and commits no more than one persistence
 boundary:
 
-1. The first turn accepts a `Scheduled` checkpoint and returns no permit.
+1. For an activity-bearing workflow, the first turn accepts a `Scheduled`
+   checkpoint and returns no permit.
 2. A later turn prepares an attempt, accepts a separate `DispatchExposed`
    checkpoint revision, and only then returns an opaque `DispatchPermit`.
-3. A completed checkpoint replays the recorded result.
+3. After observations make active replay complete, the host CAS-replaces the
+   full active checkpoint with a minimal terminal checkpoint.
+4. `WorkflowCompleted` is returned only after that CAS is accepted or a later
+   load observes terminal state. It carries the exact success/failure outcome
+   and accepted/observed opaque revision.
+
+A zero-activity workflow skips schedule, exposure, and observation. Its first
+turn validates terminal capacity and CAS-creates terminal state directly from
+absence before returning `WorkflowCompleted`.
 
 Construction requires the checkpoint store, caller-supplied host epoch, and
 validated `CheckpointLimits`; callers supply the executor used to await turns
@@ -120,6 +150,17 @@ The permit is evidence that this in-process host observed acceptance of both
 persistence boundaries. It is **not** proof of exactly-once execution: a crash
 may occur after exposure persistence and before, during, or after the external
 effect.
+
+Completion conflict or `OutcomeUnknown` returns `ReloadRequired` and never a
+permit or completion. If an unknown write applied, reload observes terminal
+state. If it did not apply, reload replays completed active results and retries
+terminalization without redispatch. Provider failures return `StoreFailed`;
+every later attempt starts with a fresh load.
+
+Terminal success and failure payloads share the `ExecutionSpec` bound. An
+exact-bound outcome is accepted. A larger outcome is an explicit checkpoint
+contract violation and is not persisted or reported complete. This workflow
+failure outcome does not add activity-failure behavior.
 
 ## Quarantine and observation recovery
 
@@ -152,19 +193,19 @@ CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --all-targets -- -D
 
 The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
-three-way classifier. The revised evidence contains 28 unique contiguous
-scenarios and 81 structured assertions; all pass. All five FR-012 authoring
-predicates and all four provider/bounding/documentation predicates also pass,
-so the mechanically derived result remains **feasible** within this kernel's
-stated boundary.
+three-way classifier. The revised evidence contains 38 unique contiguous
+scenarios and 117 structured assertions; all pass. All five FR-012 authoring
+predicates and all five provider, bounding, lifecycle, and documentation
+predicates also pass, so the mechanically derived result remains **feasible**
+within this kernel's stated boundary.
 
-## Deferred work
+## Deferred usability roadmap
 
-The crate intentionally stops at the durable-execution kernel. History
-lifecycle work and the ordered usability roadmap are tracked in
+The crate intentionally stops at the durable-execution kernel.
+Completion-only compaction is implemented; generic active-history compaction
+and continuation remain excluded. A Kubernetes checkpoint provider and the
+remaining ordered deferred work are tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
-The next history-lifecycle design is completion-only compaction; generic
-mid-operation compaction remains excluded.
 
 ## Limitations and exclusions
 

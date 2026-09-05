@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::{
     ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, CheckpointEnvelope,
-    CheckpointError, CheckpointLimits, CheckpointPayload, ExactBytes, ExecutionId,
-    LogicalActivityId, Workflow, WorkflowContext, workflow::ContextDecision,
+    CheckpointError, CheckpointLimits, CheckpointPayload, ExecutionContract, ExecutionSpec,
+    LogicalActivityId, TerminalOutcome, Workflow, WorkflowContext, workflow::ContextDecision,
 };
 
 /// Result of deterministically polling one workflow turn.
@@ -21,8 +21,13 @@ pub enum Evaluation {
         state: ActivityState,
     },
     Complete {
-        result: ExactBytes,
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
         checkpoint: CheckpointEnvelope,
+    },
+    Terminal {
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
     },
     Nondeterminism(Nondeterminism),
     CheckpointRejected(CheckpointError),
@@ -46,27 +51,49 @@ pub enum Nondeterminism {
     UnsupportedSuspension,
 }
 
-/// Validate a checkpoint, then poll the workflow exactly once with a no-op waker.
+/// Validate a checkpoint, then poll an active workflow exactly once.
 pub fn evaluate<W: Workflow>(
     workflow: &W,
-    execution_id: ExecutionId,
-    workflow_input: ExactBytes,
+    execution: &ExecutionSpec,
     checkpoint: Option<&CheckpointEnvelope>,
     limits: CheckpointLimits,
 ) -> Evaluation {
     let mut payload = match checkpoint {
-        Some(envelope) => match envelope.decode_and_validate(execution_id, &workflow_input, limits)
-        {
+        Some(envelope) => match envelope.decode_and_validate(execution, limits) {
             Ok(payload) => payload,
             Err(error) => return Evaluation::CheckpointRejected(error),
         },
-        None => CheckpointPayload::new(execution_id, workflow_input.clone(), Vec::new()),
+        None => {
+            let admitted = match u64::try_from(limits.max_encoded_bytes()) {
+                Ok(admitted) => admitted,
+                Err(_) => {
+                    return Evaluation::CheckpointRejected(CheckpointError::EncodedLengthOverflow);
+                }
+            };
+            let payload = CheckpointPayload::active(
+                ExecutionContract::new(execution.clone(), admitted),
+                Vec::new(),
+            );
+            if let Err(error) = payload.validate(execution, limits) {
+                return Evaluation::CheckpointRejected(error);
+            }
+            payload
+        }
     };
 
+    if let Some((outcome, completed_activity_count)) = payload.terminal_outcome() {
+        return Evaluation::Terminal {
+            outcome: outcome.clone(),
+            completed_activity_count,
+        };
+    }
+    let history = payload
+        .active_activities()
+        .expect("terminal state returned before active replay");
     let (poll, cursor, decision) = {
-        let mut context = WorkflowContext::new(execution_id, payload.activities());
+        let mut context = WorkflowContext::new(execution.execution_id(), history);
         let poll = {
-            let mut future = workflow.run(&mut context, workflow_input);
+            let mut future = workflow.run(&mut context, execution.workflow_input().clone());
             let mut task_context = Context::from_waker(noop_waker_ref());
             future.as_mut().poll(&mut task_context)
         };
@@ -80,7 +107,8 @@ pub fn evaluate<W: Workflow>(
             logical_id,
         }) => {
             payload
-                .activities_mut()
+                .active_activities_mut()
+                .expect("validated replay state is active")
                 .push(ActivityRecord::scheduled(sequence, spec));
             match CheckpointEnvelope::encode_with_limits(&payload, limits) {
                 Ok(checkpoint) => Evaluation::Scheduled {
@@ -96,9 +124,13 @@ pub fn evaluate<W: Workflow>(
         },
         Some(ContextDecision::Nondeterminism(error)) => Evaluation::Nondeterminism(error),
         None => match poll {
-            Poll::Ready(result) => {
-                if cursor != payload.activities().len() {
-                    let remaining = payload.activities().len() - cursor;
+            Poll::Ready(outcome) => {
+                let history_len = payload
+                    .active_activities()
+                    .expect("validated replay state is active")
+                    .len();
+                if cursor != history_len {
+                    let remaining = history_len - cursor;
                     return Evaluation::Nondeterminism(Nondeterminism::UnusedHistory {
                         consumed: u64::try_from(cursor)
                             .expect("validated history length fits in u64"),
@@ -106,8 +138,18 @@ pub fn evaluate<W: Workflow>(
                             .expect("validated history length fits in u64"),
                     });
                 }
+                let completed_activity_count = match u64::try_from(cursor) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        return Evaluation::CheckpointRejected(CheckpointError::HistoryTooLong);
+                    }
+                };
                 match CheckpointEnvelope::encode_with_limits(&payload, limits) {
-                    Ok(checkpoint) => Evaluation::Complete { result, checkpoint },
+                    Ok(checkpoint) => Evaluation::Complete {
+                        outcome,
+                        completed_activity_count,
+                        checkpoint,
+                    },
                     Err(error) => Evaluation::CheckpointRejected(error),
                 }
             }
