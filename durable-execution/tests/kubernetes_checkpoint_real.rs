@@ -176,6 +176,7 @@ async fn validates_real_api_cas_watch_compaction_and_ambiguous_recovery() -> Tes
 async fn check_authorization(client: &Client, namespace: &str) -> TestResult<()> {
     for (resource, verb, target_namespace) in [
         ("namespaces", "create", None),
+        ("namespaces", "get", None),
         ("namespaces", "delete", None),
         ("configmaps", "get", Some(namespace)),
         ("configmaps", "create", Some(namespace)),
