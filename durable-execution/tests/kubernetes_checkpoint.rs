@@ -260,6 +260,14 @@ async fn load_distinguishes_absence_success_and_malformed_objects() {
             StatusCode::OK,
             config_map_response(execution_id, None, Some(&stored)),
         ),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(execution_id, Some("rv-missing-data"), None),
+        ),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(execution_id, Some(""), Some(&stored)),
+        ),
         Step::Response(StatusCode::OK, invalid),
     ]);
     let store =
@@ -280,6 +288,12 @@ async fn load_distinguishes_absence_success_and_malformed_objects() {
         .expect_err("missing revision");
     assert_eq!(missing_revision.kind(), StoreErrorKind::MalformedResponse);
     assert!(missing_revision.description().contains("load"));
+    let missing_data = store.load(execution_id).await.expect_err("missing data");
+    assert_eq!(missing_data.kind(), StoreErrorKind::MalformedResponse);
+    assert!(missing_data.description().contains("checkpoint.json"));
+    let empty_revision = store.load(execution_id).await.expect_err("empty revision");
+    assert_eq!(empty_revision.kind(), StoreErrorKind::MalformedResponse);
+    assert!(empty_revision.description().contains("resourceVersion"));
     let malformed_checkpoint = store.load(execution_id).await.expect_err("invalid JSON");
     assert_eq!(
         malformed_checkpoint.kind(),
@@ -329,7 +343,7 @@ async fn conflicts_cover_create_stale_replace_and_deleted_object_without_recreat
             .collect::<Vec<_>>(),
         [Method::POST, Method::PUT, Method::PUT]
     );
-    assert_eq!(store.metrics().snapshot().accepted_writes(), 0);
+    assert_eq!(store.metrics().snapshot(), Default::default());
     harness.assert_consumed();
 }
 
@@ -338,7 +352,18 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
     let execution_id = execution(0x44);
     let secret_checkpoint = checkpoint(b"secret-checkpoint-content");
     let harness = Harness::new([
-        api_error(403, "Forbidden"),
+        Step::Response(
+            StatusCode::FORBIDDEN,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "metadata": {},
+                "status": "Failure",
+                "message": "Bearer credential-secret is forbidden",
+                "reason": "Forbidden",
+                "code": 403
+            }),
+        ),
         api_error(400, "BadRequest"),
         api_error(401, "Unauthorized"),
         api_error(413, "RequestEntityTooLarge"),
@@ -351,6 +376,10 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
         Step::Response(
             StatusCode::CREATED,
             config_map_response(execution_id, None, Some(&secret_checkpoint)),
+        ),
+        Step::Response(
+            StatusCode::CREATED,
+            config_map_response(execution_id, Some(""), Some(&secret_checkpoint)),
         ),
     ]);
     let store =
@@ -369,6 +398,7 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
             .description()
             .contains("secret-checkpoint-content")
     );
+    assert!(!forbidden.description().contains("credential-secret"));
 
     for (expected_kind, reason) in [
         (StoreErrorKind::Other, "BadRequest"),
@@ -392,6 +422,7 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
         Some(StorageRevision::new("timeout").expect("revision")),
         None,
         None,
+        None,
     ] {
         assert_eq!(
             store
@@ -401,7 +432,7 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
             CasOutcome::OutcomeUnknown
         );
     }
-    assert_eq!(store.metrics().snapshot().accepted_writes(), 0);
+    assert_eq!(store.metrics().snapshot(), Default::default());
     harness.assert_consumed();
 }
 

@@ -1,3 +1,14 @@
+//! Optional Kubernetes-backed checkpoint persistence.
+//!
+//! One execution is stored as one namespaced `ConfigMap`. Confirmed-write
+//! measurements count the canonical JSON bytes of the `CheckpointEnvelope` and
+//! the canonical `serde_json` bytes of the typed, server-returned `ConfigMap`.
+//! The latter includes server-assigned metadata and is not a raw HTTP-wire
+//! measurement. Kubernetes watch traffic is intentionally outside the
+//! `CheckpointStore` contract; validation measures each delivered typed
+//! `WatchEvent<ConfigMap>` by canonical `serde_json` reserialization, excluding
+//! HTTP framing and transport overhead.
+
 use std::{
     collections::BTreeMap,
     sync::{
@@ -282,9 +293,9 @@ fn classify_mutation_error(replacing: bool, error: Error) -> Result<CasOutcome, 
             Ok(CasOutcome::OutcomeUnknown)
         }
         Error::Api(status) => Err(api_status_error("compare-and-swap", &status)),
-        Error::Auth(error) => Err(StoreError::new(
+        Error::Auth(_) => Err(StoreError::new(
             StoreErrorKind::Authorization,
-            format!("compare-and-swap authentication failed before dispatch: {error}"),
+            "compare-and-swap authentication failed before dispatch",
         )),
         Error::BuildRequest(error) => Err(StoreError::new(
             StoreErrorKind::Other,
@@ -301,9 +312,9 @@ fn classify_mutation_error(replacing: bool, error: Error) -> Result<CasOutcome, 
 fn load_error(operation: &str, error: Error) -> StoreError {
     match error {
         Error::Api(status) => api_status_error(operation, &status),
-        Error::Auth(error) => StoreError::new(
+        Error::Auth(_) => StoreError::new(
             StoreErrorKind::Authorization,
-            format!("{operation} authentication failed: {error}"),
+            format!("{operation} authentication failed"),
         ),
         Error::SerdeError(error) => StoreError::new(
             StoreErrorKind::MalformedResponse,
