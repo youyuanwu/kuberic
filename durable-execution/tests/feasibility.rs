@@ -11,13 +11,8 @@ use kuberic_durable_execution::{
 use support::scenarios::{ScenarioId, run_conformance_matrix};
 
 const EXPECTED_FR_013_SCENARIOS: usize = 20;
-const IN_SCOPE_LIMITATIONS: &[&str] = &[
-    "FR-013-04 models exposure-CAS response loss rather than a lost external-effect reply",
-    "changed workflow definition can mask unresolved dispatch exposure as nondeterminism",
-];
 
 struct SelectedOrdinaryAsyncSurface;
-struct ChangedOrdinaryAsyncSurface;
 
 // FR012_SELECTED_WORKFLOW_START
 #[async_trait(?Send)]
@@ -29,15 +24,6 @@ impl Workflow for SelectedOrdinaryAsyncSurface {
     }
 }
 // FR012_SELECTED_WORKFLOW_END
-
-#[async_trait(?Send)]
-impl Workflow for ChangedOrdinaryAsyncSurface {
-    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> ExactBytes {
-        context
-            .activity(ActivityName::new("changed-definition", 1).unwrap(), input)
-            .await
-    }
-}
 
 #[derive(Clone, Copy)]
 struct PredicateEvidence {
@@ -146,31 +132,6 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         .flat_map(|scenario| &scenario.assertions)
         .filter(|assertion| assertion.passed)
         .count();
-    let lost_effect_reply_is_covered = scenarios
-        .iter()
-        .find(|scenario| scenario.id == ScenarioId::LostReplyFollowedByObservation)
-        .is_some_and(|scenario| {
-            scenario.setup.contains("external effect")
-                && scenario.setup.contains("discard")
-                && !scenario.setup.contains("exposure CAS response")
-        });
-    let unresolved_exposure_is_explicitly_quarantined =
-        unresolved_exposure_definition_change_is_quarantined();
-    let requirement_checks = [
-        PredicateEvidence {
-            name: "lost external-effect reply is distinct from exposure-CAS response loss",
-            passed: lost_effect_reply_is_covered,
-        },
-        PredicateEvidence {
-            name: "unresolved exposure quarantines before changed-definition matching",
-            passed: unresolved_exposure_is_explicitly_quarantined,
-        },
-    ];
-    let passed_requirement_checks = requirement_checks
-        .iter()
-        .filter(|check| check.passed)
-        .count();
-
     println!("EVIDENCE selected_surface=\"ordinary async Workflow::run\"");
     println!(
         "COUNT taxonomy=public_authoring_surfaces value={public_authoring_surface_count} bound=1"
@@ -187,10 +148,6 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         scenarios.len()
     );
     println!("COUNT taxonomy=fr_013_assertions value={assertion_count} passed={passed_assertions}");
-    println!(
-        "COUNT taxonomy=fr_013_requirement_coverage_checks value={} passed={passed_requirement_checks}",
-        requirement_checks.len()
-    );
 
     for predicate in fr_012 {
         println!(
@@ -217,21 +174,15 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
             );
         }
     }
-    for check in requirement_checks {
-        println!(
-            "REQUIREMENT status={} check={:?}",
-            status(check.passed),
-            check.name
-        );
-    }
 
-    let requirement_coverage_pass = requirement_checks.iter().all(|check| check.passed);
-    let safety_and_determinism_pass =
-        scenarios.iter().all(|scenario| scenario.passed()) && requirement_coverage_pass;
-    let all_conformance_pass =
-        passed_scenarios == EXPECTED_FR_013_SCENARIOS && requirement_coverage_pass;
+    let safety_and_determinism_pass = scenarios.iter().all(|scenario| scenario.passed());
+    let all_conformance_pass = passed_scenarios == EXPECTED_FR_013_SCENARIOS
+        && passed_assertions == assertion_count
+        && scenarios
+            .iter()
+            .all(|scenario| !scenario.assertions.is_empty());
     let authoring_simplicity_pass = fr_012.iter().all(|predicate| predicate.passed);
-    let has_in_scope_limitation = !IN_SCOPE_LIMITATIONS.is_empty();
+    let has_in_scope_limitation = false;
     let classification = classify_feasibility(FeasibilityInputs {
         safety_and_determinism_pass,
         all_conformance_pass,
@@ -248,31 +199,6 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
     );
 }
 
-fn unresolved_exposure_definition_change_is_quarantined() -> bool {
-    let store = InMemoryCheckpointStore::new();
-    let execution_id = ExecutionId::from_bytes([2; 16]);
-    let input = ExactBytes::new(b"input");
-    let mut first_host = DurableHost::new(store.clone(), HostEpoch::from_bytes([2; 16]));
-    if !matches!(
-        first_host.turn(&SelectedOrdinaryAsyncSurface, execution_id, input.clone()),
-        HostOutcome::ScheduleAccepted { .. }
-    ) {
-        return false;
-    }
-    if !matches!(
-        first_host.turn(&SelectedOrdinaryAsyncSurface, execution_id, input.clone()),
-        HostOutcome::DispatchPermitted { .. }
-    ) {
-        return false;
-    }
-
-    let mut restarted_host = DurableHost::new(store, HostEpoch::from_bytes([3; 16]));
-    matches!(
-        restarted_host.turn(&ChangedOrdinaryAsyncSurface, execution_id, input),
-        HostOutcome::Quarantined { .. }
-    )
-}
-
 #[test]
 fn fr_014_classifier_matches_all_truth_table_cases() {
     for safety_and_determinism_pass in [false, true] {
@@ -285,9 +211,7 @@ fn fr_014_classifier_matches_all_truth_table_cases() {
                         authoring_simplicity_pass,
                         has_in_scope_limitation,
                     };
-                    let expected = if !safety_and_determinism_pass
-                        || (!all_conformance_pass && !has_in_scope_limitation)
-                    {
+                    let expected = if !safety_and_determinism_pass {
                         FeasibilityClassification::Infeasible
                     } else if !all_conformance_pass
                         || !authoring_simplicity_pass

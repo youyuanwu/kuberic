@@ -53,6 +53,27 @@ impl ActivityObservation {
 }
 
 /// Unforgeable evidence that the dispatch-exposed checkpoint was accepted.
+///
+/// External callers can inspect a permit but cannot construct one:
+///
+/// ```compile_fail
+/// use kuberic_durable_execution::{
+///     ActivityName, ActivitySequence, AttemptId, DispatchPermit, ExactBytes, ExecutionId,
+///     HostEpoch, LogicalActivityId,
+/// };
+///
+/// let activity = LogicalActivityId::new(
+///     ExecutionId::from_bytes([1; 16]),
+///     ActivitySequence::new(0),
+///     ActivityName::new("effect", 1).unwrap(),
+///     ExactBytes::new(b"input"),
+/// );
+/// let attempt_id = AttemptId::new(HostEpoch::from_bytes([2; 16]), 1).unwrap();
+/// let forged = DispatchPermit {
+///     activity,
+///     attempt_id,
+/// };
+/// ```
 #[derive(Debug, Eq, PartialEq)]
 pub struct DispatchPermit {
     activity: LogicalActivityId,
@@ -147,6 +168,23 @@ impl<S: CheckpointStore> DurableHost<S> {
     ) -> HostOutcome {
         let loaded = self.store.load(execution_id);
         let expected_revision = loaded.as_ref().map(|stored| stored.revision());
+        if let Some(stored) = loaded.as_ref() {
+            let payload = match stored
+                .checkpoint()
+                .decode_and_validate(execution_id, &workflow_input)
+            {
+                Ok(payload) => payload,
+                Err(error) => return HostOutcome::CheckpointRejected(error),
+            };
+            if let Some(record) = payload.activities().last()
+                && let ActivityState::DispatchExposed { attempt_id } = record.state()
+            {
+                return HostOutcome::Quarantined {
+                    activity: record.logical_id(execution_id),
+                    attempt_id: *attempt_id,
+                };
+            }
+        }
         let evaluation = evaluate(
             workflow,
             execution_id,

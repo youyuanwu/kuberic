@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityName, ActivityObservation, ActivitySequence, CheckpointEnvelope, CheckpointPayload,
-    CheckpointStore, CompareAndSwap, DispatchPermit, DurableHost, ExactBytes, ExecutionId,
-    HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault, LogicalActivityId,
+    ActivityName, ActivityObservation, ActivitySequence, AttemptId, CheckpointEnvelope,
+    CheckpointPayload, CheckpointStore, CompareAndSwap, DispatchPermit, DurableHost, ExactBytes,
+    ExecutionId, HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault, LogicalActivityId,
     Nondeterminism, ObservationRejection, PersistenceBoundary, ReloadReason, Workflow,
     WorkflowContext,
 };
@@ -328,6 +328,27 @@ fn prepared_one(
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SyntheticEffectCall {
+    activity: LogicalActivityId,
+    attempt_id: AttemptId,
+}
+
+#[derive(Default)]
+struct SyntheticEffect {
+    calls: Vec<SyntheticEffectCall>,
+}
+
+impl SyntheticEffect {
+    fn invoke(&mut self, permit: DispatchPermit) -> ExactBytes {
+        self.calls.push(SyntheticEffectCall {
+            activity: permit.activity().clone(),
+            attempt_id: permit.attempt_id(),
+        });
+        bytes(b"effect-result")
+    }
+}
+
 fn restart_before_schedule(id: ScenarioId) -> ScenarioEvidence {
     let store = InMemoryCheckpointStore::new();
     let workflow = LinearWorkflow::one("effect", 1, b"A");
@@ -434,40 +455,39 @@ fn restart_after_exposure(id: ScenarioId) -> ScenarioEvidence {
 }
 
 fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
-    let store = InMemoryCheckpointStore::new();
-    let workflow = LinearWorkflow::one("effect", 1, b"A");
-    let execution_id = execution(4);
-    let input = bytes(b"workflow");
-    let mut durable_host = host(store.clone(), 4);
-    let logical = schedule(&mut durable_host, &workflow, execution_id, &input).unwrap();
-    store.fail_next_compare_and_swap(InMemoryFault::LoseResponseAfterApply);
-    let lost = durable_host.turn(&workflow, execution_id, input.clone());
-    let quarantined = durable_host.turn(&workflow, execution_id, input.clone());
-    let observed = durable_host.observe(
+    let (store, _, workflow, execution_id, input, logical, permit) = prepared_one(4);
+    let expected_attempt = permit.attempt_id();
+    let mut effect = SyntheticEffect::default();
+    let lost_effect_reply = effect.invoke(permit);
+    drop(lost_effect_reply);
+    let mut restarted = host(store, 40);
+    let quarantined = restarted.turn(&workflow, execution_id, input.clone());
+    let observed = restarted.observe(
         execution_id,
         &input,
-        ActivityObservation::new(logical.clone(), bytes(b"result")),
+        ActivityObservation::new(logical.clone(), bytes(b"effect-result")),
     );
-    let completed = durable_host.turn(&workflow, execution_id, input);
+    let completed = restarted.turn(&workflow, execution_id, input);
     ScenarioEvidence::new(
         id,
-        "lose the exposure CAS response, reload quarantine, then inject a result",
+        "invoke one permitted external effect, discard its reply, restart into quarantine, then inject an authoritative observation",
         [
             (
-                "lost reply grants no permit",
-                matches!(
-                    lost,
-                    HostOutcome::ReloadRequired {
-                        boundary: PersistenceBoundary::Exposure,
-                        reason: ReloadReason::ResponseLostAfterApply
-                    }
-                ),
+                "exactly one permitted external effect was invoked",
+                effect.calls
+                    == [SyntheticEffectCall {
+                        activity: logical.clone(),
+                        attempt_id: expected_attempt,
+                    }],
             ),
             (
-                "accepted but unresolved exposure reloads as quarantine",
+                "discarded effect reply leaves the same logical attempt quarantined",
                 matches!(
                     quarantined,
-                    HostOutcome::Quarantined { activity, .. } if activity == logical
+                    HostOutcome::Quarantined {
+                        activity,
+                        attempt_id
+                    } if activity == logical && attempt_id == expected_attempt
                 ),
             ),
             (
@@ -478,7 +498,8 @@ fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
                 "observed result replays to workflow completion",
                 matches!(
                     completed,
-                    HostOutcome::WorkflowCompleted { result } if result == bytes(b"result")
+                    HostOutcome::WorkflowCompleted { result }
+                        if result == bytes(b"effect-result")
                 ),
             ),
         ],
@@ -714,23 +735,46 @@ fn refreshed_attempt(id: ScenarioId) -> ScenarioEvidence {
 
 fn quarantine(id: ScenarioId) -> ScenarioEvidence {
     let (store, mut durable_host, workflow, execution_id, input, logical, _) = prepared_one(11);
+    let changed = LinearWorkflow::one("changed-effect", 1, b"A");
     let before = store.load(execution_id);
     let first = durable_host.turn(&workflow, execution_id, input.clone());
-    let second = durable_host.turn(&workflow, execution_id, input);
+    let changed_while_unresolved = durable_host.turn(&changed, execution_id, input.clone());
+    let second = durable_host.turn(&workflow, execution_id, input.clone());
     let after = store.load(execution_id);
+    let observed = durable_host.observe(
+        execution_id,
+        &input,
+        ActivityObservation::new(logical.clone(), bytes(b"resolved")),
+    );
+    let changed_after_resolution = durable_host.turn(&changed, execution_id, input);
     ScenarioEvidence::new(
         id,
-        "poll exposed unresolved work repeatedly",
+        "poll exposed unresolved work repeatedly and with a changed workflow definition",
         [
             (
                 "first replay is quarantined",
                 matches!(&first, HostOutcome::Quarantined { activity, .. } if activity == &logical),
             ),
             (
+                "quarantine takes precedence over changed-definition matching",
+                matches!(
+                    &changed_while_unresolved,
+                    HostOutcome::Quarantined { activity, .. } if activity == &logical
+                ),
+            ),
+            (
                 "duplicate replay remains quarantined without a permit",
                 matches!(second, HostOutcome::Quarantined { .. }),
             ),
             ("quarantine does not mutate the checkpoint", before == after),
+            (
+                "after observation, the changed definition reports nondeterminism",
+                matches!(observed, HostOutcome::ObservationAccepted { .. })
+                    && matches!(
+                        changed_after_resolution,
+                        HostOutcome::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+                    ),
+            ),
         ],
     )
 }
@@ -1002,13 +1046,21 @@ fn competing_observations(id: ScenarioId) -> ScenarioEvidence {
 }
 
 fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
-    let (_, mut durable_host, workflow, execution_id, input, logical, permit) = prepared_one(19);
+    let (store, mut durable_host, workflow, execution_id, input, logical, permit) =
+        prepared_one(19);
     let quarantined = durable_host.turn(&workflow, execution_id, input.clone());
     let accepted = durable_host.observe(
         execution_id,
         &input,
         ActivityObservation::new(logical.clone(), bytes(b"resolved")),
     );
+    let before_stale = store.load(execution_id);
+    let stale = durable_host.observe(
+        execution_id,
+        &input,
+        ActivityObservation::new(logical.clone(), bytes(b"stale")),
+    );
+    let stale_left_checkpoint_unchanged = before_stale == store.load(execution_id);
     let completed = durable_host.turn(&workflow, execution_id, input);
     ScenarioEvidence::new(
         id,
@@ -1030,6 +1082,13 @@ fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
                     accepted,
                     HostOutcome::ObservationAccepted { activity, .. } if activity == logical
                 ),
+            ),
+            (
+                "a stale observation is rejected without changing the completed record",
+                matches!(
+                    stale,
+                    HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed)
+                ) && stale_left_checkpoint_unchanged,
             ),
             (
                 "resolution replays without redispatch",

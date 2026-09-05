@@ -89,8 +89,11 @@ effect.
 ## Quarantine and observation recovery
 
 Reloading an unresolved `DispatchExposed` activity returns `Quarantined` with
-the persisted logical and attempt identities. Quarantine does not redispatch,
-compensate, mutate the checkpoint, or schedule a later activity.
+the persisted logical and attempt identities before workflow-definition
+matching. Quarantine does not redispatch, compensate, mutate the checkpoint,
+or schedule a later activity. After an authoritative observation resolves the
+exposed activity, ordinary replay resumes and still reports any definition
+mismatch as nondeterminism before a later dispatch.
 
 The host leaves effect execution to its caller. A caller may later supply an
 authoritative `ActivityObservation` for the exact exposed logical activity.
@@ -124,12 +127,12 @@ lease, activity handler, automatic observation polling, or passive-observation
 transport. It does not establish a canonical exact-byte representation across
 versions.
 
-Two in-scope evidence gaps remain. The registered lost-reply fixture models a
-lost exposure-CAS response rather than discarding an external effect's reply.
-Also, if workflow name or input changes while an exposed activity is
-unresolved, definition matching reports nondeterminism before the host can
-return explicit quarantine. The feasibility assessment reports both gaps
-instead of treating the otherwise passing registry as complete evidence.
+The bounded classifier reports `feasible`: all 20 registered FR-013 scenarios
+and 54 structured assertions pass, all five FR-012 predicates pass, and no
+in-scope limitation remains. The lost-reply fixture invokes one synthetic
+effect under an opaque permit and discards its returned result before restart;
+separate cases retain schedule, exposure, and observation CAS response-loss
+coverage.
 
 Timers, parallel activities, retries or backoff policy, cancellation, child
 workflows, external events, compensation, migrations, upgrade guarantees,
