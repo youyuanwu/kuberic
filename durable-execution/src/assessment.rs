@@ -17,7 +17,9 @@ pub struct FeasibilityInputs {
 
 /// Classify only the synthetic model represented by the supplied evidence.
 pub const fn classify_feasibility(inputs: FeasibilityInputs) -> FeasibilityClassification {
-    if !inputs.safety_and_determinism_pass {
+    if !inputs.safety_and_determinism_pass
+        || (!inputs.all_conformance_pass && !inputs.has_in_scope_limitation)
+    {
         FeasibilityClassification::Infeasible
     } else if !inputs.all_conformance_pass
         || !inputs.authoring_simplicity_pass
@@ -41,11 +43,11 @@ mod tests {
 
         let rows = [
             (inputs(false, false, false, false), Infeasible),
-            (inputs(true, false, false, false), Conditional),
+            (inputs(true, false, false, false), Infeasible),
             (inputs(false, true, false, false), Infeasible),
             (inputs(true, true, false, false), Conditional),
             (inputs(false, false, true, false), Infeasible),
-            (inputs(true, false, true, false), Conditional),
+            (inputs(true, false, true, false), Infeasible),
             (inputs(false, true, true, false), Infeasible),
             (inputs(true, true, true, false), Feasible),
             (inputs(false, false, false, true), Infeasible),

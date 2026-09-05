@@ -4,6 +4,13 @@
 //! ordinary-async authoring API is paired with a synchronous in-memory durable
 //! host. Dispatch permission is available only after separate accepted
 //! schedule and exposure checkpoint transitions.
+//!
+//! The crate README documents the selected
+//! [ordinary-async authoring surface](../README.md#selected-authoring-surface),
+//! [replay and checkpoint semantics](../README.md#replay-and-checkpoint-semantics),
+//! [turn and dispatch-permission boundary](../README.md#turns-and-dispatch-permission),
+//! [quarantine recovery](../README.md#quarantine-and-observation-recovery), and
+//! [bounded limitations](../README.md#limitations-and-exclusions).
 
 mod assessment;
 mod checkpoint;

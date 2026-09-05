@@ -1,10 +1,15 @@
 # Kuberic Durable Execution Experiment
 
 `kuberic-durable-execution` is an isolated feasibility crate for deterministic,
-linear workflow replay. It is not used by the Kuberic operator or
-`kuberic-core`.
+linear workflow replay. It has no dependency on `kuberic-core` or
+`kuberic-operator`, and neither production crate depends on it.
 
-Phase 1 evaluates a provisional ordinary-async authoring surface:
+## Selected authoring surface
+
+The feasibility evaluation selected the ordinary async surface. A workflow is
+an `#[async_trait(?Send)]` implementation of `Workflow::run`; its only
+framework-specific workflow-body operation is
+`WorkflowContext::activity(name, input).await`.
 
 ```rust
 use async_trait::async_trait;
@@ -28,31 +33,107 @@ impl Workflow for Greeting {
 }
 ```
 
-The only workflow-body operation is `WorkflowContext::activity`. Evaluation
-polls one deterministic turn: completed records return their exact result, a
-new activity produces a versioned checkpoint containing one scheduled record,
-and changed history produces a nondeterminism result. Checkpoints are JSON
-payloads inside an envelope with an explicit format version. Validation occurs
-before workflow code is polled.
+The measured workflow body uses one framework operation against an FR-012
+maximum of two. The public host reports nine turn/observation outcome variants.
+No explicit poll/replay authoring surface is also exported.
 
-Logical activity identity is the complete tuple of execution ID, zero-based
-sequence, caller-supplied name and positive version, and exact input bytes.
-Its stable external rendering includes that entire tuple directly. It does not
-hash or normalize any tuple member.
+## Replay and checkpoint semantics
 
-Run the focused Phase 1 checks with:
+`ExactBytes` are compared and persisted without normalization. Workflow
+history is a contiguous, zero-based sequence with a completed prefix and at
+most one final pending activity. A requested activity must match the recorded
+sequence, immutable positive-versioned name, and exact input; a mismatch is
+nondeterminism rather than a new dispatch.
+
+Format version 1 stores JSON payload bytes in a versioned
+`CheckpointEnvelope`. The payload contains execution identity, exact workflow
+input, and linear activity records in `Scheduled`, `DispatchExposed`, or
+`Completed` state. Envelope version and payload shape are validated before the
+workflow is polled. Unsupported versions are compatibility errors, not storage
+conflicts. Completed results replay into workflow code and do not create a new
+dispatch permit.
+
+Logical activity identity is the complete tuple of execution ID, sequence,
+versioned activity name, and exact activity input. Its external rendering
+contains the complete tuple without hashing or normalization. `AttemptId` is a
+separate host-epoch and monotonic-counter identity, so a discarded
+pre-exposure attempt may change without changing the logical activity.
+
+## Storage revisions
+
+`CheckpointStore` exposes synchronous `load` and `compare_and_swap`
+operations. `StorageRevision` is an opaque concurrency token and is unrelated
+to checkpoint format version. The included `InMemoryCheckpointStore` assigns
+the first accepted checkpoint a nonzero revision and advances it once for each
+accepted replacement. Its one-shot faults model rejection before apply and
+response loss after apply.
+
+A conflict, pre-apply rejection, or lost response returns `ReloadRequired`.
+None of those responses is dispatch permission, even when a lost response
+means the state was applied.
+
+## Turns and dispatch permission
+
+`DurableHost::turn` evaluates and commits no more than one persistence boundary:
+
+1. The first turn accepts a `Scheduled` checkpoint and returns no permit.
+2. A later turn prepares an attempt, accepts a separate `DispatchExposed`
+   checkpoint revision, and only then returns an opaque `DispatchPermit`.
+3. A completed checkpoint replays the recorded result.
+
+The permit is evidence that this in-process host observed acceptance of both
+persistence boundaries. It is **not** proof of exactly-once execution: a crash
+may occur after exposure persistence and before, during, or after the external
+effect.
+
+## Quarantine and observation recovery
+
+Reloading an unresolved `DispatchExposed` activity returns `Quarantined` with
+the persisted logical and attempt identities. Quarantine does not redispatch,
+compensate, mutate the checkpoint, or schedule a later activity.
+
+The host leaves effect execution to its caller. A caller may later supply an
+authoritative `ActivityObservation` for the exact exposed logical activity.
+An accepted observation records the exact result, after which normal replay
+continues. Missing, stale, or mismatched observations are rejected; competing
+observations use the same CAS rule. The crate does not determine the
+observation's trust source or transport.
+
+## Validation
+
+Run the bounded feasibility evidence and the complete crate/workspace gates:
 
 ```console
-cargo check -p kuberic-durable-execution --all-targets
-cargo test -p kuberic-durable-execution --test replay --test authoring_candidate
+cargo test -p kuberic-durable-execution --test feasibility -- --nocapture
+cargo test -p kuberic-durable-execution --all-targets
+cargo test -p kuberic-durable-execution --doc
+cargo fmt --all -- --check
+cargo check --workspace
 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
-cargo fmt -p kuberic-durable-execution -- --check
 ```
 
-This phase deliberately has no storage host, compare-and-swap implementation,
-dispatch permit, activity handler, worker, observation transport, or effect
-invocation. The overall experiment also excludes timers, parallel activities,
-cancellation, child workflows, external events, queues, leases, retries,
-production persistence, migration, compatibility guarantees, operator/CRD or
-gRPC changes, deployment changes, production-readiness claims, and any claim
-that Kuberic will adopt this framework.
+The feasibility test reruns the sole 20-scenario FR-013 registry, emits every
+assertion, measures the FR-012 surface, and applies the exhaustive FR-014
+three-way classifier.
+
+## Limitations and exclusions
+
+The result is limited to an in-memory synthetic model. The crate supplies no
+production persistence, distributed execution ownership, worker, queue,
+lease, activity handler, automatic observation polling, or passive-observation
+transport. It does not establish a canonical exact-byte representation across
+versions.
+
+Two in-scope evidence gaps remain. The registered lost-reply fixture models a
+lost exposure-CAS response rather than discarding an external effect's reply.
+Also, if workflow name or input changes while an exposed activity is
+unresolved, definition matching reports nondeterminism before the host can
+return explicit quarantine. The feasibility assessment reports both gaps
+instead of treating the otherwise passing registry as complete evidence.
+
+Timers, parallel activities, retries or backoff policy, cancellation, child
+workflows, external events, compensation, migrations, upgrade guarantees,
+rollout, or diagnostics are excluded. The experiment changes no Kuberic CRD,
+operator reconciliation, durable topology workflow, status persistence,
+ReplicaAgent, gRPC protocol, or deployment manifest. Its classification is
+not a production-readiness, current-operator-parity, or adoption claim.
