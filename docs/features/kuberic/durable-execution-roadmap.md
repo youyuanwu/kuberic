@@ -31,8 +31,8 @@ The implemented kernel provides:
   non-controlling owner references and separately authorized orphan cleanup;
 - a configurable conservative ConfigMap data budget with documented headroom;
 - namespace-scoped writer and cleanup RBAC examples with separate identities;
-- an explicit ignored real-API test invocation in the existing
-  one-control-plane KinD CI job;
+- feature-gated real-API coverage through the existing all-features workspace
+  test command after the one-control-plane KinD CI job is provisioned;
 - real-API spike measurements for checkpoint/object size, accepted writes,
   canonical typed watch-event bytes, and unknown-outcome recovery.
 
@@ -140,9 +140,9 @@ spike:
    owner references, and assigns orphan deletion to a separately authorized
    lifecycle actor.
 4. **Implemented:** A configurable 786,432-byte default ConfigMap data budget,
-   standalone least-privilege writer and cleanup RBAC examples, and explicit
-   selection of the ignored real-API test in the existing one-control-plane
-   KinD CI job.
+   standalone least-privilege writer and cleanup RBAC examples, and
+   feature-gated real-API coverage through the existing all-features workspace
+   test command after the one-control-plane KinD CI job is provisioned.
 
 The remaining steps stay ordered and deferred:
 

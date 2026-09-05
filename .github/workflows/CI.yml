@@ -57,18 +57,8 @@ jobs:
         cluster_name: kind
         config: deploy/kind-config.yaml
 
-    - name: Run real Kubernetes checkpoint test
-      env:
-        CARGO_BUILD_JOBS: 2
-      run: |
-        cargo test \
-          -p kuberic-durable-execution \
-          --features kubernetes \
-          --test kubernetes_checkpoint_real \
-          -- --ignored --nocapture
-
     - name: Build and load Docker images
       run: just images
 
     - name: Run cargo test
-      run: cargo test --all -- --nocapture
+      run: cargo test --all --all-features

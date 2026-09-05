@@ -282,21 +282,21 @@ CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes
 CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --features kubernetes --all-targets -- -D warnings
 ```
 
-An explicit ignored test performs authorization preflight, creates a temporary
+A feature-gated test performs authorization preflight, creates a temporary
 namespace, validates the provider against the configured real Kubernetes API,
 prints its measurement report, and waits for namespace deletion:
 
 ```console
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real -- --ignored --nocapture
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real
 ```
 
-The repository's existing [CI workflow](../.github/workflows/CI.yml) explicitly
-selects this ignored test after its existing `helm/kind-action` step has
-provisioned the shared one-control-plane KinD environment. The targeted step
-sets `CARGO_BUILD_JOBS=2`; it does not create a second cluster or register a
+The repository's existing [CI workflow](../.github/workflows/CI.yml) enables
+all crate features on its workspace-wide test command after the existing
+`helm/kind-action` step has provisioned the shared one-control-plane KinD
+environment. There is no separate provider test step, second cluster, or
 second cleanup owner. Cluster lifecycle remains owned by the existing KinD
-action. Ordinary local and default Cargo test runs do not select the ignored
-test.
+action. Ordinary local and default Cargo test runs without the Kubernetes
+feature do not select this test.
 
 The test reports a failed endpoint or authorization precondition rather than
 claiming real-API coverage. Its apply-then-unknown and no-apply-unknown cases

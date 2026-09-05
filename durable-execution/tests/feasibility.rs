@@ -513,7 +513,7 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
         "owner references, admission mutation, and API-server policy",
         "checkpoint-writer-rbac.yaml",
         "checkpoint-cleanup-rbac.yaml",
-        "runs do not select the ignored",
+        "feature do not select this test",
     ] {
         assert!(
             readme.contains(required),
@@ -537,14 +537,14 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
         .find("uses: helm/kind-action@v1")
         .expect("existing KinD action");
     let checkpoint_step = workflow
-        .find("name: Run real Kubernetes checkpoint test")
-        .expect("explicit real checkpoint test step");
+        .find("name: Run cargo test")
+        .expect("existing workspace test step");
     assert!(kind_step < checkpoint_step);
     assert_eq!(workflow.matches("uses: helm/kind-action@v1").count(), 1);
-    assert!(workflow.contains("CARGO_BUILD_JOBS: 2"));
-    assert!(workflow.contains("--test kubernetes_checkpoint_real"));
-    assert!(workflow.contains("-- --ignored --nocapture"));
-    assert!(real_test.contains("#[ignore ="));
+    assert!(!workflow.contains("name: Run real Kubernetes checkpoint test"));
+    assert!(workflow.contains("cargo test --all --all-features"));
+    assert!(!workflow.contains("--nocapture"));
+    assert!(!real_test.contains("#[ignore"));
 }
 
 const fn status(passed: bool) -> &'static str {

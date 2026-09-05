@@ -114,7 +114,6 @@ impl Workflow for OneActivityWorkflow {
 }
 
 #[tokio::test]
-#[ignore = "requires a reachable and authorized Kubernetes API"]
 async fn validates_real_api_cas_watch_compaction_and_ambiguous_recovery() -> TestResult<()> {
     let client = match Client::try_default().await {
         Ok(client) => client,
