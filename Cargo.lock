@@ -1370,9 +1370,14 @@ dependencies = [
  "async-trait",
  "base64",
  "futures",
+ "http",
+ "k8s-openapi",
+ "kube",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

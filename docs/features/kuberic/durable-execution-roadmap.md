@@ -24,7 +24,11 @@ The implemented kernel provides:
 - immutable execution-level terminal payload and admitted capacity;
 - completion-only active-to-terminal checkpoint compaction;
 - direct terminal outcome reload without workflow polling;
-- ambiguity quarantine and authoritative observation recovery.
+- ambiguity quarantine and authoritative observation recovery;
+- an optional, isolated ConfigMap checkpoint-provider spike using opaque
+  Kubernetes `resourceVersion` compare-and-swap;
+- real-API spike measurements for checkpoint/object size, accepted writes,
+  canonical typed watch-event bytes, and unknown-outcome recovery.
 
 The bounds prevent unlimited growth and ensure a declared-valid result remains
 persistable after dispatch. Active history is never compacted: every completed
@@ -115,15 +119,25 @@ those runtime facilities rather than growing the kernel speculatively.
 
 ### Kubernetes Integration
 
-After the provider contract and history lifecycle are proven:
+The first two integration steps are now implemented as an isolated spike:
 
-1. Implement a Kubernetes checkpoint provider using opaque
-   `resourceVersion` compare-and-swap.
-2. Measure checkpoint size, accepted writes, and watch-delivered bytes.
+1. **Implemented:** Kubernetes ConfigMap checkpoint storage using opaque
+   `resourceVersion` create/replace compare-and-swap, portable errors, and
+   conservative unknown mutation outcomes.
+2. **Implemented:** Deterministic and real-API validation with measurements for
+   active/terminal checkpoint and returned-object size, confirmed accepted
+   writes, canonical typed watch-event JSON bytes, and both reload branches
+   after an unknown outcome.
+
+The remaining steps stay ordered and deferred:
+
 3. Add one operator workflow pilot without changing workflow ownership.
 4. Evaluate whether the async authoring model is materially simpler than the
    existing explicit state machine.
 5. Generalize only if the pilot preserves safety and reduces complexity.
+
+The provider spike does not add an operator dependency, alter reconciliation,
+or authorize a workflow migration.
 
 ## Explicitly Deferred
 

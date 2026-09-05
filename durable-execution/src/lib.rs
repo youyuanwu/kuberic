@@ -18,6 +18,8 @@ mod checkpoint;
 mod host;
 mod identity;
 mod in_memory;
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
 mod replay;
 mod store;
 mod workflow;
@@ -36,6 +38,10 @@ pub use identity::{
     ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
 };
 pub use in_memory::{InMemoryCheckpointStore, InMemoryFault};
+#[cfg(feature = "kubernetes")]
+pub use kubernetes::{
+    KubernetesCheckpointMetrics, KubernetesCheckpointMetricsSnapshot, KubernetesCheckpointStore,
+};
 pub use replay::{Evaluation, Nondeterminism, evaluate};
 pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
