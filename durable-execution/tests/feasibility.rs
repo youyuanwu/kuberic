@@ -502,7 +502,8 @@ fn checkpoint_rbac_examples_are_structural_and_lifecycle_specific() {
 fn checkpoint_provider_readiness_contract_is_user_visible() {
     let readme = include_str!("../README.md");
     let roadmap = include_str!("../../docs/features/kuberic/durable-execution-roadmap.md");
-    let workflow = include_str!("../../.github/workflows/checkpoint-kubernetes-real.yml");
+    let workflow = include_str!("../../.github/workflows/CI.yml");
+    let real_test = include_str!("kubernetes_checkpoint_real.rs");
 
     for required in [
         "independently retained checkpoints",
@@ -512,7 +513,7 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
         "owner references, admission mutation, and API-server policy",
         "checkpoint-writer-rbac.yaml",
         "checkpoint-cleanup-rbac.yaml",
-        "runs do not select the ignored test",
+        "runs do not select the ignored",
     ] {
         assert!(
             readme.contains(required),
@@ -532,11 +533,18 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
             "roadmap must retain {required:?}"
         );
     }
-    assert!(workflow.contains("workflow_dispatch:"));
+    let kind_step = workflow
+        .find("uses: helm/kind-action@v1")
+        .expect("existing KinD action");
+    let checkpoint_step = workflow
+        .find("name: Run real Kubernetes checkpoint test")
+        .expect("explicit real checkpoint test step");
+    assert!(kind_step < checkpoint_step);
+    assert_eq!(workflow.matches("uses: helm/kind-action@v1").count(), 1);
     assert!(workflow.contains("CARGO_BUILD_JOBS: 2"));
     assert!(workflow.contains("--test kubernetes_checkpoint_real"));
     assert!(workflow.contains("-- --ignored --nocapture"));
-    assert!(workflow.contains("if: ${{ always() }}"));
+    assert!(real_test.contains("#[ignore ="));
 }
 
 const fn status(passed: bool) -> &'static str {

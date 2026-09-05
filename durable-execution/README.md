@@ -290,14 +290,13 @@ prints its measurement report, and waits for namespace deletion:
 CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real -- --ignored --nocapture
 ```
 
-Maintainers can also manually dispatch the
-[`checkpoint-kubernetes-real` workflow](../.github/workflows/checkpoint-kubernetes-real.yml).
-It creates a uniquely named one-control-plane KinD cluster, runs only the
-ignored test above with `CARGO_BUILD_JOBS=2`, and uses an always-run step to
-delete and verify absence of only that workflow-owned cluster. Ordinary test
-runs do not select the ignored test. GitHub can schedule cleanup after test
-failure or cancellation while the runner remains available, but abrupt runner
-loss or infrastructure teardown can prevent any in-run cleanup verification.
+The repository's existing [CI workflow](../.github/workflows/CI.yml) explicitly
+selects this ignored test after its existing `helm/kind-action` step has
+provisioned the shared one-control-plane KinD environment. The targeted step
+sets `CARGO_BUILD_JOBS=2`; it does not create a second cluster or register a
+second cleanup owner. Cluster lifecycle remains owned by the existing KinD
+action. Ordinary local and default Cargo test runs do not select the ignored
+test.
 
 The test reports a failed endpoint or authorization precondition rather than
 claiming real-API coverage. Its apply-then-unknown and no-apply-unknown cases
