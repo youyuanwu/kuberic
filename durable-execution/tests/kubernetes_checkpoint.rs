@@ -21,7 +21,7 @@ use kuberic_durable_execution::{
 #[derive(Clone, Debug)]
 enum Step {
     Response(StatusCode, Value),
-    TransportFailure,
+    TransportFailure(&'static str),
 }
 
 #[derive(Clone, Debug)]
@@ -79,9 +79,7 @@ impl Harness {
                             serde_json::to_vec(&body).expect("response JSON"),
                         ))
                         .map_err(io::Error::other),
-                    Some(Step::TransportFailure) => {
-                        Err(io::Error::other("injected transport failure"))
-                    }
+                    Some(Step::TransportFailure(message)) => Err(io::Error::other(message)),
                     None => Err(io::Error::other("unexpected Kubernetes request")),
                 }
             }
@@ -142,6 +140,7 @@ fn api_error(code: u16, reason: &str) -> Step {
             "kind": "Status",
             "metadata": {},
             "status": "Failure",
+            "details": {"name": "sensitive-api-diagnostic-marker"},
             "message": format!("{reason} without credential or checkpoint content"),
             "reason": reason,
             "code": code
@@ -372,7 +371,7 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
         api_error(429, "TooManyRequests"),
         api_error(500, "InternalError"),
         api_error(504, "Timeout"),
-        Step::TransportFailure,
+        Step::TransportFailure("sensitive-mutation-transport-marker"),
         Step::Response(
             StatusCode::CREATED,
             config_map_response(execution_id, None, Some(&secret_checkpoint)),
@@ -398,8 +397,6 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
             .description()
             .contains("secret-checkpoint-content")
     );
-    assert!(!forbidden.description().contains("credential-secret"));
-
     for (expected_kind, reason) in [
         (StoreErrorKind::Other, "BadRequest"),
         (StoreErrorKind::Authorization, "Unauthorized"),
@@ -415,6 +412,11 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
         assert_eq!(rejected.kind(), expected_kind);
         assert!(rejected.description().contains(reason));
         assert!(!rejected.description().contains("secret-checkpoint-content"));
+        assert!(
+            !rejected
+                .description()
+                .contains("sensitive-api-diagnostic-marker")
+        );
     }
 
     for expected in [
@@ -444,22 +446,28 @@ async fn load_errors_map_to_every_relevant_portable_category() {
         api_error(504, "Timeout"),
         api_error(500, "InternalError"),
         api_error(422, "Invalid"),
-        Step::TransportFailure,
+        Step::TransportFailure("sensitive-load-transport-marker"),
     ]);
     let store =
         KubernetesCheckpointStore::new(harness.client(), "checkpoint-tests").expect("store");
 
-    for expected in [
-        StoreErrorKind::Authorization,
-        StoreErrorKind::Timeout,
-        StoreErrorKind::Unavailable,
-        StoreErrorKind::Other,
-        StoreErrorKind::Unavailable,
+    for (expected, excluded_marker) in [
+        (StoreErrorKind::Authorization, None),
+        (StoreErrorKind::Timeout, None),
+        (StoreErrorKind::Unavailable, None),
+        (StoreErrorKind::Other, None),
+        (
+            StoreErrorKind::Unavailable,
+            Some("sensitive-load-transport-marker"),
+        ),
     ] {
         let error = store.load(execution_id).await.expect_err("load failure");
         assert_eq!(error.kind(), expected);
         assert!(error.description().contains("load"));
         assert!(!error.description().contains("checkpoint-content"));
+        if let Some(marker) = excluded_marker {
+            assert!(!error.description().contains(marker));
+        }
     }
     harness.assert_consumed();
 }

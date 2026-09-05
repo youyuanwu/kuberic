@@ -297,13 +297,13 @@ fn classify_mutation_error(replacing: bool, error: Error) -> Result<CasOutcome, 
             StoreErrorKind::Authorization,
             "compare-and-swap authentication failed before dispatch",
         )),
-        Error::BuildRequest(error) => Err(StoreError::new(
+        Error::BuildRequest(_) => Err(StoreError::new(
             StoreErrorKind::Other,
-            format!("compare-and-swap request construction failed before dispatch: {error}"),
+            "compare-and-swap request construction failed before dispatch",
         )),
-        Error::HttpError(error) => Err(StoreError::new(
+        Error::HttpError(_) => Err(StoreError::new(
             StoreErrorKind::Other,
-            format!("compare-and-swap HTTP request construction failed before dispatch: {error}"),
+            "compare-and-swap HTTP request construction failed before dispatch",
         )),
         _ => Ok(CasOutcome::OutcomeUnknown),
     }
@@ -324,13 +324,13 @@ fn load_error(operation: &str, error: Error) -> StoreError {
             StoreErrorKind::MalformedResponse,
             format!("{operation} response was not UTF-8: {error}"),
         ),
-        Error::BuildRequest(error) => StoreError::new(
+        Error::BuildRequest(_) => StoreError::new(
             StoreErrorKind::Other,
-            format!("{operation} request construction failed: {error}"),
+            format!("{operation} request construction failed"),
         ),
-        other => StoreError::new(
+        _ => StoreError::new(
             StoreErrorKind::Unavailable,
-            format!("{operation} Kubernetes request failed: {other}"),
+            format!("{operation} Kubernetes request was unavailable or failed in transport"),
         ),
     }
 }
