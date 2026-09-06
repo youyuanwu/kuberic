@@ -159,7 +159,7 @@ successful execution used 88 accepted checkpoint writes and reached a
 explicit test path. The checked-in lexical measurement reports 1,258
 executable lines and 141 decision points for the explicit implementation,
 while the four non-overlapping pilot module, checkpoint-store, effect-bridge,
-and reconcile boundaries total 2,149 executable lines and 176 decision points.
+and reconcile boundaries total 2,233 executable lines and 187 decision points.
 CRD, manifest, and test changes are outside both measurements. The pilot
 therefore preserves safety but does not yet demonstrate lower persistence
 traffic or net implementation complexity.

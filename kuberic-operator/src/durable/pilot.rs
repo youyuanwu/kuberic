@@ -685,7 +685,7 @@ fn validate_terminal(
     snapshot: &StablePartitionSnapshotStatus,
     compensated: bool,
 ) -> Result<(), String> {
-    use crate::crd::{DurableOperationPhase as Phase, StableReplicaRoleStatus};
+    use crate::crd::DurableOperationPhase as Phase;
     if !compensated {
         if operation.phase != Phase::Completed
             || operation.pending_action.is_some()
@@ -698,17 +698,43 @@ fn validate_terminal(
     }
     if operation.phase != Phase::Failed
         || operation.pending_action.is_some()
-        || snapshot.primary_id != operation.old_primary_id
-        || snapshot.members.iter().any(|member| {
-            (member.id == operation.old_primary_id
-                && member.role != StableReplicaRoleStatus::Primary)
-                || (member.id != operation.old_primary_id
-                    && member.role != StableReplicaRoleStatus::ActiveSecondary)
-        })
+        || !valid_compensation_snapshot(operation, snapshot)
     {
         return Err("compensated durable switchover terminal is inconsistent".to_string());
     }
     Ok(())
+}
+
+fn valid_compensation_snapshot(
+    operation: &DurableOperationStatus,
+    snapshot: &StablePartitionSnapshotStatus,
+) -> bool {
+    use crate::crd::StableReplicaRoleStatus;
+    let Some(previous) = operation.previous_snapshot.as_ref() else {
+        return false;
+    };
+    if snapshot.primary_id != operation.old_primary_id
+        || snapshot.write_quorum != previous.write_quorum
+        || snapshot.members.len() != previous.members.len()
+        || (snapshot.epoch != previous.epoch && snapshot.epoch != operation.target_snapshot.epoch)
+    {
+        return false;
+    }
+    previous.members.iter().all(|expected| {
+        let matches: Vec<_> = snapshot
+            .members
+            .iter()
+            .filter(|actual| actual.id == expected.id)
+            .collect();
+        matches.len() == 1
+            && matches[0].instance_id == expected.instance_id
+            && matches[0].role
+                == if expected.id == operation.old_primary_id {
+                    StableReplicaRoleStatus::Primary
+                } else {
+                    StableReplicaRoleStatus::ActiveSecondary
+                }
+    })
 }
 
 fn same_topology(
@@ -1865,6 +1891,50 @@ mod durable_switchover_pilot_tests {
             .unwrap(),
         );
         assert!(validate_loaded_terminal(&reference, &wrong_snapshot).is_err());
+
+        let mut failed = initial_operation(&reference).unwrap();
+        failed.phase = crate::crd::DurableOperationPhase::Failed;
+        let compensated = failed.previous_snapshot.cloned().unwrap();
+        let valid_compensation = DurableSwitchoverPilotTerminal::Complete {
+            operation: failed.clone(),
+            snapshot: compensated.clone(),
+            compensated: true,
+        };
+        assert!(
+            validate_loaded_terminal(
+                &reference,
+                &TerminalOutcome::succeeded(encode_terminal(&valid_compensation).unwrap()),
+            )
+            .is_ok()
+        );
+
+        let mut malformed = Vec::new();
+        let mut missing = compensated.clone();
+        missing.members.pop();
+        malformed.push(missing);
+        let mut extra = compensated.clone();
+        extra.members.push(extra.members[0].clone());
+        malformed.push(extra);
+        let mut wrong_incarnation = compensated.clone();
+        wrong_incarnation.members[0].instance_id = "replacement".to_string();
+        malformed.push(wrong_incarnation);
+        let mut wrong_quorum = compensated.clone();
+        wrong_quorum.write_quorum = wrong_quorum.write_quorum.saturating_add(1);
+        malformed.push(wrong_quorum);
+        let mut wrong_epoch = compensated;
+        wrong_epoch.epoch.configuration_number += 9;
+        malformed.push(wrong_epoch);
+        for snapshot in malformed {
+            let outcome = TerminalOutcome::succeeded(
+                encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                    operation: failed.clone(),
+                    snapshot,
+                    compensated: true,
+                })
+                .unwrap(),
+            );
+            assert!(validate_loaded_terminal(&reference, &outcome).is_err());
+        }
     }
 
     #[test]
