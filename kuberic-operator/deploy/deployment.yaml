@@ -2063,6 +2063,9 @@ spec:
         - jsonPath: .spec.operation
           name: Operation
           type: string
+        - jsonPath: .spec.desiredState
+          name: Desired
+          type: string
         - jsonPath: .status.phase
           name: Phase
           type: string
@@ -2081,6 +2084,13 @@ spec:
               properties:
                 deadline:
                   nullable: true
+                  type: string
+                desiredState:
+                  default: Prepare
+                  enum:
+                    - Prepare
+                    - Complete
+                    - Cancel
                   type: string
                 nodeName:
                   type: string
@@ -2126,7 +2136,18 @@ spec:
                         type: boolean
                       replicas:
                         items:
-                          type: string
+                          properties:
+                            isPrimary:
+                              default: false
+                              type: boolean
+                            podName:
+                              type: string
+                            podUid:
+                              type: string
+                          required:
+                            - podName
+                            - podUid
+                          type: object
                         type: array
                     required:
                       - name
@@ -2135,12 +2156,12 @@ spec:
                   type: array
                 blockedReason:
                   enum:
+                    - NodeNotFound
+                    - NodeIncarnationChanged
                     - BlockedByQuorum
                     - NoEligibleTarget
                     - SwitchoverFailed
                     - DeadlineExceeded
-                    - NodeNotFound
-                    - NodeIncarnationChanged
                     - ConflictingOperation
                     - ApplicationCloseIncomplete
                     - null
@@ -2167,10 +2188,21 @@ spec:
                       - type
                     type: object
                   type: array
+                discoveryCompletedAt:
+                  nullable: true
+                  type: string
                 message:
                   nullable: true
                   type: string
                 nodeUid:
+                  nullable: true
+                  type: string
+                observedDesiredState:
+                  enum:
+                    - Prepare
+                    - Complete
+                    - Cancel
+                    - null
                   nullable: true
                   type: string
                 observedGeneration:
@@ -2178,18 +2210,16 @@ spec:
                   nullable: true
                   type: integer
                 phase:
-                  default: Requested
+                  default: Pending
                   enum:
-                    - Requested
+                    - Pending
                     - Preparing
                     - Prepared
-                    - Draining
-                    - Executing
-                    - Restoring
-                    - Completed
                     - Blocked
                     - Failed
                     - Expired
+                    - Releasing
+                    - Released
                   type: string
                 preparedAt:
                   nullable: true
@@ -2226,10 +2256,13 @@ rules:
   verbs: ["update"]
 - apiGroups: ["kuberic.io"]
   resources: ["nodemaintenancerequests"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["kuberic.io"]
   resources: ["nodemaintenancerequests/status"]
   verbs: ["get", "update", "patch"]
+- apiGroups: ["kuberic.io"]
+  resources: ["nodemaintenancerequests/finalizers"]
+  verbs: ["update"]
 - apiGroups: [""]
   resources: ["nodes"]
   verbs: ["get", "list", "watch"]

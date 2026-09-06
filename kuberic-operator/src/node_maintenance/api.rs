@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::crd::StatusCondition;
 
 pub const PREPARED_CONDITION_TYPE: &str = "KubericPrepared";
+pub const FINALIZER: &str = "kuberic.io/node-maintenance";
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[kube(
@@ -17,6 +18,7 @@ pub const PREPARED_CONDITION_TYPE: &str = "KubericPrepared";
     status = "NodeMaintenanceRequestStatus",
     printcolumn = r#"{"name":"Node","type":"string","jsonPath":".spec.nodeName"}"#,
     printcolumn = r#"{"name":"Operation","type":"string","jsonPath":".spec.operation"}"#,
+    printcolumn = r#"{"name":"Desired","type":"string","jsonPath":".spec.desiredState"}"#,
     printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
     printcolumn = r#"{"name":"Deadline","type":"string","jsonPath":".spec.deadline"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
@@ -27,6 +29,9 @@ pub struct NodeMaintenanceRequestSpec {
 
     #[serde(default)]
     pub operation: MaintenanceOperation,
+
+    #[serde(default)]
+    pub desired_state: MaintenanceDesiredState,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
@@ -51,7 +56,13 @@ pub struct NodeMaintenanceRequestStatus {
     pub observed_generation: Option<i64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_desired_state: Option<MaintenanceDesiredState>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub node_uid: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_completed_at: Option<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub affected_sets: Vec<AffectedKubericSetStatus>,
@@ -77,7 +88,7 @@ pub struct AffectedKubericSetStatus {
     pub name: String,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub replicas: Vec<String>,
+    pub replicas: Vec<AffectedReplicaStatus>,
 
     #[serde(default)]
     pub hosts_primary: bool,
@@ -87,6 +98,17 @@ pub struct AffectedKubericSetStatus {
 
     #[serde(default)]
     pub quorum_without_node: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AffectedReplicaStatus {
+    pub pod_name: String,
+
+    pub pod_uid: String,
+
+    #[serde(default)]
+    pub is_primary: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
@@ -106,27 +128,39 @@ impl MaintenanceOperation {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
+pub enum MaintenanceDesiredState {
+    #[default]
+    Prepare,
+    Complete,
+    Cancel,
+}
+
+impl MaintenanceDesiredState {
+    pub fn releases_request(self) -> bool {
+        matches!(self, Self::Complete | Self::Cancel)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
 pub enum MaintenancePhase {
     #[default]
-    Requested,
+    Pending,
     Preparing,
     Prepared,
-    Draining,
-    Executing,
-    Restoring,
-    Completed,
     Blocked,
     Failed,
     Expired,
+    Releasing,
+    Released,
 }
 
 impl MaintenancePhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Expired)
+        matches!(self, Self::Failed | Self::Expired | Self::Released)
     }
 
     pub fn is_safe_to_drain(self) -> bool {
-        matches!(self, Self::Prepared | Self::Draining | Self::Executing)
+        matches!(self, Self::Prepared)
     }
 
     pub fn requires_reason(self) -> bool {
@@ -138,35 +172,36 @@ impl MaintenancePhase {
             return !self.is_terminal();
         }
         match self {
-            Self::Requested => matches!(
+            Self::Pending => matches!(
                 next,
-                Self::Preparing | Self::Blocked | Self::Failed | Self::Expired
+                Self::Preparing | Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
             ),
             Self::Preparing => matches!(
                 next,
-                Self::Prepared | Self::Blocked | Self::Failed | Self::Expired
+                Self::Prepared | Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
             ),
             Self::Prepared => matches!(
                 next,
-                Self::Draining | Self::Blocked | Self::Failed | Self::Expired
+                Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
             ),
-            Self::Draining => matches!(next, Self::Executing | Self::Failed | Self::Expired),
-            Self::Executing => matches!(next, Self::Restoring | Self::Failed),
-            Self::Restoring => matches!(next, Self::Completed | Self::Failed),
-            Self::Blocked => matches!(next, Self::Preparing | Self::Failed | Self::Expired),
-            Self::Completed | Self::Failed | Self::Expired => false,
+            Self::Blocked => matches!(
+                next,
+                Self::Preparing | Self::Failed | Self::Expired | Self::Releasing
+            ),
+            Self::Releasing => matches!(next, Self::Released | Self::Failed),
+            Self::Failed | Self::Expired | Self::Released => false,
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
 pub enum MaintenanceBlockedReason {
+    NodeNotFound,
+    NodeIncarnationChanged,
     BlockedByQuorum,
     NoEligibleTarget,
     SwitchoverFailed,
     DeadlineExceeded,
-    NodeNotFound,
-    NodeIncarnationChanged,
     ConflictingOperation,
     ApplicationCloseIncomplete,
 }
@@ -214,91 +249,73 @@ impl PreparationChecks {
     }
 }
 
-pub fn evaluate_preparation(
-    checks: &PreparationChecks,
-    deadline_exceeded: bool,
-) -> (MaintenancePhase, Option<MaintenanceBlockedReason>) {
-    if checks.satisfied() {
-        return (MaintenancePhase::Prepared, None);
-    }
-    if deadline_exceeded {
-        return (
-            MaintenancePhase::Expired,
-            Some(MaintenanceBlockedReason::DeadlineExceeded),
-        );
-    }
-    let reason = if !checks.quorum_without_node {
-        MaintenanceBlockedReason::BlockedByQuorum
-    } else if !checks.primary_serving_elsewhere || !checks.no_primary_on_node {
-        MaintenanceBlockedReason::NoEligibleTarget
-    } else if !checks.switchovers_committed {
-        MaintenanceBlockedReason::SwitchoverFailed
-    } else if !checks.application_close_completed {
-        MaintenanceBlockedReason::ApplicationCloseIncomplete
-    } else {
-        MaintenanceBlockedReason::NoEligibleTarget
-    };
-    (MaintenancePhase::Blocked, Some(reason))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use kube::CustomResourceExt;
 
-    fn all_phases() -> [MaintenancePhase; 10] {
+    fn all_phases() -> [MaintenancePhase; 8] {
         [
-            MaintenancePhase::Requested,
+            MaintenancePhase::Pending,
             MaintenancePhase::Preparing,
             MaintenancePhase::Prepared,
-            MaintenancePhase::Draining,
-            MaintenancePhase::Executing,
-            MaintenancePhase::Restoring,
-            MaintenancePhase::Completed,
             MaintenancePhase::Blocked,
             MaintenancePhase::Failed,
             MaintenancePhase::Expired,
+            MaintenancePhase::Releasing,
+            MaintenancePhase::Released,
         ]
     }
 
-    fn satisfied_checks() -> PreparationChecks {
-        PreparationChecks {
-            replicas_discovered: true,
-            no_primary_on_node: true,
-            switchovers_committed: true,
-            primary_serving_elsewhere: true,
-            quorum_without_node: true,
-            node_excluded_from_placement: true,
-            application_close_completed: true,
-        }
-    }
-
     #[test]
-    fn default_phase_is_requested() {
-        assert_eq!(MaintenancePhase::default(), MaintenancePhase::Requested);
+    fn defaults_are_pending_and_prepare() {
+        assert_eq!(MaintenancePhase::default(), MaintenancePhase::Pending);
+        assert_eq!(
+            MaintenanceDesiredState::default(),
+            MaintenanceDesiredState::Prepare
+        );
         assert_eq!(
             NodeMaintenanceRequestStatus::default().phase,
-            MaintenancePhase::Requested
+            MaintenancePhase::Pending
         );
     }
 
     #[test]
-    fn happy_path_transitions_are_allowed() {
-        let path = [
-            MaintenancePhase::Requested,
+    fn externally_owned_activity_is_not_a_kuberic_phase() {
+        let generated = serde_json::to_string(&NodeMaintenanceRequest::crd()).unwrap();
+        for external in ["\"Draining\"", "\"Executing\"", "\"Restoring\""] {
+            assert!(
+                !generated.contains(external),
+                "{external} is owned by the maintenance coordinator and must not be a status phase"
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_path_transitions_are_allowed() {
+        assert!(MaintenancePhase::Pending.can_transition_to(MaintenancePhase::Preparing));
+        assert!(MaintenancePhase::Preparing.can_transition_to(MaintenancePhase::Prepared));
+        assert!(MaintenancePhase::Prepared.can_transition_to(MaintenancePhase::Releasing));
+        assert!(MaintenancePhase::Releasing.can_transition_to(MaintenancePhase::Released));
+    }
+
+    #[test]
+    fn preparation_cannot_be_skipped() {
+        assert!(!MaintenancePhase::Pending.can_transition_to(MaintenancePhase::Prepared));
+        assert!(!MaintenancePhase::Blocked.can_transition_to(MaintenancePhase::Prepared));
+    }
+
+    #[test]
+    fn release_can_be_requested_from_any_active_phase() {
+        for phase in [
+            MaintenancePhase::Pending,
             MaintenancePhase::Preparing,
             MaintenancePhase::Prepared,
-            MaintenancePhase::Draining,
-            MaintenancePhase::Executing,
-            MaintenancePhase::Restoring,
-            MaintenancePhase::Completed,
-        ];
-        for pair in path.windows(2) {
+            MaintenancePhase::Blocked,
+        ] {
             assert!(
-                pair[0].can_transition_to(pair[1]),
-                "{:?} -> {:?} must be allowed",
-                pair[0],
-                pair[1]
+                phase.can_transition_to(MaintenancePhase::Releasing),
+                "{phase:?} must be releasable"
             );
         }
     }
@@ -306,9 +323,9 @@ mod tests {
     #[test]
     fn terminal_phases_accept_no_transition() {
         for terminal in [
-            MaintenancePhase::Completed,
             MaintenancePhase::Failed,
             MaintenancePhase::Expired,
+            MaintenancePhase::Released,
         ] {
             assert!(terminal.is_terminal());
             for next in all_phases() {
@@ -321,36 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn preparation_cannot_be_skipped() {
-        assert!(!MaintenancePhase::Requested.can_transition_to(MaintenancePhase::Prepared));
-        assert!(!MaintenancePhase::Requested.can_transition_to(MaintenancePhase::Draining));
-        assert!(!MaintenancePhase::Preparing.can_transition_to(MaintenancePhase::Draining));
-        assert!(!MaintenancePhase::Preparing.can_transition_to(MaintenancePhase::Executing));
-    }
-
-    #[test]
-    fn blocked_can_retry_preparation_but_not_jump_to_prepared() {
-        assert!(MaintenancePhase::Blocked.can_transition_to(MaintenancePhase::Preparing));
-        assert!(!MaintenancePhase::Blocked.can_transition_to(MaintenancePhase::Prepared));
-        assert!(!MaintenancePhase::Blocked.can_transition_to(MaintenancePhase::Draining));
-    }
-
-    #[test]
-    fn prepared_can_be_revoked_when_safety_is_lost() {
-        assert!(MaintenancePhase::Prepared.can_transition_to(MaintenancePhase::Blocked));
-        assert!(MaintenancePhase::Prepared.can_transition_to(MaintenancePhase::Failed));
-    }
-
-    #[test]
-    fn only_prepared_states_are_safe_to_drain() {
+    fn only_prepared_is_safe_to_drain() {
         for phase in all_phases() {
-            let expected = matches!(
-                phase,
-                MaintenancePhase::Prepared
-                    | MaintenancePhase::Draining
-                    | MaintenancePhase::Executing
+            assert_eq!(
+                phase.is_safe_to_drain(),
+                phase == MaintenancePhase::Prepared,
+                "{phase:?}"
             );
-            assert_eq!(phase.is_safe_to_drain(), expected, "{phase:?}");
         }
     }
 
@@ -366,15 +360,35 @@ mod tests {
     }
 
     #[test]
-    fn satisfied_checks_report_no_unmet_conditions() {
-        let checks = satisfied_checks();
-        assert!(checks.satisfied());
-        assert!(checks.unmet().is_empty());
+    fn completion_and_cancellation_release_the_request() {
+        assert!(MaintenanceDesiredState::Complete.releases_request());
+        assert!(MaintenanceDesiredState::Cancel.releases_request());
+        assert!(!MaintenanceDesiredState::Prepare.releases_request());
+    }
+
+    #[test]
+    fn reimage_and_replace_discard_local_state() {
+        assert!(MaintenanceOperation::Reimage.discards_local_state());
+        assert!(MaintenanceOperation::Replace.discards_local_state());
+        assert!(!MaintenanceOperation::Reboot.discards_local_state());
+        assert!(!MaintenanceOperation::OsUpgrade.discards_local_state());
+        assert!(!MaintenanceOperation::Shutdown.discards_local_state());
     }
 
     #[test]
     fn every_safety_condition_blocks_preparation_on_its_own() {
         type BreakCheck = (&'static str, fn(&mut PreparationChecks));
+        let all = PreparationChecks {
+            replicas_discovered: true,
+            no_primary_on_node: true,
+            switchovers_committed: true,
+            primary_serving_elsewhere: true,
+            quorum_without_node: true,
+            node_excluded_from_placement: true,
+            application_close_completed: true,
+        };
+        assert!(all.satisfied());
+
         let fields: [BreakCheck; 7] = [
             ("replicasDiscovered", |c| c.replicas_discovered = false),
             ("noPrimaryOnNode", |c| c.no_primary_on_node = false),
@@ -391,83 +405,52 @@ mod tests {
             }),
         ];
         for (name, break_one) in fields {
-            let mut checks = satisfied_checks();
+            let mut checks = all;
             break_one(&mut checks);
             assert!(!checks.satisfied(), "{name} must block preparation");
             assert!(checks.unmet().contains(&name), "{name} must be reported");
-            let (phase, reason) = evaluate_preparation(&checks, false);
-            assert_ne!(phase, MaintenancePhase::Prepared, "{name}");
-            assert!(reason.is_some(), "{name} must produce a structured reason");
         }
     }
 
     #[test]
-    fn preparation_fails_closed_on_deadline() {
-        let mut checks = satisfied_checks();
-        checks.quorum_without_node = false;
-        let (phase, reason) = evaluate_preparation(&checks, true);
-        assert_eq!(phase, MaintenancePhase::Expired);
-        assert_eq!(reason, Some(MaintenanceBlockedReason::DeadlineExceeded));
-    }
-
-    #[test]
-    fn deadline_does_not_override_a_satisfied_preparation() {
-        let (phase, reason) = evaluate_preparation(&satisfied_checks(), true);
-        assert_eq!(phase, MaintenancePhase::Prepared);
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn quorum_loss_is_reported_before_other_reasons() {
-        let mut checks = satisfied_checks();
-        checks.quorum_without_node = false;
-        checks.switchovers_committed = false;
-        let (_, reason) = evaluate_preparation(&checks, false);
-        assert_eq!(reason, Some(MaintenanceBlockedReason::BlockedByQuorum));
-    }
-
-    #[test]
-    fn reimage_and_replace_discard_local_state() {
-        assert!(MaintenanceOperation::Reimage.discards_local_state());
-        assert!(MaintenanceOperation::Replace.discards_local_state());
-        assert!(!MaintenanceOperation::Reboot.discards_local_state());
-        assert!(!MaintenanceOperation::OsUpgrade.discards_local_state());
-        assert!(!MaintenanceOperation::Shutdown.discards_local_state());
-    }
-
-    #[test]
-    fn phase_and_operation_serialize_as_pascal_case() {
-        let phase = serde_json::to_string(&MaintenancePhase::Prepared).unwrap();
-        assert_eq!(phase, "\"Prepared\"");
-        let operation = serde_json::to_string(&MaintenanceOperation::OsUpgrade).unwrap();
-        assert_eq!(operation, "\"OsUpgrade\"");
-        let reason = serde_json::to_string(&MaintenanceBlockedReason::BlockedByQuorum).unwrap();
-        assert_eq!(reason, "\"BlockedByQuorum\"");
+    fn enums_serialize_as_pascal_case() {
+        assert_eq!(
+            serde_json::to_string(&MaintenancePhase::Prepared).unwrap(),
+            "\"Prepared\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MaintenanceDesiredState::Cancel).unwrap(),
+            "\"Cancel\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MaintenanceOperation::OsUpgrade).unwrap(),
+            "\"OsUpgrade\""
+        );
     }
 
     #[test]
     fn spec_round_trips_through_camel_case_json() {
         let spec = NodeMaintenanceRequestSpec {
-            node_name: "aks-nodepool1-0".to_string(),
+            node_name: "worker-node-04".to_string(),
             operation: MaintenanceOperation::Reboot,
-            provider: Some("AzureScheduledEvents".to_string()),
-            provider_event_id: Some("abc-123".to_string()),
-            not_before: Some("2026-01-01T00:00:00Z".to_string()),
-            deadline: Some("2026-01-01T01:00:00Z".to_string()),
+            desired_state: MaintenanceDesiredState::Prepare,
+            provider: Some("Manual".to_string()),
+            provider_event_id: Some("event-123".to_string()),
+            not_before: Some("2026-09-06T20:00:00Z".to_string()),
+            deadline: Some("2026-09-06T21:00:00Z".to_string()),
         };
         let json = serde_json::to_value(&spec).unwrap();
-        assert_eq!(json["nodeName"], "aks-nodepool1-0");
-        assert_eq!(json["providerEventId"], "abc-123");
-        assert_eq!(json["notBefore"], "2026-01-01T00:00:00Z");
+        assert_eq!(json["nodeName"], "worker-node-04");
+        assert_eq!(json["desiredState"], "Prepare");
+        assert_eq!(json["providerEventId"], "event-123");
         let decoded: NodeMaintenanceRequestSpec = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, spec);
     }
 
     #[test]
-    fn crd_is_cluster_scoped_and_exposes_safety_fields() {
+    fn crd_is_cluster_scoped_and_exposes_identity_fields() {
         let crd = serde_json::to_value(NodeMaintenanceRequest::crd()).unwrap();
         assert_eq!(crd["spec"]["scope"], "Cluster");
-        assert_eq!(crd["spec"]["names"]["kind"], "NodeMaintenanceRequest");
         assert_eq!(
             crd["metadata"]["name"],
             "nodemaintenancerequests.kuberic.io"
@@ -476,17 +459,18 @@ mod tests {
         let generated = serde_json::to_string(&crd).unwrap();
         for required in [
             "nodeName",
+            "desiredState",
             "providerEventId",
             "notBefore",
             "deadline",
-            "blockedReason",
-            "affectedSets",
-            "quorumWithoutNode",
-            "hostsPrimary",
-            "primaryMoved",
-            "preparedAt",
-            "observedGeneration",
             "nodeUid",
+            "observedGeneration",
+            "observedDesiredState",
+            "discoveryCompletedAt",
+            "affectedSets",
+            "podUid",
+            "isPrimary",
+            "blockedReason",
         ] {
             assert!(
                 generated.contains(required),
@@ -496,19 +480,22 @@ mod tests {
     }
 
     #[test]
-    fn deployment_manifest_installs_the_maintenance_crd_and_node_access() {
-        let deployment = include_str!("../deploy/deployment.yaml");
-        for required in [
-            "nodemaintenancerequests.kuberic.io",
-            "nodemaintenancerequests",
-            "nodemaintenancerequests/status",
-            "NodeMaintenanceRequest",
-            "v1alpha1",
-            "nodes",
-        ] {
+    fn deployment_grants_consume_only_access() {
+        let deployment = include_str!("../../deploy/deployment.yaml");
+        assert!(deployment.contains("nodemaintenancerequests.kuberic.io"));
+        assert!(deployment.contains("nodemaintenancerequests/status"));
+        assert!(deployment.contains("nodemaintenancerequests/finalizers"));
+        assert!(deployment.contains("nodes"));
+
+        let rules = deployment
+            .split("resources: [\"nodemaintenancerequests\"]")
+            .nth(1)
+            .expect("nodemaintenancerequests rule");
+        let verbs = rules.lines().nth(1).unwrap_or_default();
+        for forbidden in ["create", "delete"] {
             assert!(
-                deployment.contains(required),
-                "deployment.yaml missing {required}"
+                !verbs.contains(forbidden),
+                "operator must not {forbidden} requests owned by the coordinator: {verbs}"
             );
         }
     }
