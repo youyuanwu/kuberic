@@ -39,8 +39,9 @@ use crate::durable::pilot::DurableSwitchoverPilotRuntime;
 #[cfg(feature = "durable-switchover-pilot")]
 use crate::durable::pilot::{
     DurableSwitchoverPilotTerminal, DurableSwitchoverStepResult, DurableSwitchoverWorkflow,
-    PilotAdapterDecision, PilotPermitGuard, decode_terminal, encode_step_result,
-    evaluate_adapter_step, execution_spec, initial_operation, new_pilot_reference,
+    PilotAdapterDecision, PilotPermitGuard, encode_step_result, evaluate_adapter_step,
+    execution_spec, initial_operation, new_pilot_reference, validate_loaded_terminal,
+    validate_pilot_admission,
 };
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
@@ -704,7 +705,7 @@ fn quarantine_result_is_authoritative(
 ) -> bool {
     match result {
         DurableSwitchoverStepResult::Complete { .. } => operation.pending_action.is_none(),
-        DurableSwitchoverStepResult::Stopped { .. } => false,
+        DurableSwitchoverStepResult::Stopped { .. } => operation.pending_action.is_none(),
         DurableSwitchoverStepResult::ProvenNoAdmission { .. } => true,
         DurableSwitchoverStepResult::Advance { operation: next } => {
             if next.phase == DurableOperationPhase::Poisoned {
@@ -872,21 +873,14 @@ pub async fn reconcile_set(
                     && status.operation.is_none()
                     && status.durable_switchover_pilot.is_some()
             }) {
-                let mut status = set.status.clone().unwrap_or_default();
-                set_pilot_condition(
-                    &mut status,
+                record_pilot_wait_condition(
+                    set,
+                    api,
                     "ObservationUnavailable",
                     &format!("pod observation failed: {error}"),
                     unix_seconds(),
-                );
-                let _ = api
-                    .patch_set_status(
-                        &namespace,
-                        &name,
-                        &status,
-                        set.metadata.resource_version.as_deref(),
-                    )
-                    .await;
+                )
+                .await;
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
             return Err(error);
@@ -2004,16 +1998,7 @@ pub async fn reconcile_set(
                     Ok(action) => Ok(action),
                     Err(error) => {
                         warn!(name, error, "durable switchover pilot reconcile blocked");
-                        let now = unix_seconds();
-                        let mut status = set.status.clone().unwrap_or_default();
-                        set_pilot_condition(&mut status, "Blocked", &error, now);
-                        let _ = api
-                            .patch_set_status(
-                                &namespace,
-                                &name,
-                                &status,
-                                set.metadata.resource_version.as_deref(),
-                            )
+                        record_pilot_wait_condition(set, api, "Blocked", &error, unix_seconds())
                             .await;
                         Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
                     }
@@ -3067,7 +3052,7 @@ async fn reconcile_durable_switchover_pilot(
         .load(execution.execution_id())
         .await
         .map_err(|error| format!("load durable switchover checkpoint: {error}"))?;
-    if let Some(terminal) = loaded_pilot_terminal(loaded.as_ref(), &execution)? {
+    if let Some(terminal) = loaded_pilot_terminal(reference, loaded.as_ref(), &execution)? {
         return publish_pilot_terminal(set, api, state, terminal, unix_seconds()).await;
     }
     let operation = current_pilot_operation(reference, &execution, loaded.as_ref())?;
@@ -3226,7 +3211,7 @@ async fn reconcile_durable_switchover_pilot(
             Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
         }
         HostOutcome::WorkflowCompleted { outcome, .. } => {
-            let terminal = decode_terminal(&outcome)?;
+            let terminal = validate_loaded_terminal(reference, &outcome)?;
             drop(host);
             publish_pilot_terminal(set, api, state, terminal, now).await
         }
@@ -3290,18 +3275,25 @@ async fn record_pilot_wait_condition(
     message: &str,
     now: i64,
 ) {
+    let normalized_message: String = message.chars().take(512).collect();
+    let desired_status = if matches!(reason, "Completed" | "CompensatedOrSafeFailure") {
+        "False"
+    } else {
+        "True"
+    };
     let unchanged = set.status.as_ref().is_some_and(|status| {
         status.conditions.iter().any(|condition| {
             condition.type_ == "DurableSwitchoverPilot"
                 && condition.reason == reason
-                && condition.message == message
+                && condition.status == desired_status
+                && condition.message == normalized_message
         })
     });
     if unchanged {
         return;
     }
     let mut status = set.status.clone().unwrap_or_default();
-    set_pilot_condition(&mut status, reason, message, now);
+    set_pilot_condition(&mut status, reason, &normalized_message, now);
     let _ = api
         .patch_set_status(
             &set.namespace().unwrap_or_default(),
@@ -3314,6 +3306,7 @@ async fn record_pilot_wait_condition(
 
 #[cfg(feature = "durable-switchover-pilot")]
 fn loaded_pilot_terminal(
+    reference: &crate::crd::DurableSwitchoverPilotStatus,
     loaded: Option<&kuberic_durable_execution::StoredCheckpoint>,
     execution: &kuberic_durable_execution::ExecutionSpec,
 ) -> Result<Option<DurableSwitchoverPilotTerminal>, String> {
@@ -3324,11 +3317,10 @@ fn loaded_pilot_terminal(
         .checkpoint()
         .decode_and_validate(execution, crate::durable::pilot::checkpoint_limits())
         .map_err(|error| format!("decode durable switchover checkpoint: {error}"))?;
-    payload
-        .terminal_outcome()
-        .map(|(outcome, _)| decode_terminal(outcome).map(Some))
-        .transpose()
-        .map(Option::flatten)
+    match payload.terminal_outcome() {
+        Some((outcome, _)) => validate_loaded_terminal(reference, outcome).map(Some),
+        None => Ok(None),
+    }
 }
 
 #[cfg(feature = "durable-switchover-pilot")]
@@ -3512,7 +3504,7 @@ fn current_pilot_operation(
     let Some(last) = activities.last() else {
         return initial_operation(reference);
     };
-    match last.state() {
+    let operation = match last.state() {
         ActivityState::Scheduled | ActivityState::DispatchExposed { .. } => {
             serde_json::from_slice(last.input().as_slice())
                 .map_err(|error| format!("decode current durable switchover activity: {error}"))
@@ -3529,7 +3521,9 @@ fn current_pilot_operation(
                 | DurableSwitchoverStepResult::Stopped { operation, .. } => operation,
             })
         }
-    }
+    }?;
+    validate_pilot_admission(&operation)?;
+    Ok(operation)
 }
 
 #[cfg(feature = "durable-switchover-pilot")]

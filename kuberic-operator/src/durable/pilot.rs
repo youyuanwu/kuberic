@@ -413,6 +413,45 @@ pub fn decode_terminal(
         .map_err(|error| format!("decode durable switchover terminal outcome: {error}"))
 }
 
+pub fn validate_loaded_terminal(
+    reference: &DurableSwitchoverPilotStatus,
+    outcome: &TerminalOutcome,
+) -> Result<DurableSwitchoverPilotTerminal, String> {
+    let initial = initial_operation(reference)?;
+    validate_pilot_admission(&initial)?;
+    let terminal = decode_terminal(outcome)?;
+    match (outcome, &terminal) {
+        (
+            TerminalOutcome::Succeeded(_),
+            DurableSwitchoverPilotTerminal::Complete {
+                operation,
+                snapshot,
+                compensated,
+            },
+        ) => {
+            validate_transition(&initial, operation)?;
+            validate_terminal(operation, snapshot, *compensated)?;
+        }
+        (
+            TerminalOutcome::Failed(_),
+            DurableSwitchoverPilotTerminal::Stopped {
+                operation: Some(operation),
+                ..
+            },
+        ) => {
+            validate_transition(&initial, operation)?;
+        }
+        (TerminalOutcome::Failed(_), DurableSwitchoverPilotTerminal::Stopped { .. }) => {}
+        _ => {
+            return Err(
+                "kernel terminal outcome kind does not match durable switchover payload"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(terminal)
+}
+
 pub enum PilotAdapterDecision {
     Observe(DurableSwitchoverStepResult),
     AwaitEvidence,
@@ -425,6 +464,18 @@ pub fn evaluate_adapter_step(
     now: i64,
 ) -> Result<PilotAdapterDecision, String> {
     Ok(match decide(operation, observations, now)? {
+        Decision::Persist(operation)
+            if operation.phase == crate::crd::DurableOperationPhase::Poisoned =>
+        {
+            let message = operation
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "durable switchover entered poisoned state".to_string());
+            PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Stopped {
+                operation,
+                message,
+            })
+        }
         Decision::Persist(operation) => {
             PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance { operation })
         }
@@ -1582,6 +1633,22 @@ mod durable_switchover_pilot_tests {
         ));
     }
 
+    #[test]
+    fn adapter_turns_effect_free_poison_into_stopped_result() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance {
+            operation: pending,
+        }) = evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected persisted revoke intent");
+        };
+        assert!(matches!(
+            evaluate_adapter_step(&pending, &OperationObservations::new(), 1_000).unwrap(),
+            PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Stopped { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn proven_no_admission_redelivery_is_bounded_per_action() {
         let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
@@ -1757,6 +1824,50 @@ mod durable_switchover_pilot_tests {
     }
 
     #[test]
+    fn loaded_terminal_revalidates_identity_topology_and_outcome_kind() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut operation = initial_operation(&reference).unwrap();
+        operation.phase = crate::crd::DurableOperationPhase::Completed;
+        let valid = DurableSwitchoverPilotTerminal::Complete {
+            snapshot: operation.target_snapshot.clone(),
+            operation: operation.clone(),
+            compensated: false,
+        };
+        let success = TerminalOutcome::succeeded(encode_terminal(&valid).unwrap());
+        assert_eq!(
+            validate_loaded_terminal(&reference, &success).unwrap(),
+            valid
+        );
+
+        let failed_kind = TerminalOutcome::failed(encode_terminal(&valid).unwrap());
+        assert!(validate_loaded_terminal(&reference, &failed_kind).is_err());
+
+        let mut wrong_identity = operation.clone();
+        wrong_identity.operation_id.push_str("-other");
+        let wrong_identity = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                snapshot: wrong_identity.target_snapshot.clone(),
+                operation: wrong_identity,
+                compensated: false,
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &wrong_identity).is_err());
+
+        let mut wrong_snapshot = operation.target_snapshot.clone();
+        wrong_snapshot.primary_id = operation.old_primary_id;
+        let wrong_snapshot = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                operation,
+                snapshot: wrong_snapshot,
+                compensated: false,
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &wrong_snapshot).is_err());
+    }
+
+    #[test]
     fn transition_and_terminal_validation_rejects_shortcuts() {
         let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let initial = initial_operation(&reference).unwrap();
@@ -1913,6 +2024,87 @@ mod durable_switchover_pilot_tests {
                 matches!(
                     recovered,
                     kuberic_durable_execution::HostOutcome::Quarantined { .. }
+                ),
+                !applied
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exposure_faults_reload_without_false_permits() {
+        use kuberic_durable_execution::{PersistenceBoundary, StoreOperation};
+
+        for (fault, applied) in [
+            (
+                kuberic_durable_execution::InMemoryFault::ConflictWithoutApply,
+                false,
+            ),
+            (
+                kuberic_durable_execution::InMemoryFault::OutcomeUnknownWithoutApply,
+                false,
+            ),
+            (
+                kuberic_durable_execution::InMemoryFault::OutcomeUnknownAfterApply,
+                true,
+            ),
+            (
+                kuberic_durable_execution::InMemoryFault::FailBeforeRequest(
+                    kuberic_durable_execution::StoreErrorKind::Unavailable,
+                ),
+                false,
+            ),
+        ] {
+            let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+            let execution = execution_spec(&reference).unwrap();
+            let backend = InMemoryCheckpointStore::new();
+            let mut host = DurableHost::new(
+                MeasuredPilotCheckpointStore::new(
+                    execution.execution_id(),
+                    PilotCheckpointStore::InMemory(backend.clone()),
+                ),
+                HostEpoch::from_bytes([20; 16]),
+                checkpoint_limits(),
+            );
+            assert!(matches!(
+                host.turn(&DurableSwitchoverWorkflow, execution.clone())
+                    .await,
+                kuberic_durable_execution::HostOutcome::ScheduleAccepted { .. }
+            ));
+            backend.fail_next_compare_and_swap(fault);
+            let exposure = host
+                .turn(&DurableSwitchoverWorkflow, execution.clone())
+                .await;
+            assert!(matches!(
+                exposure,
+                kuberic_durable_execution::HostOutcome::ReloadRequired {
+                    boundary: PersistenceBoundary::Exposure,
+                    ..
+                } | kuberic_durable_execution::HostOutcome::StoreFailed {
+                    operation: StoreOperation::CompareAndSwap(PersistenceBoundary::Exposure),
+                    ..
+                }
+            ));
+
+            let mut restarted = DurableHost::new(
+                MeasuredPilotCheckpointStore::new(
+                    execution.execution_id(),
+                    PilotCheckpointStore::InMemory(backend),
+                ),
+                HostEpoch::from_bytes([21; 16]),
+                checkpoint_limits(),
+            );
+            let recovered = restarted.turn(&DurableSwitchoverWorkflow, execution).await;
+            assert_eq!(
+                matches!(
+                    recovered,
+                    kuberic_durable_execution::HostOutcome::Quarantined { .. }
+                ),
+                applied
+            );
+            assert_eq!(
+                matches!(
+                    recovered,
+                    kuberic_durable_execution::HostOutcome::DispatchPermitted { .. }
                 ),
                 !applied
             );
