@@ -39,8 +39,11 @@ const MAX_EFFECT_DIAGNOSTIC_BYTES: usize = 512;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaEffectCommand {
     pub action_id: String,
+    pub action_signature: String,
     pub target_id: ReplicaId,
     pub target_instance_id: String,
+    pub expected_epoch: EpochStatus,
+    pub desired_postcondition: crate::crd::DurablePostconditionStatus,
     pub expected_agent_generation: String,
     pub expected_control_version: u64,
     pub observed_runtime_epoch: EpochStatus,
@@ -49,14 +52,17 @@ pub struct ReplicaEffectCommand {
 
 impl ReplicaEffectCommand {
     pub fn from_pending(pending: &PendingActionStatus) -> Result<Self, String> {
-        kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+        let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
             &pending.dispatch_action_payload,
         )
         .map_err(|error| format!("decode frozen correlated action: {error}"))?;
         Ok(Self {
             action_id: pending.action_id.clone(),
+            action_signature: action.signature(),
             target_id: pending.target_id,
             target_instance_id: pending.target_instance_id.clone(),
+            expected_epoch: pending.expected_epoch.clone(),
+            desired_postcondition: pending.desired_postcondition.clone(),
             expected_agent_generation: pending
                 .dispatch_agent_generation
                 .clone()
@@ -81,6 +87,40 @@ pub struct LabelEffectCommand {
     pub pod_name: String,
     pub expected_uid: String,
     pub role: String,
+    pub identity_signature: String,
+}
+
+impl LabelEffectCommand {
+    pub fn new(target_id: ReplicaId, pod_name: String, expected_uid: String, role: String) -> Self {
+        let identity_signature =
+            label_identity_signature(target_id, &pod_name, &expected_uid, &role);
+        Self {
+            target_id,
+            pod_name,
+            expected_uid,
+            role,
+            identity_signature,
+        }
+    }
+
+    pub fn has_valid_identity_signature(&self) -> bool {
+        self.identity_signature
+            == label_identity_signature(
+                self.target_id,
+                &self.pod_name,
+                &self.expected_uid,
+                &self.role,
+            )
+    }
+}
+
+fn label_identity_signature(
+    target_id: ReplicaId,
+    pod_name: &str,
+    expected_uid: &str,
+    role: &str,
+) -> String {
+    format!("{target_id}@{expected_uid}:{pod_name}:{role}")
 }
 
 /// Portable outcome vocabulary exposed by operator effect adapters.
@@ -132,6 +172,121 @@ pub(crate) enum DispatchEvidencePlan {
     Persist(Box<PendingActionStatus>),
     WaitForExactIncarnation,
     WaitForSupportedProtocol,
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PilotEffectPreparationError {
+    WaitForExactIncarnation,
+    WaitForSupportedProtocol,
+    InvalidCommand,
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+pub fn prepare_replica_effect_command(
+    pending: &PendingActionStatus,
+    observed: &ReplicaStatusInfo,
+    addressed_instance: &ReplicaInstanceId,
+    action: &DurableReplicaAction,
+) -> Result<(PendingActionStatus, ReplicaEffectCommand), PilotEffectPreparationError> {
+    let exact_incarnation = addressed_instance.as_str() == pending.target_instance_id
+        && observed.instance_id.as_str() == pending.target_instance_id;
+    if !exact_incarnation {
+        return Err(PilotEffectPreparationError::WaitForExactIncarnation);
+    }
+    if observed.agent.protocol_version
+        != kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION
+    {
+        return Err(PilotEffectPreparationError::WaitForSupportedProtocol);
+    }
+    let has_frozen_evidence = pending.dispatch_agent_generation.is_some()
+        || pending.dispatch_agent_control_version.is_some()
+        || pending.dispatch_observed_runtime_epoch.is_some()
+        || !pending.dispatch_action_payload.is_empty();
+    if has_frozen_evidence {
+        let command = ReplicaEffectCommand::from_pending(pending)
+            .map_err(|_| PilotEffectPreparationError::InvalidCommand)?;
+        let observed_epoch = EpochStatus {
+            data_loss_number: observed.epoch.data_loss_number,
+            configuration_number: observed.epoch.configuration_number,
+        };
+        if command.expected_agent_generation != observed.agent.generation.to_string()
+            || command.expected_control_version != observed.agent.control_version.value()
+            || command.observed_runtime_epoch != observed_epoch
+        {
+            return Err(PilotEffectPreparationError::WaitForExactIncarnation);
+        }
+        let decoded = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+            &command.action_payload,
+        )
+        .map_err(|_| PilotEffectPreparationError::InvalidCommand)?;
+        if decoded.signature() != action.signature() {
+            return Err(PilotEffectPreparationError::InvalidCommand);
+        }
+        return Ok((pending.clone(), command));
+    }
+    let planned = match plan_dispatch_evidence(pending, observed, addressed_instance, action, true)
+    {
+        DispatchEvidencePlan::Ready => pending.clone(),
+        DispatchEvidencePlan::Persist(planned) => *planned,
+        DispatchEvidencePlan::WaitForExactIncarnation => {
+            return Err(PilotEffectPreparationError::WaitForExactIncarnation);
+        }
+        DispatchEvidencePlan::WaitForSupportedProtocol => {
+            return Err(PilotEffectPreparationError::WaitForSupportedProtocol);
+        }
+    };
+    let command = ReplicaEffectCommand::from_pending(&planned)
+        .map_err(|_| PilotEffectPreparationError::InvalidCommand)?;
+    if command.action_id != pending.action_id
+        || command.target_id != pending.target_id
+        || command.target_instance_id != pending.target_instance_id
+        || command.action_payload.is_empty()
+    {
+        return Err(PilotEffectPreparationError::InvalidCommand);
+    }
+    let decoded = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+        &command.action_payload,
+    )
+    .map_err(|_| PilotEffectPreparationError::InvalidCommand)?;
+    if decoded.signature() != action.signature() {
+        return Err(PilotEffectPreparationError::InvalidCommand);
+    }
+    Ok((planned, command))
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+pub fn validate_pilot_replica_action_kind(
+    kind: crate::crd::DurableActionKind,
+    action: &DurableReplicaAction,
+) -> bool {
+    use crate::crd::DurableActionKind as Kind;
+    matches!(
+        (kind, action),
+        (Kind::RevokeWrite, DurableReplicaAction::RevokeWriteStatus)
+            | (
+                Kind::DemoteOldPrimary | Kind::PromoteTarget | Kind::CompensatePromoteOldPrimary,
+                DurableReplicaAction::ChangeRole { .. }
+            )
+            | (
+                Kind::UpdateSecondaryEpoch | Kind::CompensateUpdateSecondaryEpoch,
+                DurableReplicaAction::UpdateEpoch { .. }
+            )
+            | (
+                Kind::UpdateCatchUpConfiguration | Kind::CompensateCatchUpConfiguration,
+                DurableReplicaAction::UpdateCatchUpConfiguration { .. }
+            )
+            | (
+                Kind::WaitForCatchUpQuorum,
+                DurableReplicaAction::WaitForCatchUpQuorum { .. }
+            )
+            | (
+                Kind::UpdateCurrentConfiguration
+                    | Kind::RestorePreviousConfiguration
+                    | Kind::CompensateCurrentConfiguration,
+                DurableReplicaAction::UpdateCurrentConfiguration { .. }
+            )
+    )
 }
 
 pub(crate) fn plan_dispatch_evidence(
@@ -243,6 +398,11 @@ pub async fn execute_replica_command(
         &command.action_payload,
     )
     .map_err(|error| KubericError::Internal(error.into()))?;
+    if action.signature() != command.action_signature {
+        return Err(KubericError::Internal(
+            "persisted correlated action signature does not match its payload".into(),
+        ));
+    }
     execute_correlated_action(
         handle,
         &command.action_id,
@@ -257,6 +417,19 @@ pub async fn execute_replica_command(
         action,
     )
     .await
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+pub async fn execute_label_command(
+    api: &dyn ClusterApi,
+    namespace: &str,
+    command: &LabelEffectCommand,
+) {
+    let mut labels = BTreeMap::new();
+    labels.insert("kuberic.io/role".to_string(), command.role.clone());
+    let _ = api
+        .patch_pod_labels_if_uid(namespace, &command.pod_name, &command.expected_uid, labels)
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -396,116 +569,55 @@ pub enum PilotEffectBridgeOutcome {
 }
 
 #[cfg(feature = "durable-switchover-pilot")]
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_pilot_permitted_step(
     guard: &mut PilotPermitGuard,
     operation: &DurableOperationStatus,
-    decision: PilotAdapterDecision,
+    prepared: &super::pilot::PilotActivityKind,
+    accepted_activity: &kuberic_durable_execution::LogicalActivityId,
+    accepted_attempt: kuberic_durable_execution::AttemptId,
     observations: &OperationObservations,
     handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
     api: &dyn ClusterApi,
     namespace: &str,
 ) -> Result<PilotEffectBridgeOutcome, String> {
-    let _permit = guard.consume_for(operation)?;
-    let decision = match decision {
-        PilotAdapterDecision::Observe(result) => {
-            return Ok(PilotEffectBridgeOutcome::Observe(result));
+    let _permit = guard.consume_for(operation, prepared, accepted_activity, accepted_attempt)?;
+    match prepared {
+        super::pilot::PilotActivityKind::PassiveObservation => {
+            Err("passive pilot observation unexpectedly reached the effect bridge".to_string())
         }
-        PilotAdapterDecision::AwaitEvidence => {
-            return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
-        }
-        PilotAdapterDecision::External(decision) => *decision,
-    };
-    match decision {
-        Decision::Execute {
-            target_id,
-            action_id,
-            action,
-        } => {
-            let pending = operation.pending_action.as_ref().ok_or_else(|| {
-                "pilot execution requested a replica effect without pending intent".to_string()
-            })?;
-            if pending.action_id != action_id {
-                return Err(
-                    "pilot replica effect does not match pending correlation identity".to_string(),
-                );
-            }
-            let Some(observed) = observations.get(&target_id) else {
+        super::pilot::PilotActivityKind::PreparedReplica { command } => {
+            let Some(handle) = handles.get(&command.target_id) else {
                 return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
             };
-            let Some(handle) = handles.get(&target_id) else {
+            if handle.instance_id().as_str() != command.target_instance_id {
                 return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
-            };
-            match plan_dispatch_evidence(
-                pending,
-                &observed.status,
-                &handle.instance_id(),
-                &action,
-                true,
-            ) {
-                DispatchEvidencePlan::Persist(planned) => {
-                    let mut next = operation.clone();
-                    next.pending_action = Some(*planned);
-                    return Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                        DurableSwitchoverStepResult::Advance {
-                            operation: DurableSwitchoverState::from_operation(&next),
-                        },
-                    )));
-                }
-                DispatchEvidencePlan::WaitForExactIncarnation
-                | DispatchEvidencePlan::WaitForSupportedProtocol => {
-                    return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
-                }
-                DispatchEvidencePlan::Ready => {}
             }
-            match execute_planned_control_action(handle.as_ref(), pending, None).await {
+            match execute_replica_command(handle.as_ref(), command).await {
                 Ok(()) => Ok(PilotEffectBridgeOutcome::Exposed),
-                Err(error) => match pilot_result_after_dispatch_error(operation, action_id, &error)
-                {
+                Err(error) => match pilot_result_after_dispatch_error(
+                    operation,
+                    command.action_id.clone(),
+                    &error,
+                ) {
                     Some(result) => Ok(PilotEffectBridgeOutcome::Observe(Box::new(result))),
                     None => Ok(PilotEffectBridgeOutcome::Exposed),
                 },
             }
         }
-        Decision::PatchPodRole { target_id, role } => {
-            let command = exact_label_command(operation, target_id, &role, observations)?;
-            let mut labels = BTreeMap::new();
-            labels.insert("kuberic.io/role".to_string(), command.role);
-            let _ = api
-                .patch_pod_labels_if_uid(
-                    namespace,
-                    &command.pod_name,
-                    &command.expected_uid,
-                    labels,
-                )
-                .await;
-            Ok(PilotEffectBridgeOutcome::Exposed)
-        }
-        Decision::PatchPodRoleExactUid {
-            target_id,
-            expected_uid,
-            role,
-        } => {
-            let command = exact_label_command(operation, target_id, &role, observations)?;
-            if command.expected_uid != expected_uid {
-                return Err(
-                    "pilot label command does not match shared switchover UID intent".to_string(),
-                );
+        super::pilot::PilotActivityKind::PreparedLabel { command } => {
+            if observations
+                .get(&command.target_id)
+                .is_some_and(|observed| {
+                    observed.status.instance_id.as_str() != command.expected_uid
+                        || observed.pod_name != command.pod_name
+                })
+            {
+                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
             }
-            let mut labels = BTreeMap::new();
-            labels.insert("kuberic.io/role".to_string(), command.role);
-            let _ = api
-                .patch_pod_labels_if_uid(
-                    namespace,
-                    &command.pod_name,
-                    &command.expected_uid,
-                    labels,
-                )
-                .await;
+            execute_label_command(api, namespace, command).await;
             Ok(PilotEffectBridgeOutcome::Exposed)
         }
-        other => Err(format!(
-            "unsupported external decision reached durable switchover pilot: {other:?}"
-        )),
     }
 }
 
@@ -727,12 +839,12 @@ pub(crate) fn exact_label_command(
             "pilot label target {target_id} incarnation changed before patch"
         ));
     }
-    Ok(LabelEffectCommand {
+    Ok(LabelEffectCommand::new(
         target_id,
-        pod_name: observed.pod_name.clone(),
+        observed.pod_name.clone(),
         expected_uid,
-        role: role.to_string(),
-    })
+        role.to_string(),
+    ))
 }
 
 fn bounded(value: &str) -> String {
@@ -743,6 +855,121 @@ fn bounded(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "durable-switchover-pilot")]
+    use kuberic_core::types::{
+        AccessStatus, ReplicaAgentStatus, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
+    };
+    #[cfg(feature = "durable-switchover-pilot")]
+    use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    struct RecordingHandle {
+        requests: Arc<Mutex<Vec<CorrelatedControlActionRequest>>>,
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[async_trait::async_trait]
+    impl ReplicaHandle for RecordingHandle {
+        fn id(&self) -> ReplicaId {
+            2
+        }
+
+        fn instance_id(&self) -> ReplicaInstanceId {
+            ReplicaInstanceId::new("replica-2-uid")
+        }
+
+        fn current_progress(&self) -> i64 {
+            10
+        }
+
+        fn catch_up_capability(&self) -> i64 {
+            10
+        }
+
+        fn control_address(&self) -> String {
+            "http://replica-2".to_string()
+        }
+
+        fn replicator_address(&self) -> String {
+            "http://replica-2-data".to_string()
+        }
+
+        async fn get_status(&self) -> kuberic_core::Result<ReplicaStatusInfo> {
+            Ok(observed_command_target())
+        }
+
+        async fn execute_correlated_control_action(
+            &self,
+            request: CorrelatedControlActionRequest,
+        ) -> kuberic_core::Result<CorrelatedControlActionAcknowledgement> {
+            self.requests.lock().unwrap().push(request);
+            Err(KubericError::AgentBusy)
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    fn pending_command() -> PendingActionStatus {
+        PendingActionStatus {
+            action_id: "pilot:7:effect".to_string(),
+            sequence: 7,
+            kind: crate::crd::DurableActionKind::RevokeWrite,
+            target_id: 2,
+            target_instance_id: "replica-2-uid".to_string(),
+            expected_epoch: EpochStatus {
+                data_loss_number: 4,
+                configuration_number: 9,
+            },
+            desired_postcondition: crate::crd::DurablePostconditionStatus {
+                kind: crate::crd::DurablePostconditionKind::WriteRevoked,
+                role: None,
+            },
+            attempts: 0,
+            deadline_unix_seconds: 200,
+            last_error: None,
+            dispatch_authorized: true,
+            dispatch_agent_generation: None,
+            dispatch_agent_control_version: None,
+            dispatch_observed_runtime_epoch: None,
+            dispatch_action_payload: String::new(),
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    fn observed_command_target() -> ReplicaStatusInfo {
+        ReplicaStatusInfo {
+            instance_id: ReplicaInstanceId::new("replica-2-uid"),
+            role: Role::Primary,
+            epoch: Epoch::new(4, 8),
+            current_progress: 10,
+            catch_up_capability: Some(10),
+            committed_lsn: 10,
+            healthy: true,
+            write_status: AccessStatus::Granted,
+            configuration: None,
+            election_configuration: None,
+            deactivation_info: None,
+            active_replica_connections: Vec::new(),
+            build_observation: None,
+            agent: ReplicaAgentStatus {
+                protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+                lifecycle_peer_protocol_version:
+                    kuberic_core::replica_lifecycle::REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION,
+                generation: AgentGeneration::parse("0123456789abcdef0123456789abcdef").unwrap(),
+                control_version: AgentControlVersion::new(11),
+                current_action: None,
+                retained_terminal_actions: Vec::new(),
+                local_faults: Vec::new(),
+            },
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    fn config() -> ReplicaSetConfig {
+        ReplicaSetConfig {
+            members: Vec::new(),
+            write_quorum: 1,
+        }
+    }
 
     #[test]
     fn portable_outcome_kinds_are_distinct_and_bounded() {
@@ -775,6 +1002,181 @@ mod tests {
         assert_eq!(
             classify_dispatch_failure(&KubericError::Closed),
             DispatchFailureDisposition::Unknown
+        );
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[tokio::test]
+    async fn all_seven_pilot_replica_actions_prepare_and_dispatch_exact_fenced_commands() {
+        let actions = [
+            DurableReplicaAction::RevokeWriteStatus,
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch::new(4, 9),
+                role: Role::ActiveSecondary,
+            },
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch::new(4, 9),
+                role: Role::Primary,
+            },
+            DurableReplicaAction::UpdateEpoch {
+                epoch: Epoch::new(4, 9),
+            },
+            DurableReplicaAction::UpdateCatchUpConfiguration {
+                current: config(),
+                previous: config(),
+            },
+            DurableReplicaAction::WaitForCatchUpQuorum {
+                mode: ReplicaSetQuorumMode::Write,
+            },
+            DurableReplicaAction::UpdateCurrentConfiguration { current: config() },
+        ];
+        for action in actions {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let handle = RecordingHandle {
+                requests: requests.clone(),
+            };
+            let pending = pending_command();
+            let observed = observed_command_target();
+            let (planned, command) = prepare_replica_effect_command(
+                &pending,
+                &observed,
+                &ReplicaInstanceId::new("replica-2-uid"),
+                &action,
+            )
+            .unwrap();
+            assert_eq!(
+                command,
+                ReplicaEffectCommand::from_pending(&planned).unwrap()
+            );
+            assert_eq!(command.action_id, pending.action_id);
+            assert_eq!(command.action_signature, action.signature());
+            assert_eq!(command.target_id, pending.target_id);
+            assert_eq!(command.target_instance_id, pending.target_instance_id);
+            assert_eq!(command.expected_epoch, pending.expected_epoch);
+            assert_eq!(command.desired_postcondition, pending.desired_postcondition);
+            assert_eq!(
+                command.expected_agent_generation,
+                observed.agent.generation.to_string()
+            );
+            assert_eq!(
+                command.expected_control_version,
+                observed.agent.control_version.value()
+            );
+            assert_eq!(
+                command.observed_runtime_epoch,
+                EpochStatus {
+                    data_loss_number: observed.epoch.data_loss_number,
+                    configuration_number: observed.epoch.configuration_number,
+                }
+            );
+            let decoded = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+                &command.action_payload,
+            )
+            .unwrap();
+            assert_eq!(decoded.signature(), action.signature());
+            assert!(matches!(
+                execute_replica_command(&handle, &command).await,
+                Err(KubericError::AgentBusy)
+            ));
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].action.signature(), action.signature());
+            assert_eq!(requests[0].action_id, command.action_id);
+            assert_eq!(
+                requests[0].target_instance_id.as_str(),
+                command.target_instance_id
+            );
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn pilot_preparation_rejects_incarnation_protocol_and_action_identity_drift() {
+        let pending = pending_command();
+        let action = DurableReplicaAction::RevokeWriteStatus;
+        assert_eq!(
+            prepare_replica_effect_command(
+                &pending,
+                &observed_command_target(),
+                &ReplicaInstanceId::new("replacement-uid"),
+                &action,
+            ),
+            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+        );
+
+        let mut replacement = observed_command_target();
+        replacement.instance_id = ReplicaInstanceId::new("replacement-uid");
+        assert_eq!(
+            prepare_replica_effect_command(
+                &pending,
+                &replacement,
+                &ReplicaInstanceId::new("replica-2-uid"),
+                &action,
+            ),
+            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+        );
+
+        let mut unsupported = observed_command_target();
+        unsupported.agent.protocol_version = 0;
+        assert_eq!(
+            prepare_replica_effect_command(
+                &pending,
+                &unsupported,
+                &ReplicaInstanceId::new("replica-2-uid"),
+                &action,
+            ),
+            Err(PilotEffectPreparationError::WaitForSupportedProtocol)
+        );
+
+        let (frozen, _) = prepare_replica_effect_command(
+            &pending,
+            &observed_command_target(),
+            &ReplicaInstanceId::new("replica-2-uid"),
+            &action,
+        )
+        .unwrap();
+        let mut changed_generation = observed_command_target();
+        changed_generation.agent.generation =
+            AgentGeneration::parse("fedcba9876543210fedcba9876543210").unwrap();
+        assert_eq!(
+            prepare_replica_effect_command(
+                &frozen,
+                &changed_generation,
+                &ReplicaInstanceId::new("replica-2-uid"),
+                &action,
+            ),
+            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+        );
+        let mut changed_control = observed_command_target();
+        changed_control.agent.control_version = AgentControlVersion::new(12);
+        assert_eq!(
+            prepare_replica_effect_command(
+                &frozen,
+                &changed_control,
+                &ReplicaInstanceId::new("replica-2-uid"),
+                &action,
+            ),
+            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+        );
+        let mut changed_epoch = observed_command_target();
+        changed_epoch.epoch = Epoch::new(4, 9);
+        assert_eq!(
+            prepare_replica_effect_command(
+                &frozen,
+                &changed_epoch,
+                &ReplicaInstanceId::new("replica-2-uid"),
+                &action,
+            ),
+            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+        );
+        assert_eq!(
+            prepare_replica_effect_command(
+                &frozen,
+                &observed_command_target(),
+                &ReplicaInstanceId::new("replica-2-uid"),
+                &DurableReplicaAction::Close,
+            ),
+            Err(PilotEffectPreparationError::InvalidCommand)
         );
     }
 }

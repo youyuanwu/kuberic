@@ -6,7 +6,7 @@
 //! lifecycle policy.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, OnceLock},
 };
 
@@ -18,8 +18,9 @@ use kuberic_durable_execution::{
     DurableHost, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch,
     InMemoryCheckpointStore, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, LogicalActivityId,
-    StorageRevision, StoreError, StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
-    decode_activity_input, decode_activity_result, encode_activity_input, encode_activity_result,
+    PreparedActivityError, PreparedActivityResolver, StorageRevision, StoreError, StoredCheckpoint,
+    TerminalOutcome, Workflow, WorkflowContext, decode_activity_input, decode_activity_result,
+    encode_activity_input, encode_activity_result,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,10 @@ use crate::crd::{
     PendingActionStatus, StablePartitionSnapshotStatus,
 };
 
+use super::effects::{
+    LabelEffectCommand, PilotEffectPreparationError, ReplicaEffectCommand, exact_label_command,
+    prepare_replica_effect_command, validate_pilot_replica_action_kind,
+};
 use super::pilot_store::MeasuredPilotCheckpointStore;
 use super::{
     Decision, OperationObservations, decide, start_switchover,
@@ -45,6 +50,7 @@ pub const PILOT_MAX_REPLICAS: usize = 3;
 pub const PILOT_MAX_ACTIVITY_RECORDS: usize = 32;
 pub const PILOT_MAX_TRANSITION_FUEL: usize = 64;
 pub const PILOT_MAX_OPERATION_BYTES: usize = 3_000;
+pub const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = 8_192;
 pub const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = 4_096;
 pub const PILOT_MAX_TERMINAL_BYTES: u64 = 4_096;
 pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 752 * 1_024;
@@ -266,6 +272,21 @@ impl DurableSwitchoverState {
 pub struct DurableSwitchoverActivityInput {
     pub version: u32,
     pub state: DurableSwitchoverState,
+    #[serde(default)]
+    pub kind: PilotActivityKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PilotActivityKind {
+    #[default]
+    PassiveObservation,
+    PreparedReplica {
+        command: ReplicaEffectCommand,
+    },
+    PreparedLabel {
+        command: LabelEffectCommand,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -298,7 +319,7 @@ impl DurableActivity for DurableSwitchoverActivity {
 
     const NAME: &'static str = PILOT_ACTIVITY_NAME;
     const VERSION: u32 = PILOT_ACTIVITY_VERSION;
-    const MAX_INPUT_BYTES: u64 = PILOT_MAX_OPERATION_BYTES as u64;
+    const MAX_INPUT_BYTES: u64 = PILOT_MAX_ACTIVITY_INPUT_BYTES as u64;
     const MAX_RESULT_BYTES: u64 = PILOT_MAX_ACTIVITY_RESULT_BYTES as u64;
 }
 
@@ -392,6 +413,7 @@ impl Workflow for DurableSwitchoverWorkflow {
                 .call::<DurableSwitchoverActivity>(DurableSwitchoverActivityInput {
                     version: PILOT_VERSION,
                     state: state.clone(),
+                    kind: PilotActivityKind::PassiveObservation,
                 })
                 .await
             {
@@ -556,6 +578,12 @@ pub fn encode_step_result(result: &DurableSwitchoverStepResult) -> Result<ExactB
 }
 
 pub fn decode_activity_input_state(input: &ExactBytes) -> Result<DurableSwitchoverState, String> {
+    Ok(decode_pilot_activity_input(input)?.state)
+}
+
+pub fn decode_pilot_activity_input(
+    input: &ExactBytes,
+) -> Result<DurableSwitchoverActivityInput, String> {
     let input = decode_activity_input::<DurableSwitchoverActivity>(input)
         .map_err(|error| format!("decode current durable switchover activity: {error}"))?;
     if input.version != PILOT_VERSION {
@@ -564,7 +592,7 @@ pub fn decode_activity_input_state(input: &ExactBytes) -> Result<DurableSwitchov
             input.version
         ));
     }
-    Ok(input.state)
+    Ok(input)
 }
 
 pub fn decode_activity_step_result(
@@ -691,6 +719,266 @@ pub fn evaluate_adapter_step(
     })
 }
 
+pub struct PilotPreparedActivityResolver<'a> {
+    initial: &'a DurableOperationStatus,
+    observations: &'a OperationObservations,
+    addressed_instances: &'a BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+    now: i64,
+}
+
+impl<'a> PilotPreparedActivityResolver<'a> {
+    pub fn new(
+        initial: &'a DurableOperationStatus,
+        observations: &'a OperationObservations,
+        addressed_instances: &'a BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+        now: i64,
+    ) -> Self {
+        Self {
+            initial,
+            observations,
+            addressed_instances,
+            now,
+        }
+    }
+
+    fn prepare(
+        &self,
+        logical: &DurableSwitchoverActivityInput,
+    ) -> Result<DurableSwitchoverActivityInput, PreparedActivityError> {
+        if logical.version != PILOT_VERSION || logical.kind != PilotActivityKind::PassiveObservation
+        {
+            return Err(PreparedActivityError::Validation);
+        }
+        let operation = logical
+            .state
+            .apply_to(self.initial)
+            .map_err(|_| PreparedActivityError::Validation)?;
+        let decision = evaluate_adapter_step(&operation, self.observations, self.now)
+            .map_err(|_| PreparedActivityError::Derivation)?;
+        let mut prepared = logical.clone();
+        match decision {
+            PilotAdapterDecision::Observe(_) | PilotAdapterDecision::AwaitEvidence => {}
+            PilotAdapterDecision::External(decision) => match *decision {
+                Decision::Execute {
+                    target_id,
+                    action_id,
+                    action,
+                } => {
+                    let pending = operation
+                        .pending_action
+                        .as_ref()
+                        .ok_or(PreparedActivityError::Validation)?;
+                    if pending.action_id != action_id || pending.target_id != target_id {
+                        return Err(PreparedActivityError::Validation);
+                    }
+                    let observed = self
+                        .observations
+                        .get(&target_id)
+                        .ok_or(PreparedActivityError::Derivation)?;
+                    let addressed = self
+                        .addressed_instances
+                        .get(&target_id)
+                        .ok_or(PreparedActivityError::Derivation)?;
+                    let (planned, command) = prepare_replica_effect_command(
+                        pending,
+                        &observed.status,
+                        addressed,
+                        &action,
+                    )
+                    .map_err(preparation_error)?;
+                    let mut operation = operation;
+                    operation.pending_action = Some(planned);
+                    prepared.state = DurableSwitchoverState::from_operation(&operation);
+                    prepared.kind = PilotActivityKind::PreparedReplica { command };
+                }
+                Decision::PatchPodRole { target_id, role } => {
+                    let command =
+                        exact_label_command(&operation, target_id, &role, self.observations)
+                            .map_err(|_| PreparedActivityError::Derivation)?;
+                    prepared.kind = PilotActivityKind::PreparedLabel { command };
+                }
+                Decision::PatchPodRoleExactUid {
+                    target_id,
+                    expected_uid,
+                    role,
+                } => {
+                    let command =
+                        exact_label_command(&operation, target_id, &role, self.observations)
+                            .map_err(|_| PreparedActivityError::Derivation)?;
+                    if command.expected_uid != expected_uid {
+                        return Err(PreparedActivityError::Validation);
+                    }
+                    prepared.kind = PilotActivityKind::PreparedLabel { command };
+                }
+                _ => return Err(PreparedActivityError::Validation),
+            },
+        }
+        Ok(prepared)
+    }
+
+    fn validate_recorded(
+        &self,
+        logical: &DurableSwitchoverActivityInput,
+        recorded: &DurableSwitchoverActivityInput,
+    ) -> Result<(), PreparedActivityError> {
+        if logical.version != PILOT_VERSION
+            || recorded.version != PILOT_VERSION
+            || logical.kind != PilotActivityKind::PassiveObservation
+        {
+            return Err(PreparedActivityError::Validation);
+        }
+        let mut logical_predecessor = recorded.state.clone();
+        if let Some(pending) = logical_predecessor.pending_action.as_mut() {
+            pending.dispatch_agent_generation = None;
+            pending.dispatch_agent_control_version = None;
+            pending.dispatch_observed_runtime_epoch = None;
+            pending.dispatch_action_payload.clear();
+        }
+        if recorded.state != logical.state && logical_predecessor != logical.state {
+            return Err(PreparedActivityError::Validation);
+        }
+        let operation = recorded
+            .state
+            .apply_to(self.initial)
+            .map_err(|_| PreparedActivityError::Validation)?;
+        match &recorded.kind {
+            PilotActivityKind::PassiveObservation => {
+                if recorded.state != logical.state {
+                    return Err(PreparedActivityError::Validation);
+                }
+            }
+            PilotActivityKind::PreparedReplica { command } => {
+                let pending = operation
+                    .pending_action
+                    .as_ref()
+                    .ok_or(PreparedActivityError::Validation)?;
+                let expected = ReplicaEffectCommand::from_pending(pending)
+                    .map_err(|_| PreparedActivityError::Validation)?;
+                if &expected != command {
+                    return Err(PreparedActivityError::Validation);
+                }
+                let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+                    &command.action_payload,
+                )
+                .map_err(|_| PreparedActivityError::Validation)?;
+                if action.signature() != command.action_signature
+                    || !validate_pilot_replica_action_kind(pending.kind, &action)
+                    || !action_matches_pending_epoch_and_role(pending, &action)
+                {
+                    return Err(PreparedActivityError::Validation);
+                }
+            }
+            PilotActivityKind::PreparedLabel { command } => {
+                let pending = operation
+                    .pending_action
+                    .as_ref()
+                    .ok_or(PreparedActivityError::Validation)?;
+                let expected_uid = operation
+                    .previous_snapshot
+                    .members
+                    .iter()
+                    .chain(operation.target_snapshot.members.iter())
+                    .find(|member| member.id == command.target_id)
+                    .map(|member| member.instance_id.as_str());
+                let expected_role = match pending.kind {
+                    crate::crd::DurableActionKind::LabelTargetPrimary
+                    | crate::crd::DurableActionKind::CompensateLabelOldPrimary => Some("primary"),
+                    crate::crd::DurableActionKind::LabelOldSecondary
+                    | crate::crd::DurableActionKind::CompensateLabelTargetSecondary => {
+                        Some("secondary")
+                    }
+                    _ => None,
+                };
+                if command.target_id != pending.target_id
+                    || command.expected_uid != pending.target_instance_id
+                    || expected_uid != Some(command.expected_uid.as_str())
+                    || command.pod_name.is_empty()
+                    || expected_role != Some(command.role.as_str())
+                    || !command.has_valid_identity_signature()
+                {
+                    return Err(PreparedActivityError::Validation);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PreparedActivityResolver for PilotPreparedActivityResolver<'_> {
+    fn resolve(
+        &self,
+        logical: &ActivitySpec,
+        recorded: Option<&ActivitySpec>,
+    ) -> Result<ActivitySpec, PreparedActivityError> {
+        let logical_input = decode_activity_input::<DurableSwitchoverActivity>(logical.input())
+            .map_err(|_| PreparedActivityError::Encoding)?;
+        if let Some(recorded) = recorded {
+            let Ok(recorded_input) =
+                decode_activity_input::<DurableSwitchoverActivity>(recorded.input())
+            else {
+                return Ok(logical.clone());
+            };
+            if self
+                .validate_recorded(&logical_input, &recorded_input)
+                .is_err()
+            {
+                return Ok(logical.clone());
+            }
+            return Ok(recorded.clone());
+        }
+        let prepared = self.prepare(&logical_input)?;
+        let spec = activity_spec(&prepared).map_err(|_| PreparedActivityError::Encoding)?;
+        let actual_bytes = u64::try_from(spec.input().as_slice().len())
+            .map_err(|_| PreparedActivityError::Encoding)?;
+        if actual_bytes > DurableSwitchoverActivity::MAX_INPUT_BYTES {
+            return Err(PreparedActivityError::InputTooLarge {
+                actual_bytes,
+                max_bytes: DurableSwitchoverActivity::MAX_INPUT_BYTES,
+            });
+        }
+        Ok(spec)
+    }
+}
+
+fn action_matches_pending_epoch_and_role(
+    pending: &PendingActionStatus,
+    action: &kuberic_core::types::DurableReplicaAction,
+) -> bool {
+    use kuberic_core::types::{DurableReplicaAction, Role};
+    let expected_epoch = |epoch: &kuberic_core::types::Epoch| {
+        epoch.data_loss_number == pending.expected_epoch.data_loss_number
+            && epoch.configuration_number == pending.expected_epoch.configuration_number
+    };
+    match action {
+        DurableReplicaAction::ChangeRole { epoch, role } => {
+            let expected_role =
+                pending
+                    .desired_postcondition
+                    .role
+                    .as_ref()
+                    .map(|role| match role {
+                        crate::crd::StableReplicaRoleStatus::Primary => Role::Primary,
+                        crate::crd::StableReplicaRoleStatus::ActiveSecondary => {
+                            Role::ActiveSecondary
+                        }
+                    });
+            expected_epoch(epoch) && expected_role.as_ref() == Some(role)
+        }
+        DurableReplicaAction::UpdateEpoch { epoch } => expected_epoch(epoch),
+        _ => true,
+    }
+}
+
+fn preparation_error(error: PilotEffectPreparationError) -> PreparedActivityError {
+    match error {
+        PilotEffectPreparationError::WaitForExactIncarnation
+        | PilotEffectPreparationError::WaitForSupportedProtocol => {
+            PreparedActivityError::Derivation
+        }
+        PilotEffectPreparationError::InvalidCommand => PreparedActivityError::Validation,
+    }
+}
+
 pub struct PilotPermitGuard {
     permit: Option<DispatchPermit>,
 }
@@ -705,15 +993,26 @@ impl PilotPermitGuard {
     pub fn consume_for(
         &mut self,
         operation: &DurableOperationStatus,
+        prepared: &PilotActivityKind,
+        expected_activity: &LogicalActivityId,
+        attempt_id: kuberic_durable_execution::AttemptId,
     ) -> Result<DispatchPermit, String> {
-        let expected = activity_spec(operation)?;
+        let expected = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: DurableSwitchoverState::from_operation(operation),
+            kind: prepared.clone(),
+        })?;
         let permit = self
             .permit
             .as_ref()
             .ok_or_else(|| "durable switchover dispatch permit was already consumed".to_string())?;
-        if permit.activity().spec() != &expected {
+        if permit.attempt_id() != attempt_id
+            || permit.activity() != expected_activity
+            || permit.activity().spec() != &expected
+        {
             return Err(
-                "durable switchover dispatch permit does not match current operation".to_string(),
+                "durable switchover dispatch permit does not match prepared operation or attempt"
+                    .to_string(),
             );
         }
         Ok(self
@@ -727,15 +1026,11 @@ impl PilotPermitGuard {
     }
 }
 
-fn activity_spec(operation: &DurableOperationStatus) -> Result<ActivitySpec, String> {
-    let input = DurableSwitchoverActivityInput {
-        version: PILOT_VERSION,
-        state: DurableSwitchoverState::from_operation(operation),
-    };
+fn activity_spec(input: &DurableSwitchoverActivityInput) -> Result<ActivitySpec, String> {
     Ok(ActivitySpec::new(
         ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
             .map_err(|error| format!("construct pilot activity name: {error}"))?,
-        encode_activity_input::<DurableSwitchoverActivity>(&input)
+        encode_activity_input::<DurableSwitchoverActivity>(input)
             .map_err(|error| format!("serialize pilot activity input: {error}"))?,
         PILOT_MAX_ACTIVITY_RESULT_BYTES as u64,
     ))
@@ -1241,7 +1536,7 @@ fn maximum_active_payload(
         .map(|sequence| {
             let spec = ActivitySpec::new(
                 name.clone(),
-                ExactBytes::new(vec![u8::MAX; PILOT_MAX_OPERATION_BYTES]),
+                ExactBytes::new(vec![u8::MAX; PILOT_MAX_ACTIVITY_INPUT_BYTES]),
                 u64::try_from(PILOT_MAX_ACTIVITY_RESULT_BYTES)
                     .expect("pilot result bound fits u64"),
             );
@@ -1721,23 +2016,267 @@ mod durable_switchover_pilot_tests {
             checkpoint_limits(),
         );
         let permit = expose_next(&mut host, &DurableSwitchoverWorkflow, &execution).await;
-        let current = decode_activity_input_state(permit.activity().input())
-            .unwrap()
-            .apply_to(&operation)
-            .unwrap();
+        let prepared = decode_pilot_activity_input(permit.activity().input()).unwrap();
+        let current = prepared.state.apply_to(&operation).unwrap();
+        let activity = permit.activity().clone();
+        let attempt_id = permit.attempt_id();
         let mut guard = PilotPermitGuard::new(permit);
         assert!(guard.activity().is_some());
-        let consumed = guard.consume_for(&current).unwrap();
+        let wrong_attempt =
+            kuberic_durable_execution::AttemptId::new(HostEpoch::from_bytes([99; 16]), 1).unwrap();
+        assert!(
+            guard
+                .consume_for(&current, &prepared.kind, &activity, wrong_attempt)
+                .is_err()
+        );
+        let wrong_kind = PilotActivityKind::PreparedLabel {
+            command: LabelEffectCommand::new(
+                1,
+                "database-0".to_string(),
+                "pod-1-uid".to_string(),
+                "primary".to_string(),
+            ),
+        };
+        assert!(
+            guard
+                .consume_for(&current, &wrong_kind, &activity, attempt_id)
+                .is_err()
+        );
+        let consumed = guard
+            .consume_for(&current, &prepared.kind, &activity, attempt_id)
+            .unwrap();
         assert_eq!(
             consumed.activity().input().as_slice(),
             encode_activity_input::<DurableSwitchoverActivity>(&DurableSwitchoverActivityInput {
                 version: PILOT_VERSION,
                 state: compact(&current),
+                kind: prepared.kind.clone(),
             })
             .unwrap()
             .as_slice()
         );
-        assert!(guard.consume_for(&current).is_err());
+        assert!(
+            guard
+                .consume_for(&current, &prepared.kind, &activity, attempt_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_replica_spec_binds_every_dispatch_fence() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let command = ReplicaEffectCommand {
+            action_id: "execution:1:RevokeWrite".to_string(),
+            action_signature: kuberic_core::types::DurableReplicaAction::RevokeWriteStatus
+                .signature(),
+            target_id: 1,
+            target_instance_id: "pod-1-uid".to_string(),
+            expected_epoch: EpochStatus {
+                data_loss_number: 4,
+                configuration_number: 8,
+            },
+            desired_postcondition: crate::crd::DurablePostconditionStatus {
+                kind: crate::crd::DurablePostconditionKind::WriteRevoked,
+                role: None,
+            },
+            expected_agent_generation: "0123456789abcdef0123456789abcdef".to_string(),
+            expected_control_version: 7,
+            observed_runtime_epoch: EpochStatus {
+                data_loss_number: 4,
+                configuration_number: 8,
+            },
+            action_payload: kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::RevokeWriteStatus,
+            )
+            .unwrap(),
+        };
+        let input = |command| DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&operation),
+            kind: PilotActivityKind::PreparedReplica { command },
+        };
+        let baseline = activity_spec(&input(command.clone())).unwrap();
+        let mut variants = Vec::new();
+        let mut changed = command.clone();
+        changed.action_id.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.action_signature.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_id = 2;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_instance_id = "replacement-uid".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.desired_postcondition.kind = crate::crd::DurablePostconditionKind::Role;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_agent_generation = "fedcba9876543210fedcba9876543210".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_control_version += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.observed_runtime_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command;
+        changed.action_payload =
+            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::Close,
+            )
+            .unwrap();
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(activity_spec(&input(changed)).unwrap(), baseline);
+        }
+    }
+
+    #[test]
+    fn replay_rejects_recorded_command_semantic_drift_as_activity_mismatch() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let PilotAdapterDecision::Observe(result) =
+            evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected revoke intent");
+        };
+        let DurableSwitchoverStepResult::Advance { operation: state } = *result else {
+            panic!("expected pending revoke state");
+        };
+        let logical = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: state.clone(),
+            kind: PilotActivityKind::PassiveObservation,
+        })
+        .unwrap();
+        let mut prepared_operation = state.apply_to(&initial).unwrap();
+        let pending = prepared_operation.pending_action.as_mut().unwrap();
+        pending.dispatch_agent_generation = Some("0123456789abcdef0123456789abcdef".to_string());
+        pending.dispatch_agent_control_version = Some(7);
+        pending.dispatch_observed_runtime_epoch = Some(EpochStatus {
+            data_loss_number: 4,
+            configuration_number: 8,
+        });
+        pending.dispatch_action_payload =
+            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::RevokeWriteStatus,
+            )
+            .unwrap();
+        let command = ReplicaEffectCommand::from_pending(pending).unwrap();
+        let prepared = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&prepared_operation),
+            kind: PilotActivityKind::PreparedReplica {
+                command: command.clone(),
+            },
+        })
+        .unwrap();
+        let observations = OperationObservations::new();
+        let addressed = BTreeMap::new();
+        let resolver = PilotPreparedActivityResolver::new(&initial, &observations, &addressed, 100);
+        assert_eq!(
+            resolver.resolve(&logical, Some(&prepared)).unwrap(),
+            prepared
+        );
+
+        let execution = execution_spec(&reference).unwrap();
+        let mut variants = Vec::new();
+        let mut changed = command.clone();
+        changed.action_id.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.action_signature.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_id = 2;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_instance_id = "replacement-uid".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.desired_postcondition.kind = crate::crd::DurablePostconditionKind::Role;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_agent_generation = "fedcba9876543210fedcba9876543210".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_control_version += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.observed_runtime_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command;
+        changed.action_payload =
+            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::Close,
+            )
+            .unwrap();
+        variants.push(changed);
+
+        for changed in variants {
+            let drifted = activity_spec(&DurableSwitchoverActivityInput {
+                version: PILOT_VERSION,
+                state: compact(&prepared_operation),
+                kind: PilotActivityKind::PreparedReplica { command: changed },
+            })
+            .unwrap();
+            assert_eq!(resolver.resolve(&logical, Some(&drifted)).unwrap(), logical);
+            let payload = CheckpointPayload::active(
+                ExecutionContract::new(
+                    execution.clone(),
+                    u64::try_from(PILOT_MAX_ENCODED_CHECKPOINT_BYTES).unwrap(),
+                ),
+                vec![ActivityRecord::scheduled(ActivitySequence::new(0), drifted)],
+            );
+            let checkpoint =
+                CheckpointEnvelope::encode_with_limits(&payload, checkpoint_limits()).unwrap();
+            assert!(matches!(
+                kuberic_durable_execution::evaluate_prepared(
+                    &DurableSwitchoverWorkflow,
+                    &execution,
+                    Some(&checkpoint),
+                    checkpoint_limits(),
+                    &resolver,
+                ),
+                kuberic_durable_execution::Evaluation::Nondeterminism(
+                    kuberic_durable_execution::Nondeterminism::ActivityMismatch { .. }
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_activity_v1_without_kind_replays_with_exact_recorded_bytes() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let logical = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&initial),
+            kind: PilotActivityKind::PassiveObservation,
+        })
+        .unwrap();
+        let mut legacy_json: serde_json::Value =
+            serde_json::from_slice(logical.input().as_slice()).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("kind");
+        let legacy = ActivitySpec::new(
+            logical.name().clone(),
+            ExactBytes::new(serde_json::to_vec(&legacy_json).unwrap()),
+            logical.max_result_bytes(),
+        );
+        let observations = OperationObservations::new();
+        let addressed = BTreeMap::new();
+        let resolver = PilotPreparedActivityResolver::new(&initial, &observations, &addressed, 100);
+        assert_eq!(resolver.resolve(&logical, Some(&legacy)).unwrap(), legacy);
     }
 
     #[test]
@@ -1955,6 +2494,7 @@ mod durable_switchover_pilot_tests {
             encode_activity_input::<DurableSwitchoverActivity>(&DurableSwitchoverActivityInput {
                 version: PILOT_VERSION,
                 state: state.clone(),
+                kind: PilotActivityKind::PassiveObservation,
             })
             .unwrap();
         let result =
