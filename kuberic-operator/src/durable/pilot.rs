@@ -11,10 +11,11 @@ use async_trait::async_trait;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kuberic_durable_execution::{
     ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
-    CheckpointLimits, CheckpointPayload, CheckpointStore, DurableHost, ExactBytes,
+    CheckpointLimits, CheckpointPayload, CheckpointStore, DispatchPermit, DurableHost, ExactBytes,
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, InMemoryCheckpointStore,
     KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope, KubernetesCheckpointStore,
-    KubernetesCheckpointStoreOptions, StorageRevision, StoreError, StoredCheckpoint,
+    KubernetesCheckpointStoreOptions, LogicalActivityId, StorageRevision, StoreError,
+    StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -24,12 +25,17 @@ use crate::crd::{
     DurableOperationStatus, DurableSwitchoverPilotStatus, StablePartitionSnapshotStatus,
 };
 
-use super::start_switchover;
+use super::pilot_store::MeasuredPilotCheckpointStore;
+use super::{
+    Decision, OperationObservations, decide, start_switchover,
+    switchover::validate_switchover_operation,
+};
 
 pub const PILOT_VERSION: u32 = 1;
 pub const PILOT_MAX_REPLICAS: usize = 3;
 pub const PILOT_MAX_ACTIVITY_RECORDS: usize = 48;
-pub const PILOT_MAX_OPERATION_BYTES: usize = 4_096;
+pub const PILOT_MAX_OPERATION_BYTES: usize = 3_000;
+pub const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = 4_096;
 pub const PILOT_MAX_TERMINAL_BYTES: u64 = 4_096;
 pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 704 * 1_024;
 
@@ -81,7 +87,7 @@ enum PilotStoreFactory {
     InMemory(InMemoryCheckpointStore),
 }
 
-pub type PilotHost = DurableHost<PilotCheckpointStore>;
+pub type PilotHost = DurableHost<MeasuredPilotCheckpointStore>;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PilotHostKey {
@@ -148,7 +154,7 @@ impl DurableSwitchoverPilotRuntime {
             PilotStoreFactory::InMemory(store) => PilotCheckpointStore::InMemory(store.clone()),
         };
         let host = Arc::new(Mutex::new(DurableHost::new(
-            store,
+            MeasuredPilotCheckpointStore::new(execution_id, store),
             self.host_epoch,
             checkpoint_limits(),
         )));
@@ -177,6 +183,474 @@ pub struct DurableSwitchoverPilotInput {
     pub version: u32,
     pub execution_id: String,
     pub initial_operation: DurableOperationStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DurableSwitchoverStepResult {
+    Advance {
+        operation: DurableOperationStatus,
+    },
+    ProvenNoAdmission {
+        operation: DurableOperationStatus,
+        action_id: String,
+        redelivery: u8,
+    },
+    Complete {
+        operation: DurableOperationStatus,
+        snapshot: StablePartitionSnapshotStatus,
+        compensated: bool,
+    },
+    Stopped {
+        operation: DurableOperationStatus,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DurableSwitchoverPilotTerminal {
+    Complete {
+        operation: DurableOperationStatus,
+        snapshot: StablePartitionSnapshotStatus,
+        compensated: bool,
+    },
+    Stopped {
+        operation: Option<DurableOperationStatus>,
+        message: String,
+    },
+}
+
+pub struct DurableSwitchoverWorkflow;
+
+#[async_trait]
+impl Workflow for DurableSwitchoverWorkflow {
+    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
+        let input: DurableSwitchoverPilotInput = match serde_json::from_slice(input.as_slice()) {
+            Ok(input) => input,
+            Err(error) => {
+                return terminal_failure(None, format!("decode pilot workflow input: {error}"));
+            }
+        };
+        if input.version != PILOT_VERSION {
+            return terminal_failure(
+                Some(input.initial_operation),
+                format!("unsupported pilot workflow version {}", input.version),
+            );
+        }
+        if input.execution_id != encode_execution_id(context.execution_id()) {
+            return terminal_failure(
+                Some(input.initial_operation),
+                "pilot workflow execution identity mismatch".to_string(),
+            );
+        }
+        let initial = input.initial_operation;
+        if let Err(error) = validate_pilot_admission(&initial) {
+            return terminal_failure(Some(initial), error);
+        }
+        if let Err(error) = validate_switchover_operation(&initial) {
+            return terminal_failure(Some(initial), error);
+        }
+        let mut operation = initial.clone();
+        let mut no_admission_redeliveries = std::collections::BTreeMap::<String, u8>::new();
+
+        for _ in 0..PILOT_MAX_ACTIVITY_RECORDS {
+            let activity = match activity_spec(&operation) {
+                Ok(activity) => activity,
+                Err(error) => return terminal_failure(Some(operation), error),
+            };
+            let encoded = context.activity(activity).await;
+            let result: DurableSwitchoverStepResult =
+                match serde_json::from_slice(encoded.as_slice()) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        return terminal_failure(
+                            Some(operation),
+                            format!("decode pilot activity result: {error}"),
+                        );
+                    }
+                };
+            match result {
+                DurableSwitchoverStepResult::Advance { operation: next } => {
+                    if let Err(error) = validate_transition(&initial, &next) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    if let Err(error) = validate_phase_transition(&operation, &next) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    operation = next;
+                }
+                DurableSwitchoverStepResult::ProvenNoAdmission {
+                    operation: next,
+                    action_id,
+                    redelivery,
+                } => {
+                    if let Err(error) = validate_transition(&initial, &next) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    if next != operation {
+                        return terminal_failure(
+                            Some(operation),
+                            "proven-no-admission result changed operation state".to_string(),
+                        );
+                    }
+                    let expected_action_id = operation
+                        .pending_action
+                        .as_ref()
+                        .map(|pending| pending.action_id.as_str());
+                    if expected_action_id != Some(action_id.as_str()) || redelivery != 1 {
+                        return terminal_failure(
+                            Some(operation),
+                            "invalid proven-no-admission redelivery evidence".to_string(),
+                        );
+                    }
+                    let count = no_admission_redeliveries.entry(action_id).or_default();
+                    *count = count.saturating_add(1);
+                    if *count > 1 {
+                        return terminal_failure(
+                            Some(operation),
+                            "correlated action exceeded one proven-no-admission redelivery"
+                                .to_string(),
+                        );
+                    }
+                    operation = next;
+                }
+                DurableSwitchoverStepResult::Complete {
+                    operation: completed,
+                    snapshot,
+                    compensated,
+                } => {
+                    if let Err(error) = validate_transition(&initial, &completed) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    if let Err(error) =
+                        validate_completion_transition(&operation, &completed, compensated)
+                    {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    if let Err(error) = validate_terminal(&completed, &snapshot, compensated) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    return terminal_success(DurableSwitchoverPilotTerminal::Complete {
+                        operation: completed,
+                        snapshot,
+                        compensated,
+                    });
+                }
+                DurableSwitchoverStepResult::Stopped {
+                    operation: stopped,
+                    message,
+                } => {
+                    if let Err(error) = validate_transition(&initial, &stopped) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    if stopped.phase != crate::crd::DurableOperationPhase::Poisoned
+                        || stopped.pending_action.is_some()
+                    {
+                        return terminal_failure(
+                            Some(operation),
+                            "stopped durable switchover is not poisoned and effect-free"
+                                .to_string(),
+                        );
+                    }
+                    return terminal_failure(Some(stopped), message);
+                }
+            }
+        }
+
+        terminal_failure(
+            Some(operation),
+            format!(
+                "durable switchover exhausted its {PILOT_MAX_ACTIVITY_RECORDS}-activity admission"
+            ),
+        )
+    }
+}
+
+pub fn encode_step_result(result: &DurableSwitchoverStepResult) -> Result<ExactBytes, String> {
+    let encoded = serde_json::to_vec(result)
+        .map_err(|error| format!("serialize pilot activity result: {error}"))?;
+    if encoded.len() > PILOT_MAX_ACTIVITY_RESULT_BYTES {
+        return Err(format!(
+            "durable switchover activity result is {} bytes; maximum is {}",
+            encoded.len(),
+            PILOT_MAX_ACTIVITY_RESULT_BYTES
+        ));
+    }
+    Ok(ExactBytes::new(encoded))
+}
+
+pub fn decode_terminal(
+    outcome: &TerminalOutcome,
+) -> Result<DurableSwitchoverPilotTerminal, String> {
+    serde_json::from_slice(outcome.payload().as_slice())
+        .map_err(|error| format!("decode durable switchover terminal outcome: {error}"))
+}
+
+pub enum PilotAdapterDecision {
+    Observe(DurableSwitchoverStepResult),
+    AwaitEvidence,
+    External(Decision),
+}
+
+pub fn evaluate_adapter_step(
+    operation: &DurableOperationStatus,
+    observations: &OperationObservations,
+    now: i64,
+) -> Result<PilotAdapterDecision, String> {
+    Ok(match decide(operation, observations, now)? {
+        Decision::Persist(operation) => {
+            PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance { operation })
+        }
+        Decision::Complete {
+            operation,
+            snapshot,
+            compensated,
+        } => PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Complete {
+            operation,
+            snapshot,
+            compensated,
+        }),
+        Decision::Wait => PilotAdapterDecision::AwaitEvidence,
+        external @ (Decision::Execute { .. } | Decision::PatchPodRole { .. }) => {
+            PilotAdapterDecision::External(external)
+        }
+        other => {
+            return Err(format!(
+                "unsupported explicit switchover decision reached pilot adapter: {other:?}"
+            ));
+        }
+    })
+}
+
+pub struct PilotPermitGuard {
+    permit: Option<DispatchPermit>,
+}
+
+impl PilotPermitGuard {
+    pub fn new(permit: DispatchPermit) -> Self {
+        Self {
+            permit: Some(permit),
+        }
+    }
+
+    pub fn consume_for(
+        &mut self,
+        operation: &DurableOperationStatus,
+    ) -> Result<DispatchPermit, String> {
+        let expected = activity_spec(operation)?;
+        let permit = self
+            .permit
+            .as_ref()
+            .ok_or_else(|| "durable switchover dispatch permit was already consumed".to_string())?;
+        if permit.activity().spec() != &expected {
+            return Err(
+                "durable switchover dispatch permit does not match current operation".to_string(),
+            );
+        }
+        Ok(self
+            .permit
+            .take()
+            .expect("permit existence checked before consumption"))
+    }
+
+    pub fn activity(&self) -> Option<&LogicalActivityId> {
+        self.permit.as_ref().map(DispatchPermit::activity)
+    }
+}
+
+fn activity_spec(operation: &DurableOperationStatus) -> Result<ActivitySpec, String> {
+    let input = serde_json::to_vec(operation)
+        .map_err(|error| format!("serialize pilot activity input: {error}"))?;
+    if input.len() > PILOT_MAX_OPERATION_BYTES {
+        return Err(format!(
+            "durable switchover activity input is {} bytes; maximum is {}",
+            input.len(),
+            PILOT_MAX_OPERATION_BYTES
+        ));
+    }
+    Ok(ActivitySpec::new(
+        ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
+            .map_err(|error| format!("construct pilot activity name: {error}"))?,
+        ExactBytes::new(input),
+        PILOT_MAX_ACTIVITY_RESULT_BYTES as u64,
+    ))
+}
+
+fn validate_transition(
+    initial: &DurableOperationStatus,
+    next: &DurableOperationStatus,
+) -> Result<(), String> {
+    if next.operation_id != initial.operation_id
+        || next.execution_id != initial.execution_id
+        || next.kind != initial.kind
+        || next.previous_snapshot != initial.previous_snapshot
+        || next.target_snapshot != initial.target_snapshot
+        || next.old_primary_id != initial.old_primary_id
+        || next.target_primary_id != initial.target_primary_id
+    {
+        return Err("durable switchover activity changed immutable operation identity".to_string());
+    }
+    validate_pilot_admission(next)?;
+    validate_switchover_operation(next)
+}
+
+fn validate_phase_transition(
+    current: &DurableOperationStatus,
+    next: &DurableOperationStatus,
+) -> Result<(), String> {
+    use crate::crd::DurableOperationPhase as Phase;
+    let allowed = current.phase == next.phase
+        || next.phase == Phase::Poisoned
+        || matches!(
+            (current.phase, next.phase),
+            (Phase::Revoke, Phase::CaptureLsn | Phase::Failed)
+                | (Phase::CaptureLsn, Phase::PreCatchUp)
+                | (
+                    Phase::PreCatchUp,
+                    Phase::DemoteOldPrimary | Phase::RestorePreviousConfiguration
+                )
+                | (
+                    Phase::DemoteOldPrimary,
+                    Phase::PromoteTarget | Phase::RestorePreviousConfiguration
+                )
+                | (
+                    Phase::PromoteTarget,
+                    Phase::DistributeEpoch | Phase::CompensatePromoteOldPrimary
+                )
+                | (Phase::DistributeEpoch, Phase::UpdateCatchUpConfiguration)
+                | (
+                    Phase::UpdateCatchUpConfiguration,
+                    Phase::WaitForCatchUpQuorum
+                )
+                | (
+                    Phase::WaitForCatchUpQuorum,
+                    Phase::UpdateCurrentConfiguration
+                )
+                | (Phase::UpdateCurrentConfiguration, Phase::LabelTargetPrimary)
+                | (Phase::LabelTargetPrimary, Phase::LabelOldSecondary)
+                | (Phase::LabelOldSecondary, Phase::Finalize)
+                | (Phase::RestorePreviousConfiguration, Phase::Failed)
+                | (
+                    Phase::CompensatePromoteOldPrimary,
+                    Phase::CompensateDistributeEpoch
+                )
+                | (
+                    Phase::CompensateDistributeEpoch,
+                    Phase::CompensateCatchUpConfiguration
+                )
+                | (
+                    Phase::CompensateCatchUpConfiguration,
+                    Phase::CompensateCurrentConfiguration
+                )
+                | (
+                    Phase::CompensateCurrentConfiguration,
+                    Phase::CompensateLabelOldPrimary
+                )
+                | (
+                    Phase::CompensateLabelOldPrimary,
+                    Phase::CompensateLabelTargetSecondary
+                )
+                | (
+                    Phase::CompensateLabelTargetSecondary,
+                    Phase::CompensateFinalize
+                )
+        );
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid durable switchover phase transition {:?} -> {:?}",
+            current.phase, next.phase
+        ))
+    }
+}
+
+fn validate_terminal(
+    operation: &DurableOperationStatus,
+    snapshot: &StablePartitionSnapshotStatus,
+    compensated: bool,
+) -> Result<(), String> {
+    use crate::crd::{DurableOperationPhase as Phase, StableReplicaRoleStatus};
+    if !compensated {
+        if operation.phase != Phase::Completed
+            || operation.pending_action.is_some()
+            || snapshot != &operation.target_snapshot
+        {
+            return Err("successful durable switchover terminal is inconsistent".to_string());
+        }
+
+        return Ok(());
+    }
+    if operation.phase != Phase::Failed
+        || operation.pending_action.is_some()
+        || snapshot.primary_id != operation.old_primary_id
+        || snapshot.members.iter().any(|member| {
+            (member.id == operation.old_primary_id
+                && member.role != StableReplicaRoleStatus::Primary)
+                || (member.id != operation.old_primary_id
+                    && member.role != StableReplicaRoleStatus::ActiveSecondary)
+        })
+    {
+        return Err("compensated durable switchover terminal is inconsistent".to_string());
+    }
+    Ok(())
+}
+
+fn validate_completion_transition(
+    current: &DurableOperationStatus,
+    completed: &DurableOperationStatus,
+    compensated: bool,
+) -> Result<(), String> {
+    use crate::crd::DurableOperationPhase as Phase;
+    let allowed = if compensated {
+        matches!(
+            (current.phase, completed.phase),
+            (Phase::CompensateFinalize, Phase::Failed) | (Phase::Failed, Phase::Failed)
+        )
+    } else {
+        (current.phase, completed.phase) == (Phase::Finalize, Phase::Completed)
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid durable switchover completion transition {:?} -> {:?}",
+            current.phase, completed.phase
+        ))
+    }
+}
+
+fn terminal_success(terminal: DurableSwitchoverPilotTerminal) -> TerminalOutcome {
+    match encode_terminal(&terminal) {
+        Ok(payload) => TerminalOutcome::succeeded(payload),
+        Err(error) => terminal_failure(None, error),
+    }
+}
+
+fn terminal_failure(operation: Option<DurableOperationStatus>, message: String) -> TerminalOutcome {
+    let bounded_message: String = message.chars().take(512).collect();
+    let terminal = DurableSwitchoverPilotTerminal::Stopped {
+        operation,
+        message: bounded_message,
+    };
+    let payload = encode_terminal(&terminal).unwrap_or_else(|_| {
+        ExactBytes::new(br#"{"status":"stopped","operation":null,"message":"pilot terminal payload exceeded its bound"}"#)
+    });
+    TerminalOutcome::failed(payload)
+}
+
+fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactBytes, String> {
+    let encoded = serde_json::to_vec(terminal)
+        .map_err(|error| format!("serialize durable switchover terminal outcome: {error}"))?;
+    if encoded.len() > PILOT_MAX_TERMINAL_BYTES as usize {
+        return Err(format!(
+            "durable switchover terminal outcome is {} bytes; maximum is {}",
+            encoded.len(),
+            PILOT_MAX_TERMINAL_BYTES
+        ));
+    }
+    Ok(ExactBytes::new(encoded))
 }
 
 pub fn new_pilot_reference(
@@ -309,6 +783,7 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
             "durable switchover operation is {operation_bytes} bytes; maximum is {PILOT_MAX_OPERATION_BYTES}"
         ));
     }
+    validate_variant_bounds(operation)?;
     let success_steps = projected_success_steps(operation.previous_snapshot.members.len());
     let rollback_steps = projected_rollback_steps(operation.previous_snapshot.members.len());
     let projected_steps = success_steps.len().max(rollback_steps.len());
@@ -346,6 +821,7 @@ fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
     for _ in 0..member_count.saturating_sub(2) {
         steps.extend(["epoch.prepare", "epoch.fence", "epoch.resolve"]);
     }
+
     steps.extend([
         "catch-up-config.prepare",
         "catch-up-config.fence",
@@ -368,6 +844,66 @@ fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
         redelivery_headroom,
     ));
     steps
+}
+
+fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), String> {
+    let previous = operation
+        .previous_snapshot
+        .cloned()
+        .ok_or_else(|| "durable switchover has no previous snapshot".to_string())?;
+    let mut stopped = operation.clone();
+    stopped.phase = crate::crd::DurableOperationPhase::Poisoned;
+    stopped.pending_action = None;
+    let variants = [
+        DurableSwitchoverStepResult::Advance {
+            operation: operation.clone(),
+        },
+        DurableSwitchoverStepResult::ProvenNoAdmission {
+            operation: operation.clone(),
+            action_id: operation
+                .pending_action
+                .as_ref()
+                .map(|pending| pending.action_id.clone())
+                .unwrap_or_else(|| format!("{}:maximum-action", operation.operation_id)),
+            redelivery: 1,
+        },
+        DurableSwitchoverStepResult::Complete {
+            operation: operation.clone(),
+            snapshot: operation.target_snapshot.clone(),
+            compensated: false,
+        },
+        DurableSwitchoverStepResult::Complete {
+            operation: operation.clone(),
+            snapshot: previous.clone(),
+            compensated: true,
+        },
+        DurableSwitchoverStepResult::Stopped {
+            operation: stopped.clone(),
+            message: "x".repeat(512),
+        },
+    ];
+    for variant in &variants {
+        encode_step_result(variant)?;
+    }
+    for terminal in [
+        DurableSwitchoverPilotTerminal::Complete {
+            operation: operation.clone(),
+            snapshot: operation.target_snapshot.clone(),
+            compensated: false,
+        },
+        DurableSwitchoverPilotTerminal::Complete {
+            operation: operation.clone(),
+            snapshot: previous,
+            compensated: true,
+        },
+        DurableSwitchoverPilotTerminal::Stopped {
+            operation: Some(stopped),
+            message: "x".repeat(512),
+        },
+    ] {
+        encode_terminal(&terminal)?;
+    }
+    Ok(())
 }
 
 fn projected_rollback_steps(member_count: usize) -> Vec<&'static str> {
@@ -449,14 +985,15 @@ fn maximum_active_payload(
             let spec = ActivitySpec::new(
                 name.clone(),
                 ExactBytes::new(vec![u8::MAX; PILOT_MAX_OPERATION_BYTES]),
-                u64::try_from(PILOT_MAX_OPERATION_BYTES).expect("pilot operation bound fits u64"),
+                u64::try_from(PILOT_MAX_ACTIVITY_RESULT_BYTES)
+                    .expect("pilot result bound fits u64"),
             );
             ActivityRecord::completed(
                 ActivitySequence::new(
                     u64::try_from(sequence).expect("pilot activity count fits u64"),
                 ),
                 spec,
-                ExactBytes::new(vec![u8::MAX; PILOT_MAX_OPERATION_BYTES]),
+                ExactBytes::new(vec![u8::MAX; PILOT_MAX_ACTIVITY_RESULT_BYTES]),
             )
         })
         .collect();
@@ -497,11 +1034,14 @@ fn decode_hex(value: u8) -> Result<u8, String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod durable_switchover_pilot_tests {
     use super::*;
     use crate::crd::{EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus};
     use crate::durable::{Decision, decide};
+    use kuberic_durable_execution::ActivityObservation;
     use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn snapshot(member_count: usize) -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {
@@ -666,6 +1206,599 @@ mod tests {
             .await
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &other_owner));
+    }
+
+    struct PollCountingPilotWorkflow {
+        polls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Workflow for PollCountingPilotWorkflow {
+        async fn run(
+            &self,
+            context: &mut WorkflowContext<'_>,
+            input: ExactBytes,
+        ) -> TerminalOutcome {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            DurableSwitchoverWorkflow.run(context, input).await
+        }
+    }
+
+    async fn expose_next<W: Workflow>(
+        host: &mut PilotHost,
+        workflow: &W,
+        execution: &ExecutionSpec,
+    ) -> kuberic_durable_execution::DispatchPermit {
+        assert!(matches!(
+            {
+                let outcome = host.turn(workflow, execution.clone()).await;
+                host.store().correlate_host_outcome(&outcome);
+                outcome
+            },
+            kuberic_durable_execution::HostOutcome::ScheduleAccepted { .. }
+        ));
+        let outcome = host.turn(workflow, execution.clone()).await;
+        host.store().correlate_host_outcome(&outcome);
+        match outcome {
+            kuberic_durable_execution::HostOutcome::DispatchPermitted { permit, .. } => permit,
+            other => panic!("expected dispatch permit, found {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_replays_steps_and_reloads_terminal_without_polling() {
+        let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut initial = initial_operation(&reference).unwrap();
+        initial.phase = crate::crd::DurableOperationPhase::LabelOldSecondary;
+        reference.initial_operation_json = serde_json::to_string(&initial).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let store = InMemoryCheckpointStore::new();
+        let measured = MeasuredPilotCheckpointStore::new(
+            execution.execution_id(),
+            PilotCheckpointStore::InMemory(store),
+        );
+        let mut host = DurableHost::new(
+            measured,
+            HostEpoch::from_bytes([7; 16]),
+            checkpoint_limits(),
+        );
+        let polls = Arc::new(AtomicUsize::new(0));
+        let workflow = PollCountingPilotWorkflow {
+            polls: polls.clone(),
+        };
+
+        let first_permit = expose_next(&mut host, &workflow, &execution).await;
+        let mut advanced = initial.clone();
+        advanced.phase = crate::crd::DurableOperationPhase::Finalize;
+        let outcome = host
+            .observe(
+                &execution,
+                ActivityObservation::new(
+                    first_permit.activity().clone(),
+                    encode_step_result(&DurableSwitchoverStepResult::Advance {
+                        operation: advanced.clone(),
+                    })
+                    .unwrap(),
+                ),
+            )
+            .await;
+        host.store().correlate_host_outcome(&outcome);
+        assert!(matches!(
+            outcome,
+            kuberic_durable_execution::HostOutcome::ObservationAccepted { .. }
+        ));
+
+        let second_permit = expose_next(&mut host, &workflow, &execution).await;
+        advanced.phase = crate::crd::DurableOperationPhase::Completed;
+        let terminal_snapshot = advanced.target_snapshot.clone();
+        let observed = host
+            .observe(
+                &execution,
+                ActivityObservation::new(
+                    second_permit.activity().clone(),
+                    encode_step_result(&DurableSwitchoverStepResult::Complete {
+                        operation: advanced.clone(),
+                        snapshot: terminal_snapshot.clone(),
+                        compensated: false,
+                    })
+                    .unwrap(),
+                ),
+            )
+            .await;
+        host.store().correlate_host_outcome(&observed);
+        assert!(matches!(
+            observed,
+            kuberic_durable_execution::HostOutcome::ObservationAccepted { .. }
+        ));
+
+        let completed = host.turn(&workflow, execution.clone()).await;
+        host.store().correlate_host_outcome(&completed);
+        let kuberic_durable_execution::HostOutcome::WorkflowCompleted { outcome, .. } = completed
+        else {
+            panic!("expected workflow completion, found {completed:?}");
+        };
+        assert_eq!(
+            decode_terminal(&outcome).unwrap(),
+            DurableSwitchoverPilotTerminal::Complete {
+                operation: advanced,
+                snapshot: terminal_snapshot,
+                compensated: false,
+            }
+        );
+        let polls_before_terminal_reload = polls.load(Ordering::SeqCst);
+        assert!(matches!(
+            host.turn(&workflow, execution).await,
+            kuberic_durable_execution::HostOutcome::WorkflowCompleted { .. }
+        ));
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            polls_before_terminal_reload,
+            "terminal reload must not poll workflow code"
+        );
+        let measurements = host.store().measurements();
+        assert_eq!(measurements.accepted_writes, 7);
+        assert!(measurements.latest_authoritative_checkpoint_bytes.is_some());
+        assert!(
+            host.store()
+                .collector()
+                .events()
+                .iter()
+                .all(|event| event.boundary.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn exposed_activity_is_quarantined_after_host_restart() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let backend = InMemoryCheckpointStore::new();
+        let mut first_host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(backend.clone()),
+            ),
+            HostEpoch::from_bytes([3; 16]),
+            checkpoint_limits(),
+        );
+        let workflow = DurableSwitchoverWorkflow;
+        let permit = expose_next(&mut first_host, &workflow, &execution).await;
+
+        let mut restarted_host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(backend),
+            ),
+            HostEpoch::from_bytes([4; 16]),
+            checkpoint_limits(),
+        );
+        match restarted_host.turn(&workflow, execution).await {
+            kuberic_durable_execution::HostOutcome::Quarantined { activity, .. } => {
+                assert_eq!(&activity, permit.activity());
+            }
+            other => panic!("expected quarantine after restart, found {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_step_becomes_failed_terminal() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let store = InMemoryCheckpointStore::new();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(store),
+            ),
+            HostEpoch::from_bytes([8; 16]),
+            checkpoint_limits(),
+        );
+        let workflow = DurableSwitchoverWorkflow;
+        let permit = expose_next(&mut host, &workflow, &execution).await;
+        let mut stopped = operation.clone();
+        stopped.phase = crate::crd::DurableOperationPhase::Poisoned;
+        stopped.pending_action = None;
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    permit.activity().clone(),
+                    encode_step_result(&DurableSwitchoverStepResult::Stopped {
+                        operation: stopped.clone(),
+                        message: "ambiguous effect remains quarantined".to_string(),
+                    })
+                    .unwrap(),
+                ),
+            )
+            .await,
+            kuberic_durable_execution::HostOutcome::ObservationAccepted { .. }
+        ));
+        let completed = host.turn(&workflow, execution).await;
+        let kuberic_durable_execution::HostOutcome::WorkflowCompleted { outcome, .. } = completed
+        else {
+            panic!("expected stopped terminal, found {completed:?}");
+        };
+        assert!(matches!(outcome, TerminalOutcome::Failed(_)));
+        assert_eq!(
+            decode_terminal(&outcome).unwrap(),
+            DurableSwitchoverPilotTerminal::Stopped {
+                operation: Some(stopped),
+                message: "ambiguous effect remains quarantined".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_guard_consumes_matching_permit_once() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            ),
+            HostEpoch::from_bytes([12; 16]),
+            checkpoint_limits(),
+        );
+        let permit = expose_next(&mut host, &DurableSwitchoverWorkflow, &execution).await;
+        let mut guard = PilotPermitGuard::new(permit);
+        assert!(guard.activity().is_some());
+        let consumed = guard.consume_for(&operation).unwrap();
+        assert_eq!(
+            consumed.activity().input().as_slice(),
+            serde_json::to_vec(&operation).unwrap()
+        );
+        assert!(guard.consume_for(&operation).is_err());
+    }
+
+    #[test]
+    fn adapter_invokes_existing_switchover_decision_engine() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let observations = OperationObservations::new();
+        let PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance {
+            operation: pending,
+        }) = evaluate_adapter_step(&operation, &observations, 100).unwrap()
+        else {
+            panic!("initial explicit decision must persist the correlated revoke action");
+        };
+        assert!(pending.pending_action.is_some());
+        assert!(matches!(
+            evaluate_adapter_step(&pending, &observations, 100).unwrap(),
+            PilotAdapterDecision::AwaitEvidence
+        ));
+    }
+
+    #[tokio::test]
+    async fn proven_no_admission_redelivery_is_bounded_per_action() {
+        let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance {
+            operation: pending,
+        }) = evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected persisted revoke action");
+        };
+        let action_id = pending.pending_action.as_ref().unwrap().action_id.clone();
+        reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            ),
+            HostEpoch::from_bytes([13; 16]),
+            checkpoint_limits(),
+        );
+        let workflow = DurableSwitchoverWorkflow;
+
+        for _ in 0..2 {
+            let permit = expose_next(&mut host, &workflow, &execution).await;
+            let observed = host
+                .observe(
+                    &execution,
+                    ActivityObservation::new(
+                        permit.activity().clone(),
+                        encode_step_result(&DurableSwitchoverStepResult::ProvenNoAdmission {
+                            operation: pending.clone(),
+                            action_id: action_id.clone(),
+                            redelivery: 1,
+                        })
+                        .unwrap(),
+                    ),
+                )
+                .await;
+            assert!(matches!(
+                observed,
+                kuberic_durable_execution::HostOutcome::ObservationAccepted { .. }
+            ));
+        }
+        let completed = host.turn(&workflow, execution).await;
+        let kuberic_durable_execution::HostOutcome::WorkflowCompleted { outcome, .. } = completed
+        else {
+            panic!("second no-admission redelivery must stop, found {completed:?}");
+        };
+        assert!(matches!(outcome, TerminalOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn compensation_branch_terminalizes_failed_old_primary_topology() {
+        let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut failed = initial_operation(&reference).unwrap();
+        failed.phase = crate::crd::DurableOperationPhase::Failed;
+        reference.initial_operation_json = serde_json::to_string(&failed).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            ),
+            HostEpoch::from_bytes([14; 16]),
+            checkpoint_limits(),
+        );
+        let workflow = DurableSwitchoverWorkflow;
+        let permit = expose_next(&mut host, &workflow, &execution).await;
+        let previous = failed.previous_snapshot.cloned().unwrap();
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    permit.activity().clone(),
+                    encode_step_result(&DurableSwitchoverStepResult::Complete {
+                        operation: failed.clone(),
+                        snapshot: previous.clone(),
+                        compensated: true,
+                    })
+                    .unwrap(),
+                ),
+            )
+            .await,
+            kuberic_durable_execution::HostOutcome::ObservationAccepted { .. }
+        ));
+        let kuberic_durable_execution::HostOutcome::WorkflowCompleted { outcome, .. } =
+            host.turn(&workflow, execution).await
+        else {
+            panic!("expected compensated terminal");
+        };
+        assert_eq!(
+            decode_terminal(&outcome).unwrap(),
+            DurableSwitchoverPilotTerminal::Complete {
+                operation: failed,
+                snapshot: previous,
+                compensated: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_workflow_input_fails_without_scheduling_activity() {
+        let execution = ExecutionSpec::new(
+            ExecutionId::from_bytes([11; 16]),
+            ExactBytes::new(b"not-json"),
+            PILOT_MAX_TERMINAL_BYTES,
+        );
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            ),
+            HostEpoch::from_bytes([9; 16]),
+            checkpoint_limits(),
+        );
+        let outcome = host.turn(&DurableSwitchoverWorkflow, execution).await;
+        let kuberic_durable_execution::HostOutcome::WorkflowCompleted { outcome, .. } = outcome
+        else {
+            panic!("malformed input must fail terminally, found {outcome:?}");
+        };
+        assert!(matches!(outcome, TerminalOutcome::Failed(_)));
+        assert!(matches!(
+            decode_terminal(&outcome).unwrap(),
+            DurableSwitchoverPilotTerminal::Stopped {
+                operation: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn structurally_invalid_initial_operation_fails_before_activity_schedule() {
+        let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut invalid = initial_operation(&reference).unwrap();
+        invalid.version = u32::MAX;
+        reference.initial_operation_json = serde_json::to_string(&invalid).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let backend = InMemoryCheckpointStore::new();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(backend.clone()),
+            ),
+            HostEpoch::from_bytes([17; 16]),
+            checkpoint_limits(),
+        );
+        let outcome = host
+            .turn(&DurableSwitchoverWorkflow, execution.clone())
+            .await;
+        assert!(matches!(
+            outcome,
+            kuberic_durable_execution::HostOutcome::WorkflowCompleted {
+                outcome: TerminalOutcome::Failed(_),
+                ..
+            }
+        ));
+        let stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(&execution, checkpoint_limits())
+            .unwrap();
+        assert!(payload.active_activities().is_none());
+        assert_eq!(payload.terminal_outcome().unwrap().1, 0);
+    }
+
+    #[test]
+    fn codecs_reject_identity_drift_and_oversized_results() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let mut drifted = initial.clone();
+        drifted.operation_id.push_str("-other");
+        assert!(validate_transition(&initial, &drifted).is_err());
+
+        let mut oversized = initial;
+        oversized.last_error = Some("x".repeat(PILOT_MAX_ACTIVITY_RESULT_BYTES));
+        let error = encode_step_result(&DurableSwitchoverStepResult::Advance {
+            operation: oversized,
+        })
+        .unwrap_err();
+        assert!(error.contains("activity result is"), "{error}");
+    }
+
+    #[test]
+    fn compensated_terminal_round_trips_exactly() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let terminal = DurableSwitchoverPilotTerminal::Complete {
+            snapshot: operation.previous_snapshot.cloned().unwrap(),
+            operation,
+            compensated: true,
+        };
+        let outcome = TerminalOutcome::succeeded(encode_terminal(&terminal).unwrap());
+        assert_eq!(decode_terminal(&outcome).unwrap(), terminal);
+    }
+
+    #[test]
+    fn transition_and_terminal_validation_rejects_shortcuts() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let mut skipped = initial.clone();
+        skipped.phase = crate::crd::DurableOperationPhase::PromoteTarget;
+        assert!(validate_phase_transition(&initial, &skipped).is_err());
+
+        let mut completed = initial.clone();
+        completed.phase = crate::crd::DurableOperationPhase::Completed;
+        assert!(validate_completion_transition(&initial, &completed, false).is_err());
+        assert!(
+            validate_terminal(
+                &completed,
+                &completed.previous_snapshot.cloned().unwrap(),
+                false
+            )
+            .is_err()
+        );
+        assert!(validate_terminal(&completed, &completed.target_snapshot.clone(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn schedule_unknown_outcomes_reload_before_any_permit() {
+        for (fault, applied) in [
+            (
+                kuberic_durable_execution::InMemoryFault::OutcomeUnknownWithoutApply,
+                false,
+            ),
+            (
+                kuberic_durable_execution::InMemoryFault::OutcomeUnknownAfterApply,
+                true,
+            ),
+        ] {
+            let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+            let execution = execution_spec(&reference).unwrap();
+            let backend = InMemoryCheckpointStore::new();
+            backend.fail_next_compare_and_swap(fault);
+            let mut host = DurableHost::new(
+                MeasuredPilotCheckpointStore::new(
+                    execution.execution_id(),
+                    PilotCheckpointStore::InMemory(backend),
+                ),
+                HostEpoch::from_bytes([15; 16]),
+                checkpoint_limits(),
+            );
+            let first = host
+                .turn(&DurableSwitchoverWorkflow, execution.clone())
+                .await;
+            assert!(matches!(
+                first,
+                kuberic_durable_execution::HostOutcome::ReloadRequired {
+                    boundary: kuberic_durable_execution::PersistenceBoundary::Schedule,
+                    reason: kuberic_durable_execution::ReloadReason::OutcomeUnknown,
+                }
+            ));
+            let second = host.turn(&DurableSwitchoverWorkflow, execution).await;
+            assert_eq!(
+                matches!(
+                    &second,
+                    kuberic_durable_execution::HostOutcome::DispatchPermitted { .. }
+                ),
+                applied
+            );
+            assert_eq!(
+                matches!(
+                    &second,
+                    kuberic_durable_execution::HostOutcome::ScheduleAccepted { .. }
+                ),
+                !applied
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct ConflictOnceStore {
+        inner: InMemoryCheckpointStore,
+        conflict: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl CheckpointStore for ConflictOnceStore {
+        async fn load(
+            &self,
+            execution_id: ExecutionId,
+        ) -> Result<Option<StoredCheckpoint>, StoreError> {
+            self.inner.load(execution_id).await
+        }
+
+        async fn compare_and_swap(
+            &self,
+            execution_id: ExecutionId,
+            expected: Option<StorageRevision>,
+            checkpoint: CheckpointEnvelope,
+        ) -> Result<CasOutcome, StoreError> {
+            if self.conflict.swap(false, Ordering::SeqCst) {
+                Ok(CasOutcome::Conflict)
+            } else {
+                self.inner
+                    .compare_and_swap(execution_id, expected, checkpoint)
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_conflict_reloads_before_any_permit() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let mut host = DurableHost::new(
+            ConflictOnceStore {
+                inner: InMemoryCheckpointStore::new(),
+                conflict: Arc::new(AtomicBool::new(true)),
+            },
+            HostEpoch::from_bytes([16; 16]),
+            checkpoint_limits(),
+        );
+        assert!(matches!(
+            host.turn(&DurableSwitchoverWorkflow, execution.clone())
+                .await,
+            kuberic_durable_execution::HostOutcome::ReloadRequired {
+                boundary: kuberic_durable_execution::PersistenceBoundary::Schedule,
+                reason: kuberic_durable_execution::ReloadReason::Conflict,
+            }
+        ));
+        assert!(matches!(
+            host.turn(&DurableSwitchoverWorkflow, execution).await,
+            kuberic_durable_execution::HostOutcome::ScheduleAccepted { .. }
+        ));
     }
 
     #[test]

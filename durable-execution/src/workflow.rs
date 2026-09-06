@@ -70,6 +70,11 @@ impl<'history> WorkflowContext<'history> {
         self.cursor
     }
 
+    /// Return the immutable execution identity being replayed.
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
     fn poll_activity(&mut self, spec: &ActivitySpec) -> Poll<ExactBytes> {
         if self.decision.is_some() {
             return Poll::Pending;

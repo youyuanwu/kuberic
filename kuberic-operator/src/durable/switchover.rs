@@ -114,6 +114,7 @@ pub fn decide(
     {
         return Ok(Decision::Wait);
     }
+
     if operation.phase == DurableOperationPhase::Failed {
         let old = observations
             .get(&operation.old_primary_id)
@@ -422,6 +423,16 @@ pub fn decide(
             operation.phase
         )),
     }
+}
+
+pub(crate) fn validate_switchover_operation(
+    operation: &DurableOperationStatus,
+) -> Result<(), String> {
+    validate_operation(operation)?;
+    if let Some(pending) = &operation.pending_action {
+        validate_pending_action(operation, pending)?;
+    }
+    Ok(())
 }
 
 fn decide_pending(
