@@ -1,4 +1,5 @@
 pub mod api;
+pub mod controller;
 pub mod discovery;
 
 pub use api::{
@@ -7,4 +8,5 @@ pub use api::{
     NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus, PREPARED_CONDITION_TYPE,
     PreparationChecks,
 };
+pub use controller::{KubeMaintenanceApi, MaintenanceApi, ReconcileOutcome, reconcile_request};
 pub use discovery::{DiscoveryInput, MaintenancePod, NodeRef, reconcile_discovery};
