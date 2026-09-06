@@ -83,13 +83,21 @@ enum PilotStoreFactory {
 
 pub type PilotHost = DurableHost<PilotCheckpointStore>;
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PilotHostKey {
+    namespace: String,
+    set_name: String,
+    set_uid: String,
+    execution_id: String,
+}
+
 /// Process-local host cache. Checkpoints, rather than this cache, remain the
 /// recovery authority; retaining hosts preserves monotonic attempt counters
 /// within one process epoch.
 pub struct DurableSwitchoverPilotRuntime {
     factory: PilotStoreFactory,
     host_epoch: HostEpoch,
-    hosts: Mutex<HashMap<String, Arc<Mutex<PilotHost>>>>,
+    hosts: Mutex<HashMap<PilotHostKey, Arc<Mutex<PilotHost>>>>,
 }
 
 impl DurableSwitchoverPilotRuntime {
@@ -117,7 +125,12 @@ impl DurableSwitchoverPilotRuntime {
         reference: &DurableSwitchoverPilotStatus,
     ) -> Result<Arc<Mutex<PilotHost>>, String> {
         let execution_id = execution_id(reference)?;
-        let key = reference.execution_id.clone();
+        let key = PilotHostKey {
+            namespace: namespace.to_string(),
+            set_name: set_name.to_string(),
+            set_uid: set_uid.to_string(),
+            execution_id: reference.execution_id.clone(),
+        };
         let mut hosts = self.hosts.lock().await;
         if let Some(host) = hosts.get(&key) {
             return Ok(host.clone());
@@ -139,17 +152,22 @@ impl DurableSwitchoverPilotRuntime {
             self.host_epoch,
             checkpoint_limits(),
         )));
-        hosts.insert(key, host.clone());
+        hosts.insert(key.clone(), host.clone());
         let expected_name = KubernetesCheckpointStore::object_name(execution_id);
         if expected_name != reference.checkpoint_name {
-            hosts.remove(&reference.execution_id);
+            hosts.remove(&key);
             return Err("durable switchover checkpoint identity changed".to_string());
         }
         Ok(host)
     }
 
-    pub async fn forget(&self, execution_id: &str) {
-        self.hosts.lock().await.remove(execution_id);
+    pub async fn forget(&self, namespace: &str, set_name: &str, set_uid: &str, execution_id: &str) {
+        self.hosts.lock().await.remove(&PilotHostKey {
+            namespace: namespace.to_string(),
+            set_name: set_name.to_string(),
+            set_uid: set_uid.to_string(),
+            execution_id: execution_id.to_string(),
+        });
     }
 }
 
@@ -183,12 +201,14 @@ pub fn new_pilot_reference(
     let initial_operation_json = serde_json::to_string(&initial_operation)
         .map_err(|error| format!("serialize initial durable switchover operation: {error}"))?;
 
-    Ok(DurableSwitchoverPilotStatus {
+    let reference = DurableSwitchoverPilotStatus {
         version: PILOT_VERSION,
         execution_id: execution_hex,
         checkpoint_name: KubernetesCheckpointStore::object_name(execution_id),
         initial_operation_json,
-    })
+    };
+    execution_spec(&reference)?;
+    Ok(reference)
 }
 
 pub fn execution_id(reference: &DurableSwitchoverPilotStatus) -> Result<ExecutionId, String> {
@@ -289,6 +309,14 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
             "durable switchover operation is {operation_bytes} bytes; maximum is {PILOT_MAX_OPERATION_BYTES}"
         ));
     }
+    let success_steps = projected_success_steps(operation.previous_snapshot.members.len());
+    let rollback_steps = projected_rollback_steps(operation.previous_snapshot.members.len());
+    let projected_steps = success_steps.len().max(rollback_steps.len());
+    if projected_steps > PILOT_MAX_ACTIVITY_RECORDS {
+        return Err(format!(
+            "durable switchover requires {projected_steps} projected activities; maximum is {PILOT_MAX_ACTIVITY_RECORDS}"
+        ));
+    }
     let projected = maximum_active_checkpoint()?;
     let projected_bytes = projected
         .encoded_len()
@@ -299,6 +327,99 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
         ));
     }
     Ok(())
+}
+
+fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
+    let mut steps = vec![
+        "revoke.prepare",
+        "revoke.fence",
+        "revoke.resolve",
+        "capture-lsn",
+        "target-catch-up",
+        "demote.prepare",
+        "demote.fence",
+        "demote.resolve",
+        "promote.prepare",
+        "promote.fence",
+        "promote.resolve",
+    ];
+    for _ in 0..member_count.saturating_sub(2) {
+        steps.extend(["epoch.prepare", "epoch.fence", "epoch.resolve"]);
+    }
+    steps.extend([
+        "catch-up-config.prepare",
+        "catch-up-config.fence",
+        "catch-up-config.resolve",
+        "quorum.prepare",
+        "quorum.fence",
+        "quorum.resolve",
+        "current-config.prepare",
+        "current-config.fence",
+        "current-config.resolve",
+        "target-label.prepare",
+        "target-label.resolve",
+        "old-label.prepare",
+        "old-label.resolve",
+        "final-attestation",
+    ]);
+    let redelivery_headroom = external_effect_count(&steps);
+    steps.extend(std::iter::repeat_n(
+        "proven-no-admission-redelivery",
+        redelivery_headroom,
+    ));
+    steps
+}
+
+fn projected_rollback_steps(member_count: usize) -> Vec<&'static str> {
+    let mut steps = vec![
+        "revoke.prepare",
+        "revoke.fence",
+        "revoke.resolve",
+        "capture-lsn",
+        "target-catch-up",
+        "demote.prepare",
+        "demote.fence",
+        "demote.resolve",
+        "promote.prepare",
+        "promote.fence",
+        "promote.failure",
+        "rollback-promote.prepare",
+        "rollback-promote.fence",
+        "rollback-promote.resolve",
+    ];
+    for _ in 0..member_count.saturating_sub(1) {
+        steps.extend([
+            "rollback-epoch.prepare",
+            "rollback-epoch.fence",
+            "rollback-epoch.resolve",
+        ]);
+    }
+    steps.extend([
+        "rollback-catch-up.prepare",
+        "rollback-catch-up.fence",
+        "rollback-catch-up.resolve",
+        "rollback-current.prepare",
+        "rollback-current.fence",
+        "rollback-current.resolve",
+        "rollback-old-label.prepare",
+        "rollback-old-label.resolve",
+        "rollback-target-label.prepare",
+        "rollback-target-label.resolve",
+        "rollback-final-attestation",
+    ]);
+    let redelivery_headroom = external_effect_count(&steps);
+    steps.extend(std::iter::repeat_n(
+        "proven-no-admission-redelivery",
+        redelivery_headroom,
+    ));
+    steps
+}
+
+fn external_effect_count(steps: &[&str]) -> usize {
+    steps
+        .iter()
+        .filter(|step| step.ends_with(".resolve") || step.ends_with(".failure"))
+        .count()
 }
 
 pub fn maximum_active_checkpoint() -> Result<CheckpointEnvelope, String> {
@@ -379,6 +500,8 @@ fn decode_hex(value: u8) -> Result<u8, String> {
 mod tests {
     use super::*;
     use crate::crd::{EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus};
+    use crate::durable::{Decision, decide};
+    use std::collections::BTreeMap;
 
     fn snapshot(member_count: usize) -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {
@@ -412,6 +535,17 @@ mod tests {
             initial_operation(&first).unwrap().operation_id,
             initial_operation(&second).unwrap().operation_id
         );
+        let first_action =
+            match decide(&initial_operation(&first).unwrap(), &BTreeMap::new(), 100).unwrap() {
+                Decision::Persist(operation) => operation.pending_action.unwrap().action_id,
+                other => panic!("expected initial pending action, found {other:?}"),
+            };
+        let second_action =
+            match decide(&initial_operation(&second).unwrap(), &BTreeMap::new(), 100).unwrap() {
+                Decision::Persist(operation) => operation.pending_action.unwrap().action_id,
+                other => panic!("expected initial pending action, found {other:?}"),
+            };
+        assert_ne!(first_action, second_action);
         assert_eq!(
             execution_spec(&first).unwrap(),
             execution_spec(&first).unwrap()
@@ -474,6 +608,28 @@ mod tests {
         assert!(execution_id(&reference).is_err());
     }
 
+    #[test]
+    fn wrapped_workflow_input_is_bounded_before_checkpoint_creation() {
+        let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut operation = initial_operation(&reference).unwrap();
+        let mut found_wrapped_overflow = false;
+        for length in (1..=PILOT_MAX_OPERATION_BYTES).rev() {
+            operation.last_error = Some("x".repeat(length));
+            let operation_json = serde_json::to_string(&operation).unwrap();
+            if operation_json.len() <= PILOT_MAX_OPERATION_BYTES {
+                reference.initial_operation_json = operation_json;
+                let error = execution_spec(&reference).unwrap_err();
+                assert!(error.contains("pilot input is"), "{error}");
+                found_wrapped_overflow = true;
+                break;
+            }
+        }
+        assert!(
+            found_wrapped_overflow,
+            "test must construct an operation that fits while its workflow wrapper does not"
+        );
+    }
+
     #[tokio::test]
     async fn runtime_reuses_one_host_per_process_execution() {
         let runtime = DurableSwitchoverPilotRuntime::in_memory(InMemoryCheckpointStore::new());
@@ -487,11 +643,40 @@ mod tests {
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        runtime.forget(&reference.execution_id).await;
+        runtime
+            .forget("tenant-a", "database", "set-uid", &reference.execution_id)
+            .await;
         let replacement = runtime
             .host("tenant-a", "database", "set-uid", &reference)
             .await
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &replacement));
+    }
+
+    #[tokio::test]
+    async fn host_cache_identity_includes_owner_coordinates() {
+        let runtime = DurableSwitchoverPilotRuntime::in_memory(InMemoryCheckpointStore::new());
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let first = runtime
+            .host("tenant-a", "database", "set-uid", &reference)
+            .await
+            .unwrap();
+        let other_owner = runtime
+            .host("tenant-b", "database", "other-uid", &reference)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &other_owner));
+    }
+
+    #[test]
+    fn success_and_rollback_transcripts_fit_with_redelivery_headroom() {
+        let success = projected_success_steps(PILOT_MAX_REPLICAS);
+        let rollback = projected_rollback_steps(PILOT_MAX_REPLICAS);
+        assert_eq!(success.len(), 37);
+        assert_eq!(rollback.len(), 41);
+        assert!(success.len() <= PILOT_MAX_ACTIVITY_RECORDS);
+        assert!(rollback.len() <= PILOT_MAX_ACTIVITY_RECORDS);
+        assert!(success.contains(&"proven-no-admission-redelivery"));
+        assert!(rollback.contains(&"rollback-promote.resolve"));
     }
 }

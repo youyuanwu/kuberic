@@ -154,6 +154,7 @@ fn validate_active_operation_phase(
     ) {
         return Ok(());
     }
+
     let expected_phase = match operation.kind {
         DurableOperationKind::CreatePartition => Phase::Creating,
         DurableOperationKind::Switchover => Phase::Switchover,
@@ -168,6 +169,28 @@ fn validate_active_operation_phase(
         ));
     }
     Ok(())
+}
+
+fn validate_new_switchover_engine(mode: crate::crd::SwitchoverExecutionMode) -> Result<(), String> {
+    match mode {
+        crate::crd::SwitchoverExecutionMode::Explicit => Ok(()),
+        crate::crd::SwitchoverExecutionMode::DurablePilot => {
+            #[cfg(feature = "durable-switchover-pilot")]
+            {
+                Err(
+                    "durable switchover pilot is compiled but its reconciliation adapter is not connected"
+                        .to_string(),
+                )
+            }
+            #[cfg(not(feature = "durable-switchover-pilot"))]
+            {
+                Err(
+                    "durable switchover pilot requires the operator durable-switchover-pilot build feature"
+                        .to_string(),
+                )
+            }
+        }
+    }
 }
 
 fn durable_identity_members(
@@ -1322,6 +1345,7 @@ pub async fn reconcile_set(
             if let (Some(current), Some(target)) = (&current_primary, &target_primary)
                 && current != target
             {
+                validate_new_switchover_engine(set.spec.switchover_execution_mode)?;
                 let target_id = current_pods
                     .iter()
                     .find(|(_, _, pod)| pod.name_any() == *target)
@@ -3479,6 +3503,24 @@ async fn ensure_pod(
 mod tests {
     use super::*;
     use kuberic_core::remove_replica::ManualRemoveReplicaClock;
+
+    #[test]
+    fn explicit_switchover_engine_is_always_available() {
+        assert!(
+            validate_new_switchover_engine(crate::crd::SwitchoverExecutionMode::Explicit).is_ok()
+        );
+    }
+
+    #[test]
+    fn durable_pilot_never_silently_falls_back_to_explicit() {
+        let error =
+            validate_new_switchover_engine(crate::crd::SwitchoverExecutionMode::DurablePilot)
+                .unwrap_err();
+        #[cfg(feature = "durable-switchover-pilot")]
+        assert!(error.contains("adapter is not connected"), "{error}");
+        #[cfg(not(feature = "durable-switchover-pilot"))]
+        assert!(error.contains("requires the operator"), "{error}");
+    }
 
     fn snapshot(primary_id: i64, member_ids: &[i64]) -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {

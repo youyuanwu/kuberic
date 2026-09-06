@@ -107,6 +107,16 @@ fn execution(byte: u8) -> ExecutionId {
     ExecutionId::from_bytes([byte; 16])
 }
 
+fn assert_send<T: Send>(_: T) {}
+
+#[tokio::test]
+async fn kubernetes_store_futures_are_send() {
+    let harness = Harness::new([]);
+    let store = KubernetesCheckpointStore::new(harness.client(), "checkpoint-tests").unwrap();
+    assert_send(store.load(execution(0x01)));
+    assert_send(store.compare_and_swap(execution(0x01), None, checkpoint(b"send-contract")));
+}
+
 fn checkpoint(label: &[u8]) -> CheckpointEnvelope {
     CheckpointEnvelope::new(3, ExactBytes::new(label))
 }
