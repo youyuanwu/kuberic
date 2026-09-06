@@ -205,49 +205,6 @@ pub enum MaintenanceBlockedReason {
     ApplicationCloseIncomplete,
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Default)]
-pub struct PreparationChecks {
-    pub replicas_discovered: bool,
-    pub no_primary_on_node: bool,
-    pub switchovers_committed: bool,
-    pub primary_serving_elsewhere: bool,
-    pub quorum_without_node: bool,
-    pub node_excluded_from_placement: bool,
-    pub application_close_completed: bool,
-}
-
-impl PreparationChecks {
-    pub fn satisfied(&self) -> bool {
-        self.unmet().is_empty()
-    }
-
-    pub fn unmet(&self) -> Vec<&'static str> {
-        let mut unmet = Vec::new();
-        if !self.replicas_discovered {
-            unmet.push("replicasDiscovered");
-        }
-        if !self.no_primary_on_node {
-            unmet.push("noPrimaryOnNode");
-        }
-        if !self.switchovers_committed {
-            unmet.push("switchoversCommitted");
-        }
-        if !self.primary_serving_elsewhere {
-            unmet.push("primaryServingElsewhere");
-        }
-        if !self.quorum_without_node {
-            unmet.push("quorumWithoutNode");
-        }
-        if !self.node_excluded_from_placement {
-            unmet.push("nodeExcludedFromPlacement");
-        }
-        if !self.application_close_completed {
-            unmet.push("applicationCloseCompleted");
-        }
-        unmet
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,43 +329,6 @@ mod tests {
         assert!(!MaintenanceOperation::Reboot.discards_local_state());
         assert!(!MaintenanceOperation::OsUpgrade.discards_local_state());
         assert!(!MaintenanceOperation::Shutdown.discards_local_state());
-    }
-
-    #[test]
-    fn every_safety_condition_blocks_preparation_on_its_own() {
-        type BreakCheck = (&'static str, fn(&mut PreparationChecks));
-        let all = PreparationChecks {
-            replicas_discovered: true,
-            no_primary_on_node: true,
-            switchovers_committed: true,
-            primary_serving_elsewhere: true,
-            quorum_without_node: true,
-            node_excluded_from_placement: true,
-            application_close_completed: true,
-        };
-        assert!(all.satisfied());
-
-        let fields: [BreakCheck; 7] = [
-            ("replicasDiscovered", |c| c.replicas_discovered = false),
-            ("noPrimaryOnNode", |c| c.no_primary_on_node = false),
-            ("switchoversCommitted", |c| c.switchovers_committed = false),
-            ("primaryServingElsewhere", |c| {
-                c.primary_serving_elsewhere = false
-            }),
-            ("quorumWithoutNode", |c| c.quorum_without_node = false),
-            ("nodeExcludedFromPlacement", |c| {
-                c.node_excluded_from_placement = false
-            }),
-            ("applicationCloseCompleted", |c| {
-                c.application_close_completed = false
-            }),
-        ];
-        for (name, break_one) in fields {
-            let mut checks = all;
-            break_one(&mut checks);
-            assert!(!checks.satisfied(), "{name} must block preparation");
-            assert!(checks.unmet().contains(&name), "{name} must be reported");
-        }
     }
 
     #[test]

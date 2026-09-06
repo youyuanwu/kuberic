@@ -6,7 +6,6 @@ pub use api::{
     AffectedKubericSetStatus, AffectedReplicaStatus, MaintenanceBlockedReason,
     MaintenanceDesiredState, MaintenanceOperation, MaintenancePhase, NodeMaintenanceRequest,
     NodeMaintenanceRequestSpec, NodeMaintenanceRequestStatus, PREPARED_CONDITION_TYPE,
-    PreparationChecks,
 };
 pub use controller::{
     KubeMaintenanceApi, MaintenanceApi, ReconcileOutcome, RequestContext, reconcile_request,

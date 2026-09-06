@@ -54,6 +54,16 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
         return status;
     }
 
+    if input.deadline_exceeded && !input.previous.phase.is_safe_to_drain() {
+        return finish(
+            status,
+            MaintenancePhase::Expired,
+            Some(MaintenanceBlockedReason::DeadlineExceeded),
+            Some("deadline exceeded before preparation completed".to_string()),
+            input.now,
+        );
+    }
+
     if !input.not_before_reached {
         return finish(
             status,
@@ -92,19 +102,14 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
         );
     }
 
-    if input.deadline_exceeded {
-        return finish(
-            status,
-            MaintenancePhase::Expired,
-            Some(MaintenanceBlockedReason::DeadlineExceeded),
-            Some("deadline exceeded before preparation completed".to_string()),
-            input.now,
-        );
+    let node_uid = Some(node.uid.clone());
+    let affected_sets = discover_affected_sets(&input.spec.node_name, input.pods);
+    let rediscovered = status.node_uid != node_uid || status.affected_sets != affected_sets;
+    status.node_uid = node_uid;
+    status.affected_sets = affected_sets;
+    if rediscovered || status.discovery_completed_at.is_none() {
+        status.discovery_completed_at = Some(input.now.to_string());
     }
-
-    status.node_uid = Some(node.uid.clone());
-    status.affected_sets = discover_affected_sets(&input.spec.node_name, input.pods);
-    status.discovery_completed_at = Some(input.now.to_string());
 
     let message = if status.affected_sets.is_empty() {
         format!("no kuberic replicas on node {}", input.spec.node_name)
@@ -517,6 +522,108 @@ mod tests {
         );
         let second = run(&spec, &first, Some(&node("uid-a")), &pods, false);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn unchanged_discovery_does_not_move_with_the_clock() {
+        let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
+        let spec = spec("worker-04");
+        let first = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &NodeMaintenanceRequestStatus::default(),
+            node: Some(&node("uid-a")),
+            pods: &pods,
+            now: NOW,
+            not_before_reached: true,
+            deadline_exceeded: false,
+        });
+        let later = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &first,
+            node: Some(&node("uid-a")),
+            pods: &pods,
+            now: "2026-09-06T21:30:00Z",
+            not_before_reached: true,
+            deadline_exceeded: false,
+        });
+        assert_eq!(
+            first, later,
+            "an unchanged request must not produce a new status on every reconcile"
+        );
+    }
+
+    #[test]
+    fn rediscovery_refreshes_the_completion_timestamp() {
+        let spec = spec("worker-04");
+        let first = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &NodeMaintenanceRequestStatus::default(),
+            node: Some(&node("uid-a")),
+            pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
+            now: NOW,
+            not_before_reached: true,
+            deadline_exceeded: false,
+        });
+        let later = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &first,
+            node: Some(&node("uid-a")),
+            pods: &[
+                pod("kv-0", "kv", Some("worker-04"), false),
+                pod("kv-1", "kv", Some("worker-04"), true),
+            ],
+            now: "2026-09-06T21:30:00Z",
+            not_before_reached: true,
+            deadline_exceeded: false,
+        });
+        assert_ne!(first.affected_sets, later.affected_sets);
+        assert_eq!(
+            later.discovery_completed_at.as_deref(),
+            Some("2026-09-06T21:30:00Z")
+        );
+    }
+
+    #[test]
+    fn deadline_expires_even_when_the_node_is_gone() {
+        let status = run(
+            &spec("worker-04"),
+            &NodeMaintenanceRequestStatus::default(),
+            None,
+            &[],
+            true,
+        );
+        assert_eq!(status.phase, MaintenancePhase::Expired);
+        assert_eq!(
+            status.blocked_reason,
+            Some(MaintenanceBlockedReason::DeadlineExceeded)
+        );
+    }
+
+    #[test]
+    fn an_elapsed_window_expires_even_before_not_before() {
+        let mut spec = spec("worker-04");
+        spec.not_before = Some("2026-09-06T23:00:00Z".to_string());
+
+        let status = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &NodeMaintenanceRequestStatus::default(),
+            node: Some(&node("uid-a")),
+            pods: &[],
+            now: NOW,
+            not_before_reached: false,
+            deadline_exceeded: true,
+        });
+
+        assert_eq!(status.phase, MaintenancePhase::Expired);
+        assert_eq!(
+            status.blocked_reason,
+            Some(MaintenanceBlockedReason::DeadlineExceeded)
+        );
     }
 
     #[test]

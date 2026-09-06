@@ -133,15 +133,12 @@ impl MaintenanceApi for KubeMaintenanceApi {
         status: &NodeMaintenanceRequestStatus,
     ) -> Result<(), String> {
         let api: kube::Api<NodeMaintenanceRequest> = kube::Api::all(self.client.clone());
-        let patch = serde_json::json!({ "status": status });
-        api.patch_status(
-            name,
-            &kube::api::PatchParams::apply("kuberic-operator").force(),
-            &kube::api::Patch::Apply(&patch),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        let mut current = api.get(name).await.map_err(|e| e.to_string())?;
+        current.status = Some(status.clone());
+        api.replace_status(name, &kube::api::PostParams::default(), &current)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 

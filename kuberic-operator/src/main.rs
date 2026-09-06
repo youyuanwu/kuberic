@@ -87,7 +87,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     )
                     .await
-                    .map(|_| Action::requeue(std::time::Duration::from_secs(30)))
+                    .map(|outcome| {
+                        if outcome.persisted {
+                            info!(
+                                request = %name,
+                                phase = ?outcome.status.phase,
+                                "node maintenance status updated"
+                            );
+                        }
+                        Action::requeue(std::time::Duration::from_secs(30))
+                    })
                     .map_err(OperatorError)
                 },
                 |_request: Arc<NodeMaintenanceRequest>, error, _api: Arc<KubeMaintenanceApi>| {
