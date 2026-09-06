@@ -478,6 +478,13 @@ struct KvClusterApi {
     /// Preserved data dirs from crashed pods (simulates PVC survival).
     data_dirs: Mutex<HashMap<String, PathBuf>>,
     statuses: Mutex<Vec<KubericSetStatus>>,
+    status_patch_attempts: Mutex<u64>,
+    status_patch_conflicts: Mutex<u64>,
+    status_patch_unknowns: Mutex<u64>,
+    status_patch_definite_failures: Mutex<u64>,
+    pod_list_api_calls: Mutex<u64>,
+    uid_label_patch_attempts: Mutex<u64>,
+    uid_label_patch_accepted: Mutex<u64>,
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
@@ -504,6 +511,13 @@ impl KvClusterApi {
             live_pods: Mutex::new(HashMap::new()),
             data_dirs: Mutex::new(HashMap::new()),
             statuses: Mutex::new(Vec::new()),
+            status_patch_attempts: Mutex::new(0),
+            status_patch_conflicts: Mutex::new(0),
+            status_patch_unknowns: Mutex::new(0),
+            status_patch_definite_failures: Mutex::new(0),
+            pod_list_api_calls: Mutex::new(0),
+            uid_label_patch_attempts: Mutex::new(0),
+            uid_label_patch_accepted: Mutex::new(0),
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(Vec::new())),
@@ -827,6 +841,7 @@ impl KvClusterApi {
 #[async_trait]
 impl ClusterApi for KvClusterApi {
     async fn list_pods(&self, _ns: &str, _sel: &str) -> Result<Vec<Pod>, String> {
+        *self.pod_list_api_calls.lock().unwrap() += 1;
         Ok(self.pods.lock().unwrap().clone())
     }
 
@@ -976,6 +991,7 @@ impl ClusterApi for KvClusterApi {
         expected_uid: &str,
         labels: BTreeMap<String, String>,
     ) -> Result<(), String> {
+        *self.uid_label_patch_attempts.lock().unwrap() += 1;
         let mut pods = self.pods.lock().unwrap();
         let pod = pods
             .iter_mut()
@@ -986,6 +1002,7 @@ impl ClusterApi for KvClusterApi {
         }
         let current = pod.metadata.labels.get_or_insert_with(BTreeMap::new);
         current.extend(labels);
+        *self.uid_label_patch_accepted.lock().unwrap() += 1;
         Ok(())
     }
 
@@ -996,14 +1013,18 @@ impl ClusterApi for KvClusterApi {
         status: &KubericSetStatus,
         _expected_resource_version: Option<&str>,
     ) -> Result<(), String> {
+        *self.status_patch_attempts.lock().unwrap() += 1;
         if std::mem::take(&mut *self.fail_next_status_conflict.lock().unwrap()) {
+            *self.status_patch_conflicts.lock().unwrap() += 1;
             return Err("resource version conflict".to_string());
         }
         if std::mem::take(&mut *self.fail_next_status_patch.lock().unwrap()) {
+            *self.status_patch_definite_failures.lock().unwrap() += 1;
             return Err("injected status persistence failure".to_string());
         }
         self.statuses.lock().unwrap().push(status.clone());
         if std::mem::take(&mut *self.fail_after_next_status_patch.lock().unwrap()) {
+            *self.status_patch_unknowns.lock().unwrap() += 1;
             return Err("injected status response loss after apply".to_string());
         }
         Ok(())
@@ -3558,7 +3579,15 @@ async fn test_reconciler_switchover() {
     };
 
     // Healthy → Switchover: set target_primary to a different pod
+    api.reset_operations();
     let switchover_status_writes_before = api.statuses.lock().unwrap().len();
+    let switchover_status_attempts_before = *api.status_patch_attempts.lock().unwrap();
+    let switchover_status_conflicts_before = *api.status_patch_conflicts.lock().unwrap();
+    let switchover_status_unknowns_before = *api.status_patch_unknowns.lock().unwrap();
+    let switchover_status_failures_before = *api.status_patch_definite_failures.lock().unwrap();
+    let switchover_pod_lists_before = *api.pod_list_api_calls.lock().unwrap();
+    let switchover_label_attempts_before = *api.uid_label_patch_attempts.lock().unwrap();
+    let switchover_label_accepted_before = *api.uid_label_patch_accepted.lock().unwrap();
     let set = make_set(
         "myapp",
         3,
@@ -3610,13 +3639,68 @@ async fn test_reconciler_switchover() {
         status.current_primary.as_deref(),
         Some(original_primary.as_str())
     );
+    let explicit_mutations = api
+        .operations()
+        .iter()
+        .filter(|operation| **operation != ControlOperation::GetStatus)
+        .count();
+    let explicit_labels = api
+        .uid_label_patch_accepted
+        .lock()
+        .unwrap()
+        .saturating_sub(switchover_label_accepted_before);
     println!(
-        "KUBERIC_SWITCHOVER_MEASUREMENT engine=explicit accepted_status_writes={}",
+        concat!(
+            "KUBERIC_SWITCHOVER_MEASUREMENT engine=explicit ",
+            "logical_external_effect_commands={} accepted_status_writes={} ",
+            "checkpoint_load_attempts=not_applicable(reason=explicit_uses_cr_status) ",
+            "checkpoint_write_attempts=not_applicable(reason=explicit_uses_cr_status) ",
+            "checkpoint_accepted_writes=not_applicable(reason=explicit_uses_cr_status) ",
+            "checkpoint_conflicts=not_applicable(reason=explicit_uses_cr_status) ",
+            "checkpoint_unknowns=not_applicable(reason=explicit_uses_cr_status) ",
+            "checkpoint_definite_failures=not_applicable(reason=explicit_uses_cr_status) ",
+            "latest_authoritative_checkpoint_bytes=not_applicable(reason=explicit_uses_cr_status) ",
+            "maximum_authoritative_checkpoint_bytes=not_applicable(reason=explicit_uses_cr_status) ",
+            "active_checkpoint_bytes=not_applicable(reason=explicit_uses_cr_status) ",
+            "maximum_active_checkpoint_bytes=not_applicable(reason=explicit_uses_cr_status) ",
+            "terminal_checkpoint_bytes=not_applicable(reason=explicit_uses_cr_status) ",
+            "maximum_terminal_checkpoint_bytes=not_applicable(reason=explicit_uses_cr_status) ",
+            "durable_boundary_count=not_applicable(reason=explicit_uses_cr_status) ",
+            "status_write_attempts={} status_write_conflicts={} status_write_unknowns={} ",
+            "status_write_definite_failures={} uid_label_attempts={} uid_label_accepted={} ",
+            "pod_list_api_calls={} requeues=unavailable(reason=harness_does_not_execute_controller_actions)"
+        ),
+        explicit_mutations as u64 + explicit_labels,
         api.statuses
             .lock()
             .unwrap()
             .len()
-            .saturating_sub(switchover_status_writes_before)
+            .saturating_sub(switchover_status_writes_before),
+        api.status_patch_attempts
+            .lock()
+            .unwrap()
+            .saturating_sub(switchover_status_attempts_before),
+        api.status_patch_conflicts
+            .lock()
+            .unwrap()
+            .saturating_sub(switchover_status_conflicts_before),
+        api.status_patch_unknowns
+            .lock()
+            .unwrap()
+            .saturating_sub(switchover_status_unknowns_before),
+        api.status_patch_definite_failures
+            .lock()
+            .unwrap()
+            .saturating_sub(switchover_status_failures_before),
+        api.uid_label_patch_attempts
+            .lock()
+            .unwrap()
+            .saturating_sub(switchover_label_attempts_before),
+        explicit_labels,
+        api.pod_list_api_calls
+            .lock()
+            .unwrap()
+            .saturating_sub(switchover_pod_lists_before),
     );
 
     // Write on new primary
@@ -3667,9 +3751,8 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         .map(|pod| pod.metadata.name.clone().unwrap())
         .find(|name| name != &original_primary)
         .unwrap();
-    let pilot_state = ReconcilerState::with_durable_switchover_store(
-        kuberic_durable_execution::InMemoryCheckpointStore::new(),
-    );
+    let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let pilot_state = ReconcilerState::with_durable_switchover_store(checkpoint_store.clone());
 
     reconcile_set(
         &make_pilot_set(
@@ -3688,6 +3771,13 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     .unwrap();
     let accepted = api.last_status().unwrap();
     let pilot_status_writes_after_acceptance = api.statuses.lock().unwrap().len();
+    let status_attempts_after_acceptance = *api.status_patch_attempts.lock().unwrap();
+    let status_conflicts_after_acceptance = *api.status_patch_conflicts.lock().unwrap();
+    let status_unknowns_after_acceptance = *api.status_patch_unknowns.lock().unwrap();
+    let status_failures_after_acceptance = *api.status_patch_definite_failures.lock().unwrap();
+    let pod_lists_after_acceptance = *api.pod_list_api_calls.lock().unwrap();
+    let label_attempts_after_acceptance = *api.uid_label_patch_attempts.lock().unwrap();
+    let label_accepted_after_acceptance = *api.uid_label_patch_accepted.lock().unwrap();
     assert_eq!(accepted.phase, Phase::Switchover);
     assert!(accepted.operation.is_none());
     assert!(accepted.durable_switchover_pilot.is_some());
@@ -3698,14 +3788,6 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     assert!(completed.operation.is_none());
     assert!(completed.durable_switchover_pilot.is_some());
     assert_stable_snapshot(&api, &completed, 3);
-    println!(
-        "KUBERIC_SWITCHOVER_MEASUREMENT engine=durable_pilot accepted_status_writes_after_acceptance={}",
-        api.statuses
-            .lock()
-            .unwrap()
-            .len()
-            .saturating_sub(pilot_status_writes_after_acceptance)
-    );
     let operations = api.operations();
     assert_eq!(
         operations
@@ -3722,9 +3804,76 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         2
     );
     let mutations: Vec<_> = operations
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|operation| *operation != ControlOperation::GetStatus)
         .collect();
+    let accepted_label_effects = api
+        .uid_label_patch_accepted
+        .lock()
+        .unwrap()
+        .saturating_sub(label_accepted_after_acceptance);
+    let external_effect_commands = mutations.len() as u64 + accepted_label_effects;
+    let reference = completed.durable_switchover_pilot.as_ref().unwrap();
+    let execution = kuberic_operator::durable::pilot::execution_spec(reference).unwrap();
+    use kuberic_durable_execution::CheckpointStore;
+    let terminal = checkpoint_store
+        .load(execution.execution_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let terminal_bytes = terminal.checkpoint().encoded_len().unwrap();
+    let terminal_payload = terminal
+        .checkpoint()
+        .decode_and_validate(
+            &execution,
+            kuberic_operator::durable::pilot::checkpoint_limits(),
+        )
+        .unwrap();
+    let durable_boundary_count = terminal_payload.terminal_outcome().unwrap().1;
+    println!(
+        concat!(
+            "KUBERIC_SWITCHOVER_MEASUREMENT engine=durable_pilot ",
+            "logical_external_effect_commands={} durable_boundary_count={} ",
+            "terminal_checkpoint_bytes={} accepted_status_writes_after_acceptance={} ",
+            "status_write_attempts={} status_write_conflicts={} status_write_unknowns={} ",
+            "status_write_definite_failures={} uid_label_attempts={} uid_label_accepted={} ",
+            "pod_list_api_calls={} requeues=unavailable(reason=harness_does_not_execute_controller_actions)"
+        ),
+        external_effect_commands,
+        durable_boundary_count,
+        terminal_bytes,
+        api.statuses
+            .lock()
+            .unwrap()
+            .len()
+            .saturating_sub(pilot_status_writes_after_acceptance),
+        api.status_patch_attempts
+            .lock()
+            .unwrap()
+            .saturating_sub(status_attempts_after_acceptance),
+        api.status_patch_conflicts
+            .lock()
+            .unwrap()
+            .saturating_sub(status_conflicts_after_acceptance),
+        api.status_patch_unknowns
+            .lock()
+            .unwrap()
+            .saturating_sub(status_unknowns_after_acceptance),
+        api.status_patch_definite_failures
+            .lock()
+            .unwrap()
+            .saturating_sub(status_failures_after_acceptance),
+        api.uid_label_patch_attempts
+            .lock()
+            .unwrap()
+            .saturating_sub(label_attempts_after_acceptance),
+        accepted_label_effects,
+        api.pod_list_api_calls
+            .lock()
+            .unwrap()
+            .saturating_sub(pod_lists_after_acceptance),
+    );
     assert_eq!(
         mutations,
         vec![

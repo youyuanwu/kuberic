@@ -3080,10 +3080,18 @@ async fn publish_pilot_terminal(
                     checkpoint_accepted_writes = measurements.accepted_writes,
                     checkpoint_conflicts = measurements.conflicts,
                     checkpoint_unknown_outcomes = measurements.unknown_outcomes,
+                    checkpoint_definite_failures = measurements.definite_failures,
                     latest_authoritative_checkpoint_bytes =
                         ?measurements.latest_authoritative_checkpoint_bytes,
                     maximum_authoritative_checkpoint_bytes =
                         measurements.maximum_authoritative_checkpoint_bytes,
+                    maximum_active_checkpoint_bytes =
+                        measurements.maximum_active_checkpoint_bytes,
+                    latest_terminal_checkpoint_bytes =
+                        ?measurements.latest_terminal_checkpoint_bytes,
+                    maximum_terminal_checkpoint_bytes =
+                        measurements.maximum_terminal_checkpoint_bytes,
+                    durable_boundary_count = ?measurements.completed_activity_count,
                     "durable switchover pilot process summary"
                 );
             }

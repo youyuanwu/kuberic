@@ -332,6 +332,7 @@ enum DurableSwitchoverTerminalRecord {
 // COMPLEXITY-BOUNDARY: pilot-workflow:start
 pub struct DurableSwitchoverWorkflow;
 
+// COMPLEXITY-BOUNDARY: pilot-workflow-body:start
 #[async_trait]
 impl Workflow for DurableSwitchoverWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
@@ -507,6 +508,7 @@ impl Workflow for DurableSwitchoverWorkflow {
         )
     }
 }
+// COMPLEXITY-BOUNDARY: pilot-workflow-body:end
 
 fn advance_effect_free(
     operation: &DurableOperationStatus,

@@ -33,6 +33,7 @@ use super::{correlated_action_observation, fail_closed, record_activity_error};
 
 const MAX_EFFECT_DIAGNOSTIC_BYTES: usize = 512;
 
+// COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:start
 /// Exact compact command persisted before one correlated replica dispatch.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -691,6 +692,7 @@ pub(crate) fn exact_label_command(
 fn bounded(value: &str) -> String {
     value.chars().take(MAX_EFFECT_DIAGNOSTIC_BYTES).collect()
 }
+// COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:end
 
 #[cfg(test)]
 mod tests {
