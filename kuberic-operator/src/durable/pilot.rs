@@ -2276,7 +2276,7 @@ mod durable_switchover_pilot_tests {
             dispatch_action_payload:
                 kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
                     &DurableReplicaAction::ChangeRole {
-                        epoch: target_epoch.clone(),
+                        epoch: target_epoch,
                         role: Role::Primary,
                     },
                 )
@@ -2295,7 +2295,7 @@ mod durable_switchover_pilot_tests {
             DurableReplicaAction::ChangeRole {
                 epoch: Epoch {
                     configuration_number: target_epoch.configuration_number + 1,
-                    ..target_epoch.clone()
+                    ..target_epoch
                 },
                 role: Role::Primary,
             },

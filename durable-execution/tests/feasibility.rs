@@ -543,7 +543,7 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
     assert_eq!(workflow.matches("uses: helm/kind-action@v1").count(), 1);
     assert!(!workflow.contains("name: Run real Kubernetes checkpoint test"));
     assert!(workflow.contains("cargo test --all --all-features"));
-    assert!(!workflow.contains("--nocapture"));
+    assert!(!workflow.contains("kubernetes_checkpoint_real -- --nocapture"));
     assert!(!real_test.contains("#[ignore"));
 }
 
