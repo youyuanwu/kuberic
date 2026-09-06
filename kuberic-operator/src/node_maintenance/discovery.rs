@@ -50,7 +50,7 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
         );
     }
 
-    if input.previous.phase.is_terminal() {
+    if input.previous.phase.is_terminal() || input.previous.phase == MaintenancePhase::Releasing {
         return status;
     }
 
@@ -201,12 +201,23 @@ fn set_prepared_condition(status: &mut NodeMaintenanceRequestStatus, now: &str) 
         (false, Some(reason)) => format!("{reason:?}"),
         (false, None) => format!("{:?}", status.phase),
     };
+    let condition_status = if prepared { "True" } else { "False" }.to_string();
+    let existing = status
+        .conditions
+        .iter()
+        .find(|existing| existing.type_ == PREPARED_CONDITION_TYPE);
+    let last_transition_time = match existing {
+        Some(existing) if existing.status == condition_status => {
+            existing.last_transition_time.clone()
+        }
+        _ => now.to_string(),
+    };
     let condition = StatusCondition {
         type_: PREPARED_CONDITION_TYPE.to_string(),
-        status: if prepared { "True" } else { "False" }.to_string(),
+        status: condition_status,
         reason,
         message: status.message.clone().unwrap_or_default(),
-        last_transition_time: now.to_string(),
+        last_transition_time,
     };
 
     let unchanged = status.conditions.iter().any(|existing| {
@@ -494,7 +505,6 @@ mod tests {
             blocked_reason: Some(MaintenanceBlockedReason::DeadlineExceeded),
             ..Default::default()
         };
-
         let status = run(
             &spec("worker-04"),
             &previous,
@@ -504,6 +514,29 @@ mod tests {
         );
         assert_eq!(status.phase, MaintenancePhase::Expired);
         assert!(status.affected_sets.is_empty());
+    }
+
+    #[test]
+    fn a_releasing_request_is_not_redriven_by_a_reverted_desired_state() {
+        let previous = NodeMaintenanceRequestStatus {
+            phase: MaintenancePhase::Releasing,
+            message: Some("release requested: Complete".to_string()),
+            ..Default::default()
+        };
+        let status = run(
+            &spec("worker-04"),
+            &previous,
+            Some(&node("uid-a")),
+            &[pod("kv-0", "kv", Some("worker-04"), false)],
+            false,
+        );
+        assert_eq!(status.phase, MaintenancePhase::Releasing);
+        assert!(status.affected_sets.is_empty());
+        assert!(status.discovery_completed_at.is_none());
+        assert_eq!(
+            status.message.as_deref(),
+            Some("release requested: Complete")
+        );
     }
 
     #[test]
@@ -584,6 +617,45 @@ mod tests {
         assert_eq!(
             later.discovery_completed_at.as_deref(),
             Some("2026-09-06T21:30:00Z")
+        );
+    }
+
+    #[test]
+    fn condition_transition_time_survives_a_message_only_change() {
+        let spec = spec("worker-04");
+        let first = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &NodeMaintenanceRequestStatus::default(),
+            node: Some(&node("uid-a")),
+            pods: &[pod("kv-0", "kv", Some("worker-04"), false)],
+            now: NOW,
+            not_before_reached: true,
+            deadline_exceeded: false,
+        });
+        let first_condition = first.conditions.first().expect("condition").clone();
+        assert_eq!(first_condition.status, "False");
+
+        let later = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &first,
+            node: Some(&node("uid-a")),
+            pods: &[
+                pod("kv-0", "kv", Some("worker-04"), false),
+                pod("kv-1", "kv", Some("worker-04"), true),
+            ],
+            now: "2026-09-06T22:00:00Z",
+            not_before_reached: true,
+            deadline_exceeded: false,
+        });
+        let later_condition = later.conditions.first().expect("condition");
+
+        assert_ne!(first.message, later.message);
+        assert_eq!(later_condition.status, "False");
+        assert_eq!(
+            later_condition.last_transition_time, first_condition.last_transition_time,
+            "lastTransitionTime must change only when the condition status changes"
         );
     }
 

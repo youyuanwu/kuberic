@@ -53,6 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Controller::new(requests, watcher::Config::default())
             .run(
                 |request: Arc<NodeMaintenanceRequest>, api: Arc<KubeMaintenanceApi>| async move {
+                    if request.metadata.deletion_timestamp.is_some() {
+                        return Ok(Action::await_change());
+                    }
                     let name = request
                         .metadata
                         .name

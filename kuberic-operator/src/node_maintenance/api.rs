@@ -181,7 +181,7 @@ impl MaintenancePhase {
             ),
             Self::Prepared => matches!(
                 next,
-                Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
+                Self::Preparing | Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
             ),
             Self::Blocked => matches!(
                 next,
