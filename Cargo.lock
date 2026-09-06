@@ -1396,6 +1396,8 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kuberic-core",
+ "kuberic-durable-execution",
+ "rand",
  "schemars",
  "serde",
  "serde_json",

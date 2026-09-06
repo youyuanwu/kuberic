@@ -9,12 +9,21 @@ description = "Kubernetes operator for kuberic — manages KubericSet CRDs, pod 
 readme = "README.md"
 publish = false
 
+[features]
+default = []
+durable-switchover-pilot = [
+    "dep:kuberic-durable-execution",
+    "kuberic-durable-execution/kubernetes",
+    "dep:rand",
+]
+
 [[bin]]
 name = "kuberic-operator"
 path = "src/main.rs"
 
 [dependencies]
 kuberic-core = { path = "../kuberic-core" }
+kuberic-durable-execution = { path = "../durable-execution", optional = true }
 kube.workspace = true
 k8s-openapi.workspace = true
 schemars.workspace = true
@@ -27,6 +36,7 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+rand = { workspace = true, optional = true }
 
 [dev-dependencies]
 kuberic-core = { path = "../kuberic-core", features = ["testing"] }

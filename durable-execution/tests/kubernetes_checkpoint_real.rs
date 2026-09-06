@@ -61,7 +61,7 @@ impl MaskOnceStore {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CheckpointStore for MaskOnceStore {
     async fn load(
         &self,
@@ -106,7 +106,7 @@ struct OneActivityWorkflow {
     activity: ActivitySpec,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for OneActivityWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         TerminalOutcome::succeeded(context.activity(self.activity.clone()).await)

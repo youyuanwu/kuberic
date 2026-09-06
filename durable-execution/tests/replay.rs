@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
@@ -10,6 +10,22 @@ use kuberic_durable_execution::{
 };
 
 const MAX_RESULT_BYTES: u64 = 1024;
+
+struct Cell(AtomicUsize);
+
+impl Cell {
+    fn new(value: usize) -> Self {
+        Self(AtomicUsize::new(value))
+    }
+
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, value: usize) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+}
 
 fn execution(byte: u8) -> ExecutionId {
     ExecutionId::from_bytes([byte; 16])
@@ -36,7 +52,7 @@ struct LinearWorkflow {
     activities: Vec<ActivitySpec>,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for LinearWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         let mut results = Vec::new();
@@ -408,10 +424,10 @@ fn rejects_invalid_sequence_and_pending_shapes() {
 }
 
 struct PollCountingWorkflow {
-    polls: Cell<u32>,
+    polls: Cell,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for PollCountingWorkflow {
     async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         self.polls.set(self.polls.get() + 1);

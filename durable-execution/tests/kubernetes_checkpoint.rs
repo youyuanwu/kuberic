@@ -827,7 +827,7 @@ async fn data_budget_validates_configuration_and_exact_write_boundary() {
 
 struct ImmediateWorkflow;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for ImmediateWorkflow {
     async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         TerminalOutcome::succeeded(ExactBytes::new(b"done".to_vec()))

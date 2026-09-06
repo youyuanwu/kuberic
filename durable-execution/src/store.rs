@@ -127,8 +127,8 @@ pub enum CasOutcome {
 /// A provider must return [`CasOutcome::OutcomeUnknown`] whenever it cannot
 /// prove whether a CAS was accepted. `StoreError` is reserved for definitely
 /// local or pre-request failures that could not have applied the mutation.
-#[async_trait(?Send)]
-pub trait CheckpointStore {
+#[async_trait]
+pub trait CheckpointStore: Send + Sync {
     async fn load(&self, execution_id: ExecutionId)
     -> Result<Option<StoredCheckpoint>, StoreError>;
 

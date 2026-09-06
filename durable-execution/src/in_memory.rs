@@ -64,7 +64,7 @@ impl InMemoryCheckpointStore {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CheckpointStore for InMemoryCheckpointStore {
     async fn load(
         &self,

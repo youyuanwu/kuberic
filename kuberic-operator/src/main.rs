@@ -31,11 +31,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sets: Api<KubericSet> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
 
+    #[cfg(feature = "durable-switchover-pilot")]
+    let state = ReconcilerState::with_durable_switchover_client(client.clone());
+    #[cfg(not(feature = "durable-switchover-pilot"))]
+    let state = ReconcilerState::default();
+
     let ctx = Arc::new(Context {
         api: KubeClusterApi {
             client: client.clone(),
         },
-        state: ReconcilerState::default(),
+        state,
     });
 
     info!("Watching KubericSets");

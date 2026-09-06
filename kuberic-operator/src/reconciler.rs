@@ -32,6 +32,8 @@ use crate::crd::{
     StableReplicaElectionMetadataStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
     StatusCondition,
 };
+#[cfg(feature = "durable-switchover-pilot")]
+use crate::durable::pilot::DurableSwitchoverPilotRuntime;
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
     RemoveReplicaTarget, ReplicaObservation, adopt_replacement_before_confirmation,
@@ -50,6 +52,8 @@ pub struct ReconcilerState {
     /// corresponding runtime topology had already committed.
     pending_statuses: Mutex<HashMap<String, KubericSetStatus>>,
     removal_clock: Arc<dyn RemoveReplicaClock>,
+    #[cfg(feature = "durable-switchover-pilot")]
+    pub durable_switchover_pilot: Option<Arc<DurableSwitchoverPilotRuntime>>,
 }
 
 impl Default for ReconcilerState {
@@ -58,6 +62,8 @@ impl Default for ReconcilerState {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
+            #[cfg(feature = "durable-switchover-pilot")]
+            durable_switchover_pilot: None,
         }
     }
 }
@@ -68,6 +74,34 @@ impl ReconcilerState {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: clock,
+            #[cfg(feature = "durable-switchover-pilot")]
+            durable_switchover_pilot: None,
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    pub fn with_durable_switchover_client(client: kube::Client) -> Self {
+        Self {
+            drivers: Mutex::new(HashMap::new()),
+            pending_statuses: Mutex::new(HashMap::new()),
+            removal_clock: Arc::new(SystemRemoveReplicaClock),
+            durable_switchover_pilot: Some(Arc::new(DurableSwitchoverPilotRuntime::kubernetes(
+                client,
+            ))),
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    pub fn with_durable_switchover_store(
+        store: kuberic_durable_execution::InMemoryCheckpointStore,
+    ) -> Self {
+        Self {
+            drivers: Mutex::new(HashMap::new()),
+            pending_statuses: Mutex::new(HashMap::new()),
+            removal_clock: Arc::new(SystemRemoveReplicaClock),
+            durable_switchover_pilot: Some(Arc::new(DurableSwitchoverPilotRuntime::in_memory(
+                store,
+            ))),
         }
     }
 }
@@ -2457,6 +2491,7 @@ async fn apply_failover_decision(
                 members,
                 stable_snapshot: Some(snapshot),
                 operation: None,
+                durable_switchover_pilot: None,
                 conditions: Vec::new(),
                 primary_failing_since: None,
                 stable_election_metadata_refresh: None,

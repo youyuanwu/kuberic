@@ -1073,6 +1073,7 @@ fn make_set_with_min(
             image: "test:latest".to_string(),
             failover_delay: 0,
             switchover_delay: 3600,
+            switchover_execution_mode: Default::default(),
             port: 8080,
             control_port: 9090,
             data_port: 9091,

@@ -39,8 +39,8 @@ impl TerminalOutcome {
 }
 
 /// Provisional ordinary-async workflow authoring surface.
-#[async_trait(?Send)]
-pub trait Workflow {
+#[async_trait]
+pub trait Workflow: Sync {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome;
 }
 
