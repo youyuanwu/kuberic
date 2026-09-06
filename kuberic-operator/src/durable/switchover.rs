@@ -425,6 +425,7 @@ pub fn decide(
     }
 }
 
+#[cfg(feature = "durable-switchover-pilot")]
 pub(crate) fn validate_switchover_operation(
     operation: &DurableOperationStatus,
 ) -> Result<(), String> {

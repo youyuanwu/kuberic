@@ -29,7 +29,8 @@ clap.workspace = true
 [dev-dependencies]
 test-log.workspace = true
 kvstore = { path = ".", features = ["testing"] }
-kuberic-operator = { path = "../../kuberic-operator" }
+kuberic-operator = { path = "../../kuberic-operator", features = ["durable-switchover-pilot"] }
+kuberic-durable-execution = { path = "../../durable-execution" }
 k8s-openapi.workspace = true
 kube.workspace = true
 async-trait.workspace = true

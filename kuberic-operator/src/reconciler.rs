@@ -23,6 +23,8 @@ use kuberic_core::types::{
     ReplicaElectionConfiguration, ReplicaStatusInfo,
 };
 use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, StablePartitionSnapshot};
+#[cfg(feature = "durable-switchover-pilot")]
+use kuberic_durable_execution::{ActivityObservation, ActivityState, CheckpointStore, HostOutcome};
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
@@ -35,7 +37,11 @@ use crate::crd::{
 #[cfg(feature = "durable-switchover-pilot")]
 use crate::durable::pilot::DurableSwitchoverPilotRuntime;
 #[cfg(feature = "durable-switchover-pilot")]
-use crate::durable::pilot::{DurableSwitchoverStepResult, PilotAdapterDecision, PilotPermitGuard};
+use crate::durable::pilot::{
+    DurableSwitchoverPilotTerminal, DurableSwitchoverStepResult, DurableSwitchoverWorkflow,
+    PilotAdapterDecision, PilotPermitGuard, decode_terminal, encode_step_result,
+    evaluate_adapter_step, execution_spec, initial_operation, new_pilot_reference,
+};
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
     RemoveReplicaTarget, ReplicaObservation, adopt_replacement_before_confirmation,
@@ -179,10 +185,7 @@ fn validate_new_switchover_engine(mode: crate::crd::SwitchoverExecutionMode) -> 
         crate::crd::SwitchoverExecutionMode::DurablePilot => {
             #[cfg(feature = "durable-switchover-pilot")]
             {
-                Err(
-                    "durable switchover pilot is compiled but its reconciliation adapter is not connected"
-                        .to_string(),
-                )
+                Ok(())
             }
             #[cfg(not(feature = "durable-switchover-pilot"))]
             {
@@ -778,21 +781,58 @@ pub async fn reconcile_set(
     if let Some(pending) = pending_status {
         if set.status.as_ref() == Some(&pending) {
             state.pending_statuses.lock().await.remove(&set_key);
+            #[cfg(feature = "durable-switchover-pilot")]
+            cleanup_persisted_pilot(state, set, &pending, &set_key).await;
             return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
         }
-        api.patch_set_status(
-            &namespace,
-            &name,
-            &pending,
-            set.metadata.resource_version.as_deref(),
-        )
-        .await?;
+        if api
+            .patch_set_status(
+                &namespace,
+                &name,
+                &pending,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await
+            .is_err()
+        {
+            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+        }
         state.pending_statuses.lock().await.remove(&set_key);
+        #[cfg(feature = "durable-switchover-pilot")]
+        cleanup_persisted_pilot(state, set, &pending, &set_key).await;
         return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
     }
 
     let label_selector = format!("kuberic.io/set={}", name);
-    let pods = api.list_pods(&namespace, &label_selector).await?;
+    let pods = match api.list_pods(&namespace, &label_selector).await {
+        Ok(pods) => pods,
+        Err(error) => {
+            #[cfg(feature = "durable-switchover-pilot")]
+            if set.status.as_ref().is_some_and(|status| {
+                status.phase == Phase::Switchover
+                    && status.operation.is_none()
+                    && status.durable_switchover_pilot.is_some()
+            }) {
+                let mut status = set.status.clone().unwrap_or_default();
+                set_pilot_condition(
+                    &mut status,
+                    "ObservationUnavailable",
+                    &format!("pod observation failed: {error}"),
+                    unix_seconds(),
+                );
+                let _ = api
+                    .patch_set_status(
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await;
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+            return Err(error);
+        }
+    };
 
     let ready_pods: Vec<&Pod> = pods.iter().filter(|p| is_pod_ready(p)).collect();
 
@@ -1641,6 +1681,45 @@ pub async fn reconcile_set(
                 drop(drivers);
                 info!(name, current = %current, target = %target, "switchover requested");
                 let now = unix_seconds();
+                #[cfg(feature = "durable-switchover-pilot")]
+                if set.spec.switchover_execution_mode
+                    == crate::crd::SwitchoverExecutionMode::DurablePilot
+                {
+                    if state.durable_switchover_pilot.is_none() {
+                        return Err(
+                            "durable switchover pilot runtime is not configured".to_string()
+                        );
+                    }
+                    let reference = new_pilot_reference(
+                        set.metadata.uid.as_deref().ok_or_else(|| {
+                            "durable switchover pilot requires KubericSet UID".to_string()
+                        })?,
+                        previous_snapshot,
+                        target_id,
+                        now,
+                    )?;
+                    let mut status = KubericSetStatus {
+                        phase: Phase::Switchover,
+                        operation: None,
+                        durable_switchover_pilot: Some(reference),
+                        ..set.status.clone().unwrap_or_default()
+                    };
+                    set_pilot_condition(
+                        &mut status,
+                        "Accepted",
+                        "pilot reference persisted before checkpoint creation",
+                        now,
+                    );
+                    api.patch_set_status(
+                        &namespace,
+                        &name,
+                        &status,
+                        set.metadata.resource_version.as_deref(),
+                    )
+                    .await?;
+                    state.drivers.lock().await.remove(&set_key);
+                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                }
                 let operation = start_switchover(
                     set.metadata.uid.as_deref().unwrap_or(&set_key),
                     previous_snapshot,
@@ -1650,6 +1729,7 @@ pub async fn reconcile_set(
                 let mut status = KubericSetStatus {
                     phase: Phase::Switchover,
                     operation: Some(operation.clone()),
+                    durable_switchover_pilot: None,
                     ..set.status.clone().unwrap_or_default()
                 };
                 set_operation_condition(&mut status, operation_condition(&operation, now));
@@ -1848,7 +1928,50 @@ pub async fn reconcile_set(
             .await
         }
 
-        Phase::Switchover | Phase::AddingReplica | Phase::RemovingReplica => {
+        Phase::Switchover => {
+            #[cfg(feature = "durable-switchover-pilot")]
+            if set.status.as_ref().is_some_and(|status| {
+                status.operation.is_none() && status.durable_switchover_pilot.is_some()
+            }) {
+                return match Box::pin(reconcile_durable_switchover_pilot(
+                    set,
+                    api,
+                    state,
+                    &pods,
+                    &ready_pods,
+                ))
+                .await
+                {
+                    Ok(action) => Ok(action),
+                    Err(error) => {
+                        warn!(name, error, "durable switchover pilot reconcile blocked");
+                        let now = unix_seconds();
+                        let mut status = set.status.clone().unwrap_or_default();
+                        set_pilot_condition(&mut status, "Blocked", &error, now);
+                        let _ = api
+                            .patch_set_status(
+                                &namespace,
+                                &name,
+                                &status,
+                                set.metadata.resource_version.as_deref(),
+                            )
+                            .await;
+                        Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+                    }
+                };
+            }
+            Box::pin(reconcile_durable_operation(
+                set,
+                api,
+                state,
+                &pods,
+                &ready_pods,
+                &set_key,
+            ))
+            .await
+        }
+
+        Phase::AddingReplica | Phase::RemovingReplica => {
             Box::pin(reconcile_durable_operation(
                 set,
                 api,
@@ -2853,6 +2976,525 @@ async fn apply_failover_decision(
     }
 }
 
+#[cfg(feature = "durable-switchover-pilot")]
+async fn reconcile_durable_switchover_pilot(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+    _ready_pods: &[&Pod],
+) -> Result<ReconcileAction, String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let name = set.name_any();
+    let set_uid = set
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| "active durable switchover pilot has no KubericSet UID".to_string())?;
+    let reference = set
+        .status
+        .as_ref()
+        .and_then(|status| status.durable_switchover_pilot.as_ref())
+        .ok_or_else(|| "switchover phase has no durable pilot reference".to_string())?;
+    let runtime = state
+        .durable_switchover_pilot
+        .as_ref()
+        .ok_or_else(|| "durable switchover pilot runtime is not configured".to_string())?;
+    let execution = execution_spec(reference)?;
+    let host = runtime.host(&namespace, &name, set_uid, reference).await?;
+    let store = { host.lock().await.store().clone() };
+    let loaded = store
+        .load(execution.execution_id())
+        .await
+        .map_err(|error| format!("load durable switchover checkpoint: {error}"))?;
+    if let Some(terminal) = loaded_pilot_terminal(loaded.as_ref(), &execution)? {
+        return publish_pilot_terminal(set, api, state, terminal, unix_seconds()).await;
+    }
+    let operation = current_pilot_operation(reference, &execution, loaded.as_ref())?;
+
+    let current_pods = checked_pods_by_id(pods)?;
+    for member in &operation.previous_snapshot.members {
+        let Some((_, instance_id, _)) = current_pods.iter().find(|(id, _, _)| *id == member.id)
+        else {
+            return Err(format!(
+                "durable switchover pilot replica {} has no current pod",
+                member.id
+            ));
+        };
+        if instance_id.as_str() != member.instance_id {
+            return Err(format!(
+                "durable switchover pilot replica {} incarnation changed",
+                member.id
+            ));
+        }
+    }
+
+    let mut handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::new();
+    let mut observations = OperationObservations::new();
+    for (replica_id, _, pod) in &current_pods {
+        if !operation
+            .target_snapshot
+            .members
+            .iter()
+            .any(|member| member.id == *replica_id)
+        {
+            continue;
+        }
+        let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await else {
+            continue;
+        };
+        if let Ok(status) = handle.get_status().await {
+            observations.insert(
+                *replica_id,
+                ReplicaObservation {
+                    status,
+                    control_address: handle.control_address(),
+                    replicator_address: handle.replicator_address(),
+                    pod_name: pod.name_any(),
+                    pod_role_label: pod
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("kuberic.io/role"))
+                        .cloned(),
+                },
+            );
+        }
+        handles.insert(*replica_id, handle);
+    }
+
+    let now = unix_seconds();
+    let decision = evaluate_adapter_step(&operation, &observations, now)?;
+    if checkpoint_is_scheduled(loaded.as_ref(), &execution)?
+        && !pilot_decision_ready(&decision, &observations, &handles)
+    {
+        record_pilot_wait_condition(
+            set,
+            api,
+            "AwaitingReplicaObservation",
+            "scheduled pilot activity is waiting for an exact replica observation and handle",
+            now,
+        )
+        .await;
+        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+    }
+
+    let mut host = host.lock().await;
+    let outcome = host
+        .turn(&DurableSwitchoverWorkflow, execution.clone())
+        .await;
+    host.store().correlate_host_outcome(&outcome);
+    match outcome {
+        HostOutcome::ScheduleAccepted { .. } | HostOutcome::ObservationAccepted { .. } => {
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        outcome @ (HostOutcome::ReloadRequired { .. } | HostOutcome::StoreFailed { .. }) => {
+            pilot_host_outcome_action(set, api, &outcome, now).await
+        }
+        HostOutcome::DispatchPermitted { permit, .. } => {
+            let activity = permit.activity().clone();
+            let mut guard = PilotPermitGuard::new(permit);
+            match bridge_pilot_permitted_step(
+                &mut guard,
+                &operation,
+                decision,
+                &observations,
+                &handles,
+                api,
+                &namespace,
+            )
+            .await?
+            {
+                PilotEffectBridgeOutcome::Observe(result) => {
+                    let result = enrich_pilot_terminal_result(*result, &observations);
+                    let observed = host
+                        .observe(
+                            &execution,
+                            ActivityObservation::new(activity, encode_step_result(&result)?),
+                        )
+                        .await;
+                    host.store().correlate_host_outcome(&observed);
+                    return pilot_host_outcome_action(set, api, &observed, now).await;
+                }
+                PilotEffectBridgeOutcome::Exposed => {
+                    record_pilot_wait_condition(
+                        set,
+                        api,
+                        "EffectExposed",
+                        "correlated effect was exposed and awaits authoritative observation",
+                        now,
+                    )
+                    .await;
+                }
+                PilotEffectBridgeOutcome::AwaitEvidence => {
+                    record_pilot_wait_condition(
+                        set,
+                        api,
+                        "AwaitingReplicaObservation",
+                        "pilot activity is waiting for exact replica or dispatch evidence",
+                        now,
+                    )
+                    .await;
+                }
+            }
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        HostOutcome::Quarantined { activity, .. } => {
+            match resolve_pilot_quarantine(&operation, decision, &observations)? {
+                PilotEffectBridgeOutcome::Observe(result) => {
+                    let result = enrich_pilot_terminal_result(*result, &observations);
+                    let observed = host
+                        .observe(
+                            &execution,
+                            ActivityObservation::new(activity, encode_step_result(&result)?),
+                        )
+                        .await;
+                    host.store().correlate_host_outcome(&observed);
+                    return pilot_host_outcome_action(set, api, &observed, now).await;
+                }
+                PilotEffectBridgeOutcome::Exposed | PilotEffectBridgeOutcome::AwaitEvidence => {
+                    record_pilot_wait_condition(
+                        set,
+                        api,
+                        "Quarantined",
+                        "exposed pilot activity remains quarantined pending authoritative evidence",
+                        now,
+                    )
+                    .await;
+                }
+            }
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        HostOutcome::WorkflowCompleted { outcome, .. } => {
+            let terminal = decode_terminal(&outcome)?;
+            publish_pilot_terminal(set, api, state, terminal, now).await
+        }
+        HostOutcome::Nondeterminism(error) => {
+            Err(format!("durable switchover workflow changed: {error}"))
+        }
+        HostOutcome::CheckpointRejected(error) => {
+            Err(format!("durable switchover checkpoint rejected: {error}"))
+        }
+        HostOutcome::ObservationRejected(error) => Err(format!(
+            "durable switchover observation rejected: {error:?}"
+        )),
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+async fn pilot_host_outcome_action(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    outcome: &HostOutcome,
+    now: i64,
+) -> Result<ReconcileAction, String> {
+    let diagnostic = match outcome {
+        HostOutcome::ObservationAccepted { .. } | HostOutcome::ScheduleAccepted { .. } => None,
+        HostOutcome::ReloadRequired { boundary, reason } => Some((
+            "ReloadRequired",
+            format!("checkpoint {boundary:?} requires reload after {reason:?}"),
+        )),
+        HostOutcome::StoreFailed { operation, error } => Some((
+            "StorageUnavailable",
+            format!("checkpoint {operation:?} failed: {error}"),
+        )),
+        HostOutcome::ObservationRejected(error) => {
+            return Err(format!(
+                "durable switchover observation rejected: {error:?}"
+            ));
+        }
+        HostOutcome::CheckpointRejected(error) => {
+            return Err(format!("durable switchover checkpoint rejected: {error}"));
+        }
+        HostOutcome::Nondeterminism(error) => {
+            return Err(format!("durable switchover workflow changed: {error}"));
+        }
+        HostOutcome::DispatchPermitted { .. }
+        | HostOutcome::Quarantined { .. }
+        | HostOutcome::WorkflowCompleted { .. } => {
+            return Err("unexpected durable switchover host outcome routing".to_string());
+        }
+    };
+    if let Some((reason, message)) = diagnostic {
+        let mut status = set.status.clone().unwrap_or_default();
+        set_pilot_condition(&mut status, reason, &message, now);
+        let _ = api
+            .patch_set_status(
+                &set.namespace().unwrap_or_default(),
+                &set.name_any(),
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await;
+    }
+    Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+async fn record_pilot_wait_condition(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    reason: &str,
+    message: &str,
+    now: i64,
+) {
+    let unchanged = set.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.type_ == "DurableSwitchoverPilot"
+                && condition.reason == reason
+                && condition.message == message
+        })
+    });
+    if unchanged {
+        return;
+    }
+    let mut status = set.status.clone().unwrap_or_default();
+    set_pilot_condition(&mut status, reason, message, now);
+    let _ = api
+        .patch_set_status(
+            &set.namespace().unwrap_or_default(),
+            &set.name_any(),
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await;
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn loaded_pilot_terminal(
+    loaded: Option<&kuberic_durable_execution::StoredCheckpoint>,
+    execution: &kuberic_durable_execution::ExecutionSpec,
+) -> Result<Option<DurableSwitchoverPilotTerminal>, String> {
+    let Some(stored) = loaded else {
+        return Ok(None);
+    };
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(execution, crate::durable::pilot::checkpoint_limits())
+        .map_err(|error| format!("decode durable switchover checkpoint: {error}"))?;
+    payload
+        .terminal_outcome()
+        .map(|(outcome, _)| decode_terminal(outcome).map(Some))
+        .transpose()
+        .map(Option::flatten)
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn enrich_pilot_terminal_result(
+    result: DurableSwitchoverStepResult,
+    observations: &OperationObservations,
+) -> DurableSwitchoverStepResult {
+    match result {
+        DurableSwitchoverStepResult::Complete {
+            operation,
+            snapshot,
+            compensated,
+        } => DurableSwitchoverStepResult::Complete {
+            operation,
+            snapshot: snapshot_with_observed_metadata(snapshot, observations),
+            compensated,
+        },
+        other => other,
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+async fn publish_pilot_terminal(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    terminal: DurableSwitchoverPilotTerminal,
+    now: i64,
+) -> Result<ReconcileAction, String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let name = set.name_any();
+    let set_key = format!("{namespace}/{name}");
+    let set_uid = set
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| "terminal durable switchover pilot has no KubericSet UID".to_string())?;
+    let reference = set
+        .status
+        .as_ref()
+        .and_then(|status| status.durable_switchover_pilot.as_ref())
+        .ok_or_else(|| "terminal durable switchover pilot has no reference".to_string())?;
+    let runtime = state
+        .durable_switchover_pilot
+        .as_ref()
+        .ok_or_else(|| "terminal durable switchover pilot runtime is not configured".to_string())?;
+    match terminal {
+        DurableSwitchoverPilotTerminal::Stopped { message, .. } => {
+            let mut status = set.status.clone().unwrap_or_default();
+            set_pilot_condition(&mut status, "Quarantined", &message, now);
+            let _ = api
+                .patch_set_status(
+                    &namespace,
+                    &name,
+                    &status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await;
+        }
+        DurableSwitchoverPilotTerminal::Complete { snapshot, .. } => {
+            let primary_name = set
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .members
+                        .iter()
+                        .find(|member| member.id == snapshot.primary_id)
+                })
+                .map(|member| member.name.clone())
+                .ok_or_else(|| {
+                    "terminal pilot snapshot primary is absent from persisted members".to_string()
+                })?;
+            let persisted_members = set
+                .status
+                .as_ref()
+                .map(|status| status.members.as_slice())
+                .unwrap_or_default();
+            let mut members = Vec::with_capacity(snapshot.members.len());
+            for member in &snapshot.members {
+                let persisted = persisted_members
+                    .iter()
+                    .find(|persisted| persisted.id == member.id)
+                    .ok_or_else(|| {
+                        format!(
+                            "terminal pilot snapshot member {} is absent from persisted status",
+                            member.id
+                        )
+                    })?;
+                let mut persisted = persisted.clone();
+                persisted.instance_id = member.instance_id.clone();
+                persisted.role = if member.id == snapshot.primary_id {
+                    "primary".to_string()
+                } else {
+                    "secondary".to_string()
+                };
+                members.push(persisted);
+            }
+            let mut status = set.status.clone().unwrap_or_default();
+            status.epoch = snapshot.epoch.clone();
+            status.current_primary = Some(primary_name.clone());
+            status.target_primary = Some(primary_name);
+            status.phase = Phase::Healthy;
+            status.reconfiguration_phase = ReconfigurationPhase::None;
+            status.ready_replicas = members.iter().filter(|member| member.healthy).count() as i32;
+            status.replicas = members.len() as i32;
+            status.members = members;
+            status.stable_snapshot = Some(snapshot);
+            status.operation = None;
+            status.primary_failing_since = None;
+            status.stable_election_metadata_refresh =
+                Some(crate::crd::StableElectionMetadataRefreshStatus {
+                    snapshot_epoch: status.epoch.clone(),
+                    next_member_index: 0,
+                    completed_members: Vec::new(),
+                    pending_action: None,
+                });
+            set_pilot_condition(
+                &mut status,
+                "Completed",
+                "terminal checkpoint accepted before topology publication",
+                now,
+            );
+            persist_committed_status(
+                api,
+                state,
+                &set_key,
+                &namespace,
+                &name,
+                &status,
+                set.metadata.resource_version.as_deref(),
+            )
+            .await?;
+            state.drivers.lock().await.remove(&set_key);
+            runtime
+                .forget(&namespace, &name, set_uid, &reference.execution_id)
+                .await;
+        }
+    }
+    Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn current_pilot_operation(
+    reference: &crate::crd::DurableSwitchoverPilotStatus,
+    execution: &kuberic_durable_execution::ExecutionSpec,
+    loaded: Option<&kuberic_durable_execution::StoredCheckpoint>,
+) -> Result<DurableOperationStatus, String> {
+    let Some(stored) = loaded else {
+        return initial_operation(reference);
+    };
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(execution, crate::durable::pilot::checkpoint_limits())
+        .map_err(|error| format!("decode durable switchover checkpoint: {error}"))?;
+    let Some(activities) = payload.active_activities() else {
+        return initial_operation(reference);
+    };
+    let Some(last) = activities.last() else {
+        return initial_operation(reference);
+    };
+    match last.state() {
+        ActivityState::Scheduled | ActivityState::DispatchExposed { .. } => {
+            serde_json::from_slice(last.input().as_slice())
+                .map_err(|error| format!("decode current durable switchover activity: {error}"))
+        }
+        ActivityState::Completed { result } => {
+            let result: DurableSwitchoverStepResult = serde_json::from_slice(result.as_slice())
+                .map_err(|error| {
+                    format!("decode completed durable switchover activity: {error}")
+                })?;
+            Ok(match result {
+                DurableSwitchoverStepResult::Advance { operation }
+                | DurableSwitchoverStepResult::ProvenNoAdmission { operation, .. }
+                | DurableSwitchoverStepResult::Complete { operation, .. }
+                | DurableSwitchoverStepResult::Stopped { operation, .. } => operation,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn checkpoint_is_scheduled(
+    loaded: Option<&kuberic_durable_execution::StoredCheckpoint>,
+    execution: &kuberic_durable_execution::ExecutionSpec,
+) -> Result<bool, String> {
+    let Some(stored) = loaded else {
+        return Ok(false);
+    };
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(execution, crate::durable::pilot::checkpoint_limits())
+        .map_err(|error| format!("decode durable switchover checkpoint: {error}"))?;
+    Ok(payload
+        .active_activities()
+        .and_then(|activities| activities.last())
+        .is_some_and(|activity| matches!(activity.state(), ActivityState::Scheduled)))
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn pilot_decision_ready(
+    decision: &PilotAdapterDecision,
+    observations: &OperationObservations,
+    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
+) -> bool {
+    match decision {
+        PilotAdapterDecision::Observe(_) => true,
+        PilotAdapterDecision::AwaitEvidence => false,
+        PilotAdapterDecision::External(Decision::Execute { target_id, .. }) => {
+            observations.contains_key(target_id) && handles.contains_key(target_id)
+        }
+        PilotAdapterDecision::External(Decision::PatchPodRole { target_id, .. }) => {
+            observations.contains_key(target_id)
+        }
+        PilotAdapterDecision::External(_) => false,
+    }
+}
+
 async fn reconcile_durable_operation(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -3731,6 +4373,51 @@ fn set_operation_condition(status: &mut KubericSetStatus, condition: StatusCondi
     status.conditions.push(condition);
 }
 
+#[cfg(feature = "durable-switchover-pilot")]
+fn set_pilot_condition(status: &mut KubericSetStatus, reason: &str, message: &str, now: i64) {
+    set_operation_condition(
+        status,
+        StatusCondition {
+            type_: "DurableSwitchoverPilot".to_string(),
+            status: if reason == "Completed" {
+                "False".to_string()
+            } else {
+                "True".to_string()
+            },
+            reason: reason.to_string(),
+            message: message.chars().take(512).collect(),
+            last_transition_time: now.to_string(),
+        },
+    );
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+async fn cleanup_persisted_pilot(
+    state: &ReconcilerState,
+    set: &KubericSet,
+    status: &KubericSetStatus,
+    set_key: &str,
+) {
+    let Some(reference) = status.durable_switchover_pilot.as_ref() else {
+        return;
+    };
+    let Some(runtime) = state.durable_switchover_pilot.as_ref() else {
+        return;
+    };
+    let Some(uid) = set.metadata.uid.as_deref() else {
+        return;
+    };
+    state.drivers.lock().await.remove(set_key);
+    runtime
+        .forget(
+            &set.namespace().unwrap_or_default(),
+            &set.name_any(),
+            uid,
+            &reference.execution_id,
+        )
+        .await;
+}
+
 fn unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3789,13 +4476,18 @@ mod tests {
 
     #[test]
     fn durable_pilot_never_silently_falls_back_to_explicit() {
-        let error =
-            validate_new_switchover_engine(crate::crd::SwitchoverExecutionMode::DurablePilot)
-                .unwrap_err();
         #[cfg(feature = "durable-switchover-pilot")]
-        assert!(error.contains("adapter is not connected"), "{error}");
+        assert!(
+            validate_new_switchover_engine(crate::crd::SwitchoverExecutionMode::DurablePilot)
+                .is_ok()
+        );
         #[cfg(not(feature = "durable-switchover-pilot"))]
-        assert!(error.contains("requires the operator"), "{error}");
+        {
+            let error =
+                validate_new_switchover_engine(crate::crd::SwitchoverExecutionMode::DurablePilot)
+                    .unwrap_err();
+            assert!(error.contains("requires the operator"), "{error}");
+        }
     }
 
     fn snapshot(primary_id: i64, member_ids: &[i64]) -> StablePartitionSnapshotStatus {

@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InMemoryFault {
     FailBeforeRequest(StoreErrorKind),
+    ConflictWithoutApply,
     OutcomeUnknownWithoutApply,
     OutcomeUnknownAfterApply,
 }
@@ -97,6 +98,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
                 kind,
                 "in-memory fault injected before compare-and-swap request",
             )),
+            Some(InMemoryFault::ConflictWithoutApply) => Ok(CasOutcome::Conflict),
             Some(InMemoryFault::OutcomeUnknownWithoutApply) => Ok(CasOutcome::OutcomeUnknown),
             fault @ (None | Some(InMemoryFault::OutcomeUnknownAfterApply)) => {
                 state.revision_counter =

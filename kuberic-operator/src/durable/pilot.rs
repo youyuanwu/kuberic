@@ -175,6 +175,10 @@ impl DurableSwitchoverPilotRuntime {
             execution_id: execution_id.to_string(),
         });
     }
+
+    pub async fn host_count(&self) -> usize {
+        self.hosts.lock().await.len()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -611,7 +615,7 @@ fn validate_terminal(
     if !compensated {
         if operation.phase != Phase::Completed
             || operation.pending_action.is_some()
-            || snapshot != &operation.target_snapshot
+            || !same_topology(snapshot, &operation.target_snapshot)
         {
             return Err("successful durable switchover terminal is inconsistent".to_string());
         }
@@ -631,6 +635,25 @@ fn validate_terminal(
         return Err("compensated durable switchover terminal is inconsistent".to_string());
     }
     Ok(())
+}
+
+fn same_topology(
+    actual: &StablePartitionSnapshotStatus,
+    expected: &StablePartitionSnapshotStatus,
+) -> bool {
+    actual.epoch == expected.epoch
+        && actual.primary_id == expected.primary_id
+        && actual.write_quorum == expected.write_quorum
+        && actual.members.len() == expected.members.len()
+        && actual
+            .members
+            .iter()
+            .zip(&expected.members)
+            .all(|(actual_member, expected_member)| {
+                actual_member.id == expected_member.id
+                    && actual_member.instance_id == expected_member.instance_id
+                    && actual_member.role == expected_member.role
+            })
 }
 
 fn validate_completion_transition(
