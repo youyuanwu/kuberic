@@ -45,12 +45,13 @@ pub use kubernetes::{
     KubernetesCheckpointMetricsSnapshot, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, MAX_CONFIG_MAP_DATA_BUDGET_BYTES,
 };
-pub use replay::{Evaluation, Nondeterminism, evaluate};
+pub use replay::{Evaluation, Nondeterminism, evaluate, evaluate_prepared};
 pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
 };
 pub use typed::{
-    ActivityCallError, DurableActivity, decode_activity_input, decode_activity_result,
-    encode_activity_input, encode_activity_result,
+    ActivityCallError, DurableActivity, IdentityActivityResolver, PreparedActivityError,
+    PreparedActivityResolver, decode_activity_input, decode_activity_result, encode_activity_input,
+    encode_activity_result,
 };
 pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};

@@ -6,7 +6,9 @@ use thiserror::Error;
 use crate::{
     ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, CheckpointEnvelope,
     CheckpointError, CheckpointLimits, CheckpointPayload, ExecutionContract, ExecutionSpec,
-    LogicalActivityId, TerminalOutcome, Workflow, WorkflowContext, workflow::ContextDecision,
+    LogicalActivityId, TerminalOutcome, Workflow, WorkflowContext,
+    typed::{IDENTITY_ACTIVITY_RESOLVER, PreparedActivityError, PreparedActivityResolver},
+    workflow::ContextDecision,
 };
 
 /// Result of deterministically polling one workflow turn.
@@ -31,6 +33,7 @@ pub enum Evaluation {
     },
     Nondeterminism(Nondeterminism),
     CheckpointRejected(CheckpointError),
+    PreparationRejected(PreparedActivityError),
     WorkflowStalled,
 }
 
@@ -57,6 +60,24 @@ pub fn evaluate<W: Workflow>(
     execution: &ExecutionSpec,
     checkpoint: Option<&CheckpointEnvelope>,
     limits: CheckpointLimits,
+) -> Evaluation {
+    evaluate_prepared(
+        workflow,
+        execution,
+        checkpoint,
+        limits,
+        &IDENTITY_ACTIVITY_RESOLVER,
+    )
+}
+
+/// Validate a checkpoint and evaluate one turn through an opt-in prepared
+/// activity resolver.
+pub fn evaluate_prepared<W: Workflow>(
+    workflow: &W,
+    execution: &ExecutionSpec,
+    checkpoint: Option<&CheckpointEnvelope>,
+    limits: CheckpointLimits,
+    resolver: &dyn PreparedActivityResolver,
 ) -> Evaluation {
     let mut payload = match checkpoint {
         Some(envelope) => match envelope.decode_and_validate(execution, limits) {
@@ -91,7 +112,7 @@ pub fn evaluate<W: Workflow>(
         .active_activities()
         .expect("terminal state returned before active replay");
     let (poll, cursor, decision) = {
-        let mut context = WorkflowContext::new(execution.execution_id(), history);
+        let mut context = WorkflowContext::new(execution.execution_id(), history, resolver);
         let poll = {
             let mut future = workflow.run(&mut context, execution.workflow_input().clone());
             let mut task_context = Context::from_waker(noop_waker_ref());
@@ -123,6 +144,7 @@ pub fn evaluate<W: Workflow>(
             state,
         },
         Some(ContextDecision::Nondeterminism(error)) => Evaluation::Nondeterminism(error),
+        Some(ContextDecision::PreparationRejected(error)) => Evaluation::PreparationRejected(error),
         None => match poll {
             Poll::Ready(outcome) => {
                 let history_len = payload

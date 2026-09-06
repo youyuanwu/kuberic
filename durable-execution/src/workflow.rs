@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, ExactBytes, ExecutionId,
     LogicalActivityId, Nondeterminism,
-    typed::{ActivityCallError, DurableActivity, activity_spec, decode_activity_result},
+    typed::{
+        ActivityCallError, DurableActivity, PreparedActivityError, PreparedActivityResolver,
+        activity_spec, decode_activity_result,
+    },
 };
 
 /// Exact terminal result of one workflow execution.
@@ -49,15 +52,21 @@ pub trait Workflow: Sync {
 pub struct WorkflowContext<'history> {
     execution_id: ExecutionId,
     history: &'history [ActivityRecord],
+    resolver: &'history dyn PreparedActivityResolver,
     cursor: usize,
     pub(crate) decision: Option<ContextDecision>,
 }
 
 impl<'history> WorkflowContext<'history> {
-    pub(crate) fn new(execution_id: ExecutionId, history: &'history [ActivityRecord]) -> Self {
+    pub(crate) fn new(
+        execution_id: ExecutionId,
+        history: &'history [ActivityRecord],
+        resolver: &'history dyn PreparedActivityResolver,
+    ) -> Self {
         Self {
             execution_id,
             history,
+            resolver,
             cursor: 0,
             decision: None,
         }
@@ -94,23 +103,34 @@ impl<'history> WorkflowContext<'history> {
         let sequence = ActivitySequence::new(
             u64::try_from(self.cursor).expect("validated history length fits in u64"),
         );
-        let requested_id = LogicalActivityId::new(self.execution_id, sequence, spec.clone());
+        let record = self.history.get(self.cursor);
+        let prepared = match self
+            .resolver
+            .resolve(spec, record.map(ActivityRecord::spec))
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.decision = Some(ContextDecision::PreparationRejected(error));
+                return Poll::Pending;
+            }
+        };
+        let requested_id = LogicalActivityId::new(self.execution_id, sequence, prepared.clone());
 
-        let Some(record) = self.history.get(self.cursor) else {
+        let Some(record) = record else {
             self.decision = Some(ContextDecision::Schedule {
                 sequence,
-                spec: spec.clone(),
+                spec: prepared,
                 logical_id: requested_id,
             });
             return Poll::Pending;
         };
 
-        if record.spec() != spec {
+        if record.spec() != &prepared {
             self.decision = Some(ContextDecision::Nondeterminism(
                 Nondeterminism::ActivityMismatch {
                     sequence,
                     recorded: record.spec().clone(),
-                    requested: spec.clone(),
+                    requested: prepared,
                 },
             ));
             return Poll::Pending;
@@ -143,4 +163,5 @@ pub(crate) enum ContextDecision {
         state: ActivityState,
     },
     Nondeterminism(Nondeterminism),
+    PreparationRejected(PreparedActivityError),
 }

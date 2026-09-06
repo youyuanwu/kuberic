@@ -6,8 +6,9 @@ use kuberic_durable_execution::{
     ActivityCallError, ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ActivityState,
     AttemptId, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload,
     DurableActivity, Evaluation, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
-    HostEpoch, IdentityError, LogicalActivityId, Nondeterminism, TerminalOutcome, Workflow,
-    WorkflowContext, encode_activity_input, encode_activity_result, evaluate as evaluate_with_spec,
+    HostEpoch, IdentityError, LogicalActivityId, Nondeterminism, PreparedActivityError,
+    PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext, encode_activity_input,
+    encode_activity_result, evaluate as evaluate_with_spec, evaluate_prepared,
 };
 use serde::{Deserialize, Serialize};
 
@@ -881,4 +882,197 @@ fn typed_input_encoding_canonicalizes_object_key_order() {
     let second = encode_activity_input::<MapInputActivity>(&second).unwrap();
     assert_eq!(first, second);
     assert_eq!(first.as_slice(), br#"{"alpha":2,"zeta":1}"#);
+}
+
+#[derive(Clone)]
+struct TypedPreparedResolver {
+    command: &'static [u8],
+    target: &'static [u8],
+    result_bound: u64,
+}
+
+impl PreparedActivityResolver for TypedPreparedResolver {
+    fn resolve(
+        &self,
+        logical: &ActivitySpec,
+        _recorded: Option<&ActivitySpec>,
+    ) -> Result<ActivitySpec, PreparedActivityError> {
+        let mut prepared = Vec::new();
+        prepared.extend_from_slice(b"command=");
+        prepared.extend_from_slice(self.command);
+        prepared.extend_from_slice(b";target=");
+        prepared.extend_from_slice(self.target);
+        prepared.extend_from_slice(b";logical=");
+        prepared.extend_from_slice(logical.input().as_slice());
+        Ok(ActivitySpec::new(
+            logical.name().clone(),
+            ExactBytes::new(prepared),
+            self.result_bound,
+        ))
+    }
+}
+
+fn typed_prepared_resolver() -> TypedPreparedResolver {
+    TypedPreparedResolver {
+        command: b"promote",
+        target: b"replica-2:generation-7",
+        result_bound: TypedEffectV1::MAX_RESULT_BYTES,
+    }
+}
+
+#[test]
+fn typed_prepared_spec_is_canonical_and_exact_replay_succeeds() {
+    let resolver = typed_prepared_resolver();
+    let execution_id = execution(41);
+    let workflow_input = bytes(b"workflow");
+    let Evaluation::Scheduled {
+        activity,
+        checkpoint,
+    } = evaluate_prepared(
+        &TypedWorkflowV1,
+        &execution_spec(execution_id, workflow_input.clone()),
+        None,
+        limits(),
+        &resolver,
+    )
+    else {
+        panic!("prepared typed call did not schedule");
+    };
+    assert_eq!(
+        activity.input().as_slice(),
+        br#"command=promote;target=replica-2:generation-7;logical="hello""#
+    );
+
+    assert!(matches!(
+        evaluate_prepared(
+            &TypedWorkflowV1,
+            &execution_spec(execution_id, workflow_input),
+            Some(&checkpoint),
+            limits(),
+            &resolver,
+        ),
+        Evaluation::Pending {
+            state: ActivityState::Scheduled,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn typed_prepared_replay_rejects_each_complete_specification_mismatch() {
+    let resolver = typed_prepared_resolver();
+    let execution_id = execution(42);
+    let workflow_input = bytes(b"workflow");
+    let Evaluation::Scheduled { checkpoint, .. } = evaluate_prepared(
+        &TypedWorkflowV1,
+        &execution_spec(execution_id, workflow_input.clone()),
+        None,
+        limits(),
+        &resolver,
+    ) else {
+        panic!("prepared typed call did not schedule");
+    };
+
+    let changed_resolvers = [
+        TypedPreparedResolver {
+            command: b"demote",
+            ..resolver.clone()
+        },
+        TypedPreparedResolver {
+            target: b"replica-3:generation-7",
+            ..resolver.clone()
+        },
+        TypedPreparedResolver {
+            result_bound: 127,
+            ..resolver.clone()
+        },
+    ];
+    for changed in changed_resolvers {
+        assert!(matches!(
+            evaluate_prepared(
+                &TypedWorkflowV1,
+                &execution_spec(execution_id, workflow_input.clone()),
+                Some(&checkpoint),
+                limits(),
+                &changed,
+            ),
+            Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+        ));
+    }
+
+    assert!(matches!(
+        evaluate_prepared(
+            &TypedWorkflowV2,
+            &execution_spec(execution_id, workflow_input.clone()),
+            Some(&checkpoint),
+            limits(),
+            &resolver,
+        ),
+        Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+    ));
+
+    struct ChangedLogicalInput;
+    #[async_trait]
+    impl Workflow for ChangedLogicalInput {
+        async fn run(
+            &self,
+            context: &mut WorkflowContext<'_>,
+            _input: ExactBytes,
+        ) -> TerminalOutcome {
+            match context.call::<TypedEffectV1>("changed".to_owned()).await {
+                Ok(_) => TerminalOutcome::succeeded([]),
+                Err(error) => TerminalOutcome::failed(serde_json::to_vec(&error).unwrap()),
+            }
+        }
+    }
+    assert!(matches!(
+        evaluate_prepared(
+            &ChangedLogicalInput,
+            &execution_spec(execution_id, workflow_input),
+            Some(&checkpoint),
+            limits(),
+            &resolver,
+        ),
+        Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+    ));
+}
+
+struct RejectPrepared(PreparedActivityError);
+
+impl PreparedActivityResolver for RejectPrepared {
+    fn resolve(
+        &self,
+        _logical: &ActivitySpec,
+        _recorded: Option<&ActivitySpec>,
+    ) -> Result<ActivitySpec, PreparedActivityError> {
+        Err(self.0.clone())
+    }
+}
+
+#[test]
+fn typed_prepared_failure_classes_reject_before_checkpoint_creation() {
+    for error in [
+        PreparedActivityError::Derivation,
+        PreparedActivityError::Validation,
+        PreparedActivityError::Encoding,
+        PreparedActivityError::InputTooLarge {
+            actual_bytes: 65,
+            max_bytes: 64,
+        },
+        PreparedActivityError::ResultBoundTooLarge {
+            actual_bytes: 129,
+            max_bytes: 128,
+        },
+    ] {
+        assert_eq!(
+            evaluate_prepared(
+                &TypedWorkflowV1,
+                &execution_spec(execution(43), bytes(b"workflow")),
+                None,
+                limits(),
+                &RejectPrepared(error.clone()),
+            ),
+            Evaluation::PreparationRejected(error)
+        );
+    }
 }

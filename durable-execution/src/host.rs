@@ -1,8 +1,8 @@
 use crate::{
     ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError,
     CheckpointLimits, CheckpointPayload, CheckpointStore, Evaluation, ExactBytes, ExecutionId,
-    ExecutionSpec, HostEpoch, LogicalActivityId, Nondeterminism, StorageRevision, StoreError,
-    TerminalOutcome, Workflow, evaluate,
+    ExecutionSpec, HostEpoch, LogicalActivityId, Nondeterminism, PreparedActivityResolver,
+    StorageRevision, StoreError, TerminalOutcome, Workflow, evaluate, evaluate_prepared,
 };
 
 /// The persistence boundary that must be reloaded after an uncertain CAS result.
@@ -296,6 +296,9 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
             Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
+            Evaluation::PreparationRejected(error) => {
+                HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(error))
+            }
             Evaluation::WorkflowStalled => {
                 HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
             }
@@ -313,6 +316,18 @@ impl<S: CheckpointStore> DurableHost<S> {
         &mut self,
         workflow: &W,
         execution: ExecutionSpec,
+    ) -> HostOutcome {
+        self.turn_and_expose_with(workflow, execution, &crate::IdentityActivityResolver)
+            .await
+    }
+
+    /// Evaluate and atomically expose an activity resolved to an exact prepared
+    /// specification.
+    pub async fn turn_and_expose_with<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: ExecutionSpec,
+        resolver: &dyn PreparedActivityResolver,
     ) -> HostOutcome {
         let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
@@ -351,11 +366,12 @@ impl<S: CheckpointStore> DurableHost<S> {
                 };
             }
         }
-        match evaluate(
+        match evaluate_prepared(
             workflow,
             &execution,
             loaded.as_ref().map(|stored| stored.checkpoint()),
             self.limits,
+            resolver,
         ) {
             Evaluation::Scheduled {
                 activity,
@@ -422,6 +438,9 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
             Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
+            Evaluation::PreparationRejected(error) => {
+                HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(error))
+            }
             Evaluation::WorkflowStalled => {
                 HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
             }
@@ -529,6 +548,24 @@ impl<S: CheckpointStore> DurableHost<S> {
         execution: &ExecutionSpec,
         observation: ActivityObservation,
     ) -> HostOutcome {
+        self.observe_and_turn_with(
+            workflow,
+            execution,
+            observation,
+            &crate::IdentityActivityResolver,
+        )
+        .await
+    }
+
+    /// Persist an observation and resolve the next activity to an exact
+    /// prepared specification in the same accepted checkpoint.
+    pub async fn observe_and_turn_with<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: &ExecutionSpec,
+        observation: ActivityObservation,
+        resolver: &dyn PreparedActivityResolver,
+    ) -> HostOutcome {
         let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
             Ok(loaded) => loaded,
@@ -589,11 +626,12 @@ impl<S: CheckpointStore> DurableHost<S> {
                 Err(error) => return HostOutcome::CheckpointRejected(error),
             };
         let expected_revision = Some(stored.revision().clone());
-        match evaluate(
+        match evaluate_prepared(
             workflow,
             execution,
             Some(&completed_checkpoint),
             self.limits,
+            resolver,
         ) {
             Evaluation::Scheduled {
                 activity,
@@ -637,6 +675,9 @@ impl<S: CheckpointStore> DurableHost<S> {
             },
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
             Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
+            Evaluation::PreparationRejected(error) => {
+                HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(error))
+            }
             Evaluation::WorkflowStalled => {
                 HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
             }
@@ -828,7 +869,8 @@ mod tests {
     use super::*;
     use crate::{
         ActivityName, ActivitySequence, ActivitySpec, CheckpointLimits, InMemoryCheckpointStore,
-        InMemoryFault, StoreErrorKind, WorkflowContext,
+        InMemoryFault, PreparedActivityError, PreparedActivityResolver, StoreErrorKind,
+        WorkflowContext,
     };
 
     struct OneActivity;
@@ -918,6 +960,172 @@ mod tests {
                 }
             }
             panic!("applied outcome-unknown case did not execute");
+        });
+    }
+
+    #[derive(Clone)]
+    struct PreparedResolver(Result<ActivitySpec, PreparedActivityError>);
+
+    impl PreparedActivityResolver for PreparedResolver {
+        fn resolve(
+            &self,
+            _logical: &ActivitySpec,
+            _recorded: Option<&ActivitySpec>,
+        ) -> Result<ActivitySpec, PreparedActivityError> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn fused_prepared_failures_never_reach_the_store_or_construct_a_permit() {
+        block_on(async {
+            for error in [
+                PreparedActivityError::Derivation,
+                PreparedActivityError::Validation,
+                PreparedActivityError::Encoding,
+                PreparedActivityError::InputTooLarge {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                PreparedActivityError::ResultBoundTooLarge {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+            ] {
+                let store = InMemoryCheckpointStore::new();
+                let mut host = DurableHost::new(
+                    store.clone(),
+                    HostEpoch::from_bytes([3; 16]),
+                    CheckpointLimits::new(16, 100_000).unwrap(),
+                );
+                let outcome = host
+                    .turn_and_expose_with(
+                        &OneActivity,
+                        ExecutionSpec::new(
+                            ExecutionId::from_bytes([4; 16]),
+                            ExactBytes::new(b"logical"),
+                            1024,
+                        ),
+                        &PreparedResolver(Err(error.clone())),
+                    )
+                    .await;
+                assert_eq!(
+                    outcome,
+                    HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(
+                        error
+                    ))
+                );
+                assert!(
+                    store
+                        .load(ExecutionId::from_bytes([4; 16]))
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn fused_unknown_after_apply_reloads_complete_prepared_exposure_as_quarantined() {
+        block_on(async {
+            let store = InMemoryCheckpointStore::new();
+            store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+            let execution_id = ExecutionId::from_bytes([5; 16]);
+            let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"logical"), 1024);
+            let prepared = ActivitySpec::new(
+                ActivityName::new("prepared", 9).unwrap(),
+                ExactBytes::new(b"exact-command-and-fences"),
+                77,
+            );
+            let mut host = DurableHost::new(
+                store.clone(),
+                HostEpoch::from_bytes([6; 16]),
+                CheckpointLimits::new(16, 100_000).unwrap(),
+            );
+
+            assert!(matches!(
+                host.turn_and_expose_with(
+                    &OneActivity,
+                    execution.clone(),
+                    &PreparedResolver(Ok(prepared.clone())),
+                )
+                .await,
+                HostOutcome::ReloadRequired {
+                    boundary: PersistenceBoundary::ScheduleExposure,
+                    reason: ReloadReason::OutcomeUnknown,
+                }
+            ));
+            let HostOutcome::Quarantined { activity, .. } = host
+                .turn_and_expose_with(
+                    &OneActivity,
+                    execution,
+                    &PreparedResolver(Ok(prepared.clone())),
+                )
+                .await
+            else {
+                panic!("applied prepared exposure did not reload as quarantined");
+            };
+            assert_eq!(activity.spec(), &prepared);
+        });
+    }
+
+    #[test]
+    fn fused_prepared_specification_controls_result_and_checkpoint_admission() {
+        block_on(async {
+            let execution_id = ExecutionId::from_bytes([7; 16]);
+            let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"logical"), 1024);
+
+            let result_store = InMemoryCheckpointStore::new();
+            let mut result_host = DurableHost::new(
+                result_store.clone(),
+                HostEpoch::from_bytes([8; 16]),
+                CheckpointLimits::new(16, 100_000).unwrap(),
+            );
+            let unrepresentable_result = ActivitySpec::new(
+                ActivityName::new("prepared", 1).unwrap(),
+                ExactBytes::new(b"bounded-command"),
+                u64::MAX,
+            );
+            assert!(matches!(
+                result_host
+                    .turn_and_expose_with(
+                        &OneActivity,
+                        execution.clone(),
+                        &PreparedResolver(Ok(unrepresentable_result)),
+                    )
+                    .await,
+                HostOutcome::CheckpointRejected(
+                    CheckpointError::ResultLengthUnrepresentable
+                        | CheckpointError::EncodedLengthOverflow
+                )
+            ));
+            assert!(result_store.load(execution_id).await.unwrap().is_none());
+
+            let input_store = InMemoryCheckpointStore::new();
+            let mut input_host = DurableHost::new(
+                input_store.clone(),
+                HostEpoch::from_bytes([9; 16]),
+                CheckpointLimits::new(16, 512).unwrap(),
+            );
+            let oversized_prepared = ActivitySpec::new(
+                ActivityName::new("prepared", 1).unwrap(),
+                ExactBytes::new(vec![b'x'; 1024]),
+                1,
+            );
+            assert!(matches!(
+                input_host
+                    .turn_and_expose_with(
+                        &OneActivity,
+                        ExecutionSpec::new(execution_id, ExactBytes::new(b"logical"), 1),
+                        &PreparedResolver(Ok(oversized_prepared)),
+                    )
+                    .await,
+                HostOutcome::CheckpointRejected(
+                    CheckpointError::EncodedCheckpointLimitExceeded { .. }
+                )
+            ));
+            assert!(input_store.load(execution_id).await.unwrap().is_none());
         });
     }
 }
