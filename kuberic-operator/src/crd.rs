@@ -46,6 +46,14 @@ pub struct KubericSetSpec {
     #[serde(default = "default_switchover_delay")]
     pub switchover_delay: i32,
 
+    /// Execution engine for newly accepted primary switchovers.
+    ///
+    /// The durable pilot also requires an operator binary built with the
+    /// matching compile-time feature. Existing and omitted values remain on
+    /// the explicit CRD-backed state machine.
+    #[serde(default)]
+    pub switchover_execution_mode: SwitchoverExecutionMode,
+
     /// Port for the application container.
     #[serde(default = "default_port")]
     pub port: i32,
@@ -112,6 +120,11 @@ pub struct KubericSetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<DurableOperationStatus>,
 
+    /// Immutable reference for the current or most recent durable-execution
+    /// switchover pilot. Per-phase progress lives only in its checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_switchover_pilot: Option<DurableSwitchoverPilotStatus>,
+
     /// Kubernetes-style conditions describing durable operation state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<StatusCondition>,
@@ -163,6 +176,29 @@ pub struct MemberStatus {
     pub control_address: String,
     /// gRPC data address.
     pub data_address: String,
+}
+
+/// Execution engine selected when a new switchover request is accepted.
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SwitchoverExecutionMode {
+    #[default]
+    Explicit,
+    DurablePilot,
+}
+
+/// Immutable authority needed to reconstruct one durable pilot execution.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableSwitchoverPilotStatus {
+    pub version: u32,
+    /// Lowercase hexadecimal kernel execution identity.
+    pub execution_id: String,
+    /// Deterministic provider object name derived from `execution_id`.
+    pub checkpoint_name: String,
+    /// Exact JSON encoding of the initial operation accepted before checkpoint
+    /// creation or effect dispatch.
+    pub initial_operation_json: String,
 }
 
 /// Schema-safe persisted form of the core stable partition snapshot.
@@ -965,6 +1001,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"phase": "Healthy"})).unwrap();
         assert!(status.stable_snapshot.is_none());
         assert!(status.operation.is_none());
+        assert!(status.durable_switchover_pilot.is_none());
         assert!(status.conditions.is_empty());
         assert!(
             serde_json::to_value(status)
@@ -972,6 +1009,62 @@ mod tests {
                 .get("stableSnapshot")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn switchover_execution_mode_defaults_to_explicit_and_round_trips_pilot() {
+        let explicit: KubericSetSpec =
+            serde_json::from_value(serde_json::json!({"image": "test:latest"})).unwrap();
+        assert_eq!(
+            explicit.switchover_execution_mode,
+            SwitchoverExecutionMode::Explicit
+        );
+
+        let pilot: KubericSetSpec = serde_json::from_value(serde_json::json!({
+            "image": "test:latest",
+            "switchoverExecutionMode": "durablePilot"
+        }))
+        .unwrap();
+        assert_eq!(
+            pilot.switchover_execution_mode,
+            SwitchoverExecutionMode::DurablePilot
+        );
+
+        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        let deployment = include_str!("../deploy/deployment.yaml");
+        for required in [
+            "switchoverExecutionMode",
+            "durablePilot",
+            "durableSwitchoverPilot",
+            "checkpointName",
+            "initialOperationJson",
+        ] {
+            assert!(
+                generated.contains(required),
+                "missing generated pilot schema {required}"
+            );
+            assert!(
+                deployment.contains(required),
+                "missing deployed pilot schema {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_grants_only_checkpoint_writer_verbs() {
+        let deployment = include_str!("../deploy/deployment.yaml");
+        let rule = r#"- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "create", "update"]"#;
+        assert!(deployment.contains(rule));
+        assert!(!deployment.contains(
+            r#"resources: ["configmaps"]
+  verbs: ["get", "list""#
+        ));
+        assert!(!deployment.contains(
+            r#"resources: ["configmaps"]
+  verbs: ["get", "create", "update", "delete"]"#
+        ));
     }
 
     #[test]

@@ -22,10 +22,36 @@ metadata:
 spec:
   replicas: 3
   image: my-app:latest
+  switchoverExecutionMode: explicit
   controlPort: 50051
   dataPort: 50052
   clientPort: 50053
 ```
+
+## Durable Switchover Pilot
+
+The existing explicit switchover state machine is the default. A `KubericSet`
+with at most three stable members can opt into the comparison pilot only when
+the operator binary is built with `--features durable-switchover-pilot` and
+the resource sets:
+
+```yaml
+spec:
+  switchoverExecutionMode: durablePilot
+```
+
+The pilot stores format-3 checkpoints in same-namespace ConfigMaps named
+`kuberic-checkpoint-<execution-id>`. They have a non-controlling owner
+reference to the `KubericSet`, remain through terminal reload, and are garbage
+collected with that owner. The operator needs ConfigMap `get`, `create`, and
+`update`; it does not need checkpoint delete permission. Reconciliation
+remains the scheduler and all replica mutations continue through
+`ReplicaAgent`.
+
+Use `status.durableSwitchoverPilot` and the `DurableSwitchoverPilot` condition
+to inspect execution identity, storage reloads, exposed/quarantined work, and
+completion. The pilot does not apply to creation, add/build, removal, or
+failover.
 
 ## Deployment
 

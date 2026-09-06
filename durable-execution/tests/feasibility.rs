@@ -18,7 +18,7 @@ const EXPECTED_FR_013_SCENARIOS: usize = 38;
 struct SelectedOrdinaryAsyncSurface;
 
 // FR012_SELECTED_WORKFLOW_START
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for SelectedOrdinaryAsyncSurface {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
         TerminalOutcome::succeeded(

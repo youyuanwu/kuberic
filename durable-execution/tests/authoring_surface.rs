@@ -12,7 +12,7 @@ use support::scenarios::{ScenarioId, run_conformance_matrix};
 struct OrdinaryAsyncWorkflow;
 
 // FR012_WORKFLOW_START
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for OrdinaryAsyncWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
         TerminalOutcome::succeeded(

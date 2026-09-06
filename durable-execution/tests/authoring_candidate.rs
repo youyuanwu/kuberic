@@ -6,7 +6,7 @@ use kuberic_durable_execution::{
 
 struct OneActivityWorkflow;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for OneActivityWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
         TerminalOutcome::succeeded(

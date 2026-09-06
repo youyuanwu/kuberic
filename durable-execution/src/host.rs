@@ -537,13 +537,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActivityName, ActivitySpec, CheckpointLimits, InMemoryCheckpointStore, InMemoryFault,
-        StoreErrorKind, WorkflowContext,
+        ActivityName, ActivitySequence, ActivitySpec, CheckpointLimits, InMemoryCheckpointStore,
+        InMemoryFault, StoreErrorKind, WorkflowContext,
     };
 
     struct OneActivity;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl Workflow for OneActivity {
         async fn run(
             &self,
@@ -560,6 +560,32 @@ mod tests {
                     .await,
             )
         }
+    }
+
+    fn assert_send<T: Send>(_: T) {}
+
+    #[test]
+    fn host_turn_and_observation_futures_are_send() {
+        let store = InMemoryCheckpointStore::new();
+        let execution_id = ExecutionId::from_bytes([2; 16]);
+        let spec = ActivitySpec::new(
+            ActivityName::new("unit", 1).unwrap(),
+            ExactBytes::new(b"unit"),
+            1024,
+        );
+        let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"unit"), 1024);
+        let mut host = DurableHost::new(
+            store,
+            HostEpoch::from_bytes([1; 16]),
+            CheckpointLimits::new(16, 100_000).unwrap(),
+        );
+        assert_send(host.turn(&OneActivity, execution.clone()));
+
+        let activity = LogicalActivityId::new(execution_id, ActivitySequence::new(0), spec);
+        assert_send(host.observe(
+            &execution,
+            ActivityObservation::new(activity, ExactBytes::new(b"result")),
+        ));
     }
 
     #[test]

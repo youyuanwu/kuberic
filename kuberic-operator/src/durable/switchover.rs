@@ -29,6 +29,7 @@ enum ActionObservation {
     Impossible,
 }
 
+// COMPLEXITY-BOUNDARY: explicit-switchover:start
 pub fn start_switchover(
     set_uid: &str,
     previous: StablePartitionSnapshotStatus,
@@ -114,6 +115,7 @@ pub fn decide(
     {
         return Ok(Decision::Wait);
     }
+
     if operation.phase == DurableOperationPhase::Failed {
         let old = observations
             .get(&operation.old_primary_id)
@@ -422,6 +424,17 @@ pub fn decide(
             operation.phase
         )),
     }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+pub(crate) fn validate_switchover_operation(
+    operation: &DurableOperationStatus,
+) -> Result<(), String> {
+    validate_operation(operation)?;
+    if let Some(pending) = &operation.pending_action {
+        validate_pending_action(operation, pending)?;
+    }
+    Ok(())
 }
 
 fn decide_pending(
@@ -1309,6 +1322,7 @@ fn pod_role_action(kind: DurableActionKind) -> Option<&'static str> {
     }
 }
 
+// COMPLEXITY-BOUNDARY: explicit-switchover:end
 #[cfg(test)]
 mod tests {
     use super::*;

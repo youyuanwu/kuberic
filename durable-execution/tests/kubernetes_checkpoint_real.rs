@@ -19,7 +19,7 @@ use k8s_openapi::{
         },
         core::v1::{ConfigMap, Namespace},
     },
-    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference},
 };
 use kube::{
     Api, Client, ResourceExt,
@@ -30,7 +30,8 @@ use kuberic_durable_execution::{
     ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
     CheckpointLimits, CheckpointPayload, CheckpointStore, DurableHost, ExactBytes,
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome,
-    KubernetesCheckpointStore, ReloadReason, StorageRevision, StoreError, StoreErrorKind,
+    KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope, KubernetesCheckpointStore,
+    KubernetesCheckpointStoreOptions, ReloadReason, StorageRevision, StoreError, StoreErrorKind,
     StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
 };
 
@@ -61,7 +62,7 @@ impl MaskOnceStore {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CheckpointStore for MaskOnceStore {
     async fn load(
         &self,
@@ -106,7 +107,7 @@ struct OneActivityWorkflow {
     activity: ActivitySpec,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for OneActivityWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         TerminalOutcome::succeeded(context.activity(self.activity.clone()).await)
@@ -226,6 +227,7 @@ async fn check_authorization(client: &Client, namespace: &str) -> TestResult<()>
 
 async fn run_real_api_scenarios(client: Client, namespace: &str) -> TestResult<()> {
     validate_cas_and_deletion(client.clone(), namespace).await?;
+    validate_owner_garbage_collection(client.clone(), namespace).await?;
     let measurement = validate_measurement_and_watch(client.clone(), namespace).await?;
     validate_ambiguous_recovery(client, namespace).await?;
     println!(
@@ -248,6 +250,60 @@ async fn run_real_api_scenarios(client: Client, namespace: &str) -> TestResult<(
         measurement.watch_events,
         measurement.watch_bytes,
     );
+    Ok(())
+}
+
+async fn validate_owner_garbage_collection(client: Client, namespace: &str) -> TestResult<()> {
+    let config_maps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let owner_name = "durable-checkpoint-owner";
+    let owner = config_maps
+        .create(
+            &PostParams::default(),
+            &ConfigMap {
+                metadata: ObjectMeta {
+                    name: Some(owner_name.to_string()),
+                    ..ObjectMeta::default()
+                },
+                ..ConfigMap::default()
+            },
+        )
+        .await?;
+    let owner_uid = owner
+        .metadata
+        .uid
+        .ok_or_else(|| io::Error::other("owner ConfigMap has no UID"))?;
+    let owner = KubernetesCheckpointOwner::new(
+        OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            name: owner_name.to_string(),
+            uid: owner_uid,
+            controller: Some(false),
+            block_owner_deletion: Some(false),
+        },
+        KubernetesCheckpointOwnerScope::Namespaced(namespace.to_string()),
+    );
+    let store = KubernetesCheckpointStore::with_options(
+        client,
+        namespace,
+        KubernetesCheckpointStoreOptions::default().with_owner(owner),
+    )?;
+    let execution_id = ExecutionId::from_bytes([0x15; 16]);
+    accepted_revision(
+        store
+            .compare_and_swap(
+                execution_id,
+                None,
+                opaque_checkpoint(b"owner-bound-terminal"),
+            )
+            .await?,
+    )?;
+    let checkpoint_name = KubernetesCheckpointStore::object_name(execution_id);
+    config_maps
+        .delete(owner_name, &DeleteParams::default())
+        .await?;
+    wait_for_absence(&config_maps, &checkpoint_name).await?;
+    println!("KUBERNETES_CHECKPOINT_LIFECYCLE owner_gc=passed");
     Ok(())
 }
 

@@ -11,6 +11,10 @@ mod add_replica;
 mod create_partition;
 mod failover;
 pub mod failover_election;
+#[cfg(feature = "durable-switchover-pilot")]
+pub mod pilot;
+#[cfg(feature = "durable-switchover-pilot")]
+pub mod pilot_store;
 mod remove_replica;
 mod switchover;
 

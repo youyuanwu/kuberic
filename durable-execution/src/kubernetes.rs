@@ -278,7 +278,7 @@ impl KubernetesCheckpointStore {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CheckpointStore for KubernetesCheckpointStore {
     async fn load(
         &self,
@@ -290,7 +290,20 @@ impl CheckpointStore for KubernetesCheckpointStore {
             .get_opt(&name)
             .await
             .map_err(|error| load_error("load", error))?;
-        object.map(decode_object).transpose()
+        object
+            .map(|object| {
+                if !owner_relationship_matches(
+                    self.owner_reference.as_ref(),
+                    object.metadata.owner_references.as_deref(),
+                ) {
+                    return Err(StoreError::new(
+                        StoreErrorKind::MalformedResponse,
+                        "load rejected a checkpoint with a different owner relationship",
+                    ));
+                }
+                decode_object(object)
+            })
+            .transpose()
     }
 
     async fn compare_and_swap(

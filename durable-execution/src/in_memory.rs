@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InMemoryFault {
     FailBeforeRequest(StoreErrorKind),
+    ConflictWithoutApply,
     OutcomeUnknownWithoutApply,
     OutcomeUnknownAfterApply,
 }
@@ -64,7 +65,7 @@ impl InMemoryCheckpointStore {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CheckpointStore for InMemoryCheckpointStore {
     async fn load(
         &self,
@@ -97,6 +98,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
                 kind,
                 "in-memory fault injected before compare-and-swap request",
             )),
+            Some(InMemoryFault::ConflictWithoutApply) => Ok(CasOutcome::Conflict),
             Some(InMemoryFault::OutcomeUnknownWithoutApply) => Ok(CasOutcome::OutcomeUnknown),
             fault @ (None | Some(InMemoryFault::OutcomeUnknownAfterApply)) => {
                 state.revision_counter =
@@ -176,6 +178,23 @@ mod tests {
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), StoreErrorKind::Unavailable);
+            assert_eq!(
+                store.load(execution_id).await.unwrap().unwrap().revision(),
+                &first
+            );
+
+            store.fail_next_compare_and_swap(InMemoryFault::ConflictWithoutApply);
+            assert_eq!(
+                store
+                    .compare_and_swap(
+                        execution_id,
+                        Some(first.clone()),
+                        checkpoint(execution_id, 31),
+                    )
+                    .await
+                    .unwrap(),
+                CasOutcome::Conflict
+            );
             assert_eq!(
                 store.load(execution_id).await.unwrap().unwrap().revision(),
                 &first

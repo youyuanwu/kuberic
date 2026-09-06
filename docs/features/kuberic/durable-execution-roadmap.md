@@ -35,6 +35,14 @@ The implemented kernel provides:
   test command after the one-control-plane KinD CI job is provisioned;
 - real-API spike measurements for checkpoint/object size, accepted writes,
   canonical typed watch-event bytes, and unknown-outcome recovery.
+- a feature-gated operator workflow pilot for sets with at most three members
+  that reuses the explicit switchover decisions and `ReplicaAgent` mutation
+  boundary;
+- direct kube-controller integration through Send workflow/store futures,
+  without another executor or scheduler;
+- same-namespace owner-bound pilot checkpoints, owner garbage-collection
+  validation, execution-keyed write/size telemetry, and a reproducible
+  explicit-versus-pilot source-complexity command.
 
 The bounds prevent unlimited growth and ensure a declared-valid result remains
 persistable after dispatch. Active history is never compacted: every completed
@@ -144,17 +152,22 @@ spike:
    feature-gated real-API coverage through the existing all-features workspace
    test command after the one-control-plane KinD CI job is provisioned.
 
-The remaining steps stay ordered and deferred:
+The operator pilot is implemented behind two explicit gates and does not
+authorize a workflow-ownership change or broader migration. A representative
+successful execution used 88 accepted checkpoint writes and reached a
+141,529-byte active checkpoint, versus 42 accepted status writes for the
+explicit test path. The checked-in lexical measurement reports 1,258
+executable lines and 141 decision points for the explicit implementation,
+while the four non-overlapping pilot module, checkpoint-store, effect-bridge,
+and reconcile boundaries total 2,254 executable lines and 194 decision points.
+CRD, manifest, and test changes are outside both measurements. The pilot
+therefore preserves safety but does not yet demonstrate lower persistence
+traffic or net implementation complexity.
 
-5. Add one operator workflow pilot without changing workflow ownership.
-6. Evaluate whether the async authoring model is materially simpler than the
-   existing explicit state machine.
-7. Generalize only if the pilot preserves safety and reduces complexity.
-
-The provider-readiness work does not add an operator dependency, alter
-reconciliation or deployment RBAC, or authorize a workflow migration. Operator
-pilot, switchover, deployment rollout, and any workflow-ownership change remain
-future gates.
+The remaining step stays deferred: generalize only if later evidence justifies
+the additional operational and implementation cost. No other workflow,
+generic worker, queue, lease, scheduler, retry framework, or compact-envelope
+migration is authorized.
 
 ## Explicitly Deferred
 

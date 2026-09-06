@@ -314,7 +314,7 @@ impl ContendedStore {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CheckpointStore for ContendedStore {
     async fn load(
         &self,
@@ -380,7 +380,7 @@ impl LinearWorkflow {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for LinearWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         let mut result = Vec::new();
@@ -396,7 +396,7 @@ struct TerminalWorkflow {
     outcome: TerminalOutcome,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for TerminalWorkflow {
     async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         self.outcome.clone()
@@ -404,10 +404,10 @@ impl Workflow for TerminalWorkflow {
 }
 
 struct PollSentinelWorkflow<'a> {
-    polls: &'a Cell<usize>,
+    polls: &'a Cell,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for PollSentinelWorkflow<'_> {
     async fn run(&self, _context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
         self.polls.set(self.polls.get() + 1);
@@ -2747,7 +2747,7 @@ async fn turn_injected_checkpoint(
     storage_key: ExecutionId,
     caller: ExecutionSpec,
     epoch_value: u8,
-    polls: &Cell<usize>,
+    polls: &Cell,
 ) -> HostOutcome {
     let store = InMemoryCheckpointStore::new();
     store
@@ -3292,7 +3292,6 @@ async fn base64_exact_bytes(id: ScenarioId) -> ScenarioEvidence {
 }
 
 use std::{
-    cell::Cell,
     panic::AssertUnwindSafe,
     sync::{
         Arc,
@@ -3300,3 +3299,19 @@ use std::{
     },
     task::Poll,
 };
+
+struct Cell(AtomicUsize);
+
+impl Cell {
+    fn new(value: usize) -> Self {
+        Self(AtomicUsize::new(value))
+    }
+
+    fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn set(&self, value: usize) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+}

@@ -1,17 +1,19 @@
 # Kuberic Durable Execution Kernel
 
-`kuberic-durable-execution` is an isolated feasibility crate for deterministic,
-linear workflow replay. It has no dependency on `kuberic-core` or
-`kuberic-operator`, and neither production crate depends on it. It is a kernel
-for evaluating replay and provider contracts, not an end-user runtime.
+`kuberic-durable-execution` is a focused kernel for deterministic, linear
+workflow replay. It has no dependency on `kuberic-core` or
+`kuberic-operator`; the operator can optionally depend on it for explicitly
+gated pilots. It is not an end-user runtime.
 
 ## Selected authoring surface
 
 The feasibility evaluation selected the ordinary async surface. A workflow is
-an `#[async_trait(?Send)]` implementation of `Workflow::run`; its only
+an `#[async_trait]` implementation of `Workflow::run`; its only
 framework-specific workflow-body operation is
 `WorkflowContext::activity(spec).await`. An immutable `ActivitySpec` combines
-the versioned name, exact input, and declared maximum result bytes.
+the versioned name, exact input, and declared maximum result bytes. Workflow
+and store futures are `Send` so a host turn can run directly inside an
+asynchronous controller without a second executor.
 
 ```rust
 use async_trait::async_trait;
@@ -22,7 +24,7 @@ use kuberic_durable_execution::{
 
 struct Greeting;
 
-#[async_trait(?Send)]
+#[async_trait]
 impl Workflow for Greeting {
     async fn run(
         &self,

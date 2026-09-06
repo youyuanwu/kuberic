@@ -39,8 +39,8 @@ impl TerminalOutcome {
 }
 
 /// Provisional ordinary-async workflow authoring surface.
-#[async_trait(?Send)]
-pub trait Workflow {
+#[async_trait]
+pub trait Workflow: Sync {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome;
 }
 
@@ -68,6 +68,11 @@ impl<'history> WorkflowContext<'history> {
 
     pub(crate) const fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// Return the immutable execution identity being replayed.
+    pub const fn execution_id(&self) -> ExecutionId {
+        self.execution_id
     }
 
     fn poll_activity(&mut self, spec: &ActivitySpec) -> Poll<ExactBytes> {

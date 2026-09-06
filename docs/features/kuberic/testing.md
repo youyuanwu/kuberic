@@ -387,6 +387,28 @@ before mutation. Assertions cover deterministic single dispatch of unsafe role
 changes, terminal stable snapshot recovery, and unsupported checkpoint
 versions with no mutating RPC.
 
+**Pattern 7a: Feature-gated durable-execution switchover pilot** ✅
+`test_durable_execution_switchover_pilot_*` keeps the explicit path as the
+default and drives the opt-in path through the format-3 checkpoint kernel.
+The matrix covers every-turn operator restart, schedule unknown outcomes with
+and without apply, terminal CAS conflict, failed status publication followed
+by terminal reload without Pods, stale target incarnation, failed target
+promotion compensation, and lost replies for every replica mutation. It
+asserts the ordered mutation sequence and one admitted unsafe effect per
+correlation identity.
+
+Run only the targeted pilot matrix:
+
+```console
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
+  --test reconciler test_durable_execution_switchover_pilot_ -- --nocapture
+```
+
+`python3 scripts/measure-switchover-complexity.py` reports stable lexical
+implementation boundaries. The real Kubernetes checkpoint test now also
+creates an owner-bound terminal checkpoint and proves owner deletion triggers
+garbage collection.
+
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the
 single coarse operator-to-primary reply, replaces controller state, and proves

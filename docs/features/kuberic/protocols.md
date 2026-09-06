@@ -147,6 +147,28 @@ observations. These fields are the only local correlation ledger. The bounded
 records correlate a lost reply within one agent generation without becoming
 distributed workflow history or an exactly-once claim.
 
+### Feature-gated durable replay path
+
+With both the operator build feature and per-resource `durablePilot` mode, the
+same protocol decisions are recorded as linear format-3 workflow activities.
+The ordering above does not change:
+
+```
+persist pilot reference
+  → schedule activity → expose dispatch → persist agent fence
+  → schedule activity → expose dispatch → correlated ReplicaAgent call
+  → observe agent ledger/runtime postcondition
+  → repeat existing switchover or compensation decision
+  → persist terminal checkpoint → publish stable topology/status
+```
+
+A dispatch permit is not an exactly-once claim. A lost reply is resolved from
+the exact correlation record or live postcondition. New-process generation
+plus exact precondition can prove that the old request was not admitted and
+allows one bounded redelivery of the same action identity. All other exposed
+ambiguity remains quarantined. ConfigMap conflicts and unknown write outcomes
+reload before any later permit.
+
 ---
 
 ## Protocol: Create Partition
