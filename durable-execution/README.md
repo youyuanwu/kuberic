@@ -67,11 +67,11 @@ exported.
 
 Typed calls first canonicalize JSON object-key order, then compare the encoded
 input exactly on every replay. Low-level `ExactBytes` are compared without
-normalization and encoded as validated base64 JSON strings. Workflow history is a contiguous, zero-based sequence with a
-completed prefix and at most one final pending activity. A requested activity
-must match the recorded sequence, immutable positive-versioned name, exact
-input, and declared result bound; a mismatch is nondeterminism rather than a
-new dispatch.
+normalization and encoded as validated base64 JSON strings. Workflow history
+is a contiguous, zero-based sequence with a completed prefix and at most one
+final pending activity. A requested activity must match the recorded sequence,
+immutable positive-versioned name, exact input, and declared result bound; a
+mismatch is nondeterminism rather than a new dispatch.
 
 Format version 3 stores JSON payload bytes in a versioned
 `CheckpointEnvelope`. An immutable `ExecutionSpec` declares execution
@@ -340,18 +340,20 @@ not reproduction of an actual network fault.
 
 The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
-three-way classifier. The revised evidence contains 38 unique contiguous
-scenarios and 117 structured assertions; all pass. All five FR-012 authoring
+three-way classifier. The revised evidence contains 45 unique contiguous
+scenarios and 134 structured assertions; all pass. All five FR-012 authoring
 predicates and all five provider, bounding, lifecycle, and documentation
-predicates also pass, so the mechanically derived result remains **feasible**
-within this kernel's stated boundary.
+predicates also pass. The mechanically derived result is **conditionally
+feasible** within this kernel's stated boundary because the operator pilot
+retains a documented write-efficiency exception.
 
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
-are implemented; generic active-history compaction, continuation, and operator
-adoption remain excluded. The remaining ordered deferred work is tracked in
+are implemented. A feature-gated operator pilot adopts the kernel without
+moving effect ownership into it; generic active-history compaction and
+continuation remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
 
 ## Limitations and exclusions
@@ -369,12 +371,11 @@ outcomes indistinguishable to the host. The lost-effect-reply fixture still
 invokes one synthetic effect under an opaque permit and discards its returned
 result before restart.
 
-Typed adapters, durable activity failures, dispatch registries, passive
-convergence, tracing/inspection, timers, retries, parallelism, generic
+Generic activity handlers/registries, a second activity-failure lifecycle,
+passive convergence, tracing/inspection, timers, retries, parallelism, generic
 lifecycle APIs, queries, external events, child workflows, workers, queues,
-leases, and operator integration are excluded. So are compensation,
-migrations, upgrade guarantees, rollout, and production diagnostics. The
-experiment changes no Kuberic CRD, operator reconciliation, durable topology
-workflow, status persistence, ReplicaAgent, gRPC protocol, or deployment
-manifest. These provider-readiness prerequisites do not establish
-current-operator parity or authorize an operator pilot, switchover, or adoption.
+leases, and distributed runtime ownership are excluded. So are migrations,
+upgrade guarantees, broad rollout, and production diagnostics. The
+feature-gated pilot integrates typed calls and operator-owned effect adapters;
+it does not change `ReplicaAgent`, the gRPC protocol, default explicit
+switchover, or any other topology workflow.

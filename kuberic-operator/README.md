@@ -48,10 +48,22 @@ collected with that owner. The operator needs ConfigMap `get`, `create`, and
 remains the scheduler and all replica mutations continue through
 `ReplicaAgent`.
 
+The pilot workflow uses typed activity calls and compact effect/observation
+records. Deterministic switchover transitions replay in memory; fused
+checkpoint CAS operations durably expose an exact command before returning a
+permit and combine authoritative observation with the next command or terminal
+state. Unknown replica or UID-fenced label outcomes remain quarantined and are
+not automatically retried. Set/Pod watches provide normal wakeups, with
+bounded deadline requeues as a fallback.
+
 Use `status.durableSwitchoverPilot` and the `DurableSwitchoverPilot` condition
 to inspect execution identity, storage reloads, exposed/quarantined work, and
 completion. The pilot does not apply to creation, add/build, removal, or
 failover.
+
+Run `python3 scripts/measure-switchover-complexity.py` from the repository root
+for workflow/shared/total lexical accounting. The representative integration
+test prints checkpoint, status, effect, label, and Pod-list measurements.
 
 ## Deployment
 

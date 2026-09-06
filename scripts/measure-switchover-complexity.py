@@ -103,6 +103,7 @@ def main() -> None:
     # pilot_workflow_subset is nested inside pilot_module and is intentionally
     # not added again.
     total = add(measured["pilot_module"], shared, integration)
+    combined = add(total, measured["explicit_switchover"])
     print()
     print("summary,executable_lines,decision_points")
     print(
@@ -116,15 +117,19 @@ def main() -> None:
     print(f"shared_reusable_infrastructure,{shared[0]},{shared[1]}")
     print(f"operator_integration,{integration[0]},{integration[1]}")
     print(f"pilot_nonoverlapping_total,{total[0]},{total[1]}")
+    print(f"combined_explicit_shared_and_pilot_total,{combined[0]},{combined[1]}")
     print("baseline_explicit,1258,141")
     print("baseline_pilot_workflow_subset,538,73")
     print("baseline_pilot_nonoverlapping_total,2254,194")
+    print("baseline_combined_explicit_and_pilot_total,3512,335")
     print()
     print(
         "note: pilot_workflow_body is the new workflow-only scope; "
         "pilot_workflow_subset preserves the merged-pilot marker for honest baseline "
         "comparison; both are nested in pilot_module and are not added twice; shared "
-        "reusable infrastructure is charged in total but can amortize across workflows"
+        "reusable infrastructure is charged in pilot total but can amortize across "
+        "workflows; the combined total also charges shared protocol changes retained "
+        "inside explicit_switchover"
     )
 
 
