@@ -10,7 +10,7 @@ use kuberic_durable_execution::{
 };
 use tracing::info;
 
-use super::pilot::PilotCheckpointStore;
+use super::pilot::{PilotActivityKind, PilotCheckpointStore, decode_pilot_activity_input};
 
 // COMPLEXITY-BOUNDARY: pilot-store:start
 const MAX_RECENT_CHECKPOINT_EVENTS: usize = 64;
@@ -30,6 +30,8 @@ pub struct PilotCheckpointMeasurementsSnapshot {
     pub latest_terminal_checkpoint_bytes: Option<usize>,
     pub maximum_terminal_checkpoint_bytes: usize,
     pub completed_activity_count: Option<u64>,
+    pub completed_external_effect_count: Option<u64>,
+    pub completed_passive_observation_count: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,10 +189,28 @@ impl MeasuredPilotCheckpointStore {
             return;
         };
         match payload.state() {
-            CheckpointState::Active { .. } => {
+            CheckpointState::Active { activities, .. } => {
                 measurements.latest_active_checkpoint_bytes = Some(bytes);
                 measurements.maximum_active_checkpoint_bytes =
                     measurements.maximum_active_checkpoint_bytes.max(bytes);
+                let mut external_effects = 0_u64;
+                let mut passive_observations = 0_u64;
+                for activity in activities {
+                    let Ok(input) = decode_pilot_activity_input(activity.input()) else {
+                        continue;
+                    };
+                    match input.kind {
+                        PilotActivityKind::PassiveObservation => {
+                            passive_observations = passive_observations.saturating_add(1);
+                        }
+                        PilotActivityKind::PreparedReplica { .. }
+                        | PilotActivityKind::PreparedLabel { .. } => {
+                            external_effects = external_effects.saturating_add(1);
+                        }
+                    }
+                }
+                measurements.completed_external_effect_count = Some(external_effects);
+                measurements.completed_passive_observation_count = Some(passive_observations);
             }
             CheckpointState::Terminal {
                 completed_activity_count,
@@ -200,6 +220,14 @@ impl MeasuredPilotCheckpointStore {
                 measurements.maximum_terminal_checkpoint_bytes =
                     measurements.maximum_terminal_checkpoint_bytes.max(bytes);
                 measurements.completed_activity_count = Some(*completed_activity_count);
+                let classified_count = measurements
+                    .completed_external_effect_count
+                    .zip(measurements.completed_passive_observation_count)
+                    .map(|(external, passive)| external.saturating_add(passive));
+                if classified_count != Some(*completed_activity_count) {
+                    measurements.completed_external_effect_count = None;
+                    measurements.completed_passive_observation_count = None;
+                }
             }
         }
     }
@@ -474,7 +502,7 @@ mod durable_switchover_pilot_tests {
         let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
         let store = MeasuredPilotCheckpointStore::new(
             execution_id,
-            PilotCheckpointStore::InMemory(backend),
+            PilotCheckpointStore::InMemory(backend.clone()),
         );
         let active =
             CheckpointEnvelope::encode(&CheckpointPayload::active(contract.clone(), Vec::new()))
@@ -490,7 +518,7 @@ mod durable_switchover_pilot_tests {
         let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             contract,
             TerminalOutcome::succeeded(ExactBytes::new(b"done")),
-            19,
+            12,
         ))
         .unwrap();
         let terminal_bytes = terminal.encoded_len().unwrap();
@@ -512,7 +540,23 @@ mod durable_switchover_pilot_tests {
             measurements.maximum_terminal_checkpoint_bytes,
             terminal_bytes
         );
-        assert_eq!(measurements.completed_activity_count, Some(19));
+        assert_eq!(measurements.completed_activity_count, Some(12));
+        assert_eq!(measurements.completed_external_effect_count, None);
+        assert_eq!(measurements.completed_passive_observation_count, None);
+
+        let restarted = MeasuredPilotCheckpointStore::new(
+            execution_id,
+            PilotCheckpointStore::InMemory(backend),
+        );
+        restarted.load(execution_id).await.unwrap();
+        let reloaded = restarted.measurements();
+        assert_eq!(reloaded.completed_activity_count, Some(12));
+        assert_eq!(
+            reloaded.latest_terminal_checkpoint_bytes,
+            Some(terminal_bytes)
+        );
+        assert_eq!(reloaded.completed_external_effect_count, None);
+        assert_eq!(reloaded.completed_passive_observation_count, None);
     }
 
     #[tokio::test]

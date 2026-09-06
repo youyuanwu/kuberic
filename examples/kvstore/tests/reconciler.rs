@@ -3831,18 +3831,69 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         )
         .unwrap();
     let durable_boundary_count = terminal_payload.terminal_outcome().unwrap().1;
+    let measurements = pilot_state
+        .durable_switchover_pilot
+        .as_ref()
+        .unwrap()
+        .measurements(
+            "default",
+            "pilot-happy",
+            "test-uid",
+            &reference.execution_id,
+        )
+        .await
+        .expect("completed pilot measurements must remain available");
+    let authoritative_external_effects = measurements
+        .completed_external_effect_count
+        .expect("accepted active checkpoints must classify external effects");
+    let authoritative_passive_observations = measurements
+        .completed_passive_observation_count
+        .expect("accepted active checkpoints must classify passive observations");
+    assert_eq!(external_effect_commands, 9);
+    assert_eq!(authoritative_external_effects, 9);
+    assert_eq!(authoritative_passive_observations, 3);
+    assert_eq!(durable_boundary_count, 12);
+    assert!(durable_boundary_count <= 12);
+    assert_eq!(
+        measurements.completed_activity_count,
+        Some(durable_boundary_count)
+    );
+    assert!(measurements.accepted_writes <= 13);
+    assert_eq!(measurements.accepted_writes, 13);
+    assert_eq!(
+        measurements.latest_terminal_checkpoint_bytes,
+        Some(terminal_bytes)
+    );
+    assert!(measurements.latest_active_checkpoint_bytes.is_some());
+    assert!(measurements.maximum_active_checkpoint_bytes >= terminal_bytes);
     println!(
         concat!(
             "KUBERIC_SWITCHOVER_MEASUREMENT engine=durable_pilot ",
-            "logical_external_effect_commands={} durable_boundary_count={} ",
-            "terminal_checkpoint_bytes={} accepted_status_writes_after_acceptance={} ",
-            "status_write_attempts={} status_write_conflicts={} status_write_unknowns={} ",
+            "external_effects={} passive_observations={} durable_boundaries={} ",
+            "checkpoint_accepted_writes={} checkpoint_write_attempts={} ",
+            "checkpoint_conflicts={} checkpoint_unknowns={} checkpoint_definite_failures={} ",
+            "latest_authoritative_checkpoint_bytes={} maximum_authoritative_checkpoint_bytes={} ",
+            "latest_active_checkpoint_bytes={} maximum_active_checkpoint_bytes={} ",
+            "terminal_checkpoint_bytes={} maximum_terminal_checkpoint_bytes={} ",
+            "accepted_status_writes_after_acceptance={} status_write_attempts={} ",
+            "status_write_conflicts={} status_write_unknowns={} ",
             "status_write_definite_failures={} uid_label_attempts={} uid_label_accepted={} ",
             "pod_list_api_calls={} requeues=unavailable(reason=harness_does_not_execute_controller_actions)"
         ),
-        external_effect_commands,
+        authoritative_external_effects,
+        authoritative_passive_observations,
         durable_boundary_count,
+        measurements.accepted_writes,
+        measurements.write_attempts,
+        measurements.conflicts,
+        measurements.unknown_outcomes,
+        measurements.definite_failures,
+        measurements.latest_authoritative_checkpoint_bytes.unwrap(),
+        measurements.maximum_authoritative_checkpoint_bytes,
+        measurements.latest_active_checkpoint_bytes.unwrap(),
+        measurements.maximum_active_checkpoint_bytes,
         terminal_bytes,
+        measurements.maximum_terminal_checkpoint_bytes,
         api.statuses
             .lock()
             .unwrap()

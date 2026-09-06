@@ -57,6 +57,7 @@ pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 752 * 1_024;
 
 const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.effect-boundary";
 const PILOT_ACTIVITY_VERSION: u32 = 1;
+const MAX_COMPLETED_MEASUREMENT_SNAPSHOTS: usize = 64;
 
 #[derive(Clone)]
 pub enum PilotCheckpointStore {
@@ -120,6 +121,8 @@ pub struct DurableSwitchoverPilotRuntime {
     factory: PilotStoreFactory,
     host_epoch: HostEpoch,
     hosts: Mutex<HashMap<PilotHostKey, Arc<Mutex<PilotHost>>>>,
+    completed_measurements:
+        Mutex<HashMap<PilotHostKey, super::pilot_store::PilotCheckpointMeasurementsSnapshot>>,
 }
 
 impl DurableSwitchoverPilotRuntime {
@@ -128,6 +131,7 @@ impl DurableSwitchoverPilotRuntime {
             factory: PilotStoreFactory::Kubernetes(client),
             host_epoch: HostEpoch::from_bytes(random()),
             hosts: Mutex::new(HashMap::new()),
+            completed_measurements: Mutex::new(HashMap::new()),
         }
     }
 
@@ -136,6 +140,7 @@ impl DurableSwitchoverPilotRuntime {
             factory: PilotStoreFactory::InMemory(store),
             host_epoch: HostEpoch::from_bytes(random()),
             hosts: Mutex::new(HashMap::new()),
+            completed_measurements: Mutex::new(HashMap::new()),
         }
     }
 
@@ -157,6 +162,7 @@ impl DurableSwitchoverPilotRuntime {
         if let Some(host) = hosts.get(&key) {
             return Ok(host.clone());
         }
+        self.completed_measurements.lock().await.remove(&key);
         let store = match &self.factory {
             PilotStoreFactory::Kubernetes(client) => {
                 let options = checkpoint_store_options(namespace, set_name, set_uid)?;
@@ -184,12 +190,23 @@ impl DurableSwitchoverPilotRuntime {
     }
 
     pub async fn forget(&self, namespace: &str, set_name: &str, set_uid: &str, execution_id: &str) {
-        self.hosts.lock().await.remove(&PilotHostKey {
+        let key = PilotHostKey {
             namespace: namespace.to_string(),
             set_name: set_name.to_string(),
             set_uid: set_uid.to_string(),
             execution_id: execution_id.to_string(),
-        });
+        };
+        let host = self.hosts.lock().await.remove(&key);
+        if let Some(host) = host {
+            let measurements = host.lock().await.store().measurements();
+            let mut completed = self.completed_measurements.lock().await;
+            if completed.len() == MAX_COMPLETED_MEASUREMENT_SNAPSHOTS {
+                if let Some(eviction_candidate) = completed.keys().next().cloned() {
+                    completed.remove(&eviction_candidate);
+                }
+            }
+            completed.insert(key, measurements);
+        }
     }
 
     pub async fn host_count(&self) -> usize {
@@ -203,18 +220,16 @@ impl DurableSwitchoverPilotRuntime {
         set_uid: &str,
         execution_id: &str,
     ) -> Option<super::pilot_store::PilotCheckpointMeasurementsSnapshot> {
-        let host = self
-            .hosts
-            .lock()
-            .await
-            .get(&PilotHostKey {
-                namespace: namespace.to_string(),
-                set_name: set_name.to_string(),
-                set_uid: set_uid.to_string(),
-                execution_id: execution_id.to_string(),
-            })
-            .cloned()?;
-        Some(host.lock().await.store().measurements())
+        let key = PilotHostKey {
+            namespace: namespace.to_string(),
+            set_name: set_name.to_string(),
+            set_uid: set_uid.to_string(),
+            execution_id: execution_id.to_string(),
+        };
+        if let Some(host) = self.hosts.lock().await.get(&key).cloned() {
+            return Some(host.lock().await.store().measurements());
+        }
+        self.completed_measurements.lock().await.get(&key).copied()
     }
 }
 
@@ -1396,9 +1411,11 @@ fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
         "demote.effect",
         "promote.effect",
     ];
-    for _ in 0..member_count.saturating_sub(2) {
-        steps.push("epoch.effect");
-    }
+    steps.extend(std::iter::repeat_n(
+        "epoch.effect",
+        member_count.saturating_sub(2),
+    ));
+
     steps.extend([
         "catch-up-config.effect",
         "quorum.effect",
@@ -1413,6 +1430,22 @@ fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
         redelivery_headroom,
     ));
     steps
+}
+
+#[cfg(test)]
+fn projected_passive_observation_count(steps: &[&str]) -> usize {
+    steps
+        .iter()
+        .filter(|step| !step.ends_with(".effect") && **step != "proven-no-admission-redelivery")
+        .count()
+}
+
+#[cfg(test)]
+fn projected_label_effect_count(steps: &[&str]) -> usize {
+    steps
+        .iter()
+        .filter(|step| step.contains("label.effect"))
+        .count()
 }
 
 fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), String> {
@@ -1485,9 +1518,10 @@ fn projected_rollback_steps(member_count: usize) -> Vec<&'static str> {
         "promote.effect",
         "rollback-promote.effect",
     ];
-    for _ in 0..member_count.saturating_sub(1) {
-        steps.push("rollback-epoch.effect");
-    }
+    steps.extend(std::iter::repeat_n(
+        "rollback-epoch.effect",
+        member_count.saturating_sub(1),
+    ));
     steps.extend([
         "rollback-catch-up.effect",
         "rollback-current.effect",
@@ -1558,6 +1592,55 @@ fn maximum_active_payload(
         })
         .collect();
     Ok(CheckpointPayload::active(contract, activities))
+}
+
+#[cfg(test)]
+fn maximum_prepared_activity_input() -> Result<ExactBytes, String> {
+    let maximum_fence = "x".repeat(512);
+    let input = DurableSwitchoverActivityInput {
+        version: PILOT_VERSION,
+        state: DurableSwitchoverState {
+            phase: DurableOperationPhase::Poisoned,
+            frozen_lsn: Some(i64::MAX),
+            next_secondary_index: u32::MAX,
+            phase_deadline_unix_seconds: i64::MAX,
+            pending_action: None,
+            last_error: Some(maximum_fence.clone()),
+        },
+        kind: PilotActivityKind::PreparedReplica {
+            command: ReplicaEffectCommand {
+                action_id: maximum_fence.clone(),
+                action_signature: maximum_fence.clone(),
+                target_id: i64::MAX,
+                target_instance_id: maximum_fence.clone(),
+                expected_epoch: crate::crd::EpochStatus {
+                    data_loss_number: i64::MAX,
+                    configuration_number: i64::MAX,
+                },
+                desired_postcondition: crate::crd::DurablePostconditionStatus {
+                    kind: crate::crd::DurablePostconditionKind::CurrentConfiguration,
+                    role: Some(crate::crd::StableReplicaRoleStatus::Primary),
+                },
+                expected_agent_generation: maximum_fence.clone(),
+                expected_control_version: u64::MAX,
+                observed_runtime_epoch: crate::crd::EpochStatus {
+                    data_loss_number: i64::MAX,
+                    configuration_number: i64::MAX,
+                },
+                action_payload: "x".repeat(4_096),
+            },
+        },
+    };
+    let encoded = encode_activity_input::<DurableSwitchoverActivity>(&input)
+        .map_err(|error| format!("encode maximum prepared pilot activity: {error}"))?;
+    if encoded.as_slice().len() > PILOT_MAX_ACTIVITY_INPUT_BYTES {
+        return Err(format!(
+            "maximum prepared pilot activity is {} bytes; maximum is {}",
+            encoded.as_slice().len(),
+            PILOT_MAX_ACTIVITY_INPUT_BYTES
+        ));
+    }
+    Ok(encoded)
 }
 
 fn encode_execution_id(execution_id: ExecutionId) -> String {
@@ -1685,6 +1768,15 @@ mod durable_switchover_pilot_tests {
 
     #[test]
     fn maximum_projected_history_fits_both_budgets() {
+        let prepared_input = maximum_prepared_activity_input().unwrap();
+        assert!(
+            prepared_input.as_slice().len() > PILOT_MAX_ACTIVITY_INPUT_BYTES / 2,
+            "prepared fixture must exercise large commands and fences"
+        );
+        assert!(matches!(
+            decode_pilot_activity_input(&prepared_input).unwrap().kind,
+            PilotActivityKind::PreparedReplica { .. }
+        ));
         let checkpoint = maximum_active_checkpoint().unwrap();
         let encoded = checkpoint.encoded_len().unwrap();
         assert!(encoded <= PILOT_MAX_ENCODED_CHECKPOINT_BYTES);
@@ -3096,6 +3188,25 @@ mod durable_switchover_pilot_tests {
         let rollback = projected_rollback_steps(PILOT_MAX_REPLICAS);
         assert_eq!(success.len(), 21);
         assert_eq!(rollback.len(), 23);
+        let success_external_effects = external_effect_count(&success);
+        let rollback_external_effects = external_effect_count(&rollback);
+        assert_eq!(success_external_effects, 9);
+        let success_label_effects = projected_label_effect_count(&success);
+        assert_eq!(success_label_effects, 2);
+        assert_eq!(success_external_effects - success_label_effects, 7);
+        assert_eq!(projected_passive_observation_count(&success), 3);
+        assert_eq!(
+            success.len() - success_external_effects,
+            12,
+            "success projection includes three passive observations and nine redeliveries"
+        );
+        assert_eq!(rollback_external_effects, 10);
+        assert_eq!(projected_passive_observation_count(&rollback), 3);
+        assert_eq!(
+            rollback.len() - rollback_external_effects,
+            13,
+            "rollback projection retains three passive observations and ten redeliveries"
+        );
         assert!(success.len() <= PILOT_MAX_ACTIVITY_RECORDS);
         assert!(rollback.len() <= PILOT_MAX_ACTIVITY_RECORDS);
         assert!(success.len() + projected_success_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL);

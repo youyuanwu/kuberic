@@ -5,6 +5,8 @@ on: [push, pull_request]
 
 env:
   XEDIO_CI: true
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
 
 jobs:
   build:
@@ -43,9 +45,21 @@ jobs:
 
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
+
+    - name: Measure switchover complexity
+      run: python3 scripts/measure-switchover-complexity.py
     
     - name: Run cargo clippy
       run: cargo clippy --all-targets -- -D warnings
+
+    - name: Run durable switchover measurement gates
+      env:
+        RUST_MIN_STACK: 4194304
+      run: |
+        cargo test -p kuberic-operator --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
+        cargo test -p kuberic-operator --features durable-switchover-pilot maximum_projected_history_fits_both_budgets
+        cargo test -p kuberic-operator --features durable-switchover-pilot measurements_ -- --nocapture
+        cargo test -p kvstore --test reconciler test_durable_execution_switchover_pilot_happy_path -- --nocapture
 
     - name: Build all targets
       run: cargo build --all-targets

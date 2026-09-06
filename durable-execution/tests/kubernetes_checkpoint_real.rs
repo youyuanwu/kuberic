@@ -5,7 +5,7 @@ use std::{
     io,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -105,6 +105,34 @@ impl CheckpointStore for MaskOnceStore {
 #[derive(Clone)]
 struct OneActivityWorkflow {
     activity: ActivitySpec,
+}
+
+#[derive(Clone)]
+struct AttemptCountingStore {
+    inner: KubernetesCheckpointStore,
+    write_attempts: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl CheckpointStore for AttemptCountingStore {
+    async fn load(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Option<StoredCheckpoint>, StoreError> {
+        self.inner.load(execution_id).await
+    }
+
+    async fn compare_and_swap(
+        &self,
+        execution_id: ExecutionId,
+        expected: Option<StorageRevision>,
+        checkpoint: CheckpointEnvelope,
+    ) -> Result<CasOutcome, StoreError> {
+        self.write_attempts.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .compare_and_swap(execution_id, expected, checkpoint)
+            .await
+    }
 }
 
 #[async_trait]
@@ -235,7 +263,7 @@ async fn run_real_api_scenarios(client: Client, namespace: &str) -> TestResult<(
          fixture=active-completed-to-terminal-v1 \
          active_checkpoint_bytes={} active_object_bytes={} \
          terminal_checkpoint_bytes={} terminal_object_bytes={} \
-         accepted_writes={} measurement_failures={} \
+         write_attempts={} accepted_writes={} measurement_failures={} \
          watch_events={} watch_typed_event_json_bytes={} \
          watch_byte_boundary=canonical_typed_WatchEvent_ConfigMap_JSON_excludes_HTTP_framing \
          apply_then_unknown_recovery=successor \
@@ -245,6 +273,7 @@ async fn run_real_api_scenarios(client: Client, namespace: &str) -> TestResult<(
         measurement.active_object_bytes,
         measurement.terminal_checkpoint_bytes,
         measurement.terminal_object_bytes,
+        measurement.write_attempts,
         measurement.accepted_writes,
         measurement.measurement_failures,
         measurement.watch_events,
@@ -379,6 +408,7 @@ struct Measurement {
     active_object_bytes: u64,
     terminal_checkpoint_bytes: u64,
     terminal_object_bytes: u64,
+    write_attempts: u64,
     accepted_writes: u64,
     measurement_failures: u64,
     watch_events: u64,
@@ -393,8 +423,13 @@ async fn validate_measurement_and_watch(
     let (execution, activity, active, terminal, limits) = fixed_fixture(execution_id)?;
     let store = KubernetesCheckpointStore::new(client.clone(), namespace)?;
     let before = store.metrics().snapshot();
+    let write_attempts = Arc::new(AtomicU64::new(0));
+    let measured_store = AttemptCountingStore {
+        inner: store.clone(),
+        write_attempts: write_attempts.clone(),
+    };
     let active_revision = accepted_revision(
-        store
+        measured_store
             .compare_and_swap(execution_id, None, active.clone())
             .await?,
     )?;
@@ -445,7 +480,7 @@ async fn validate_measurement_and_watch(
         }
     };
     let write_future =
-        store.compare_and_swap(execution_id, Some(active_revision), terminal.clone());
+        measured_store.compare_and_swap(execution_id, Some(active_revision), terminal.clone());
     let (write_result, watch_result) = tokio::join!(write_future, watch_future);
     let terminal_revision = accepted_revision(write_result?)?;
     let (watch_events, watch_bytes, watched_revision) = watch_result?;
@@ -459,6 +494,9 @@ async fn validate_measurement_and_watch(
         after_terminal.accepted_writes() - before.accepted_writes(),
         2
     );
+    let write_attempts = write_attempts.load(Ordering::Relaxed);
+    assert_eq!(write_attempts, 2);
+    assert!(after_terminal.accepted_writes() - before.accepted_writes() <= write_attempts);
     assert_eq!(after_terminal.measurement_failures(), 0);
     let loaded = store
         .load(execution_id)
@@ -479,6 +517,7 @@ async fn validate_measurement_and_watch(
         terminal_checkpoint_bytes: after_terminal.checkpoint_bytes()
             - after_active.checkpoint_bytes(),
         terminal_object_bytes: after_terminal.object_bytes() - after_active.object_bytes(),
+        write_attempts,
         accepted_writes: after_terminal.accepted_writes() - before.accepted_writes(),
         measurement_failures: after_terminal.measurement_failures() - before.measurement_failures(),
         watch_events,
