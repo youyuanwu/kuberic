@@ -18,11 +18,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use k8s_openapi::{api::core::v1::ConfigMap, apimachinery::pkg::apis::meta::v1::ObjectMeta};
-use kube::{
-    Api, Client, Error,
-    api::{PostParams, ResourceExt},
+use k8s_openapi::{
+    api::core::v1::ConfigMap,
+    apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference},
 };
+use kube::{Api, Client, Error, api::PostParams};
 
 use crate::{
     CasOutcome, CheckpointEnvelope, CheckpointStore, ExecutionId, StorageRevision, StoreError,
@@ -31,7 +31,93 @@ use crate::{
 
 const CHECKPOINT_DATA_KEY: &str = "checkpoint.json";
 const CHECKPOINT_NAME_PREFIX: &str = "kuberic-checkpoint-";
-const CONFIG_MAP_DATA_LIMIT: usize = 1024 * 1024;
+
+/// Default aggregate UTF-8 byte budget for ConfigMap data keys and values.
+pub const DEFAULT_CONFIG_MAP_DATA_BUDGET_BYTES: u64 = 768 * 1024;
+
+/// Largest configurable data budget, retaining 64 KiB below the 1 MiB ceiling.
+pub const MAX_CONFIG_MAP_DATA_BUDGET_BYTES: u64 = 960 * 1024;
+
+/// Caller assertion about the scope of a checkpoint owner.
+///
+/// Kubernetes does not serialize owner namespace or scope in an
+/// [`OwnerReference`], so the provider needs this assertion to reject known
+/// cross-namespace references before dispatch. The caller remains responsible
+/// for asserting the actual scope of the referenced resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KubernetesCheckpointOwnerScope {
+    /// A namespaced owner, which must share the checkpoint namespace.
+    Namespaced(String),
+    /// A cluster-scoped owner, which may own a namespaced checkpoint.
+    ClusterScoped,
+}
+
+/// Optional Kubernetes garbage-collection owner for checkpoint ConfigMaps.
+///
+/// The provider accepts only non-controlling, non-blocking references. It does
+/// not fetch the owner to prove its existence or scope.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KubernetesCheckpointOwner {
+    reference: OwnerReference,
+    scope: KubernetesCheckpointOwnerScope,
+}
+
+impl KubernetesCheckpointOwner {
+    /// Pair an owner reference with the caller's scope assertion.
+    pub const fn new(reference: OwnerReference, scope: KubernetesCheckpointOwnerScope) -> Self {
+        Self { reference, scope }
+    }
+
+    /// Borrow the owner reference emitted on checkpoint objects.
+    pub const fn reference(&self) -> &OwnerReference {
+        &self.reference
+    }
+
+    /// Borrow the caller-supplied owner scope assertion.
+    pub const fn scope(&self) -> &KubernetesCheckpointOwnerScope {
+        &self.scope
+    }
+}
+
+/// Construction options for a Kubernetes checkpoint store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KubernetesCheckpointStoreOptions {
+    data_budget_bytes: u64,
+    owner: Option<KubernetesCheckpointOwner>,
+}
+
+impl Default for KubernetesCheckpointStoreOptions {
+    fn default() -> Self {
+        Self {
+            data_budget_bytes: DEFAULT_CONFIG_MAP_DATA_BUDGET_BYTES,
+            owner: None,
+        }
+    }
+}
+
+impl KubernetesCheckpointStoreOptions {
+    /// Set the aggregate ConfigMap data-key and data-value budget in bytes.
+    pub const fn with_data_budget_bytes(mut self, data_budget_bytes: u64) -> Self {
+        self.data_budget_bytes = data_budget_bytes;
+        self
+    }
+
+    /// Attach one optional, non-controlling garbage-collection owner.
+    pub fn with_owner(mut self, owner: KubernetesCheckpointOwner) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// Return the configured aggregate ConfigMap data budget.
+    pub const fn data_budget_bytes(&self) -> u64 {
+        self.data_budget_bytes
+    }
+
+    /// Return the optional checkpoint owner.
+    pub const fn owner(&self) -> Option<&KubernetesCheckpointOwner> {
+        self.owner.as_ref()
+    }
+}
 
 #[derive(Debug, Default)]
 struct Metrics {
@@ -111,17 +197,39 @@ impl KubernetesCheckpointMetricsSnapshot {
 pub struct KubernetesCheckpointStore {
     api: Api<ConfigMap>,
     namespace: String,
+    data_budget_bytes: usize,
+    owner_reference: Option<OwnerReference>,
     metrics: KubernetesCheckpointMetrics,
 }
 
 impl KubernetesCheckpointStore {
     /// Construct a store from a caller-owned Kubernetes client and namespace.
     pub fn new(client: Client, namespace: impl Into<String>) -> Result<Self, StoreError> {
+        Self::with_options(
+            client,
+            namespace,
+            KubernetesCheckpointStoreOptions::default(),
+        )
+    }
+
+    /// Construct a store with an explicit data budget and optional owner.
+    pub fn with_options(
+        client: Client,
+        namespace: impl Into<String>,
+        options: KubernetesCheckpointStoreOptions,
+    ) -> Result<Self, StoreError> {
         let namespace = namespace.into();
         validate_namespace(&namespace)?;
+        let data_budget_bytes = validate_data_budget(options.data_budget_bytes)?;
+        let owner_reference = options
+            .owner
+            .map(|owner| validate_owner(&namespace, owner))
+            .transpose()?;
         Ok(Self {
             api: Api::namespaced(client, &namespace),
             namespace,
+            data_budget_bytes,
+            owner_reference,
             metrics: KubernetesCheckpointMetrics::default(),
         })
     }
@@ -161,6 +269,7 @@ impl KubernetesCheckpointStore {
                 namespace: Some(self.namespace.clone()),
                 resource_version: expected.map(|revision| revision.as_str().to_string()),
                 labels: Some(labels),
+                owner_references: self.owner_reference.clone().map(|owner| vec![owner]),
                 ..ObjectMeta::default()
             },
             data: Some(data),
@@ -205,18 +314,48 @@ impl CheckpointStore for KubernetesCheckpointStore {
                     "compare-and-swap ConfigMap data size overflowed",
                 )
             })?;
-        if config_map_data_bytes > CONFIG_MAP_DATA_LIMIT {
+        if config_map_data_bytes > self.data_budget_bytes {
             return Err(StoreError::new(
                 StoreErrorKind::Other,
                 format!(
-                    "compare-and-swap ConfigMap data is {config_map_data_bytes} bytes, exceeding the ConfigMap data limit of {CONFIG_MAP_DATA_LIMIT} bytes"
+                    "compare-and-swap ConfigMap data is {config_map_data_bytes} bytes, exceeding the configured ConfigMap data budget of {} bytes",
+                    self.data_budget_bytes
                 ),
             ));
         }
 
+        let name = Self::object_name(execution_id);
+        if let Some(expected_revision) = expected.as_ref() {
+            let existing = self
+                .api
+                .get_opt(&name)
+                .await
+                .map_err(|error| load_error("compare-and-swap ownership preflight", error))?;
+            let Some(existing) = existing else {
+                return Ok(CasOutcome::Conflict);
+            };
+            let Some(existing_revision) = response_revision(&existing) else {
+                return Err(StoreError::new(
+                    StoreErrorKind::MalformedResponse,
+                    "compare-and-swap ownership preflight returned a ConfigMap without a usable resourceVersion",
+                ));
+            };
+            if &existing_revision != expected_revision {
+                return Ok(CasOutcome::Conflict);
+            }
+            if !owner_relationship_matches(
+                self.owner_reference.as_ref(),
+                existing.metadata.owner_references.as_deref(),
+            ) {
+                return Err(StoreError::new(
+                    StoreErrorKind::Other,
+                    "compare-and-swap refused to change the checkpoint owner relationship",
+                ));
+            }
+        }
+
         let checkpoint_bytes = checkpoint_json.len();
         let object = self.object(execution_id, expected.as_ref(), checkpoint_json);
-        let name = object.name_any();
         let result = if expected.is_some() {
             self.api
                 .replace(&name, &PostParams::default(), &object)
@@ -236,6 +375,92 @@ impl CheckpointStore for KubernetesCheckpointStore {
             Err(error) => classify_mutation_error(expected.is_some(), error),
         }
     }
+}
+
+fn owner_relationship_matches(
+    configured: Option<&OwnerReference>,
+    persisted: Option<&[OwnerReference]>,
+) -> bool {
+    match (configured, persisted.unwrap_or_default()) {
+        (None, []) => true,
+        (Some(configured), [persisted]) => {
+            configured.api_version == persisted.api_version
+                && configured.kind == persisted.kind
+                && configured.name == persisted.name
+                && configured.uid == persisted.uid
+                && configured.controller.unwrap_or(false) == persisted.controller.unwrap_or(false)
+                && configured.block_owner_deletion.unwrap_or(false)
+                    == persisted.block_owner_deletion.unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn validate_data_budget(data_budget_bytes: u64) -> Result<usize, StoreError> {
+    if !(1..=MAX_CONFIG_MAP_DATA_BUDGET_BYTES).contains(&data_budget_bytes) {
+        return Err(StoreError::new(
+            StoreErrorKind::Other,
+            format!(
+                "Kubernetes checkpoint ConfigMap data budget must be between 1 and {MAX_CONFIG_MAP_DATA_BUDGET_BYTES} bytes inclusive; received {data_budget_bytes}"
+            ),
+        ));
+    }
+    usize::try_from(data_budget_bytes).map_err(|_| {
+        StoreError::new(
+            StoreErrorKind::Other,
+            format!(
+                "Kubernetes checkpoint ConfigMap data budget {data_budget_bytes} cannot be represented on this platform"
+            ),
+        )
+    })
+}
+
+fn validate_owner(
+    checkpoint_namespace: &str,
+    owner: KubernetesCheckpointOwner,
+) -> Result<OwnerReference, StoreError> {
+    for (field, value) in [
+        ("apiVersion", owner.reference.api_version.as_str()),
+        ("kind", owner.reference.kind.as_str()),
+        ("name", owner.reference.name.as_str()),
+        ("uid", owner.reference.uid.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::new(
+                StoreErrorKind::Other,
+                format!("Kubernetes checkpoint owner {field} must be nonempty"),
+            ));
+        }
+    }
+    if owner.reference.controller == Some(true) {
+        return Err(StoreError::new(
+            StoreErrorKind::Other,
+            "Kubernetes checkpoint owner controller must be absent or false; the checkpoint provider does not take controller ownership",
+        ));
+    }
+    if owner.reference.block_owner_deletion == Some(true) {
+        return Err(StoreError::new(
+            StoreErrorKind::Other,
+            "Kubernetes checkpoint owner blockOwnerDeletion must be absent or false; the checkpoint provider does not require delete permission on the owner",
+        ));
+    }
+    if let KubernetesCheckpointOwnerScope::Namespaced(owner_namespace) = &owner.scope {
+        validate_namespace(owner_namespace).map_err(|_| {
+            StoreError::new(
+                StoreErrorKind::Other,
+                "Kubernetes checkpoint owner namespace must be a nonempty DNS label of at most 63 characters",
+            )
+        })?;
+        if owner_namespace != checkpoint_namespace {
+            return Err(StoreError::new(
+                StoreErrorKind::Other,
+                format!(
+                    "Kubernetes checkpoint owner namespace {owner_namespace:?} must match checkpoint namespace {checkpoint_namespace:?}"
+                ),
+            ));
+        }
+    }
+    Ok(owner.reference)
 }
 
 fn validate_namespace(namespace: &str) -> Result<(), StoreError> {

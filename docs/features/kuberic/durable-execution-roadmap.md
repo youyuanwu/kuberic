@@ -27,6 +27,12 @@ The implemented kernel provides:
 - ambiguity quarantine and authoritative observation recovery;
 - an optional, isolated ConfigMap checkpoint-provider spike using opaque
   Kubernetes `resourceVersion` compare-and-swap;
+- independently retained checkpoints by default, with validated optional
+  non-controlling owner references and separately authorized orphan cleanup;
+- a configurable conservative ConfigMap data budget with documented headroom;
+- namespace-scoped writer and cleanup RBAC examples with separate identities;
+- feature-gated real-API coverage through the existing all-features workspace
+  test command after the one-control-plane KinD CI job is provisioned;
 - real-API spike measurements for checkpoint/object size, accepted writes,
   canonical typed watch-event bytes, and unknown-outcome recovery.
 
@@ -119,7 +125,8 @@ those runtime facilities rather than growing the kernel speculatively.
 
 ### Kubernetes Integration
 
-The first two integration steps are now implemented as an isolated spike:
+The provider and its readiness prerequisites are implemented as an isolated
+spike:
 
 1. **Implemented:** Kubernetes ConfigMap checkpoint storage using opaque
    `resourceVersion` create/replace compare-and-swap, portable errors, and
@@ -128,16 +135,26 @@ The first two integration steps are now implemented as an isolated spike:
    active/terminal checkpoint and returned-object size, confirmed accepted
    writes, canonical typed watch-event JSON bytes, and both reload branches
    after an unknown outcome.
+3. **Implemented:** A retention contract that keeps terminal checkpoints,
+   defaults to independent retention, accepts only validated non-controlling
+   owner references, and assigns orphan deletion to a separately authorized
+   lifecycle actor.
+4. **Implemented:** A configurable 786,432-byte default ConfigMap data budget,
+   standalone least-privilege writer and cleanup RBAC examples, and
+   feature-gated real-API coverage through the existing all-features workspace
+   test command after the one-control-plane KinD CI job is provisioned.
 
 The remaining steps stay ordered and deferred:
 
-3. Add one operator workflow pilot without changing workflow ownership.
-4. Evaluate whether the async authoring model is materially simpler than the
+5. Add one operator workflow pilot without changing workflow ownership.
+6. Evaluate whether the async authoring model is materially simpler than the
    existing explicit state machine.
-5. Generalize only if the pilot preserves safety and reduces complexity.
+7. Generalize only if the pilot preserves safety and reduces complexity.
 
-The provider spike does not add an operator dependency, alter reconciliation,
-or authorize a workflow migration.
+The provider-readiness work does not add an operator dependency, alter
+reconciliation or deployment RBAC, or authorize a workflow migration. Operator
+pilot, switchover, deployment rollout, and any workflow-ownership change remain
+future gates.
 
 ## Explicitly Deferred
 

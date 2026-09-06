@@ -25,5 +25,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 http = "1"
+serde_yaml_ng = "=0.10.0"
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }

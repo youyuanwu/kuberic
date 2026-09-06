@@ -141,6 +141,21 @@ let store = KubernetesCheckpointStore::new(client, "durable-checkpoints")?;
 # }
 ```
 
+`KubernetesCheckpointStore::new` uses independently retained checkpoints and a
+786,432-byte ConfigMap data budget. Advanced callers can use
+`KubernetesCheckpointStore::with_options` with
+`KubernetesCheckpointStoreOptions` to select a budget from 1 through 983,040
+bytes and optionally attach one `KubernetesCheckpointOwner`. The owner wraps a
+Kubernetes `OwnerReference` plus either a namespaced or cluster-scoped
+assertion. A namespaced owner must name the checkpoint namespace. Required
+identity fields and the immutable UID must be nonempty, and controlling or
+deletion-blocking references are rejected before any request. The provider
+does not fetch the owner, so the caller remains responsible for the accuracy
+of its scope, GVK, name, and UID. Before a replacement, the provider reads the
+current object and rejects a stale revision or owner relationship that differs
+from the store configuration, so reconstruction cannot silently change a
+checkpoint between independent and owner-based retention.
+
 Each execution maps to
 `kuberic-checkpoint-<32-lowercase-execution-id-hex>` in that namespace. The
 format-3 envelope's canonical JSON is stored in
@@ -156,8 +171,32 @@ retain only the operation plus API code/reason. Mutation transport failures,
 5xx responses, and successful responses without a usable revision are
 `OutcomeUnknown`, because acceptance cannot be disproved. The provider never
 embeds Kubernetes error types, credentials, checkpoint contents, or arbitrary
-transport text in its public errors. ConfigMap data is checked against the
-1 MiB data limit before dispatch.
+transport text in its public errors.
+
+The data budget is the aggregate UTF-8 byte length of every ConfigMap `data`
+key and value. An exact-bound object passes this local gate; one byte over is
+rejected before dispatch. This provider check is separate from and does not
+weaken the kernel's activity-count and encoded-checkpoint limits. Passing the
+budget does not guarantee API-server acceptance: metadata, managed fields,
+annotations, owner references, admission mutation, and API-server policy can
+consume capacity or reject the object independently.
+
+Checkpoints have no provider-driven terminal deletion. Terminalization
+CAS-replaces active history with a terminal record and retains the ConfigMap.
+Without an owner reference, the checkpoint remains independently retained
+until an explicitly authorized lifecycle actor removes it. With an owner,
+ordinary Kubernetes garbage collection may remove the checkpoint after that
+owner is deleted. Orphan selection, retention policy, and recovery-safety
+checks remain responsibilities of a separate lifecycle actor, not this
+provider.
+
+The namespace-scoped
+[writer RBAC example](deploy/checkpoint-writer-rbac.yaml) grants only ConfigMap
+`get`, `create`, and `update`. The separate
+[cleanup RBAC example](deploy/checkpoint-cleanup-rbac.yaml) grants only
+ConfigMap `list` and `delete`; it is optional and intentionally not granted to
+the writer identity. These examples do not alter or broaden the existing
+operator permissions.
 
 `store.metrics().snapshot()` reports only writes confirmed by a response with a
 usable authoritative revision. It includes accepted-write count, canonical
@@ -243,13 +282,21 @@ CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes
 CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --features kubernetes --all-targets -- -D warnings
 ```
 
-An explicit ignored test performs authorization preflight, creates a temporary
+A feature-gated test performs authorization preflight, creates a temporary
 namespace, validates the provider against the configured real Kubernetes API,
 prints its measurement report, and waits for namespace deletion:
 
 ```console
-CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real -- --ignored --nocapture
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real
 ```
+
+The repository's existing [CI workflow](../.github/workflows/CI.yml) enables
+all crate features on its workspace-wide test command after the existing
+`helm/kind-action` step has provisioned the shared one-control-plane KinD
+environment. There is no separate provider test step, second cluster, or
+second cleanup owner. Cluster lifecycle remains owned by the existing KinD
+action. Ordinary local and default Cargo test runs without the Kubernetes
+feature do not select this test.
 
 The test reports a failed endpoint or authorization precondition rather than
 claiming real-API coverage. Its apply-then-unknown and no-apply-unknown cases
@@ -288,11 +335,11 @@ invokes one synthetic effect under an opaque permit and discards its returned
 result before restart.
 
 Typed adapters, durable activity failures, dispatch registries, passive
-convergence, tracing/inspection, timers, retries, parallelism, lifecycle,
-queries, external events, child workflows, workers, queues, leases, and
-operator integration are excluded. So are compensation, migrations, upgrade
-guarantees, rollout, and production diagnostics. The experiment changes no
-Kuberic CRD, operator reconciliation, durable topology workflow, status
-persistence, ReplicaAgent, gRPC protocol, or deployment manifest. Its
-classification is not a production-readiness, current-operator-parity, or
-adoption claim.
+convergence, tracing/inspection, timers, retries, parallelism, generic
+lifecycle APIs, queries, external events, child workflows, workers, queues,
+leases, and operator integration are excluded. So are compensation,
+migrations, upgrade guarantees, rollout, and production diagnostics. The
+experiment changes no Kuberic CRD, operator reconciliation, durable topology
+workflow, status persistence, ReplicaAgent, gRPC protocol, or deployment
+manifest. These provider-readiness prerequisites do not establish
+current-operator parity or authorize an operator pilot, switchover, or adoption.

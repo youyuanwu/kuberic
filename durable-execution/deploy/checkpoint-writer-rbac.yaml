@@ -1,0 +1,41 @@
+# Example namespace-scoped identity for the Kubernetes checkpoint data path.
+# Create the namespace separately and replace names to match your deployment.
+# Deletion is intentionally absent: terminal checkpoints stay recoverable until
+# a separate lifecycle actor applies an explicit retention policy. Optional
+# provider owner references are non-controlling and never block owner deletion,
+# so this writer does not need permission to delete the referenced owner.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kuberic-checkpoint-writer
+  namespace: kuberic-checkpoints
+  annotations:
+    kuberic.io/checkpoint-lifecycle: retained-writer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kuberic-checkpoint-writer
+  namespace: kuberic-checkpoints
+  annotations:
+    kuberic.io/checkpoint-lifecycle: retained-writer
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kuberic-checkpoint-writer
+  namespace: kuberic-checkpoints
+  annotations:
+    kuberic.io/checkpoint-lifecycle: retained-writer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kuberic-checkpoint-writer
+subjects:
+  - kind: ServiceAccount
+    name: kuberic-checkpoint-writer
+    namespace: kuberic-checkpoints

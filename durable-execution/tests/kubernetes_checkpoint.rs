@@ -8,14 +8,18 @@ use std::{
 
 use async_trait::async_trait;
 use http::{Method, Request, Response, StatusCode};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{Client, client::Body};
 use serde_json::{Value, json};
 use tower::service_fn;
 
 use kuberic_durable_execution::{
-    CasOutcome, CheckpointEnvelope, CheckpointLimits, CheckpointStore, DurableHost, ExactBytes,
-    ExecutionId, ExecutionSpec, HostEpoch, HostOutcome, KubernetesCheckpointStore, ReloadReason,
-    StorageRevision, StoreErrorKind, StoreOperation, TerminalOutcome, Workflow, WorkflowContext,
+    CasOutcome, CheckpointEnvelope, CheckpointLimits, CheckpointStore,
+    DEFAULT_CONFIG_MAP_DATA_BUDGET_BYTES, DurableHost, ExactBytes, ExecutionId, ExecutionSpec,
+    HostEpoch, HostOutcome, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
+    KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, MAX_CONFIG_MAP_DATA_BUDGET_BYTES,
+    ReloadReason, StorageRevision, StoreErrorKind, StoreOperation, TerminalOutcome, Workflow,
+    WorkflowContext,
 };
 
 #[derive(Clone, Debug)]
@@ -107,10 +111,30 @@ fn checkpoint(label: &[u8]) -> CheckpointEnvelope {
     CheckpointEnvelope::new(3, ExactBytes::new(label))
 }
 
+fn owner_reference() -> OwnerReference {
+    OwnerReference {
+        api_version: "kuberic.io/v1alpha1".to_string(),
+        kind: "WorkflowRun".to_string(),
+        name: "example-run".to_string(),
+        uid: "opaque-owner-uid".to_string(),
+        controller: None,
+        block_owner_deletion: None,
+    }
+}
+
 fn config_map_response(
     execution_id: ExecutionId,
     revision: Option<&str>,
     checkpoint: Option<&CheckpointEnvelope>,
+) -> Value {
+    config_map_response_with_owner(execution_id, revision, checkpoint, None)
+}
+
+fn config_map_response_with_owner(
+    execution_id: ExecutionId,
+    revision: Option<&str>,
+    checkpoint: Option<&CheckpointEnvelope>,
+    owner: Option<&OwnerReference>,
 ) -> Value {
     let mut metadata = json!({
         "name": KubernetesCheckpointStore::object_name(execution_id),
@@ -118,6 +142,9 @@ fn config_map_response(
     });
     if let Some(revision) = revision {
         metadata["resourceVersion"] = json!(revision);
+    }
+    if let Some(owner) = owner {
+        metadata["ownerReferences"] = json!([owner]);
     }
     let mut object = json!({
         "apiVersion": "v1",
@@ -167,6 +194,13 @@ async fn deterministic_names_and_namespace_validation() {
         .expect_err("invalid namespace must fail before requests");
     assert_eq!(error.kind(), StoreErrorKind::Other);
     assert!(harness.requests().is_empty());
+
+    let defaults = KubernetesCheckpointStoreOptions::default();
+    assert_eq!(
+        defaults.data_budget_bytes(),
+        DEFAULT_CONFIG_MAP_DATA_BUDGET_BYTES
+    );
+    assert!(defaults.owner().is_none());
 }
 
 #[tokio::test]
@@ -177,6 +211,10 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
     let harness = Harness::new([
         Step::Response(
             StatusCode::CREATED,
+            config_map_response(execution_id, Some("opaque-alpha"), Some(&first)),
+        ),
+        Step::Response(
+            StatusCode::OK,
             config_map_response(execution_id, Some("opaque-alpha"), Some(&first)),
         ),
         Step::Response(
@@ -209,17 +247,19 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
     );
 
     let requests = harness.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].method, Method::POST);
-    assert_eq!(requests[1].method, Method::PUT);
+    assert_eq!(requests[1].method, Method::GET);
+    assert_eq!(requests[2].method, Method::PUT);
     assert!(
         requests[0]
             .uri
             .starts_with("/api/v1/namespaces/checkpoint-tests/configmaps?")
     );
     assert!(requests[0].body["metadata"]["resourceVersion"].is_null());
+    assert!(requests[0].body["metadata"]["ownerReferences"].is_null());
     assert_eq!(
-        requests[1].body["metadata"]["resourceVersion"],
+        requests[2].body["metadata"]["resourceVersion"],
         "opaque-alpha"
     );
     assert_eq!(
@@ -227,7 +267,7 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
         serde_json::to_string(&first).expect("checkpoint JSON")
     );
     assert_eq!(
-        requests[1].body["data"]["checkpoint.json"],
+        requests[2].body["data"]["checkpoint.json"],
         serde_json::to_string(&second).expect("checkpoint JSON")
     );
 
@@ -241,6 +281,227 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
     assert!(metrics.object_bytes() > metrics.checkpoint_bytes());
     assert_eq!(metrics.measurement_failures(), 0);
     harness.assert_consumed();
+}
+
+#[tokio::test]
+async fn owner_reference_is_validated_locally_and_preserved_across_writes() {
+    let execution_id = execution(0x12);
+    let first = checkpoint(b"owned-first");
+    let second = checkpoint(b"owned-second");
+    let owner_reference = owner_reference();
+    let harness = Harness::new([
+        Step::Response(
+            StatusCode::CREATED,
+            config_map_response_with_owner(
+                execution_id,
+                Some("owned-alpha"),
+                Some(&first),
+                Some(&owner_reference),
+            ),
+        ),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response_with_owner(
+                execution_id,
+                Some("owned-alpha"),
+                Some(&first),
+                Some(&owner_reference),
+            ),
+        ),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response_with_owner(
+                execution_id,
+                Some("owned-beta"),
+                Some(&second),
+                Some(&owner_reference),
+            ),
+        ),
+    ]);
+    let owner = KubernetesCheckpointOwner::new(
+        owner_reference,
+        KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
+    );
+    let store = KubernetesCheckpointStore::with_options(
+        harness.client(),
+        "checkpoint-tests",
+        KubernetesCheckpointStoreOptions::default().with_owner(owner),
+    )
+    .expect("owned store");
+
+    let first_outcome = store
+        .compare_and_swap(execution_id, None, first)
+        .await
+        .expect("owned create");
+    assert_eq!(
+        first_outcome,
+        CasOutcome::Accepted(StorageRevision::new("owned-alpha").expect("revision"))
+    );
+    let second_outcome = store
+        .compare_and_swap(
+            execution_id,
+            Some(StorageRevision::new("owned-alpha").expect("revision")),
+            second,
+        )
+        .await
+        .expect("owned replace");
+    assert_eq!(
+        second_outcome,
+        CasOutcome::Accepted(StorageRevision::new("owned-beta").expect("revision"))
+    );
+
+    let requests = harness.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].method, Method::GET);
+    for request in requests
+        .iter()
+        .filter(|request| matches!(request.method, Method::POST | Method::PUT))
+    {
+        let owner = &request.body["metadata"]["ownerReferences"][0];
+        assert_eq!(owner["apiVersion"], "kuberic.io/v1alpha1");
+        assert_eq!(owner["kind"], "WorkflowRun");
+        assert_eq!(owner["name"], "example-run");
+        assert_eq!(owner["uid"], "opaque-owner-uid");
+        assert!(owner["controller"].is_null());
+        assert!(owner["blockOwnerDeletion"].is_null());
+    }
+    harness.assert_consumed();
+}
+
+#[tokio::test]
+async fn replacement_rejects_lifecycle_owner_changes_without_mutation() {
+    let execution_id = execution(0x13);
+    let persisted_checkpoint = checkpoint(b"persisted");
+    let configured_owner = owner_reference();
+    let mut different_owner = owner_reference();
+    different_owner.uid = "different-owner-uid".to_string();
+
+    let cases = [
+        (
+            None,
+            Some(owner_reference()),
+            "owned checkpoint must not become independent",
+        ),
+        (
+            Some(configured_owner.clone()),
+            None,
+            "independent checkpoint must not become owned",
+        ),
+        (
+            Some(different_owner),
+            Some(owner_reference()),
+            "checkpoint owner must not change",
+        ),
+    ];
+
+    for (configured, persisted, description) in cases {
+        let harness = Harness::new([Step::Response(
+            StatusCode::OK,
+            config_map_response_with_owner(
+                execution_id,
+                Some("stable-owner-revision"),
+                Some(&persisted_checkpoint),
+                persisted.as_ref(),
+            ),
+        )]);
+        let mut options = KubernetesCheckpointStoreOptions::default();
+        if let Some(owner) = configured {
+            options = options.with_owner(KubernetesCheckpointOwner::new(
+                owner,
+                KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
+            ));
+        }
+        let store =
+            KubernetesCheckpointStore::with_options(harness.client(), "checkpoint-tests", options)
+                .expect("store");
+
+        let error = store
+            .compare_and_swap(
+                execution_id,
+                Some(StorageRevision::new("stable-owner-revision").expect("revision")),
+                checkpoint(description.as_bytes()),
+            )
+            .await
+            .expect_err(description);
+        assert_eq!(error.kind(), StoreErrorKind::Other);
+        assert!(error.description().contains("owner relationship"));
+        let requests = harness.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, Method::GET);
+        harness.assert_consumed();
+    }
+}
+
+#[tokio::test]
+async fn invalid_owner_configuration_is_rejected_before_dispatch() {
+    let invalid_owners = [
+        (
+            KubernetesCheckpointOwner::new(
+                OwnerReference {
+                    uid: String::new(),
+                    ..owner_reference()
+                },
+                KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
+            ),
+            "uid",
+        ),
+        (
+            KubernetesCheckpointOwner::new(
+                owner_reference(),
+                KubernetesCheckpointOwnerScope::Namespaced("other-namespace".to_string()),
+            ),
+            "must match",
+        ),
+        (
+            KubernetesCheckpointOwner::new(
+                OwnerReference {
+                    controller: Some(true),
+                    ..owner_reference()
+                },
+                KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
+            ),
+            "controller",
+        ),
+        (
+            KubernetesCheckpointOwner::new(
+                OwnerReference {
+                    block_owner_deletion: Some(true),
+                    ..owner_reference()
+                },
+                KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
+            ),
+            "blockOwnerDeletion",
+        ),
+    ];
+
+    for (owner, expected_diagnostic) in invalid_owners {
+        let harness = Harness::new([]);
+        let error = KubernetesCheckpointStore::with_options(
+            harness.client(),
+            "checkpoint-tests",
+            KubernetesCheckpointStoreOptions::default().with_owner(owner),
+        )
+        .expect_err("invalid owner must fail");
+        assert_eq!(error.kind(), StoreErrorKind::Other);
+        assert!(error.description().contains(expected_diagnostic));
+        assert!(harness.requests().is_empty());
+    }
+
+    let harness = Harness::new([]);
+    KubernetesCheckpointStore::with_options(
+        harness.client(),
+        "checkpoint-tests",
+        KubernetesCheckpointStoreOptions::default().with_owner(KubernetesCheckpointOwner::new(
+            OwnerReference {
+                controller: Some(false),
+                block_owner_deletion: Some(false),
+                ..owner_reference()
+            },
+            KubernetesCheckpointOwnerScope::ClusterScoped,
+        )),
+    )
+    .expect("explicit cluster-scoped non-controlling owner");
+    assert!(harness.requests().is_empty());
 }
 
 #[tokio::test]
@@ -307,7 +568,23 @@ async fn conflicts_cover_create_stale_replace_and_deleted_object_without_recreat
     let execution_id = execution(0x33);
     let harness = Harness::new([
         api_error(409, "AlreadyExists"),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(
+                execution_id,
+                Some("stale"),
+                Some(&checkpoint(b"current-stale")),
+            ),
+        ),
         api_error(409, "Conflict"),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(
+                execution_id,
+                Some("deleted"),
+                Some(&checkpoint(b"current-deleted")),
+            ),
+        ),
         api_error(404, "NotFound"),
     ]);
     let store =
@@ -340,7 +617,13 @@ async fn conflicts_cover_create_stale_replace_and_deleted_object_without_recreat
             .iter()
             .map(|request| request.method.clone())
             .collect::<Vec<_>>(),
-        [Method::POST, Method::PUT, Method::PUT]
+        [
+            Method::POST,
+            Method::GET,
+            Method::PUT,
+            Method::GET,
+            Method::PUT
+        ]
     );
     assert_eq!(store.metrics().snapshot(), Default::default());
     harness.assert_consumed();
@@ -370,6 +653,10 @@ async fn mutation_classification_is_conservative_and_diagnostics_are_portable() 
         api_error(422, "Invalid"),
         api_error(429, "TooManyRequests"),
         api_error(500, "InternalError"),
+        Step::Response(
+            StatusCode::OK,
+            config_map_response(execution_id, Some("timeout"), Some(&secret_checkpoint)),
+        ),
         api_error(504, "Timeout"),
         Step::TransportFailure("sensitive-mutation-transport-marker"),
         Step::Response(
@@ -473,19 +760,69 @@ async fn load_errors_map_to_every_relevant_portable_category() {
 }
 
 #[tokio::test]
-async fn oversized_checkpoint_is_rejected_before_dispatch() {
+async fn data_budget_validates_configuration_and_exact_write_boundary() {
+    for valid_budget in [1, MAX_CONFIG_MAP_DATA_BUDGET_BYTES] {
+        let harness = Harness::new([]);
+        let options =
+            KubernetesCheckpointStoreOptions::default().with_data_budget_bytes(valid_budget);
+        KubernetesCheckpointStore::with_options(harness.client(), "checkpoint-tests", options)
+            .expect("valid budget");
+        assert!(harness.requests().is_empty());
+    }
+
+    for invalid_budget in [0, MAX_CONFIG_MAP_DATA_BUDGET_BYTES + 1] {
+        let harness = Harness::new([]);
+        let options =
+            KubernetesCheckpointStoreOptions::default().with_data_budget_bytes(invalid_budget);
+        let error =
+            KubernetesCheckpointStore::with_options(harness.client(), "checkpoint-tests", options)
+                .expect_err("invalid budget");
+        assert_eq!(error.kind(), StoreErrorKind::Other);
+        assert!(error.description().contains("data budget"));
+        assert!(error.description().contains(&invalid_budget.to_string()));
+        assert!(harness.requests().is_empty());
+    }
+
     let execution_id = execution(0x66);
-    let harness = Harness::new([]);
-    let store =
-        KubernetesCheckpointStore::new(harness.client(), "checkpoint-tests").expect("store");
-    let oversized = checkpoint(&vec![0_u8; 1024 * 1024]);
-    let error = store
-        .compare_and_swap(execution_id, None, oversized)
+    let boundary = checkpoint(b"exact configured boundary");
+    let data_bytes = "checkpoint.json".len()
+        + serde_json::to_string(&boundary)
+            .expect("checkpoint JSON")
+            .len();
+    let exact_harness = Harness::new([Step::Response(
+        StatusCode::CREATED,
+        config_map_response(execution_id, Some("boundary"), Some(&boundary)),
+    )]);
+    let exact_store = KubernetesCheckpointStore::with_options(
+        exact_harness.client(),
+        "checkpoint-tests",
+        KubernetesCheckpointStoreOptions::default().with_data_budget_bytes(data_bytes as u64),
+    )
+    .expect("exact-bound store");
+    assert_eq!(
+        exact_store
+            .compare_and_swap(execution_id, None, boundary.clone())
+            .await
+            .expect("exact boundary"),
+        CasOutcome::Accepted(StorageRevision::new("boundary").expect("revision"))
+    );
+    exact_harness.assert_consumed();
+
+    let over_harness = Harness::new([]);
+    let over_store = KubernetesCheckpointStore::with_options(
+        over_harness.client(),
+        "checkpoint-tests",
+        KubernetesCheckpointStoreOptions::default().with_data_budget_bytes((data_bytes - 1) as u64),
+    )
+    .expect("one-byte-tight store");
+    let error = over_store
+        .compare_and_swap(execution_id, None, boundary)
         .await
-        .expect_err("oversized checkpoint");
+        .expect_err("one byte over budget");
     assert_eq!(error.kind(), StoreErrorKind::Other);
-    assert!(error.description().contains("ConfigMap data limit"));
-    assert!(harness.requests().is_empty());
+    assert!(error.description().contains("ConfigMap data budget"));
+    assert!(error.description().contains(&data_bytes.to_string()));
+    assert!(over_harness.requests().is_empty());
 }
 
 struct ImmediateWorkflow;
