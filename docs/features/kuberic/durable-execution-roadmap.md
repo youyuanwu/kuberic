@@ -35,8 +35,9 @@ The implemented kernel provides:
   test command after the one-control-plane KinD CI job is provisioned;
 - real-API spike measurements for checkpoint/object size, accepted writes,
   canonical typed watch-event bytes, and unknown-outcome recovery.
-- a feature-gated three-member operator switchover pilot that reuses the
-  explicit protocol decisions and `ReplicaAgent` mutation boundary;
+- a feature-gated operator workflow pilot for sets with at most three members
+  that reuses the explicit switchover decisions and `ReplicaAgent` mutation
+  boundary;
 - direct kube-controller integration through Send workflow/store futures,
   without another executor or scheduler;
 - same-namespace owner-bound pilot checkpoints, owner garbage-collection
@@ -152,14 +153,15 @@ spike:
    test command after the one-control-plane KinD CI job is provisioned.
 
 The operator pilot is implemented behind two explicit gates and does not
-authorize a workflow migration. A representative successful execution used 88
-accepted checkpoint writes and reached a 141,529-byte active checkpoint,
-versus 42 accepted status writes for the explicit test path. The checked-in
-lexical measurement reports 1,258 executable lines and 141 decision points for
-the explicit implementation, while the additive pilot workflow, effect bridge,
-and reconcile boundaries total 1,250 executable lines and 129 decision
-points. The pilot therefore preserves safety but does not yet demonstrate
-lower persistence traffic or net implementation complexity.
+authorize a workflow-ownership change or broader migration. A representative
+successful execution used 88 accepted checkpoint writes and reached a
+141,529-byte active checkpoint, versus 42 accepted status writes for the
+explicit test path. The checked-in lexical measurement reports 1,258
+executable lines and 141 decision points for the explicit implementation,
+while the additive pilot workflow, effect bridge, and reconcile boundaries
+total 1,250 executable lines and 129 decision points. The pilot therefore
+preserves safety but does not yet demonstrate lower persistence traffic or net
+implementation complexity.
 
 The remaining step stays deferred: generalize only if later evidence justifies
 the additional operational and implementation cost. No other workflow,

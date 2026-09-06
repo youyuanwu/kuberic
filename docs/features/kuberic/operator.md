@@ -265,9 +265,10 @@ operation without publishing a new stable snapshot.
 
 The explicit checkpoint above remains the default. A default-off operator
 Cargo feature plus `spec.switchoverExecutionMode: durablePilot` selects a
-three-member comparison pilot. Acceptance first persists a random execution
-ID and exact initial operation in `status.durableSwitchoverPilot`; no
-checkpoint or effect exists before that status write.
+comparison pilot for sets with at most three members. Acceptance first
+persists a random execution ID and exact initial operation in
+`status.durableSwitchoverPilot`; no checkpoint or effect exists before that
+status write.
 
 The pilot uses the format-3 linear replay kernel, but every activity delegates
 its decision to the same switchover module. A schedule and exposure checkpoint

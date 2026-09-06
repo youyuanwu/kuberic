@@ -30,10 +30,10 @@ spec:
 
 ## Durable Switchover Pilot
 
-The existing explicit switchover state machine is the default. A
-three-member `KubericSet` can opt into the comparison pilot only when the
-operator binary is built with `--features durable-switchover-pilot` and the
-resource sets:
+The existing explicit switchover state machine is the default. A `KubericSet`
+with at most three stable members can opt into the comparison pilot only when
+the operator binary is built with `--features durable-switchover-pilot` and
+the resource sets:
 
 ```yaml
 spec:
