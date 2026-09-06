@@ -132,9 +132,9 @@ impl MeasuredPilotCheckpointStore {
     pub fn correlate_host_outcome(&self, outcome: &HostOutcome) {
         let boundary = match outcome {
             HostOutcome::ScheduleAccepted { .. } => Some(PersistenceBoundary::Schedule),
-            HostOutcome::DispatchPermitted { .. } => Some(PersistenceBoundary::Exposure),
+            HostOutcome::DispatchPermitted { boundary, .. } => Some(*boundary),
             HostOutcome::ObservationAccepted { .. } => Some(PersistenceBoundary::Observation),
-            HostOutcome::WorkflowCompleted { .. } => Some(PersistenceBoundary::Completion),
+            HostOutcome::WorkflowCompleted { boundary, .. } => Some(*boundary),
             HostOutcome::ReloadRequired { boundary, .. } => Some(*boundary),
             HostOutcome::StoreFailed {
                 operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(boundary),
@@ -372,6 +372,7 @@ mod durable_switchover_pilot_tests {
         store.correlate_host_outcome(&HostOutcome::WorkflowCompleted {
             outcome: TerminalOutcome::succeeded(ExactBytes::new(b"terminal")),
             revision: revision.clone(),
+            boundary: PersistenceBoundary::Completion,
         });
         let accepted_bytes = store
             .load(execution_id)

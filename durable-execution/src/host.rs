@@ -135,6 +135,7 @@ define_host_outcomes! {
     DispatchPermitted {
         permit: DispatchPermit,
         revision: StorageRevision,
+        boundary: PersistenceBoundary,
     },
     ObservationAccepted {
         activity: LogicalActivityId,
@@ -143,6 +144,7 @@ define_host_outcomes! {
     WorkflowCompleted {
         outcome: TerminalOutcome,
         revision: StorageRevision,
+        boundary: PersistenceBoundary,
     },
     Quarantined {
         activity: LogicalActivityId,
@@ -212,6 +214,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::WorkflowCompleted {
                     outcome: outcome.clone(),
                     revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
                 };
             }
             if let Some(record) = payload
@@ -288,6 +291,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 HostOutcome::WorkflowCompleted {
                     outcome,
                     revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
                 }
             }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
@@ -333,6 +337,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::WorkflowCompleted {
                     outcome: outcome.clone(),
                     revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
                 };
             }
             if let Some(record) = payload
@@ -412,6 +417,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 HostOutcome::WorkflowCompleted {
                     outcome,
                     revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
                 }
             }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
@@ -627,6 +633,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             Evaluation::Terminal { outcome, .. } => HostOutcome::WorkflowCompleted {
                 outcome,
                 revision: stored.revision().clone(),
+                boundary: PersistenceBoundary::Completion,
             },
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
             Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
@@ -708,6 +715,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             Ok(CasOutcome::Accepted(revision)) => HostOutcome::DispatchPermitted {
                 permit: DispatchPermit::new(proposal.activity, proposal.attempt_id),
                 revision,
+                boundary,
             },
             Ok(other) => reload_outcome(boundary, other),
             Err(error) => store_failed(boundary, error),
@@ -760,9 +768,11 @@ impl<S: CheckpointStore> DurableHost<S> {
             .compare_and_swap(execution_id, expected_revision, checkpoint)
             .await
         {
-            Ok(CasOutcome::Accepted(revision)) => {
-                HostOutcome::WorkflowCompleted { outcome, revision }
-            }
+            Ok(CasOutcome::Accepted(revision)) => HostOutcome::WorkflowCompleted {
+                outcome,
+                revision,
+                boundary,
+            },
             Ok(other) => reload_outcome(boundary, other),
             Err(error) => store_failed(boundary, error),
         }

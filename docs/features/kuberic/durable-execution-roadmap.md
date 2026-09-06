@@ -180,11 +180,11 @@ stretch gate, and terminal size passes its baseline gate.
 
 The lexical report distinguishes a 173-line/28-decision workflow body and the
 comparable 535/59 legacy workflow scope (merged baseline 538/73). Shared typed,
-fused, and effect-adapter infrastructure is 993/92; operator integration is
-887/47; the honestly charged non-overlapping total is 3,049/230 versus the
+fused, and effect-adapter infrastructure is 996/92; operator integration is
+887/47; the honestly charged non-overlapping total is 3,052/230 versus the
 merged pilot's 2,254/194. The shared protocol remains measured with the
 explicit implementation: that scope increased from 1,258/141 to 1,449/172.
-Charging it as well yields a combined 4,498/402 versus the combined baseline
+Charging it as well yields a combined 4,501/402 versus the combined baseline
 3,512/335. Shared code may amortize across later workflows, but this pilot
 does not claim that amortization yet.
 

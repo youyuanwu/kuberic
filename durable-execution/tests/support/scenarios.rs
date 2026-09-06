@@ -625,7 +625,9 @@ async fn restart_after_schedule(id: ScenarioId) -> ScenarioEvidence {
         .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await
     {
-        HostOutcome::DispatchPermitted { permit, revision } => (Some(permit), Some(revision)),
+        HostOutcome::DispatchPermitted {
+            permit, revision, ..
+        } => (Some(permit), Some(revision)),
         _ => (None, None),
     };
     ScenarioEvidence::new(
