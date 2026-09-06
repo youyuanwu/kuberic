@@ -27,19 +27,24 @@ pub struct ReconcileOutcome {
     pub persisted: bool,
 }
 
+pub struct RequestContext<'a> {
+    pub name: &'a str,
+    pub spec: &'a NodeMaintenanceRequestSpec,
+    pub generation: Option<i64>,
+    pub previous: &'a NodeMaintenanceRequestStatus,
+    pub now: &'a str,
+    pub not_before_reached: bool,
+    pub deadline_exceeded: bool,
+}
+
 pub async fn reconcile_request<A>(
     api: &A,
-    name: &str,
-    spec: &NodeMaintenanceRequestSpec,
-    generation: Option<i64>,
-    previous: &NodeMaintenanceRequestStatus,
-    now: &str,
-    deadline_exceeded: bool,
+    ctx: RequestContext<'_>,
 ) -> Result<ReconcileOutcome, String>
 where
     A: MaintenanceApi + ?Sized,
 {
-    let node = api.get_node(&spec.node_name).await?;
+    let node = api.get_node(&ctx.spec.node_name).await?;
     let pods = if node.is_some() {
         api.list_maintenance_pods().await?
     } else {
@@ -47,23 +52,24 @@ where
     };
 
     let status = reconcile_discovery(DiscoveryInput {
-        spec,
-        generation,
-        previous,
+        spec: ctx.spec,
+        generation: ctx.generation,
+        previous: ctx.previous,
         node: node.as_ref(),
         pods: &pods,
-        now,
-        deadline_exceeded,
+        now: ctx.now,
+        not_before_reached: ctx.not_before_reached,
+        deadline_exceeded: ctx.deadline_exceeded,
     });
 
-    if &status == previous {
+    if &status == ctx.previous {
         return Ok(ReconcileOutcome {
             status,
             persisted: false,
         });
     }
 
-    api.patch_request_status(name, &status).await?;
+    api.patch_request_status(ctx.name, &status).await?;
     Ok(ReconcileOutcome {
         status,
         persisted: true,
@@ -216,7 +222,19 @@ mod tests {
         api: &MockApi,
         previous: &NodeMaintenanceRequestStatus,
     ) -> Result<ReconcileOutcome, String> {
-        reconcile_request(api, "req-1", &spec(), Some(1), previous, NOW, false).await
+        reconcile_request(
+            api,
+            RequestContext {
+                name: "req-1",
+                spec: &spec(),
+                generation: Some(1),
+                previous,
+                now: NOW,
+                not_before_reached: true,
+                deadline_exceeded: false,
+            },
+        )
+        .await
     }
 
     #[tokio::test]

@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use crate::crd::StatusCondition;
 
 pub const PREPARED_CONDITION_TYPE: &str = "KubericPrepared";
-pub const FINALIZER: &str = "kuberic.io/node-maintenance";
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[kube(

@@ -31,6 +31,7 @@ pub struct DiscoveryInput<'a> {
     pub node: Option<&'a NodeRef>,
     pub pods: &'a [MaintenancePod],
     pub now: &'a str,
+    pub not_before_reached: bool,
     pub deadline_exceeded: bool,
 }
 
@@ -51,6 +52,19 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
 
     if input.previous.phase.is_terminal() {
         return status;
+    }
+
+    if !input.not_before_reached {
+        return finish(
+            status,
+            MaintenancePhase::Requested,
+            None,
+            Some(format!(
+                "waiting until {}",
+                input.spec.not_before.as_deref().unwrap_or("notBefore")
+            )),
+            input.now,
+        );
     }
 
     let Some(node) = input.node else {
@@ -256,8 +270,50 @@ mod tests {
             node,
             pods,
             now: NOW,
+            not_before_reached: true,
             deadline_exceeded,
         })
+    }
+
+    #[test]
+    fn preparation_waits_until_not_before() {
+        let mut spec = spec("worker-04");
+        spec.not_before = Some("2026-09-06T23:00:00Z".to_string());
+        let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
+
+        let status = reconcile_discovery(DiscoveryInput {
+            spec: &spec,
+            generation: Some(1),
+            previous: &NodeMaintenanceRequestStatus::default(),
+            node: Some(&node("uid-a")),
+            pods: &pods,
+            now: NOW,
+            not_before_reached: false,
+            deadline_exceeded: false,
+        });
+
+        assert_eq!(status.phase, MaintenancePhase::Requested);
+        assert!(status.affected_sets.is_empty());
+        assert!(status.node_uid.is_none());
+        assert!(!status.phase.is_safe_to_drain());
+    }
+
+    #[test]
+    fn discovery_proceeds_once_not_before_is_reached() {
+        let mut spec = spec("worker-04");
+        spec.not_before = Some("2026-09-06T19:00:00Z".to_string());
+        let pods = [pod("kv-1", "kv", Some("worker-04"), true)];
+
+        let status = run(
+            &spec,
+            &NodeMaintenanceRequestStatus::default(),
+            Some(&node("uid-a")),
+            &pods,
+            false,
+        );
+
+        assert_eq!(status.phase, MaintenancePhase::Preparing);
+        assert_eq!(status.affected_sets.len(), 1);
     }
 
     #[test]

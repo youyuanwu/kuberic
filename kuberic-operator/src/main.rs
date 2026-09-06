@@ -10,7 +10,7 @@ use tracing::info;
 use kuberic_operator::cluster_api::KubeClusterApi;
 use kuberic_operator::crd::KubericSet;
 use kuberic_operator::node_maintenance::{
-    KubeMaintenanceApi, NodeMaintenanceRequest, reconcile_request,
+    KubeMaintenanceApi, NodeMaintenanceRequest, RequestContext, reconcile_request,
 };
 use kuberic_operator::reconciler::{ReconcileAction, ReconcilerState};
 
@@ -61,6 +61,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let previous = request.status.clone().unwrap_or_default();
                     let now_ts = k8s_openapi::jiff::Timestamp::now();
                     let now = now_ts.to_string();
+                    let not_before_reached = request
+                        .spec
+                        .not_before
+                        .as_deref()
+                        .and_then(|at| at.parse::<k8s_openapi::jiff::Timestamp>().ok())
+                        .is_none_or(|at| now_ts >= at);
                     let deadline_exceeded = request
                         .spec
                         .deadline
@@ -70,12 +76,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     reconcile_request(
                         api.as_ref(),
-                        &name,
-                        &request.spec,
-                        request.metadata.generation,
-                        &previous,
-                        &now,
-                        deadline_exceeded,
+                        RequestContext {
+                            name: &name,
+                            spec: &request.spec,
+                            generation: request.metadata.generation,
+                            previous: &previous,
+                            now: &now,
+                            not_before_reached,
+                            deadline_exceeded,
+                        },
                     )
                     .await
                     .map(|_| Action::requeue(std::time::Duration::from_secs(30)))
