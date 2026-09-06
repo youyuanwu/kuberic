@@ -71,18 +71,6 @@ impl ReplicaEffectCommand {
             action_payload: pending.dispatch_action_payload.clone(),
         })
     }
-
-    fn from_action(
-        pending: &PendingActionStatus,
-        action: &DurableReplicaAction,
-    ) -> Result<Self, String> {
-        let action_payload =
-            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(action)
-                .map_err(|error| format!("encode frozen correlated action: {error}"))?;
-        let mut pending = pending.clone();
-        pending.dispatch_action_payload = action_payload;
-        Self::from_pending(&pending)
-    }
 }
 
 /// Exact UID-fenced pod-label command persisted before patch dispatch.
@@ -202,12 +190,46 @@ pub(crate) async fn execute_planned_control_action(
     pending: &PendingActionStatus,
     authoritative_action: Option<DurableReplicaAction>,
 ) -> kuberic_core::Result<()> {
-    let command = match authoritative_action {
-        Some(action) => ReplicaEffectCommand::from_action(pending, &action)
-            .map_err(|error| KubericError::Internal(error.into()))?,
-        None => ReplicaEffectCommand::from_pending(pending)
-            .map_err(|error| KubericError::Internal(error.into()))?,
-    };
+    if let Some(action) = authoritative_action {
+        let generation = pending
+            .dispatch_agent_generation
+            .as_deref()
+            .ok_or_else(|| {
+                KubericError::Internal("correlated dispatch is missing agent generation".into())
+            })
+            .and_then(|generation| {
+                AgentGeneration::parse(generation)
+                    .map_err(|error| KubericError::Internal(error.into()))
+            })?;
+        let control_version = pending.dispatch_agent_control_version.ok_or_else(|| {
+            KubericError::Internal("correlated dispatch is missing agent control version".into())
+        })?;
+        let observed_epoch = pending
+            .dispatch_observed_runtime_epoch
+            .as_ref()
+            .ok_or_else(|| {
+                KubericError::Internal(
+                    "correlated dispatch is missing observed runtime epoch".into(),
+                )
+            })?;
+        return execute_correlated_action(
+            handle,
+            &pending.action_id,
+            pending.target_id,
+            &pending.target_instance_id,
+            generation,
+            AgentControlVersion::new(control_version),
+            Epoch::new(
+                observed_epoch.data_loss_number,
+                observed_epoch.configuration_number,
+            ),
+            action,
+        )
+        .await;
+    }
+
+    let command = ReplicaEffectCommand::from_pending(pending)
+        .map_err(|error| KubericError::Internal(error.into()))?;
     execute_replica_command(handle, &command).await
 }
 
@@ -221,30 +243,54 @@ pub async fn execute_replica_command(
         &command.action_payload,
     )
     .map_err(|error| KubericError::Internal(error.into()))?;
+    execute_correlated_action(
+        handle,
+        &command.action_id,
+        command.target_id,
+        &command.target_instance_id,
+        generation,
+        AgentControlVersion::new(command.expected_control_version),
+        Epoch::new(
+            command.observed_runtime_epoch.data_loss_number,
+            command.observed_runtime_epoch.configuration_number,
+        ),
+        action,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_correlated_action(
+    handle: &dyn ReplicaHandle,
+    action_id: &str,
+    target_id: ReplicaId,
+    target_instance_id: &str,
+    generation: AgentGeneration,
+    control_version: AgentControlVersion,
+    observed_runtime_epoch: Epoch,
+    action: DurableReplicaAction,
+) -> kuberic_core::Result<()> {
     let input_signature = action.signature();
     handle
         .execute_correlated_control_action(CorrelatedControlActionRequest {
             protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-            action_id: command.action_id.clone(),
+            action_id: action_id.to_string(),
             input_signature: input_signature.clone(),
-            target_replica_id: command.target_id,
-            target_instance_id: ReplicaInstanceId::new(command.target_instance_id.clone()),
+            target_replica_id: target_id,
+            target_instance_id: ReplicaInstanceId::new(target_instance_id),
             expected_agent_generation: generation.clone(),
-            expected_control_version: AgentControlVersion::new(command.expected_control_version),
-            observed_runtime_epoch: Epoch::new(
-                command.observed_runtime_epoch.data_loss_number,
-                command.observed_runtime_epoch.configuration_number,
-            ),
+            expected_control_version: control_version,
+            observed_runtime_epoch,
             action,
         })
         .await
         .and_then(|acknowledgement| {
             correlated_acknowledgement_result(
                 acknowledgement,
-                &command.action_id,
+                action_id,
                 &input_signature,
                 &generation,
-                AgentControlVersion::new(command.expected_control_version),
+                control_version,
             )
         })
 }
