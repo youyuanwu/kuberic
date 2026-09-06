@@ -31,7 +31,10 @@ use crate::crd::{
 use super::pilot_store::MeasuredPilotCheckpointStore;
 use super::{
     Decision, OperationObservations, decide, start_switchover,
-    switchover::validate_switchover_operation,
+    switchover::{
+        is_legal_switchover_phase_transition, validate_switchover_operation,
+        validate_switchover_terminal as validate_terminal,
+    },
 };
 
 // COMPLEXITY-BOUNDARY: pilot-module:start
@@ -492,9 +495,9 @@ pub fn evaluate_adapter_step(
             compensated,
         }),
         Decision::Wait => PilotAdapterDecision::AwaitEvidence,
-        external @ (Decision::Execute { .. } | Decision::PatchPodRole { .. }) => {
-            PilotAdapterDecision::External(external)
-        }
+        external @ (Decision::Execute { .. }
+        | Decision::PatchPodRole { .. }
+        | Decision::PatchPodRoleExactUid { .. }) => PilotAdapterDecision::External(external),
         other => {
             return Err(format!(
                 "unsupported explicit switchover decision reached pilot adapter: {other:?}"
@@ -578,64 +581,7 @@ fn validate_phase_transition(
     current: &DurableOperationStatus,
     next: &DurableOperationStatus,
 ) -> Result<(), String> {
-    use crate::crd::DurableOperationPhase as Phase;
-    let allowed = current.phase == next.phase
-        || next.phase == Phase::Poisoned
-        || matches!(
-            (current.phase, next.phase),
-            (Phase::Revoke, Phase::CaptureLsn | Phase::Failed)
-                | (Phase::CaptureLsn, Phase::PreCatchUp)
-                | (
-                    Phase::PreCatchUp,
-                    Phase::DemoteOldPrimary | Phase::RestorePreviousConfiguration
-                )
-                | (
-                    Phase::DemoteOldPrimary,
-                    Phase::PromoteTarget | Phase::RestorePreviousConfiguration
-                )
-                | (
-                    Phase::PromoteTarget,
-                    Phase::DistributeEpoch | Phase::CompensatePromoteOldPrimary
-                )
-                | (Phase::DistributeEpoch, Phase::UpdateCatchUpConfiguration)
-                | (
-                    Phase::UpdateCatchUpConfiguration,
-                    Phase::WaitForCatchUpQuorum
-                )
-                | (
-                    Phase::WaitForCatchUpQuorum,
-                    Phase::UpdateCurrentConfiguration
-                )
-                | (Phase::UpdateCurrentConfiguration, Phase::LabelTargetPrimary)
-                | (Phase::LabelTargetPrimary, Phase::LabelOldSecondary)
-                | (Phase::LabelOldSecondary, Phase::Finalize)
-                | (Phase::RestorePreviousConfiguration, Phase::Failed)
-                | (
-                    Phase::CompensatePromoteOldPrimary,
-                    Phase::CompensateDistributeEpoch
-                )
-                | (
-                    Phase::CompensateDistributeEpoch,
-                    Phase::CompensateCatchUpConfiguration
-                )
-                | (
-                    Phase::CompensateCatchUpConfiguration,
-                    Phase::CompensateCurrentConfiguration
-                )
-                | (
-                    Phase::CompensateCurrentConfiguration,
-                    Phase::CompensateLabelOldPrimary
-                )
-                | (
-                    Phase::CompensateLabelOldPrimary,
-                    Phase::CompensateLabelTargetSecondary
-                )
-                | (
-                    Phase::CompensateLabelTargetSecondary,
-                    Phase::CompensateFinalize
-                )
-        );
-    if allowed {
+    if is_legal_switchover_phase_transition(current.phase, next.phase) {
         Ok(())
     } else {
         Err(format!(
@@ -680,82 +626,6 @@ fn validate_no_admission_transition(
         return Err("proven-no-admission changed non-dispatch operation state".to_string());
     }
     Ok(())
-}
-
-fn validate_terminal(
-    operation: &DurableOperationStatus,
-    snapshot: &StablePartitionSnapshotStatus,
-    compensated: bool,
-) -> Result<(), String> {
-    use crate::crd::DurableOperationPhase as Phase;
-    if !compensated {
-        if operation.phase != Phase::Completed
-            || operation.pending_action.is_some()
-            || !same_topology(snapshot, &operation.target_snapshot)
-        {
-            return Err("successful durable switchover terminal is inconsistent".to_string());
-        }
-
-        return Ok(());
-    }
-    if operation.phase != Phase::Failed
-        || operation.pending_action.is_some()
-        || !valid_compensation_snapshot(operation, snapshot)
-    {
-        return Err("compensated durable switchover terminal is inconsistent".to_string());
-    }
-    Ok(())
-}
-
-fn valid_compensation_snapshot(
-    operation: &DurableOperationStatus,
-    snapshot: &StablePartitionSnapshotStatus,
-) -> bool {
-    use crate::crd::StableReplicaRoleStatus;
-    let Some(previous) = operation.previous_snapshot.as_ref() else {
-        return false;
-    };
-    if snapshot.primary_id != operation.old_primary_id
-        || snapshot.write_quorum != previous.write_quorum
-        || snapshot.members.len() != previous.members.len()
-        || (snapshot.epoch != previous.epoch && snapshot.epoch != operation.target_snapshot.epoch)
-    {
-        return false;
-    }
-    previous.members.iter().all(|expected| {
-        let matches: Vec<_> = snapshot
-            .members
-            .iter()
-            .filter(|actual| actual.id == expected.id)
-            .collect();
-        matches.len() == 1
-            && matches[0].instance_id == expected.instance_id
-            && matches[0].role
-                == if expected.id == operation.old_primary_id {
-                    StableReplicaRoleStatus::Primary
-                } else {
-                    StableReplicaRoleStatus::ActiveSecondary
-                }
-    })
-}
-
-fn same_topology(
-    actual: &StablePartitionSnapshotStatus,
-    expected: &StablePartitionSnapshotStatus,
-) -> bool {
-    actual.epoch == expected.epoch
-        && actual.primary_id == expected.primary_id
-        && actual.write_quorum == expected.write_quorum
-        && actual.members.len() == expected.members.len()
-        && actual
-            .members
-            .iter()
-            .zip(&expected.members)
-            .all(|(actual_member, expected_member)| {
-                actual_member.id == expected_member.id
-                    && actual_member.instance_id == expected_member.instance_id
-                    && actual_member.role == expected_member.role
-            })
 }
 
 fn validate_completion_transition(

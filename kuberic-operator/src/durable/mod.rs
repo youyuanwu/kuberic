@@ -9,6 +9,7 @@ use crate::crd::{
 
 mod add_replica;
 mod create_partition;
+pub mod effects;
 mod failover;
 pub mod failover_election;
 #[cfg(feature = "durable-switchover-pilot")]

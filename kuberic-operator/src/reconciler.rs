@@ -16,11 +16,16 @@ use tracing::{debug, info, warn};
 use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
 use kuberic_core::error::KubericError;
 use kuberic_core::remove_replica::{RemoveReplicaClock, SystemRemoveReplicaClock};
+#[cfg(all(test, feature = "durable-switchover-pilot"))]
+use kuberic_core::types::CorrelatedControlActionRequest;
+#[cfg(test)]
+use kuberic_core::types::DurableActionState;
+#[cfg(test)]
+use kuberic_core::types::{AgentControlVersion, CorrelatedControlActionAcknowledgement};
 use kuberic_core::types::{
-    AgentControlVersion, AgentGeneration, CorrelatedControlActionAcknowledgement,
-    CorrelatedControlActionRequest, DurableActionState, DurableReplicaAction,
-    ReplicaConfigurationMemberStatus, ReplicaConfigurationMode, ReplicaConfigurationStatus,
-    ReplicaElectionConfiguration, ReplicaStatusInfo,
+    AgentGeneration, DurableReplicaAction, ReplicaConfigurationMemberStatus,
+    ReplicaConfigurationMode, ReplicaConfigurationStatus, ReplicaElectionConfiguration,
+    ReplicaStatusInfo,
 };
 use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, StablePartitionSnapshot};
 #[cfg(feature = "durable-switchover-pilot")]
@@ -126,12 +131,7 @@ pub enum ReconcileAction {
     Requeue(Duration),
 }
 
-enum DispatchEvidencePlan {
-    Ready,
-    Persist(Box<PendingActionStatus>),
-    WaitForExactIncarnation,
-    WaitForSupportedProtocol,
-}
+type DispatchEvidencePlan = crate::durable::effects::DispatchEvidencePlan;
 
 fn authoritative_topology_snapshot(
     status: &KubericSetStatus,
@@ -314,48 +314,13 @@ fn plan_dispatch_evidence(
     action: &DurableReplicaAction,
     persist_action_payload: bool,
 ) -> DispatchEvidencePlan {
-    let mut planned = pending.clone();
-    let exact_incarnation = addressed_instance.as_str() == pending.target_instance_id
-        && observed.instance_id.as_str() == pending.target_instance_id;
-    if !exact_incarnation {
-        return DispatchEvidencePlan::WaitForExactIncarnation;
-    }
-    let agent = &observed.agent;
-    if agent.protocol_version != kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION {
-        return DispatchEvidencePlan::WaitForSupportedProtocol;
-    }
-    let generation = agent.generation.to_string();
-    let control_version = agent.control_version.value();
-    let runtime_epoch = crate::crd::EpochStatus {
-        data_loss_number: observed.epoch.data_loss_number,
-        configuration_number: observed.epoch.configuration_number,
-    };
-    let evidence_matches = pending.dispatch_agent_generation.as_deref() == Some(&generation)
-        && pending.dispatch_agent_control_version == Some(control_version)
-        && pending.dispatch_observed_runtime_epoch.as_ref() == Some(&runtime_epoch);
-    planned.dispatch_agent_generation = Some(generation);
-    planned.dispatch_agent_control_version = Some(control_version);
-    planned.dispatch_observed_runtime_epoch = Some(runtime_epoch);
-    let local_record_exists = correlated_action_observation(observed, &pending.action_id).is_some();
-    if persist_action_payload {
-        if planned.dispatch_action_payload.is_empty() || (!evidence_matches && !local_record_exists)
-        {
-            let Ok(payload) =
-                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(action)
-            else {
-                return DispatchEvidencePlan::WaitForSupportedProtocol;
-            };
-            planned.dispatch_action_payload = payload;
-        }
-    } else {
-        planned.dispatch_action_payload.clear();
-    }
-
-    if planned == *pending {
-        DispatchEvidencePlan::Ready
-    } else {
-        DispatchEvidencePlan::Persist(Box::new(planned))
-    }
+    crate::durable::effects::plan_dispatch_evidence(
+        pending,
+        observed,
+        addressed_instance,
+        action,
+        persist_action_payload,
+    )
 }
 
 async fn execute_planned_control_action(
@@ -363,59 +328,11 @@ async fn execute_planned_control_action(
     pending: &PendingActionStatus,
     authoritative_action: Option<DurableReplicaAction>,
 ) -> kuberic_core::Result<()> {
-    let action = match authoritative_action {
-        Some(action) => action,
-        None => kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
-            &pending.dispatch_action_payload,
-        )
-        .map_err(|error| KubericError::Internal(error.into()))?,
-    };
-    let generation = pending
-        .dispatch_agent_generation
-        .as_deref()
-        .ok_or_else(|| {
-            KubericError::Internal("correlated dispatch is missing agent generation".into())
-        })
-        .and_then(|generation| {
-            AgentGeneration::parse(generation).map_err(|error| KubericError::Internal(error.into()))
-        })?;
-    let control_version = pending.dispatch_agent_control_version.ok_or_else(|| {
-        KubericError::Internal("correlated dispatch is missing agent control version".into())
-    })?;
-    let observed_epoch = pending
-        .dispatch_observed_runtime_epoch
-        .as_ref()
-        .ok_or_else(|| {
-            KubericError::Internal("correlated dispatch is missing observed runtime epoch".into())
-        })?;
-    let input_signature = action.signature();
-    handle
-        .execute_correlated_control_action(CorrelatedControlActionRequest {
-            protocol_version: kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-            action_id: pending.action_id.clone(),
-            input_signature: input_signature.clone(),
-            target_replica_id: pending.target_id,
-            target_instance_id: ReplicaInstanceId::new(pending.target_instance_id.clone()),
-            expected_agent_generation: generation.clone(),
-            expected_control_version: AgentControlVersion::new(control_version),
-            observed_runtime_epoch: Epoch::new(
-                observed_epoch.data_loss_number,
-                observed_epoch.configuration_number,
-            ),
-            action,
-        })
+    crate::durable::effects::execute_planned_control_action(handle, pending, authoritative_action)
         .await
-        .and_then(|acknowledgement| {
-            correlated_acknowledgement_result(
-                acknowledgement,
-                &pending.action_id,
-                &input_signature,
-                &generation,
-                AgentControlVersion::new(control_version),
-            )
-        })
 }
 
+#[cfg(test)]
 fn correlated_acknowledgement_result(
     acknowledgement: CorrelatedControlActionAcknowledgement,
     expected_action_id: &str,
@@ -423,86 +340,38 @@ fn correlated_acknowledgement_result(
     expected_generation: &AgentGeneration,
     expected_control_version: AgentControlVersion,
 ) -> kuberic_core::Result<()> {
-    let observation = &acknowledgement.observation;
-    if observation.generation != *expected_generation
-        || observation.control_version.value() == 0
-        || observation.control_version.value() > expected_control_version.value().saturating_add(1)
-        || observation.action.action_id != expected_action_id
-        || observation.action.signature != expected_signature
-    {
-        return Err(KubericError::RemoteAgentRequestRejected(
-            "correlated acknowledgement does not match the dispatched action".to_string(),
-        ));
-    }
-    if acknowledgement.observation.action.state != DurableActionState::Failed {
-        return Ok(());
-    }
-    let action = acknowledgement.observation.action;
-    let class = action.error_class.ok_or_else(|| {
-        KubericError::RemoteAgentRequestRejected(
-            "failed correlated acknowledgement has no error class".to_string(),
-        )
-    })?;
-    Err(KubericError::RemoteAgentTerminalFailure {
-        class,
-        message: action
-            .error
-            .unwrap_or_else(|| "correlated control action failed".to_string()),
-    })
-}
-
-fn dispatch_rejection_requires_refresh(error: &KubericError) -> bool {
-    matches!(
-        error,
-        KubericError::RemoteAgentPreconditionRejected(_)
-            | KubericError::RemoteAgentContinuityUnavailable(_)
+    crate::durable::effects::correlated_acknowledgement_result(
+        acknowledgement,
+        expected_action_id,
+        expected_signature,
+        expected_generation,
+        expected_control_version,
     )
 }
 
+fn dispatch_rejection_requires_refresh(error: &KubericError) -> bool {
+    crate::durable::effects::dispatch_rejection_requires_refresh(error)
+}
+
 fn dispatch_rejection_is_retryable_without_execution(error: &KubericError) -> bool {
-    matches!(error, KubericError::AgentBusy)
+    crate::durable::effects::dispatch_rejection_is_retryable_without_execution(error)
 }
 
 fn clear_dispatch_evidence(pending: &mut PendingActionStatus) {
-    pending.dispatch_agent_generation = None;
-    pending.dispatch_agent_control_version = None;
-    pending.dispatch_observed_runtime_epoch = None;
-    pending.dispatch_action_payload.clear();
+    crate::durable::effects::clear_dispatch_evidence(pending);
 }
 
 fn operation_after_dispatch_error(
     operation: &DurableOperationStatus,
     error: &KubericError,
 ) -> DurableOperationStatus {
-    if matches!(error, KubericError::RemoteAgentConflict(_)) {
-        fail_closed(operation, &error.to_string())
-    } else if dispatch_rejection_requires_refresh(error) {
-        let mut next = operation.clone();
-        if let Some(pending) = next.pending_action.as_mut() {
-            clear_dispatch_evidence(pending);
-            pending.last_error = Some(error.to_string().chars().take(512).collect());
-        }
-
-        next
-    } else if dispatch_rejection_is_retryable_without_execution(error) {
-        let mut next = operation.clone();
-        if let Some(pending) = next.pending_action.as_mut() {
-            pending.last_error = Some(error.to_string().chars().take(512).collect());
-        }
-        next
-    } else {
-        record_activity_error(operation, &error.to_string())
-    }
+    crate::durable::effects::operation_after_dispatch_error(operation, error)
 }
 
 // COMPLEXITY-BOUNDARY: pilot-effect-bridge:start
 #[cfg(feature = "durable-switchover-pilot")]
 /// Result of handling one dispatch-permitted durable pilot activity.
-pub enum PilotEffectBridgeOutcome {
-    Observe(Box<DurableSwitchoverStepResult>),
-    Exposed,
-    AwaitEvidence,
-}
+pub type PilotEffectBridgeOutcome = crate::durable::effects::PilotEffectBridgeOutcome;
 
 #[cfg(feature = "durable-switchover-pilot")]
 /// Consume one permit and either persist adapter evidence, issue one existing
@@ -516,84 +385,26 @@ pub async fn bridge_pilot_permitted_step(
     api: &dyn ClusterApi,
     namespace: &str,
 ) -> Result<PilotEffectBridgeOutcome, String> {
-    let _permit = guard.consume_for(operation)?;
-    match decision {
-        PilotAdapterDecision::Observe(result) => {
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
-        }
-        PilotAdapterDecision::AwaitEvidence => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
-        PilotAdapterDecision::External(Decision::Execute {
-            target_id,
-            action_id,
-            action,
-        }) => {
-            let pending = operation.pending_action.as_ref().ok_or_else(|| {
-                "pilot execution requested a replica effect without pending intent".to_string()
-            })?;
-            if pending.action_id != action_id {
-                return Err(
-                    "pilot replica effect does not match pending correlation identity".to_string(),
-                );
-            }
-            let Some(observed) = observations.get(&target_id) else {
-                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
-            };
-            let Some(handle) = handles.get(&target_id) else {
-                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
-            };
-            match plan_dispatch_evidence(
-                pending,
-                &observed.status,
-                &handle.instance_id(),
-                &action,
-                true,
-            ) {
-                DispatchEvidencePlan::Persist(planned) => {
-                    let mut next = operation.clone();
-                    next.pending_action = Some(*planned);
-                    return Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                        DurableSwitchoverStepResult::Advance { operation: next },
-                    )));
-                }
-                DispatchEvidencePlan::WaitForExactIncarnation
-                | DispatchEvidencePlan::WaitForSupportedProtocol => {
-                    return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
-                }
-                DispatchEvidencePlan::Ready => {}
-            }
-            match execute_planned_control_action(handle.as_ref(), pending, None).await {
-                Ok(()) => Ok(PilotEffectBridgeOutcome::Exposed),
-                Err(error) => match pilot_result_after_dispatch_error(operation, action_id, &error)
-                {
-                    Some(result) => Ok(PilotEffectBridgeOutcome::Observe(Box::new(result))),
-                    None => Ok(PilotEffectBridgeOutcome::Exposed),
-                },
-            }
-        }
-        PilotAdapterDecision::External(Decision::PatchPodRole { target_id, role }) => {
-            let (pod_name, expected_uid) =
-                exact_pilot_label_target(operation, target_id, observations)?;
-            let mut labels = BTreeMap::new();
-            labels.insert("kuberic.io/role".to_string(), role);
-            let _ = api
-                .patch_pod_labels_if_uid(namespace, &pod_name, &expected_uid, labels)
-                .await;
-            Ok(PilotEffectBridgeOutcome::Exposed)
-        }
-        PilotAdapterDecision::External(other) => Err(format!(
-            "unsupported external decision reached durable switchover pilot: {other:?}"
-        )),
-    }
+    crate::durable::effects::bridge_pilot_permitted_step(
+        guard,
+        operation,
+        decision,
+        observations,
+        handles,
+        api,
+        namespace,
+    )
+    .await
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(all(test, feature = "durable-switchover-pilot"))]
 fn pilot_result_after_dispatch_error(
     operation: &DurableOperationStatus,
     action_id: String,
     error: &KubericError,
 ) -> Option<DurableSwitchoverStepResult> {
-    if dispatch_rejection_requires_refresh(error)
-        || dispatch_rejection_is_retryable_without_execution(error)
+    if crate::durable::effects::classify_dispatch_failure(error)
+        == crate::durable::effects::DispatchFailureDisposition::ProvenNoAdmission
     {
         return Some(DurableSwitchoverStepResult::ProvenNoAdmission {
             operation: operation_after_dispatch_error(operation, error),
@@ -616,230 +427,18 @@ pub fn resolve_pilot_quarantine(
     decision: PilotAdapterDecision,
     observations: &OperationObservations,
 ) -> Result<PilotEffectBridgeOutcome, String> {
-    match decision {
-        PilotAdapterDecision::Observe(result)
-            if operation.pending_action.as_ref().is_some_and(|pending| {
-                !matches!(
-                    pending.kind,
-                    crate::crd::DurableActionKind::LabelTargetPrimary
-                        | crate::crd::DurableActionKind::LabelOldSecondary
-                        | crate::crd::DurableActionKind::CompensateLabelOldPrimary
-                        | crate::crd::DurableActionKind::CompensateLabelTargetSecondary
-                ) && pending.dispatch_agent_generation.is_none()
-                    && pending.dispatch_agent_control_version.is_none()
-                    && pending.dispatch_observed_runtime_epoch.is_none()
-                    && pending.dispatch_action_payload.is_empty()
-            }) =>
-        {
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
-        }
-        PilotAdapterDecision::Observe(result)
-            if quarantine_result_is_authoritative(operation, &result, observations) =>
-        {
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
-        }
-        PilotAdapterDecision::Observe(_) => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
-        PilotAdapterDecision::AwaitEvidence => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
-        PilotAdapterDecision::External(Decision::Execute {
-            target_id,
-            action_id,
-            action,
-        }) if operation
-            .pending_action
-            .as_ref()
-            .is_some_and(|pending| pending.dispatch_agent_generation.is_none()) =>
-        {
-            let pending = operation.pending_action.as_ref().ok_or_else(|| {
-                "quarantined pilot execution has no pending correlated action".to_string()
-            })?;
-            if pending.action_id != action_id {
-                return Err(
-                    "quarantined pilot action identity changed before fence persistence"
-                        .to_string(),
-                );
-            }
-            let observed = observations
-                .get(&target_id)
-                .ok_or_else(|| format!("quarantined pilot replica {target_id} is unavailable"))?;
-            match plan_dispatch_evidence(
-                pending,
-                &observed.status,
-                &ReplicaInstanceId::new(pending.target_instance_id.clone()),
-                &action,
-                true,
-            ) {
-                DispatchEvidencePlan::Persist(planned) => {
-                    let mut next = operation.clone();
-                    next.pending_action = Some(*planned);
-                    Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                        DurableSwitchoverStepResult::Advance { operation: next },
-                    )))
-                }
-                DispatchEvidencePlan::Ready => Err(
-                    "quarantined effect-free activity unexpectedly already had dispatch evidence"
-                        .to_string(),
-                ),
-                DispatchEvidencePlan::WaitForExactIncarnation
-                | DispatchEvidencePlan::WaitForSupportedProtocol => {
-                    Ok(PilotEffectBridgeOutcome::AwaitEvidence)
-                }
-            }
-        }
-        PilotAdapterDecision::External(Decision::Execute { target_id, .. })
-            if generation_change_proves_no_admission(operation, target_id, observations) =>
-        {
-            let pending = operation.pending_action.as_ref().ok_or_else(|| {
-                "quarantined pilot execution has no pending correlated action".to_string()
-            })?;
-            let mut next = operation.clone();
-            if let Some(next_pending) = next.pending_action.as_mut() {
-                clear_dispatch_evidence(next_pending);
-            }
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                DurableSwitchoverStepResult::ProvenNoAdmission {
-                    operation: next,
-                    action_id: pending.action_id.clone(),
-                    redelivery: 1,
-                },
-            )))
-        }
-        PilotAdapterDecision::External(Decision::PatchPodRole { .. }) => {
-            let pending = operation.pending_action.as_ref().ok_or_else(|| {
-                "quarantined pilot label activity has no pending action".to_string()
-            })?;
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                DurableSwitchoverStepResult::ProvenNoAdmission {
-                    operation: operation.clone(),
-                    action_id: pending.action_id.clone(),
-                    redelivery: 1,
-                },
-            )))
-        }
-        PilotAdapterDecision::External(_) => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
-    }
+    crate::durable::effects::resolve_pilot_quarantine(operation, decision, observations)
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
-fn quarantine_result_is_authoritative(
-    operation: &DurableOperationStatus,
-    result: &DurableSwitchoverStepResult,
-    observations: &OperationObservations,
-) -> bool {
-    match result {
-        DurableSwitchoverStepResult::Complete { .. } => operation.pending_action.is_none(),
-        DurableSwitchoverStepResult::Stopped { .. } => operation.pending_action.is_none(),
-        DurableSwitchoverStepResult::ProvenNoAdmission { .. } => true,
-        DurableSwitchoverStepResult::Advance { operation: next } => {
-            if next.phase == DurableOperationPhase::Poisoned {
-                return false;
-            }
-            let Some(pending) = operation.pending_action.as_ref() else {
-                return true;
-            };
-            if let Some(observed) = observations.get(&pending.target_id)
-                && let Some(action) =
-                    correlated_action_observation(&observed.status, &pending.action_id)
-            {
-                return matches!(
-                    action.state,
-                    DurableActionState::Completed | DurableActionState::Failed
-                ) && next.pending_action.is_none();
-            }
-            pending_postcondition_transition(operation, next, pending)
-        }
-    }
-}
-
-#[cfg(feature = "durable-switchover-pilot")]
-fn pending_postcondition_transition(
-    operation: &DurableOperationStatus,
-    next: &DurableOperationStatus,
-    pending: &PendingActionStatus,
-) -> bool {
-    use crate::crd::DurableActionKind as Action;
-    use crate::crd::DurableOperationPhase as Phase;
-    if next.pending_action.is_some() {
-        return false;
-    }
-    match pending.kind {
-        Action::RevokeWrite => next.phase == Phase::CaptureLsn,
-        Action::DemoteOldPrimary => next.phase == Phase::PromoteTarget,
-        Action::PromoteTarget => next.phase == Phase::DistributeEpoch,
-        Action::UpdateSecondaryEpoch => {
-            next.phase == operation.phase
-                && next.next_secondary_index == operation.next_secondary_index.saturating_add(1)
-        }
-        Action::UpdateCatchUpConfiguration => next.phase == Phase::WaitForCatchUpQuorum,
-        Action::WaitForCatchUpQuorum => next.phase == Phase::UpdateCurrentConfiguration,
-        Action::UpdateCurrentConfiguration => next.phase == Phase::LabelTargetPrimary,
-        Action::LabelTargetPrimary => next.phase == Phase::LabelOldSecondary,
-        Action::LabelOldSecondary => next.phase == Phase::Finalize,
-        Action::RestorePreviousConfiguration => next.phase == Phase::Failed,
-        Action::CompensatePromoteOldPrimary => next.phase == Phase::CompensateDistributeEpoch,
-        Action::CompensateUpdateSecondaryEpoch => {
-            next.phase == operation.phase
-                && next.next_secondary_index == operation.next_secondary_index.saturating_add(1)
-        }
-        Action::CompensateCatchUpConfiguration => {
-            next.phase == Phase::CompensateCurrentConfiguration
-        }
-        Action::CompensateCurrentConfiguration => next.phase == Phase::CompensateLabelOldPrimary,
-        Action::CompensateLabelOldPrimary => next.phase == Phase::CompensateLabelTargetSecondary,
-        Action::CompensateLabelTargetSecondary => next.phase == Phase::CompensateFinalize,
-        _ => false,
-    }
-}
-
-#[cfg(feature = "durable-switchover-pilot")]
-fn generation_change_proves_no_admission(
-    operation: &DurableOperationStatus,
-    target_id: ReplicaId,
-    observations: &OperationObservations,
-) -> bool {
-    let Some(pending) = operation.pending_action.as_ref() else {
-        return false;
-    };
-    let Some(dispatched_generation) = pending.dispatch_agent_generation.as_deref() else {
-        return false;
-    };
-    let Some(observed) = observations.get(&target_id) else {
-        return false;
-    };
-    observed.status.agent.generation.as_str() != dispatched_generation
-        && correlated_action_observation(&observed.status, &pending.action_id).is_none()
-}
-
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(all(test, feature = "durable-switchover-pilot"))]
 fn exact_pilot_label_target(
     operation: &DurableOperationStatus,
     target_id: ReplicaId,
     observations: &OperationObservations,
 ) -> Result<(String, String), String> {
-    let expected_uid = operation
-        .previous_snapshot
-        .members
-        .iter()
-        .find(|member| member.id == target_id)
-        .or_else(|| {
-            operation
-                .target_snapshot
-                .members
-                .iter()
-                .find(|member| member.id == target_id)
-        })
-        .map(|member| member.instance_id.clone())
-        .ok_or_else(|| {
-            format!("pilot label target {target_id} is not in the operation snapshot")
-        })?;
-    let observed = observations
-        .get(&target_id)
-        .ok_or_else(|| format!("pilot label target {target_id} is unavailable"))?;
-    if observed.status.instance_id.as_str() != expected_uid {
-        return Err(format!(
-            "pilot label target {target_id} incarnation changed before patch"
-        ));
-    }
-    Ok((observed.pod_name.clone(), expected_uid))
+    let command =
+        crate::durable::effects::exact_label_command(operation, target_id, "", observations)?;
+    Ok((command.pod_name, command.expected_uid))
 }
 
 // COMPLEXITY-BOUNDARY: pilot-effect-bridge:end
@@ -3546,9 +3145,10 @@ fn pilot_decision_ready(
         PilotAdapterDecision::External(Decision::Execute { target_id, .. }) => {
             observations.contains_key(target_id) && handles.contains_key(target_id)
         }
-        PilotAdapterDecision::External(Decision::PatchPodRole { target_id, .. }) => {
-            observations.contains_key(target_id)
-        }
+        PilotAdapterDecision::External(
+            Decision::PatchPodRole { target_id, .. }
+            | Decision::PatchPodRoleExactUid { target_id, .. },
+        ) => observations.contains_key(target_id),
         PilotAdapterDecision::External(_) => false,
     }
 }
