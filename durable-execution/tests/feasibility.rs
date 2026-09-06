@@ -13,7 +13,7 @@ use kuberic_durable_execution::{
 use serde::Deserialize;
 use support::scenarios::{ScenarioEvidence, ScenarioId, run_conformance_matrix};
 
-const EXPECTED_FR_013_SCENARIOS: usize = 38;
+const EXPECTED_FR_013_SCENARIOS: usize = 45;
 
 struct SelectedOrdinaryAsyncSurface;
 

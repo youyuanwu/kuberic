@@ -258,6 +258,23 @@ state. If it did not apply, reload replays completed active results and retries
 terminalization without redispatch. Provider failures return `StoreFailed`;
 every later attempt starts with a fresh load.
 
+Callers with effect-specific authoritative recovery can opt into the fused
+host methods without changing the low-level behavior above:
+
+- `turn_and_expose` evaluates the next activity, reserves its maximum result,
+  and persists it directly as `DispatchExposed` in one CAS. It creates the
+  opaque permit only after that CAS is accepted.
+- `observe_and_turn` validates one exact authoritative observation, replays
+  deterministic workflow code, and uses one CAS to persist either the
+  completed result plus the next `DispatchExposed` command or the compact
+  terminal state.
+
+Conflict, definite store failure, and `OutcomeUnknown` at either fused boundary
+never return a permit. An unknown-after-apply next exposure reloads as
+quarantined, including the case where this process knows it never received the
+permit; generic recovery does not weaken that conservative rule. The original
+`turn` and `observe` methods remain the default for arbitrary effects.
+
 Terminal success and failure payloads share the `ExecutionSpec` bound. An
 exact-bound outcome is accepted. A larger outcome is an explicit checkpoint
 contract violation and is not persisted or reported complete. This workflow
