@@ -40,6 +40,10 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
     status.observed_generation = input.generation;
     status.observed_desired_state = Some(input.spec.desired_state);
 
+    if input.previous.phase.is_terminal() {
+        return status;
+    }
+
     if input.spec.desired_state.releases_request() {
         return finish(
             status,
@@ -50,7 +54,7 @@ pub fn reconcile_discovery(input: DiscoveryInput<'_>) -> NodeMaintenanceRequestS
         );
     }
 
-    if input.previous.phase.is_terminal() || input.previous.phase == MaintenancePhase::Releasing {
+    if input.previous.phase == MaintenancePhase::Releasing {
         return status;
     }
 
@@ -536,6 +540,34 @@ mod tests {
         assert_eq!(
             status.message.as_deref(),
             Some("release requested: Complete")
+        );
+    }
+
+    #[test]
+    fn a_terminal_request_is_not_disturbed_by_a_release_request() {
+        let mut spec = spec("worker-04");
+        spec.desired_state = MaintenanceDesiredState::Complete;
+        let previous = NodeMaintenanceRequestStatus {
+            phase: MaintenancePhase::Expired,
+            blocked_reason: Some(MaintenanceBlockedReason::DeadlineExceeded),
+            message: Some("deadline exceeded before preparation completed".to_string()),
+            ..Default::default()
+        };
+
+        let status = run(&spec, &previous, Some(&node("uid-a")), &[], false);
+
+        assert_eq!(status.phase, MaintenancePhase::Expired);
+        assert_eq!(
+            status.blocked_reason,
+            Some(MaintenanceBlockedReason::DeadlineExceeded)
+        );
+        assert_eq!(
+            status.message.as_deref(),
+            Some("deadline exceeded before preparation completed")
+        );
+        assert_eq!(
+            status.observed_desired_state,
+            Some(MaintenanceDesiredState::Complete)
         );
     }
 
