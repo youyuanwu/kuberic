@@ -29,6 +29,7 @@ enum ActionObservation {
     Impossible,
 }
 
+// COMPLEXITY-BOUNDARY: explicit-switchover:start
 pub fn start_switchover(
     set_uid: &str,
     previous: StablePartitionSnapshotStatus,
@@ -1321,6 +1322,7 @@ fn pod_role_action(kind: DurableActionKind) -> Option<&'static str> {
     }
 }
 
+// COMPLEXITY-BOUNDARY: explicit-switchover:end
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -488,6 +488,7 @@ fn operation_after_dispatch_error(
     }
 }
 
+// COMPLEXITY-BOUNDARY: pilot-effect-bridge:start
 #[cfg(feature = "durable-switchover-pilot")]
 /// Result of handling one dispatch-permitted durable pilot activity.
 pub enum PilotEffectBridgeOutcome {
@@ -761,6 +762,7 @@ fn exact_pilot_label_target(
     Ok((observed.pod_name.clone(), expected_uid))
 }
 
+// COMPLEXITY-BOUNDARY: pilot-effect-bridge:end
 /// Main reconciliation logic, decoupled from kube-runtime.
 /// Takes a ClusterApi trait object so it can be tested without a real cluster.
 pub async fn reconcile_set(
@@ -3167,6 +3169,7 @@ async fn reconcile_durable_switchover_pilot(
         }
         HostOutcome::WorkflowCompleted { outcome, .. } => {
             let terminal = decode_terminal(&outcome)?;
+            drop(host);
             publish_pilot_terminal(set, api, state, terminal, now).await
         }
         HostOutcome::Nondeterminism(error) => {
@@ -3410,6 +3413,24 @@ async fn publish_pilot_terminal(
                 set.metadata.resource_version.as_deref(),
             )
             .await?;
+            if let Some(measurements) = runtime
+                .measurements(&namespace, &name, set_uid, &reference.execution_id)
+                .await
+            {
+                info!(
+                    execution_id = reference.execution_id,
+                    checkpoint_load_attempts = measurements.load_attempts,
+                    checkpoint_write_attempts = measurements.write_attempts,
+                    checkpoint_accepted_writes = measurements.accepted_writes,
+                    checkpoint_conflicts = measurements.conflicts,
+                    checkpoint_unknown_outcomes = measurements.unknown_outcomes,
+                    latest_authoritative_checkpoint_bytes =
+                        ?measurements.latest_authoritative_checkpoint_bytes,
+                    maximum_authoritative_checkpoint_bytes =
+                        measurements.maximum_authoritative_checkpoint_bytes,
+                    "durable switchover pilot process summary"
+                );
+            }
             state.drivers.lock().await.remove(&set_key);
             runtime
                 .forget(&namespace, &name, set_uid, &reference.execution_id)

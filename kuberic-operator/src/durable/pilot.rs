@@ -179,6 +179,27 @@ impl DurableSwitchoverPilotRuntime {
     pub async fn host_count(&self) -> usize {
         self.hosts.lock().await.len()
     }
+
+    pub async fn measurements(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        set_uid: &str,
+        execution_id: &str,
+    ) -> Option<super::pilot_store::PilotCheckpointMeasurementsSnapshot> {
+        let host = self
+            .hosts
+            .lock()
+            .await
+            .get(&PilotHostKey {
+                namespace: namespace.to_string(),
+                set_name: set_name.to_string(),
+                set_uid: set_uid.to_string(),
+                execution_id: execution_id.to_string(),
+            })
+            .cloned()?;
+        Some(host.lock().await.store().measurements())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -225,6 +246,7 @@ pub enum DurableSwitchoverPilotTerminal {
     },
 }
 
+// COMPLEXITY-BOUNDARY: pilot-workflow:start
 pub struct DurableSwitchoverWorkflow;
 
 #[async_trait]
@@ -712,6 +734,7 @@ fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactByt
     Ok(ExactBytes::new(encoded))
 }
 
+// COMPLEXITY-BOUNDARY: pilot-workflow:end
 pub fn new_pilot_reference(
     set_uid: &str,
     previous_snapshot: StablePartitionSnapshotStatus,

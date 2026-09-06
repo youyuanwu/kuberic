@@ -183,6 +183,23 @@ mod tests {
                 &first
             );
 
+            store.fail_next_compare_and_swap(InMemoryFault::ConflictWithoutApply);
+            assert_eq!(
+                store
+                    .compare_and_swap(
+                        execution_id,
+                        Some(first.clone()),
+                        checkpoint(execution_id, 31),
+                    )
+                    .await
+                    .unwrap(),
+                CasOutcome::Conflict
+            );
+            assert_eq!(
+                store.load(execution_id).await.unwrap().unwrap().revision(),
+                &first
+            );
+
             store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
             assert_eq!(
                 store
