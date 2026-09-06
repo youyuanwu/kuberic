@@ -2817,7 +2817,7 @@ async fn reconcile_durable_switchover_pilot(
                             set,
                             api,
                             "AwaitingReplicaObservation",
-                            "pilot activity is waiting for exact replica or dispatch evidence",
+                            "pilot activity is waiting for an exact replica or authoritative effect evidence",
                             now,
                         )
                         .await;
@@ -5000,73 +5000,6 @@ mod dispatch_planning_tests {
             },
             _ => panic!("new agent generation and exact precondition must prove no admission"),
         }
-    }
-
-    #[cfg(feature = "durable-switchover-pilot")]
-    #[test]
-    fn quarantine_never_reconstructs_an_effect_free_pre_dispatch_fence_step() {
-        let operation = pilot_operation();
-        let Decision::Persist(operation) =
-            decide(&operation, &OperationObservations::new(), 100).unwrap()
-        else {
-            panic!("expected revoke intent");
-        };
-        assert!(
-            operation
-                .pending_action
-                .as_ref()
-                .unwrap()
-                .dispatch_agent_generation
-                .is_none()
-        );
-        let observations = pilot_observations(observed(
-            kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
-        ));
-        let decision =
-            crate::durable::pilot::evaluate_adapter_step(&operation, &observations, 100).unwrap();
-        assert!(matches!(
-            resolve_pilot_quarantine(
-                &operation,
-                &PilotActivityKind::PassiveObservation,
-                decision,
-                &observations,
-            )
-            .unwrap(),
-            PilotEffectBridgeOutcome::AwaitEvidence
-        ));
-    }
-
-    #[cfg(feature = "durable-switchover-pilot")]
-    #[test]
-    fn expired_effect_free_pre_dispatch_exposure_stops_instead_of_stranding() {
-        let operation = pilot_operation();
-        let Decision::Persist(mut operation) =
-            decide(&operation, &OperationObservations::new(), 100).unwrap()
-        else {
-            panic!("expected revoke intent");
-        };
-        operation
-            .pending_action
-            .as_mut()
-            .unwrap()
-            .deadline_unix_seconds = 0;
-        let decision = crate::durable::pilot::evaluate_adapter_step(
-            &operation,
-            &OperationObservations::new(),
-            1,
-        )
-        .unwrap();
-        assert!(matches!(
-            resolve_pilot_quarantine(
-                &operation,
-                &PilotActivityKind::PassiveObservation,
-                decision,
-                &OperationObservations::new(),
-            )
-            .unwrap(),
-            PilotEffectBridgeOutcome::Observe(result)
-                if matches!(*result, DurableSwitchoverStepResult::Stopped { .. })
-        ));
     }
 
     #[cfg(feature = "durable-switchover-pilot")]

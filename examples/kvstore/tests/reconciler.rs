@@ -6183,6 +6183,12 @@ async fn test_durable_remove_coarse_activation() {
             .last_observed_result,
         Some(RemoveReplicaTerminalResultStatus::CommittedClean)
     );
+    let remove_operation = status.operation.as_ref().unwrap();
+    let remove_intent = remove_operation.remove_intent.as_ref().unwrap();
+    assert_eq!(
+        remove_intent.action_id,
+        format!("{}:RemoveReplicaIntent", remove_intent.attempt_id)
+    );
     assert_eq!(injected, expected);
     assert_stable_snapshot(&api, &status, 2);
     assert!(persisted_phases.contains(&DurableOperationPhase::RemoveFreezeIntent));
@@ -6196,6 +6202,16 @@ async fn test_durable_remove_coarse_activation() {
 
     let history = api.statuses.lock().unwrap();
     let removal_history = &history[history_start..];
+    assert!(
+        removal_history.iter().all(|entry| {
+            entry
+                .operation
+                .as_ref()
+                .and_then(|operation| operation.pending_action.as_ref())
+                .is_none_or(|pending| pending.dispatch_action_payload.is_empty())
+        }),
+        "coarse remove dispatch must retain its structured intent without a direct payload"
+    );
     let first_reduced = removal_history
         .iter()
         .position(|entry| {

@@ -1390,24 +1390,18 @@ fn maximum_projected_checkpoint_bytes() -> Result<usize, String> {
 
 fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
     let mut steps = vec![
-        "revoke.observe",
         "revoke.effect",
         "capture-lsn",
         "target-catch-up",
-        "demote.observe",
         "demote.effect",
-        "promote.observe",
         "promote.effect",
     ];
     for _ in 0..member_count.saturating_sub(2) {
-        steps.extend(["epoch.observe", "epoch.effect"]);
+        steps.push("epoch.effect");
     }
     steps.extend([
-        "catch-up-config.observe",
         "catch-up-config.effect",
-        "quorum.observe",
         "quorum.effect",
-        "current-config.observe",
         "current-config.effect",
         "target-label.effect",
         "old-label.effect",
@@ -1484,24 +1478,18 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
 
 fn projected_rollback_steps(member_count: usize) -> Vec<&'static str> {
     let mut steps = vec![
-        "revoke.observe",
         "revoke.effect",
         "capture-lsn",
         "target-catch-up",
-        "demote.observe",
         "demote.effect",
-        "promote.observe",
         "promote.effect",
-        "rollback-promote.observe",
         "rollback-promote.effect",
     ];
     for _ in 0..member_count.saturating_sub(1) {
-        steps.extend(["rollback-epoch.observe", "rollback-epoch.effect"]);
+        steps.push("rollback-epoch.effect");
     }
     steps.extend([
-        "rollback-catch-up.observe",
         "rollback-catch-up.effect",
-        "rollback-current.observe",
         "rollback-current.effect",
         "rollback-old-label.effect",
         "rollback-target-label.effect",
@@ -3106,8 +3094,8 @@ mod durable_switchover_pilot_tests {
     fn success_and_rollback_transcripts_fit_with_redelivery_headroom() {
         let success = projected_success_steps(PILOT_MAX_REPLICAS);
         let rollback = projected_rollback_steps(PILOT_MAX_REPLICAS);
-        assert_eq!(success.len(), 28);
-        assert_eq!(rollback.len(), 31);
+        assert_eq!(success.len(), 21);
+        assert_eq!(rollback.len(), 23);
         assert!(success.len() <= PILOT_MAX_ACTIVITY_RECORDS);
         assert!(rollback.len() <= PILOT_MAX_ACTIVITY_RECORDS);
         assert!(success.len() + projected_success_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL);

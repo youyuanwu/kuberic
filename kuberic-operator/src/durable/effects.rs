@@ -226,17 +226,19 @@ pub fn prepare_replica_effect_command(
         }
         return Ok((pending.clone(), command));
     }
-    let planned = match plan_dispatch_evidence(pending, observed, addressed_instance, action, true)
-    {
-        DispatchEvidencePlan::Ready => pending.clone(),
-        DispatchEvidencePlan::Persist(planned) => *planned,
-        DispatchEvidencePlan::WaitForExactIncarnation => {
-            return Err(PilotEffectPreparationError::WaitForExactIncarnation);
-        }
-        DispatchEvidencePlan::WaitForSupportedProtocol => {
-            return Err(PilotEffectPreparationError::WaitForSupportedProtocol);
-        }
-    };
+    let planned =
+        match freeze_dispatch_evidence(pending, observed, addressed_instance, action, true) {
+            Ok(planned) => planned,
+            Err(DispatchEvidencePlan::WaitForExactIncarnation) => {
+                return Err(PilotEffectPreparationError::WaitForExactIncarnation);
+            }
+            Err(DispatchEvidencePlan::WaitForSupportedProtocol) => {
+                return Err(PilotEffectPreparationError::WaitForSupportedProtocol);
+            }
+            Err(DispatchEvidencePlan::Ready | DispatchEvidencePlan::Persist(_)) => {
+                unreachable!("dispatch evidence freezing returns only wait errors")
+            }
+        };
     let command = ReplicaEffectCommand::from_pending(&planned)
         .map_err(|_| PilotEffectPreparationError::InvalidCommand)?;
     if command.action_id != pending.action_id
@@ -297,15 +299,40 @@ pub(crate) fn plan_dispatch_evidence(
     action: &DurableReplicaAction,
     persist_action_payload: bool,
 ) -> DispatchEvidencePlan {
+    let planned = match freeze_dispatch_evidence(
+        pending,
+        observed,
+        addressed_instance,
+        action,
+        persist_action_payload,
+    ) {
+        Ok(planned) => planned,
+        Err(wait) => return wait,
+    };
+
+    if planned == *pending {
+        DispatchEvidencePlan::Ready
+    } else {
+        DispatchEvidencePlan::Persist(Box::new(planned))
+    }
+}
+
+fn freeze_dispatch_evidence(
+    pending: &PendingActionStatus,
+    observed: &ReplicaStatusInfo,
+    addressed_instance: &ReplicaInstanceId,
+    action: &DurableReplicaAction,
+    persist_action_payload: bool,
+) -> Result<PendingActionStatus, DispatchEvidencePlan> {
     let mut planned = pending.clone();
     let exact_incarnation = addressed_instance.as_str() == pending.target_instance_id
         && observed.instance_id.as_str() == pending.target_instance_id;
     if !exact_incarnation {
-        return DispatchEvidencePlan::WaitForExactIncarnation;
+        return Err(DispatchEvidencePlan::WaitForExactIncarnation);
     }
     let agent = &observed.agent;
     if agent.protocol_version != kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION {
-        return DispatchEvidencePlan::WaitForSupportedProtocol;
+        return Err(DispatchEvidencePlan::WaitForSupportedProtocol);
     }
     let generation = agent.generation.to_string();
     let control_version = agent.control_version.value();
@@ -326,7 +353,7 @@ pub(crate) fn plan_dispatch_evidence(
             let Ok(payload) =
                 kuberic_core::grpc::convert::encode_direct_correlated_action_payload(action)
             else {
-                return DispatchEvidencePlan::WaitForSupportedProtocol;
+                return Err(DispatchEvidencePlan::WaitForSupportedProtocol);
             };
             planned.dispatch_action_payload = payload;
         }
@@ -334,11 +361,7 @@ pub(crate) fn plan_dispatch_evidence(
         planned.dispatch_action_payload.clear();
     }
 
-    if planned == *pending {
-        DispatchEvidencePlan::Ready
-    } else {
-        DispatchEvidencePlan::Persist(Box::new(planned))
-    }
+    Ok(planned)
 }
 
 pub(crate) async fn execute_planned_control_action(
