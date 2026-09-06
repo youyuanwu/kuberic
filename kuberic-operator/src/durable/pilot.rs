@@ -595,6 +595,108 @@ pub fn decode_pilot_activity_input(
     Ok(input)
 }
 
+pub fn validate_prepared_activity(
+    operation: &DurableOperationStatus,
+    kind: &PilotActivityKind,
+) -> Result<(), String> {
+    match kind {
+        PilotActivityKind::PassiveObservation => Ok(()),
+        PilotActivityKind::PreparedReplica { command } => {
+            let pending = operation
+                .pending_action
+                .as_ref()
+                .ok_or_else(|| "prepared replica activity has no pending action".to_string())?;
+            let expected = ReplicaEffectCommand::from_pending(pending)?;
+            if &expected != command {
+                return Err(
+                    "prepared replica activity differs from frozen pending action".to_string(),
+                );
+            }
+            let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+                &command.action_payload,
+            )
+            .map_err(|error| format!("decode prepared replica activity: {error}"))?;
+            let signature_matches = action.signature() == command.action_signature;
+            let kind_matches = validate_pilot_replica_action_kind(pending.kind, &action);
+            let fixed_semantics_match =
+                action_matches_fixed_operation_semantics(operation, pending, &action);
+            if !signature_matches || !kind_matches || !fixed_semantics_match {
+                return Err(format!(
+                    "prepared replica activity has invalid action identity \
+                     (kind={:?}, signature_matches={signature_matches}, \
+                     kind_matches={kind_matches}, \
+                     fixed_semantics_match={fixed_semantics_match})",
+                    pending.kind
+                ));
+            }
+            Ok(())
+        }
+        PilotActivityKind::PreparedLabel { command } => {
+            let pending = operation
+                .pending_action
+                .as_ref()
+                .ok_or_else(|| "prepared label activity has no pending action".to_string())?;
+            let expected_uid = operation
+                .previous_snapshot
+                .members
+                .iter()
+                .chain(operation.target_snapshot.members.iter())
+                .find(|member| member.id == command.target_id)
+                .map(|member| member.instance_id.as_str());
+            let expected_role = match pending.kind {
+                crate::crd::DurableActionKind::LabelTargetPrimary
+                | crate::crd::DurableActionKind::CompensateLabelOldPrimary => Some("primary"),
+                crate::crd::DurableActionKind::LabelOldSecondary
+                | crate::crd::DurableActionKind::CompensateLabelTargetSecondary => {
+                    Some("secondary")
+                }
+                _ => None,
+            };
+            if command.target_id != pending.target_id
+                || command.expected_uid != pending.target_instance_id
+                || expected_uid != Some(command.expected_uid.as_str())
+                || command.pod_name.is_empty()
+                || expected_role != Some(command.role.as_str())
+                || !command.has_valid_identity_signature()
+            {
+                return Err("prepared label activity has invalid UID-fenced identity".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn action_matches_fixed_operation_semantics(
+    operation: &DurableOperationStatus,
+    pending: &PendingActionStatus,
+    action: &kuberic_core::types::DurableReplicaAction,
+) -> bool {
+    use kuberic_core::types::{DurableReplicaAction, Role};
+    let target_epoch = &operation.target_snapshot.epoch;
+    let has_target_epoch = |epoch: &kuberic_core::types::Epoch| {
+        epoch.data_loss_number == target_epoch.data_loss_number
+            && epoch.configuration_number == target_epoch.configuration_number
+    };
+    match action {
+        DurableReplicaAction::ChangeRole { epoch, role } => {
+            let expected_role =
+                pending
+                    .desired_postcondition
+                    .role
+                    .as_ref()
+                    .map(|role| match role {
+                        crate::crd::StableReplicaRoleStatus::Primary => Role::Primary,
+                        crate::crd::StableReplicaRoleStatus::ActiveSecondary => {
+                            Role::ActiveSecondary
+                        }
+                    });
+            has_target_epoch(epoch) && expected_role.as_ref() == Some(role)
+        }
+        DurableReplicaAction::UpdateEpoch { epoch } => has_target_epoch(epoch),
+        _ => true,
+    }
+}
+
 pub fn decode_activity_step_result(
     result: &ExactBytes,
 ) -> Result<DurableSwitchoverStepResult, String> {
@@ -841,66 +943,13 @@ impl<'a> PilotPreparedActivityResolver<'a> {
             .state
             .apply_to(self.initial)
             .map_err(|_| PreparedActivityError::Validation)?;
-        match &recorded.kind {
-            PilotActivityKind::PassiveObservation => {
-                if recorded.state != logical.state {
-                    return Err(PreparedActivityError::Validation);
-                }
-            }
-            PilotActivityKind::PreparedReplica { command } => {
-                let pending = operation
-                    .pending_action
-                    .as_ref()
-                    .ok_or(PreparedActivityError::Validation)?;
-                let expected = ReplicaEffectCommand::from_pending(pending)
-                    .map_err(|_| PreparedActivityError::Validation)?;
-                if &expected != command {
-                    return Err(PreparedActivityError::Validation);
-                }
-                let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
-                    &command.action_payload,
-                )
-                .map_err(|_| PreparedActivityError::Validation)?;
-                if action.signature() != command.action_signature
-                    || !validate_pilot_replica_action_kind(pending.kind, &action)
-                    || !action_matches_pending_epoch_and_role(pending, &action)
-                {
-                    return Err(PreparedActivityError::Validation);
-                }
-            }
-            PilotActivityKind::PreparedLabel { command } => {
-                let pending = operation
-                    .pending_action
-                    .as_ref()
-                    .ok_or(PreparedActivityError::Validation)?;
-                let expected_uid = operation
-                    .previous_snapshot
-                    .members
-                    .iter()
-                    .chain(operation.target_snapshot.members.iter())
-                    .find(|member| member.id == command.target_id)
-                    .map(|member| member.instance_id.as_str());
-                let expected_role = match pending.kind {
-                    crate::crd::DurableActionKind::LabelTargetPrimary
-                    | crate::crd::DurableActionKind::CompensateLabelOldPrimary => Some("primary"),
-                    crate::crd::DurableActionKind::LabelOldSecondary
-                    | crate::crd::DurableActionKind::CompensateLabelTargetSecondary => {
-                        Some("secondary")
-                    }
-                    _ => None,
-                };
-                if command.target_id != pending.target_id
-                    || command.expected_uid != pending.target_instance_id
-                    || expected_uid != Some(command.expected_uid.as_str())
-                    || command.pod_name.is_empty()
-                    || expected_role != Some(command.role.as_str())
-                    || !command.has_valid_identity_signature()
-                {
-                    return Err(PreparedActivityError::Validation);
-                }
-            }
+        if matches!(recorded.kind, PilotActivityKind::PassiveObservation)
+            && recorded.state != logical.state
+        {
+            return Err(PreparedActivityError::Validation);
         }
-        Ok(())
+        validate_prepared_activity(&operation, &recorded.kind)
+            .map_err(|_| PreparedActivityError::Validation)
     }
 }
 
@@ -937,35 +986,6 @@ impl PreparedActivityResolver for PilotPreparedActivityResolver<'_> {
             });
         }
         Ok(spec)
-    }
-}
-
-fn action_matches_pending_epoch_and_role(
-    pending: &PendingActionStatus,
-    action: &kuberic_core::types::DurableReplicaAction,
-) -> bool {
-    use kuberic_core::types::{DurableReplicaAction, Role};
-    let expected_epoch = |epoch: &kuberic_core::types::Epoch| {
-        epoch.data_loss_number == pending.expected_epoch.data_loss_number
-            && epoch.configuration_number == pending.expected_epoch.configuration_number
-    };
-    match action {
-        DurableReplicaAction::ChangeRole { epoch, role } => {
-            let expected_role =
-                pending
-                    .desired_postcondition
-                    .role
-                    .as_ref()
-                    .map(|role| match role {
-                        crate::crd::StableReplicaRoleStatus::Primary => Role::Primary,
-                        crate::crd::StableReplicaRoleStatus::ActiveSecondary => {
-                            Role::ActiveSecondary
-                        }
-                    });
-            expected_epoch(epoch) && expected_role.as_ref() == Some(role)
-        }
-        DurableReplicaAction::UpdateEpoch { epoch } => expected_epoch(epoch),
-        _ => true,
     }
 }
 
@@ -2139,6 +2159,89 @@ mod durable_switchover_pilot_tests {
     }
 
     #[test]
+    fn restart_validation_rejects_consistently_rewritten_role_and_epoch_payloads() {
+        use kuberic_core::types::{DurableReplicaAction, Epoch, Role};
+
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut operation = initial_operation(&reference).unwrap();
+        operation.phase = DurableOperationPhase::PromoteTarget;
+        let target = operation
+            .target_snapshot
+            .members
+            .iter()
+            .find(|member| member.id == operation.target_primary_id)
+            .unwrap();
+        let target_epoch = Epoch {
+            data_loss_number: operation.target_snapshot.epoch.data_loss_number,
+            configuration_number: operation.target_snapshot.epoch.configuration_number,
+        };
+        let mut pending = PendingActionStatus {
+            action_id: "execution:3:PromoteTarget".to_string(),
+            sequence: 3,
+            kind: crate::crd::DurableActionKind::PromoteTarget,
+            target_id: target.id,
+            target_instance_id: target.instance_id.clone(),
+            expected_epoch: operation.previous_snapshot.epoch.clone(),
+            desired_postcondition: crate::crd::DurablePostconditionStatus {
+                kind: crate::crd::DurablePostconditionKind::Role,
+                role: Some(crate::crd::StableReplicaRoleStatus::Primary),
+            },
+            attempts: 0,
+            deadline_unix_seconds: 100,
+            last_error: None,
+            dispatch_authorized: true,
+            dispatch_agent_generation: Some("0123456789abcdef0123456789abcdef".to_string()),
+            dispatch_agent_control_version: Some(7),
+            dispatch_observed_runtime_epoch: Some(operation.previous_snapshot.epoch.clone()),
+            dispatch_action_payload:
+                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                    &DurableReplicaAction::ChangeRole {
+                        epoch: target_epoch.clone(),
+                        role: Role::Primary,
+                    },
+                )
+                .unwrap(),
+        };
+        operation.pending_action = Some(pending.clone());
+        validate_prepared_activity(
+            &operation,
+            &PilotActivityKind::PreparedReplica {
+                command: ReplicaEffectCommand::from_pending(&pending).unwrap(),
+            },
+        )
+        .unwrap();
+
+        for rewritten in [
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch {
+                    configuration_number: target_epoch.configuration_number + 1,
+                    ..target_epoch.clone()
+                },
+                role: Role::Primary,
+            },
+            DurableReplicaAction::ChangeRole {
+                epoch: target_epoch,
+                role: Role::ActiveSecondary,
+            },
+        ] {
+            pending.dispatch_action_payload =
+                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(&rewritten)
+                    .unwrap();
+            operation.pending_action = Some(pending.clone());
+            assert!(
+                validate_prepared_activity(
+                    &operation,
+                    &PilotActivityKind::PreparedReplica {
+                        command: ReplicaEffectCommand::from_pending(&pending).unwrap(),
+                    },
+                )
+                .is_err(),
+                "restart validation accepted rewritten fixed role/epoch semantics"
+            );
+        }
+    }
+
+    #[test]
     fn replay_rejects_recorded_command_semantic_drift_as_activity_mismatch() {
         let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let initial = initial_operation(&reference).unwrap();
@@ -2177,6 +2280,13 @@ mod durable_switchover_pilot_tests {
                 command: command.clone(),
             },
         })
+        .unwrap();
+        validate_prepared_activity(
+            &prepared_operation,
+            &PilotActivityKind::PreparedReplica {
+                command: command.clone(),
+            },
+        )
         .unwrap();
         let observations = OperationObservations::new();
         let addressed = BTreeMap::new();
@@ -2224,6 +2334,16 @@ mod durable_switchover_pilot_tests {
         variants.push(changed);
 
         for changed in variants {
+            assert!(
+                validate_prepared_activity(
+                    &prepared_operation,
+                    &PilotActivityKind::PreparedReplica {
+                        command: changed.clone(),
+                    },
+                )
+                .is_err(),
+                "restart validation must reject any changed prepared command"
+            );
             let drifted = activity_spec(&DurableSwitchoverActivityInput {
                 version: PILOT_VERSION,
                 state: compact(&prepared_operation),

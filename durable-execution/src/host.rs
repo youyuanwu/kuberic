@@ -1071,6 +1071,51 @@ mod tests {
     }
 
     #[test]
+    fn fused_unknown_without_apply_reloads_the_authoritative_predecessor() {
+        block_on(async {
+            let store = InMemoryCheckpointStore::new();
+            store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
+            let execution_id = ExecutionId::from_bytes([10; 16]);
+            let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"logical"), 1024);
+            let prepared = ActivitySpec::new(
+                ActivityName::new("prepared", 9).unwrap(),
+                ExactBytes::new(b"exact-command-and-fences"),
+                77,
+            );
+            let mut host = DurableHost::new(
+                store.clone(),
+                HostEpoch::from_bytes([11; 16]),
+                CheckpointLimits::new(16, 100_000).unwrap(),
+            );
+
+            assert!(matches!(
+                host.turn_and_expose_with(
+                    &OneActivity,
+                    execution.clone(),
+                    &PreparedResolver(Ok(prepared.clone())),
+                )
+                .await,
+                HostOutcome::ReloadRequired {
+                    boundary: PersistenceBoundary::ScheduleExposure,
+                    reason: ReloadReason::OutcomeUnknown,
+                }
+            ));
+            assert!(store.load(execution_id).await.unwrap().is_none());
+            let HostOutcome::DispatchPermitted { permit, .. } = host
+                .turn_and_expose_with(
+                    &OneActivity,
+                    execution,
+                    &PreparedResolver(Ok(prepared.clone())),
+                )
+                .await
+            else {
+                panic!("unapplied prepared exposure did not reload its empty predecessor");
+            };
+            assert_eq!(permit.activity().spec(), &prepared);
+        });
+    }
+
+    #[test]
     fn fused_prepared_specification_controls_result_and_checkpoint_admission() {
         block_on(async {
             let execution_id = ExecutionId::from_bytes([7; 16]);

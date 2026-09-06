@@ -3374,6 +3374,7 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
     let mut no_false_permits = true;
     let mut boundaries_are_fused = true;
     let mut applied_unknown_quarantines = false;
+    let mut unapplied_unknown_keeps_predecessor = false;
 
     for (index, fault) in faults.into_iter().enumerate() {
         let store = InMemoryCheckpointStore::new();
@@ -3381,7 +3382,7 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
         let workflow = LinearWorkflow::one("fused-fault", 1, b"command");
         let execution_id = execution(181 + index as u8);
         let execution = execution_spec(execution_id, bytes(b"workflow"));
-        let mut durable_host = host(store, 181 + index as u8);
+        let mut durable_host = host(store.clone(), 181 + index as u8);
         let outcome = durable_host
             .turn_and_expose_with(&workflow, execution.clone(), &PreparedPrefixResolver)
             .await;
@@ -3403,6 +3404,8 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
                     .await,
                 HostOutcome::Quarantined { .. }
             );
+        } else if fault == InMemoryFault::OutcomeUnknownWithoutApply {
+            unapplied_unknown_keeps_predecessor = store.load(execution_id).await.unwrap().is_none();
         }
     }
 
@@ -3421,6 +3424,10 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
             (
                 "unknown-after-apply reloads as conservative quarantine",
                 applied_unknown_quarantines,
+            ),
+            (
+                "unknown-without-apply retains the authoritative predecessor",
+                unapplied_unknown_keeps_predecessor,
             ),
         ],
     )

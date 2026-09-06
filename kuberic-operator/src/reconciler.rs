@@ -47,6 +47,7 @@ use crate::durable::pilot::{
     PilotActivityKind, PilotAdapterDecision, PilotPermitGuard, PilotPreparedActivityResolver,
     decode_pilot_activity_input, encode_step_result, evaluate_adapter_step, execution_spec,
     initial_operation, new_pilot_reference, validate_loaded_terminal, validate_pilot_operation,
+    validate_prepared_activity,
 };
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
@@ -434,10 +435,11 @@ fn pilot_result_after_dispatch_error(
 /// Resolve an exposed activity only from authoritative replica observations.
 pub fn resolve_pilot_quarantine(
     operation: &DurableOperationStatus,
+    prepared: &PilotActivityKind,
     decision: PilotAdapterDecision,
     observations: &OperationObservations,
 ) -> Result<PilotEffectBridgeOutcome, String> {
-    crate::durable::effects::resolve_pilot_quarantine(operation, decision, observations)
+    crate::durable::effects::resolve_pilot_quarantine(operation, prepared, decision, observations)
 }
 
 #[cfg(all(test, feature = "durable-switchover-pilot"))]
@@ -2826,11 +2828,12 @@ async fn reconcile_durable_switchover_pilot(
                 )));
             }
             HostOutcome::Quarantined { activity, .. } => {
-                let operation =
-                    crate::durable::pilot::decode_activity_input_state(activity.input())?
-                        .apply_to(&initial)?;
+                let prepared = decode_pilot_activity_input(activity.input())?;
+                let operation = prepared.state.apply_to(&initial)?;
+                validate_prepared_activity(&operation, &prepared.kind)?;
                 let decision = evaluate_adapter_step(&operation, &observations, now)?;
-                match resolve_pilot_quarantine(&operation, decision, &observations)? {
+                match resolve_pilot_quarantine(&operation, &prepared.kind, decision, &observations)?
+                {
                     PilotEffectBridgeOutcome::Observe(result) => {
                         let result = enrich_pilot_terminal_result(*result, &observations);
                         outcome = host
@@ -4568,6 +4571,8 @@ fn build_service(
 #[cfg(test)]
 mod dispatch_planning_tests {
     use super::*;
+    #[cfg(feature = "durable-switchover-pilot")]
+    use crate::durable::effects::{LabelEffectCommand, ReplicaEffectCommand};
     use kuberic_core::types::{
         AccessStatus, AgentControlVersion, AgentGeneration, CorrelatedActionObservation,
         DurableActionErrorClass, DurableActionObservation, ReplicaAgentStatus,
@@ -4946,7 +4951,18 @@ mod dispatch_planning_tests {
             crate::durable::pilot::evaluate_adapter_step(&operation, &same_generation, 100)
                 .unwrap();
         assert!(matches!(
-            resolve_pilot_quarantine(&operation, decision, &same_generation).unwrap(),
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PreparedReplica {
+                    command: ReplicaEffectCommand::from_pending(
+                        operation.pending_action.as_ref().unwrap(),
+                    )
+                    .unwrap(),
+                },
+                decision,
+                &same_generation,
+            )
+            .unwrap(),
             PilotEffectBridgeOutcome::AwaitEvidence
         ));
 
@@ -4956,7 +4972,11 @@ mod dispatch_planning_tests {
         let restarted = pilot_observations(restarted);
         let decision =
             crate::durable::pilot::evaluate_adapter_step(&operation, &restarted, 100).unwrap();
-        match resolve_pilot_quarantine(&operation, decision, &restarted).unwrap() {
+        let prepared = PilotActivityKind::PreparedReplica {
+            command: ReplicaEffectCommand::from_pending(operation.pending_action.as_ref().unwrap())
+                .unwrap(),
+        };
+        match resolve_pilot_quarantine(&operation, &prepared, decision, &restarted).unwrap() {
             PilotEffectBridgeOutcome::Observe(result) => match *result {
                 DurableSwitchoverStepResult::ProvenNoAdmission {
                     operation: next,
@@ -4984,7 +5004,7 @@ mod dispatch_planning_tests {
 
     #[cfg(feature = "durable-switchover-pilot")]
     #[test]
-    fn quarantine_recovers_effect_free_pre_dispatch_fence_step() {
+    fn quarantine_never_reconstructs_an_effect_free_pre_dispatch_fence_step() {
         let operation = pilot_operation();
         let Decision::Persist(operation) =
             decide(&operation, &OperationObservations::new(), 100).unwrap()
@@ -5004,21 +5024,16 @@ mod dispatch_planning_tests {
         ));
         let decision =
             crate::durable::pilot::evaluate_adapter_step(&operation, &observations, 100).unwrap();
-        match resolve_pilot_quarantine(&operation, decision, &observations).unwrap() {
-            PilotEffectBridgeOutcome::Observe(result) => match *result {
-                DurableSwitchoverStepResult::Advance { operation } => {
-                    assert!(
-                        operation
-                            .pending_action
-                            .unwrap()
-                            .dispatch_agent_generation
-                            .is_some()
-                    );
-                }
-                _ => panic!("effect-free recovery must persist a fence"),
-            },
-            _ => panic!("effect-free exposed activity must be recoverable"),
-        }
+        assert!(matches!(
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PassiveObservation,
+                decision,
+                &observations,
+            )
+            .unwrap(),
+            PilotEffectBridgeOutcome::AwaitEvidence
+        ));
     }
 
     #[cfg(feature = "durable-switchover-pilot")]
@@ -5042,7 +5057,13 @@ mod dispatch_planning_tests {
         )
         .unwrap();
         assert!(matches!(
-            resolve_pilot_quarantine(&operation, decision, &OperationObservations::new()).unwrap(),
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PassiveObservation,
+                decision,
+                &OperationObservations::new(),
+            )
+            .unwrap(),
             PilotEffectBridgeOutcome::Observe(result)
                 if matches!(*result, DurableSwitchoverStepResult::Stopped { .. })
         ));
@@ -5070,7 +5091,25 @@ mod dispatch_planning_tests {
         )
         .unwrap();
         assert!(matches!(
-            resolve_pilot_quarantine(&operation, decision, &OperationObservations::new()).unwrap(),
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PreparedLabel {
+                    command: LabelEffectCommand::new(
+                        operation.pending_action.as_ref().unwrap().target_id,
+                        "target".to_string(),
+                        operation
+                            .pending_action
+                            .as_ref()
+                            .unwrap()
+                            .target_instance_id
+                            .clone(),
+                        "primary".to_string(),
+                    ),
+                },
+                decision,
+                &OperationObservations::new(),
+            )
+            .unwrap(),
             PilotEffectBridgeOutcome::AwaitEvidence
         ));
         let unknown_patch =
@@ -5080,8 +5119,25 @@ mod dispatch_planning_tests {
                 role: "primary".to_string(),
             }));
         assert!(matches!(
-            resolve_pilot_quarantine(&operation, unknown_patch, &OperationObservations::new())
-                .unwrap(),
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PreparedLabel {
+                    command: LabelEffectCommand::new(
+                        operation.pending_action.as_ref().unwrap().target_id,
+                        "target".to_string(),
+                        operation
+                            .pending_action
+                            .as_ref()
+                            .unwrap()
+                            .target_instance_id
+                            .clone(),
+                        "primary".to_string(),
+                    ),
+                },
+                unknown_patch,
+                &OperationObservations::new(),
+            )
+            .unwrap(),
             PilotEffectBridgeOutcome::AwaitEvidence
         ));
     }
@@ -5097,7 +5153,18 @@ mod dispatch_planning_tests {
         let decision =
             crate::durable::pilot::evaluate_adapter_step(&operation, &postcondition, 100).unwrap();
         assert!(matches!(
-            resolve_pilot_quarantine(&operation, decision, &postcondition).unwrap(),
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PreparedReplica {
+                    command: ReplicaEffectCommand::from_pending(
+                        operation.pending_action.as_ref().unwrap(),
+                    )
+                    .unwrap(),
+                },
+                decision,
+                &postcondition,
+            )
+            .unwrap(),
             PilotEffectBridgeOutcome::Observe(_)
         ));
 
@@ -5121,7 +5188,18 @@ mod dispatch_planning_tests {
         let decision =
             crate::durable::pilot::evaluate_adapter_step(&operation, &in_progress, 111).unwrap();
         assert!(matches!(
-            resolve_pilot_quarantine(&operation, decision, &in_progress).unwrap(),
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PreparedReplica {
+                    command: ReplicaEffectCommand::from_pending(
+                        operation.pending_action.as_ref().unwrap(),
+                    )
+                    .unwrap(),
+                },
+                decision,
+                &in_progress,
+            )
+            .unwrap(),
             PilotEffectBridgeOutcome::AwaitEvidence
         ));
 
@@ -5131,7 +5209,18 @@ mod dispatch_planning_tests {
         let decision =
             crate::durable::pilot::evaluate_adapter_step(&operation, &mixed, 100).unwrap();
         assert!(matches!(
-            resolve_pilot_quarantine(&operation, decision, &mixed).unwrap(),
+            resolve_pilot_quarantine(
+                &operation,
+                &PilotActivityKind::PreparedReplica {
+                    command: ReplicaEffectCommand::from_pending(
+                        operation.pending_action.as_ref().unwrap(),
+                    )
+                    .unwrap(),
+                },
+                decision,
+                &mixed,
+            )
+            .unwrap(),
             PilotEffectBridgeOutcome::AwaitEvidence
         ));
     }

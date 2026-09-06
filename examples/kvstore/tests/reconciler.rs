@@ -4502,6 +4502,11 @@ async fn test_durable_execution_switchover_pilot_rejects_stale_target_incarnatio
             })
     );
     assert!(api.operations().is_empty());
+    assert_eq!(
+        *api.uid_label_patch_attempts.lock().unwrap(),
+        0,
+        "a replacement UID must not receive a stale prepared label command"
+    );
 }
 
 #[test_log::test(tokio::test)]
@@ -4571,6 +4576,41 @@ async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_req
                 .iter()
                 .all(|operation| *operation == ControlOperation::GetStatus)
         );
+        use kuberic_durable_execution::CheckpointStore;
+        let reference = api.last_status().unwrap().durable_switchover_pilot.unwrap();
+        let execution = kuberic_operator::durable::pilot::execution_spec(&reference).unwrap();
+        let loaded = store.load(execution.execution_id()).await.unwrap();
+        match fault {
+            kuberic_durable_execution::InMemoryFault::OutcomeUnknownWithoutApply => {
+                assert!(
+                    loaded.is_none(),
+                    "unknown-without-apply must retain the empty authoritative predecessor"
+                );
+            }
+            kuberic_durable_execution::InMemoryFault::OutcomeUnknownAfterApply => {
+                let checkpoint =
+                    loaded.expect("unknown-after-apply must retain the accepted prepared exposure");
+                let payload = checkpoint
+                    .checkpoint()
+                    .decode_and_validate(
+                        &execution,
+                        kuberic_operator::durable::pilot::checkpoint_limits(),
+                    )
+                    .unwrap();
+                let exposed = payload.active_activities().unwrap().last().unwrap();
+                assert!(matches!(
+                    exposed.state(),
+                    kuberic_durable_execution::ActivityState::DispatchExposed { .. }
+                ));
+                assert!(matches!(
+                    kuberic_operator::durable::pilot::decode_pilot_activity_input(exposed.input())
+                        .unwrap()
+                        .kind,
+                    kuberic_operator::durable::pilot::PilotActivityKind::PreparedReplica { .. }
+                ));
+            }
+            _ => unreachable!("test covers only unknown checkpoint outcomes"),
+        }
     }
 }
 

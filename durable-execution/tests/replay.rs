@@ -1037,6 +1037,60 @@ fn typed_prepared_replay_rejects_each_complete_specification_mismatch() {
     ));
 }
 
+#[test]
+fn typed_completed_prepared_activity_replays_its_exact_recorded_result_and_specification() {
+    let resolver = typed_prepared_resolver();
+    let execution_id = execution(44);
+    let workflow_input = bytes(b"workflow");
+    let logical = encode_activity_input::<TypedEffectV1>(&"hello".to_owned()).unwrap();
+    let requested = ActivitySpec::new(
+        ActivityName::new(TypedEffectV1::NAME, TypedEffectV1::VERSION).unwrap(),
+        logical,
+        TypedEffectV1::MAX_RESULT_BYTES,
+    );
+    let recorded = resolver.resolve(&requested, None).unwrap();
+    let recorded_result = TypedOutcome::Applied {
+        value: "recorded-result".to_owned(),
+    };
+    let terminal_result = serde_json::to_vec(&recorded_result).unwrap();
+    let checkpoint = envelope(
+        execution_id,
+        workflow_input.clone(),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            recorded,
+            encode_activity_result::<TypedEffectV1>(&recorded_result).unwrap(),
+        )],
+    );
+
+    assert!(matches!(
+        evaluate_prepared(
+            &TypedWorkflowV1,
+            &execution_spec(execution_id, workflow_input.clone()),
+            Some(&checkpoint),
+            limits(),
+            &resolver,
+        ),
+        Evaluation::Complete {
+            outcome: TerminalOutcome::Succeeded(ref result),
+            ..
+        } if result.as_slice() == terminal_result
+    ));
+    assert!(matches!(
+        evaluate_prepared(
+            &TypedWorkflowV1,
+            &execution_spec(execution_id, workflow_input),
+            Some(&checkpoint),
+            limits(),
+            &TypedPreparedResolver {
+                command: b"demote",
+                ..resolver
+            },
+        ),
+        Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+    ));
+}
+
 struct RejectPrepared(PreparedActivityError);
 
 impl PreparedActivityResolver for RejectPrepared {
