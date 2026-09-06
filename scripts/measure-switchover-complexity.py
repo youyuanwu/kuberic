@@ -10,7 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DECISIONS = re.compile(r"\b(?:if|match|for|while)\b|&&|\|\|")
 BOUNDARIES = [
     ("explicit_switchover", "kuberic-operator/src/durable/switchover.rs"),
+    ("pilot_module", "kuberic-operator/src/durable/pilot.rs"),
     ("pilot_workflow", "kuberic-operator/src/durable/pilot.rs"),
+    ("pilot_store", "kuberic-operator/src/durable/pilot_store.rs"),
     ("pilot_effect_bridge", "kuberic-operator/src/reconciler.rs"),
     ("pilot_reconcile", "kuberic-operator/src/reconciler.rs"),
 ]

@@ -11,6 +11,9 @@ use tracing::info;
 
 use super::pilot::PilotCheckpointStore;
 
+// COMPLEXITY-BOUNDARY: pilot-store:start
+const MAX_RECENT_CHECKPOINT_EVENTS: usize = 64;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PilotCheckpointMeasurementsSnapshot {
     pub load_attempts: u64,
@@ -55,10 +58,14 @@ impl PilotCheckpointEventCollector {
     }
 
     fn push(&self, event: PilotCheckpointEvent) {
-        self.events
+        let mut events = self
+            .events
             .lock()
-            .expect("pilot checkpoint event collector lock poisoned")
-            .push(event);
+            .expect("pilot checkpoint event collector lock poisoned");
+        if events.len() == MAX_RECENT_CHECKPOINT_EVENTS {
+            events.remove(0);
+        }
+        events.push(event);
     }
 
     fn correlate_latest(&self, boundary: PersistenceBoundary) {
@@ -303,6 +310,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
     }
 }
 
+// COMPLEXITY-BOUNDARY: pilot-store:end
 #[cfg(test)]
 mod durable_switchover_pilot_tests {
     use super::*;
@@ -421,5 +429,30 @@ mod durable_switchover_pilot_tests {
         assert_eq!(events[1].boundary, Some(PersistenceBoundary::Exposure));
         assert_eq!(events[2].boundary, Some(PersistenceBoundary::Schedule));
         assert_eq!(events[3].boundary, Some(PersistenceBoundary::Observation));
+    }
+
+    #[tokio::test]
+    async fn production_event_history_is_bounded() {
+        let execution_id = ExecutionId::from_bytes([10; 16]);
+        let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let store = MeasuredPilotCheckpointStore::new(
+            execution_id,
+            PilotCheckpointStore::InMemory(backend.clone()),
+        );
+        for sequence in 1..=70_u64 {
+            backend.fail_next_compare_and_swap(InMemoryFault::ConflictWithoutApply);
+            assert_eq!(
+                store
+                    .compare_and_swap(execution_id, None, checkpoint(b"bounded"))
+                    .await
+                    .unwrap(),
+                CasOutcome::Conflict
+            );
+            assert_eq!(store.measurements().write_attempts, sequence);
+        }
+        let events = store.collector().events();
+        assert_eq!(events.len(), MAX_RECENT_CHECKPOINT_EVENTS);
+        assert_eq!(events.first().unwrap().sequence, 7);
+        assert_eq!(events.last().unwrap().sequence, 70);
     }
 }

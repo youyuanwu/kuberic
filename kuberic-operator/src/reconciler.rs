@@ -617,6 +617,51 @@ pub fn resolve_pilot_quarantine(
         }
         PilotAdapterDecision::Observe(_) => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
         PilotAdapterDecision::AwaitEvidence => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
+        PilotAdapterDecision::External(Decision::Execute {
+            target_id,
+            action_id,
+            action,
+        }) if operation
+            .pending_action
+            .as_ref()
+            .is_some_and(|pending| pending.dispatch_agent_generation.is_none()) =>
+        {
+            let pending = operation.pending_action.as_ref().ok_or_else(|| {
+                "quarantined pilot execution has no pending correlated action".to_string()
+            })?;
+            if pending.action_id != action_id {
+                return Err(
+                    "quarantined pilot action identity changed before fence persistence"
+                        .to_string(),
+                );
+            }
+            let observed = observations
+                .get(&target_id)
+                .ok_or_else(|| format!("quarantined pilot replica {target_id} is unavailable"))?;
+            match plan_dispatch_evidence(
+                pending,
+                &observed.status,
+                &ReplicaInstanceId::new(pending.target_instance_id.clone()),
+                &action,
+                true,
+            ) {
+                DispatchEvidencePlan::Persist(planned) => {
+                    let mut next = operation.clone();
+                    next.pending_action = Some(*planned);
+                    Ok(PilotEffectBridgeOutcome::Observe(Box::new(
+                        DurableSwitchoverStepResult::Advance { operation: next },
+                    )))
+                }
+                DispatchEvidencePlan::Ready => Err(
+                    "quarantined effect-free activity unexpectedly already had dispatch evidence"
+                        .to_string(),
+                ),
+                DispatchEvidencePlan::WaitForExactIncarnation
+                | DispatchEvidencePlan::WaitForSupportedProtocol => {
+                    Ok(PilotEffectBridgeOutcome::AwaitEvidence)
+                }
+            }
+        }
         PilotAdapterDecision::External(Decision::Execute { target_id, .. })
             if generation_change_proves_no_admission(operation, target_id, observations) =>
         {
@@ -630,6 +675,18 @@ pub fn resolve_pilot_quarantine(
             Ok(PilotEffectBridgeOutcome::Observe(Box::new(
                 DurableSwitchoverStepResult::ProvenNoAdmission {
                     operation: next,
+                    action_id: pending.action_id.clone(),
+                    redelivery: 1,
+                },
+            )))
+        }
+        PilotAdapterDecision::External(Decision::PatchPodRole { .. }) => {
+            let pending = operation.pending_action.as_ref().ok_or_else(|| {
+                "quarantined pilot label activity has no pending action".to_string()
+            })?;
+            Ok(PilotEffectBridgeOutcome::Observe(Box::new(
+                DurableSwitchoverStepResult::ProvenNoAdmission {
+                    operation: operation.clone(),
                     action_id: pending.action_id.clone(),
                     redelivery: 1,
                 },
@@ -3220,16 +3277,7 @@ async fn pilot_host_outcome_action(
         }
     };
     if let Some((reason, message)) = diagnostic {
-        let mut status = set.status.clone().unwrap_or_default();
-        set_pilot_condition(&mut status, reason, &message, now);
-        let _ = api
-            .patch_set_status(
-                &set.namespace().unwrap_or_default(),
-                &set.name_any(),
-                &status,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await;
+        record_pilot_wait_condition(set, api, reason, &message, now).await;
     }
     Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
 }
@@ -3329,18 +3377,13 @@ async fn publish_pilot_terminal(
         .ok_or_else(|| "terminal durable switchover pilot runtime is not configured".to_string())?;
     match terminal {
         DurableSwitchoverPilotTerminal::Stopped { message, .. } => {
-            let mut status = set.status.clone().unwrap_or_default();
-            set_pilot_condition(&mut status, "Quarantined", &message, now);
-            let _ = api
-                .patch_set_status(
-                    &namespace,
-                    &name,
-                    &status,
-                    set.metadata.resource_version.as_deref(),
-                )
-                .await;
+            record_pilot_wait_condition(set, api, "Quarantined", &message, now).await;
         }
-        DurableSwitchoverPilotTerminal::Complete { snapshot, .. } => {
+        DurableSwitchoverPilotTerminal::Complete {
+            operation,
+            snapshot,
+            compensated,
+        } => {
             let primary_name = set
                 .status
                 .as_ref()
@@ -3398,12 +3441,21 @@ async fn publish_pilot_terminal(
                     completed_members: Vec::new(),
                     pending_action: None,
                 });
-            set_pilot_condition(
-                &mut status,
-                "Completed",
-                "terminal checkpoint accepted before topology publication",
-                now,
-            );
+            let (reason, message) = if compensated {
+                (
+                    "CompensatedOrSafeFailure",
+                    operation
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("target promotion failed and the old primary was restored"),
+                )
+            } else {
+                (
+                    "Completed",
+                    "terminal checkpoint accepted before topology publication",
+                )
+            };
+            set_pilot_condition(&mut status, reason, message, now);
             persist_committed_status(
                 api,
                 state,
@@ -4402,7 +4454,7 @@ fn set_pilot_condition(status: &mut KubericSetStatus, reason: &str, message: &st
         status,
         StatusCondition {
             type_: "DurableSwitchoverPilot".to_string(),
-            status: if reason == "Completed" {
+            status: if matches!(reason, "Completed" | "CompensatedOrSafeFailure") {
                 "False".to_string()
             } else {
                 "True".to_string()
@@ -5234,6 +5286,45 @@ mod dispatch_planning_tests {
                 _ => panic!("expected proven-no-admission result"),
             },
             _ => panic!("new agent generation and exact precondition must prove no admission"),
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn quarantine_recovers_effect_free_pre_dispatch_fence_step() {
+        let operation = pilot_operation();
+        let Decision::Persist(operation) =
+            decide(&operation, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected revoke intent");
+        };
+        assert!(
+            operation
+                .pending_action
+                .as_ref()
+                .unwrap()
+                .dispatch_agent_generation
+                .is_none()
+        );
+        let observations = pilot_observations(observed(
+            kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+        ));
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&operation, &observations, 100).unwrap();
+        match resolve_pilot_quarantine(&operation, decision, &observations).unwrap() {
+            PilotEffectBridgeOutcome::Observe(result) => match *result {
+                DurableSwitchoverStepResult::Advance { operation } => {
+                    assert!(
+                        operation
+                            .pending_action
+                            .unwrap()
+                            .dispatch_agent_generation
+                            .is_some()
+                    );
+                }
+                _ => panic!("effect-free recovery must persist a fence"),
+            },
+            _ => panic!("effect-free exposed activity must be recoverable"),
         }
     }
 

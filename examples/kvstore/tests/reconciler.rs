@@ -3916,6 +3916,11 @@ async fn test_durable_execution_switchover_pilot_compensates_failed_promotion() 
             .unwrap()
             .id
     );
+    assert!(completed.conditions.iter().any(|condition| {
+        condition.type_ == "DurableSwitchoverPilot"
+            && condition.reason == "CompensatedOrSafeFailure"
+            && condition.status == "False"
+    }));
     assert_eq!(
         api.operations()
             .iter()

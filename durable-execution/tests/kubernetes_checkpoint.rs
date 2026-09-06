@@ -421,6 +421,7 @@ async fn replacement_rejects_lifecycle_owner_changes_without_mutation() {
                 KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
             ));
         }
+
         let store =
             KubernetesCheckpointStore::with_options(harness.client(), "checkpoint-tests", options)
                 .expect("store");
@@ -438,6 +439,54 @@ async fn replacement_rejects_lifecycle_owner_changes_without_mutation() {
         let requests = harness.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, Method::GET);
+        harness.assert_consumed();
+    }
+}
+
+#[tokio::test]
+async fn load_rejects_missing_mismatched_or_additional_owners() {
+    let execution_id = execution(0x23);
+    let configured_owner = owner_reference();
+    let mut different_owner = owner_reference();
+    different_owner.uid = "different-owner-uid".to_string();
+
+    let missing = config_map_response_with_owner(
+        execution_id,
+        Some("owner-revision"),
+        Some(&checkpoint(b"terminal")),
+        None,
+    );
+    let mismatched = config_map_response_with_owner(
+        execution_id,
+        Some("owner-revision"),
+        Some(&checkpoint(b"terminal")),
+        Some(&different_owner),
+    );
+    let mut additional = config_map_response_with_owner(
+        execution_id,
+        Some("owner-revision"),
+        Some(&checkpoint(b"terminal")),
+        Some(&configured_owner),
+    );
+    additional["metadata"]["ownerReferences"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::to_value(different_owner).unwrap());
+
+    for response in [missing, mismatched, additional] {
+        let harness = Harness::new([Step::Response(StatusCode::OK, response)]);
+        let store = KubernetesCheckpointStore::with_options(
+            harness.client(),
+            "checkpoint-tests",
+            KubernetesCheckpointStoreOptions::default().with_owner(KubernetesCheckpointOwner::new(
+                configured_owner.clone(),
+                KubernetesCheckpointOwnerScope::Namespaced("checkpoint-tests".to_string()),
+            )),
+        )
+        .unwrap();
+        let error = store.load(execution_id).await.unwrap_err();
+        assert_eq!(error.kind(), StoreErrorKind::MalformedResponse);
+        assert!(error.description().contains("owner relationship"));
         harness.assert_consumed();
     }
 }
