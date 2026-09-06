@@ -261,6 +261,33 @@ postconditions rather than blind RPC repetition. Target-promotion failure can
 durably restore the old primary; impossible or stale observations poison the
 operation without publishing a new stable snapshot.
 
+### Durable-execution pilot
+
+The explicit checkpoint above remains the default. A default-off operator
+Cargo feature plus `spec.switchoverExecutionMode: durablePilot` selects a
+three-member comparison pilot. Acceptance first persists a random execution
+ID and exact initial operation in `status.durableSwitchoverPilot`; no
+checkpoint or effect exists before that status write.
+
+The pilot uses the format-3 linear replay kernel, but every activity delegates
+its decision to the same switchover module. A schedule and exposure checkpoint
+precede a private dispatch permit. Dispatch-fence evidence is itself observed
+as one activity before a later permit can call the existing correlated
+`ReplicaAgent` API. Routing-label activities use the exact Pod UID
+precondition. Exposed work is observation-only: matching terminal ledger or
+postcondition evidence advances it; in-progress, mixed, or unavailable
+evidence remains quarantined.
+
+The terminal checkpoint is accepted before topology/status publication.
+Terminal reload is status-only and does not poll replicas or dispatch effects.
+All incomplete pilot outcomes requeue in one second through the controller;
+there is no additional worker, queue, lease, watcher, or retry scheduler.
+
+Checkpoints use same-namespace ConfigMaps with a non-controlling owner
+reference to the exact `KubericSet`. The operator has ConfigMap `get`,
+`create`, and `update` only. Active and terminal checkpoints live with the
+owner and rely on Kubernetes garbage collection after owner deletion.
+
 ---
 
 ## Scale-Up Reconciliation

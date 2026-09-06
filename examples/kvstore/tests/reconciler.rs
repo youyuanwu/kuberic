@@ -3547,6 +3547,7 @@ async fn test_reconciler_switchover() {
     };
 
     // Healthy → Switchover: set target_primary to a different pod
+    let switchover_status_writes_before = api.statuses.lock().unwrap().len();
     let set = make_set(
         "myapp",
         3,
@@ -3597,6 +3598,14 @@ async fn test_reconciler_switchover() {
     assert_ne!(
         status.current_primary.as_deref(),
         Some(original_primary.as_str())
+    );
+    println!(
+        "KUBERIC_SWITCHOVER_MEASUREMENT engine=explicit accepted_status_writes={}",
+        api.statuses
+            .lock()
+            .unwrap()
+            .len()
+            .saturating_sub(switchover_status_writes_before)
     );
 
     // Write on new primary
@@ -3667,6 +3676,7 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     .await
     .unwrap();
     let accepted = api.last_status().unwrap();
+    let pilot_status_writes_after_acceptance = api.statuses.lock().unwrap().len();
     assert_eq!(accepted.phase, Phase::Switchover);
     assert!(accepted.operation.is_none());
     assert!(accepted.durable_switchover_pilot.is_some());
@@ -3677,6 +3687,14 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     assert!(completed.operation.is_none());
     assert!(completed.durable_switchover_pilot.is_some());
     assert_stable_snapshot(&api, &completed, 3);
+    println!(
+        "KUBERIC_SWITCHOVER_MEASUREMENT engine=durable_pilot accepted_status_writes_after_acceptance={}",
+        api.statuses
+            .lock()
+            .unwrap()
+            .len()
+            .saturating_sub(pilot_status_writes_after_acceptance)
+    );
     let operations = api.operations();
     assert_eq!(
         operations

@@ -2978,6 +2978,7 @@ async fn apply_failover_decision(
     }
 }
 
+// COMPLEXITY-BOUNDARY: pilot-reconcile:start
 #[cfg(feature = "durable-switchover-pilot")]
 async fn reconcile_durable_switchover_pilot(
     set: &KubericSet,
@@ -3516,6 +3517,7 @@ fn pilot_decision_ready(
     }
 }
 
+// COMPLEXITY-BOUNDARY: pilot-reconcile:end
 async fn reconcile_durable_operation(
     set: &KubericSet,
     api: &dyn ClusterApi,

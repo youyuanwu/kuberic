@@ -12,6 +12,7 @@ BOUNDARIES = [
     ("explicit_switchover", "kuberic-operator/src/durable/switchover.rs"),
     ("pilot_workflow", "kuberic-operator/src/durable/pilot.rs"),
     ("pilot_effect_bridge", "kuberic-operator/src/reconciler.rs"),
+    ("pilot_reconcile", "kuberic-operator/src/reconciler.rs"),
 ]
 
 
