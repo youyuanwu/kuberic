@@ -7,51 +7,67 @@ gated pilots. It is not an end-user runtime.
 
 ## Selected authoring surface
 
-The feasibility evaluation selected the ordinary async surface. A workflow is
-an `#[async_trait]` implementation of `Workflow::run`; its only
-framework-specific workflow-body operation is
-`WorkflowContext::activity(spec).await`. An immutable `ActivitySpec` combines
-the versioned name, exact input, and declared maximum result bytes. Workflow
-and store futures are `Send` so a host turn can run directly inside an
-asynchronous controller without a second executor.
+The feasibility evaluation selected an ordinary async surface. A typed
+activity declares its input, output, immutable versioned identity, and encoded
+bounds once through `DurableActivity`. Workflow bodies use
+`WorkflowContext::call::<A>(input).await`; activity names, exact byte wrappers,
+JSON calls, and result bounds stay out of the workflow body. Workflow and
+store futures are `Send` so a host turn can run directly inside an asynchronous
+controller without a second executor.
 
 ```rust
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityName, ActivitySpec, ExactBytes, TerminalOutcome, Workflow,
-    WorkflowContext,
+    DurableActivity, ExactBytes, TerminalOutcome, Workflow, WorkflowContext,
 };
+use serde::{Deserialize, Serialize};
 
-struct Greeting;
+#[derive(Deserialize, Serialize)]
+struct GreetingInput {
+    name: String,
+}
 
-#[async_trait]
-impl Workflow for Greeting {
-    async fn run(
-        &self,
-        context: &mut WorkflowContext<'_>,
-        input: ExactBytes,
-    ) -> TerminalOutcome {
-        TerminalOutcome::succeeded(
-            context.activity(ActivitySpec::new(
-                ActivityName::new("greeting", 1).unwrap(),
-                input,
-                4096,
-            ))
-            .await,
-        )
-    }
+#[derive(Deserialize, Serialize)]
+enum GreetingResult {
+    Greeted(String),
+    Rejected { code: u16 },
+}
+
+struct Greet;
+
+impl DurableActivity for Greet {
+    type Input = GreetingInput;
+    type Output = GreetingResult;
+    const NAME: &'static str = "greeting";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 1024;
+    const MAX_RESULT_BYTES: u64 = 4096;
 }
 ```
 
-The measured workflow body uses one framework operation against an FR-012
-maximum of two. The public host reports ten turn/observation outcome variants,
-including portable store failure. No explicit poll/replay authoring surface is
-also exported.
+Inside `Workflow::run`, an ordinary call is:
+
+```rust
+let result = context
+    .call::<Greet>(GreetingInput {
+        name: "Ada".to_owned(),
+    })
+    .await;
+```
+
+`ActivityCallError` reports deterministic identity, encoding, decoding, and
+bound failures in a portable bounded form. Domain rejection or failure belongs
+in the declared output enum, as shown above, and is stored through the same
+completed-result lifecycle as success. The low-level
+`WorkflowContext::activity(ActivitySpec)` API remains available for justified
+advanced and compatibility uses. No explicit poll/replay authoring surface is
+exported.
 
 ## Replay and checkpoint semantics
 
-`ExactBytes` are compared without normalization and encoded as validated base64
-JSON strings. Workflow history is a contiguous, zero-based sequence with a
+Typed calls first canonicalize JSON object-key order, then compare the encoded
+input exactly on every replay. Low-level `ExactBytes` are compared without
+normalization and encoded as validated base64 JSON strings. Workflow history is a contiguous, zero-based sequence with a
 completed prefix and at most one final pending activity. A requested activity
 must match the recorded sequence, immutable positive-versioned name, exact
 input, and declared result bound; a mismatch is nondeterminism rather than a

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, ExactBytes, ExecutionId,
     LogicalActivityId, Nondeterminism,
+    typed::{ActivityCallError, DurableActivity, activity_spec, decode_activity_result},
 };
 
 /// Exact terminal result of one workflow execution.
@@ -64,6 +65,16 @@ impl<'history> WorkflowContext<'history> {
 
     pub async fn activity(&mut self, spec: ActivitySpec) -> ExactBytes {
         poll_fn(|_| self.poll_activity(&spec)).await
+    }
+
+    /// Invoke a versioned activity with typed, bounded input and output.
+    pub async fn call<A: DurableActivity>(
+        &mut self,
+        input: A::Input,
+    ) -> Result<A::Output, ActivityCallError> {
+        let spec = activity_spec::<A>(&input)?;
+        let result = self.activity(spec).await;
+        decode_activity_result::<A>(&result)
     }
 
     pub(crate) const fn cursor(&self) -> usize {

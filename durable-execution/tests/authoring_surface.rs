@@ -3,30 +3,48 @@ mod support;
 use async_trait::async_trait;
 use futures::executor::block_on;
 use kuberic_durable_execution::{
-    ActivityName, ActivitySpec, CheckpointLimits, DurableHost, ExactBytes, ExecutionId,
-    ExecutionSpec, HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore,
-    TerminalOutcome, Workflow, WorkflowContext,
+    CheckpointLimits, DurableActivity, DurableHost, ExactBytes, ExecutionId, ExecutionSpec,
+    HOST_OUTCOME_VARIANTS, HostEpoch, HostOutcome, InMemoryCheckpointStore, TerminalOutcome,
+    Workflow, WorkflowContext,
 };
+use serde::{Deserialize, Serialize};
 use support::scenarios::{ScenarioId, run_conformance_matrix};
 
 struct OrdinaryAsyncWorkflow;
 
-// FR012_WORKFLOW_START
+struct OrdinaryAsyncActivity;
+
+#[derive(Deserialize, Serialize)]
+struct GreetingInput {
+    message: String,
+}
+
+impl DurableActivity for OrdinaryAsyncActivity {
+    type Input = GreetingInput;
+    type Output = Vec<u8>;
+
+    const NAME: &'static str = "ordinary-async";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 1024;
+    const MAX_RESULT_BYTES: u64 = 1024;
+}
+
 #[async_trait]
 impl Workflow for OrdinaryAsyncWorkflow {
-    async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
-        TerminalOutcome::succeeded(
-            context
-                .activity(ActivitySpec::new(
-                    ActivityName::new("ordinary-async", 1).unwrap(),
-                    input,
-                    1024,
-                ))
-                .await,
-        )
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
+        // FR012_WORKFLOW_START
+        match context
+            .call::<OrdinaryAsyncActivity>(GreetingInput {
+                message: "hello".to_owned(),
+            })
+            .await
+        {
+            Ok(result) => TerminalOutcome::succeeded(result),
+            Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
+        }
+        // FR012_WORKFLOW_END
     }
 }
-// FR012_WORKFLOW_END
 
 #[test]
 fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
@@ -38,10 +56,20 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
         .split_once("// FR012_WORKFLOW_END")
         .unwrap()
         .0;
-    let framework_operation_count = body.matches(".activity(").count();
+    let framework_operation_count = body.matches(".call::<").count();
     let authored_poll = body.contains(concat!("fn po", "ll("))
         || body.contains(concat!("impl Future", " for"))
         || body.contains(concat!("state_", "machine"));
+    let raw_plumbing = [
+        "ActivitySpec",
+        "ActivityName",
+        "ExactBytes",
+        "into_vec",
+        "serde_json",
+        "MAX_RESULT_BYTES",
+    ]
+    .iter()
+    .any(|symbol| body.contains(symbol));
 
     let store = InMemoryCheckpointStore::new();
     let mut host = DurableHost::new(
@@ -78,6 +106,10 @@ fn ordinary_async_mechanically_passes_fr_012_and_is_the_sole_surface() {
             matches!(first_turn, HostOutcome::ScheduleAccepted { .. }),
         ),
         ("no author-written poll or state machine", !authored_poll),
+        (
+            "no raw identity, byte, serde, or bound plumbing",
+            !raw_plumbing,
+        ),
         (
             "workflow body uses no more than two framework operations",
             framework_operation_count <= 2,
