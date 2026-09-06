@@ -29,6 +29,7 @@ pub struct InMemoryCheckpointStore {
 struct State {
     checkpoints: BTreeMap<ExecutionId, StoredCheckpoint>,
     next_cas_fault: Option<InMemoryFault>,
+    matching_cas_before_fault: usize,
     next_load_error: Option<StoreError>,
     revision_counter: u64,
 }
@@ -41,10 +42,21 @@ impl InMemoryCheckpointStore {
     /// Arm a fault for one matching compare-and-swap. A newly armed fault replaces
     /// an older unconsumed fault.
     pub fn fail_next_compare_and_swap(&self, fault: InMemoryFault) {
-        self.state
+        self.fail_compare_and_swap_after(0, fault);
+    }
+
+    /// Arm a one-shot fault after a bounded number of matching CAS operations.
+    pub fn fail_compare_and_swap_after(
+        &self,
+        matching_cas_before_fault: usize,
+        fault: InMemoryFault,
+    ) {
+        let mut state = self
+            .state
             .lock()
-            .expect("in-memory checkpoint store mutex poisoned")
-            .next_cas_fault = Some(fault);
+            .expect("in-memory checkpoint store mutex poisoned");
+        state.matching_cas_before_fault = matching_cas_before_fault;
+        state.next_cas_fault = Some(fault);
     }
 
     /// Arm one provider error for the next load.
@@ -93,7 +105,13 @@ impl CheckpointStore for InMemoryCheckpointStore {
             return Ok(CasOutcome::Conflict);
         }
 
-        match state.next_cas_fault.take() {
+        let fault = if state.matching_cas_before_fault == 0 {
+            state.next_cas_fault.take()
+        } else {
+            state.matching_cas_before_fault -= 1;
+            None
+        };
+        match fault {
             Some(InMemoryFault::FailBeforeRequest(kind)) => Err(StoreError::new(
                 kind,
                 "in-memory fault injected before compare-and-swap request",

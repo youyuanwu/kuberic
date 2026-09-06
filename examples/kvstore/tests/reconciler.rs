@@ -1351,7 +1351,8 @@ async fn pilot_checkpoint_ready_for_terminal(
 ) -> bool {
     use kuberic_durable_execution::{ActivityState, CheckpointStore};
     use kuberic_operator::durable::pilot::{
-        DurableSwitchoverStepResult, checkpoint_limits, execution_id, execution_spec,
+        DurableSwitchoverStepResult, checkpoint_limits, decode_activity_input_state,
+        decode_activity_step_result, execution_id, execution_spec,
     };
 
     let Some(reference) = status.durable_switchover_pilot.as_ref() else {
@@ -1370,13 +1371,23 @@ async fn pilot_checkpoint_ready_for_terminal(
     else {
         return false;
     };
-    let ActivityState::Completed { result } = last.state() else {
-        return false;
-    };
-    matches!(
-        serde_json::from_slice::<DurableSwitchoverStepResult>(result.as_slice()),
-        Ok(DurableSwitchoverStepResult::Complete { .. })
-    )
+    match last.state() {
+        ActivityState::DispatchExposed { .. } => decode_activity_input_state(last.input())
+            .is_ok_and(|state| {
+                state.pending_action.as_ref().is_some_and(|pending| {
+                    matches!(
+                        pending.kind,
+                        DurableActionKind::LabelOldSecondary
+                            | DurableActionKind::CompensateLabelTargetSecondary
+                    )
+                })
+            }),
+        ActivityState::Completed { result } => matches!(
+            decode_activity_step_result(result),
+            Ok(DurableSwitchoverStepResult::Complete { .. })
+        ),
+        ActivityState::Scheduled => false,
+    }
 }
 
 async fn drive_add_replica(
@@ -4244,8 +4255,10 @@ async fn test_durable_execution_switchover_pilot_reloads_after_terminal_cas_conf
         .iter()
         .filter(|operation| **operation != ControlOperation::GetStatus)
         .count();
-    store
-        .fail_next_compare_and_swap(kuberic_durable_execution::InMemoryFault::ConflictWithoutApply);
+    store.fail_compare_and_swap_after(
+        1,
+        kuberic_durable_execution::InMemoryFault::ConflictWithoutApply,
+    );
     let action = reconcile_set(
         &make_pilot_set("pilot-terminal-conflict", 3, Some(status.clone())),
         &api,
@@ -4260,7 +4273,7 @@ async fn test_durable_execution_switchover_pilot_reloads_after_terminal_cas_conf
     assert!(status.conditions.iter().any(|condition| {
         condition.type_ == "DurableSwitchoverPilot"
             && condition.reason == "ReloadRequired"
-            && condition.message.contains("Completion")
+            && condition.message.contains("ObservationProgression")
     }));
     let completed =
         drive_pilot_switchover(&api, &state, "pilot-terminal-conflict", 3, status).await;

@@ -24,7 +24,9 @@ use crate::crd::DurableOperationPhase;
 use crate::crd::{DurableOperationStatus, EpochStatus, PendingActionStatus};
 
 #[cfg(feature = "durable-switchover-pilot")]
-use super::pilot::{DurableSwitchoverStepResult, PilotAdapterDecision, PilotPermitGuard};
+use super::pilot::{
+    DurableSwitchoverState, DurableSwitchoverStepResult, PilotAdapterDecision, PilotPermitGuard,
+};
 #[cfg(feature = "durable-switchover-pilot")]
 use super::{Decision, OperationObservations, switchover::is_switchover_postcondition_transition};
 use super::{correlated_action_observation, fail_closed, record_activity_error};
@@ -357,16 +359,21 @@ pub async fn bridge_pilot_permitted_step(
     namespace: &str,
 ) -> Result<PilotEffectBridgeOutcome, String> {
     let _permit = guard.consume_for(operation)?;
-    match decision {
+    let decision = match decision {
         PilotAdapterDecision::Observe(result) => {
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
+            return Ok(PilotEffectBridgeOutcome::Observe(result));
         }
-        PilotAdapterDecision::AwaitEvidence => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
-        PilotAdapterDecision::External(Decision::Execute {
+        PilotAdapterDecision::AwaitEvidence => {
+            return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+        }
+        PilotAdapterDecision::External(decision) => *decision,
+    };
+    match decision {
+        Decision::Execute {
             target_id,
             action_id,
             action,
-        }) => {
+        } => {
             let pending = operation.pending_action.as_ref().ok_or_else(|| {
                 "pilot execution requested a replica effect without pending intent".to_string()
             })?;
@@ -392,7 +399,9 @@ pub async fn bridge_pilot_permitted_step(
                     let mut next = operation.clone();
                     next.pending_action = Some(*planned);
                     return Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                        DurableSwitchoverStepResult::Advance { operation: next },
+                        DurableSwitchoverStepResult::Advance {
+                            operation: DurableSwitchoverState::from_operation(&next),
+                        },
                     )));
                 }
                 DispatchEvidencePlan::WaitForExactIncarnation
@@ -410,7 +419,7 @@ pub async fn bridge_pilot_permitted_step(
                 },
             }
         }
-        PilotAdapterDecision::External(Decision::PatchPodRole { target_id, role }) => {
+        Decision::PatchPodRole { target_id, role } => {
             let command = exact_label_command(operation, target_id, &role, observations)?;
             let mut labels = BTreeMap::new();
             labels.insert("kuberic.io/role".to_string(), command.role);
@@ -424,11 +433,11 @@ pub async fn bridge_pilot_permitted_step(
                 .await;
             Ok(PilotEffectBridgeOutcome::Exposed)
         }
-        PilotAdapterDecision::External(Decision::PatchPodRoleExactUid {
+        Decision::PatchPodRoleExactUid {
             target_id,
             expected_uid,
             role,
-        }) => {
+        } => {
             let command = exact_label_command(operation, target_id, &role, observations)?;
             if command.expected_uid != expected_uid {
                 return Err(
@@ -447,7 +456,7 @@ pub async fn bridge_pilot_permitted_step(
                 .await;
             Ok(PilotEffectBridgeOutcome::Exposed)
         }
-        PilotAdapterDecision::External(other) => Err(format!(
+        other => Err(format!(
             "unsupported external decision reached durable switchover pilot: {other:?}"
         )),
     }
@@ -461,14 +470,19 @@ fn pilot_result_after_dispatch_error(
 ) -> Option<DurableSwitchoverStepResult> {
     if classify_dispatch_failure(error) == DispatchFailureDisposition::ProvenNoAdmission {
         return Some(DurableSwitchoverStepResult::ProvenNoAdmission {
-            operation: operation_after_dispatch_error(operation, error),
+            operation: DurableSwitchoverState::from_operation(&operation_after_dispatch_error(
+                operation, error,
+            )),
             action_id,
             redelivery: 1,
         });
     }
     matches!(error, KubericError::RemoteAgentConflict(_)).then(|| {
         DurableSwitchoverStepResult::Stopped {
-            operation: fail_closed(operation, &error.to_string()),
+            operation: DurableSwitchoverState::from_operation(&fail_closed(
+                operation,
+                &error.to_string(),
+            )),
             message: error.to_string(),
         }
     })
@@ -480,36 +494,39 @@ pub fn resolve_pilot_quarantine(
     decision: PilotAdapterDecision,
     observations: &OperationObservations,
 ) -> Result<PilotEffectBridgeOutcome, String> {
+    let decision = match decision {
+        PilotAdapterDecision::Observe(result) => {
+            let effect_free_before_dispatch =
+                operation.pending_action.as_ref().is_some_and(|pending| {
+                    !matches!(
+                        pending.kind,
+                        crate::crd::DurableActionKind::LabelTargetPrimary
+                            | crate::crd::DurableActionKind::LabelOldSecondary
+                            | crate::crd::DurableActionKind::CompensateLabelOldPrimary
+                            | crate::crd::DurableActionKind::CompensateLabelTargetSecondary
+                    ) && pending.dispatch_agent_generation.is_none()
+                        && pending.dispatch_agent_control_version.is_none()
+                        && pending.dispatch_observed_runtime_epoch.is_none()
+                        && pending.dispatch_action_payload.is_empty()
+                });
+            if effect_free_before_dispatch
+                || quarantine_result_is_authoritative(operation, &result, observations)
+            {
+                return Ok(PilotEffectBridgeOutcome::Observe(result));
+            }
+            return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+        }
+        PilotAdapterDecision::AwaitEvidence => {
+            return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+        }
+        PilotAdapterDecision::External(decision) => *decision,
+    };
     match decision {
-        PilotAdapterDecision::Observe(result)
-            if operation.pending_action.as_ref().is_some_and(|pending| {
-                !matches!(
-                    pending.kind,
-                    crate::crd::DurableActionKind::LabelTargetPrimary
-                        | crate::crd::DurableActionKind::LabelOldSecondary
-                        | crate::crd::DurableActionKind::CompensateLabelOldPrimary
-                        | crate::crd::DurableActionKind::CompensateLabelTargetSecondary
-                ) && pending.dispatch_agent_generation.is_none()
-                    && pending.dispatch_agent_control_version.is_none()
-                    && pending.dispatch_observed_runtime_epoch.is_none()
-                    && pending.dispatch_action_payload.is_empty()
-            }) =>
-        {
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
-        }
-        PilotAdapterDecision::Observe(result)
-            if quarantine_result_is_authoritative(operation, &result, observations) =>
-        {
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
-        }
-        PilotAdapterDecision::Observe(_) | PilotAdapterDecision::AwaitEvidence => {
-            Ok(PilotEffectBridgeOutcome::AwaitEvidence)
-        }
-        PilotAdapterDecision::External(Decision::Execute {
+        Decision::Execute {
             target_id,
             action_id,
             action,
-        }) if operation
+        } if operation
             .pending_action
             .as_ref()
             .is_some_and(|pending| pending.dispatch_agent_generation.is_none()) =>
@@ -537,7 +554,9 @@ pub fn resolve_pilot_quarantine(
                     let mut next = operation.clone();
                     next.pending_action = Some(*planned);
                     Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                        DurableSwitchoverStepResult::Advance { operation: next },
+                        DurableSwitchoverStepResult::Advance {
+                            operation: DurableSwitchoverState::from_operation(&next),
+                        },
                     )))
                 }
                 DispatchEvidencePlan::Ready => Err(
@@ -550,7 +569,7 @@ pub fn resolve_pilot_quarantine(
                 }
             }
         }
-        PilotAdapterDecision::External(Decision::Execute { target_id, .. })
+        Decision::Execute { target_id, .. }
             if generation_change_proves_no_admission(operation, target_id, observations) =>
         {
             let pending = operation.pending_action.as_ref().ok_or_else(|| {
@@ -562,27 +581,16 @@ pub fn resolve_pilot_quarantine(
             }
             Ok(PilotEffectBridgeOutcome::Observe(Box::new(
                 DurableSwitchoverStepResult::ProvenNoAdmission {
-                    operation: next,
+                    operation: DurableSwitchoverState::from_operation(&next),
                     action_id: pending.action_id.clone(),
                     redelivery: 1,
                 },
             )))
         }
-        PilotAdapterDecision::External(
-            Decision::PatchPodRole { .. } | Decision::PatchPodRoleExactUid { .. },
-        ) => {
-            let pending = operation.pending_action.as_ref().ok_or_else(|| {
-                "quarantined pilot label activity has no pending action".to_string()
-            })?;
-            Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-                DurableSwitchoverStepResult::ProvenNoAdmission {
-                    operation: operation.clone(),
-                    action_id: pending.action_id.clone(),
-                    redelivery: 1,
-                },
-            )))
+        Decision::PatchPodRole { .. } | Decision::PatchPodRoleExactUid { .. } => {
+            Ok(PilotEffectBridgeOutcome::AwaitEvidence)
         }
-        PilotAdapterDecision::External(_) => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
+        _ => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
     }
 }
 
@@ -596,7 +604,12 @@ fn quarantine_result_is_authoritative(
         DurableSwitchoverStepResult::Complete { .. } => operation.pending_action.is_none(),
         DurableSwitchoverStepResult::Stopped { .. } => operation.pending_action.is_none(),
         DurableSwitchoverStepResult::ProvenNoAdmission { .. } => true,
-        DurableSwitchoverStepResult::Advance { operation: next } => {
+        DurableSwitchoverStepResult::Advance {
+            operation: next_state,
+        } => {
+            let Ok(next) = next_state.apply_to(operation) else {
+                return false;
+            };
             if next.phase == DurableOperationPhase::Poisoned {
                 return false;
             }
@@ -612,7 +625,7 @@ fn quarantine_result_is_authoritative(
                     DurableActionState::Completed | DurableActionState::Failed
                 ) && next.pending_action.is_none();
             }
-            is_switchover_postcondition_transition(operation, next, pending)
+            is_switchover_postcondition_transition(operation, &next, pending)
         }
     }
 }

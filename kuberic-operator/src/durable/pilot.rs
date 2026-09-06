@@ -14,18 +14,20 @@ use async_trait::async_trait;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kuberic_durable_execution::{
     ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
-    CheckpointLimits, CheckpointPayload, CheckpointStore, DispatchPermit, DurableHost, ExactBytes,
-    ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, InMemoryCheckpointStore,
-    KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope, KubernetesCheckpointStore,
-    KubernetesCheckpointStoreOptions, LogicalActivityId, StorageRevision, StoreError,
-    StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
+    CheckpointLimits, CheckpointPayload, CheckpointStore, DispatchPermit, DurableActivity,
+    DurableHost, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch,
+    InMemoryCheckpointStore, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
+    KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, LogicalActivityId,
+    StorageRevision, StoreError, StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
+    decode_activity_input, decode_activity_result, encode_activity_input, encode_activity_result,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::crd::{
-    DurableOperationStatus, DurableSwitchoverPilotStatus, StablePartitionSnapshotStatus,
+    DurableOperationPhase, DurableOperationStatus, DurableSwitchoverPilotStatus,
+    PendingActionStatus, StablePartitionSnapshotStatus,
 };
 
 use super::pilot_store::MeasuredPilotCheckpointStore;
@@ -38,15 +40,16 @@ use super::{
 };
 
 // COMPLEXITY-BOUNDARY: pilot-module:start
-pub const PILOT_VERSION: u32 = 1;
+pub const PILOT_VERSION: u32 = 2;
 pub const PILOT_MAX_REPLICAS: usize = 3;
-pub const PILOT_MAX_ACTIVITY_RECORDS: usize = 56;
+pub const PILOT_MAX_ACTIVITY_RECORDS: usize = 32;
+pub const PILOT_MAX_TRANSITION_FUEL: usize = 64;
 pub const PILOT_MAX_OPERATION_BYTES: usize = 3_000;
 pub const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = 4_096;
 pub const PILOT_MAX_TERMINAL_BYTES: u64 = 4_096;
 pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 752 * 1_024;
 
-const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.explicit-step";
+const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.effect-boundary";
 const PILOT_ACTIVITY_VERSION: u32 = 1;
 
 #[derive(Clone)]
@@ -217,30 +220,89 @@ pub struct DurableSwitchoverPilotInput {
     pub initial_operation: DurableOperationStatus,
 }
 
+/// Compact mutable protocol projection replayed over the immutable initial
+/// operation in the workflow input.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableSwitchoverState {
+    pub phase: DurableOperationPhase,
+    pub frozen_lsn: Option<i64>,
+    pub next_secondary_index: u32,
+    pub phase_deadline_unix_seconds: i64,
+    pub pending_action: Option<PendingActionStatus>,
+    pub last_error: Option<String>,
+}
+
+impl DurableSwitchoverState {
+    pub fn from_operation(operation: &DurableOperationStatus) -> Self {
+        Self {
+            phase: operation.phase,
+            frozen_lsn: operation.frozen_lsn,
+            next_secondary_index: operation.next_secondary_index,
+            phase_deadline_unix_seconds: operation.phase_deadline_unix_seconds,
+            pending_action: operation.pending_action.clone(),
+            last_error: operation.last_error.clone(),
+        }
+    }
+
+    pub fn apply_to(
+        &self,
+        initial: &DurableOperationStatus,
+    ) -> Result<DurableOperationStatus, String> {
+        let mut operation = initial.clone();
+        operation.phase = self.phase;
+        operation.frozen_lsn = self.frozen_lsn;
+        operation.next_secondary_index = self.next_secondary_index;
+        operation.phase_deadline_unix_seconds = self.phase_deadline_unix_seconds;
+        operation.pending_action = self.pending_action.clone();
+        operation.last_error = self.last_error.clone();
+        validate_transition(initial, &operation)?;
+        Ok(operation)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DurableSwitchoverActivityInput {
+    pub version: u32,
+    pub state: DurableSwitchoverState,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DurableSwitchoverStepResult {
     Advance {
-        operation: DurableOperationStatus,
+        operation: DurableSwitchoverState,
     },
     ProvenNoAdmission {
-        operation: DurableOperationStatus,
+        operation: DurableSwitchoverState,
         action_id: String,
         redelivery: u8,
     },
     Complete {
-        operation: DurableOperationStatus,
+        operation: DurableSwitchoverState,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
     },
     Stopped {
-        operation: DurableOperationStatus,
+        operation: DurableSwitchoverState,
         message: String,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub struct DurableSwitchoverActivity;
+
+impl DurableActivity for DurableSwitchoverActivity {
+    type Input = DurableSwitchoverActivityInput;
+    type Output = DurableSwitchoverStepResult;
+
+    const NAME: &'static str = PILOT_ACTIVITY_NAME;
+    const VERSION: u32 = PILOT_ACTIVITY_VERSION;
+    const MAX_INPUT_BYTES: u64 = PILOT_MAX_OPERATION_BYTES as u64;
+    const MAX_RESULT_BYTES: u64 = PILOT_MAX_ACTIVITY_RESULT_BYTES as u64;
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum DurableSwitchoverPilotTerminal {
     Complete {
         operation: DurableOperationStatus,
@@ -249,6 +311,20 @@ pub enum DurableSwitchoverPilotTerminal {
     },
     Stopped {
         operation: Option<DurableOperationStatus>,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum DurableSwitchoverTerminalRecord {
+    Complete {
+        state: DurableSwitchoverState,
+        snapshot: StablePartitionSnapshotStatus,
+        compensated: bool,
+    },
+    Stopped {
+        state: Option<DurableSwitchoverState>,
         message: String,
     },
 }
@@ -284,43 +360,76 @@ impl Workflow for DurableSwitchoverWorkflow {
         if let Err(error) = validate_switchover_operation(&initial) {
             return terminal_failure(Some(initial), error);
         }
-        let mut operation = initial.clone();
+        let mut state = DurableSwitchoverState::from_operation(&initial);
         let mut no_admission_redeliveries = std::collections::BTreeMap::<String, u8>::new();
 
-        for _ in 0..PILOT_MAX_ACTIVITY_RECORDS {
-            let activity = match activity_spec(&operation) {
-                Ok(activity) => activity,
-                Err(error) => return terminal_failure(Some(operation), error),
+        for _ in 0..PILOT_MAX_TRANSITION_FUEL {
+            let operation = match state.apply_to(&initial) {
+                Ok(operation) => operation,
+                Err(error) => return terminal_failure(None, error),
             };
-            let encoded = context.activity(activity).await;
-            let result: DurableSwitchoverStepResult =
-                match serde_json::from_slice(encoded.as_slice()) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        return terminal_failure(
-                            Some(operation),
-                            format!("decode pilot activity result: {error}"),
-                        );
-                    }
-                };
-            match result {
-                DurableSwitchoverStepResult::Advance { operation: next } => {
-                    if let Err(error) = validate_transition(&initial, &next) {
-                        return terminal_failure(Some(operation), error);
-                    }
+            match advance_effect_free(&operation) {
+                Ok(Some(next)) => {
                     if let Err(error) = validate_phase_transition(&operation, &next) {
                         return terminal_failure(Some(operation), error);
                     }
-                    operation = next;
+                    if next.phase == DurableOperationPhase::Poisoned {
+                        return terminal_failure(
+                            Some(next.clone()),
+                            next.last_error.clone().unwrap_or_else(|| {
+                                "durable switchover entered poisoned state".to_string()
+                            }),
+                        );
+                    }
+                    state = DurableSwitchoverState::from_operation(&next);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => return terminal_failure(Some(operation), error),
+            }
+            let result = match context
+                .call::<DurableSwitchoverActivity>(DurableSwitchoverActivityInput {
+                    version: PILOT_VERSION,
+                    state: state.clone(),
+                })
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return terminal_failure(
+                        Some(operation),
+                        format!("decode pilot activity result: {error}"),
+                    );
+                }
+            };
+            match result {
+                DurableSwitchoverStepResult::Advance {
+                    operation: next_state,
+                } => {
+                    if next_state == state {
+                        return terminal_failure(
+                            Some(operation),
+                            "durable switchover activity made no protocol progress".to_string(),
+                        );
+                    }
+                    let next = match next_state.apply_to(&initial) {
+                        Ok(next) => next,
+                        Err(error) => return terminal_failure(Some(operation), error),
+                    };
+                    if let Err(error) = validate_phase_transition(&operation, &next) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    state = next_state;
                 }
                 DurableSwitchoverStepResult::ProvenNoAdmission {
-                    operation: next,
+                    operation: next_state,
                     action_id,
                     redelivery,
                 } => {
-                    if let Err(error) = validate_transition(&initial, &next) {
-                        return terminal_failure(Some(operation), error);
-                    }
+                    let next = match next_state.apply_to(&initial) {
+                        Ok(next) => next,
+                        Err(error) => return terminal_failure(Some(operation), error),
+                    };
                     if let Err(error) =
                         validate_no_admission_transition(&operation, &next, &action_id)
                     {
@@ -345,16 +454,17 @@ impl Workflow for DurableSwitchoverWorkflow {
                                 .to_string(),
                         );
                     }
-                    operation = next;
+                    state = next_state;
                 }
                 DurableSwitchoverStepResult::Complete {
-                    operation: completed,
+                    operation: completed_state,
                     snapshot,
                     compensated,
                 } => {
-                    if let Err(error) = validate_transition(&initial, &completed) {
-                        return terminal_failure(Some(operation), error);
-                    }
+                    let completed = match completed_state.apply_to(&initial) {
+                        Ok(completed) => completed,
+                        Err(error) => return terminal_failure(Some(operation), error),
+                    };
                     if let Err(error) =
                         validate_completion_transition(&operation, &completed, compensated)
                     {
@@ -370,12 +480,13 @@ impl Workflow for DurableSwitchoverWorkflow {
                     });
                 }
                 DurableSwitchoverStepResult::Stopped {
-                    operation: stopped,
+                    operation: stopped_state,
                     message,
                 } => {
-                    if let Err(error) = validate_transition(&initial, &stopped) {
-                        return terminal_failure(Some(operation), error);
-                    }
+                    let stopped = match stopped_state.apply_to(&initial) {
+                        Ok(stopped) => stopped,
+                        Err(error) => return terminal_failure(Some(operation), error),
+                    };
                     if stopped.phase != crate::crd::DurableOperationPhase::Poisoned
                         || stopped.pending_action.is_some()
                     {
@@ -391,32 +502,100 @@ impl Workflow for DurableSwitchoverWorkflow {
         }
 
         terminal_failure(
-            Some(operation),
-            format!(
-                "durable switchover exhausted its {PILOT_MAX_ACTIVITY_RECORDS}-activity admission"
-            ),
+            state.apply_to(&initial).ok(),
+            format!("durable switchover exhausted its {PILOT_MAX_TRANSITION_FUEL}-transition fuel"),
         )
     }
 }
 
+fn advance_effect_free(
+    operation: &DurableOperationStatus,
+) -> Result<Option<DurableOperationStatus>, String> {
+    if operation.pending_action.is_some() {
+        return Ok(None);
+    }
+    use DurableOperationPhase as Phase;
+    if !matches!(
+        operation.phase,
+        Phase::Revoke
+            | Phase::DemoteOldPrimary
+            | Phase::PromoteTarget
+            | Phase::DistributeEpoch
+            | Phase::UpdateCatchUpConfiguration
+            | Phase::WaitForCatchUpQuorum
+            | Phase::UpdateCurrentConfiguration
+            | Phase::LabelTargetPrimary
+            | Phase::LabelOldSecondary
+            | Phase::RestorePreviousConfiguration
+            | Phase::CompensatePromoteOldPrimary
+            | Phase::CompensateDistributeEpoch
+            | Phase::CompensateCatchUpConfiguration
+            | Phase::CompensateCurrentConfiguration
+            | Phase::CompensateLabelOldPrimary
+            | Phase::CompensateLabelTargetSecondary
+    ) {
+        return Ok(None);
+    }
+    let deterministic_now = operation
+        .phase_deadline_unix_seconds
+        .saturating_sub(super::ACTION_DEADLINE_SECONDS);
+    match decide(operation, &OperationObservations::new(), deterministic_now)? {
+        Decision::Persist(next) => Ok(Some(next)),
+        Decision::Wait => Ok(None),
+        other => Err(format!(
+            "effect-free switchover transition produced external decision: {other:?}"
+        )),
+    }
+}
+
 pub fn encode_step_result(result: &DurableSwitchoverStepResult) -> Result<ExactBytes, String> {
-    let encoded = serde_json::to_vec(result)
-        .map_err(|error| format!("serialize pilot activity result: {error}"))?;
-    if encoded.len() > PILOT_MAX_ACTIVITY_RESULT_BYTES {
+    encode_activity_result::<DurableSwitchoverActivity>(result)
+        .map_err(|error| format!("serialize pilot activity result: {error}"))
+}
+
+pub fn decode_activity_input_state(input: &ExactBytes) -> Result<DurableSwitchoverState, String> {
+    let input = decode_activity_input::<DurableSwitchoverActivity>(input)
+        .map_err(|error| format!("decode current durable switchover activity: {error}"))?;
+    if input.version != PILOT_VERSION {
         return Err(format!(
-            "durable switchover activity result is {} bytes; maximum is {}",
-            encoded.len(),
-            PILOT_MAX_ACTIVITY_RESULT_BYTES
+            "unsupported durable switchover activity version {}",
+            input.version
         ));
     }
-    Ok(ExactBytes::new(encoded))
+    Ok(input.state)
+}
+
+pub fn decode_activity_step_result(
+    result: &ExactBytes,
+) -> Result<DurableSwitchoverStepResult, String> {
+    decode_activity_result::<DurableSwitchoverActivity>(result)
+        .map_err(|error| format!("decode completed durable switchover activity: {error}"))
 }
 
 pub fn decode_terminal(
     outcome: &TerminalOutcome,
+    initial: &DurableOperationStatus,
 ) -> Result<DurableSwitchoverPilotTerminal, String> {
-    serde_json::from_slice(outcome.payload().as_slice())
-        .map_err(|error| format!("decode durable switchover terminal outcome: {error}"))
+    let record: DurableSwitchoverTerminalRecord =
+        serde_json::from_slice(outcome.payload().as_slice())
+            .map_err(|error| format!("decode durable switchover terminal outcome: {error}"))?;
+    Ok(match record {
+        DurableSwitchoverTerminalRecord::Complete {
+            state,
+            snapshot,
+            compensated,
+        } => DurableSwitchoverPilotTerminal::Complete {
+            operation: state.apply_to(initial)?,
+            snapshot,
+            compensated,
+        },
+        DurableSwitchoverTerminalRecord::Stopped { state, message } => {
+            DurableSwitchoverPilotTerminal::Stopped {
+                operation: state.map(|state| state.apply_to(initial)).transpose()?,
+                message,
+            }
+        }
+    })
 }
 
 pub fn validate_loaded_terminal(
@@ -425,7 +604,7 @@ pub fn validate_loaded_terminal(
 ) -> Result<DurableSwitchoverPilotTerminal, String> {
     let initial = initial_operation(reference)?;
     validate_pilot_admission(&initial)?;
-    let terminal = decode_terminal(outcome)?;
+    let terminal = decode_terminal(outcome, &initial)?;
     match (outcome, &terminal) {
         (
             TerminalOutcome::Succeeded(_),
@@ -459,9 +638,9 @@ pub fn validate_loaded_terminal(
 }
 
 pub enum PilotAdapterDecision {
-    Observe(DurableSwitchoverStepResult),
+    Observe(Box<DurableSwitchoverStepResult>),
     AwaitEvidence,
-    External(Decision),
+    External(Box<Decision>),
 }
 
 pub fn evaluate_adapter_step(
@@ -477,27 +656,31 @@ pub fn evaluate_adapter_step(
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "durable switchover entered poisoned state".to_string());
-            PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Stopped {
-                operation,
+            PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Stopped {
+                operation: DurableSwitchoverState::from_operation(&operation),
                 message,
-            })
+            }))
         }
         Decision::Persist(operation) => {
-            PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance { operation })
+            PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Advance {
+                operation: DurableSwitchoverState::from_operation(&operation),
+            }))
         }
         Decision::Complete {
             operation,
             snapshot,
             compensated,
-        } => PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Complete {
-            operation,
+        } => PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Complete {
+            operation: DurableSwitchoverState::from_operation(&operation),
             snapshot,
             compensated,
-        }),
+        })),
         Decision::Wait => PilotAdapterDecision::AwaitEvidence,
         external @ (Decision::Execute { .. }
         | Decision::PatchPodRole { .. }
-        | Decision::PatchPodRoleExactUid { .. }) => PilotAdapterDecision::External(external),
+        | Decision::PatchPodRoleExactUid { .. }) => {
+            PilotAdapterDecision::External(Box::new(external))
+        }
         other => {
             return Err(format!(
                 "unsupported explicit switchover decision reached pilot adapter: {other:?}"
@@ -543,19 +726,15 @@ impl PilotPermitGuard {
 }
 
 fn activity_spec(operation: &DurableOperationStatus) -> Result<ActivitySpec, String> {
-    let input = serde_json::to_vec(operation)
-        .map_err(|error| format!("serialize pilot activity input: {error}"))?;
-    if input.len() > PILOT_MAX_OPERATION_BYTES {
-        return Err(format!(
-            "durable switchover activity input is {} bytes; maximum is {}",
-            input.len(),
-            PILOT_MAX_OPERATION_BYTES
-        ));
-    }
+    let input = DurableSwitchoverActivityInput {
+        version: PILOT_VERSION,
+        state: DurableSwitchoverState::from_operation(operation),
+    };
     Ok(ActivitySpec::new(
         ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
             .map_err(|error| format!("construct pilot activity name: {error}"))?,
-        ExactBytes::new(input),
+        encode_activity_input::<DurableSwitchoverActivity>(&input)
+            .map_err(|error| format!("serialize pilot activity input: {error}"))?,
         PILOT_MAX_ACTIVITY_RESULT_BYTES as u64,
     ))
 }
@@ -659,19 +838,46 @@ fn terminal_success(terminal: DurableSwitchoverPilotTerminal) -> TerminalOutcome
     }
 }
 
+fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactBytes, String> {
+    let record = match terminal {
+        DurableSwitchoverPilotTerminal::Complete {
+            operation,
+            snapshot,
+            compensated,
+        } => DurableSwitchoverTerminalRecord::Complete {
+            state: DurableSwitchoverState::from_operation(operation),
+            snapshot: snapshot.clone(),
+            compensated: *compensated,
+        },
+        DurableSwitchoverPilotTerminal::Stopped { operation, message } => {
+            DurableSwitchoverTerminalRecord::Stopped {
+                state: operation
+                    .as_ref()
+                    .map(DurableSwitchoverState::from_operation),
+                message: message.clone(),
+            }
+        }
+    };
+    encode_terminal_record(&record)
+}
+
 fn terminal_failure(operation: Option<DurableOperationStatus>, message: String) -> TerminalOutcome {
     let bounded_message: String = message.chars().take(512).collect();
-    let terminal = DurableSwitchoverPilotTerminal::Stopped {
-        operation,
+    let terminal = DurableSwitchoverTerminalRecord::Stopped {
+        state: operation
+            .as_ref()
+            .map(DurableSwitchoverState::from_operation),
         message: bounded_message,
     };
-    let payload = encode_terminal(&terminal).unwrap_or_else(|_| {
-        ExactBytes::new(br#"{"status":"stopped","operation":null,"message":"pilot terminal payload exceeded its bound"}"#)
+    let payload = encode_terminal_record(&terminal).unwrap_or_else(|_| {
+        ExactBytes::new(br#"{"status":"stopped","state":null,"message":"pilot terminal payload exceeded its bound"}"#)
     });
     TerminalOutcome::failed(payload)
 }
 
-fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactBytes, String> {
+fn encode_terminal_record(
+    terminal: &DurableSwitchoverTerminalRecord,
+) -> Result<ExactBytes, String> {
     let encoded = serde_json::to_vec(terminal)
         .map_err(|error| format!("serialize durable switchover terminal outcome: {error}"))?;
     if encoded.len() > PILOT_MAX_TERMINAL_BYTES as usize {
@@ -815,6 +1021,13 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
             "durable switchover requires {projected_steps} projected activities; maximum is {PILOT_MAX_ACTIVITY_RECORDS}"
         ));
     }
+    let projected_transitions = (success_steps.len() + projected_success_pure_transitions())
+        .max(rollback_steps.len() + projected_rollback_pure_transitions());
+    if projected_transitions > PILOT_MAX_TRANSITION_FUEL {
+        return Err(format!(
+            "durable switchover requires {projected_transitions} projected transitions; maximum is {PILOT_MAX_TRANSITION_FUEL}"
+        ));
+    }
     let projected_bytes = maximum_projected_checkpoint_bytes()?;
     if projected_bytes > PILOT_MAX_ENCODED_CHECKPOINT_BYTES {
         return Err(format!(
@@ -860,46 +1073,34 @@ fn maximum_projected_checkpoint_bytes() -> Result<usize, String> {
 
 fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
     let mut steps = vec![
-        "revoke.prepare",
-        "revoke.fence",
-        "revoke.resolve",
+        "revoke.observe",
+        "revoke.effect",
         "capture-lsn",
         "target-catch-up",
-        "demote.prepare",
-        "demote.fence",
-        "demote.resolve",
-        "promote.prepare",
-        "promote.fence",
-        "promote.resolve",
+        "demote.observe",
+        "demote.effect",
+        "promote.observe",
+        "promote.effect",
     ];
     for _ in 0..member_count.saturating_sub(2) {
-        steps.extend(["epoch.prepare", "epoch.fence", "epoch.resolve"]);
+        steps.extend(["epoch.observe", "epoch.effect"]);
     }
-    steps.push("epoch.complete");
-
     steps.extend([
-        "catch-up-config.prepare",
-        "catch-up-config.fence",
-        "catch-up-config.resolve",
-        "quorum.prepare",
-        "quorum.fence",
-        "quorum.resolve",
-        "current-config.prepare",
-        "current-config.fence",
-        "current-config.resolve",
-        "target-label.prepare",
-        "target-label.resolve",
-        "old-label.prepare",
-        "old-label.resolve",
+        "catch-up-config.observe",
+        "catch-up-config.effect",
+        "quorum.observe",
+        "quorum.effect",
+        "current-config.observe",
+        "current-config.effect",
+        "target-label.effect",
+        "old-label.effect",
         "final-attestation",
     ]);
     let redelivery_headroom = external_effect_count(&steps);
-    for _ in 0..redelivery_headroom {
-        steps.extend([
-            "proven-no-admission-refence",
-            "proven-no-admission-redelivery",
-        ]);
-    }
+    steps.extend(std::iter::repeat_n(
+        "proven-no-admission-redelivery",
+        redelivery_headroom,
+    ));
     steps
 }
 
@@ -911,12 +1112,13 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
     let mut stopped = operation.clone();
     stopped.phase = crate::crd::DurableOperationPhase::Poisoned;
     stopped.pending_action = None;
+    let state = DurableSwitchoverState::from_operation(operation);
     let variants = [
         DurableSwitchoverStepResult::Advance {
-            operation: operation.clone(),
+            operation: state.clone(),
         },
         DurableSwitchoverStepResult::ProvenNoAdmission {
-            operation: operation.clone(),
+            operation: state.clone(),
             action_id: operation
                 .pending_action
                 .as_ref()
@@ -925,17 +1127,17 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
             redelivery: 1,
         },
         DurableSwitchoverStepResult::Complete {
-            operation: operation.clone(),
+            operation: state.clone(),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
         },
         DurableSwitchoverStepResult::Complete {
-            operation: operation.clone(),
+            operation: state,
             snapshot: previous.clone(),
             compensated: true,
         },
         DurableSwitchoverStepResult::Stopped {
-            operation: stopped.clone(),
+            operation: DurableSwitchoverState::from_operation(&stopped),
             message: "x".repeat(512),
         },
     ];
@@ -943,79 +1145,72 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
         encode_step_result(variant)?;
     }
     for terminal in [
-        DurableSwitchoverPilotTerminal::Complete {
-            operation: operation.clone(),
+        DurableSwitchoverTerminalRecord::Complete {
+            state: DurableSwitchoverState::from_operation(operation),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
         },
-        DurableSwitchoverPilotTerminal::Complete {
-            operation: operation.clone(),
+        DurableSwitchoverTerminalRecord::Complete {
+            state: DurableSwitchoverState::from_operation(operation),
             snapshot: previous,
             compensated: true,
         },
-        DurableSwitchoverPilotTerminal::Stopped {
-            operation: Some(stopped),
+        DurableSwitchoverTerminalRecord::Stopped {
+            state: Some(DurableSwitchoverState::from_operation(&stopped)),
             message: "x".repeat(512),
         },
     ] {
-        encode_terminal(&terminal)?;
+        encode_terminal_record(&terminal)?;
     }
     Ok(())
 }
 
 fn projected_rollback_steps(member_count: usize) -> Vec<&'static str> {
     let mut steps = vec![
-        "revoke.prepare",
-        "revoke.fence",
-        "revoke.resolve",
+        "revoke.observe",
+        "revoke.effect",
         "capture-lsn",
         "target-catch-up",
-        "demote.prepare",
-        "demote.fence",
-        "demote.resolve",
-        "promote.prepare",
-        "promote.fence",
-        "promote.failure",
-        "rollback-promote.prepare",
-        "rollback-promote.fence",
-        "rollback-promote.resolve",
+        "demote.observe",
+        "demote.effect",
+        "promote.observe",
+        "promote.effect",
+        "rollback-promote.observe",
+        "rollback-promote.effect",
     ];
     for _ in 0..member_count.saturating_sub(1) {
-        steps.extend([
-            "rollback-epoch.prepare",
-            "rollback-epoch.fence",
-            "rollback-epoch.resolve",
-        ]);
+        steps.extend(["rollback-epoch.observe", "rollback-epoch.effect"]);
     }
-    steps.push("rollback-epoch.complete");
     steps.extend([
-        "rollback-catch-up.prepare",
-        "rollback-catch-up.fence",
-        "rollback-catch-up.resolve",
-        "rollback-current.prepare",
-        "rollback-current.fence",
-        "rollback-current.resolve",
-        "rollback-old-label.prepare",
-        "rollback-old-label.resolve",
-        "rollback-target-label.prepare",
-        "rollback-target-label.resolve",
+        "rollback-catch-up.observe",
+        "rollback-catch-up.effect",
+        "rollback-current.observe",
+        "rollback-current.effect",
+        "rollback-old-label.effect",
+        "rollback-target-label.effect",
         "rollback-final-attestation",
     ]);
     let redelivery_headroom = external_effect_count(&steps);
-    for _ in 0..redelivery_headroom {
-        steps.extend([
-            "proven-no-admission-refence",
-            "proven-no-admission-redelivery",
-        ]);
-    }
+    steps.extend(std::iter::repeat_n(
+        "proven-no-admission-redelivery",
+        redelivery_headroom,
+    ));
     steps
 }
 
 fn external_effect_count(steps: &[&str]) -> usize {
     steps
         .iter()
-        .filter(|step| step.ends_with(".resolve") || step.ends_with(".failure"))
+        .filter(|step| step.ends_with(".effect"))
         .count()
+}
+
+const fn projected_success_pure_transitions() -> usize {
+    10
+}
+
+const fn projected_rollback_pure_transitions() -> usize {
+    11
 }
 
 pub fn maximum_active_checkpoint() -> Result<CheckpointEnvelope, String> {
@@ -1125,6 +1320,10 @@ mod durable_switchover_pilot_tests {
                 .collect(),
             write_quorum: u32::try_from(member_count / 2 + 1).unwrap(),
         }
+    }
+
+    fn compact(operation: &DurableOperationStatus) -> DurableSwitchoverState {
+        DurableSwitchoverState::from_operation(operation)
     }
 
     #[test]
@@ -1354,7 +1553,7 @@ mod durable_switchover_pilot_tests {
                 ActivityObservation::new(
                     first_permit.activity().clone(),
                     encode_step_result(&DurableSwitchoverStepResult::Advance {
-                        operation: advanced.clone(),
+                        operation: compact(&advanced),
                     })
                     .unwrap(),
                 ),
@@ -1375,7 +1574,7 @@ mod durable_switchover_pilot_tests {
                 ActivityObservation::new(
                     second_permit.activity().clone(),
                     encode_step_result(&DurableSwitchoverStepResult::Complete {
-                        operation: advanced.clone(),
+                        operation: compact(&advanced),
                         snapshot: terminal_snapshot.clone(),
                         compensated: false,
                     })
@@ -1396,7 +1595,7 @@ mod durable_switchover_pilot_tests {
             panic!("expected workflow completion, found {completed:?}");
         };
         assert_eq!(
-            decode_terminal(&outcome).unwrap(),
+            decode_terminal(&outcome, &initial).unwrap(),
             DurableSwitchoverPilotTerminal::Complete {
                 operation: advanced,
                 snapshot: terminal_snapshot,
@@ -1482,7 +1681,7 @@ mod durable_switchover_pilot_tests {
                 ActivityObservation::new(
                     permit.activity().clone(),
                     encode_step_result(&DurableSwitchoverStepResult::Stopped {
-                        operation: stopped.clone(),
+                        operation: compact(&stopped),
                         message: "ambiguous effect remains quarantined".to_string(),
                     })
                     .unwrap(),
@@ -1498,7 +1697,7 @@ mod durable_switchover_pilot_tests {
         };
         assert!(matches!(outcome, TerminalOutcome::Failed(_)));
         assert_eq!(
-            decode_terminal(&outcome).unwrap(),
+            decode_terminal(&outcome, &operation).unwrap(),
             DurableSwitchoverPilotTerminal::Stopped {
                 operation: Some(stopped),
                 message: "ambiguous effect remains quarantined".to_string(),
@@ -1520,14 +1719,23 @@ mod durable_switchover_pilot_tests {
             checkpoint_limits(),
         );
         let permit = expose_next(&mut host, &DurableSwitchoverWorkflow, &execution).await;
+        let current = decode_activity_input_state(permit.activity().input())
+            .unwrap()
+            .apply_to(&operation)
+            .unwrap();
         let mut guard = PilotPermitGuard::new(permit);
         assert!(guard.activity().is_some());
-        let consumed = guard.consume_for(&operation).unwrap();
+        let consumed = guard.consume_for(&current).unwrap();
         assert_eq!(
             consumed.activity().input().as_slice(),
-            serde_json::to_vec(&operation).unwrap()
+            encode_activity_input::<DurableSwitchoverActivity>(&DurableSwitchoverActivityInput {
+                version: PILOT_VERSION,
+                state: compact(&current),
+            })
+            .unwrap()
+            .as_slice()
         );
-        assert!(guard.consume_for(&operation).is_err());
+        assert!(guard.consume_for(&current).is_err());
     }
 
     #[test]
@@ -1535,12 +1743,15 @@ mod durable_switchover_pilot_tests {
         let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let operation = initial_operation(&reference).unwrap();
         let observations = OperationObservations::new();
-        let PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance {
-            operation: pending,
-        }) = evaluate_adapter_step(&operation, &observations, 100).unwrap()
+        let PilotAdapterDecision::Observe(result) =
+            evaluate_adapter_step(&operation, &observations, 100).unwrap()
         else {
             panic!("initial explicit decision must persist the correlated revoke action");
         };
+        let DurableSwitchoverStepResult::Advance { operation: pending } = *result else {
+            panic!("initial explicit decision must advance compact state");
+        };
+        let pending = pending.apply_to(&operation).unwrap();
         assert!(pending.pending_action.is_some());
         assert!(matches!(
             evaluate_adapter_step(&pending, &observations, 100).unwrap(),
@@ -1552,15 +1763,23 @@ mod durable_switchover_pilot_tests {
     fn adapter_turns_effect_free_poison_into_stopped_result() {
         let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let initial = initial_operation(&reference).unwrap();
-        let PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance {
-            operation: pending,
-        }) = evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
+        let PilotAdapterDecision::Observe(result) =
+            evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
         else {
             panic!("expected persisted revoke intent");
         };
+        let DurableSwitchoverStepResult::Advance { operation: pending } = *result else {
+            panic!("expected compact revoke state");
+        };
+        let pending = pending.apply_to(&initial).unwrap();
+        let PilotAdapterDecision::Observe(result) =
+            evaluate_adapter_step(&pending, &OperationObservations::new(), 1_000).unwrap()
+        else {
+            panic!("expired operation did not produce an observation");
+        };
         assert!(matches!(
-            evaluate_adapter_step(&pending, &OperationObservations::new(), 1_000).unwrap(),
-            PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Stopped { .. })
+            *result,
+            DurableSwitchoverStepResult::Stopped { .. }
         ));
     }
 
@@ -1568,12 +1787,15 @@ mod durable_switchover_pilot_tests {
     async fn proven_no_admission_redelivery_is_bounded_per_action() {
         let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let initial = initial_operation(&reference).unwrap();
-        let PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance {
-            operation: pending,
-        }) = evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
+        let PilotAdapterDecision::Observe(result) =
+            evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
         else {
             panic!("expected persisted revoke action");
         };
+        let DurableSwitchoverStepResult::Advance { operation: pending } = *result else {
+            panic!("expected compact revoke state");
+        };
+        let pending = pending.apply_to(&initial).unwrap();
         let action_id = pending.pending_action.as_ref().unwrap().action_id.clone();
         reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
         let execution = execution_spec(&reference).unwrap();
@@ -1595,7 +1817,7 @@ mod durable_switchover_pilot_tests {
                     ActivityObservation::new(
                         permit.activity().clone(),
                         encode_step_result(&DurableSwitchoverStepResult::ProvenNoAdmission {
-                            operation: pending.clone(),
+                            operation: compact(&pending),
                             action_id: action_id.clone(),
                             redelivery: 1,
                         })
@@ -1640,7 +1862,7 @@ mod durable_switchover_pilot_tests {
                 ActivityObservation::new(
                     permit.activity().clone(),
                     encode_step_result(&DurableSwitchoverStepResult::Complete {
-                        operation: failed.clone(),
+                        operation: compact(&failed),
                         snapshot: previous.clone(),
                         compensated: true,
                     })
@@ -1656,7 +1878,7 @@ mod durable_switchover_pilot_tests {
             panic!("expected compensated terminal");
         };
         assert_eq!(
-            decode_terminal(&outcome).unwrap(),
+            decode_terminal(&outcome, &failed).unwrap(),
             DurableSwitchoverPilotTerminal::Complete {
                 operation: failed,
                 snapshot: previous,
@@ -1686,13 +1908,10 @@ mod durable_switchover_pilot_tests {
             panic!("malformed input must fail terminally, found {outcome:?}");
         };
         assert!(matches!(outcome, TerminalOutcome::Failed(_)));
-        assert!(matches!(
-            decode_terminal(&outcome).unwrap(),
-            DurableSwitchoverPilotTerminal::Stopped {
-                operation: None,
-                ..
-            }
-        ));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(outcome.payload().as_slice()).unwrap()["status"]
+                == "stopped"
+        );
     }
 
     #[test]
@@ -1719,10 +1938,86 @@ mod durable_switchover_pilot_tests {
         let mut oversized = initial;
         oversized.last_error = Some("x".repeat(PILOT_MAX_ACTIVITY_RESULT_BYTES));
         let error = encode_step_result(&DurableSwitchoverStepResult::Advance {
-            operation: oversized,
+            operation: compact(&oversized),
         })
         .unwrap_err();
         assert!(error.contains("activity result is"), "{error}");
+    }
+
+    #[test]
+    fn compact_activity_payloads_exclude_immutable_operation_snapshots() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let state = compact(&operation);
+        let input =
+            encode_activity_input::<DurableSwitchoverActivity>(&DurableSwitchoverActivityInput {
+                version: PILOT_VERSION,
+                state: state.clone(),
+            })
+            .unwrap();
+        let result =
+            encode_step_result(&DurableSwitchoverStepResult::Advance { operation: state }).unwrap();
+        for payload in [input, result] {
+            let text = std::str::from_utf8(payload.as_slice()).unwrap();
+            assert!(!text.contains("previousSnapshot"));
+            assert!(!text.contains("targetSnapshot"));
+            assert!(!text.contains("operationId"));
+            assert!(!text.contains("executionId"));
+        }
+    }
+
+    #[test]
+    fn effect_free_pending_creation_advances_without_an_activity() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let pending = advance_effect_free(&operation).unwrap().unwrap();
+        assert_eq!(pending.phase, operation.phase);
+        assert!(pending.pending_action.is_some());
+        assert!(advance_effect_free(&pending).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn same_state_activity_result_stops_before_consuming_history_capacity() {
+        let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut initial = initial_operation(&reference).unwrap();
+        initial.phase = DurableOperationPhase::CaptureLsn;
+        reference.initial_operation_json = serde_json::to_string(&initial).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            ),
+            HostEpoch::from_bytes([31; 16]),
+            checkpoint_limits(),
+        );
+        let permit = expose_next(&mut host, &DurableSwitchoverWorkflow, &execution).await;
+        let current = decode_activity_input_state(permit.activity().input()).unwrap();
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    permit.activity().clone(),
+                    encode_step_result(&DurableSwitchoverStepResult::Advance {
+                        operation: current,
+                    })
+                    .unwrap(),
+                ),
+            )
+            .await,
+            kuberic_durable_execution::HostOutcome::ObservationAccepted { .. }
+        ));
+        let kuberic_durable_execution::HostOutcome::WorkflowCompleted { outcome, .. } =
+            host.turn(&DurableSwitchoverWorkflow, execution).await
+        else {
+            panic!("same-state transcript did not stop");
+        };
+        let DurableSwitchoverPilotTerminal::Stopped { message, .. } =
+            decode_terminal(&outcome, &initial).unwrap()
+        else {
+            panic!("no-progress result did not produce stopped terminal");
+        };
+        assert!(message.contains("no protocol progress"));
     }
 
     #[test]
@@ -1731,11 +2026,11 @@ mod durable_switchover_pilot_tests {
         let operation = initial_operation(&reference).unwrap();
         let terminal = DurableSwitchoverPilotTerminal::Complete {
             snapshot: operation.previous_snapshot.cloned().unwrap(),
-            operation,
+            operation: operation.clone(),
             compensated: true,
         };
         let outcome = TerminalOutcome::succeeded(encode_terminal(&terminal).unwrap());
-        assert_eq!(decode_terminal(&outcome).unwrap(), terminal);
+        assert_eq!(decode_terminal(&outcome, &operation).unwrap(), terminal);
     }
 
     #[test]
@@ -1767,7 +2062,19 @@ mod durable_switchover_pilot_tests {
             })
             .unwrap(),
         );
-        assert!(validate_loaded_terminal(&reference, &wrong_identity).is_err());
+        let canonical = validate_loaded_terminal(&reference, &wrong_identity).unwrap();
+        let DurableSwitchoverPilotTerminal::Complete {
+            operation: canonical,
+            ..
+        } = canonical
+        else {
+            panic!("expected compact completed terminal");
+        };
+        assert_eq!(
+            canonical.operation_id,
+            initial_operation(&reference).unwrap().operation_id,
+            "immutable identity comes only from the authoritative initial reference"
+        );
 
         let mut wrong_snapshot = operation.target_snapshot.clone();
         wrong_snapshot.primary_id = operation.old_primary_id;
@@ -1935,12 +2242,6 @@ mod durable_switchover_pilot_tests {
         ] {
             let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
             let execution = execution_spec(&reference).unwrap();
-            let initial = initial_operation(&reference).unwrap();
-            let PilotAdapterDecision::Observe(result) =
-                evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
-            else {
-                panic!("initial decision must be an effect-free advance");
-            };
             let backend = InMemoryCheckpointStore::new();
             let mut host = DurableHost::new(
                 MeasuredPilotCheckpointStore::new(
@@ -1951,6 +2252,9 @@ mod durable_switchover_pilot_tests {
                 checkpoint_limits(),
             );
             let permit = expose_next(&mut host, &DurableSwitchoverWorkflow, &execution).await;
+            let mut next = decode_activity_input_state(permit.activity().input()).unwrap();
+            next.last_error = Some("authoritative observation advanced state".to_string());
+            let result = DurableSwitchoverStepResult::Advance { operation: next };
             backend.fail_next_compare_and_swap(fault);
             let observed = host
                 .observe(
@@ -2140,11 +2444,15 @@ mod durable_switchover_pilot_tests {
     fn success_and_rollback_transcripts_fit_with_redelivery_headroom() {
         let success = projected_success_steps(PILOT_MAX_REPLICAS);
         let rollback = projected_rollback_steps(PILOT_MAX_REPLICAS);
-        assert_eq!(success.len(), 47);
-        assert_eq!(rollback.len(), 52);
+        assert_eq!(success.len(), 28);
+        assert_eq!(rollback.len(), 31);
         assert!(success.len() <= PILOT_MAX_ACTIVITY_RECORDS);
         assert!(rollback.len() <= PILOT_MAX_ACTIVITY_RECORDS);
+        assert!(success.len() + projected_success_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL);
+        assert!(
+            rollback.len() + projected_rollback_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL
+        );
         assert!(success.contains(&"proven-no-admission-redelivery"));
-        assert!(rollback.contains(&"rollback-promote.resolve"));
+        assert!(rollback.contains(&"rollback-promote.effect"));
     }
 }
