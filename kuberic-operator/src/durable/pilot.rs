@@ -5,7 +5,10 @@
 //! later phases; this module owns only identity, bounds, and Kubernetes
 //! lifecycle policy.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use async_trait::async_trait;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -272,7 +275,7 @@ impl Workflow for DurableSwitchoverWorkflow {
             );
         }
         let initial = input.initial_operation;
-        if let Err(error) = validate_pilot_admission(&initial) {
+        if let Err(error) = validate_pilot_operation(&initial) {
             return terminal_failure(Some(initial), error);
         }
         if let Err(error) = validate_switchover_operation(&initial) {
@@ -568,8 +571,7 @@ fn validate_transition(
     {
         return Err("durable switchover activity changed immutable operation identity".to_string());
     }
-    validate_pilot_admission(next)?;
-    validate_switchover_operation(next)
+    validate_pilot_operation(next)
 }
 
 fn validate_phase_transition(
@@ -929,6 +931,30 @@ pub fn checkpoint_store_options(
 }
 
 pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<(), String> {
+    validate_pilot_operation(operation)?;
+    validate_variant_bounds(operation)?;
+    let previous_snapshot = operation
+        .previous_snapshot
+        .as_ref()
+        .ok_or_else(|| "durable switchover pilot has no previous snapshot".to_string())?;
+    let success_steps = projected_success_steps(previous_snapshot.members.len());
+    let rollback_steps = projected_rollback_steps(previous_snapshot.members.len());
+    let projected_steps = success_steps.len().max(rollback_steps.len());
+    if projected_steps > PILOT_MAX_ACTIVITY_RECORDS {
+        return Err(format!(
+            "durable switchover requires {projected_steps} projected activities; maximum is {PILOT_MAX_ACTIVITY_RECORDS}"
+        ));
+    }
+    let projected_bytes = maximum_projected_checkpoint_bytes()?;
+    if projected_bytes > PILOT_MAX_ENCODED_CHECKPOINT_BYTES {
+        return Err(format!(
+            "durable switchover projected checkpoint is {projected_bytes} bytes; maximum is {PILOT_MAX_ENCODED_CHECKPOINT_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_pilot_operation(operation: &DurableOperationStatus) -> Result<(), String> {
     validate_switchover_operation(operation)?;
     let previous_snapshot = operation
         .previous_snapshot
@@ -948,25 +974,18 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
             "durable switchover operation is {operation_bytes} bytes; maximum is {PILOT_MAX_OPERATION_BYTES}"
         ));
     }
-    validate_variant_bounds(operation)?;
-    let success_steps = projected_success_steps(previous_snapshot.members.len());
-    let rollback_steps = projected_rollback_steps(previous_snapshot.members.len());
-    let projected_steps = success_steps.len().max(rollback_steps.len());
-    if projected_steps > PILOT_MAX_ACTIVITY_RECORDS {
-        return Err(format!(
-            "durable switchover requires {projected_steps} projected activities; maximum is {PILOT_MAX_ACTIVITY_RECORDS}"
-        ));
-    }
-    let projected = maximum_active_checkpoint()?;
-    let projected_bytes = projected
-        .encoded_len()
-        .map_err(|error| format!("measure maximum pilot checkpoint: {error}"))?;
-    if projected_bytes > PILOT_MAX_ENCODED_CHECKPOINT_BYTES {
-        return Err(format!(
-            "durable switchover projected checkpoint is {projected_bytes} bytes; maximum is {PILOT_MAX_ENCODED_CHECKPOINT_BYTES}"
-        ));
-    }
     Ok(())
+}
+
+fn maximum_projected_checkpoint_bytes() -> Result<usize, String> {
+    static PROJECTED_BYTES: OnceLock<Result<usize, String>> = OnceLock::new();
+    PROJECTED_BYTES
+        .get_or_init(|| {
+            maximum_active_checkpoint()?
+                .encoded_len()
+                .map_err(|error| format!("measure maximum pilot checkpoint: {error}"))
+        })
+        .clone()
 }
 
 fn projected_success_steps(member_count: usize) -> Vec<&'static str> {

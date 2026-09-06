@@ -41,7 +41,7 @@ use crate::durable::pilot::{
     DurableSwitchoverPilotTerminal, DurableSwitchoverStepResult, DurableSwitchoverWorkflow,
     PilotAdapterDecision, PilotPermitGuard, encode_step_result, evaluate_adapter_step,
     execution_spec, initial_operation, new_pilot_reference, validate_loaded_terminal,
-    validate_pilot_admission,
+    validate_pilot_operation,
 };
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
@@ -619,7 +619,13 @@ pub fn resolve_pilot_quarantine(
     match decision {
         PilotAdapterDecision::Observe(result)
             if operation.pending_action.as_ref().is_some_and(|pending| {
-                pending.dispatch_agent_generation.is_none()
+                !matches!(
+                    pending.kind,
+                    crate::crd::DurableActionKind::LabelTargetPrimary
+                        | crate::crd::DurableActionKind::LabelOldSecondary
+                        | crate::crd::DurableActionKind::CompensateLabelOldPrimary
+                        | crate::crd::DurableActionKind::CompensateLabelTargetSecondary
+                ) && pending.dispatch_agent_generation.is_none()
                     && pending.dispatch_agent_control_version.is_none()
                     && pending.dispatch_observed_runtime_epoch.is_none()
                     && pending.dispatch_action_payload.is_empty()
@@ -3506,7 +3512,7 @@ fn current_pilot_operation(
             })
         }
     }?;
-    validate_pilot_admission(&operation)?;
+    validate_pilot_operation(&operation)?;
     Ok(operation)
 }
 
@@ -5301,6 +5307,33 @@ mod dispatch_planning_tests {
             resolve_pilot_quarantine(&operation, decision, &OperationObservations::new()).unwrap(),
             PilotEffectBridgeOutcome::Observe(result)
                 if matches!(*result, DurableSwitchoverStepResult::Stopped { .. })
+        ));
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn expired_exposed_label_is_not_mistaken_for_effect_free() {
+        let mut operation = pilot_operation();
+        operation.phase = DurableOperationPhase::LabelTargetPrimary;
+        let Decision::Persist(mut operation) =
+            decide(&operation, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected label intent");
+        };
+        operation
+            .pending_action
+            .as_mut()
+            .unwrap()
+            .deadline_unix_seconds = 0;
+        let decision = crate::durable::pilot::evaluate_adapter_step(
+            &operation,
+            &OperationObservations::new(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_pilot_quarantine(&operation, decision, &OperationObservations::new()).unwrap(),
+            PilotEffectBridgeOutcome::AwaitEvidence
         ));
     }
 
