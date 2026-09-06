@@ -288,11 +288,10 @@ impl Workflow for DurableSwitchoverWorkflow {
                     if let Err(error) = validate_transition(&initial, &next) {
                         return terminal_failure(Some(operation), error);
                     }
-                    if next != operation {
-                        return terminal_failure(
-                            Some(operation),
-                            "proven-no-admission result changed operation state".to_string(),
-                        );
+                    if let Err(error) =
+                        validate_no_admission_transition(&operation, &next, &action_id)
+                    {
+                        return terminal_failure(Some(operation), error);
                     }
                     let expected_action_id = operation
                         .pending_action
@@ -564,6 +563,43 @@ fn validate_phase_transition(
             current.phase, next.phase
         ))
     }
+}
+
+fn validate_no_admission_transition(
+    current: &DurableOperationStatus,
+    next: &DurableOperationStatus,
+    action_id: &str,
+) -> Result<(), String> {
+    if current.phase != next.phase {
+        return Err("proven-no-admission changed switchover phase".to_string());
+    }
+    let Some(current_pending) = current.pending_action.as_ref() else {
+        return Err("proven-no-admission has no current pending action".to_string());
+    };
+    let Some(next_pending) = next.pending_action.as_ref() else {
+        return Err("proven-no-admission removed the pending action".to_string());
+    };
+    if current_pending.action_id != action_id || next_pending.action_id != action_id {
+        return Err("proven-no-admission changed correlated action identity".to_string());
+    }
+    let mut normalized_current = current.clone();
+    let mut normalized_next = next.clone();
+    normalized_current.last_error = None;
+    normalized_next.last_error = None;
+    for pending in [
+        normalized_current.pending_action.as_mut().unwrap(),
+        normalized_next.pending_action.as_mut().unwrap(),
+    ] {
+        pending.last_error = None;
+        pending.dispatch_agent_generation = None;
+        pending.dispatch_agent_control_version = None;
+        pending.dispatch_observed_runtime_epoch = None;
+        pending.dispatch_action_payload.clear();
+    }
+    if normalized_current != normalized_next {
+        return Err("proven-no-admission changed non-dispatch operation state".to_string());
+    }
+    Ok(())
 }
 
 fn validate_terminal(

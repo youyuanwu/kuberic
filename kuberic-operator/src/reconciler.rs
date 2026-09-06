@@ -34,6 +34,8 @@ use crate::crd::{
 };
 #[cfg(feature = "durable-switchover-pilot")]
 use crate::durable::pilot::DurableSwitchoverPilotRuntime;
+#[cfg(feature = "durable-switchover-pilot")]
+use crate::durable::pilot::{DurableSwitchoverStepResult, PilotAdapterDecision, PilotPermitGuard};
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
     RemoveReplicaTarget, ReplicaObservation, adopt_replacement_before_confirmation,
@@ -470,6 +472,7 @@ fn operation_after_dispatch_error(
             clear_dispatch_evidence(pending);
             pending.last_error = Some(error.to_string().chars().take(512).collect());
         }
+
         next
     } else if dispatch_rejection_is_retryable_without_execution(error) {
         let mut next = operation.clone();
@@ -480,6 +483,279 @@ fn operation_after_dispatch_error(
     } else {
         record_activity_error(operation, &error.to_string())
     }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+/// Result of handling one dispatch-permitted durable pilot activity.
+pub enum PilotEffectBridgeOutcome {
+    Observe(Box<DurableSwitchoverStepResult>),
+    Exposed,
+    AwaitEvidence,
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+/// Consume one permit and either persist adapter evidence, issue one existing
+/// correlated effect, or leave the activity exposed for observation.
+pub async fn bridge_pilot_permitted_step(
+    guard: &mut PilotPermitGuard,
+    operation: &DurableOperationStatus,
+    decision: PilotAdapterDecision,
+    observations: &OperationObservations,
+    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
+    api: &dyn ClusterApi,
+    namespace: &str,
+) -> Result<PilotEffectBridgeOutcome, String> {
+    let _permit = guard.consume_for(operation)?;
+    match decision {
+        PilotAdapterDecision::Observe(result) => {
+            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
+        }
+        PilotAdapterDecision::AwaitEvidence => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
+        PilotAdapterDecision::External(Decision::Execute {
+            target_id,
+            action_id,
+            action,
+        }) => {
+            let pending = operation.pending_action.as_ref().ok_or_else(|| {
+                "pilot execution requested a replica effect without pending intent".to_string()
+            })?;
+            if pending.action_id != action_id {
+                return Err(
+                    "pilot replica effect does not match pending correlation identity".to_string(),
+                );
+            }
+            let Some(observed) = observations.get(&target_id) else {
+                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+            };
+            let Some(handle) = handles.get(&target_id) else {
+                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+            };
+            match plan_dispatch_evidence(
+                pending,
+                &observed.status,
+                &handle.instance_id(),
+                &action,
+                true,
+            ) {
+                DispatchEvidencePlan::Persist(planned) => {
+                    let mut next = operation.clone();
+                    next.pending_action = Some(*planned);
+                    return Ok(PilotEffectBridgeOutcome::Observe(Box::new(
+                        DurableSwitchoverStepResult::Advance { operation: next },
+                    )));
+                }
+                DispatchEvidencePlan::WaitForExactIncarnation
+                | DispatchEvidencePlan::WaitForSupportedProtocol => {
+                    return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+                }
+                DispatchEvidencePlan::Ready => {}
+            }
+            match execute_planned_control_action(handle.as_ref(), pending, None).await {
+                Ok(()) => Ok(PilotEffectBridgeOutcome::Exposed),
+                Err(error) => match pilot_result_after_dispatch_error(operation, action_id, &error)
+                {
+                    Some(result) => Ok(PilotEffectBridgeOutcome::Observe(Box::new(result))),
+                    None => Ok(PilotEffectBridgeOutcome::Exposed),
+                },
+            }
+        }
+        PilotAdapterDecision::External(Decision::PatchPodRole { target_id, role }) => {
+            let (pod_name, expected_uid) =
+                exact_pilot_label_target(operation, target_id, observations)?;
+            let mut labels = BTreeMap::new();
+            labels.insert("kuberic.io/role".to_string(), role);
+            let _ = api
+                .patch_pod_labels_if_uid(namespace, &pod_name, &expected_uid, labels)
+                .await;
+            Ok(PilotEffectBridgeOutcome::Exposed)
+        }
+        PilotAdapterDecision::External(other) => Err(format!(
+            "unsupported external decision reached durable switchover pilot: {other:?}"
+        )),
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn pilot_result_after_dispatch_error(
+    operation: &DurableOperationStatus,
+    action_id: String,
+    error: &KubericError,
+) -> Option<DurableSwitchoverStepResult> {
+    if dispatch_rejection_requires_refresh(error)
+        || dispatch_rejection_is_retryable_without_execution(error)
+    {
+        return Some(DurableSwitchoverStepResult::ProvenNoAdmission {
+            operation: operation_after_dispatch_error(operation, error),
+            action_id,
+            redelivery: 1,
+        });
+    }
+    matches!(error, KubericError::RemoteAgentConflict(_)).then(|| {
+        DurableSwitchoverStepResult::Stopped {
+            operation: fail_closed(operation, &error.to_string()),
+            message: error.to_string(),
+        }
+    })
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+/// Resolve an exposed activity only from authoritative replica observations.
+pub fn resolve_pilot_quarantine(
+    operation: &DurableOperationStatus,
+    decision: PilotAdapterDecision,
+    observations: &OperationObservations,
+) -> Result<PilotEffectBridgeOutcome, String> {
+    match decision {
+        PilotAdapterDecision::Observe(result)
+            if quarantine_result_is_authoritative(operation, &result, observations) =>
+        {
+            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
+        }
+        PilotAdapterDecision::Observe(_) => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
+        PilotAdapterDecision::AwaitEvidence => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
+        PilotAdapterDecision::External(Decision::Execute { target_id, .. })
+            if generation_change_proves_no_admission(operation, target_id, observations) =>
+        {
+            let pending = operation.pending_action.as_ref().ok_or_else(|| {
+                "quarantined pilot execution has no pending correlated action".to_string()
+            })?;
+            let mut next = operation.clone();
+            if let Some(next_pending) = next.pending_action.as_mut() {
+                clear_dispatch_evidence(next_pending);
+            }
+            Ok(PilotEffectBridgeOutcome::Observe(Box::new(
+                DurableSwitchoverStepResult::ProvenNoAdmission {
+                    operation: next,
+                    action_id: pending.action_id.clone(),
+                    redelivery: 1,
+                },
+            )))
+        }
+        PilotAdapterDecision::External(_) => Ok(PilotEffectBridgeOutcome::AwaitEvidence),
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn quarantine_result_is_authoritative(
+    operation: &DurableOperationStatus,
+    result: &DurableSwitchoverStepResult,
+    observations: &OperationObservations,
+) -> bool {
+    match result {
+        DurableSwitchoverStepResult::Complete { .. } => operation.pending_action.is_none(),
+        DurableSwitchoverStepResult::Stopped { .. } => false,
+        DurableSwitchoverStepResult::ProvenNoAdmission { .. } => true,
+        DurableSwitchoverStepResult::Advance { operation: next } => {
+            if next.phase == DurableOperationPhase::Poisoned {
+                return false;
+            }
+            let Some(pending) = operation.pending_action.as_ref() else {
+                return true;
+            };
+            if let Some(observed) = observations.get(&pending.target_id)
+                && let Some(action) =
+                    correlated_action_observation(&observed.status, &pending.action_id)
+            {
+                return matches!(
+                    action.state,
+                    DurableActionState::Completed | DurableActionState::Failed
+                ) && next.pending_action.is_none();
+            }
+            pending_postcondition_transition(operation, next, pending)
+        }
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn pending_postcondition_transition(
+    operation: &DurableOperationStatus,
+    next: &DurableOperationStatus,
+    pending: &PendingActionStatus,
+) -> bool {
+    use crate::crd::DurableActionKind as Action;
+    use crate::crd::DurableOperationPhase as Phase;
+    if next.pending_action.is_some() {
+        return false;
+    }
+    match pending.kind {
+        Action::RevokeWrite => next.phase == Phase::CaptureLsn,
+        Action::DemoteOldPrimary => next.phase == Phase::PromoteTarget,
+        Action::PromoteTarget => next.phase == Phase::DistributeEpoch,
+        Action::UpdateSecondaryEpoch => {
+            next.phase == operation.phase
+                && next.next_secondary_index == operation.next_secondary_index.saturating_add(1)
+        }
+        Action::UpdateCatchUpConfiguration => next.phase == Phase::WaitForCatchUpQuorum,
+        Action::WaitForCatchUpQuorum => next.phase == Phase::UpdateCurrentConfiguration,
+        Action::UpdateCurrentConfiguration => next.phase == Phase::LabelTargetPrimary,
+        Action::LabelTargetPrimary => next.phase == Phase::LabelOldSecondary,
+        Action::LabelOldSecondary => next.phase == Phase::Finalize,
+        Action::RestorePreviousConfiguration => next.phase == Phase::Failed,
+        Action::CompensatePromoteOldPrimary => next.phase == Phase::CompensateDistributeEpoch,
+        Action::CompensateUpdateSecondaryEpoch => {
+            next.phase == operation.phase
+                && next.next_secondary_index == operation.next_secondary_index.saturating_add(1)
+        }
+        Action::CompensateCatchUpConfiguration => {
+            next.phase == Phase::CompensateCurrentConfiguration
+        }
+        Action::CompensateCurrentConfiguration => next.phase == Phase::CompensateLabelOldPrimary,
+        Action::CompensateLabelOldPrimary => next.phase == Phase::CompensateLabelTargetSecondary,
+        Action::CompensateLabelTargetSecondary => next.phase == Phase::CompensateFinalize,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn generation_change_proves_no_admission(
+    operation: &DurableOperationStatus,
+    target_id: ReplicaId,
+    observations: &OperationObservations,
+) -> bool {
+    let Some(pending) = operation.pending_action.as_ref() else {
+        return false;
+    };
+    let Some(dispatched_generation) = pending.dispatch_agent_generation.as_deref() else {
+        return false;
+    };
+    let Some(observed) = observations.get(&target_id) else {
+        return false;
+    };
+    observed.status.agent.generation.as_str() != dispatched_generation
+        && correlated_action_observation(&observed.status, &pending.action_id).is_none()
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+fn exact_pilot_label_target(
+    operation: &DurableOperationStatus,
+    target_id: ReplicaId,
+    observations: &OperationObservations,
+) -> Result<(String, String), String> {
+    let expected_uid = operation
+        .previous_snapshot
+        .members
+        .iter()
+        .find(|member| member.id == target_id)
+        .or_else(|| {
+            operation
+                .target_snapshot
+                .members
+                .iter()
+                .find(|member| member.id == target_id)
+        })
+        .map(|member| member.instance_id.clone())
+        .ok_or_else(|| {
+            format!("pilot label target {target_id} is not in the operation snapshot")
+        })?;
+    let observed = observations
+        .get(&target_id)
+        .ok_or_else(|| format!("pilot label target {target_id} is unavailable"))?;
+    if observed.status.instance_id.as_str() != expected_uid {
+        return Err(format!(
+            "pilot label target {target_id} incarnation changed before patch"
+        ));
+    }
+    Ok((observed.pod_name.clone(), expected_uid))
 }
 
 /// Main reconciliation logic, decoupled from kube-runtime.
@@ -3919,6 +4195,11 @@ mod dispatch_planning_tests {
         AccessStatus, AgentControlVersion, AgentGeneration, CorrelatedActionObservation,
         DurableActionErrorClass, DurableActionObservation, ReplicaAgentStatus,
     };
+    #[cfg(feature = "durable-switchover-pilot")]
+    use std::sync::{
+        Arc as StdArc, Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     fn pending() -> PendingActionStatus {
         PendingActionStatus {
@@ -3978,6 +4259,194 @@ mod dispatch_planning_tests {
         DurableReplicaAction::RevokeWriteStatus
     }
 
+    #[cfg(feature = "durable-switchover-pilot")]
+    fn pilot_snapshot() -> StablePartitionSnapshotStatus {
+        StablePartitionSnapshotStatus {
+            epoch: crate::crd::EpochStatus {
+                data_loss_number: 1,
+                configuration_number: 4,
+            },
+            primary_id: 1,
+            members: vec![
+                StableReplicaSnapshotStatus {
+                    id: 1,
+                    instance_id: "pod-uid".to_string(),
+                    role: StableReplicaRoleStatus::Primary,
+                    election_metadata: None,
+                },
+                StableReplicaSnapshotStatus {
+                    id: 2,
+                    instance_id: "target-uid".to_string(),
+                    role: StableReplicaRoleStatus::ActiveSecondary,
+                    election_metadata: None,
+                },
+            ],
+            write_quorum: 2,
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    fn pilot_operation() -> DurableOperationStatus {
+        crate::durable::start_switchover("set-uid", pilot_snapshot(), 2, 100).unwrap()
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    fn pilot_observations(status: ReplicaStatusInfo) -> OperationObservations {
+        BTreeMap::from([(
+            1,
+            ReplicaObservation {
+                status,
+                control_address: "http://primary".to_string(),
+                replicator_address: "http://primary-data".to_string(),
+                pod_name: "database-0".to_string(),
+                pod_role_label: Some("primary".to_string()),
+            },
+        )])
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    fn pilot_pending_with_fence() -> (DurableOperationStatus, ReplicaStatusInfo) {
+        let operation = pilot_operation();
+        let Decision::Persist(mut operation) =
+            decide(&operation, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected revoke intent");
+        };
+        let observed = observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION);
+        let pending = operation.pending_action.take().unwrap();
+        operation.pending_action = Some(persisted(plan_dispatch_evidence(
+            &pending,
+            &observed,
+            &ReplicaInstanceId::new("pod-uid"),
+            &action(),
+            true,
+        )));
+        (operation, observed)
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    struct BusyPilotHandle {
+        requests: StdArc<StdMutex<Vec<CorrelatedControlActionRequest>>>,
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[async_trait::async_trait]
+    impl ReplicaHandle for BusyPilotHandle {
+        fn id(&self) -> ReplicaId {
+            1
+        }
+
+        fn instance_id(&self) -> ReplicaInstanceId {
+            ReplicaInstanceId::new("pod-uid")
+        }
+
+        fn current_progress(&self) -> i64 {
+            0
+        }
+
+        fn catch_up_capability(&self) -> i64 {
+            0
+        }
+
+        fn control_address(&self) -> String {
+            "http://primary".to_string()
+        }
+
+        fn replicator_address(&self) -> String {
+            "http://primary-data".to_string()
+        }
+
+        async fn get_status(&self) -> kuberic_core::Result<ReplicaStatusInfo> {
+            Ok(observed(
+                kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+            ))
+        }
+
+        async fn execute_correlated_control_action(
+            &self,
+            request: CorrelatedControlActionRequest,
+        ) -> kuberic_core::Result<CorrelatedControlActionAcknowledgement> {
+            self.requests.lock().unwrap().push(request);
+            Err(KubericError::AgentBusy)
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    struct BridgeTestApi {
+        exact_uid_patches: AtomicUsize,
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[async_trait::async_trait]
+    impl ClusterApi for BridgeTestApi {
+        async fn list_pods(&self, _: &str, _: &str) -> Result<Vec<Pod>, String> {
+            Err("unused".to_string())
+        }
+        async fn create_pod(&self, _: &str, _: &Pod) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+        async fn delete_pod(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+        async fn patch_pod_labels(
+            &self,
+            _: &str,
+            _: &str,
+            _: BTreeMap<String, String>,
+        ) -> Result<(), String> {
+            panic!("pilot labels must use the UID-fenced API")
+        }
+        async fn patch_pod_labels_if_uid(
+            &self,
+            _: &str,
+            _: &str,
+            expected_uid: &str,
+            _: BTreeMap<String, String>,
+        ) -> Result<(), String> {
+            assert_eq!(expected_uid, "pod-uid");
+            self.exact_uid_patches.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn patch_set_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: &KubericSetStatus,
+            _: Option<&str>,
+        ) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+        async fn create_replica_handle(
+            &self,
+            _: ReplicaId,
+            _: &Pod,
+            _: &KubericSetSpec,
+        ) -> Result<Box<dyn ReplicaHandle>, String> {
+            Err("unused".to_string())
+        }
+        async fn get_pvc(&self, _: &str, _: &str) -> Result<PersistentVolumeClaim, String> {
+            Err("unused".to_string())
+        }
+        async fn create_pvc(&self, _: &str, _: &PersistentVolumeClaim) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+        async fn list_pvcs(&self, _: &str, _: &str) -> Result<Vec<PersistentVolumeClaim>, String> {
+            Err("unused".to_string())
+        }
+        async fn delete_pvc(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+        async fn get_service(&self, _: &str, _: &str) -> Result<Service, String> {
+            Err("unused".to_string())
+        }
+        async fn create_service(&self, _: &str, _: &Service) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+        async fn delete_service(&self, _: &str, _: &str) -> Result<(), String> {
+            Err("unused".to_string())
+        }
+    }
+
     fn configuration_action(progress: i64) -> DurableReplicaAction {
         DurableReplicaAction::UpdateCurrentConfiguration {
             current: kuberic_core::types::ReplicaSetConfig {
@@ -4005,6 +4474,328 @@ mod dispatch_planning_tests {
                 panic!("expected dispatch evidence persistence")
             }
         }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn quarantine_only_proves_no_admission_after_agent_generation_changes() {
+        let (operation, old_observed) = pilot_pending_with_fence();
+
+        let same_generation = pilot_observations(old_observed.clone());
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&operation, &same_generation, 100)
+                .unwrap();
+        assert!(matches!(
+            resolve_pilot_quarantine(&operation, decision, &same_generation).unwrap(),
+            PilotEffectBridgeOutcome::AwaitEvidence
+        ));
+
+        let mut restarted = old_observed;
+        restarted.agent.generation =
+            AgentGeneration::parse("fedcba9876543210fedcba9876543210").unwrap();
+        let restarted = pilot_observations(restarted);
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&operation, &restarted, 100).unwrap();
+        match resolve_pilot_quarantine(&operation, decision, &restarted).unwrap() {
+            PilotEffectBridgeOutcome::Observe(result) => match *result {
+                DurableSwitchoverStepResult::ProvenNoAdmission {
+                    operation: next,
+                    action_id,
+                    redelivery,
+                } => {
+                    assert_eq!(
+                        action_id,
+                        operation.pending_action.as_ref().unwrap().action_id
+                    );
+                    assert_eq!(redelivery, 1);
+                    assert!(
+                        next.pending_action
+                            .as_ref()
+                            .unwrap()
+                            .dispatch_agent_generation
+                            .is_none()
+                    );
+                }
+                _ => panic!("expected proven-no-admission result"),
+            },
+            _ => panic!("new agent generation and exact precondition must prove no admission"),
+        }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn quarantine_observes_postcondition_but_not_in_progress_timeout_or_mixed_state() {
+        let (operation, base_observed) = pilot_pending_with_fence();
+
+        let mut postcondition = base_observed.clone();
+        postcondition.write_status = AccessStatus::ReconfigurationPending;
+        let postcondition = pilot_observations(postcondition);
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&operation, &postcondition, 100).unwrap();
+        assert!(matches!(
+            resolve_pilot_quarantine(&operation, decision, &postcondition).unwrap(),
+            PilotEffectBridgeOutcome::Observe(_)
+        ));
+
+        let mut in_progress = base_observed.clone();
+        let pending = operation.pending_action.as_ref().unwrap();
+        in_progress.agent.current_action = Some(CorrelatedActionObservation {
+            generation: in_progress.agent.generation.clone(),
+            control_version: in_progress.agent.control_version,
+            action: DurableActionObservation {
+                action_id: pending.action_id.clone(),
+                signature: action().signature(),
+                state: DurableActionState::InProgress,
+                error_class: None,
+                error: None,
+                result: None,
+                add_replica_progress: None,
+                remove_replica_progress: None,
+            },
+        });
+        let in_progress = pilot_observations(in_progress);
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&operation, &in_progress, 111).unwrap();
+        assert!(matches!(
+            resolve_pilot_quarantine(&operation, decision, &in_progress).unwrap(),
+            PilotEffectBridgeOutcome::AwaitEvidence
+        ));
+
+        let mut mixed = base_observed;
+        mixed.role = kuberic_core::types::Role::ActiveSecondary;
+        let mixed = pilot_observations(mixed);
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&operation, &mixed, 100).unwrap();
+        assert!(matches!(
+            resolve_pilot_quarantine(&operation, decision, &mixed).unwrap(),
+            PilotEffectBridgeOutcome::AwaitEvidence
+        ));
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn pilot_label_target_requires_exact_snapshot_incarnation() {
+        let operation = pilot_operation();
+        let observations = pilot_observations(observed(
+            kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+        ));
+        assert_eq!(
+            exact_pilot_label_target(&operation, 1, &observations).unwrap(),
+            ("database-0".to_string(), "pod-uid".to_string())
+        );
+        let mut drifted = observations;
+        drifted.get_mut(&1).unwrap().status.instance_id = ReplicaInstanceId::new("replacement-uid");
+        assert!(exact_pilot_label_target(&operation, 1, &drifted).is_err());
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn pilot_dispatch_errors_only_observe_definitive_zero_effect_outcomes() {
+        let operation = pilot_operation();
+        let Decision::Persist(operation) =
+            decide(&operation, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected revoke intent");
+        };
+        let action_id = operation.pending_action.as_ref().unwrap().action_id.clone();
+
+        assert!(matches!(
+            pilot_result_after_dispatch_error(
+                &operation,
+                action_id.clone(),
+                &KubericError::RemoteAgentPreconditionRejected("stale fence".to_string()),
+            ),
+            Some(DurableSwitchoverStepResult::ProvenNoAdmission { .. })
+        ));
+        assert!(matches!(
+            pilot_result_after_dispatch_error(
+                &operation,
+                action_id.clone(),
+                &KubericError::AgentBusy,
+            ),
+            Some(DurableSwitchoverStepResult::ProvenNoAdmission { .. })
+        ));
+        assert!(matches!(
+            pilot_result_after_dispatch_error(
+                &operation,
+                action_id.clone(),
+                &KubericError::RemoteAgentConflict("signature conflict".to_string()),
+            ),
+            Some(DurableSwitchoverStepResult::Stopped { .. })
+        ));
+        assert!(
+            pilot_result_after_dispatch_error(
+                &operation,
+                action_id,
+                &KubericError::Internal(Box::new(std::io::Error::other("ambiguous transport"))),
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[tokio::test]
+    async fn bridge_checkpoints_fence_before_one_correlated_call_per_later_permit() {
+        use crate::durable::pilot::{
+            DurableSwitchoverWorkflow, PilotCheckpointStore, execution_spec, initial_operation,
+            new_pilot_reference,
+        };
+        use crate::durable::pilot_store::MeasuredPilotCheckpointStore;
+        use kuberic_durable_execution::{
+            ActivityObservation, DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
+        };
+
+        let mut reference = new_pilot_reference("set-uid", pilot_snapshot(), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let PilotAdapterDecision::Observe(DurableSwitchoverStepResult::Advance {
+            operation: pending,
+        }) = crate::durable::pilot::evaluate_adapter_step(
+            &initial,
+            &OperationObservations::new(),
+            100,
+        )
+        .unwrap()
+        else {
+            panic!("expected persisted revoke intent");
+        };
+        reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            ),
+            HostEpoch::from_bytes([21; 16]),
+            crate::durable::pilot::checkpoint_limits(),
+        );
+        let workflow = DurableSwitchoverWorkflow;
+        assert!(matches!(
+            host.turn(&workflow, execution.clone()).await,
+            HostOutcome::ScheduleAccepted { .. }
+        ));
+        let HostOutcome::DispatchPermitted { permit, .. } =
+            host.turn(&workflow, execution.clone()).await
+        else {
+            panic!("expected first dispatch permit");
+        };
+        let first_activity = permit.activity().clone();
+        let requests = StdArc::new(StdMutex::new(Vec::new()));
+        let handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::from([(
+            1,
+            Box::new(BusyPilotHandle {
+                requests: requests.clone(),
+            }) as Box<dyn ReplicaHandle>,
+        )]);
+        let observations = pilot_observations(observed(
+            kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+        ));
+        let api = BridgeTestApi {
+            exact_uid_patches: AtomicUsize::new(0),
+        };
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&pending, &observations, 100).unwrap();
+        let mut guard = PilotPermitGuard::new(permit);
+        let PilotEffectBridgeOutcome::Observe(result) = bridge_pilot_permitted_step(
+            &mut guard,
+            &pending,
+            decision,
+            &observations,
+            &handles,
+            &api,
+            "default",
+        )
+        .await
+        .unwrap() else {
+            panic!("first permit must persist dispatch fences");
+        };
+        let DurableSwitchoverStepResult::Advance { operation: fenced } = *result else {
+            panic!("first permit must advance only dispatch evidence");
+        };
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(
+            fenced
+                .pending_action
+                .as_ref()
+                .unwrap()
+                .dispatch_agent_generation
+                .is_some()
+        );
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    first_activity,
+                    crate::durable::pilot::encode_step_result(
+                        &DurableSwitchoverStepResult::Advance {
+                            operation: fenced.clone()
+                        }
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { .. }
+        ));
+
+        assert!(matches!(
+            host.turn(&workflow, execution.clone()).await,
+            HostOutcome::ScheduleAccepted { .. }
+        ));
+        let HostOutcome::DispatchPermitted { permit, .. } = host.turn(&workflow, execution).await
+        else {
+            panic!("expected second dispatch permit");
+        };
+        let decision =
+            crate::durable::pilot::evaluate_adapter_step(&fenced, &observations, 100).unwrap();
+        let mut guard = PilotPermitGuard::new(permit);
+        assert!(matches!(
+            bridge_pilot_permitted_step(
+                &mut guard,
+                &fenced,
+                decision,
+                &observations,
+                &handles,
+                &api,
+                "default",
+            )
+            .await
+            .unwrap(),
+            PilotEffectBridgeOutcome::Observe(_)
+        ));
+        {
+            let recorded = requests.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            let request = &recorded[0];
+            let pending_action = fenced.pending_action.as_ref().unwrap();
+            assert_eq!(request.action_id, pending_action.action_id);
+            assert_eq!(request.target_instance_id.as_str(), "pod-uid");
+            assert_eq!(
+                request.expected_agent_generation.to_string(),
+                pending_action.dispatch_agent_generation.as_deref().unwrap()
+            );
+            assert_eq!(
+                request.expected_control_version.value(),
+                pending_action.dispatch_agent_control_version.unwrap()
+            );
+        }
+
+        let second_decision =
+            crate::durable::pilot::evaluate_adapter_step(&fenced, &observations, 100).unwrap();
+        assert!(
+            bridge_pilot_permitted_step(
+                &mut guard,
+                &fenced,
+                second_decision,
+                &observations,
+                &handles,
+                &api,
+                "default",
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(api.exact_uid_patches.load(Ordering::SeqCst), 0);
     }
 
     #[test]
