@@ -2210,9 +2210,9 @@ spec:
                   nullable: true
                   type: integer
                 phase:
-                  default: Pending
+                  default: Requested
                   enum:
-                    - Pending
+                    - Requested
                     - Preparing
                     - Prepared
                     - Blocked

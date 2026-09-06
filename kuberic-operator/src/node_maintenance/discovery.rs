@@ -409,7 +409,7 @@ mod tests {
         let mut spec = spec("worker-04");
         spec.desired_state = MaintenanceDesiredState::Complete;
         for phase in [
-            MaintenancePhase::Pending,
+            MaintenancePhase::Requested,
             MaintenancePhase::Preparing,
             MaintenancePhase::Blocked,
         ] {

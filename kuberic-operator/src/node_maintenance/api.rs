@@ -144,7 +144,7 @@ impl MaintenanceDesiredState {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema, Default)]
 pub enum MaintenancePhase {
     #[default]
-    Pending,
+    Requested,
     Preparing,
     Prepared,
     Blocked,
@@ -172,7 +172,7 @@ impl MaintenancePhase {
             return !self.is_terminal();
         }
         match self {
-            Self::Pending => matches!(
+            Self::Requested => matches!(
                 next,
                 Self::Preparing | Self::Blocked | Self::Failed | Self::Expired | Self::Releasing
             ),
@@ -256,7 +256,7 @@ mod tests {
 
     fn all_phases() -> [MaintenancePhase; 8] {
         [
-            MaintenancePhase::Pending,
+            MaintenancePhase::Requested,
             MaintenancePhase::Preparing,
             MaintenancePhase::Prepared,
             MaintenancePhase::Blocked,
@@ -268,15 +268,15 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_pending_and_prepare() {
-        assert_eq!(MaintenancePhase::default(), MaintenancePhase::Pending);
+    fn defaults_are_requested_and_prepare() {
+        assert_eq!(MaintenancePhase::default(), MaintenancePhase::Requested);
         assert_eq!(
             MaintenanceDesiredState::default(),
             MaintenanceDesiredState::Prepare
         );
         assert_eq!(
             NodeMaintenanceRequestStatus::default().phase,
-            MaintenancePhase::Pending
+            MaintenancePhase::Requested
         );
     }
 
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn preparation_path_transitions_are_allowed() {
-        assert!(MaintenancePhase::Pending.can_transition_to(MaintenancePhase::Preparing));
+        assert!(MaintenancePhase::Requested.can_transition_to(MaintenancePhase::Preparing));
         assert!(MaintenancePhase::Preparing.can_transition_to(MaintenancePhase::Prepared));
         assert!(MaintenancePhase::Prepared.can_transition_to(MaintenancePhase::Releasing));
         assert!(MaintenancePhase::Releasing.can_transition_to(MaintenancePhase::Released));
@@ -301,14 +301,14 @@ mod tests {
 
     #[test]
     fn preparation_cannot_be_skipped() {
-        assert!(!MaintenancePhase::Pending.can_transition_to(MaintenancePhase::Prepared));
+        assert!(!MaintenancePhase::Requested.can_transition_to(MaintenancePhase::Prepared));
         assert!(!MaintenancePhase::Blocked.can_transition_to(MaintenancePhase::Prepared));
     }
 
     #[test]
     fn release_can_be_requested_from_any_active_phase() {
         for phase in [
-            MaintenancePhase::Pending,
+            MaintenancePhase::Requested,
             MaintenancePhase::Preparing,
             MaintenancePhase::Prepared,
             MaintenancePhase::Blocked,
