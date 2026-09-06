@@ -38,7 +38,7 @@ const PILOT_ACTIVITY_VERSION: u32 = 1;
 
 #[derive(Clone)]
 pub enum PilotCheckpointStore {
-    Kubernetes(KubernetesCheckpointStore),
+    Kubernetes(Box<KubernetesCheckpointStore>),
     InMemory(InMemoryCheckpointStore),
 }
 
@@ -125,12 +125,12 @@ impl DurableSwitchoverPilotRuntime {
         let store = match &self.factory {
             PilotStoreFactory::Kubernetes(client) => {
                 let options = checkpoint_store_options(namespace, set_name, set_uid)?;
-                PilotCheckpointStore::Kubernetes(
+                PilotCheckpointStore::Kubernetes(Box::new(
                     KubernetesCheckpointStore::with_options(client.clone(), namespace, options)
                         .map_err(|error| {
                             format!("construct durable switchover checkpoint store: {error}")
                         })?,
-                )
+                ))
             }
             PilotStoreFactory::InMemory(store) => PilotCheckpointStore::InMemory(store.clone()),
         };
