@@ -4164,6 +4164,14 @@ async fn test_durable_execution_switchover_pilot_reloads_terminal_after_status_f
     assert!(
         matches!(retry, kuberic_operator::reconciler::ReconcileAction::Requeue(delay) if delay == Duration::from_secs(1))
     );
+    let mut replacement = make_pilot_set("pilot-terminal-reload", 3, None);
+    replacement.metadata.uid = Some("replacement-set-uid".to_string());
+    reconcile_set(&replacement, &api, &state).await.unwrap();
+    assert_eq!(
+        api.last_status().unwrap().phase,
+        Phase::Creating,
+        "a cached terminal status must not cross a KubericSet UID boundary"
+    );
     api.reset_operations();
     api.pods.lock().unwrap().clear();
     let restarted = ReconcilerState::with_durable_switchover_store(store);

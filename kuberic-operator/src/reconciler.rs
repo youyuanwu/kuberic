@@ -59,10 +59,16 @@ pub struct ReconcilerState {
     pub drivers: Mutex<HashMap<String, PartitionDriver>>,
     /// Stable statuses whose first persistence attempt failed after the
     /// corresponding runtime topology had already committed.
-    pending_statuses: Mutex<HashMap<String, KubericSetStatus>>,
+    pending_statuses: Mutex<HashMap<String, PendingCommittedStatus>>,
     removal_clock: Arc<dyn RemoveReplicaClock>,
     #[cfg(feature = "durable-switchover-pilot")]
     pub durable_switchover_pilot: Option<Arc<DurableSwitchoverPilotRuntime>>,
+}
+
+#[derive(Clone)]
+struct PendingCommittedStatus {
+    owner_uid: Option<String>,
+    status: KubericSetStatus,
 }
 
 impl Default for ReconcilerState {
@@ -612,6 +618,16 @@ pub fn resolve_pilot_quarantine(
 ) -> Result<PilotEffectBridgeOutcome, String> {
     match decision {
         PilotAdapterDecision::Observe(result)
+            if operation.pending_action.as_ref().is_some_and(|pending| {
+                pending.dispatch_agent_generation.is_none()
+                    && pending.dispatch_agent_control_version.is_none()
+                    && pending.dispatch_observed_runtime_epoch.is_none()
+                    && pending.dispatch_action_payload.is_empty()
+            }) =>
+        {
+            Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
+        }
+        PilotAdapterDecision::Observe(result)
             if quarantine_result_is_authoritative(operation, &result, observations) =>
         {
             Ok(PilotEffectBridgeOutcome::Observe(Box::new(result)))
@@ -839,28 +855,32 @@ pub async fn reconcile_set(
     // or selecting any further health/topology action.
     let pending_status = { state.pending_statuses.lock().await.get(&set_key).cloned() };
     if let Some(pending) = pending_status {
-        if set.status.as_ref() == Some(&pending) {
+        if pending.owner_uid.as_deref() != set.metadata.uid.as_deref() {
+            state.pending_statuses.lock().await.remove(&set_key);
+        } else {
+            if set.status.as_ref() == Some(&pending.status) {
+                state.pending_statuses.lock().await.remove(&set_key);
+                #[cfg(feature = "durable-switchover-pilot")]
+                cleanup_persisted_pilot(state, set, &pending.status, &set_key).await;
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+            if api
+                .patch_set_status(
+                    &namespace,
+                    &name,
+                    &pending.status,
+                    set.metadata.resource_version.as_deref(),
+                )
+                .await
+                .is_err()
+            {
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
             state.pending_statuses.lock().await.remove(&set_key);
             #[cfg(feature = "durable-switchover-pilot")]
-            cleanup_persisted_pilot(state, set, &pending, &set_key).await;
+            cleanup_persisted_pilot(state, set, &pending.status, &set_key).await;
             return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
         }
-        if api
-            .patch_set_status(
-                &namespace,
-                &name,
-                &pending,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await
-            .is_err()
-        {
-            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-        }
-        state.pending_statuses.lock().await.remove(&set_key);
-        #[cfg(feature = "durable-switchover-pilot")]
-        cleanup_persisted_pilot(state, set, &pending, &set_key).await;
-        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
     }
 
     let label_selector = format!("kuberic.io/set={}", name);
@@ -905,16 +925,7 @@ pub async fn reconcile_set(
                 phase: Phase::Creating,
                 ..Default::default()
             };
-            persist_committed_status(
-                api,
-                state,
-                &set_key,
-                &namespace,
-                &name,
-                &status,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await?;
+            persist_committed_status(api, state, &set_key, set, &status).await?;
             Ok(ReconcileAction::Requeue(Duration::from_secs(5)))
         }
 
@@ -2889,16 +2900,7 @@ async fn apply_failover_decision(
             status.ready_replicas = ready_pods.len() as i32;
             status.replicas = pods.len() as i32;
             set_operation_condition(&mut status, operation_condition(&operation, now));
-            persist_committed_status(
-                api,
-                state,
-                set_key,
-                &set.namespace().unwrap_or_default(),
-                &set.name_any(),
-                &status,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await?;
+            persist_committed_status(api, state, set_key, set, &status).await?;
             Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
         }
         Decision::Complete {
@@ -2963,16 +2965,7 @@ async fn apply_failover_decision(
                 primary_failing_since: None,
                 stable_election_metadata_refresh: None,
             };
-            persist_committed_status(
-                api,
-                state,
-                set_key,
-                &set.namespace().unwrap_or_default(),
-                &set.name_any(),
-                &status,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await?;
+            persist_committed_status(api, state, set_key, set, &status).await?;
             let core_snapshot = StablePartitionSnapshot::try_from(&recovery_snapshot)
                 .map_err(|error| format!("invalid completed failover snapshot: {error}"))?;
             let mut recovery_handles = Vec::new();
@@ -3448,16 +3441,7 @@ async fn publish_pilot_terminal(
                 )
             };
             set_pilot_condition(&mut status, reason, message, now);
-            persist_committed_status(
-                api,
-                state,
-                &set_key,
-                &namespace,
-                &name,
-                &status,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await?;
+            persist_committed_status(api, state, &set_key, set, &status).await?;
             if let Some(measurements) = runtime
                 .measurements(&namespace, &name, set_uid, &reference.execution_id)
                 .await
@@ -3961,16 +3945,7 @@ async fn reconcile_durable_operation(
                 )
                 .await?;
             } else {
-                persist_committed_status(
-                    api,
-                    state,
-                    set_key,
-                    &namespace,
-                    &name,
-                    &status,
-                    set.metadata.resource_version.as_deref(),
-                )
-                .await?;
+                persist_committed_status(api, state, set_key, set, &status).await?;
             }
         }
         Decision::RecordCommitEvidence(operation) => {
@@ -4024,16 +3999,7 @@ async fn reconcile_durable_operation(
                 )
                 .await?;
             } else {
-                persist_committed_status(
-                    api,
-                    state,
-                    set_key,
-                    &namespace,
-                    &name,
-                    &status,
-                    set.metadata.resource_version.as_deref(),
-                )
-                .await?;
+                persist_committed_status(api, state, set_key, set, &status).await?;
             }
             if operation.kind == DurableOperationKind::CreatePartition {
                 let core_snapshot = StablePartitionSnapshot::try_from(&recovery_snapshot)
@@ -4090,16 +4056,7 @@ async fn reconcile_durable_operation(
                     last_transition_time: now.to_string(),
                 },
             );
-            persist_committed_status(
-                api,
-                state,
-                set_key,
-                &namespace,
-                &name,
-                &status,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await?;
+            persist_committed_status(api, state, set_key, set, &status).await?;
             state.drivers.lock().await.remove(set_key);
         }
         Decision::RestartCreation { operation } => {
@@ -4110,16 +4067,7 @@ async fn reconcile_durable_operation(
             status.current_primary = None;
             status.target_primary = None;
             set_operation_condition(&mut status, operation_condition(&operation, now));
-            persist_committed_status(
-                api,
-                state,
-                set_key,
-                &namespace,
-                &name,
-                &status,
-                set.metadata.resource_version.as_deref(),
-            )
-            .await?;
+            persist_committed_status(api, state, set_key, set, &status).await?;
             state.drivers.lock().await.remove(set_key);
         }
     }
@@ -4172,13 +4120,18 @@ async fn persist_committed_status(
     api: &dyn ClusterApi,
     state: &ReconcilerState,
     set_key: &str,
-    namespace: &str,
-    name: &str,
+    set: &KubericSet,
     status: &KubericSetStatus,
-    expected_resource_version: Option<&str>,
 ) -> Result<(), String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let name = set.name_any();
     match api
-        .patch_set_status(namespace, name, status, expected_resource_version)
+        .patch_set_status(
+            &namespace,
+            &name,
+            status,
+            set.metadata.resource_version.as_deref(),
+        )
         .await
     {
         Ok(()) => {
@@ -4186,11 +4139,13 @@ async fn persist_committed_status(
             Ok(())
         }
         Err(error) => {
-            state
-                .pending_statuses
-                .lock()
-                .await
-                .insert(set_key.to_string(), status.clone());
+            state.pending_statuses.lock().await.insert(
+                set_key.to_string(),
+                PendingCommittedStatus {
+                    owner_uid: set.metadata.uid.clone(),
+                    status: status.clone(),
+                },
+            );
             Err(error)
         }
     }
@@ -5320,6 +5275,33 @@ mod dispatch_planning_tests {
             },
             _ => panic!("effect-free exposed activity must be recoverable"),
         }
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[test]
+    fn expired_effect_free_pre_dispatch_exposure_stops_instead_of_stranding() {
+        let operation = pilot_operation();
+        let Decision::Persist(mut operation) =
+            decide(&operation, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected revoke intent");
+        };
+        operation
+            .pending_action
+            .as_mut()
+            .unwrap()
+            .deadline_unix_seconds = 0;
+        let decision = crate::durable::pilot::evaluate_adapter_step(
+            &operation,
+            &OperationObservations::new(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_pilot_quarantine(&operation, decision, &OperationObservations::new()).unwrap(),
+            PilotEffectBridgeOutcome::Observe(result)
+                if matches!(*result, DurableSwitchoverStepResult::Stopped { .. })
+        ));
     }
 
     #[cfg(feature = "durable-switchover-pilot")]
