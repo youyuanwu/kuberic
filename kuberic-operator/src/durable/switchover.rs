@@ -132,6 +132,7 @@ pub fn decide(
                 "failed operation cannot attest a stable old-primary topology",
             )));
         };
+        validate_switchover_terminal(operation, &snapshot, true)?;
         return Ok(Decision::Complete {
             operation: operation.clone(),
             snapshot,
@@ -277,6 +278,7 @@ pub fn decide(
             }
             let mut failed = operation.clone();
             failed.phase = DurableOperationPhase::Failed;
+            validate_switchover_terminal(&failed, &snapshot, true)?;
             Ok(Decision::Complete {
                 operation: failed,
                 snapshot,
@@ -331,6 +333,7 @@ pub fn decide(
             let mut completed = operation.clone();
             completed.phase = DurableOperationPhase::Completed;
             completed.pending_action = None;
+            validate_switchover_terminal(&completed, &operation.target_snapshot, false)?;
             Ok(Decision::Complete {
                 operation: completed,
                 snapshot: operation.target_snapshot.clone(),
@@ -437,6 +440,163 @@ pub(crate) fn validate_switchover_operation(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum PostconditionAdvance {
+    Phase(DurableOperationPhase),
+    PhaseAndResetIndex(DurableOperationPhase),
+    IncrementIndex,
+}
+
+fn postcondition_advance(kind: DurableActionKind) -> Option<PostconditionAdvance> {
+    use DurableActionKind as Action;
+    use DurableOperationPhase as Phase;
+    Some(match kind {
+        Action::RevokeWrite => PostconditionAdvance::Phase(Phase::CaptureLsn),
+        Action::DemoteOldPrimary => PostconditionAdvance::Phase(Phase::PromoteTarget),
+        Action::PromoteTarget => PostconditionAdvance::PhaseAndResetIndex(Phase::DistributeEpoch),
+        Action::UpdateSecondaryEpoch => PostconditionAdvance::IncrementIndex,
+        Action::UpdateCatchUpConfiguration => {
+            PostconditionAdvance::Phase(Phase::WaitForCatchUpQuorum)
+        }
+        Action::WaitForCatchUpQuorum => {
+            PostconditionAdvance::Phase(Phase::UpdateCurrentConfiguration)
+        }
+        Action::UpdateCurrentConfiguration => {
+            PostconditionAdvance::Phase(Phase::LabelTargetPrimary)
+        }
+        Action::LabelTargetPrimary => PostconditionAdvance::Phase(Phase::LabelOldSecondary),
+        Action::LabelOldSecondary => PostconditionAdvance::Phase(Phase::Finalize),
+        Action::RestorePreviousConfiguration => PostconditionAdvance::Phase(Phase::Failed),
+        Action::CompensatePromoteOldPrimary => {
+            PostconditionAdvance::PhaseAndResetIndex(Phase::CompensateDistributeEpoch)
+        }
+        Action::CompensateUpdateSecondaryEpoch => PostconditionAdvance::IncrementIndex,
+        Action::CompensateCatchUpConfiguration => {
+            PostconditionAdvance::Phase(Phase::CompensateCurrentConfiguration)
+        }
+        Action::CompensateCurrentConfiguration => {
+            PostconditionAdvance::Phase(Phase::CompensateLabelOldPrimary)
+        }
+        Action::CompensateLabelOldPrimary => {
+            PostconditionAdvance::Phase(Phase::CompensateLabelTargetSecondary)
+        }
+        Action::CompensateLabelTargetSecondary => {
+            PostconditionAdvance::Phase(Phase::CompensateFinalize)
+        }
+        _ => return None,
+    })
+}
+
+pub(crate) fn advance_after_switchover_postcondition(
+    operation: &DurableOperationStatus,
+    pending: &PendingActionStatus,
+    now: i64,
+) -> Result<DurableOperationStatus, String> {
+    let advance = postcondition_advance(pending.kind)
+        .ok_or_else(|| "non-switchover action reached switchover decision".to_string())?;
+    let mut next = operation.clone();
+    next.pending_action = None;
+    next.last_error = None;
+    next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+    match advance {
+        PostconditionAdvance::Phase(phase) => next.phase = phase,
+        PostconditionAdvance::PhaseAndResetIndex(phase) => {
+            next.phase = phase;
+            next.next_secondary_index = 0;
+        }
+        PostconditionAdvance::IncrementIndex => {
+            next.next_secondary_index = next.next_secondary_index.saturating_add(1);
+        }
+    }
+    Ok(next)
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+pub(crate) fn is_switchover_postcondition_transition(
+    operation: &DurableOperationStatus,
+    next: &DurableOperationStatus,
+    pending: &PendingActionStatus,
+) -> bool {
+    if next.pending_action.is_some() {
+        return false;
+    }
+    match postcondition_advance(pending.kind) {
+        Some(PostconditionAdvance::Phase(phase)) => next.phase == phase,
+        Some(PostconditionAdvance::PhaseAndResetIndex(phase)) => {
+            next.phase == phase && next.next_secondary_index == 0
+        }
+        Some(PostconditionAdvance::IncrementIndex) => {
+            next.phase == operation.phase
+                && next.next_secondary_index == operation.next_secondary_index.saturating_add(1)
+        }
+        None => false,
+    }
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+pub(crate) fn is_legal_switchover_phase_transition(
+    current: DurableOperationPhase,
+    next: DurableOperationPhase,
+) -> bool {
+    use DurableOperationPhase as Phase;
+    current == next
+        || next == Phase::Poisoned
+        || matches!(
+            (current, next),
+            (Phase::Revoke, Phase::CaptureLsn | Phase::Failed)
+                | (Phase::CaptureLsn, Phase::PreCatchUp)
+                | (
+                    Phase::PreCatchUp,
+                    Phase::DemoteOldPrimary | Phase::RestorePreviousConfiguration
+                )
+                | (
+                    Phase::DemoteOldPrimary,
+                    Phase::PromoteTarget | Phase::RestorePreviousConfiguration
+                )
+                | (
+                    Phase::PromoteTarget,
+                    Phase::DistributeEpoch | Phase::CompensatePromoteOldPrimary
+                )
+                | (Phase::DistributeEpoch, Phase::UpdateCatchUpConfiguration)
+                | (
+                    Phase::UpdateCatchUpConfiguration,
+                    Phase::WaitForCatchUpQuorum
+                )
+                | (
+                    Phase::WaitForCatchUpQuorum,
+                    Phase::UpdateCurrentConfiguration
+                )
+                | (Phase::UpdateCurrentConfiguration, Phase::LabelTargetPrimary)
+                | (Phase::LabelTargetPrimary, Phase::LabelOldSecondary)
+                | (Phase::LabelOldSecondary, Phase::Finalize)
+                | (Phase::RestorePreviousConfiguration, Phase::Failed)
+                | (
+                    Phase::CompensatePromoteOldPrimary,
+                    Phase::CompensateDistributeEpoch
+                )
+                | (
+                    Phase::CompensateDistributeEpoch,
+                    Phase::CompensateCatchUpConfiguration
+                )
+                | (
+                    Phase::CompensateCatchUpConfiguration,
+                    Phase::CompensateCurrentConfiguration
+                )
+                | (
+                    Phase::CompensateCurrentConfiguration,
+                    Phase::CompensateLabelOldPrimary
+                )
+                | (
+                    Phase::CompensateLabelOldPrimary,
+                    Phase::CompensateLabelTargetSecondary
+                )
+                | (
+                    Phase::CompensateLabelTargetSecondary,
+                    Phase::CompensateFinalize
+                )
+        )
+}
+
 fn decide_pending(
     operation: &DurableOperationStatus,
     pending: &PendingActionStatus,
@@ -444,64 +604,9 @@ fn decide_pending(
     now: i64,
 ) -> Result<Decision, String> {
     match observe_action(operation, pending, observations)? {
-        ActionObservation::Postcondition => {
-            let mut next = operation.clone();
-            next.pending_action = None;
-            next.last_error = None;
-            next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
-            match pending.kind {
-                DurableActionKind::RevokeWrite => next.phase = DurableOperationPhase::CaptureLsn,
-                DurableActionKind::DemoteOldPrimary => {
-                    next.phase = DurableOperationPhase::PromoteTarget
-                }
-                DurableActionKind::PromoteTarget => {
-                    next.phase = DurableOperationPhase::DistributeEpoch;
-                    next.next_secondary_index = 0;
-                }
-                DurableActionKind::UpdateSecondaryEpoch => {
-                    next.next_secondary_index += 1;
-                }
-                DurableActionKind::UpdateCatchUpConfiguration => {
-                    next.phase = DurableOperationPhase::WaitForCatchUpQuorum
-                }
-                DurableActionKind::WaitForCatchUpQuorum => {
-                    next.phase = DurableOperationPhase::UpdateCurrentConfiguration
-                }
-                DurableActionKind::UpdateCurrentConfiguration => {
-                    next.phase = DurableOperationPhase::LabelTargetPrimary
-                }
-                DurableActionKind::LabelTargetPrimary => {
-                    next.phase = DurableOperationPhase::LabelOldSecondary
-                }
-                DurableActionKind::LabelOldSecondary => {
-                    next.phase = DurableOperationPhase::Finalize
-                }
-                DurableActionKind::RestorePreviousConfiguration => {
-                    next.phase = DurableOperationPhase::Failed
-                }
-                DurableActionKind::CompensatePromoteOldPrimary => {
-                    next.phase = DurableOperationPhase::CompensateDistributeEpoch;
-                    next.next_secondary_index = 0;
-                }
-                DurableActionKind::CompensateUpdateSecondaryEpoch => {
-                    next.next_secondary_index += 1;
-                }
-                DurableActionKind::CompensateCatchUpConfiguration => {
-                    next.phase = DurableOperationPhase::CompensateCurrentConfiguration
-                }
-                DurableActionKind::CompensateCurrentConfiguration => {
-                    next.phase = DurableOperationPhase::CompensateLabelOldPrimary;
-                }
-                DurableActionKind::CompensateLabelOldPrimary => {
-                    next.phase = DurableOperationPhase::CompensateLabelTargetSecondary;
-                }
-                DurableActionKind::CompensateLabelTargetSecondary => {
-                    next.phase = DurableOperationPhase::CompensateFinalize;
-                }
-                _ => return Err("non-switchover action reached switchover decision".to_string()),
-            }
-            Ok(Decision::Persist(next))
-        }
+        ActionObservation::Postcondition => Ok(Decision::Persist(
+            advance_after_switchover_postcondition(operation, pending, now)?,
+        )),
         ActionObservation::Precondition => {
             if now >= pending.deadline_unix_seconds {
                 return Ok(Decision::Persist(timeout_transition(
@@ -509,8 +614,9 @@ fn decide_pending(
                 )));
             }
             if let Some(role) = pod_role_action(pending.kind) {
-                Ok(Decision::PatchPodRole {
+                Ok(Decision::PatchPodRoleExactUid {
                     target_id: pending.target_id,
+                    expected_uid: switchover_label_uid(operation, pending.target_id)?,
                     role: role.to_string(),
                 })
             } else {
@@ -1311,6 +1417,80 @@ fn compensation_snapshot(operation: &DurableOperationStatus) -> StablePartitionS
     snapshot
 }
 
+pub(crate) fn validate_switchover_terminal(
+    operation: &DurableOperationStatus,
+    snapshot: &StablePartitionSnapshotStatus,
+    compensated: bool,
+) -> Result<(), String> {
+    use DurableOperationPhase as Phase;
+    if !compensated {
+        if operation.phase != Phase::Completed
+            || operation.pending_action.is_some()
+            || !same_switchover_topology(snapshot, &operation.target_snapshot)
+        {
+            return Err("successful durable switchover terminal is inconsistent".to_string());
+        }
+        return Ok(());
+    }
+    if operation.phase != Phase::Failed
+        || operation.pending_action.is_some()
+        || !valid_compensation_snapshot(operation, snapshot)
+    {
+        return Err("compensated durable switchover terminal is inconsistent".to_string());
+    }
+    Ok(())
+}
+
+fn valid_compensation_snapshot(
+    operation: &DurableOperationStatus,
+    snapshot: &StablePartitionSnapshotStatus,
+) -> bool {
+    let Some(previous) = operation.previous_snapshot.as_ref() else {
+        return false;
+    };
+    if snapshot.primary_id != operation.old_primary_id
+        || snapshot.write_quorum != previous.write_quorum
+        || snapshot.members.len() != previous.members.len()
+        || (snapshot.epoch != previous.epoch && snapshot.epoch != operation.target_snapshot.epoch)
+    {
+        return false;
+    }
+    previous.members.iter().all(|expected| {
+        let matches = snapshot
+            .members
+            .iter()
+            .filter(|actual| actual.id == expected.id)
+            .collect::<Vec<_>>();
+        matches.len() == 1
+            && matches[0].instance_id == expected.instance_id
+            && matches[0].role
+                == if expected.id == operation.old_primary_id {
+                    StableReplicaRoleStatus::Primary
+                } else {
+                    StableReplicaRoleStatus::ActiveSecondary
+                }
+    })
+}
+
+pub(crate) fn same_switchover_topology(
+    actual: &StablePartitionSnapshotStatus,
+    expected: &StablePartitionSnapshotStatus,
+) -> bool {
+    actual.epoch == expected.epoch
+        && actual.primary_id == expected.primary_id
+        && actual.write_quorum == expected.write_quorum
+        && actual.members.len() == expected.members.len()
+        && actual
+            .members
+            .iter()
+            .zip(&expected.members)
+            .all(|(actual, expected)| {
+                actual.id == expected.id
+                    && actual.instance_id == expected.instance_id
+                    && actual.role == expected.role
+            })
+}
+
 fn pod_role_action(kind: DurableActionKind) -> Option<&'static str> {
     match kind {
         DurableActionKind::LabelTargetPrimary | DurableActionKind::CompensateLabelOldPrimary => {
@@ -1320,6 +1500,26 @@ fn pod_role_action(kind: DurableActionKind) -> Option<&'static str> {
         | DurableActionKind::CompensateLabelTargetSecondary => Some("secondary"),
         _ => None,
     }
+}
+
+fn switchover_label_uid(
+    operation: &DurableOperationStatus,
+    target_id: i64,
+) -> Result<String, String> {
+    operation
+        .previous_snapshot
+        .members
+        .iter()
+        .find(|member| member.id == target_id)
+        .or_else(|| {
+            operation
+                .target_snapshot
+                .members
+                .iter()
+                .find(|member| member.id == target_id)
+        })
+        .map(|member| member.instance_id.clone())
+        .ok_or_else(|| format!("switchover label target {target_id} is not in its snapshots"))
 }
 
 // COMPLEXITY-BOUNDARY: explicit-switchover:end
@@ -1361,6 +1561,165 @@ mod tests {
             pending.action_id,
             format!("{}:1:RevokeWrite", operation.execution_id)
         );
+    }
+
+    #[test]
+    fn shared_postcondition_table_drives_every_switchover_action() {
+        use DurableActionKind as Action;
+        use DurableOperationPhase as Phase;
+
+        let base = start_switchover("set", snapshot(), 2, 100).unwrap();
+        let pending = pending_action(&base, 1, Action::RevokeWrite, 100).unwrap();
+        let cases = [
+            (Action::RevokeWrite, Phase::Revoke, Phase::CaptureLsn, false),
+            (
+                Action::DemoteOldPrimary,
+                Phase::DemoteOldPrimary,
+                Phase::PromoteTarget,
+                false,
+            ),
+            (
+                Action::PromoteTarget,
+                Phase::PromoteTarget,
+                Phase::DistributeEpoch,
+                true,
+            ),
+            (
+                Action::UpdateSecondaryEpoch,
+                Phase::DistributeEpoch,
+                Phase::DistributeEpoch,
+                false,
+            ),
+            (
+                Action::UpdateCatchUpConfiguration,
+                Phase::UpdateCatchUpConfiguration,
+                Phase::WaitForCatchUpQuorum,
+                false,
+            ),
+            (
+                Action::WaitForCatchUpQuorum,
+                Phase::WaitForCatchUpQuorum,
+                Phase::UpdateCurrentConfiguration,
+                false,
+            ),
+            (
+                Action::UpdateCurrentConfiguration,
+                Phase::UpdateCurrentConfiguration,
+                Phase::LabelTargetPrimary,
+                false,
+            ),
+            (
+                Action::LabelTargetPrimary,
+                Phase::LabelTargetPrimary,
+                Phase::LabelOldSecondary,
+                false,
+            ),
+            (
+                Action::LabelOldSecondary,
+                Phase::LabelOldSecondary,
+                Phase::Finalize,
+                false,
+            ),
+            (
+                Action::RestorePreviousConfiguration,
+                Phase::RestorePreviousConfiguration,
+                Phase::Failed,
+                false,
+            ),
+            (
+                Action::CompensatePromoteOldPrimary,
+                Phase::CompensatePromoteOldPrimary,
+                Phase::CompensateDistributeEpoch,
+                true,
+            ),
+            (
+                Action::CompensateUpdateSecondaryEpoch,
+                Phase::CompensateDistributeEpoch,
+                Phase::CompensateDistributeEpoch,
+                false,
+            ),
+            (
+                Action::CompensateCatchUpConfiguration,
+                Phase::CompensateCatchUpConfiguration,
+                Phase::CompensateCurrentConfiguration,
+                false,
+            ),
+            (
+                Action::CompensateCurrentConfiguration,
+                Phase::CompensateCurrentConfiguration,
+                Phase::CompensateLabelOldPrimary,
+                false,
+            ),
+            (
+                Action::CompensateLabelOldPrimary,
+                Phase::CompensateLabelOldPrimary,
+                Phase::CompensateLabelTargetSecondary,
+                false,
+            ),
+            (
+                Action::CompensateLabelTargetSecondary,
+                Phase::CompensateLabelTargetSecondary,
+                Phase::CompensateFinalize,
+                false,
+            ),
+        ];
+
+        for (kind, current_phase, expected_phase, resets_index) in cases {
+            let mut operation = base.clone();
+            operation.phase = current_phase;
+            operation.next_secondary_index = 7;
+            let mut pending = pending.clone();
+            pending.kind = kind;
+            operation.pending_action = Some(pending.clone());
+
+            let next = advance_after_switchover_postcondition(&operation, &pending, 200).unwrap();
+            assert_eq!(next.phase, expected_phase, "{kind:?}");
+            assert!(next.pending_action.is_none(), "{kind:?}");
+            assert_eq!(next.phase_deadline_unix_seconds, 210, "{kind:?}");
+            if matches!(
+                kind,
+                Action::UpdateSecondaryEpoch | Action::CompensateUpdateSecondaryEpoch
+            ) {
+                assert_eq!(next.next_secondary_index, 8, "{kind:?}");
+            } else if resets_index {
+                assert_eq!(next.next_secondary_index, 0, "{kind:?}");
+            } else {
+                assert_eq!(next.next_secondary_index, 7, "{kind:?}");
+            }
+            #[cfg(feature = "durable-switchover-pilot")]
+            assert!(
+                is_switchover_postcondition_transition(&operation, &next, &pending),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_terminal_validation_covers_success_and_exact_compensation() {
+        let operation = start_switchover("set", snapshot(), 2, 100).unwrap();
+
+        let mut completed = operation.clone();
+        completed.phase = DurableOperationPhase::Completed;
+        assert!(
+            validate_switchover_terminal(&completed, &completed.target_snapshot, false).is_ok()
+        );
+
+        let mut failed = operation.clone();
+        failed.phase = DurableOperationPhase::Failed;
+        let compensated = compensation_snapshot(&failed);
+        assert!(validate_switchover_terminal(&failed, &compensated, true).is_ok());
+
+        let mut wrong = compensated;
+        wrong.primary_id = failed.target_primary_id;
+        assert!(validate_switchover_terminal(&failed, &wrong, true).is_err());
+    }
+
+    #[test]
+    fn shared_label_intent_uses_snapshot_uid() {
+        let operation = start_switchover("set", snapshot(), 2, 100).unwrap();
+        assert_eq!(switchover_label_uid(&operation, 1).unwrap(), "one");
+        assert_eq!(switchover_label_uid(&operation, 2).unwrap(), "two");
+        assert!(switchover_label_uid(&operation, 3).is_err());
     }
 
     #[test]

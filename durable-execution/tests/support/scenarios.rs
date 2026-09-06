@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 use futures::{FutureExt, future::poll_fn, join, task::AtomicWaker};
 use kuberic_durable_execution::{
-    ActivityName, ActivityObservation, ActivitySequence, ActivitySpec, AttemptId,
+    ActivityName, ActivityObservation, ActivitySequence, ActivitySpec, ActivityState, AttemptId,
     CHECKPOINT_FORMAT_VERSION, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits,
     CheckpointPayload, CheckpointState, CheckpointStore, DispatchPermit, DurableHost, ExactBytes,
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore,
     InMemoryFault, LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
-    ReloadReason, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint, TerminalOutcome,
-    Workflow, WorkflowContext,
+    ReloadReason, StorageRevision, StoreError, StoreErrorKind, StoreOperation, StoredCheckpoint,
+    TerminalOutcome, Workflow, WorkflowContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,10 +50,17 @@ pub enum ScenarioId {
     CompletionOutcomeUnknownWithoutApply,
     CompletionStoreFailures,
     ExecutionContractValidation,
+    FusedScheduleExposure,
+    FusedScheduleExposureFaults,
+    FusedObservationNextExposure,
+    FusedObservationTerminal,
+    FusedObservationFaults,
+    FusedTerminalFaults,
+    FusedCapacityReservation,
 }
 
 impl ScenarioId {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 45] = [
         Self::RestartBeforeSchedulePersistence,
         Self::RestartAfterSchedulePersistence,
         Self::RestartAfterDispatchExposure,
@@ -92,6 +99,13 @@ impl ScenarioId {
         Self::CompletionOutcomeUnknownWithoutApply,
         Self::CompletionStoreFailures,
         Self::ExecutionContractValidation,
+        Self::FusedScheduleExposure,
+        Self::FusedScheduleExposureFaults,
+        Self::FusedObservationNextExposure,
+        Self::FusedObservationTerminal,
+        Self::FusedObservationFaults,
+        Self::FusedTerminalFaults,
+        Self::FusedCapacityReservation,
     ];
 
     pub const fn stable_id(self) -> &'static str {
@@ -134,6 +148,13 @@ impl ScenarioId {
             Self::CompletionOutcomeUnknownWithoutApply => "FR-013-36",
             Self::CompletionStoreFailures => "FR-013-37",
             Self::ExecutionContractValidation => "FR-013-38",
+            Self::FusedScheduleExposure => "FR-013-39",
+            Self::FusedScheduleExposureFaults => "FR-013-40",
+            Self::FusedObservationNextExposure => "FR-013-41",
+            Self::FusedObservationTerminal => "FR-013-42",
+            Self::FusedObservationFaults => "FR-013-43",
+            Self::FusedTerminalFaults => "FR-013-44",
+            Self::FusedCapacityReservation => "FR-013-45",
         }
     }
 }
@@ -258,6 +279,13 @@ async fn run_scenario_inner(id: ScenarioId) -> ScenarioEvidence {
         }
         ScenarioId::CompletionStoreFailures => completion_store_failures(id).await,
         ScenarioId::ExecutionContractValidation => execution_contract_validation(id).await,
+        ScenarioId::FusedScheduleExposure => fused_schedule_exposure(id).await,
+        ScenarioId::FusedScheduleExposureFaults => fused_schedule_exposure_faults(id).await,
+        ScenarioId::FusedObservationNextExposure => fused_observation_next_exposure(id).await,
+        ScenarioId::FusedObservationTerminal => fused_observation_terminal(id).await,
+        ScenarioId::FusedObservationFaults => fused_observation_faults(id).await,
+        ScenarioId::FusedTerminalFaults => fused_terminal_faults(id).await,
+        ScenarioId::FusedCapacityReservation => fused_capacity_reservation(id).await,
     }
 }
 
@@ -597,7 +625,9 @@ async fn restart_after_schedule(id: ScenarioId) -> ScenarioEvidence {
         .turn(&workflow, execution_spec(execution_id, input.clone()))
         .await
     {
-        HostOutcome::DispatchPermitted { permit, revision } => (Some(permit), Some(revision)),
+        HostOutcome::DispatchPermitted {
+            permit, revision, ..
+        } => (Some(permit), Some(revision)),
         _ => (None, None),
     };
     ScenarioEvidence::new(
@@ -3260,6 +3290,436 @@ async fn execution_contract_validation(id: ScenarioId) -> ScenarioEvidence {
                     HostOutcome::CheckpointRejected(CheckpointError::InvalidJson(_))
                 ) && mixed_terminal_polls.get() == 0
                     && nested_history_polls.get() == 0,
+            ),
+        ],
+    )
+}
+
+async fn fused_schedule_exposure(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let workflow = LinearWorkflow::one("fused", 1, b"command");
+    let execution_id = execution(180);
+    let execution = execution_spec(execution_id, bytes(b"workflow"));
+    let mut durable_host = host(store.clone(), 180);
+
+    let outcome = durable_host
+        .turn_and_expose(&workflow, execution.clone())
+        .await;
+    let permit_identity = match &outcome {
+        HostOutcome::DispatchPermitted { permit, .. } => {
+            Some((permit.activity().clone(), permit.attempt_id()))
+        }
+        _ => None,
+    };
+    let stored = store.load(execution_id).await.unwrap().unwrap();
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(&execution, generous_limits())
+        .unwrap();
+    let exposed = payload
+        .active_activities()
+        .and_then(|activities| activities.last())
+        .is_some_and(|record| {
+            permit_identity.as_ref().map(|identity| &identity.0)
+                == Some(&record.logical_id(execution_id))
+                && matches!(
+                    record.state(),
+                    ActivityState::DispatchExposed { attempt_id }
+                        if permit_identity.as_ref().map(|identity| identity.1) == Some(*attempt_id)
+                )
+        });
+
+    ScenarioEvidence::new(
+        id,
+        "fuse initial schedule and dispatch exposure into one accepted checkpoint",
+        [
+            (
+                "one accepted fused boundary returns one exact permit",
+                permit_identity.is_some(),
+            ),
+            (
+                "the exact command is dispatch-exposed in authoritative storage before use",
+                exposed,
+            ),
+        ],
+    )
+}
+
+async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
+    let faults = [
+        InMemoryFault::FailBeforeRequest(StoreErrorKind::Unavailable),
+        InMemoryFault::ConflictWithoutApply,
+        InMemoryFault::OutcomeUnknownWithoutApply,
+        InMemoryFault::OutcomeUnknownAfterApply,
+    ];
+    let mut no_false_permits = true;
+    let mut boundaries_are_fused = true;
+    let mut applied_unknown_quarantines = false;
+
+    for (index, fault) in faults.into_iter().enumerate() {
+        let store = InMemoryCheckpointStore::new();
+        store.fail_next_compare_and_swap(fault);
+        let workflow = LinearWorkflow::one("fused-fault", 1, b"command");
+        let execution_id = execution(181 + index as u8);
+        let execution = execution_spec(execution_id, bytes(b"workflow"));
+        let mut durable_host = host(store, 181 + index as u8);
+        let outcome = durable_host
+            .turn_and_expose(&workflow, execution.clone())
+            .await;
+        no_false_permits &= !matches!(&outcome, HostOutcome::DispatchPermitted { .. });
+        boundaries_are_fused &= matches!(
+            &outcome,
+            HostOutcome::ReloadRequired {
+                boundary: PersistenceBoundary::ScheduleExposure,
+                ..
+            } | HostOutcome::StoreFailed {
+                operation: StoreOperation::CompareAndSwap(PersistenceBoundary::ScheduleExposure),
+                ..
+            }
+        );
+        if fault == InMemoryFault::OutcomeUnknownAfterApply {
+            applied_unknown_quarantines = matches!(
+                durable_host.turn_and_expose(&workflow, execution).await,
+                HostOutcome::Quarantined { .. }
+            );
+        }
+    }
+
+    ScenarioEvidence::new(
+        id,
+        "inject every CAS failure class at fused schedule/exposure",
+        [
+            (
+                "no failed or uncertain fused CAS grants a permit",
+                no_false_permits,
+            ),
+            (
+                "all failures identify the fused schedule/exposure boundary",
+                boundaries_are_fused,
+            ),
+            (
+                "unknown-after-apply reloads as conservative quarantine",
+                applied_unknown_quarantines,
+            ),
+        ],
+    )
+}
+
+async fn fused_observation_next_exposure(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let workflow = LinearWorkflow::two();
+    let execution_id = execution(186);
+    let execution = execution_spec(execution_id, bytes(b"workflow"));
+    let mut durable_host = host(store.clone(), 186);
+    let first = match durable_host
+        .turn_and_expose(&workflow, execution.clone())
+        .await
+    {
+        HostOutcome::DispatchPermitted { permit, .. } => permit,
+        _ => {
+            return ScenarioEvidence::new(
+                id,
+                "prepare first fused effect",
+                [("first fused effect was exposed", false)],
+            );
+        }
+    };
+    let outcome = durable_host
+        .observe_and_turn(
+            &workflow,
+            &execution,
+            ActivityObservation::new(first.activity().clone(), bytes(b"one")),
+        )
+        .await;
+    let second = match &outcome {
+        HostOutcome::DispatchPermitted { permit, .. } => Some(permit.activity().clone()),
+        _ => None,
+    };
+    let payload = store
+        .load(execution_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .checkpoint()
+        .decode_and_validate(&execution, generous_limits())
+        .unwrap();
+    let history = payload.active_activities().unwrap();
+
+    ScenarioEvidence::new(
+        id,
+        "fuse authoritative observation, replay, and next command exposure",
+        [
+            (
+                "one observation CAS returns only the next exact permit",
+                second
+                    .as_ref()
+                    .is_some_and(|activity| activity.sequence() == ActivitySequence::new(1)),
+            ),
+            (
+                "authoritative history contains completed prior result and one exposed tail",
+                history.len() == 2
+                    && matches!(
+                        history[0].state(),
+                        ActivityState::Completed { result } if result == &bytes(b"one")
+                    )
+                    && matches!(history[1].state(), ActivityState::DispatchExposed { .. }),
+            ),
+        ],
+    )
+}
+
+async fn fused_observation_terminal(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let workflow = LinearWorkflow::one("fused-terminal", 1, b"command");
+    let execution_id = execution(187);
+    let execution = execution_spec(execution_id, bytes(b"workflow"));
+    let mut durable_host = host(store.clone(), 187);
+    let permit = match durable_host
+        .turn_and_expose(&workflow, execution.clone())
+        .await
+    {
+        HostOutcome::DispatchPermitted { permit, .. } => permit,
+        _ => {
+            return ScenarioEvidence::new(
+                id,
+                "prepare terminal fused effect",
+                [("first fused effect was exposed", false)],
+            );
+        }
+    };
+    let outcome = durable_host
+        .observe_and_turn(
+            &workflow,
+            &execution,
+            ActivityObservation::new(permit.activity().clone(), bytes(b"done")),
+        )
+        .await;
+    let stored = store.load(execution_id).await.unwrap().unwrap();
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(&execution, generous_limits())
+        .unwrap();
+
+    ScenarioEvidence::new(
+        id,
+        "fuse final observation, deterministic replay, and terminal compaction",
+        [
+            (
+                "accepted final observation returns the durable workflow outcome",
+                matches!(
+                    outcome,
+                    HostOutcome::WorkflowCompleted {
+                        outcome: TerminalOutcome::Succeeded(ref result),
+                        ..
+                    } if result == &bytes(b"done")
+                ),
+            ),
+            (
+                "authoritative checkpoint is terminal with one completed activity",
+                matches!(
+                    payload.state(),
+                    CheckpointState::Terminal {
+                        completed_activity_count: 1,
+                        ..
+                    }
+                ),
+            ),
+        ],
+    )
+}
+
+async fn fused_observation_faults(id: ScenarioId) -> ScenarioEvidence {
+    let faults = [
+        InMemoryFault::FailBeforeRequest(StoreErrorKind::Unavailable),
+        InMemoryFault::ConflictWithoutApply,
+        InMemoryFault::OutcomeUnknownWithoutApply,
+        InMemoryFault::OutcomeUnknownAfterApply,
+    ];
+    let mut no_false_permits = true;
+    let mut boundaries_are_fused = true;
+    let mut reloads_quarantine = true;
+
+    for (index, fault) in faults.into_iter().enumerate() {
+        let store = InMemoryCheckpointStore::new();
+        let workflow = LinearWorkflow::two();
+        let execution_id = execution(188 + index as u8);
+        let execution = execution_spec(execution_id, bytes(b"workflow"));
+        let mut durable_host = host(store.clone(), 188 + index as u8);
+        let permit = match durable_host
+            .turn_and_expose(&workflow, execution.clone())
+            .await
+        {
+            HostOutcome::DispatchPermitted { permit, .. } => permit,
+            _ => {
+                reloads_quarantine = false;
+                continue;
+            }
+        };
+        store.fail_next_compare_and_swap(fault);
+        let outcome = durable_host
+            .observe_and_turn(
+                &workflow,
+                &execution,
+                ActivityObservation::new(permit.activity().clone(), bytes(b"one")),
+            )
+            .await;
+        no_false_permits &= !matches!(&outcome, HostOutcome::DispatchPermitted { .. });
+        boundaries_are_fused &= matches!(
+            &outcome,
+            HostOutcome::ReloadRequired {
+                boundary: PersistenceBoundary::ObservationProgression,
+                ..
+            } | HostOutcome::StoreFailed {
+                operation: StoreOperation::CompareAndSwap(
+                    PersistenceBoundary::ObservationProgression
+                ),
+                ..
+            }
+        );
+        let reloaded = durable_host.turn_and_expose(&workflow, execution).await;
+        reloads_quarantine &= match fault {
+            InMemoryFault::OutcomeUnknownAfterApply => matches!(
+                reloaded,
+                HostOutcome::Quarantined { ref activity, .. }
+                    if activity.sequence() == ActivitySequence::new(1)
+            ),
+            _ => matches!(
+                reloaded,
+                HostOutcome::Quarantined { ref activity, .. }
+                    if activity.sequence() == ActivitySequence::new(0)
+            ),
+        };
+    }
+
+    ScenarioEvidence::new(
+        id,
+        "inject every CAS failure class at fused observation progression",
+        [
+            (
+                "no failed or uncertain observation progression grants the next permit",
+                no_false_permits,
+            ),
+            (
+                "all failures identify the fused observation progression boundary",
+                boundaries_are_fused,
+            ),
+            (
+                "reload conservatively quarantines original or applied next exposure",
+                reloads_quarantine,
+            ),
+        ],
+    )
+}
+
+async fn fused_terminal_faults(id: ScenarioId) -> ScenarioEvidence {
+    let faults = [
+        InMemoryFault::FailBeforeRequest(StoreErrorKind::Unavailable),
+        InMemoryFault::ConflictWithoutApply,
+        InMemoryFault::OutcomeUnknownWithoutApply,
+        InMemoryFault::OutcomeUnknownAfterApply,
+    ];
+    let mut no_false_permits_or_completion = true;
+    let mut boundaries_are_fused = true;
+    let mut reload_classification_is_exact = true;
+
+    for (index, fault) in faults.into_iter().enumerate() {
+        let store = InMemoryCheckpointStore::new();
+        let workflow = LinearWorkflow::one("fused-terminal-fault", 1, b"command");
+        let execution_id = execution(193 + index as u8);
+        let execution = execution_spec(execution_id, bytes(b"workflow"));
+        let mut durable_host = host(store.clone(), 193 + index as u8);
+        let permit = match durable_host
+            .turn_and_expose(&workflow, execution.clone())
+            .await
+        {
+            HostOutcome::DispatchPermitted { permit, .. } => permit,
+            _ => {
+                reload_classification_is_exact = false;
+                continue;
+            }
+        };
+        store.fail_next_compare_and_swap(fault);
+        let outcome = durable_host
+            .observe_and_turn(
+                &workflow,
+                &execution,
+                ActivityObservation::new(permit.activity().clone(), bytes(b"done")),
+            )
+            .await;
+        no_false_permits_or_completion &= !matches!(
+            &outcome,
+            HostOutcome::DispatchPermitted { .. } | HostOutcome::WorkflowCompleted { .. }
+        );
+        boundaries_are_fused &= matches!(
+            &outcome,
+            HostOutcome::ReloadRequired {
+                boundary: PersistenceBoundary::ObservationProgression,
+                ..
+            } | HostOutcome::StoreFailed {
+                operation: StoreOperation::CompareAndSwap(
+                    PersistenceBoundary::ObservationProgression
+                ),
+                ..
+            }
+        );
+        let reloaded = durable_host.turn_and_expose(&workflow, execution).await;
+        reload_classification_is_exact &= match fault {
+            InMemoryFault::OutcomeUnknownAfterApply => matches!(
+                reloaded,
+                HostOutcome::WorkflowCompleted {
+                    outcome: TerminalOutcome::Succeeded(ref result),
+                    ..
+                } if result == &bytes(b"done")
+            ),
+            _ => matches!(
+                reloaded,
+                HostOutcome::Quarantined { ref activity, .. }
+                    if activity.sequence() == ActivitySequence::new(0)
+            ),
+        };
+    }
+
+    ScenarioEvidence::new(
+        id,
+        "inject every CAS failure class at fused observation/terminal compaction",
+        [
+            (
+                "failed or uncertain terminal fusion reports neither permit nor completion",
+                no_false_permits_or_completion,
+            ),
+            (
+                "terminal fusion failures identify observation progression",
+                boundaries_are_fused,
+            ),
+            (
+                "only unknown-after-apply reloads terminal; all unapplied cases quarantine original exposure",
+                reload_classification_is_exact,
+            ),
+        ],
+    )
+}
+
+async fn fused_capacity_reservation(id: ScenarioId) -> ScenarioEvidence {
+    let store = InMemoryCheckpointStore::new();
+    let workflow = LinearWorkflow::one_with_bound("fused-huge", 1, b"command", u64::MAX);
+    let execution_id = execution(192);
+    let mut durable_host = host(store.clone(), 192);
+    let outcome = durable_host
+        .turn_and_expose(&workflow, execution_spec(execution_id, bytes(b"workflow")))
+        .await;
+
+    ScenarioEvidence::new(
+        id,
+        "reserve maximum result capacity before fused exposure",
+        [
+            (
+                "unrepresentable result capacity rejects fused exposure",
+                matches!(&outcome, HostOutcome::CheckpointRejected(_)),
+            ),
+            (
+                "capacity rejection grants no permit and accepts no checkpoint",
+                !matches!(&outcome, HostOutcome::DispatchPermitted { .. })
+                    && store.load(execution_id).await.unwrap().is_none(),
             ),
         ],
     )

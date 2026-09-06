@@ -10,7 +10,9 @@ use crate::{
 pub enum PersistenceBoundary {
     Schedule,
     Exposure,
+    ScheduleExposure,
     Observation,
+    ObservationProgression,
     Completion,
 }
 
@@ -133,6 +135,7 @@ define_host_outcomes! {
     DispatchPermitted {
         permit: DispatchPermit,
         revision: StorageRevision,
+        boundary: PersistenceBoundary,
     },
     ObservationAccepted {
         activity: LogicalActivityId,
@@ -141,6 +144,7 @@ define_host_outcomes! {
     WorkflowCompleted {
         outcome: TerminalOutcome,
         revision: StorageRevision,
+        boundary: PersistenceBoundary,
     },
     Quarantined {
         activity: LogicalActivityId,
@@ -210,6 +214,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::WorkflowCompleted {
                     outcome: outcome.clone(),
                     revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
                 };
             }
             if let Some(record) = payload
@@ -245,11 +250,14 @@ impl<S: CheckpointStore> DurableHost<S> {
                 let stored = loaded.expect("pending evaluation requires a loaded checkpoint");
                 match self.prepare_exposure(
                     &execution,
-                    stored.revision(),
+                    Some(stored.revision().clone()),
                     stored.checkpoint(),
                     activity,
                 ) {
-                    Ok(proposal) => self.commit_exposure(proposal).await,
+                    Ok(proposal) => {
+                        self.commit_exposure(proposal, PersistenceBoundary::Exposure)
+                            .await
+                    }
                     Err(error) => HostOutcome::CheckpointRejected(error),
                 }
             }
@@ -270,7 +278,6 @@ impl<S: CheckpointStore> DurableHost<S> {
                 checkpoint,
             } => {
                 self.commit_completion(
-                    execution_id,
                     expected_revision,
                     &execution,
                     outcome,
@@ -284,6 +291,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 HostOutcome::WorkflowCompleted {
                     outcome,
                     revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
                 }
             }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
@@ -293,6 +301,133 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
         }
     }
+
+    // COMPLEXITY-BOUNDARY: shared-kernel-fused-turn:start
+    /// Evaluate and atomically persist the next activity as dispatch-exposed.
+    ///
+    /// Unlike [`Self::turn`], a newly scheduled activity does not require an
+    /// intermediate accepted schedule checkpoint. The exact command and its
+    /// result reservation are part of the single exposed checkpoint, and a
+    /// permit is created only after that CAS is accepted.
+    pub async fn turn_and_expose<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: ExecutionSpec,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let expected_revision = loaded.as_ref().map(|stored| stored.revision().clone());
+        if let Some(stored) = loaded.as_ref() {
+            let payload = match stored
+                .checkpoint()
+                .decode_and_validate(&execution, self.limits)
+            {
+                Ok(payload) => payload,
+                Err(error) => return HostOutcome::CheckpointRejected(error),
+            };
+            if let Some((outcome, _)) = payload.terminal_outcome() {
+                return HostOutcome::WorkflowCompleted {
+                    outcome: outcome.clone(),
+                    revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
+                };
+            }
+            if let Some(record) = payload
+                .active_activities()
+                .and_then(|activities| activities.last())
+                && let ActivityState::DispatchExposed { attempt_id } = record.state()
+            {
+                return HostOutcome::Quarantined {
+                    activity: record.logical_id(execution_id),
+                    attempt_id: *attempt_id,
+                };
+            }
+        }
+        match evaluate(
+            workflow,
+            &execution,
+            loaded.as_ref().map(|stored| stored.checkpoint()),
+            self.limits,
+        ) {
+            Evaluation::Scheduled {
+                activity,
+                checkpoint,
+            } => {
+                match self.prepare_exposure(&execution, expected_revision, &checkpoint, activity) {
+                    Ok(proposal) => {
+                        self.commit_exposure(proposal, PersistenceBoundary::ScheduleExposure)
+                            .await
+                    }
+                    Err(error) => HostOutcome::CheckpointRejected(error),
+                }
+            }
+            Evaluation::Pending {
+                activity,
+                state: ActivityState::Scheduled,
+            } => {
+                let stored = loaded.expect("pending evaluation requires a loaded checkpoint");
+                match self.prepare_exposure(
+                    &execution,
+                    Some(stored.revision().clone()),
+                    stored.checkpoint(),
+                    activity,
+                ) {
+                    Ok(proposal) => {
+                        self.commit_exposure(proposal, PersistenceBoundary::ScheduleExposure)
+                            .await
+                    }
+                    Err(error) => HostOutcome::CheckpointRejected(error),
+                }
+            }
+            Evaluation::Pending {
+                activity,
+                state: ActivityState::DispatchExposed { attempt_id },
+            } => HostOutcome::Quarantined {
+                activity,
+                attempt_id,
+            },
+            Evaluation::Pending {
+                state: ActivityState::Completed { .. },
+                ..
+            } => unreachable!("completed activities are replayed rather than pending"),
+            Evaluation::Complete {
+                outcome,
+                completed_activity_count,
+                checkpoint,
+            } => {
+                self.commit_completion(
+                    expected_revision,
+                    &execution,
+                    outcome,
+                    completed_activity_count,
+                    checkpoint,
+                )
+                .await
+            }
+            Evaluation::Terminal { outcome, .. } => {
+                let stored = loaded.expect("terminal evaluation requires a loaded checkpoint");
+                HostOutcome::WorkflowCompleted {
+                    outcome,
+                    revision: stored.revision().clone(),
+                    boundary: PersistenceBoundary::Completion,
+                }
+            }
+            Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
+            Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
+            Evaluation::WorkflowStalled => {
+                HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
+            }
+        }
+    }
+    // COMPLEXITY-BOUNDARY: shared-kernel-fused-turn:end
 
     /// Persist an authoritative result only for the currently exposed activity.
     pub async fn observe(
@@ -381,6 +516,134 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
     }
 
+    // COMPLEXITY-BOUNDARY: shared-kernel-fused-observe:start
+    /// Atomically persist an observation and replay to the next exposed
+    /// activity or terminal checkpoint.
+    ///
+    /// No intermediate completed checkpoint is accepted. A next-effect permit
+    /// is returned only when the CAS containing both the completed result and
+    /// exact next exposed command is accepted.
+    pub async fn observe_and_turn<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: &ExecutionSpec,
+        observation: ActivityObservation,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected_activity = record.logical_id(execution_id);
+        if expected_activity != *observation.activity() {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected: expected_activity,
+                    observed: observation.activity,
+                },
+            );
+        }
+        if !matches!(record.state(), ActivityState::DispatchExposed { .. }) {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        }
+        let actual_result_bytes =
+            u64::try_from(observation.result().as_slice().len()).unwrap_or(u64::MAX);
+        if actual_result_bytes > record.max_result_bytes() {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::ResultExceedsDeclaredBound {
+                    actual: actual_result_bytes,
+                    maximum: record.max_result_bytes(),
+                },
+            );
+        }
+
+        replace_final_record(
+            &mut payload,
+            ActivityRecord::completed(record.sequence(), record.spec().clone(), observation.result),
+        );
+        let completed_checkpoint =
+            match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return HostOutcome::CheckpointRejected(error),
+            };
+        let expected_revision = Some(stored.revision().clone());
+        match evaluate(
+            workflow,
+            execution,
+            Some(&completed_checkpoint),
+            self.limits,
+        ) {
+            Evaluation::Scheduled {
+                activity,
+                checkpoint,
+            } => match self.prepare_exposure(execution, expected_revision, &checkpoint, activity) {
+                Ok(proposal) => {
+                    self.commit_exposure(proposal, PersistenceBoundary::ObservationProgression)
+                        .await
+                }
+                Err(error) => HostOutcome::CheckpointRejected(error),
+            },
+            Evaluation::Complete {
+                outcome,
+                completed_activity_count,
+                checkpoint,
+            } => {
+                self.commit_completion_at_boundary(
+                    expected_revision,
+                    execution,
+                    outcome,
+                    completed_activity_count,
+                    checkpoint,
+                    PersistenceBoundary::ObservationProgression,
+                )
+                .await
+            }
+            Evaluation::Pending {
+                activity,
+                state: ActivityState::DispatchExposed { attempt_id },
+            } => HostOutcome::Quarantined {
+                activity,
+                attempt_id,
+            },
+            Evaluation::Pending { .. } => {
+                HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
+            }
+            Evaluation::Terminal { outcome, .. } => HostOutcome::WorkflowCompleted {
+                outcome,
+                revision: stored.revision().clone(),
+                boundary: PersistenceBoundary::Completion,
+            },
+            Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
+            Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
+            Evaluation::WorkflowStalled => {
+                HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
+            }
+        }
+    }
+    // COMPLEXITY-BOUNDARY: shared-kernel-fused-observe:end
+
     async fn commit_schedule(
         &self,
         execution_id: ExecutionId,
@@ -404,7 +667,7 @@ impl<S: CheckpointStore> DurableHost<S> {
     fn prepare_exposure(
         &mut self,
         execution: &ExecutionSpec,
-        expected_revision: &StorageRevision,
+        expected_revision: Option<StorageRevision>,
         checkpoint: &CheckpointEnvelope,
         activity: LogicalActivityId,
     ) -> Result<PreparedExposure, CheckpointError> {
@@ -428,19 +691,23 @@ impl<S: CheckpointStore> DurableHost<S> {
         );
         Ok(PreparedExposure {
             execution_id: execution.execution_id(),
-            expected_revision: expected_revision.clone(),
+            expected_revision,
             checkpoint: CheckpointEnvelope::encode_with_limits(&payload, self.limits)?,
             activity,
             attempt_id,
         })
     }
 
-    async fn commit_exposure(&self, proposal: PreparedExposure) -> HostOutcome {
+    async fn commit_exposure(
+        &self,
+        proposal: PreparedExposure,
+        boundary: PersistenceBoundary,
+    ) -> HostOutcome {
         match self
             .store
             .compare_and_swap(
                 proposal.execution_id,
-                Some(proposal.expected_revision),
+                proposal.expected_revision,
                 proposal.checkpoint,
             )
             .await
@@ -448,21 +715,42 @@ impl<S: CheckpointStore> DurableHost<S> {
             Ok(CasOutcome::Accepted(revision)) => HostOutcome::DispatchPermitted {
                 permit: DispatchPermit::new(proposal.activity, proposal.attempt_id),
                 revision,
+                boundary,
             },
-            Ok(other) => reload_outcome(PersistenceBoundary::Exposure, other),
-            Err(error) => store_failed(PersistenceBoundary::Exposure, error),
+            Ok(other) => reload_outcome(boundary, other),
+            Err(error) => store_failed(boundary, error),
         }
     }
 
     async fn commit_completion(
         &self,
-        execution_id: ExecutionId,
         expected_revision: Option<StorageRevision>,
         execution: &ExecutionSpec,
         outcome: TerminalOutcome,
         completed_activity_count: u64,
         active_checkpoint: CheckpointEnvelope,
     ) -> HostOutcome {
+        self.commit_completion_at_boundary(
+            expected_revision,
+            execution,
+            outcome,
+            completed_activity_count,
+            active_checkpoint,
+            PersistenceBoundary::Completion,
+        )
+        .await
+    }
+
+    async fn commit_completion_at_boundary(
+        &self,
+        expected_revision: Option<StorageRevision>,
+        execution: &ExecutionSpec,
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
+        active_checkpoint: CheckpointEnvelope,
+        boundary: PersistenceBoundary,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
         let active = match active_checkpoint.decode_and_validate(execution, self.limits) {
             Ok(active) => active,
             Err(error) => return HostOutcome::CheckpointRejected(error),
@@ -480,11 +768,13 @@ impl<S: CheckpointStore> DurableHost<S> {
             .compare_and_swap(execution_id, expected_revision, checkpoint)
             .await
         {
-            Ok(CasOutcome::Accepted(revision)) => {
-                HostOutcome::WorkflowCompleted { outcome, revision }
-            }
-            Ok(other) => reload_outcome(PersistenceBoundary::Completion, other),
-            Err(error) => store_failed(PersistenceBoundary::Completion, error),
+            Ok(CasOutcome::Accepted(revision)) => HostOutcome::WorkflowCompleted {
+                outcome,
+                revision,
+                boundary,
+            },
+            Ok(other) => reload_outcome(boundary, other),
+            Err(error) => store_failed(boundary, error),
         }
     }
 
@@ -500,7 +790,7 @@ impl<S: CheckpointStore> DurableHost<S> {
 
 struct PreparedExposure {
     execution_id: ExecutionId,
-    expected_revision: StorageRevision,
+    expected_revision: Option<StorageRevision>,
     checkpoint: CheckpointEnvelope,
     activity: LogicalActivityId,
     attempt_id: AttemptId,
@@ -580,9 +870,15 @@ mod tests {
             CheckpointLimits::new(16, 100_000).unwrap(),
         );
         assert_send(host.turn(&OneActivity, execution.clone()));
+        assert_send(host.turn_and_expose(&OneActivity, execution.clone()));
 
         let activity = LogicalActivityId::new(execution_id, ActivitySequence::new(0), spec);
         assert_send(host.observe(
+            &execution,
+            ActivityObservation::new(activity.clone(), ExactBytes::new(b"result")),
+        ));
+        assert_send(host.observe_and_turn(
+            &OneActivity,
             &execution,
             ActivityObservation::new(activity, ExactBytes::new(b"result")),
         ));

@@ -270,19 +270,31 @@ persists a random execution ID and exact initial operation in
 `status.durableSwitchoverPilot`; no checkpoint or effect exists before that
 status write.
 
-The pilot uses the format-3 linear replay kernel, but every activity delegates
-its decision to the same switchover module. A schedule and exposure checkpoint
-precede a private dispatch permit. Dispatch-fence evidence is itself observed
-as one activity before a later permit can call the existing correlated
-`ReplicaAgent` API. Routing-label activities use the exact Pod UID
-precondition. Exposed work is observation-only: matching terminal ledger or
-postcondition evidence advances it; in-progress, mixed, or unavailable
-evidence remains quarantined.
+The pilot uses typed ordinary-async calls over the format-3 linear replay
+kernel and the same pure switchover calculation/terminal validation as the
+explicit path. Workflow input stores immutable operation authority once;
+ordinary activity records contain a compact mutable projection. Deterministic
+persist transitions run in memory. The three-member admission permits at most
+32 activity records and separately bounds replay at 64 transitions.
+
+Fused host progression persists a new activity directly as exposed, returning
+a private permit only after the exact checkpoint CAS is accepted. An
+authoritative observation is persisted together with replay and the next
+exposed command or terminal state. Dispatch-fence observations freeze exact
+agent generation, control version, runtime epoch, and correlated action
+payload before the later permit calls the existing `ReplicaAgent` API.
+Routing-label activities use the exact Pod UID precondition. Exposed work is
+observation-only: matching terminal ledger or postcondition evidence advances
+it; in-progress, mixed, unavailable, or unknown label evidence remains
+quarantined and is never automatically retried.
 
 The terminal checkpoint is accepted before topology/status publication.
 Terminal reload is status-only and does not poll replicas or dispatch effects.
-All incomplete pilot outcomes requeue in one second through the controller;
-there is no additional worker, queue, lease, watcher, or retry scheduler.
+Set and owned-Pod watches remain the primary wakeups. Incomplete effects use
+their bounded phase/action deadline (one to ten seconds) as a safety fallback;
+storage reloads remain prompt. One process-local mutex serializes each cached
+execution. There is no additional worker, queue, lease, watcher, distributed
+owner, or retry scheduler.
 
 Checkpoints use same-namespace ConfigMaps with a non-controlling owner
 reference to the exact `KubericSet`. The operator has ConfigMap `get`,

@@ -22,6 +22,7 @@ mod in_memory;
 mod kubernetes;
 mod replay;
 mod store;
+mod typed;
 mod workflow;
 
 pub use assessment::{FeasibilityClassification, FeasibilityInputs, classify_feasibility};
@@ -47,5 +48,9 @@ pub use kubernetes::{
 pub use replay::{Evaluation, Nondeterminism, evaluate};
 pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
+};
+pub use typed::{
+    ActivityCallError, DurableActivity, decode_activity_input, decode_activity_result,
+    encode_activity_input, encode_activity_result,
 };
 pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};

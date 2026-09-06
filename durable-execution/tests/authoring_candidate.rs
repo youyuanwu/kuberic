@@ -1,23 +1,29 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityName, ActivitySpec, CheckpointLimits, Evaluation, ExactBytes, ExecutionId,
-    ExecutionSpec, TerminalOutcome, Workflow, WorkflowContext, evaluate,
+    CheckpointLimits, DurableActivity, Evaluation, ExactBytes, ExecutionId, ExecutionSpec,
+    TerminalOutcome, Workflow, WorkflowContext, evaluate,
 };
 
 struct OneActivityWorkflow;
+struct OneActivity;
+
+impl DurableActivity for OneActivity {
+    type Input = Vec<u8>;
+    type Output = Vec<u8>;
+
+    const NAME: &'static str = "one-activity";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 1024;
+    const MAX_RESULT_BYTES: u64 = 1024;
+}
 
 #[async_trait]
 impl Workflow for OneActivityWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
-        TerminalOutcome::succeeded(
-            context
-                .activity(ActivitySpec::new(
-                    ActivityName::new("one-activity", 1).unwrap(),
-                    input,
-                    1024,
-                ))
-                .await,
-        )
+        match context.call::<OneActivity>(input.into_vec()).await {
+            Ok(result) => TerminalOutcome::succeeded(result),
+            Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
+        }
     }
 }
 

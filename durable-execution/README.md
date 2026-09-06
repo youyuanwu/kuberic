@@ -7,55 +7,71 @@ gated pilots. It is not an end-user runtime.
 
 ## Selected authoring surface
 
-The feasibility evaluation selected the ordinary async surface. A workflow is
-an `#[async_trait]` implementation of `Workflow::run`; its only
-framework-specific workflow-body operation is
-`WorkflowContext::activity(spec).await`. An immutable `ActivitySpec` combines
-the versioned name, exact input, and declared maximum result bytes. Workflow
-and store futures are `Send` so a host turn can run directly inside an
-asynchronous controller without a second executor.
+The feasibility evaluation selected an ordinary async surface. A typed
+activity declares its input, output, immutable versioned identity, and encoded
+bounds once through `DurableActivity`. Workflow bodies use
+`WorkflowContext::call::<A>(input).await`; activity names, exact byte wrappers,
+JSON calls, and result bounds stay out of the workflow body. Workflow and
+store futures are `Send` so a host turn can run directly inside an asynchronous
+controller without a second executor.
 
 ```rust
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityName, ActivitySpec, ExactBytes, TerminalOutcome, Workflow,
-    WorkflowContext,
+    DurableActivity, ExactBytes, TerminalOutcome, Workflow, WorkflowContext,
 };
+use serde::{Deserialize, Serialize};
 
-struct Greeting;
+#[derive(Deserialize, Serialize)]
+struct GreetingInput {
+    name: String,
+}
 
-#[async_trait]
-impl Workflow for Greeting {
-    async fn run(
-        &self,
-        context: &mut WorkflowContext<'_>,
-        input: ExactBytes,
-    ) -> TerminalOutcome {
-        TerminalOutcome::succeeded(
-            context.activity(ActivitySpec::new(
-                ActivityName::new("greeting", 1).unwrap(),
-                input,
-                4096,
-            ))
-            .await,
-        )
-    }
+#[derive(Deserialize, Serialize)]
+enum GreetingResult {
+    Greeted(String),
+    Rejected { code: u16 },
+}
+
+struct Greet;
+
+impl DurableActivity for Greet {
+    type Input = GreetingInput;
+    type Output = GreetingResult;
+    const NAME: &'static str = "greeting";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 1024;
+    const MAX_RESULT_BYTES: u64 = 4096;
 }
 ```
 
-The measured workflow body uses one framework operation against an FR-012
-maximum of two. The public host reports ten turn/observation outcome variants,
-including portable store failure. No explicit poll/replay authoring surface is
-also exported.
+Inside `Workflow::run`, an ordinary call is:
+
+```rust
+let result = context
+    .call::<Greet>(GreetingInput {
+        name: "Ada".to_owned(),
+    })
+    .await;
+```
+
+`ActivityCallError` reports deterministic identity, encoding, decoding, and
+bound failures in a portable bounded form. Domain rejection or failure belongs
+in the declared output enum, as shown above, and is stored through the same
+completed-result lifecycle as success. The low-level
+`WorkflowContext::activity(ActivitySpec)` API remains available for justified
+advanced and compatibility uses. No explicit poll/replay authoring surface is
+exported.
 
 ## Replay and checkpoint semantics
 
-`ExactBytes` are compared without normalization and encoded as validated base64
-JSON strings. Workflow history is a contiguous, zero-based sequence with a
-completed prefix and at most one final pending activity. A requested activity
-must match the recorded sequence, immutable positive-versioned name, exact
-input, and declared result bound; a mismatch is nondeterminism rather than a
-new dispatch.
+Typed calls first canonicalize JSON object-key order, then compare the encoded
+input exactly on every replay. Low-level `ExactBytes` are compared without
+normalization and encoded as validated base64 JSON strings. Workflow history
+is a contiguous, zero-based sequence with a completed prefix and at most one
+final pending activity. A requested activity must match the recorded sequence,
+immutable positive-versioned name, exact input, and declared result bound; a
+mismatch is nondeterminism rather than a new dispatch.
 
 Format version 3 stores JSON payload bytes in a versioned
 `CheckpointEnvelope`. An immutable `ExecutionSpec` declares execution
@@ -242,6 +258,23 @@ state. If it did not apply, reload replays completed active results and retries
 terminalization without redispatch. Provider failures return `StoreFailed`;
 every later attempt starts with a fresh load.
 
+Callers with effect-specific authoritative recovery can opt into the fused
+host methods without changing the low-level behavior above:
+
+- `turn_and_expose` evaluates the next activity, reserves its maximum result,
+  and persists it directly as `DispatchExposed` in one CAS. It creates the
+  opaque permit only after that CAS is accepted.
+- `observe_and_turn` validates one exact authoritative observation, replays
+  deterministic workflow code, and uses one CAS to persist either the
+  completed result plus the next `DispatchExposed` command or the compact
+  terminal state.
+
+Conflict, definite store failure, and `OutcomeUnknown` at either fused boundary
+never return a permit. An unknown-after-apply next exposure reloads as
+quarantined, including the case where this process knows it never received the
+permit; generic recovery does not weaken that conservative rule. The original
+`turn` and `observe` methods remain the default for arbitrary effects.
+
 Terminal success and failure payloads share the `ExecutionSpec` bound. An
 exact-bound outcome is accepted. A larger outcome is an explicit checkpoint
 contract violation and is not persisted or reported complete. This workflow
@@ -307,18 +340,20 @@ not reproduction of an actual network fault.
 
 The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
-three-way classifier. The revised evidence contains 38 unique contiguous
-scenarios and 117 structured assertions; all pass. All five FR-012 authoring
+three-way classifier. The revised evidence contains 45 unique contiguous
+scenarios and 134 structured assertions; all pass. All five FR-012 authoring
 predicates and all five provider, bounding, lifecycle, and documentation
-predicates also pass, so the mechanically derived result remains **feasible**
-within this kernel's stated boundary.
+predicates also pass. The mechanically derived result is **conditionally
+feasible** within this kernel's stated boundary because the operator pilot
+retains a documented write-efficiency exception.
 
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
-are implemented; generic active-history compaction, continuation, and operator
-adoption remain excluded. The remaining ordered deferred work is tracked in
+are implemented. A feature-gated operator pilot adopts the kernel without
+moving effect ownership into it; generic active-history compaction and
+continuation remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
 
 ## Limitations and exclusions
@@ -336,12 +371,11 @@ outcomes indistinguishable to the host. The lost-effect-reply fixture still
 invokes one synthetic effect under an opaque permit and discards its returned
 result before restart.
 
-Typed adapters, durable activity failures, dispatch registries, passive
-convergence, tracing/inspection, timers, retries, parallelism, generic
+Generic activity handlers/registries, a second activity-failure lifecycle,
+passive convergence, tracing/inspection, timers, retries, parallelism, generic
 lifecycle APIs, queries, external events, child workflows, workers, queues,
-leases, and operator integration are excluded. So are compensation,
-migrations, upgrade guarantees, rollout, and production diagnostics. The
-experiment changes no Kuberic CRD, operator reconciliation, durable topology
-workflow, status persistence, ReplicaAgent, gRPC protocol, or deployment
-manifest. These provider-readiness prerequisites do not establish
-current-operator parity or authorize an operator pilot, switchover, or adoption.
+leases, and distributed runtime ownership are excluded. So are migrations,
+upgrade guarantees, broad rollout, and production diagnostics. The
+feature-gated pilot integrates typed calls and operator-owned effect adapters;
+it does not change `ReplicaAgent`, the gRPC protocol, default explicit
+switchover, or any other topology workflow.

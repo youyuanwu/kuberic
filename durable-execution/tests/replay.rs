@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, AttemptId,
-    CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload, Evaluation,
-    ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError,
-    LogicalActivityId, Nondeterminism, TerminalOutcome, Workflow, WorkflowContext,
-    evaluate as evaluate_with_spec,
+    ActivityCallError, ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ActivityState,
+    AttemptId, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload,
+    DurableActivity, Evaluation, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
+    HostEpoch, IdentityError, LogicalActivityId, Nondeterminism, TerminalOutcome, Workflow,
+    WorkflowContext, encode_activity_input, encode_activity_result, evaluate as evaluate_with_spec,
 };
+use serde::{Deserialize, Serialize};
 
 const MAX_RESULT_BYTES: u64 = 1024;
 
@@ -594,4 +596,289 @@ fn loaded_completed_result_must_respect_its_declared_bound() {
         })
     ));
     assert_eq!(workflow.polls.get(), 0);
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum TypedOutcome {
+    Applied { value: String },
+    Rejected { code: u16 },
+}
+
+struct TypedEffectV1;
+
+impl DurableActivity for TypedEffectV1 {
+    type Input = String;
+    type Output = TypedOutcome;
+
+    const NAME: &'static str = "typed.effect";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 32;
+    const MAX_RESULT_BYTES: u64 = 128;
+}
+
+struct TypedEffectV2;
+
+impl DurableActivity for TypedEffectV2 {
+    type Input = String;
+    type Output = TypedOutcome;
+
+    const NAME: &'static str = "typed.effect";
+    const VERSION: u32 = 2;
+    const MAX_INPUT_BYTES: u64 = 32;
+    const MAX_RESULT_BYTES: u64 = 128;
+}
+
+struct TypedWorkflowV1;
+struct TypedWorkflowV2;
+
+async fn run_typed<A: DurableActivity<Input = String, Output = TypedOutcome>>(
+    context: &mut WorkflowContext<'_>,
+) -> TerminalOutcome {
+    match context.call::<A>("hello".to_owned()).await {
+        Ok(outcome) => TerminalOutcome::succeeded(serde_json::to_vec(&outcome).unwrap()),
+        Err(error) => TerminalOutcome::failed(serde_json::to_vec(&error).unwrap()),
+    }
+}
+
+#[async_trait]
+impl Workflow for TypedWorkflowV1 {
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
+        run_typed::<TypedEffectV1>(context).await
+    }
+}
+
+#[async_trait]
+impl Workflow for TypedWorkflowV2 {
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
+        run_typed::<TypedEffectV2>(context).await
+    }
+}
+
+fn typed_spec<A: DurableActivity<Input = String>>(input: &str) -> ActivitySpec {
+    ActivitySpec::new(
+        ActivityName::new(A::NAME, A::VERSION).unwrap(),
+        encode_activity_input::<A>(&input.to_owned()).unwrap(),
+        A::MAX_RESULT_BYTES,
+    )
+}
+
+#[test]
+fn typed_call_schedules_canonical_input_and_immutable_identity() {
+    let Evaluation::Scheduled { activity, .. } = evaluate(
+        &TypedWorkflowV1,
+        execution(14),
+        bytes(b"workflow"),
+        None,
+        limits(),
+    ) else {
+        panic!("typed call did not schedule");
+    };
+
+    assert_eq!(activity.name(), &name("typed.effect", 1));
+    assert_eq!(
+        activity.input(),
+        &encode_activity_input::<TypedEffectV1>(&"hello".to_owned()).unwrap()
+    );
+    assert_eq!(activity.max_result_bytes(), 128);
+}
+
+#[test]
+fn typed_domain_failure_is_a_bounded_completed_output() {
+    let execution_id = execution(15);
+    let workflow_input = bytes(b"workflow");
+    let rejection = TypedOutcome::Rejected { code: 409 };
+    let checkpoint = envelope(
+        execution_id,
+        workflow_input.clone(),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            typed_spec::<TypedEffectV1>("hello"),
+            encode_activity_result::<TypedEffectV1>(&rejection).unwrap(),
+        )],
+    );
+
+    let Evaluation::Complete { outcome, .. } = evaluate(
+        &TypedWorkflowV1,
+        execution_id,
+        workflow_input,
+        Some(&checkpoint),
+        limits(),
+    ) else {
+        panic!("typed rejection did not replay as a completed output");
+    };
+    let TerminalOutcome::Succeeded(payload) = outcome else {
+        panic!("domain rejection incorrectly entered the kernel failure lifecycle");
+    };
+    assert_eq!(
+        serde_json::from_slice::<TypedOutcome>(payload.as_slice()).unwrap(),
+        rejection
+    );
+}
+
+#[test]
+fn typed_identity_change_remains_nondeterminism() {
+    let execution_id = execution(16);
+    let workflow_input = bytes(b"workflow");
+    let checkpoint = envelope(
+        execution_id,
+        workflow_input.clone(),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            typed_spec::<TypedEffectV1>("hello"),
+            encode_activity_result::<TypedEffectV1>(&TypedOutcome::Applied {
+                value: "done".to_owned(),
+            })
+            .unwrap(),
+        )],
+    );
+
+    assert!(matches!(
+        evaluate(
+            &TypedWorkflowV2,
+            execution_id,
+            workflow_input,
+            Some(&checkpoint),
+            limits()
+        ),
+        Evaluation::Nondeterminism(Nondeterminism::ActivityMismatch { .. })
+    ));
+}
+
+#[test]
+fn malformed_typed_result_is_a_deterministic_portable_call_error() {
+    let execution_id = execution(17);
+    let workflow_input = bytes(b"workflow");
+    let checkpoint = envelope(
+        execution_id,
+        workflow_input.clone(),
+        vec![ActivityRecord::completed(
+            ActivitySequence::new(0),
+            typed_spec::<TypedEffectV1>("hello"),
+            bytes(b"not-json"),
+        )],
+    );
+
+    let first = evaluate(
+        &TypedWorkflowV1,
+        execution_id,
+        workflow_input.clone(),
+        Some(&checkpoint),
+        limits(),
+    );
+    let second = evaluate(
+        &TypedWorkflowV1,
+        execution_id,
+        workflow_input,
+        Some(&checkpoint),
+        limits(),
+    );
+    assert_eq!(first, second);
+    let Evaluation::Complete {
+        outcome: TerminalOutcome::Failed(payload),
+        ..
+    } = first
+    else {
+        panic!("malformed typed result did not fail deterministically");
+    };
+    assert_eq!(
+        serde_json::from_slice::<ActivityCallError>(payload.as_slice()).unwrap(),
+        ActivityCallError::ResultDecoding
+    );
+}
+
+struct TinyInput;
+
+impl DurableActivity for TinyInput {
+    type Input = String;
+    type Output = String;
+
+    const NAME: &'static str = "typed.tiny";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 4;
+    const MAX_RESULT_BYTES: u64 = 4;
+}
+
+struct OversizedTypedInputWorkflow;
+
+#[async_trait]
+impl Workflow for OversizedTypedInputWorkflow {
+    async fn run(&self, context: &mut WorkflowContext<'_>, _input: ExactBytes) -> TerminalOutcome {
+        match context.call::<TinyInput>("too large".to_owned()).await {
+            Ok(_) => TerminalOutcome::succeeded([]),
+            Err(error) => TerminalOutcome::failed(serde_json::to_vec(&error).unwrap()),
+        }
+    }
+}
+
+#[test]
+fn typed_input_and_result_bounds_fail_before_persistence() {
+    let Evaluation::Complete {
+        outcome: TerminalOutcome::Failed(payload),
+        completed_activity_count,
+        ..
+    } = evaluate(
+        &OversizedTypedInputWorkflow,
+        execution(18),
+        bytes(b"workflow"),
+        None,
+        limits(),
+    )
+    else {
+        panic!("oversized typed input did not fail before scheduling");
+    };
+    assert_eq!(completed_activity_count, 0);
+    assert!(matches!(
+        serde_json::from_slice::<ActivityCallError>(payload.as_slice()).unwrap(),
+        ActivityCallError::InputTooLarge { max_bytes: 4, .. }
+    ));
+
+    assert!(matches!(
+        encode_activity_result::<TinyInput>(&"large".to_owned()),
+        Err(ActivityCallError::ResultTooLarge {
+            actual_bytes: 7,
+            max_bytes: 4
+        })
+    ));
+}
+
+#[test]
+fn typed_call_errors_have_stable_portable_encoding() {
+    let error = ActivityCallError::InputTooLarge {
+        actual_bytes: 9,
+        max_bytes: 4,
+    };
+    let encoded = serde_json::to_vec(&error).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<ActivityCallError>(&encoded).unwrap(),
+        error
+    );
+    assert!(encoded.len() < 128);
+}
+
+struct MapInputActivity;
+
+impl DurableActivity for MapInputActivity {
+    type Input = HashMap<String, u64>;
+    type Output = ();
+
+    const NAME: &'static str = "typed.map-input";
+    const VERSION: u32 = 1;
+    const MAX_INPUT_BYTES: u64 = 128;
+    const MAX_RESULT_BYTES: u64 = 4;
+}
+
+#[test]
+fn typed_input_encoding_canonicalizes_object_key_order() {
+    let mut first = HashMap::new();
+    first.insert("zeta".to_owned(), 1);
+    first.insert("alpha".to_owned(), 2);
+
+    let mut second = HashMap::new();
+    second.insert("alpha".to_owned(), 2);
+    second.insert("zeta".to_owned(), 1);
+
+    let first = encode_activity_input::<MapInputActivity>(&first).unwrap();
+    let second = encode_activity_input::<MapInputActivity>(&second).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.as_slice(), br#"{"alpha":2,"zeta":1}"#);
 }

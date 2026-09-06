@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    CasOutcome, CheckpointEnvelope, CheckpointStore, ExecutionId, HostOutcome, PersistenceBoundary,
-    StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
+    CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointState, CheckpointStore,
+    ExecutionId, HostOutcome, PersistenceBoundary, StorageRevision, StoreError, StoreErrorKind,
+    StoredCheckpoint,
 };
 use tracing::info;
 
@@ -24,6 +25,11 @@ pub struct PilotCheckpointMeasurementsSnapshot {
     pub definite_failures: u64,
     pub latest_authoritative_checkpoint_bytes: Option<usize>,
     pub maximum_authoritative_checkpoint_bytes: usize,
+    pub latest_active_checkpoint_bytes: Option<usize>,
+    pub maximum_active_checkpoint_bytes: usize,
+    pub latest_terminal_checkpoint_bytes: Option<usize>,
+    pub maximum_terminal_checkpoint_bytes: usize,
+    pub completed_activity_count: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,9 +132,9 @@ impl MeasuredPilotCheckpointStore {
     pub fn correlate_host_outcome(&self, outcome: &HostOutcome) {
         let boundary = match outcome {
             HostOutcome::ScheduleAccepted { .. } => Some(PersistenceBoundary::Schedule),
-            HostOutcome::DispatchPermitted { .. } => Some(PersistenceBoundary::Exposure),
+            HostOutcome::DispatchPermitted { boundary, .. } => Some(*boundary),
             HostOutcome::ObservationAccepted { .. } => Some(PersistenceBoundary::Observation),
-            HostOutcome::WorkflowCompleted { .. } => Some(PersistenceBoundary::Completion),
+            HostOutcome::WorkflowCompleted { boundary, .. } => Some(*boundary),
             HostOutcome::ReloadRequired { boundary, .. } => Some(*boundary),
             HostOutcome::StoreFailed {
                 operation: kuberic_durable_execution::StoreOperation::CompareAndSwap(boundary),
@@ -146,6 +152,10 @@ impl MeasuredPilotCheckpointStore {
                     ?measurements.latest_authoritative_checkpoint_bytes,
                 maximum_authoritative_checkpoint_bytes =
                     measurements.maximum_authoritative_checkpoint_bytes,
+                maximum_active_checkpoint_bytes = measurements.maximum_active_checkpoint_bytes,
+                latest_terminal_checkpoint_bytes =
+                    ?measurements.latest_terminal_checkpoint_bytes,
+                completed_activity_count = ?measurements.completed_activity_count,
                 "durable switchover checkpoint boundary"
             );
         }
@@ -162,7 +172,7 @@ impl MeasuredPilotCheckpointStore {
         }
     }
 
-    fn record_authoritative_bytes(&self, bytes: usize) {
+    fn record_authoritative_checkpoint(&self, checkpoint: &CheckpointEnvelope, bytes: usize) {
         let mut measurements = self
             .measurements
             .lock()
@@ -171,6 +181,27 @@ impl MeasuredPilotCheckpointStore {
         measurements.maximum_authoritative_checkpoint_bytes = measurements
             .maximum_authoritative_checkpoint_bytes
             .max(bytes);
+        let Ok(payload) =
+            serde_json::from_slice::<CheckpointPayload>(checkpoint.payload().as_slice())
+        else {
+            return;
+        };
+        match payload.state() {
+            CheckpointState::Active { .. } => {
+                measurements.latest_active_checkpoint_bytes = Some(bytes);
+                measurements.maximum_active_checkpoint_bytes =
+                    measurements.maximum_active_checkpoint_bytes.max(bytes);
+            }
+            CheckpointState::Terminal {
+                completed_activity_count,
+                ..
+            } => {
+                measurements.latest_terminal_checkpoint_bytes = Some(bytes);
+                measurements.maximum_terminal_checkpoint_bytes =
+                    measurements.maximum_terminal_checkpoint_bytes.max(bytes);
+                measurements.completed_activity_count = Some(*completed_activity_count);
+            }
+        }
     }
 }
 
@@ -197,7 +228,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
                         format!("measure loaded pilot checkpoint: {error}"),
                     )
                 })?;
-                self.record_authoritative_bytes(bytes);
+                self.record_authoritative_checkpoint(stored.checkpoint(), bytes);
                 info!(
                     execution_id = %execution_id,
                     operation = "load",
@@ -236,6 +267,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
                 format!("measure proposed pilot checkpoint: {error}"),
             )
         })?;
+        let attempted_checkpoint = checkpoint.clone();
         {
             let mut measurements = self
                 .measurements
@@ -255,7 +287,7 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
                     .expect("pilot checkpoint measurements lock poisoned");
                 measurements.accepted_writes = measurements.accepted_writes.saturating_add(1);
                 drop(measurements);
-                self.record_authoritative_bytes(attempted_bytes);
+                self.record_authoritative_checkpoint(&attempted_checkpoint, attempted_bytes);
                 "accepted"
             }
             Ok(CasOutcome::Conflict) => {
@@ -314,7 +346,9 @@ impl CheckpointStore for MeasuredPilotCheckpointStore {
 #[cfg(test)]
 mod durable_switchover_pilot_tests {
     use super::*;
-    use kuberic_durable_execution::{ExactBytes, InMemoryFault, ReloadReason, TerminalOutcome};
+    use kuberic_durable_execution::{
+        ExactBytes, ExecutionContract, ExecutionSpec, InMemoryFault, ReloadReason, TerminalOutcome,
+    };
 
     fn checkpoint(value: &[u8]) -> CheckpointEnvelope {
         CheckpointEnvelope::new(3, ExactBytes::new(value))
@@ -338,6 +372,7 @@ mod durable_switchover_pilot_tests {
         store.correlate_host_outcome(&HostOutcome::WorkflowCompleted {
             outcome: TerminalOutcome::succeeded(ExactBytes::new(b"terminal")),
             revision: revision.clone(),
+            boundary: PersistenceBoundary::Completion,
         });
         let accepted_bytes = store
             .load(execution_id)
@@ -429,6 +464,55 @@ mod durable_switchover_pilot_tests {
         assert_eq!(events[1].boundary, Some(PersistenceBoundary::Exposure));
         assert_eq!(events[2].boundary, Some(PersistenceBoundary::Schedule));
         assert_eq!(events[3].boundary, Some(PersistenceBoundary::Observation));
+    }
+
+    #[tokio::test]
+    async fn measurements_split_active_terminal_and_boundary_count() {
+        let execution_id = ExecutionId::from_bytes([10; 16]);
+        let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"workflow"), 128);
+        let contract = ExecutionContract::new(execution, 100_000);
+        let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let store = MeasuredPilotCheckpointStore::new(
+            execution_id,
+            PilotCheckpointStore::InMemory(backend),
+        );
+        let active =
+            CheckpointEnvelope::encode(&CheckpointPayload::active(contract.clone(), Vec::new()))
+                .unwrap();
+        let active_bytes = active.encoded_len().unwrap();
+        let CasOutcome::Accepted(revision) = store
+            .compare_and_swap(execution_id, None, active)
+            .await
+            .unwrap()
+        else {
+            panic!("active checkpoint was not accepted");
+        };
+        let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
+            contract,
+            TerminalOutcome::succeeded(ExactBytes::new(b"done")),
+            19,
+        ))
+        .unwrap();
+        let terminal_bytes = terminal.encoded_len().unwrap();
+        assert!(matches!(
+            store
+                .compare_and_swap(execution_id, Some(revision), terminal)
+                .await
+                .unwrap(),
+            CasOutcome::Accepted(_)
+        ));
+
+        let measurements = store.measurements();
+        assert_eq!(measurements.maximum_active_checkpoint_bytes, active_bytes);
+        assert_eq!(
+            measurements.latest_terminal_checkpoint_bytes,
+            Some(terminal_bytes)
+        );
+        assert_eq!(
+            measurements.maximum_terminal_checkpoint_bytes,
+            terminal_bytes
+        );
+        assert_eq!(measurements.completed_activity_count, Some(19));
     }
 
     #[tokio::test]

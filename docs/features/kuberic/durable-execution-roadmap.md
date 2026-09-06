@@ -15,16 +15,20 @@ compatibility with either project.
 The implemented kernel provides:
 
 - deterministic linear replay;
+- typed, versioned, bounded activity declarations and ordinary async calls
+  over the compatible exact-byte API;
 - exact activity matching and stable logical identity;
 - asynchronous load and compare-and-swap persistence;
 - opaque provider revision tokens and conservative unknown outcomes;
-- separately persisted schedule and dispatch exposure;
+- conservative separately persisted schedule/dispatch exposure for low-level
+  callers, plus opt-in atomic schedule/exposure fusion;
 - bounded activity count and encoded checkpoint size;
 - maximum-result capacity reservation before dispatch;
 - immutable execution-level terminal payload and admitted capacity;
 - completion-only active-to-terminal checkpoint compaction;
 - direct terminal outcome reload without workflow polling;
 - ambiguity quarantine and authoritative observation recovery;
+- opt-in atomic observation/replay/next-exposure or terminal progression;
 - an optional, isolated ConfigMap checkpoint-provider spike using opaque
   Kubernetes `resourceVersion` compare-and-swap;
 - independently retained checkpoints by default, with validated optional
@@ -41,8 +45,8 @@ The implemented kernel provides:
 - direct kube-controller integration through Send workflow/store futures,
   without another executor or scheduler;
 - same-namespace owner-bound pilot checkpoints, owner garbage-collection
-  validation, execution-keyed write/size telemetry, and a reproducible
-  explicit-versus-pilot source-complexity command.
+  validation, execution-keyed write/outcome and active/terminal size telemetry,
+  and a reproducible explicit-versus-pilot source-complexity command.
 
 The bounds prevent unlimited growth and ensure a declared-valid result remains
 persistable after dispatch. Active history is never compacted: every completed
@@ -105,11 +109,15 @@ need. Short topology workflows should complete and use terminal compaction.
 
 ### Kernel Ergonomics
 
-1. Add typed serde workflow and activity adapters while retaining exact
-   encoded-byte matching.
-2. Add durable activity failure results and deterministic failure replay.
-3. Add an activity registry and dispatch adapter.
-4. Add a passive convergence resolver for quarantined activities.
+1. **Implemented:** typed serde activity declarations and calls retaining exact
+   canonical encoded-byte matching, immutable version identity, declared
+   bounds, and portable deterministic codec/call failures.
+2. Keep domain rejection/failure in each typed bounded activity output; add a
+   generic activity-failure lifecycle only if a broader workflow demonstrates
+   that need.
+3. Add an activity registry only if a non-operator host needs runtime lookup.
+4. Generalize passive convergence resolution only after another workflow
+   demonstrates reusable policy beyond the in-process operator adapters.
 5. Add replay-aware tracing and checkpoint inspection.
 
 ### Workflow Primitives
@@ -152,17 +160,37 @@ spike:
    feature-gated real-API coverage through the existing all-features workspace
    test command after the one-control-plane KinD CI job is provisioned.
 
-The operator pilot is implemented behind two explicit gates and does not
-authorize a workflow-ownership change or broader migration. A representative
-successful execution used 88 accepted checkpoint writes and reached a
-141,529-byte active checkpoint, versus 42 accepted status writes for the
-explicit test path. The checked-in lexical measurement reports 1,258
-executable lines and 141 decision points for the explicit implementation,
-while the four non-overlapping pilot module, checkpoint-store, effect-bridge,
-and reconcile boundaries total 2,254 executable lines and 194 decision points.
-CRD, manifest, and test changes are outside both measurements. The pilot
-therefore preserves safety but does not yet demonstrate lower persistence
-traffic or net implementation complexity.
+The operator pilot remains behind two explicit gates and does not authorize a
+workflow-ownership change or broader migration. Its effect-boundary redesign
+uses compact mutable state, combines deterministic transitions in memory, and
+uses fused host progression while preserving exact durable commands,
+authoritative observations, and conservative quarantine.
+
+A representative successful execution now uses 19 durable
+effect/observation boundaries and 20 accepted checkpoint writes, versus the
+merged pilot's 88. Maximum active size fell from 141,529 to 41,385 bytes;
+terminal size fell from 5,433 bytes to an observed 3,961–3,969-byte range.
+The explicit comparison still uses 42 accepted status writes; the redesigned
+pilot uses two after acceptance. Its nine external-effect commands mean the
+strict `E + 4` write gate is 13, so 20 is an explicitly retained failed gate.
+The additional boundaries durably freeze or attest replica-agent fences and
+postconditions; omitting them would weaken exact replay or
+durable-before-dispatch safety. Active size passes 64 KiB but not the 32 KiB
+stretch gate, and terminal size passes its baseline gate.
+
+The lexical report distinguishes a 173-line/28-decision workflow body and the
+comparable 535/59 legacy workflow scope (merged baseline 538/73). Shared typed,
+fused, and effect-adapter infrastructure is 996/92; operator integration is
+887/47; the honestly charged non-overlapping total is 3,052/230 versus the
+merged pilot's 2,254/194. The shared protocol remains measured with the
+explicit implementation: that scope increased from 1,258/141 to 1,449/172.
+Charging it as well yields a combined 4,501/402 versus the combined baseline
+3,512/335. Shared code may amortize across later workflows, but this pilot
+does not claim that amortization yet.
+
+A public compact reducer remains deferred. Deterministic transitions already
+add zero history records, so the failed write gate is not reducer-addressable
+under the evidence rule. No reducer prototype or API is introduced.
 
 The remaining step stays deferred: generalize only if later evidence justifies
 the additional operational and implementation cost. No other workflow,
