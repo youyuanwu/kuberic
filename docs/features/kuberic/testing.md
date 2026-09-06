@@ -410,14 +410,49 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
 `python3 scripts/measure-switchover-complexity.py` reports stable lexical
 implementation boundaries split into workflow body, comparable workflow scope,
 shared typed/fused/effect-adapter infrastructure, operator integration, and
-honestly charged total. The happy-path output reports logical external effects,
-durable boundaries, checkpoint attempts/outcomes, active/terminal sizes,
-status attempts/outcomes, UID-label calls, Pod-list calls, and an explicit
-reason requeues are unavailable in the direct-reconcile harness. The durable
-kernel's 45-scenario conformance matrix covers fused schedule/exposure,
-observation/next exposure, observation/terminal, every CAS fault class,
-unknown-after-apply reload, exact permit/attempt identity, and capacity
-reservation.
+honestly charged total, and rejects overlap among charged scopes.
+
+The authoritative happy-path gate expects exactly nine external effects plus
+three passive observations, giving 12 completed durable boundaries and 13
+accepted checkpoint writes including terminal persistence. Seven former
+preparation-only records are now part of their corresponding effect exposure.
+The measured maximum active checkpoint is 31,605 bytes and the terminal
+checkpoint is 3,965 bytes. `external_effects` counts ReplicaAgent commands and
+UID-fenced label patches; `passive_observations` counts evidence-only
+activities; `durable_boundaries` is their completed total.
+`checkpoint_write_attempts` counts checkpoint CAS calls, while
+`checkpoint_accepted_writes` counts only responses with a confirmed
+authoritative revision. Latest/maximum authoritative, active, and terminal
+checkpoint byte fields identify the lifecycle state instead of conflating
+their sizes. The output also reports persistence outcomes, status
+attempts/outcomes, UID-label calls, Pod-list calls, and an explicit reason
+requeues are unavailable in the direct-reconcile harness.
+
+Run the exact measurement and projection gates with:
+
+```console
+python3 scripts/measure-switchover-complexity.py
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  --features durable-switchover-pilot maximum_projected_history_fits_both_budgets
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  --features durable-switchover-pilot measurements_ -- --nocapture
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
+  -p kvstore --test reconciler \
+  test_durable_execution_switchover_pilot_happy_path -- --nocapture
+```
+
+The ambiguity matrix distinguishes exposure conflicts, definite storage
+failures, unknown outcomes without application, and unknown outcomes after
+application. None returns a permit on the uncertain reconcile. Reload after an
+applied unknown finds the complete prepared exposure and quarantines it;
+reload after an unapplied unknown finds the predecessor and may prepare a new
+attempt. Lost replies remain quarantined until authoritative postcondition
+evidence or proof of non-admission permits bounded redelivery. The durable
+kernel's 45-scenario conformance matrix also covers fused schedule/exposure,
+observation/next exposure, observation/terminal, exact permit/attempt identity,
+and capacity reservation.
 
 Pilot/operator tests run with a 4 MiB test-thread stack in CI-constrained
 environments:
@@ -428,8 +463,19 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
 ```
 
 The real Kubernetes checkpoint test also creates an owner-bound terminal
-checkpoint and proves owner deletion triggers garbage collection. Run it only
-after its endpoint and namespace/ConfigMap authorization preflight succeeds.
+checkpoint and proves owner deletion triggers garbage collection. It is
+conditional validation: run it only when an authorized Kubernetes endpoint is
+available and its namespace/ConfigMap preflight succeeds:
+
+```console
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test \
+  -p kuberic-durable-execution --features kubernetes \
+  --test kubernetes_checkpoint_real -- --nocapture
+```
+
+When no authorized cluster is available, the required local measurement,
+fault, replay, and bounds gates above remain authoritative; absence of the
+optional environment is not evidence of real-API coverage.
 
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the

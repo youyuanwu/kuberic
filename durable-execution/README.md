@@ -252,6 +252,33 @@ persistence boundaries. It is **not** proof of exactly-once execution: a crash
 may occur after exposure persistence and before, during, or after the external
 effect.
 
+### Internal prepared exposure
+
+Effect-specific adapters may pass a `PreparedActivityResolver` to
+`turn_and_expose_with` and `observe_and_turn_with`. For a new logical request,
+the resolver supplies the complete bounded `ActivitySpec` before checkpoint
+encoding, result-capacity reservation, and the exposure CAS. For replay, it
+validates the complete recorded specification against the logical request;
+the kernel then performs its normal exact specification comparison. Derivation,
+validation, encoding, or bound failure occurs before persistence and produces
+no permit.
+
+The accepted `DispatchExposed` checkpoint is therefore the authority for the
+exact command. A permit is created only after that checkpoint CAS is accepted
+and identifies the same logical activity and attempt. Conflict, definite store
+failure, and `OutcomeUnknown` never produce a permit. If an unknown outcome was
+applied, reload sees the complete exposed specification as quarantined; if it
+was not applied, reload sees the predecessor. An unresolved exposure remains
+quarantined until the host receives authoritative completion or
+effect-specific proof that permits a safe retry. Process-local knowledge that
+a permit or reply was lost cannot override checkpoint state.
+
+This is an internal, opt-in host/evaluation behavior. The public typed
+authoring contract is unchanged: existing `DurableActivity` declarations,
+`WorkflowContext::call`, immutable name/version identity, canonical typed
+input/output encoding, exact replay matching, and declared input/result bounds
+continue to use identity preparation by default.
+
 Completion conflict or `OutcomeUnknown` returns `ReloadRequired` and never a
 permit or completion. If an unknown write applied, reload observes terminal
 state. If it did not apply, reload replays completed active results and retries
