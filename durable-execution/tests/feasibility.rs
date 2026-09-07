@@ -40,31 +40,42 @@ struct PredicateEvidence {
     passed: bool,
 }
 
-fn root_manifest_table(manifest: &str, table: &str) -> Option<String> {
-    let header = format!("[{table}]");
-    let mut lines = manifest.lines().skip_while(|line| line.trim() != header);
-    lines.next()?;
-    Some(
-        lines
-            .take_while(|line| {
-                let trimmed = line.trim();
-                !(trimmed.starts_with('[') && trimmed.ends_with(']'))
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+fn library_dependency_lines(manifest: &str) -> Vec<&str> {
+    let mut library_dependencies = false;
+    manifest
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                library_dependencies = trimmed == "[dependencies]"
+                    || (trimmed.starts_with("[target.") && trimmed.ends_with(".dependencies]"));
+                return false;
+            }
+            library_dependencies
+        })
+        .collect()
 }
 
 fn library_dependencies_are_runtime_neutral(manifest: &str) -> bool {
-    let Some(dependencies) = root_manifest_table(manifest, "dependencies") else {
+    let dependencies = library_dependency_lines(manifest);
+    if dependencies.is_empty() {
         return false;
-    };
+    }
     const ASYNC_RUNTIMES: [&str; 4] = ["tokio", "async-std", "smol", "glommio"];
-    !dependencies.lines().any(|line| {
-        let dependency = line
-            .split_once('=')
-            .map(|(name, _)| name.trim().trim_matches('"'));
-        dependency.is_some_and(|name| ASYNC_RUNTIMES.contains(&name))
+    !dependencies.into_iter().any(|line| {
+        let line = line.split('#').next().unwrap_or_default();
+        let Some((name, declaration)) = line.split_once('=') else {
+            return false;
+        };
+        let name = name
+            .trim()
+            .trim_matches('"')
+            .strip_suffix(".workspace")
+            .unwrap_or_else(|| name.trim().trim_matches('"'));
+        ASYNC_RUNTIMES.contains(&name)
+            || ASYNC_RUNTIMES
+                .iter()
+                .any(|runtime| declaration.contains(&format!("package = \"{runtime}\"")))
     })
 }
 
@@ -92,7 +103,7 @@ pretty_assertions = "1"
 "#;
     assert!(!library_dependencies_are_runtime_neutral(library_runtime));
 
-    let target_and_quoted_tables_do_not_replace_root_dependencies = r#"
+    let target_runtime_is_a_library_dependency = r#"
 [dependencies]
 serde.workspace = true
 
@@ -102,8 +113,16 @@ tokio.workspace = true
 ["dev-dependencies"]
 tokio.workspace = true
 "#;
-    assert!(library_dependencies_are_runtime_neutral(
-        target_and_quoted_tables_do_not_replace_root_dependencies
+    assert!(!library_dependencies_are_runtime_neutral(
+        target_runtime_is_a_library_dependency
+    ));
+
+    let renamed_library_runtime = r#"
+[dependencies]
+runtime = { package = "tokio", version = "1" }
+"#;
+    assert!(!library_dependencies_are_runtime_neutral(
+        renamed_library_runtime
     ));
 
     assert!(!library_dependencies_are_runtime_neutral(
