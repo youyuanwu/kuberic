@@ -121,16 +121,29 @@ pull requests. This planning activity creates no commit.
      results, 262,144-byte active records, 12,288-byte terminal records, and
      4,096-byte terminal payloads. Admission projects the maximum fault history
      before the first checkpoint is created.
+   - Encoded limits are immutable constants of a workflow contract version.
+     Switchover keeps a terminal ceiling equal to its prior single encoded
+     ceiling, preserving existing checkpoint reloads. Native remove selects its
+     exact active/terminal limits from the serialized production contract
+     version before host construction. Any future limit change requires a
+     contract-version bump and explicit compatibility behavior.
 
 5. **Fail closed across the clean break.**
-   - Add an internal deserialization-only legacy pilot tombstone in
-     `KubericSetStatus`, excluded from generated schema and serialization, so
-     persisted `durableRemoveReplicaPilot` data remains detectable after the
-     public field is removed.
+   - Accept the legacy pilot field only during deserialization. On the first
+     reconcile, atomically replace it with a serialized production
+     `status.removeReplicaExecution` incompatibility marker containing the
+     legacy source kind, contract version, execution identity, and stable
+     fingerprint. The removed legacy field may disappear only in the same
+     status write that durably creates this marker.
+   - Apply the same durable-marker conversion to old explicit
+     `DurableOperationKind::RemoveReplica` status. Repeated reconciles and
+     restarts continue returning `IncompatibleContract` from the production
+     marker and can never interpret marker presence as permission to admit a
+     fresh execution.
    - Legacy pilot references, old workflow/activity versions, and old explicit
-     `DurableOperationKind::RemoveReplica` records map to
-     `IncompatibleContract`. Malformed, oversized, wrong-owner, or
-     wrong-execution records retain distinct rejection/isolation outcomes.
+     remove records map to `IncompatibleContract`. Malformed, oversized,
+     wrong-owner, or wrong-execution records retain distinct
+     rejection/isolation outcomes.
 
 6. **Retain the existing protocol and deployment topology.**
    - `ReplicaAgent`, gRPC contracts, exact remove intent signatures, Kubernetes
@@ -184,6 +197,10 @@ pull requests. This planning activity creates no commit.
   - Add exact-limit and one-byte-over tests for active and terminal encoded
     records, and verify oversized terminal rejection occurs before workflow
     polling or publication.
+  - Add compatibility fixtures proving existing switchover checkpoints reload
+    with its unchanged effective encoded ceiling, native remove selects limits
+    from its contract version, and a changed limit without a version bump is
+    rejected by contract-consistency tests.
 - **`durable-execution/tests/support/scenarios.rs`**:
   - Update shared fixtures/builders for separate active and terminal limits and
     retain admitted-capacity projection coverage.
@@ -260,6 +277,14 @@ pull requests. This planning activity creates no commit.
   - Keep the existing switchover happy-path, restart, conflict, ambiguous-write,
     quarantine, terminal reload, and measurement assertions running through the
     common runner.
+  - Add a named switchover common-outcome matrix covering every FR-017 outcome
+    that is reachable for the operation: active, terminal, incompatible,
+    rejected, isolated, conflict reload, unknown-write reload,
+    persistence-failure, and nondeterminism. Where an outcome is intentionally
+    impossible for the switchover contract, assert and document that fact.
+  - Add named tests covering all six switchover FR-019 responsibilities:
+    observation collection, authority/preparation, exact effect dispatch,
+    deadline policy, terminal validation, and publication.
 
 ### Success Criteria
 
@@ -376,9 +401,11 @@ pull requests. This planning activity creates no commit.
     epoch, incarnation, UID, role, control version, generation, or
     configuration evidence.
 - **`kuberic-operator/src/reconciler.rs`**:
-  - Add native remove acceptance/recovery entry points and route them through
-    the shared runner for tests while legacy production selection remains
-    available until the deletion gate.
+  - Add native remove acceptance/recovery entry points behind a test-only
+    harness and route them through the shared runner while legacy production
+    selection remains available until the deletion gate. No public field,
+    feature, or production branch may select this path before Phase 5, so Phase
+    4 cannot introduce a third production execution mode.
   - Preserve terminal-write-and-reload-before-status/topology publication,
     exact connection/retirement cleanup, UID-fenced label/delete behavior, and
     owner-bound checkpoint construction.
@@ -394,6 +421,12 @@ pull requests. This planning activity creates no commit.
     conflict, outcome-unknown, stale UID/incarnation/generation, Force
     authority, repeated identity, terminal reload, publication ordering, and
     post-commit ambiguity fixtures.
+  - Add a named native-remove common-outcome matrix covering every FR-017
+    outcome: active, terminal, incompatible, rejected, isolated, conflict
+    reload, unknown-write reload, persistence-failure, and nondeterminism.
+  - Add named tests covering all six remove FR-019 responsibilities:
+    observation collection, authority/preparation, exact effect dispatch,
+    deadline policy, terminal validation, and publication.
 - **`kuberic-tests/src/kvstore_k8s.rs`**:
   - Add `test_kvstore_k8s_framework_native_remove_replica`, which starts from a
     healthy three-member set, requests ScaleDown without a mode selector, waits
@@ -407,6 +440,12 @@ pull requests. This planning activity creates no commit.
   - Record whether each assertion is native workflow, shared runner/kernel,
     Kubernetes provider, or live-cluster coverage. No row may reference only a
     test scheduled for deletion.
+- **`durable-execution/tests/kubernetes_checkpoint_real.rs`**:
+  - Run the existing exact-owner garbage-collection real-API test against the
+    isolated Kuberic `kind` cluster before the deletion gate.
+- **`durable-execution/src/feasibility.rs`**:
+  - Retain and run the cleanup-role authorization test proving the writer
+    cannot delete retained records and the distinct cleanup identity can.
 
 ### Success Criteria
 
@@ -418,10 +457,17 @@ pull requests. This planning activity creates no commit.
   `cargo test -p kvstore --features durable-remove-replica-pilot --test reconciler test_framework_native_remove_replica_`
 - [ ] Shared owner/provider tests pass:
   `cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint`
+- [ ] Real owner-GC coverage passes before deletion with the isolated config:
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real validates_real_api_cas_watch_compaction_and_ambiguous_recovery -- --nocapture`
+- [ ] Retained-cleanup authorization coverage passes:
+  `cargo test -p kuberic-durable-execution --test feasibility checkpoint_rbac_examples_are_structural_and_lifecycle_specific`
 - [ ] Existing explicit remove regression suite still passes before deletion:
   `cargo test -p kvstore --test reconciler test_durable_remove && cargo test -p kvstore --test reconciler test_durable_force_remove && cargo test -p kvstore --test reconciler test_remove_`
 - [ ] Every row in `SafetyTraceability.md` names at least one test that passed
   in this phase.
+- [ ] The switchover and native-remove common-outcome matrices cover every
+  FR-017 outcome, and each operation has named passing tests for all six FR-019
+  responsibilities.
 
 #### Manual Verification
 
@@ -454,8 +500,11 @@ pass before any explicit remove orchestration or legacy test is deleted.
     `RemoveReplicaExecutionMode`, and public
     `durable_remove_replica_pilot`/`DurableRemoveReplicaPilotStatus`.
   - Expose only `status.removeReplicaExecution` for native remove identity.
-  - Add a deserialization-only, non-serialized, schema-skipped legacy pilot
-    tombstone so old stored status is detected and rejected explicitly.
+  - Accept the removed legacy pilot field for deserialization only, then
+    atomically persist a production `removeReplicaExecution` incompatibility
+    marker before the next status replacement can discard the legacy field.
+    The marker remains serialized across all later status writes and contains
+    enough stable identity to prove the same legacy execution remains blocked.
   - Update CRD serialization/schema tests to prove the selector and pilot names
     are absent and the compact production reference is present.
 - **`kuberic-operator/src/reconciler.rs`**:
@@ -463,9 +512,11 @@ pass before any explicit remove orchestration or legacy test is deleted.
   - Remove explicit-versus-pilot selection, feature rejection, dual recovery
     routing, pilot conditions, process-summary comparison telemetry, and
     duplicate host cleanup paths.
-  - Map a legacy pilot tombstone or a legacy
-    `status.operation.kind == RemoveReplica` to typed incompatibility without
-    creating a native execution.
+  - Map a legacy pilot value or a legacy
+    `status.operation.kind == RemoveReplica` to the durable production
+    incompatibility marker in one status update, then return typed
+    incompatibility on every later reconcile without creating a native
+    execution.
   - Delete the explicit remove action loop only after the entry gate.
 - **`kuberic-operator/src/durable/remove_replica_pilot.rs`**:
   - Delete the pilot module after all reusable tests and logic have moved to
@@ -501,7 +552,10 @@ pass before any explicit remove orchestration or legacy test is deleted.
     explicit implementation fixtures only after their native replacements are
     named in the traceability matrix.
   - Add clean-break tests for legacy pilot status, unsupported native versions,
-    and legacy explicit remove records.
+    and legacy explicit remove records. Each test must reconcile through at
+    least two full status replacements and a simulated controller restart,
+    proving that the serialized production incompatibility marker persists and
+    no fresh execution is admitted.
 
 ### Success Criteria
 
@@ -525,7 +579,8 @@ pass before any explicit remove orchestration or legacy test is deleted.
 - [ ] A new remove request has exactly one persisted execution reference and
   cannot select another engine.
 - [ ] Old pilot and explicit records fail closed with typed incompatibility and
-  remain distinguishable from absent/fresh execution.
+  remain distinguishable from absent/fresh execution across repeated status
+  writes and controller restart.
 - [ ] `status.operation` continues serving create, add, failover, and any
   unaffected explicit switchover behavior.
 - [ ] The production binary has no second remove reconciliation loop.
@@ -596,26 +651,29 @@ pass before any explicit remove orchestration or legacy test is deleted.
 
 #### Isolated Kind Verification
 
-- [ ] Inspect the dedicated Kuberic cluster with
-  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" kind get clusters`; reuse the
-  cluster named `kind` when healthy, or create only that cluster with
+- [ ] Probe only the isolated kubeconfig with
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" kubectl --kubeconfig "$HOME/.kube/kuberic-kind-config" cluster-info`.
+  If that exact config is absent or unhealthy, create only cluster `kind` with
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" kind create cluster --name kind --config deploy/kind-config.yaml --kubeconfig "$HOME/.kube/kuberic-kind-config"`.
-  Never read, switch to, modify, or delete `capi-kamaji-management` or
-  `capi-worker-spike`.
+  Do not enumerate Kind clusters and never read, switch to, modify, or delete
+  `capi-kamaji-management` or `capi-worker-spike`.
 - [ ] Build/load repository images with `just images` while
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config"`; the repository recipe targets
   cluster name `kind`.
 - [ ] Real provider/owner-GC tests pass against that cluster:
-  `cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real -- --nocapture`
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real -- --nocapture`
 - [ ] Existing live smoke tests pass before mutation:
-  `cargo test -p kuberic-tests test_kvstore_k8s_status_healthy -- --nocapture`
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests test_kvstore_k8s_status_healthy -- --nocapture`
   and
-  `cargo test -p kuberic-tests test_kvstore_k8s_write_read -- --nocapture`.
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests test_kvstore_k8s_write_read -- --nocapture`.
 - [ ] Live native removal passes:
-  `cargo test -p kuberic-tests test_kvstore_k8s_framework_native_remove_replica -- --nocapture`.
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests test_kvstore_k8s_framework_native_remove_replica -- --nocapture`.
 - [ ] Inspect the live object and checkpoint to confirm no mode selector is
   required, the admitted owner UID is retained, terminal durability precedes
-  the published two-member topology, and no replacement UID is mutated.
+  the published two-member topology, and no replacement UID is mutated. Every
+  `kubectl` invocation uses both
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config"` and
+  `--kubeconfig "$HOME/.kube/kuberic-kind-config"`.
 - [ ] Leave the dedicated `kind` cluster and isolated kubeconfig intact after
   validation unless this workflow created the cluster and cleanup is
   intentionally required; never clean up any CAPI cluster.
