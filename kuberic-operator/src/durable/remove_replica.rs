@@ -1231,6 +1231,7 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
             operation.version, REMOVE_REPLICA_OPERATION_VERSION
         ));
     }
+
     if operation.kind != DurableOperationKind::RemoveReplica {
         return Err("remove decision received another operation kind".to_string());
     }
@@ -1334,6 +1335,13 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
         return Err("remove disposition is not pinned in Poisoned".to_string());
     }
     Ok(())
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub(crate) fn validate_remove_replica_operation(
+    operation: &DurableOperationStatus,
+) -> Result<(), String> {
+    validate_operation(operation)
 }
 
 fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), String> {

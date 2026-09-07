@@ -202,6 +202,18 @@ impl MeasuredPilotCheckpointStore {
         )
     }
 
+    #[cfg(all(
+        feature = "durable-remove-replica-pilot",
+        not(feature = "durable-switchover-pilot")
+    ))]
+    pub fn new(execution_id: ExecutionId, inner: DurableCheckpointStore) -> Self {
+        Self::with_decoder(
+            execution_id,
+            inner,
+            super::remove_replica_pilot::checkpoint_measurement_decoder(),
+        )
+    }
+
     pub fn with_decoder(
         execution_id: ExecutionId,
         inner: DurableCheckpointStore,
@@ -226,6 +238,23 @@ impl MeasuredPilotCheckpointStore {
             inner,
             collector,
             super::pilot::checkpoint_measurement_decoder(),
+        )
+    }
+
+    #[cfg(all(
+        feature = "durable-remove-replica-pilot",
+        not(feature = "durable-switchover-pilot")
+    ))]
+    pub fn with_collector(
+        execution_id: ExecutionId,
+        inner: DurableCheckpointStore,
+        collector: PilotCheckpointEventCollector,
+    ) -> Self {
+        Self::with_collector_and_decoder(
+            execution_id,
+            inner,
+            collector,
+            super::remove_replica_pilot::checkpoint_measurement_decoder(),
         )
     }
 

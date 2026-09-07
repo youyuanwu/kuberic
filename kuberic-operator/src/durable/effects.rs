@@ -5,7 +5,10 @@
 //! `ReplicaHandle`; `ReplicaAgent` remains the admission, fencing, and replay
 //! owner.
 
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 use std::collections::BTreeMap;
 
 use kuberic_core::driver::ReplicaHandle;
@@ -17,7 +20,10 @@ use kuberic_core::types::{
 };
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 use crate::cluster_api::ClusterApi;
 #[cfg(feature = "durable-switchover-pilot")]
 use crate::crd::DurableOperationPhase;
@@ -29,8 +35,10 @@ use super::pilot::{
     PilotPermitGuard,
 };
 #[cfg(feature = "durable-switchover-pilot")]
-use super::{Decision, OperationObservations, switchover::is_switchover_postcondition_transition};
-use super::{correlated_action_observation, fail_closed, record_activity_error};
+use super::{Decision, switchover::is_switchover_postcondition_transition};
+use super::{
+    OperationObservations, correlated_action_observation, fail_closed, record_activity_error,
+};
 
 const MAX_EFFECT_DIAGNOSTIC_BYTES: usize = 512;
 
@@ -53,7 +61,7 @@ pub struct ReplicaEffectCommand {
 
 impl ReplicaEffectCommand {
     pub fn from_pending(pending: &PendingActionStatus) -> Result<Self, String> {
-        let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+        let action = kuberic_core::grpc::convert::decode_correlated_action_payload(
             &pending.dispatch_action_payload,
         )
         .map_err(|error| format!("decode frozen correlated action: {error}"))?;
@@ -175,7 +183,10 @@ pub(crate) enum DispatchEvidencePlan {
     WaitForSupportedProtocol,
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableEffectPreparationError {
     WaitForExactIncarnation,
@@ -186,7 +197,10 @@ pub enum DurableEffectPreparationError {
 #[cfg(feature = "durable-switchover-pilot")]
 pub type PilotEffectPreparationError = DurableEffectPreparationError;
 
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 pub fn prepare_replica_effect_command(
     pending: &PendingActionStatus,
     observed: &ReplicaStatusInfo,
@@ -220,10 +234,9 @@ pub fn prepare_replica_effect_command(
         {
             return Err(DurableEffectPreparationError::WaitForExactIncarnation);
         }
-        let decoded = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
-            &command.action_payload,
-        )
-        .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
+        let decoded =
+            kuberic_core::grpc::convert::decode_correlated_action_payload(&command.action_payload)
+                .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
         if decoded.signature() != action.signature() {
             return Err(DurableEffectPreparationError::InvalidCommand);
         }
@@ -251,10 +264,9 @@ pub fn prepare_replica_effect_command(
     {
         return Err(DurableEffectPreparationError::InvalidCommand);
     }
-    let decoded = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
-        &command.action_payload,
-    )
-    .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
+    let decoded =
+        kuberic_core::grpc::convert::decode_correlated_action_payload(&command.action_payload)
+            .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
     if decoded.signature() != action.signature() {
         return Err(DurableEffectPreparationError::InvalidCommand);
     }
@@ -284,7 +296,10 @@ pub fn validate_pilot_replica_action_kind(
     ) && replica_action_matches_kind(kind, action)
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 pub fn replica_action_matches_kind(
     kind: crate::crd::DurableActionKind,
     action: &DurableReplicaAction,
@@ -406,8 +421,7 @@ fn freeze_dispatch_evidence(
     if persist_action_payload {
         if planned.dispatch_action_payload.is_empty() || (!evidence_matches && !local_record_exists)
         {
-            let Ok(payload) =
-                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(action)
+            let Ok(payload) = kuberic_core::grpc::convert::encode_correlated_action_payload(action)
             else {
                 return Err(DispatchEvidencePlan::WaitForSupportedProtocol);
             };
@@ -474,10 +488,9 @@ pub async fn execute_replica_command(
 ) -> kuberic_core::Result<()> {
     let generation = AgentGeneration::parse(&command.expected_agent_generation)
         .map_err(|error| KubericError::Internal(error.into()))?;
-    let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
-        &command.action_payload,
-    )
-    .map_err(|error| KubericError::Internal(error.into()))?;
+    let action =
+        kuberic_core::grpc::convert::decode_correlated_action_payload(&command.action_payload)
+            .map_err(|error| KubericError::Internal(error.into()))?;
     if action.signature() != command.action_signature {
         return Err(KubericError::Internal(
             "persisted correlated action signature does not match its payload".into(),
@@ -499,7 +512,10 @@ pub async fn execute_replica_command(
     .await
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 pub async fn execute_label_command(
     api: &dyn ClusterApi,
     namespace: &str,
@@ -721,6 +737,196 @@ pub(crate) fn generation_change_proves_no_admission(
         && correlated_action_observation(&observed.status, &pending.action_id).is_none()
 }
 // COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:end
+
+// COMPLEXITY-BOUNDARY: remove-replica-effect-integration:start
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeleteEffectCommand {
+    pub target_id: ReplicaId,
+    pub pod_name: String,
+    pub expected_uid: String,
+    pub identity_signature: String,
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+impl DeleteEffectCommand {
+    pub fn new(target_id: ReplicaId, pod_name: String, expected_uid: String) -> Self {
+        let identity_signature = format!("{target_id}@{expected_uid}:{pod_name}:delete");
+        Self {
+            target_id,
+            pod_name,
+            expected_uid,
+            identity_signature,
+        }
+    }
+
+    pub fn has_valid_identity_signature(&self) -> bool {
+        self.identity_signature
+            == format!(
+                "{}@{}:{}:delete",
+                self.target_id, self.expected_uid, self.pod_name
+            )
+    }
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn validate_remove_replica_action_kind(
+    kind: crate::crd::DurableActionKind,
+    action: &DurableReplicaAction,
+) -> bool {
+    kind == crate::crd::DurableActionKind::RemoveReplicaIntent
+        && matches!(action, DurableReplicaAction::RemoveReplicaIntent { .. })
+        && replica_action_matches_kind(kind, action)
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn validate_remove_replica_dispatch_authority(
+    operation: &DurableOperationStatus,
+    observed: &ReplicaStatusInfo,
+    addressed_instance: &ReplicaInstanceId,
+    action: &DurableReplicaAction,
+) -> bool {
+    let Some(intent) = operation.remove_intent.as_ref() else {
+        return false;
+    };
+    let Some(pending) = operation.pending_action.as_ref() else {
+        return false;
+    };
+    let observed_epoch = EpochStatus {
+        data_loss_number: observed.epoch.data_loss_number,
+        configuration_number: observed.epoch.configuration_number,
+    };
+    pending.kind == crate::crd::DurableActionKind::RemoveReplicaIntent
+        && pending.target_id == operation.old_primary_id
+        && pending.target_instance_id == intent.primary_instance_id
+        && addressed_instance.as_str() == intent.primary_instance_id
+        && observed.instance_id.as_str() == intent.primary_instance_id
+        && observed.agent.generation.as_str() == intent.primary_agent_generation
+        && observed.agent.control_version.value() == intent.primary_agent_control_version
+        && observed.agent.protocol_version
+            == kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION
+        && observed_epoch == pending.expected_epoch
+        && action.signature() == intent.input_signature
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn prepare_remove_label_effect_command(
+    operation: &DurableOperationStatus,
+    target_id: ReplicaId,
+    expected_uid: &str,
+    role: &str,
+    pod_identities: &super::OperationPodIdentities,
+) -> Result<LabelEffectCommand, String> {
+    if operation.target_replica_id != Some(target_id)
+        || operation.target_pod_uid.as_deref() != Some(expected_uid)
+        || operation.target_instance_id.as_deref() != Some(expected_uid)
+        || role != "retired"
+    {
+        return Err("remove label command differs from frozen target identity".to_string());
+    }
+    let pod_name = operation
+        .target_pod_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "remove label command has no frozen pod name".to_string())?;
+    if pod_identities.get(&target_id).map(String::as_str) != Some(expected_uid) {
+        return Err("remove label target UID changed before preparation".to_string());
+    }
+    Ok(LabelEffectCommand::new(
+        target_id,
+        pod_name.to_string(),
+        expected_uid.to_string(),
+        role.to_string(),
+    ))
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn prepare_remove_delete_effect_command(
+    operation: &DurableOperationStatus,
+    pod_name: &str,
+    expected_uid: &str,
+    pod_identities: &super::OperationPodIdentities,
+) -> Result<DeleteEffectCommand, String> {
+    let target_id = operation
+        .target_replica_id
+        .ok_or_else(|| "remove delete command has no frozen target ID".to_string())?;
+    if operation.target_pod_name.as_deref() != Some(pod_name)
+        || operation.target_pod_uid.as_deref() != Some(expected_uid)
+        || operation.target_instance_id.as_deref() != Some(expected_uid)
+    {
+        return Err("remove delete command differs from frozen target identity".to_string());
+    }
+    if pod_identities.get(&target_id).map(String::as_str) != Some(expected_uid) {
+        return Err("remove delete target UID changed before preparation".to_string());
+    }
+    Ok(DeleteEffectCommand::new(
+        target_id,
+        pod_name.to_string(),
+        expected_uid.to_string(),
+    ))
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn remove_label_postcondition_satisfied(
+    command: &LabelEffectCommand,
+    pod_identities: &super::OperationPodIdentities,
+    role_label: Option<&str>,
+) -> bool {
+    pod_identities
+        .get(&command.target_id)
+        .is_none_or(|uid| uid != &command.expected_uid)
+        || role_label == Some(command.role.as_str())
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn remove_delete_postcondition_satisfied(
+    command: &DeleteEffectCommand,
+    pod_identities: &super::OperationPodIdentities,
+) -> bool {
+    pod_identities
+        .get(&command.target_id)
+        .is_none_or(|uid| uid != &command.expected_uid)
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn resolve_quarantined_remove_label_effect<T>(
+    command: &LabelEffectCommand,
+    pod_identities: &super::OperationPodIdentities,
+    role_label: Option<&str>,
+    observed: impl FnOnce() -> T,
+) -> DurableEffectBridgeOutcome<T> {
+    if remove_label_postcondition_satisfied(command, pod_identities, role_label) {
+        DurableEffectBridgeOutcome::Observe(observed())
+    } else {
+        DurableEffectBridgeOutcome::AwaitEvidence
+    }
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn resolve_quarantined_remove_delete_effect<T>(
+    command: &DeleteEffectCommand,
+    pod_identities: &super::OperationPodIdentities,
+    observed: impl FnOnce() -> T,
+) -> DurableEffectBridgeOutcome<T> {
+    if remove_delete_postcondition_satisfied(command, pod_identities) {
+        DurableEffectBridgeOutcome::Observe(observed())
+    } else {
+        DurableEffectBridgeOutcome::AwaitEvidence
+    }
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub async fn execute_delete_command(
+    api: &dyn ClusterApi,
+    namespace: &str,
+    command: &DeleteEffectCommand,
+) {
+    let _ = api
+        .delete_pod(namespace, &command.pod_name, &command.expected_uid)
+        .await;
+}
+// COMPLEXITY-BOUNDARY: remove-replica-effect-integration:end
 
 // COMPLEXITY-BOUNDARY: switchover-effect-recovery:start
 #[cfg(feature = "durable-switchover-pilot")]
@@ -1065,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_outcome_kinds_are_distinct_and_bounded() {
+    fn durable_effect_outcome_kinds_are_distinct_and_bounded() {
         let applied = DurableEffectOutcome::Applied(7_u8);
         let rejected = DurableEffectOutcome::<u8>::definite_failure("rejected", &"x".repeat(700));
         let no_admission = DurableEffectOutcome::<u8>::proven_no_admission(&"n".repeat(700));
