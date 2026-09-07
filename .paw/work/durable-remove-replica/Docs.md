@@ -134,7 +134,7 @@ successful no-fault three-member ScaleDown executions recorded:
 - 6 accepted checkpoint writes
 - approximately 91.6 KiB per-run active-checkpoint maxima
 - a 5,005–93,837-byte aggregate lifecycle minimum-to-maximum active range
-- 8,121–8,125-byte terminal checkpoints
+- 8,117–8,129-byte terminal checkpoints across repeated local validation
 - 2,188-byte terminal payloads
 
 The original production integration recorded 11 accepted writes because each
@@ -214,7 +214,7 @@ The following completed successfully on the final Phase 5 checkout:
 - 11 durable switchover reconciler tests;
 - 17 durable remove-replica reconciler tests;
 - explicit add, remove, and failover lifecycle regressions;
-- 40 replica-agent and 6 replica-lifecycle tests in the final focused run;
+- 42 replica-agent and 6 replica-lifecycle tests in the final focused run;
 - complexity measurement and its 12 standard-library Python tests.
 
 The workspace-wide `cargo test --all --all-features` command reached the two

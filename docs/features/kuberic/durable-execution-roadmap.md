@@ -243,8 +243,9 @@ without changing the three effects, two observations, or five boundaries.
 Each run reached an active-checkpoint maximum of approximately 91.6 KiB. The
 reported 5,005–93,837-byte interval is the aggregate lifecycle
 minimum-to-maximum range
-within those executions, not a range of per-run maxima. Terminal checkpoints
-ranged from 8,121 to 8,125 bytes, and the terminal payload was 2,188 bytes.
+within those executions, not a range of per-run maxima. Repeated local
+validation observed terminal checkpoints from 8,117 to 8,129 bytes, and the
+terminal payload was 2,188 bytes.
 These are run-specific snapshots, not exact byte contracts.
 
 The approximately 91.6 KiB active maximum passes the stable 770,048-byte

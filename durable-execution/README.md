@@ -368,7 +368,7 @@ not reproduction of an actual network fault.
 The feasibility test reruns the sole conformance registry, emits every
 assertion, measures the FR-012 surface, and applies the exhaustive FR-014
 three-way classifier. The revised evidence contains 45 unique contiguous
-scenarios and 134 structured assertions; all pass. All five FR-012 authoring
+scenarios and 135 structured assertions; all pass. All five FR-012 authoring
 predicates and all five provider, bounding, lifecycle, and documentation
 predicates also pass. The async runtime-neutrality predicate examines the
 library `[dependencies]` table rather than test-only dependencies and retains a

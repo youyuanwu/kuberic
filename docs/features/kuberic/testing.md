@@ -534,7 +534,8 @@ changing the semantic boundary counts.
 Run-specific active-checkpoint maxima are approximately 91.6 KiB. The
 5,005–93,837-byte interval is the aggregate lifecycle minimum-to-maximum range,
 not a range of per-run maxima. Terminal checkpoints range from 8,121 to 8,125
-bytes; the terminal payload is 2,188 bytes.
+bytes in the representative three-sample command; repeated local validation
+observed 8,117–8,129 bytes. The terminal payload is 2,188 bytes.
 
 The active maximum passes the stable 770,048-byte encoded-checkpoint admission
 ceiling but exceeds the switchover 65,536-byte baseline gate and 32,768-byte
