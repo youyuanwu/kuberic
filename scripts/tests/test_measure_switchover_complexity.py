@@ -136,7 +136,7 @@ class ComplexityMeasurementTests(unittest.TestCase):
                 "legacy_remove",
                 "remove_module",
                 "remove_comparable_workflow_scope",
-                "remove_body",
+                "remove_workflow_body_only",
                 "remove_effect_integration",
                 "remove_crd_integration",
                 "remove_routing_integration",

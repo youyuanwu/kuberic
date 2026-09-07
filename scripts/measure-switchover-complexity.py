@@ -57,7 +57,7 @@ MEASUREMENTS = [
         ],
     ),
     (
-        "remove_body",
+        "remove_workflow_body_only",
         [
             Segment(
                 "kuberic-operator/src/durable/remove_replica_pilot.rs",
@@ -334,7 +334,7 @@ def main() -> None:
             "explicit_switchover",
             "legacy_remove",
             "pilot_module",
-            "remove_body",
+            "remove_module",
             "shared_operator_effect_adapters",
             "shared_operator_checkpoint_support",
             "shared_operator_workflow_host",
@@ -375,7 +375,7 @@ def main() -> None:
         measured["remove_status_integration"],
     )
     remove_marginal = add(
-        measured["remove_body"],
+        measured["remove_module"],
         remove_integration,
         shared_growth,
     )
@@ -399,7 +399,7 @@ def main() -> None:
     combined_both_workflows = add(
         combined,
         measured["legacy_remove"],
-        measured["remove_body"],
+        measured["remove_module"],
         remove_integration,
     )
     print()
@@ -421,7 +421,12 @@ def main() -> None:
         "legacy_remove,"
         f"{measured['legacy_remove'][0]},{measured['legacy_remove'][1]}"
     )
-    print(f"remove_body,{measured['remove_body'][0]},{measured['remove_body'][1]}")
+    print(f"remove_body,{measured['remove_module'][0]},{measured['remove_module'][1]}")
+    print(
+        "remove_workflow_body_only,"
+        f"{measured['remove_workflow_body_only'][0]},"
+        f"{measured['remove_workflow_body_only'][1]}"
+    )
     print(
         "remove_comparable_workflow_scope,"
         f"{measured['remove_comparable_workflow_scope'][0]},"
@@ -454,9 +459,9 @@ def main() -> None:
     print()
     print(
         "equation: remove_marginal = remove_body + remove_integration + shared_growth "
-        f"= {measured['remove_body'][0]} + {remove_integration[0]} + "
+        f"= {measured['remove_module'][0]} + {remove_integration[0]} + "
         f"{shared_growth[0]} = {remove_marginal[0]} executable lines; "
-        f"{measured['remove_body'][1]} + {remove_integration[1]} + "
+        f"{measured['remove_module'][1]} + {remove_integration[1]} + "
         f"{shared_growth[1]} = {remove_marginal[1]} decision points"
     )
     print(
