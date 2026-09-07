@@ -1302,6 +1302,27 @@ fn validate_remove_transition(
     {
         return Err("durable remove transition invented commit evidence".to_string());
     }
+    if current.remove_commit_evidence.is_none()
+        && let Some(evidence) = &next.remove_commit_evidence
+    {
+        let intent = next
+            .remove_intent
+            .as_ref()
+            .ok_or_else(|| "durable remove commit evidence has no frozen intent".to_string())?;
+        if evidence.attempt_id != intent.attempt_id
+            || evidence.action_id != intent.action_id
+            || kuberic_core::types::AgentGeneration::parse(
+                evidence.primary_agent_generation.clone(),
+            )
+            .is_err()
+            || evidence.configuration_signature
+                != core_intent(next)?.reduced_current_configuration.signature()
+        {
+            return Err(
+                "durable remove commit transition changed frozen commit authority".to_string(),
+            );
+        }
+    }
     if next.remove_cleanup.is_some() && next.remove_commit_evidence.is_none() {
         return Err("durable remove cleanup preceded commit evidence".to_string());
     }
@@ -2766,6 +2787,26 @@ mod remove_replica_pilot_tests {
         assert_ne!(
             unsafe_operation.phase,
             DurableOperationPhase::RemoveCompensateFinalize
+        );
+    }
+
+    #[test]
+    fn remove_replica_pilot_rejects_commit_evidence_that_changes_frozen_authority() {
+        let (awaiting_commit, _) = freeze_and_dispatch(DurableRemoveMode::ScaleDown);
+        let committed = committed_operation();
+        validate_remove_transition(&awaiting_commit, &committed).unwrap();
+
+        let mut changed = committed;
+        changed
+            .remove_commit_evidence
+            .as_mut()
+            .unwrap()
+            .configuration_signature
+            .push_str("-changed");
+        assert!(
+            validate_remove_transition(&awaiting_commit, &changed)
+                .unwrap_err()
+                .contains("commit authority")
         );
     }
 

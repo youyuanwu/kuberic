@@ -215,12 +215,12 @@ atomic prepared exposure, not history compaction, and no reducer prototype or
 API is introduced.
 
 The second kernel-hosted workflow did **not** demonstrate source-cost
-amortization. The explicit remove-replica baseline is 1,627 executable lines /
-219 decision points. The complete kernel remove workflow is 1,611/155,
+amortization. The explicit remove-replica baseline is 1,611 executable lines /
+213 decision points. The complete kernel remove workflow is 1,632/162,
 remove-specific operator integration is 1,114/81, and shared reusable
 infrastructure grew by 374/3 from the frozen 1,208/110 baseline. The resulting
-marginal cost is 3,099/239: 1.9047 times the explicit baseline in executable
-lines and 1.0913 times in decision points. Shared growth is 30.96% in lines and
+marginal cost is 3,120/246: 1.9367 times the explicit baseline in executable
+lines and 1.1549 times in decision points. Shared growth is 30.96% in lines and
 2.73% in decisions. Both dimensions therefore classify as negative under the
 fixed measurement thresholds.
 
