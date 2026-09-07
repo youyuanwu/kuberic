@@ -73,15 +73,16 @@ class ComplexityMeasurementTests(unittest.TestCase):
             )
 
     def test_frozen_shared_baseline(self) -> None:
-        measured = {
-            label: measure_complexity.measure(dict(measure_complexity.MEASUREMENTS)[label])
-            for label in measure_complexity.SHARED_LABELS
-        }
+        self.assertEqual(measure_complexity.SHARED_BEFORE, (1208, 110))
         self.assertEqual(
-            measure_complexity.add(
-                *(measured[label] for label in measure_complexity.SHARED_LABELS)
-            ),
-            measure_complexity.SHARED_BEFORE,
+            measure_complexity.BASELINE_REVISION,
+            "8d773ef2b32fd3073e11849a131fe2c2f5e6b97b",
+        )
+
+    def test_shared_growth_is_measured_against_frozen_baseline(self) -> None:
+        self.assertEqual(
+            measure_complexity.subtract((1220, 113), measure_complexity.SHARED_BEFORE),
+            (12, 3),
         )
 
     def test_ratio_calculation_is_dimension_specific(self) -> None:

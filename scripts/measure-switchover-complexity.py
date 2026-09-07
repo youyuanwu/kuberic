@@ -13,6 +13,8 @@ BASELINE_REVISION = "8d773ef2b32fd3073e11849a131fe2c2f5e6b97b"
 SHARED_BEFORE = (1208, 110)
 SHARED_LABELS = (
     "shared_operator_effect_adapters",
+    "shared_operator_checkpoint_support",
+    "shared_operator_workflow_host",
     "shared_kernel_typed",
     "shared_kernel_fused",
 )
@@ -39,6 +41,33 @@ MEASUREMENTS = [
     (
         "shared_operator_effect_adapters",
         [Segment("kuberic-operator/src/durable/effects.rs", "shared-operator-effect-adapters")],
+    ),
+    (
+        "shared_operator_checkpoint_support",
+        [
+            Segment(
+                "kuberic-operator/src/durable/pilot_store.rs",
+                "shared-operator-checkpoint-support",
+            )
+        ],
+    ),
+    (
+        "shared_operator_workflow_host",
+        [
+            Segment(
+                "kuberic-operator/src/durable/workflow_host.rs",
+                "shared-operator-workflow-host",
+            )
+        ],
+    ),
+    (
+        "switchover_effect_recovery_integration",
+        [
+            Segment(
+                "kuberic-operator/src/durable/effects.rs",
+                "switchover-effect-recovery",
+            )
+        ],
     ),
     ("pilot_store_integration", [Segment("kuberic-operator/src/durable/pilot_store.rs", "pilot-store")]),
     (
@@ -219,6 +248,9 @@ def main() -> None:
         [
             "pilot_module",
             "shared_operator_effect_adapters",
+            "shared_operator_checkpoint_support",
+            "shared_operator_workflow_host",
+            "switchover_effect_recovery_integration",
             "pilot_store_integration",
             "pilot_effect_bridge_integration",
             "pilot_reconcile_integration",
@@ -235,12 +267,9 @@ def main() -> None:
     shared = add(
         *(measured[label] for label in SHARED_LABELS),
     )
-    if shared != SHARED_BEFORE:
-        raise SystemExit(
-            "pre-port shared baseline drifted before the second workflow scopes "
-            f"were introduced: expected {SHARED_BEFORE}, measured {shared}"
-        )
+    shared_growth = subtract(shared, SHARED_BEFORE)
     integration = add(
+        measured["switchover_effect_recovery_integration"],
         measured["pilot_store_integration"],
         measured["pilot_effect_bridge_integration"],
         measured["pilot_reconcile_integration"],
@@ -262,8 +291,8 @@ def main() -> None:
     print(f"shared_reusable_infrastructure,{shared[0]},{shared[1]}")
     print(f"shared_before,{SHARED_BEFORE[0]},{SHARED_BEFORE[1]}")
     print(f"shared_before_revision,{BASELINE_REVISION},not_applicable")
-    print("shared_after,not_available,not_available")
-    print("shared_growth,not_available,not_available")
+    print(f"shared_after,{shared[0]},{shared[1]}")
+    print(f"shared_growth,{shared_growth[0]},{shared_growth[1]}")
     print(
         "legacy_remove,"
         f"{measured['legacy_remove'][0]},{measured['legacy_remove'][1]}"
