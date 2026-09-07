@@ -168,7 +168,7 @@ pub struct StableElectionMetadataRefreshStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EpochStatus {
     pub data_loss_number: i64,
     pub configuration_number: i64,
@@ -280,7 +280,7 @@ pub struct RemoveReplicaAdmissionTargetStatus {
 
 /// Schema-safe persisted form of the core stable partition snapshot.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StablePartitionSnapshotStatus {
     pub epoch: EpochStatus,
     pub primary_id: i64,
@@ -290,7 +290,7 @@ pub struct StablePartitionSnapshotStatus {
 
 /// Schema-safe persisted identity and stable role of one replica.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StableReplicaSnapshotStatus {
     pub id: i64,
     pub instance_id: String,
@@ -300,7 +300,7 @@ pub struct StableReplicaSnapshotStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StableReplicaElectionMetadataStatus {
     pub current_lsn: i64,
     pub committed_lsn: i64,
@@ -493,7 +493,7 @@ pub struct RemoveReplicaIntentStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaCommitEvidenceStatus {
     pub attempt_id: String,
     pub action_id: String,
@@ -503,7 +503,7 @@ pub struct RemoveReplicaCommitEvidenceStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaCleanupStatus {
     #[serde(default)]
     pub connection_absent: bool,
@@ -549,7 +549,7 @@ pub enum RemoveReplicaTerminalResultStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum RemoveReplicaDispositionStatus {
     FailedPreCommitIncomplete {
         attempt: u32,

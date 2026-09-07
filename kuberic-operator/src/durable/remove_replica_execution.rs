@@ -45,7 +45,8 @@ use super::effects::{
 use super::remove_replica::{core_intent, validate_remove_replica_operation};
 use super::{
     Decision, OperationObservations, OperationPodIdentities, RemoveReplicaTarget,
-    ReplicaObservation, decide_remove_replica, record_activity_error, start_remove_replica,
+    ReplicaObservation, correlated_action_observation, decide_remove_replica,
+    record_activity_error, start_remove_replica,
 };
 
 pub const REMOVE_REPLICA_CONTRACT_VERSION: u32 = 2;
@@ -424,15 +425,26 @@ pub struct RemoveReplicaProgressEvidence {
 
 impl RemoveReplicaObservationEvidence {
     pub fn capture(
+        operation: &DurableOperationStatus,
         observations: &OperationObservations,
         pods: &OperationPodIdentities,
         target_role_label: Option<&str>,
         observed_unix_seconds: i64,
     ) -> Result<Self, String> {
+        let action_id = operation
+            .pending_action
+            .as_ref()
+            .map(|pending| pending.action_id.as_str())
+            .or_else(|| {
+                operation
+                    .remove_intent
+                    .as_ref()
+                    .map(|intent| intent.action_id.as_str())
+            });
         let replicas = observations
             .iter()
             .map(|(replica_id, observation)| {
-                RemoveReplicaReplicaEvidence::capture(*replica_id, observation)
+                RemoveReplicaReplicaEvidence::capture(*replica_id, observation, action_id)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let pods = pods
@@ -499,14 +511,15 @@ impl RemoveReplicaObservationEvidence {
 }
 
 impl RemoveReplicaReplicaEvidence {
-    fn capture(replica_id: i64, observation: &ReplicaObservation) -> Result<Self, String> {
+    fn capture(
+        replica_id: i64,
+        observation: &ReplicaObservation,
+        action_id: Option<&str>,
+    ) -> Result<Self, String> {
         let status = &observation.status;
-        let action = status
-            .agent
-            .current_action
-            .as_ref()
-            .or_else(|| status.agent.retained_terminal_actions.last())
-            .map(|observed| RemoveReplicaActionEvidence::capture(&observed.action))
+        let action = action_id
+            .and_then(|action_id| correlated_action_observation(status, action_id))
+            .map(RemoveReplicaActionEvidence::capture)
             .transpose()?;
         Ok(Self {
             replica_id,
@@ -1337,11 +1350,26 @@ pub fn validate_prepared_activity(
             let expected_action = DurableReplicaAction::RemoveReplicaIntent {
                 intent: Box::new(core_intent(operation)?),
             };
-            if exact.action_id != pending.action_id
-                || exact.target_id != pending.target_id
-                || exact.target_instance_id != pending.target_instance_id
-                || exact.expected_epoch != pending.expected_epoch
-                || exact.desired_postcondition != pending.desired_postcondition
+            let intent = operation
+                .remove_intent
+                .as_ref()
+                .ok_or_else(|| "prepared remove command has no frozen intent".to_string())?;
+            let expected = ReplicaEffectCommand {
+                action_id: pending.action_id.clone(),
+                action_signature: expected_action.signature(),
+                target_id: pending.target_id,
+                target_instance_id: pending.target_instance_id.clone(),
+                expected_epoch: pending.expected_epoch.clone(),
+                desired_postcondition: pending.desired_postcondition.clone(),
+                expected_agent_generation: intent.primary_agent_generation.clone(),
+                expected_control_version: intent.primary_agent_control_version,
+                observed_runtime_epoch: pending.expected_epoch.clone(),
+                action_payload: kuberic_core::grpc::convert::encode_correlated_action_payload(
+                    &expected_action,
+                )
+                .map_err(|error| format!("encode exact prepared remove command: {error}"))?,
+            };
+            if exact != expected
                 || !validate_remove_replica_action_kind(pending.kind, &action)
                 || action.signature() != expected_action.signature()
                 || exact.action_signature != expected_action.signature()
@@ -1733,6 +1761,24 @@ fn validate_transition(
     if next.remove_cleanup.is_some() && next.remove_commit_evidence.is_none() {
         return Err("native remove cleanup preceded commit evidence".to_string());
     }
+    if let Some(current_cleanup) = current.remove_cleanup.as_ref() {
+        let next_cleanup = next
+            .remove_cleanup
+            .as_ref()
+            .ok_or_else(|| "native remove transition regressed cleanup evidence".to_string())?;
+        if (current_cleanup.connection_absent && !next_cleanup.connection_absent)
+            || (current_cleanup.target_labels_fenced && !next_cleanup.target_labels_fenced)
+            || (current_cleanup.target_pod_deleted && !next_cleanup.target_pod_deleted)
+            || (current_cleanup.target_retirement.is_some()
+                && next_cleanup.target_retirement.is_none())
+            || (current_cleanup.target_retirement
+                == Some(TargetRetirementObservationStatus::Completed)
+                && next_cleanup.target_retirement
+                    != Some(TargetRetirementObservationStatus::Completed))
+        {
+            return Err("native remove transition regressed cleanup evidence".to_string());
+        }
+    }
     if current
         .remove_intent
         .as_ref()
@@ -1888,23 +1934,10 @@ pub fn validate_loaded_terminal(
             {
                 return Err("completed native remove changed action authority".to_string());
             }
-            let expected_prefix = format!("q{}[", initial.target_snapshot.write_quorum);
-            if !commit_evidence
-                .configuration_signature
-                .starts_with(&expected_prefix)
-                || !initial
-                    .target_snapshot
-                    .members
-                    .iter()
-                    .filter(|member| member.id != initial.target_snapshot.primary_id)
-                    .all(|member| {
-                        commit_evidence
-                            .configuration_signature
-                            .contains(&format!("{}@{}:", member.id, member.instance_id))
-                    })
-            {
-                return Err("completed native remove changed configuration authority".to_string());
-            }
+            validate_exact_configuration_membership(
+                &commit_evidence.configuration_signature,
+                &initial.target_snapshot,
+            )?;
             validate_completed_cleanup(cleanup)?;
         }
         RemoveReplicaTerminal::Unsafe {
@@ -1924,6 +1957,50 @@ pub fn validate_loaded_terminal(
         _ => {}
     }
     Ok(terminal)
+}
+
+fn validate_exact_configuration_membership(
+    signature: &str,
+    snapshot: &StablePartitionSnapshotStatus,
+) -> Result<(), String> {
+    let body = signature
+        .strip_prefix(&format!("q{}[", snapshot.write_quorum))
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| "completed native remove changed configuration authority".to_string())?;
+    let members = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split(',').collect::<Vec<_>>()
+    };
+    if !members.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err("completed native remove configuration is not canonical".to_string());
+    }
+    let member_count = members.len();
+    let actual = members
+        .into_iter()
+        .map(|member| {
+            let (replica_id, remainder) = member.split_once('@').ok_or_else(|| {
+                "completed native remove configuration member is malformed".to_string()
+            })?;
+            let (instance_id, _) = remainder.split_once(':').ok_or_else(|| {
+                "completed native remove configuration member is malformed".to_string()
+            })?;
+            let replica_id = replica_id.parse::<i64>().map_err(|_| {
+                "completed native remove configuration member is malformed".to_string()
+            })?;
+            Ok((replica_id, instance_id.to_string()))
+        })
+        .collect::<Result<BTreeSet<_>, String>>()?;
+    let expected = snapshot
+        .members
+        .iter()
+        .filter(|member| member.id != snapshot.primary_id)
+        .map(|member| (member.id, member.instance_id.clone()))
+        .collect::<BTreeSet<_>>();
+    if member_count != expected.len() || actual.len() != expected.len() || actual != expected {
+        return Err("completed native remove changed configuration authority".to_string());
+    }
+    Ok(())
 }
 
 fn validate_completed_cleanup(cleanup: &RemoveReplicaCleanupStatus) -> Result<(), String> {
@@ -2100,8 +2177,11 @@ mod remove_replica_execution_tests {
         ActivityCallError, CasOutcome, CheckpointError, CheckpointStore, Evaluation,
         InMemoryCheckpointStore, encode_activity_result, evaluate,
     };
+    use serde::de::DeserializeOwned;
 
-    use crate::crd::{StableReplicaRoleStatus, StableReplicaSnapshotStatus};
+    use crate::crd::{
+        StableReplicaElectionMetadataStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
+    };
 
     use super::super::checkpoint_store::{DurableCheckpointStore, MeasuredDurableCheckpointStore};
     use super::*;
@@ -2305,6 +2385,82 @@ mod remove_replica_execution_tests {
         (dispatched, observations)
     }
 
+    fn completed_action(
+        operation: &DurableOperationStatus,
+        action_id: String,
+    ) -> CorrelatedActionObservation {
+        let intent = operation.remove_intent.as_ref().unwrap();
+        CorrelatedActionObservation {
+            generation: generation(1),
+            control_version: AgentControlVersion::new(11),
+            action: DurableActionObservation {
+                action_id,
+                signature: intent.input_signature.clone(),
+                state: DurableActionState::Completed,
+                error_class: None,
+                error: None,
+                result: Some(DurableActionResult::RemoveReplica(
+                    RemoveReplicaTerminalResult::CommittedClean,
+                )),
+                add_replica_progress: None,
+                remove_replica_progress: Some(RemoveReplicaProgress {
+                    phase: RemoveReplicaCoordinatorPhase::Attesting,
+                    attempt_id: intent.attempt_id.clone(),
+                    commit_observed: true,
+                    commit_observed_unix_seconds: Some(10),
+                    connection_absent: true,
+                    target_retirement: TargetRetirementObservation::Completed,
+                    retirement_expiry_unix_seconds: Some(20),
+                    compensation_expiry_unix_seconds: None,
+                    error: None,
+                    current_install_dispatched: true,
+                }),
+            },
+        }
+    }
+
+    fn committed_operation() -> DurableOperationStatus {
+        let (mut operation, _) = freeze_and_dispatch();
+        let intent = operation.remove_intent.as_ref().unwrap();
+        operation.phase = DurableOperationPhase::Completed;
+        operation.pending_action = None;
+        operation.committed_snapshot = Some(operation.target_snapshot.clone());
+        operation.remove_commit_evidence = Some(RemoveReplicaCommitEvidenceStatus {
+            attempt_id: intent.attempt_id.clone(),
+            action_id: intent.action_id.clone(),
+            primary_agent_generation: intent.primary_agent_generation.clone(),
+            configuration_signature: core_intent(&operation)
+                .unwrap()
+                .reduced_current_configuration
+                .signature(),
+            observed_unix_seconds: 10,
+        });
+        operation.remove_cleanup = Some(RemoveReplicaCleanupStatus {
+            connection_absent: true,
+            target_retirement: Some(TargetRetirementObservationStatus::Completed),
+            target_labels_fenced: true,
+            target_pod_deleted: true,
+        });
+        operation
+    }
+
+    fn assert_unknown_field_rejected<T>(value: &serde_json::Value, pointer: &str)
+    where
+        T: DeserializeOwned,
+    {
+        let mut changed = value.clone();
+        changed
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("missing JSON pointer {pointer}"))
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("JSON pointer {pointer} is not an object"))
+            .insert("unknown".to_string(), serde_json::Value::Bool(true));
+        assert!(
+            serde_json::from_value::<T>(changed).is_err(),
+            "{pointer} accepted an unknown field"
+        );
+    }
+
     fn payload(spec: &ExecutionSpec, activities: Vec<ActivityRecord>) -> CheckpointEnvelope {
         CheckpointEnvelope::encode_with_limits(
             &CheckpointPayload::active(
@@ -2347,6 +2503,7 @@ mod remove_replica_execution_tests {
     fn remove_replica_execution_boundaries_are_tagged_and_never_store_mutable_operation_state() {
         let operation = reconstruct_initial_operation(&reference().input).unwrap();
         let evidence = RemoveReplicaObservationEvidence::capture(
+            &operation,
             &observations(&operation),
             &pod_identities(),
             Some("secondary"),
@@ -2383,6 +2540,7 @@ mod remove_replica_execution_tests {
         let spec = execution_spec(&reference).unwrap();
         let operation = reconstruct_initial_operation(&reference.input).unwrap();
         let evidence = RemoveReplicaObservationEvidence::capture(
+            &operation,
             &observations(&operation),
             &pod_identities(),
             Some("secondary"),
@@ -2412,6 +2570,54 @@ mod remove_replica_execution_tests {
             panic!("replay did not advance to the exact next boundary");
         };
         assert_eq!(activity.sequence(), ActivitySequence::new(1));
+    }
+
+    #[test]
+    fn remove_replica_execution_captures_exact_retained_terminal_evidence() {
+        let (operation, mut observations) = freeze_and_dispatch();
+        let action_id = operation.remove_intent.as_ref().unwrap().action_id.clone();
+        let primary = observations.get_mut(&operation.old_primary_id).unwrap();
+        let matching = completed_action(&operation, action_id.clone());
+        primary.status.agent.current_action = Some(completed_action(
+            &operation,
+            "another-current-action".to_string(),
+        ));
+        primary.status.agent.retained_terminal_actions = vec![
+            matching,
+            completed_action(&operation, "newer-unrelated-terminal".to_string()),
+        ];
+
+        let evidence = RemoveReplicaObservationEvidence::capture(
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+            10,
+        )
+        .unwrap();
+        let captured = evidence
+            .replicas
+            .iter()
+            .find(|replica| replica.replica_id == operation.old_primary_id)
+            .and_then(|replica| replica.agent.action.as_ref())
+            .unwrap();
+        assert_eq!(captured.action_id, action_id);
+        assert_eq!(captured.state, RemoveReplicaActionStateEvidence::Completed);
+        assert_eq!(
+            captured.result,
+            Some(RemoveReplicaTerminalResultStatus::CommittedClean)
+        );
+
+        let (reconstructed, _) = evidence.reconstruct().unwrap();
+        let reconstructed = reconstructed.get(&operation.old_primary_id).unwrap();
+        let correlated = correlated_action_observation(&reconstructed.status, &action_id).unwrap();
+        assert_eq!(correlated.state, DurableActionState::Completed);
+        assert!(matches!(
+            correlated.result,
+            Some(DurableActionResult::RemoveReplica(
+                RemoveReplicaTerminalResult::CommittedClean
+            ))
+        ));
     }
 
     #[test]
@@ -2449,12 +2655,33 @@ mod remove_replica_execution_tests {
             prepared
         );
 
+        let mut changed_commands = Vec::new();
+        let mut changed = command.clone();
+        changed.expected_agent_generation = generation(9).to_string();
+        changed_commands.push(changed);
+        let mut changed = command.clone();
+        changed.expected_control_version = changed.expected_control_version.saturating_add(1);
+        changed_commands.push(changed);
+        let mut changed = command.clone();
+        changed.observed_runtime_epoch[1] = changed.observed_runtime_epoch[1].saturating_add(1);
+        changed_commands.push(changed);
         let mut changed = command.clone();
         changed.action_payload.push('x');
-        let changed =
-            activity_spec(&RemoveReplicaBoundaryInput::ReplicaCommand { command: changed })
-                .unwrap();
-        assert_eq!(resolver.resolve(&logical, Some(&changed)).unwrap(), logical);
+        changed_commands.push(changed);
+        let (other_operation, _) = freeze_and_dispatch();
+        let other_action = DurableReplicaAction::RemoveReplicaIntent {
+            intent: Box::new(core_intent(&other_operation).unwrap()),
+        };
+        let mut changed = command.clone();
+        changed.action_payload =
+            kuberic_core::grpc::convert::encode_correlated_action_payload(&other_action).unwrap();
+        changed_commands.push(changed);
+        for changed in changed_commands {
+            let changed =
+                activity_spec(&RemoveReplicaBoundaryInput::ReplicaCommand { command: changed })
+                    .unwrap();
+            assert_eq!(resolver.resolve(&logical, Some(&changed)).unwrap(), logical);
+        }
 
         for exact in [
             RemoveReplicaBoundaryInput::LabelCommand {
@@ -2486,6 +2713,28 @@ mod remove_replica_execution_tests {
         let mut invalid_cleanup = initial.clone();
         invalid_cleanup.remove_cleanup = Some(RemoveReplicaCleanupStatus::default());
         assert!(validate_transition(&initial, &invalid_cleanup).is_err());
+
+        let current = committed_operation();
+        for regress in [
+            |cleanup: &mut RemoveReplicaCleanupStatus| cleanup.connection_absent = false,
+            |cleanup: &mut RemoveReplicaCleanupStatus| cleanup.target_retirement = None,
+            |cleanup: &mut RemoveReplicaCleanupStatus| {
+                cleanup.target_retirement = Some(TargetRetirementObservationStatus::Unavailable)
+            },
+            |cleanup: &mut RemoveReplicaCleanupStatus| cleanup.target_labels_fenced = false,
+            |cleanup: &mut RemoveReplicaCleanupStatus| cleanup.target_pod_deleted = false,
+        ] {
+            let mut next = current.clone();
+            regress(next.remove_cleanup.as_mut().unwrap());
+            assert!(validate_transition(&current, &next).is_err());
+        }
+
+        let mut current = current;
+        current.remove_cleanup.as_mut().unwrap().target_retirement =
+            Some(TargetRetirementObservationStatus::Unavailable);
+        let mut next = current.clone();
+        next.remove_cleanup.as_mut().unwrap().target_retirement = None;
+        assert!(validate_transition(&current, &next).is_err());
     }
 
     #[test]
@@ -2700,7 +2949,7 @@ mod remove_replica_execution_tests {
             mut commit_evidence,
             cleanup,
             accounting,
-        } = terminal
+        } = terminal.clone()
         else {
             unreachable!()
         };
@@ -2711,6 +2960,22 @@ mod remove_replica_execution_tests {
             accounting,
         });
         assert!(validate_loaded_terminal(&reference, &changed, 0).is_err());
+
+        let RemoveReplicaTerminal::Completed {
+            mut commit_evidence,
+            cleanup,
+            accounting,
+        } = terminal
+        else {
+            unreachable!()
+        };
+        commit_evidence.configuration_signature.push_str(",forged");
+        let forged = encode_terminal(RemoveReplicaTerminal::Completed {
+            commit_evidence,
+            cleanup,
+            accounting,
+        });
+        assert!(validate_loaded_terminal(&reference, &forged, 0).is_err());
     }
 
     #[tokio::test]
@@ -2800,23 +3065,169 @@ mod remove_replica_execution_tests {
 
     #[test]
     fn remove_replica_execution_persisted_shapes_deny_unknown_fields() {
-        let reference = reference();
-        let mut value = serde_json::to_value(reference).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .insert("extra".to_string(), serde_json::Value::Null);
-        assert!(serde_json::from_value::<RemoveReplicaExecution>(value).is_err());
+        let mut reference = reference();
+        reference.input.previous_snapshot.members[0].election_metadata =
+            Some(StableReplicaElectionMetadataStatus {
+                current_lsn: 10,
+                committed_lsn: 9,
+                first_retained_lsn: 1,
+                deactivation_epoch: EpochStatus {
+                    data_loss_number: 1,
+                    configuration_number: 6,
+                },
+                deactivation_catch_up_lsn: 8,
+            });
+        let execution = serde_json::to_value(&reference).unwrap();
+        for pointer in [
+            "",
+            "/input",
+            "/input/target",
+            "/input/previousSnapshot",
+            "/input/previousSnapshot/epoch",
+            "/input/previousSnapshot/members/0",
+            "/input/previousSnapshot/members/0/electionMetadata",
+            "/input/previousSnapshot/members/0/electionMetadata/deactivationEpoch",
+        ] {
+            assert_unknown_field_rejected::<RemoveReplicaExecution>(&execution, pointer);
+        }
+        let workflow_input = RemoveReplicaWorkflowInput {
+            contract_version: reference.contract_version,
+            execution_id: reference.execution_id.clone(),
+            admission: reference.input.clone(),
+        };
+        assert_unknown_field_rejected::<RemoveReplicaWorkflowInput>(
+            &serde_json::to_value(workflow_input).unwrap(),
+            "",
+        );
 
-        let input = RemoveReplicaBoundaryInput::Observe {
+        let boundary = RemoveReplicaBoundaryInput::Observe {
             phase: DurableOperationPhase::RemoveFreezeIntent,
             attempt: 0,
         };
-        let mut value = serde_json::to_value(input).unwrap();
-        value
-            .as_object_mut()
+        assert_unknown_field_rejected::<RemoveReplicaBoundaryInput>(
+            &serde_json::to_value(boundary).unwrap(),
+            "",
+        );
+
+        let (operation, observations) = freeze_and_dispatch();
+        let pods = pod_identities();
+        let addressed = observations
+            .iter()
+            .map(|(id, observation)| (*id, observation.status.instance_id.clone()))
+            .collect();
+        let resolver = RemoveReplicaPreparedActivityResolver::new(
+            &operation,
+            &observations,
+            &pods,
+            Some("secondary"),
+            &addressed,
+            10,
+        );
+        let RemoveReplicaBoundaryInput::ReplicaCommand { command } =
+            resolver.prepare(&logical_boundary(&operation)).unwrap()
+        else {
+            panic!("expected prepared replica command")
+        };
+        assert_unknown_field_rejected::<CompactReplicaEffectCommand>(
+            &serde_json::to_value(command).unwrap(),
+            "",
+        );
+        assert_unknown_field_rejected::<LabelEffectCommand>(
+            &serde_json::to_value(LabelEffectCommand::new(
+                3,
+                "set-2".to_string(),
+                "three".to_string(),
+                "retired".to_string(),
+            ))
+            .unwrap(),
+            "",
+        );
+        assert_unknown_field_rejected::<DeleteEffectCommand>(
+            &serde_json::to_value(DeleteEffectCommand::new(
+                3,
+                "set-2".to_string(),
+                "three".to_string(),
+            ))
+            .unwrap(),
+            "",
+        );
+    }
+
+    #[test]
+    fn remove_replica_execution_nested_evidence_denies_unknown_fields() {
+        let (operation, mut observations) = freeze_and_dispatch();
+        let action_id = operation.remove_intent.as_ref().unwrap().action_id.clone();
+        observations
+            .get_mut(&operation.old_primary_id)
             .unwrap()
-            .insert("extra".to_string(), serde_json::Value::Null);
-        assert!(serde_json::from_value::<RemoveReplicaBoundaryInput>(value).is_err());
+            .status
+            .agent
+            .retained_terminal_actions
+            .push(completed_action(&operation, action_id));
+        let evidence = RemoveReplicaObservationEvidence::capture(
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+            10,
+        )
+        .unwrap();
+        let result = serde_json::to_value(RemoveReplicaBoundaryResult::Observation {
+            evidence: evidence.clone(),
+        })
+        .unwrap();
+        for pointer in [
+            "",
+            "/evidence",
+            "/evidence/replicas/0",
+            "/evidence/replicas/0/epoch",
+            "/evidence/replicas/0/configuration",
+            "/evidence/replicas/0/configuration/members/0",
+            "/evidence/replicas/0/activeConnections/0",
+            "/evidence/replicas/0/agent",
+            "/evidence/replicas/0/agent/action",
+            "/evidence/replicas/0/agent/action/progress",
+            "/evidence/pods/0",
+        ] {
+            assert_unknown_field_rejected::<RemoveReplicaBoundaryResult>(&result, pointer);
+        }
+
+        let effect = serde_json::to_value(RemoveReplicaBoundaryResult::Effect {
+            outcome: DurableEffectOutcome::Applied(evidence),
+        })
+        .unwrap();
+        for pointer in ["", "/outcome", "/outcome/detail"] {
+            assert_unknown_field_rejected::<RemoveReplicaBoundaryResult>(&effect, pointer);
+        }
+    }
+
+    #[test]
+    fn remove_replica_execution_nested_terminal_denies_unknown_fields() {
+        let operation = committed_operation();
+        let terminal =
+            terminal_from_operation(&operation, RemoveReplicaActivityAccounting::default())
+                .unwrap();
+        let terminal = serde_json::to_value(terminal).unwrap();
+        for pointer in ["", "/commit_evidence", "/cleanup", "/accounting"] {
+            assert_unknown_field_rejected::<RemoveReplicaTerminal>(&terminal, pointer);
+        }
+
+        let unsafe_terminal = serde_json::to_value(RemoveReplicaTerminal::Unsafe {
+            committed: false,
+            commit_evidence: None,
+            cleanup: None,
+            disposition: RemoveReplicaDispositionStatus::FailedPreCommitIncomplete {
+                attempt: 1,
+                last_observed_phase: Some(RemoveReplicaCoordinatorPhaseStatus::Validating),
+                reason: "failed safely".to_string(),
+            },
+            message: "failed safely".to_string(),
+            accounting: Default::default(),
+        })
+        .unwrap();
+        assert_unknown_field_rejected::<RemoveReplicaTerminal>(
+            &unsafe_terminal,
+            "/disposition/failedPreCommitIncomplete",
+        );
     }
 }
