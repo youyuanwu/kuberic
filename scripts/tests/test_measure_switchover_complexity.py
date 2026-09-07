@@ -108,7 +108,41 @@ class ComplexityMeasurementTests(unittest.TestCase):
             measure_complexity.classify_amortization(
                 (700, 70), (1000, 100), (300, 30), (1000, 100)
             ),
-            "inconclusive",
+            "inconclusive/mixed",
+        )
+
+    def test_dimension_classification_uses_spec_thresholds(self) -> None:
+        self.assertEqual(
+            measure_complexity.classify_amortization_dimension(0.99, 0.25),
+            "positive",
+        )
+        self.assertEqual(
+            measure_complexity.classify_amortization_dimension(1.0, 0.0),
+            "negative",
+        )
+        self.assertEqual(
+            measure_complexity.classify_amortization_dimension(0.75, 0.50),
+            "inconclusive/mixed",
+        )
+        self.assertEqual(
+            measure_complexity.classify_amortization_dimension(0.75, 0.500001),
+            "negative",
+        )
+
+    def test_remove_measurement_scopes_are_declared(self) -> None:
+        labels = {label for label, _segments in measure_complexity.MEASUREMENTS}
+        self.assertTrue(
+            {
+                "legacy_remove",
+                "remove_module",
+                "remove_comparable_workflow_scope",
+                "remove_body",
+                "remove_effect_integration",
+                "remove_crd_integration",
+                "remove_routing_integration",
+                "remove_reconcile_integration",
+                "remove_status_integration",
+            }.issubset(labels)
         )
 
 

@@ -73,20 +73,24 @@ pub type PilotHost = DurableOperatorHost;
 /// recovery authority; retaining hosts preserves monotonic attempt counters
 /// within one process epoch.
 pub struct DurableSwitchoverPilotRuntime {
-    inner: DurableWorkflowRuntime,
+    inner: Arc<DurableWorkflowRuntime>,
 }
 
 impl DurableSwitchoverPilotRuntime {
     pub fn kubernetes(client: kube::Client) -> Self {
         Self {
-            inner: DurableWorkflowRuntime::kubernetes(client),
+            inner: Arc::new(DurableWorkflowRuntime::kubernetes(client)),
         }
     }
 
     pub fn in_memory(store: InMemoryCheckpointStore) -> Self {
         Self {
-            inner: DurableWorkflowRuntime::in_memory(store),
+            inner: Arc::new(DurableWorkflowRuntime::in_memory(store)),
         }
+    }
+
+    pub fn shared(inner: Arc<DurableWorkflowRuntime>) -> Self {
+        Self { inner }
     }
 
     pub async fn host(

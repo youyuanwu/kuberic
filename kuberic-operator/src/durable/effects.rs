@@ -34,6 +34,11 @@ use super::pilot::{
     DurableSwitchoverState, DurableSwitchoverStepResult, PilotActivityKind, PilotAdapterDecision,
     PilotPermitGuard,
 };
+#[cfg(feature = "durable-remove-replica-pilot")]
+use super::remove_replica_pilot::{
+    DurableRemoveReplicaState, DurableRemoveReplicaStepResult, RemoveReplicaActivityCompletion,
+    RemoveReplicaActivityKind, RemoveReplicaAdapterDecision, RemoveReplicaPermitGuard,
+};
 #[cfg(feature = "durable-switchover-pilot")]
 use super::{Decision, switchover::is_switchover_postcondition_transition};
 use super::{
@@ -1006,6 +1011,143 @@ pub async fn execute_delete_command(
     let _ = api
         .delete_pod(namespace, &command.pod_name, &command.expected_uid)
         .await;
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub type RemoveReplicaEffectBridgeOutcome =
+    DurableEffectBridgeOutcome<Box<DurableRemoveReplicaStepResult>>;
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[allow(clippy::too_many_arguments)]
+pub async fn bridge_remove_replica_permitted_step(
+    guard: &mut RemoveReplicaPermitGuard,
+    operation: &DurableOperationStatus,
+    prepared: &RemoveReplicaActivityKind,
+    accepted_activity: &kuberic_durable_execution::LogicalActivityId,
+    accepted_attempt: kuberic_durable_execution::AttemptId,
+    observations: &OperationObservations,
+    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
+    api: &dyn ClusterApi,
+    namespace: &str,
+) -> Result<RemoveReplicaEffectBridgeOutcome, String> {
+    let _permit = guard.consume_for(operation, prepared, accepted_activity, accepted_attempt)?;
+    match prepared {
+        RemoveReplicaActivityKind::PassiveObservation => Err(
+            "passive durable remove observation unexpectedly reached the effect bridge".to_string(),
+        ),
+        RemoveReplicaActivityKind::PreparedReplica { command } => {
+            let Some(handle) = handles.get(&command.target_id) else {
+                return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
+            };
+            if handle.instance_id().as_str() != command.target_instance_id {
+                return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
+            }
+            match execute_replica_command(handle.as_ref(), command).await {
+                Ok(()) => Ok(DurableEffectBridgeOutcome::Exposed),
+                Err(error) => match classify_dispatch_failure(&error) {
+                    DispatchFailureDisposition::ProvenNoAdmission => {
+                        let next = operation_after_dispatch_error(operation, &error);
+                        let result = DurableRemoveReplicaStepResult::ProvenNoAdmission {
+                            operation: DurableRemoveReplicaState::from_operation(&next),
+                            action_id: command.action_id.clone(),
+                            redelivery: 1,
+                        };
+                        if dispatch_rejection_requires_refresh(&error) {
+                            Ok(DurableEffectBridgeOutcome::ObserveAfterFenceRefresh(
+                                Box::new(result),
+                            ))
+                        } else {
+                            Ok(DurableEffectBridgeOutcome::Observe(Box::new(result)))
+                        }
+                    }
+                    DispatchFailureDisposition::DefiniteFailure
+                        if matches!(error, KubericError::RemoteAgentConflict(_)) =>
+                    {
+                        let next =
+                            super::remove_replica::invalid_removal(operation, &error.to_string());
+                        Ok(DurableEffectBridgeOutcome::Observe(Box::new(
+                            DurableRemoveReplicaStepResult::Advance {
+                                operation: DurableRemoveReplicaState::from_operation(&next),
+                                completion: RemoveReplicaActivityCompletion::ExternalEffect,
+                            },
+                        )))
+                    }
+                    DispatchFailureDisposition::DefiniteFailure
+                    | DispatchFailureDisposition::Unknown => {
+                        Ok(DurableEffectBridgeOutcome::Exposed)
+                    }
+                },
+            }
+        }
+        RemoveReplicaActivityKind::PreparedLabel { command } => {
+            if observations
+                .get(&command.target_id)
+                .is_some_and(|observed| {
+                    observed.status.instance_id.as_str() != command.expected_uid
+                        || observed.pod_name != command.pod_name
+                })
+            {
+                return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
+            }
+            execute_label_command(api, namespace, command).await;
+            Ok(DurableEffectBridgeOutcome::Exposed)
+        }
+        RemoveReplicaActivityKind::PreparedDelete { command } => {
+            execute_delete_command(api, namespace, command).await;
+            Ok(DurableEffectBridgeOutcome::Exposed)
+        }
+    }
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn resolve_remove_replica_quarantine(
+    operation: &DurableOperationStatus,
+    prepared: &RemoveReplicaActivityKind,
+    decision: RemoveReplicaAdapterDecision,
+    observations: &OperationObservations,
+) -> Result<RemoveReplicaEffectBridgeOutcome, String> {
+    let decision = match decision {
+        RemoveReplicaAdapterDecision::Advance(next) => {
+            return Ok(DurableEffectBridgeOutcome::Observe(Box::new(
+                DurableRemoveReplicaStepResult::Advance {
+                    operation: *next,
+                    completion: prepared.completion_class(),
+                },
+            )));
+        }
+        RemoveReplicaAdapterDecision::AwaitEvidence => {
+            return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
+        }
+        RemoveReplicaAdapterDecision::External(decision) => decision,
+    };
+    let RemoveReplicaActivityKind::PreparedReplica { command } = prepared else {
+        return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
+    };
+    let super::Decision::Execute {
+        target_id,
+        action_id,
+        action,
+    } = *decision
+    else {
+        return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
+    };
+    resolve_quarantined_replica_effect(
+        operation,
+        command,
+        QuarantinedReplicaDecision {
+            target_id,
+            action_id,
+            action,
+        },
+        observations,
+        |next, action_id| {
+            Box::new(DurableRemoveReplicaStepResult::ProvenNoAdmission {
+                operation: DurableRemoveReplicaState::from_operation(&next),
+                action_id,
+                redelivery: 1,
+            })
+        },
+    )
 }
 // COMPLEXITY-BOUNDARY: remove-replica-effect-integration:end
 

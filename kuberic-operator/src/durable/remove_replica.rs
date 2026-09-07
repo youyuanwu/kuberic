@@ -1551,7 +1551,10 @@ fn failed_precommit(operation: &DurableOperationStatus, reason: &str) -> Durable
     poison(&next, reason)
 }
 
-fn invalid_removal(operation: &DurableOperationStatus, reason: &str) -> DurableOperationStatus {
+pub(crate) fn invalid_removal(
+    operation: &DurableOperationStatus,
+    reason: &str,
+) -> DurableOperationStatus {
     let mut next = operation.clone();
     let intent = next.remove_intent.as_ref();
     next.removal_disposition = Some(RemoveReplicaDispositionStatus::InvalidRemovalState {

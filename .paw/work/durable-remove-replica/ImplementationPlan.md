@@ -161,7 +161,7 @@ prevents generalized code from being reclassified after seeing the result.
 - [x] **Phase 1: Freeze Attributable Complexity Baselines** - Established immutable pre-port shared and explicit-remove accounting before shared code changes.
 - [x] **Phase 2: Generalize the Shared Operator Host** - Generalized hosting, effects, measurements, and terminal accounting while preserving switchover behavior.
 - [x] **Phase 3: Implement the Kernel Remove-Replica Workflow** - Added typed orchestration, admission, replay, prepared effects, terminal outcomes, and focused fault coverage.
-- [ ] **Phase 4: Integrate Operator Routing and Produce Measurements** - Add feature-gated CRD/reconciler selection, end-to-end coverage, and final amortization/checkpoint evidence.
+- [x] **Phase 4: Integrate Operator Routing and Produce Measurements** - Added feature-gated CRD/reconciler selection, end-to-end coverage, and final amortization/checkpoint evidence.
 - [ ] **Phase 5: Correct Feasibility Evidence and Documentation** - Fix runtime-neutrality classification and update README, roadmap, testing docs, and as-built documentation from measured results.
 
 ## Phase Candidates

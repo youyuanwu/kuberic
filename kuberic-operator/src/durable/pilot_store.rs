@@ -119,8 +119,10 @@ pub struct PilotCheckpointMeasurementsSnapshot {
     pub latest_authoritative_checkpoint_bytes: Option<usize>,
     pub maximum_authoritative_checkpoint_bytes: usize,
     pub latest_active_checkpoint_bytes: Option<usize>,
+    pub minimum_active_checkpoint_bytes: Option<usize>,
     pub maximum_active_checkpoint_bytes: usize,
     pub latest_terminal_checkpoint_bytes: Option<usize>,
+    pub minimum_terminal_checkpoint_bytes: Option<usize>,
     pub maximum_terminal_checkpoint_bytes: usize,
     pub completed_activity_count: Option<u64>,
     pub completed_external_effect_count: Option<u64>,
@@ -345,6 +347,11 @@ impl MeasuredPilotCheckpointStore {
         match payload.state() {
             CheckpointState::Active { activities, .. } => {
                 measurements.latest_active_checkpoint_bytes = Some(bytes);
+                measurements.minimum_active_checkpoint_bytes = Some(
+                    measurements
+                        .minimum_active_checkpoint_bytes
+                        .map_or(bytes, |minimum| minimum.min(bytes)),
+                );
                 measurements.maximum_active_checkpoint_bytes =
                     measurements.maximum_active_checkpoint_bytes.max(bytes);
                 let mut external_effects = 0_u64;
@@ -369,6 +376,11 @@ impl MeasuredPilotCheckpointStore {
                 ..
             } => {
                 measurements.latest_terminal_checkpoint_bytes = Some(bytes);
+                measurements.minimum_terminal_checkpoint_bytes = Some(
+                    measurements
+                        .minimum_terminal_checkpoint_bytes
+                        .map_or(bytes, |minimum| minimum.min(bytes)),
+                );
                 measurements.maximum_terminal_checkpoint_bytes =
                     measurements.maximum_terminal_checkpoint_bytes.max(bytes);
                 measurements.completed_activity_count = Some(*completed_activity_count);

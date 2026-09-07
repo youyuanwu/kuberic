@@ -8,7 +8,7 @@ Execution Mode: current-checkout
 Repository Identity: github.com/youyuanwu/kuberic@3d2f129bf328d7869c998718fa98e4dac441693b
 Execution Binding: none
 Workflow Mode: full
-Review Strategy: prs
+Review Strategy: local
 Review Policy: milestones
 Session Policy: continuous
 Final Agent Review: enabled

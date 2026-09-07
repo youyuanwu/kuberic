@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::crd::{
-    DurableOperationPhase, DurableOperationStatus, DurableRemoveMode, PendingActionStatus,
-    RemoveReplicaCleanupStatus, RemoveReplicaCommitEvidenceStatus, RemoveReplicaDispositionStatus,
-    RemoveReplicaIntentStatus, StablePartitionSnapshotStatus, TargetRetirementObservationStatus,
+    DurableOperationPhase, DurableOperationStatus, DurableRemoveMode,
+    DurableRemoveReplicaPilotStatus, PendingActionStatus, RemoveReplicaCleanupStatus,
+    RemoveReplicaCommitEvidenceStatus, RemoveReplicaDispositionStatus, RemoveReplicaIntentStatus,
+    StablePartitionSnapshotStatus, TargetRetirementObservationStatus,
 };
 
 use super::effects::{
@@ -47,10 +48,10 @@ use super::{
 // COMPLEXITY-BOUNDARY: remove-replica-pilot-module:start
 pub const REMOVE_REPLICA_PILOT_VERSION: u32 = 1;
 pub const REMOVE_REPLICA_PILOT_MAX_REPLICAS: usize = 3;
-pub const REMOVE_REPLICA_PILOT_MAX_ACTIVITY_RECORDS: usize = 20;
+pub const REMOVE_REPLICA_PILOT_MAX_ACTIVITY_RECORDS: usize = 16;
 pub const REMOVE_REPLICA_PILOT_MAX_TRANSITION_FUEL: usize = 48;
 pub const REMOVE_REPLICA_PILOT_MAX_WORKFLOW_INPUT_BYTES: usize = 8_192;
-pub const REMOVE_REPLICA_PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = 12_288;
+pub const REMOVE_REPLICA_PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = 16_384;
 pub const REMOVE_REPLICA_PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = 8_192;
 pub const REMOVE_REPLICA_PILOT_MAX_TERMINAL_BYTES: u64 = 4_096;
 pub const REMOVE_REPLICA_PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 752 * 1_024;
@@ -63,30 +64,27 @@ const PROJECTED_MAX_DETERMINISTIC_TRANSITIONS: usize = 8;
 
 pub type RemoveReplicaPilotHost = DurableOperatorHost;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DurableRemoveReplicaPilotExecution {
-    pub version: u32,
-    pub execution_id: String,
-    pub checkpoint_name: String,
-    pub initial_operation_json: String,
-}
+pub type DurableRemoveReplicaPilotExecution = DurableRemoveReplicaPilotStatus;
 
 pub struct DurableRemoveReplicaPilotRuntime {
-    inner: DurableWorkflowRuntime,
+    inner: Arc<DurableWorkflowRuntime>,
 }
 
 impl DurableRemoveReplicaPilotRuntime {
     pub fn kubernetes(client: kube::Client) -> Self {
         Self {
-            inner: DurableWorkflowRuntime::kubernetes(client),
+            inner: Arc::new(DurableWorkflowRuntime::kubernetes(client)),
         }
     }
 
     pub fn in_memory(store: InMemoryCheckpointStore) -> Self {
         Self {
-            inner: DurableWorkflowRuntime::in_memory(store),
+            inner: Arc::new(DurableWorkflowRuntime::in_memory(store)),
         }
+    }
+
+    pub fn shared(inner: Arc<DurableWorkflowRuntime>) -> Self {
+        Self { inner }
     }
 
     pub async fn host(
@@ -215,7 +213,7 @@ pub enum RemoveReplicaActivityKind {
 }
 
 impl RemoveReplicaActivityKind {
-    fn completion_class(&self) -> RemoveReplicaActivityCompletion {
+    pub(crate) fn completion_class(&self) -> RemoveReplicaActivityCompletion {
         match self {
             Self::PassiveObservation => RemoveReplicaActivityCompletion::PassiveObservation,
             Self::PreparedReplica { .. }
@@ -306,19 +304,17 @@ impl DurableActivity for DurableRemoveReplicaActivity {
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DurableRemoveReplicaPilotTerminal {
     Completed {
-        snapshot: StablePartitionSnapshotStatus,
         authority: RemoveReplicaTerminalCommitAuthority,
         commit_evidence: RemoveReplicaCommitEvidenceStatus,
         cleanup: RemoveReplicaCleanupStatus,
         accounting: RemoveReplicaActivityAccounting,
     },
     Compensated {
-        snapshot: StablePartitionSnapshotStatus,
         message: String,
         accounting: RemoveReplicaActivityAccounting,
     },
     UnsafeAmbiguity {
-        committed_snapshot: Option<StablePartitionSnapshotStatus>,
+        committed: bool,
         commit_evidence: Option<RemoveReplicaCommitEvidenceStatus>,
         cleanup: Option<RemoveReplicaCleanupStatus>,
         disposition: RemoveReplicaDispositionStatus,
@@ -584,7 +580,6 @@ fn terminal_from_operation(
             };
             authority.binding_signature = terminal_commit_authority_binding(operation, &authority)?;
             Ok(DurableRemoveReplicaPilotTerminal::Completed {
-                snapshot: operation.target_snapshot.clone(),
                 authority,
                 commit_evidence,
                 cleanup,
@@ -593,9 +588,6 @@ fn terminal_from_operation(
         }
         Phase::Failed if operation.remove_commit_evidence.is_none() => {
             Ok(DurableRemoveReplicaPilotTerminal::Compensated {
-                snapshot: operation.previous_snapshot.cloned().ok_or_else(|| {
-                    "compensated remove terminal has no previous snapshot".to_string()
-                })?,
                 message: bounded_terminal_message(
                     operation
                         .last_error
@@ -611,7 +603,7 @@ fn terminal_from_operation(
                 .clone()
                 .ok_or_else(|| "poisoned remove terminal has no typed disposition".to_string())?;
             Ok(DurableRemoveReplicaPilotTerminal::UnsafeAmbiguity {
-                committed_snapshot: operation.committed_snapshot.clone(),
+                committed: operation.committed_snapshot.is_some(),
                 commit_evidence: operation.remove_commit_evidence.clone(),
                 cleanup: operation.remove_cleanup.clone(),
                 disposition,
@@ -762,7 +754,6 @@ pub fn validate_loaded_terminal(
     }
     match &terminal {
         DurableRemoveReplicaPilotTerminal::Completed {
-            snapshot,
             authority,
             commit_evidence,
             cleanup,
@@ -784,9 +775,6 @@ pub fn validate_loaded_terminal(
                 });
             let exact_binding = terminal_commit_authority_binding(&initial, authority)?
                 == authority.binding_signature;
-            if snapshot != &initial.target_snapshot {
-                return Err("completed remove terminal changed frozen snapshot".to_string());
-            }
             if authority.attempt == 0
                 || authority.attempt
                     > kuberic_core::remove_replica::MAX_REMOVE_REPLICA_PRE_COMMIT_ATTEMPTS
@@ -822,21 +810,13 @@ pub fn validate_loaded_terminal(
             }
             validate_completed_cleanup(cleanup)?;
         }
-        DurableRemoveReplicaPilotTerminal::Compensated { snapshot, .. } => {
-            if snapshot != &*initial.previous_snapshot {
-                return Err("compensated remove terminal changed previous topology".to_string());
-            }
-        }
+        DurableRemoveReplicaPilotTerminal::Compensated { .. } => {}
         DurableRemoveReplicaPilotTerminal::UnsafeAmbiguity {
-            committed_snapshot,
+            committed,
             commit_evidence,
             ..
         } => {
-            if committed_snapshot.is_some() != commit_evidence.is_some()
-                || committed_snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot != &initial.target_snapshot)
-            {
+            if *committed != commit_evidence.is_some() {
                 return Err("unsafe remove terminal has inconsistent commit evidence".to_string());
             }
         }
@@ -1631,19 +1611,17 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
     }
     for terminal in [
         DurableRemoveReplicaPilotTerminal::Completed {
-            snapshot: operation.target_snapshot.clone(),
             authority,
             commit_evidence: commit_evidence.clone(),
             cleanup: cleanup.clone(),
             accounting,
         },
         DurableRemoveReplicaPilotTerminal::Compensated {
-            snapshot: operation.previous_snapshot.cloned().unwrap(),
             message: maximum.clone(),
             accounting,
         },
         DurableRemoveReplicaPilotTerminal::UnsafeAmbiguity {
-            committed_snapshot: Some(operation.target_snapshot.clone()),
+            committed: true,
             commit_evidence: Some(commit_evidence),
             cleanup: Some(cleanup),
             disposition: RemoveReplicaDispositionStatus::InvalidRemovalState {

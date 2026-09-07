@@ -39,6 +39,33 @@ MEASUREMENTS = [
         [Segment("kuberic-operator/src/durable/pilot.rs", "pilot-workflow-body")],
     ),
     (
+        "remove_module",
+        [
+            Segment(
+                "kuberic-operator/src/durable/remove_replica_pilot.rs",
+                "remove-replica-pilot-module",
+            )
+        ],
+    ),
+    (
+        "remove_comparable_workflow_scope",
+        [
+            Segment(
+                "kuberic-operator/src/durable/remove_replica_pilot.rs",
+                "remove-replica-pilot-workflow",
+            )
+        ],
+    ),
+    (
+        "remove_body",
+        [
+            Segment(
+                "kuberic-operator/src/durable/remove_replica_pilot.rs",
+                "remove-replica-pilot-workflow-body",
+            )
+        ],
+    ),
+    (
         "shared_operator_effect_adapters",
         [Segment("kuberic-operator/src/durable/effects.rs", "shared-operator-effect-adapters")],
     ),
@@ -57,7 +84,16 @@ MEASUREMENTS = [
             Segment(
                 "kuberic-operator/src/durable/workflow_host.rs",
                 "shared-operator-workflow-host",
-            )
+            ),
+            Segment(
+                "kuberic-operator/src/reconciler.rs",
+                "shared-durable-runtime-wiring",
+            ),
+            Segment(
+                "kuberic-operator/src/reconciler.rs",
+                "shared-durable-terminal-cleanup",
+            ),
+            Segment("kuberic-operator/src/main.rs", "shared-durable-main-wiring"),
         ],
     ),
     (
@@ -77,6 +113,51 @@ MEASUREMENTS = [
     (
         "pilot_reconcile_integration",
         [Segment("kuberic-operator/src/reconciler.rs", "pilot-reconcile")],
+    ),
+    (
+        "remove_effect_integration",
+        [
+            Segment(
+                "kuberic-operator/src/durable/effects.rs",
+                "remove-replica-effect-integration",
+            )
+        ],
+    ),
+    (
+        "remove_crd_integration",
+        [
+            Segment(
+                "kuberic-operator/src/crd.rs",
+                "remove-replica-crd-integration",
+            )
+        ],
+    ),
+    (
+        "remove_routing_integration",
+        [
+            Segment(
+                "kuberic-operator/src/reconciler.rs",
+                "remove-replica-routing-integration",
+            )
+        ],
+    ),
+    (
+        "remove_reconcile_integration",
+        [
+            Segment(
+                "kuberic-operator/src/reconciler.rs",
+                "remove-replica-reconcile-integration",
+            )
+        ],
+    ),
+    (
+        "remove_status_integration",
+        [
+            Segment(
+                "kuberic-operator/src/reconciler.rs",
+                "remove-replica-status-integration",
+            )
+        ],
     ),
     ("shared_kernel_typed", [Segment("durable-execution/src/typed.rs")]),
     (
@@ -225,28 +306,35 @@ def classify_amortization(
 ) -> str:
     marginal_ratio = ratio(remove_marginal, legacy_remove)
     shared_growth_ratio = ratio(shared_growth, shared_before)
-    if (
-        marginal_ratio[0] < 1.0
-        and marginal_ratio[1] < 1.0
-        and shared_growth_ratio[0] <= 0.25
-        and shared_growth_ratio[1] <= 0.25
-    ):
+    dimensions = tuple(
+        classify_amortization_dimension(marginal, growth)
+        for marginal, growth in zip(marginal_ratio, shared_growth_ratio)
+    )
+    if dimensions == ("positive", "positive"):
         return "positive"
-    if (
-        marginal_ratio[0] >= 1.0
-        or marginal_ratio[1] >= 1.0
-        or shared_growth_ratio[0] > 0.50
-        or shared_growth_ratio[1] > 0.50
-    ):
+    if "negative" in dimensions:
         return "negative"
-    return "inconclusive"
+    return "inconclusive/mixed"
+
+
+def classify_amortization_dimension(
+    marginal_ratio: float, shared_growth_ratio: float
+) -> str:
+    if marginal_ratio < 1.0 and shared_growth_ratio <= 0.25:
+        return "positive"
+    if marginal_ratio >= 1.0 or shared_growth_ratio > 0.50:
+        return "negative"
+    return "inconclusive/mixed"
 
 
 def main() -> None:
     validate_measurement_registry(MEASUREMENTS)
     validate_nonoverlapping(
         [
+            "explicit_switchover",
+            "legacy_remove",
             "pilot_module",
+            "remove_body",
             "shared_operator_effect_adapters",
             "shared_operator_checkpoint_support",
             "shared_operator_workflow_host",
@@ -254,6 +342,11 @@ def main() -> None:
             "pilot_store_integration",
             "pilot_effect_bridge_integration",
             "pilot_reconcile_integration",
+            "remove_effect_integration",
+            "remove_crd_integration",
+            "remove_routing_integration",
+            "remove_reconcile_integration",
+            "remove_status_integration",
             "shared_kernel_typed",
             "shared_kernel_fused",
         ]
@@ -274,10 +367,41 @@ def main() -> None:
         measured["pilot_effect_bridge_integration"],
         measured["pilot_reconcile_integration"],
     )
+    remove_integration = add(
+        measured["remove_effect_integration"],
+        measured["remove_crd_integration"],
+        measured["remove_routing_integration"],
+        measured["remove_reconcile_integration"],
+        measured["remove_status_integration"],
+    )
+    remove_marginal = add(
+        measured["remove_body"],
+        remove_integration,
+        shared_growth,
+    )
+    marginal_ratio = ratio(remove_marginal, measured["legacy_remove"])
+    shared_growth_ratio = ratio(shared_growth, SHARED_BEFORE)
+    executable_classification = classify_amortization_dimension(
+        marginal_ratio[0], shared_growth_ratio[0]
+    )
+    decision_classification = classify_amortization_dimension(
+        marginal_ratio[1], shared_growth_ratio[1]
+    )
+    classification = classify_amortization(
+        remove_marginal,
+        measured["legacy_remove"],
+        shared_growth,
+    )
     # pilot_workflow_subset is nested inside pilot_module and is intentionally
     # not added again.
     total = add(measured["pilot_module"], shared, integration)
     combined = add(total, measured["explicit_switchover"])
+    combined_both_workflows = add(
+        combined,
+        measured["legacy_remove"],
+        measured["remove_body"],
+        remove_integration,
+    )
     print()
     print("summary,executable_lines,decision_points")
     print(
@@ -297,20 +421,60 @@ def main() -> None:
         "legacy_remove,"
         f"{measured['legacy_remove'][0]},{measured['legacy_remove'][1]}"
     )
-    print("remove_body,not_available,not_available")
-    print("remove_integration,not_available,not_available")
-    print("remove_marginal,not_available,not_available")
-    print("remove_marginal_ratio,not_available,not_available")
-    print("shared_growth_ratio,not_available,not_available")
-    print("remove_amortization_classification,not_available,not_available")
+    print(f"remove_body,{measured['remove_body'][0]},{measured['remove_body'][1]}")
+    print(
+        "remove_comparable_workflow_scope,"
+        f"{measured['remove_comparable_workflow_scope'][0]},"
+        f"{measured['remove_comparable_workflow_scope'][1]}"
+    )
+    print(f"remove_module,{measured['remove_module'][0]},{measured['remove_module'][1]}")
+    print(f"remove_integration,{remove_integration[0]},{remove_integration[1]}")
+    print(f"remove_marginal,{remove_marginal[0]},{remove_marginal[1]}")
+    print(f"remove_marginal_ratio,{marginal_ratio[0]:.6f},{marginal_ratio[1]:.6f}")
+    print(
+        f"shared_growth_ratio,{shared_growth_ratio[0]:.6f},"
+        f"{shared_growth_ratio[1]:.6f}"
+    )
+    print(
+        "remove_amortization_dimension_classification,"
+        f"{executable_classification},{decision_classification}"
+    )
+    print(f"remove_amortization_classification,{classification},{classification}")
     print(f"operator_integration,{integration[0]},{integration[1]}")
     print(f"pilot_nonoverlapping_total,{total[0]},{total[1]}")
     print(f"combined_explicit_shared_and_pilot_total,{combined[0]},{combined[1]}")
+    print(
+        f"combined_two_workflow_total,{combined_both_workflows[0]},"
+        f"{combined_both_workflows[1]}"
+    )
     print("baseline_explicit,1449,172")
     print("baseline_pilot_workflow_subset,820,99")
     print("baseline_pilot_nonoverlapping_total,3709,295")
     print("baseline_combined_explicit_and_pilot_total,5158,467")
     print()
+    print(
+        "equation: remove_marginal = remove_body + remove_integration + shared_growth "
+        f"= {measured['remove_body'][0]} + {remove_integration[0]} + "
+        f"{shared_growth[0]} = {remove_marginal[0]} executable lines; "
+        f"{measured['remove_body'][1]} + {remove_integration[1]} + "
+        f"{shared_growth[1]} = {remove_marginal[1]} decision points"
+    )
+    print(
+        "equation: marginal_ratio = remove_marginal / legacy_remove "
+        f"= {marginal_ratio[0]:.6f} executable lines; "
+        f"{marginal_ratio[1]:.6f} decision points"
+    )
+    print(
+        "equation: shared_growth_ratio = shared_growth / shared_before "
+        f"= {shared_growth_ratio[0]:.6f} executable lines; "
+        f"{shared_growth_ratio[1]:.6f} decision points"
+    )
+    print(
+        "thresholds: positive requires marginal_ratio < 1.0 and "
+        "shared_growth_ratio <= 0.25 in both dimensions; negative requires "
+        "marginal_ratio >= 1.0 or shared_growth_ratio > 0.50 in either "
+        "dimension; all other results are inconclusive/mixed"
+    )
     print(
         "note: pilot_workflow_body is the new workflow-only scope; "
         "pilot_workflow_subset preserves the merged-pilot marker for honest baseline "
@@ -319,8 +483,9 @@ def main() -> None:
         "workflows; the combined total also charges shared protocol changes retained "
         "inside explicit_switchover; charged scopes are checked for line overlap before "
         "totals are emitted; shared_before is frozen at revision "
-        f"{BASELINE_REVISION} and second-workflow values remain unavailable until "
-        "their attributable scopes exist"
+        f"{BASELINE_REVISION}; remove_module and remove_comparable_workflow_scope "
+        "are nested diagnostics excluded from additive totals; remove_body and "
+        "remove_integration are charged exactly once"
     )
 
 
