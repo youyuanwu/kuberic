@@ -7,7 +7,8 @@ use kuberic_durable_execution::{
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore,
     InMemoryFault, LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
     PreparedActivityError, PreparedActivityResolver, ReloadReason, StorageRevision, StoreError,
-    StoreErrorKind, StoreOperation, StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
+    StoreErrorKind, StoreOperation, StoredCheckpoint, TerminalCheckpointStatus, TerminalOutcome,
+    Workflow, WorkflowContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1122,7 +1123,31 @@ async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
                     } if result == &bytes(b"recorded")
                 ),
             ),
-            ("second replay is semantically identical", first == second),
+            (
+                "accepted completion and authoritative reload are semantically identical",
+                matches!(
+                    (&first, &second),
+                    (
+                        HostOutcome::WorkflowCompleted {
+                            outcome: first_outcome,
+                            completed_activity_count: first_count,
+                            revision: first_revision,
+                            boundary: first_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Accepted,
+                        },
+                        HostOutcome::WorkflowCompleted {
+                            outcome: second_outcome,
+                            completed_activity_count: second_count,
+                            revision: second_revision,
+                            boundary: second_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                        },
+                    ) if first_outcome == second_outcome
+                        && first_count == second_count
+                        && first_revision == second_revision
+                        && first_boundary == second_boundary
+                ),
+            ),
             (
                 "neither completed replay grants dispatch",
                 !matches!(first, HostOutcome::DispatchPermitted { .. })
@@ -2277,8 +2302,29 @@ async fn terminal_reload_without_poll(id: ScenarioId) -> ScenarioEvidence {
                 ),
             ),
             (
-                "terminal reload returns the same outcome and revision",
-                accepted == reloaded,
+                "terminal reload returns the same outcome and revision with authoritative status",
+                matches!(
+                    (&accepted, &reloaded),
+                    (
+                        HostOutcome::WorkflowCompleted {
+                            outcome: accepted_outcome,
+                            completed_activity_count: accepted_count,
+                            revision: accepted_revision,
+                            boundary: accepted_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Accepted,
+                        },
+                        HostOutcome::WorkflowCompleted {
+                            outcome: reloaded_outcome,
+                            completed_activity_count: reloaded_count,
+                            revision: reloaded_revision,
+                            boundary: reloaded_boundary,
+                            checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                        },
+                    ) if accepted_outcome == reloaded_outcome
+                        && accepted_count == reloaded_count
+                        && accepted_revision == reloaded_revision
+                        && accepted_boundary == reloaded_boundary
+                ),
             ),
             (
                 "terminal reload does not poll workflow code",

@@ -800,6 +800,7 @@ mod checkpoint_store_tests {
             completed_activity_count: 0,
             revision: revision.clone(),
             boundary: PersistenceBoundary::Completion,
+            checkpoint_status: kuberic_durable_execution::TerminalCheckpointStatus::Accepted,
         });
         let accepted_bytes = store
             .load(execution_id)

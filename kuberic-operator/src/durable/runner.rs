@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use kuberic_durable_execution::{
     ActivityObservation, AttemptId, CheckpointError, CheckpointLimits, ExecutionSpec, HostOutcome,
     LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
-    PreparedActivityResolver, ReloadReason, StoreError, StoreOperation, TerminalOutcome, Workflow,
+    PreparedActivityResolver, ReloadReason, StoreError, StoreOperation, TerminalCheckpointStatus,
+    TerminalOutcome, Workflow,
 };
 use thiserror::Error;
 
@@ -79,6 +80,10 @@ pub enum DurableCheckpointDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableAdapterBoundary {
     Observed(ActivityObservation),
+    ObserveAndWait {
+        observation: Box<ActivityObservation>,
+        detail: String,
+    },
     Wait(String),
     Incompatible(String),
     Rejected(String),
@@ -188,6 +193,7 @@ impl DurableRunner {
         let mut outcome = host
             .turn_and_expose_with(workflow, execution.clone(), adapter.resolver())
             .await;
+        let mut observation_wait = None;
         for _ in 0..self.max_host_outcomes {
             host.store().correlate_host_outcome(&outcome);
             outcome = match outcome {
@@ -214,6 +220,13 @@ impl DurableRunner {
                             )
                             .await
                         }
+                        AdapterHandling::ObserveAndWait {
+                            observation,
+                            detail,
+                        } => {
+                            observation_wait = Some(detail);
+                            host.observe(&execution, observation).await
+                        }
                         AdapterHandling::Return(result) => return result,
                     }
                 }
@@ -232,14 +245,29 @@ impl DurableRunner {
                             )
                             .await
                         }
+                        AdapterHandling::ObserveAndWait {
+                            observation,
+                            detail,
+                        } => {
+                            observation_wait = Some(detail);
+                            host.observe(&execution, observation).await
+                        }
                         AdapterHandling::Return(result) => return result,
                     }
+                }
+                HostOutcome::WorkflowCompleted {
+                    checkpoint_status: TerminalCheckpointStatus::Accepted,
+                    ..
+                } => {
+                    host.turn_and_expose_with(workflow, execution.clone(), adapter.resolver())
+                        .await
                 }
                 HostOutcome::WorkflowCompleted {
                     outcome,
                     completed_activity_count,
                     revision: _,
                     boundary: _,
+                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
                 } => {
                     return match adapter.validate_terminal(outcome, completed_activity_count) {
                         Ok(terminal) => {
@@ -248,6 +276,20 @@ impl DurableRunner {
                         Err(boundary) => self
                             .handle_adapter_boundary(boundary, adapter, now_unix_seconds)
                             .into_result(),
+                    };
+                }
+                HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(
+                    error,
+                )) => {
+                    return DurableRunnerOutcome::Active {
+                        reason: DurableActiveReason::Adapter,
+                        detail: format!(
+                            "durable activity preparation awaits authoritative evidence: {error}"
+                        ),
+                        requeue_after_seconds: deadline_requeue_seconds(
+                            now_unix_seconds,
+                            adapter.deadline_unix_seconds(),
+                        ),
                     };
                 }
                 HostOutcome::CheckpointRejected(error) => {
@@ -276,7 +318,22 @@ impl DurableRunner {
                 HostOutcome::Nondeterminism(error) => {
                     return DurableRunnerOutcome::Nondeterministic(error);
                 }
-                HostOutcome::ScheduleAccepted { .. } | HostOutcome::ObservationAccepted { .. } => {
+                HostOutcome::ObservationAccepted { .. } => {
+                    let Some(detail) = observation_wait.take() else {
+                        return DurableRunnerOutcome::Nondeterministic(
+                            Nondeterminism::UnsupportedSuspension,
+                        );
+                    };
+                    return DurableRunnerOutcome::Active {
+                        reason: DurableActiveReason::Adapter,
+                        detail,
+                        requeue_after_seconds: deadline_requeue_seconds(
+                            now_unix_seconds,
+                            adapter.deadline_unix_seconds(),
+                        ),
+                    };
+                }
+                HostOutcome::ScheduleAccepted { .. } => {
                     return DurableRunnerOutcome::Nondeterministic(
                         Nondeterminism::UnsupportedSuspension,
                     );
@@ -302,6 +359,13 @@ impl DurableRunner {
     ) -> AdapterHandling<A::Publication> {
         match boundary {
             DurableAdapterBoundary::Observed(observation) => AdapterHandling::Observe(observation),
+            DurableAdapterBoundary::ObserveAndWait {
+                observation,
+                detail,
+            } => AdapterHandling::ObserveAndWait {
+                observation: *observation,
+                detail,
+            },
             DurableAdapterBoundary::Wait(detail) => {
                 AdapterHandling::Return(DurableRunnerOutcome::Active {
                     reason: DurableActiveReason::Adapter,
@@ -327,6 +391,10 @@ impl DurableRunner {
 
 enum AdapterHandling<P> {
     Observe(ActivityObservation),
+    ObserveAndWait {
+        observation: ActivityObservation,
+        detail: String,
+    },
     Return(DurableRunnerOutcome<P>),
 }
 
@@ -334,7 +402,7 @@ impl<P> AdapterHandling<P> {
     fn into_result(self) -> DurableRunnerOutcome<P> {
         match self {
             Self::Return(result) => result,
-            Self::Observe(_) => {
+            Self::Observe(_) | Self::ObserveAndWait { .. } => {
                 DurableRunnerOutcome::Nondeterministic(Nondeterminism::UnsupportedSuspension)
             }
         }
@@ -375,9 +443,9 @@ fn observation_rejection(error: ObservationRejection) -> String {
 mod durable_runner_tests {
     use async_trait::async_trait;
     use kuberic_durable_execution::{
-        CheckpointEnvelope, CheckpointStore, DurableActivity, ExactBytes, ExecutionId, HostEpoch,
-        IdentityActivityResolver, InMemoryCheckpointStore, InMemoryFault, StoreErrorKind,
-        WorkflowContext,
+        ActivitySpec, ActivityState, CheckpointEnvelope, CheckpointStore, DurableActivity,
+        ExactBytes, ExecutionId, HostEpoch, InMemoryCheckpointStore, InMemoryFault,
+        PreparedActivityError, StoreErrorKind, WorkflowContext,
     };
 
     use super::*;
@@ -451,35 +519,59 @@ mod durable_runner_tests {
     #[derive(Clone, Copy)]
     enum AdapterMode {
         Observe,
+        ObserveAndWait,
         Wait,
         WrongObservation,
     }
 
+    struct FakeResolver {
+        rejection: Option<PreparedActivityError>,
+    }
+
+    impl PreparedActivityResolver for FakeResolver {
+        fn resolve(
+            &self,
+            logical: &ActivitySpec,
+            _recorded: Option<&ActivitySpec>,
+        ) -> Result<ActivitySpec, PreparedActivityError> {
+            match &self.rejection {
+                Some(error) => Err(error.clone()),
+                None => Ok(logical.clone()),
+            }
+        }
+    }
+
     struct FakeAdapter {
-        resolver: IdentityActivityResolver,
+        resolver: FakeResolver,
         mode: AdapterMode,
         deadline: i64,
         checkpoint_disposition: DurableCheckpointDisposition,
         dispatch_calls: usize,
+        publication_calls: usize,
         second_consume_rejected: bool,
     }
 
     impl FakeAdapter {
         fn new(mode: AdapterMode) -> Self {
             Self {
-                resolver: IdentityActivityResolver,
+                resolver: FakeResolver { rejection: None },
                 mode,
                 deadline: 100,
                 checkpoint_disposition: DurableCheckpointDisposition::Rejected,
                 dispatch_calls: 0,
+                publication_calls: 0,
                 second_consume_rejected: false,
             }
+        }
+
+        fn reject_preparation(&mut self, error: PreparedActivityError) {
+            self.resolver.rejection = Some(error);
         }
     }
 
     #[async_trait]
     impl DurableOperationAdapter for FakeAdapter {
-        type Resolver = IdentityActivityResolver;
+        type Resolver = FakeResolver;
         type Terminal = (TerminalOutcome, u64);
         type Publication = (TerminalOutcome, u64);
 
@@ -515,10 +607,15 @@ mod durable_runner_tests {
             } else {
                 activity.clone()
             };
-            DurableAdapterBoundary::Observed(ActivityObservation::new(
-                observed,
-                ExactBytes::new(br#""applied""#),
-            ))
+            let observation = ActivityObservation::new(observed, ExactBytes::new(br#""applied""#));
+            if matches!(self.mode, AdapterMode::ObserveAndWait) {
+                DurableAdapterBoundary::ObserveAndWait {
+                    observation: Box::new(observation),
+                    detail: "refresh authoritative fence evidence".to_string(),
+                }
+            } else {
+                DurableAdapterBoundary::Observed(observation)
+            }
         }
 
         async fn resolve_quarantine(
@@ -549,6 +646,7 @@ mod durable_runner_tests {
         }
 
         fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication {
+            self.publication_calls += 1;
             terminal
         }
     }
@@ -591,7 +689,7 @@ mod durable_runner_tests {
     }
 
     #[tokio::test]
-    async fn active_terminal_and_one_use_permit_follow_one_bounded_runner_path() {
+    async fn freshly_accepted_terminal_reloads_before_publication_and_permit_is_one_use() {
         let store = InMemoryCheckpointStore::new();
         let mut host = fixture_host(store.clone(), 1);
         let mut adapter = FakeAdapter::new(AdapterMode::Observe);
@@ -605,6 +703,8 @@ mod durable_runner_tests {
             DurableRunnerOutcome::Terminal((TerminalOutcome::Succeeded { .. }, 1))
         ));
         assert!(adapter.second_consume_rejected);
+        assert_eq!(adapter.publication_calls, 1);
+        assert_eq!(host.store().measurements().load_attempts, 3);
 
         let mut restarted = fixture_host(store, 1);
         let mut restarted_adapter = FakeAdapter::new(AdapterMode::Observe);
@@ -623,6 +723,8 @@ mod durable_runner_tests {
             DurableRunnerOutcome::Terminal((TerminalOutcome::Succeeded(_), 1))
         ));
         assert_eq!(restarted_adapter.dispatch_calls, 0);
+        assert_eq!(restarted_adapter.publication_calls, 1);
+        assert_eq!(restarted.store().measurements().load_attempts, 1);
     }
 
     #[tokio::test]
@@ -656,6 +758,93 @@ mod durable_runner_tests {
             .run(&mut host, &OneEffect, execution(8), &mut adapter, 0)
             .await;
         assert!(matches!(outcome, DurableRunnerOutcome::Isolated(_)));
+    }
+
+    #[tokio::test]
+    async fn observe_and_wait_persists_without_same_cycle_progression() {
+        let store = InMemoryCheckpointStore::new();
+        let mut host = fixture_host(store.clone(), 9);
+        let mut adapter = FakeAdapter::new(AdapterMode::ObserveAndWait);
+        let outcome = DurableRunner::new(4)
+            .unwrap()
+            .run(&mut host, &TwoEffects, execution(9), &mut adapter, 0)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            DurableRunnerOutcome::Active {
+                reason: DurableActiveReason::Adapter,
+                ref detail,
+                ..
+            } if detail == "refresh authoritative fence evidence"
+        ));
+        assert_eq!(adapter.dispatch_calls, 1);
+        assert_eq!(adapter.publication_calls, 0);
+
+        let stored = store
+            .load(execution(9).execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(&execution(9), limits())
+            .unwrap();
+        let activities = payload.active_activities().unwrap();
+        assert_eq!(activities.len(), 1);
+        assert!(matches!(
+            activities[0].state(),
+            ActivityState::Completed { .. }
+        ));
+
+        let mut restarted = fixture_host(store, 9);
+        let mut restarted_adapter = FakeAdapter::new(AdapterMode::Observe);
+        let completed = DurableRunner::new(8)
+            .unwrap()
+            .run(
+                &mut restarted,
+                &TwoEffects,
+                execution(9),
+                &mut restarted_adapter,
+                0,
+            )
+            .await;
+        assert!(matches!(
+            completed,
+            DurableRunnerOutcome::Terminal((TerminalOutcome::Succeeded { .. }, 2))
+        ));
+        assert_eq!(restarted_adapter.dispatch_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn prepared_activity_rejection_is_an_active_wait() {
+        let store = InMemoryCheckpointStore::new();
+        let mut host = fixture_host(store.clone(), 10);
+        let mut adapter = FakeAdapter::new(AdapterMode::Observe);
+        adapter.reject_preparation(PreparedActivityError::Derivation);
+
+        let outcome = DurableRunner::new(2)
+            .unwrap()
+            .run(&mut host, &OneEffect, execution(10), &mut adapter, 0)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            DurableRunnerOutcome::Active {
+                reason: DurableActiveReason::Adapter,
+                ref detail,
+                requeue_after_seconds: 10,
+            } if detail.contains("preparation awaits authoritative evidence")
+        ));
+        assert_eq!(adapter.dispatch_calls, 0);
+        assert_eq!(adapter.publication_calls, 0);
+        assert!(
+            store
+                .load(execution(10).execution_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

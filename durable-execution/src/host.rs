@@ -30,6 +30,13 @@ pub enum StoreOperation {
     CompareAndSwap(PersistenceBoundary),
 }
 
+/// Whether a terminal checkpoint was just accepted or authoritatively reloaded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalCheckpointStatus {
+    Accepted,
+    Reloaded,
+}
+
 /// Rejection of an authoritative result observation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObservationRejection {
@@ -146,6 +153,7 @@ define_host_outcomes! {
         completed_activity_count: u64,
         revision: StorageRevision,
         boundary: PersistenceBoundary,
+        checkpoint_status: TerminalCheckpointStatus,
     },
     Quarantined {
         activity: LogicalActivityId,
@@ -217,6 +225,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                     completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
+                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
                 };
             }
             if let Some(record) = payload
@@ -298,6 +307,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                     completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
+                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
                 }
             }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
@@ -360,6 +370,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                     completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
+                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
                 };
             }
             if let Some(record) = payload
@@ -445,6 +456,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                     completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
+                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
                 }
             }
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
@@ -687,6 +699,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 completed_activity_count,
                 revision: stored.revision().clone(),
                 boundary: PersistenceBoundary::Completion,
+                checkpoint_status: TerminalCheckpointStatus::Reloaded,
             },
             Evaluation::Nondeterminism(error) => HostOutcome::Nondeterminism(error),
             Evaluation::CheckpointRejected(error) => HostOutcome::CheckpointRejected(error),
@@ -829,6 +842,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 completed_activity_count,
                 revision,
                 boundary,
+                checkpoint_status: TerminalCheckpointStatus::Accepted,
             },
             Ok(other) => reload_outcome(boundary, other),
             Err(error) => store_failed(boundary, error),
