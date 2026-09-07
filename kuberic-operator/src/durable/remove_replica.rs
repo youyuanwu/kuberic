@@ -1,3 +1,4 @@
+// COMPLEXITY-BOUNDARY: explicit-remove:start
 use std::collections::HashSet;
 
 use kuberic_core::remove_replica::{
@@ -1657,6 +1658,7 @@ impl From<TargetRetirementObservation> for TargetRetirementObservationStatus {
     }
 }
 
+// COMPLEXITY-BOUNDARY: explicit-remove:end
 #[cfg(test)]
 mod tests {
     use super::*;
