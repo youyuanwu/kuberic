@@ -9,6 +9,9 @@ use tracing::info;
 
 use kuberic_operator::cluster_api::KubeClusterApi;
 use kuberic_operator::crd::KubericSet;
+use kuberic_operator::node_maintenance::{
+    KubeMaintenanceApi, NodeMaintenanceRequest, RequestContext, reconcile_request,
+};
 use kuberic_operator::reconciler::{ReconcileAction, ReconcilerState};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +48,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Watching KubericSets");
 
+    let maintenance_client = client.clone();
+    let maintenance = tokio::spawn(async move {
+        let requests: Api<NodeMaintenanceRequest> = Api::all(maintenance_client.clone());
+        let maintenance_api = Arc::new(KubeMaintenanceApi {
+            client: maintenance_client,
+        });
+
+        Controller::new(requests, watcher::Config::default())
+            .run(
+                |request: Arc<NodeMaintenanceRequest>, api: Arc<KubeMaintenanceApi>| async move {
+                    if request.metadata.deletion_timestamp.is_some() {
+                        return Ok(Action::await_change());
+                    }
+                    let name = request
+                        .metadata
+                        .name
+                        .clone()
+                        .ok_or_else(|| OperatorError("request has no name".to_string()))?;
+                    let previous = request.status.clone().unwrap_or_default();
+                    let now_ts = k8s_openapi::jiff::Timestamp::now();
+                    let now = now_ts.to_string();
+                    let not_before_reached = request
+                        .spec
+                        .not_before
+                        .as_deref()
+                        .and_then(|at| at.parse::<k8s_openapi::jiff::Timestamp>().ok())
+                        .is_none_or(|at| now_ts >= at);
+                    let deadline_exceeded = request
+                        .spec
+                        .deadline
+                        .as_deref()
+                        .and_then(|deadline| deadline.parse::<k8s_openapi::jiff::Timestamp>().ok())
+                        .is_some_and(|deadline| now_ts > deadline);
+
+                    reconcile_request(
+                        api.as_ref(),
+                        RequestContext {
+                            name: &name,
+                            spec: &request.spec,
+                            generation: request.metadata.generation,
+                            previous: &previous,
+                            now: &now,
+                            not_before_reached,
+                            deadline_exceeded,
+                        },
+                    )
+                    .await
+                    .map(|outcome| {
+                        if outcome.persisted {
+                            info!(
+                                request = %name,
+                                phase = ?outcome.status.phase,
+                                "node maintenance status updated"
+                            );
+                        }
+                        Action::requeue(std::time::Duration::from_secs(30))
+                    })
+                    .map_err(OperatorError)
+                },
+                |_request: Arc<NodeMaintenanceRequest>, error, _api: Arc<KubeMaintenanceApi>| {
+                    tracing::warn!(?error, "node maintenance controller error");
+                    Action::requeue(std::time::Duration::from_secs(10))
+                },
+                maintenance_api,
+            )
+            .for_each(|res| async move {
+                match res {
+                    Ok(o) => info!("reconciled maintenance request {:?}", o),
+                    Err(e) => tracing::warn!("maintenance reconcile failed: {}", e),
+                }
+            })
+            .await;
+    });
+
+    info!("Watching NodeMaintenanceRequests");
+
     Controller::new(sets, watcher::Config::default())
         .owns(pods, watcher::Config::default())
         .run(
@@ -68,6 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .await;
+
+    maintenance.abort();
 
     Ok(())
 }
