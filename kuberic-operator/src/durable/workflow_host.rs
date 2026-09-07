@@ -10,7 +10,7 @@ use kuberic_durable_execution::{
 use rand::random;
 use tokio::sync::Mutex;
 
-use super::pilot_store::{
+use super::checkpoint_store::{
     CheckpointMeasurementDecoder, DurableCheckpointMeasurementsSnapshot, DurableCheckpointStore,
     MeasuredDurableCheckpointStore,
 };
@@ -59,6 +59,10 @@ impl DurablePermitGuard {
 
     pub fn activity(&self) -> Option<&LogicalActivityId> {
         self.permit.as_ref().map(DispatchPermit::activity)
+    }
+
+    pub fn attempt_id(&self) -> Option<AttemptId> {
+        self.permit.as_ref().map(DispatchPermit::attempt_id)
     }
 }
 

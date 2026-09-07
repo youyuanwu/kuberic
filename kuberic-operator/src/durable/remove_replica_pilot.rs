@@ -28,15 +28,15 @@ use crate::crd::{
     StablePartitionSnapshotStatus, TargetRetirementObservationStatus,
 };
 
+use super::checkpoint_store::{
+    CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
+    DurableCheckpointMeasurementsSnapshot,
+};
 use super::effects::{
     DeleteEffectCommand, DurableEffectPreparationError, LabelEffectCommand, ReplicaEffectCommand,
     prepare_lifecycle_replica_effect_command, prepare_remove_delete_effect_command,
     prepare_remove_label_effect_command, validate_remove_replica_action_kind,
     validate_remove_replica_dispatch_authority,
-};
-use super::pilot_store::{
-    CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
-    DurableCheckpointMeasurementsSnapshot,
 };
 use super::remove_replica::{core_intent, validate_remove_replica_operation};
 use super::workflow_host::{DurableOperatorHost, DurablePermitGuard, DurableWorkflowRuntime};
@@ -1502,6 +1502,7 @@ pub fn checkpoint_limits() -> CheckpointLimits {
     CheckpointLimits::new(
         REMOVE_REPLICA_PILOT_MAX_ACTIVITY_RECORDS,
         REMOVE_REPLICA_PILOT_MAX_ENCODED_CHECKPOINT_BYTES,
+        REMOVE_REPLICA_PILOT_MAX_ENCODED_CHECKPOINT_BYTES,
     )
     .expect("durable remove pilot limits are nonzero")
 }
@@ -1691,11 +1692,9 @@ fn maximum_active_payload(
         ExactBytes::new(vec![u8::MAX; REMOVE_REPLICA_PILOT_MAX_WORKFLOW_INPUT_BYTES]),
         REMOVE_REPLICA_PILOT_MAX_TERMINAL_BYTES,
     );
-    let contract = ExecutionContract::new(
-        execution,
-        u64::try_from(admitted_max_encoded_checkpoint_bytes)
-            .map_err(|_| "remove checkpoint limit does not fit u64".to_string())?,
-    );
+    let admitted = u64::try_from(admitted_max_encoded_checkpoint_bytes)
+        .map_err(|_| "remove checkpoint limit does not fit u64".to_string())?;
+    let contract = ExecutionContract::with_encoded_limits(execution, admitted, admitted);
     let name = ActivityName::new(
         REMOVE_REPLICA_ACTIVITY_NAME,
         REMOVE_REPLICA_ACTIVITY_VERSION,
@@ -1806,7 +1805,7 @@ mod remove_replica_pilot_tests {
         },
     };
 
-    use super::super::pilot_store::MeasuredPilotCheckpointStore;
+    use super::super::checkpoint_store::MeasuredDurableCheckpointStore;
     use super::*;
 
     fn snapshot() -> StablePartitionSnapshotStatus {
@@ -2293,9 +2292,9 @@ mod remove_replica_pilot_tests {
         epoch: u8,
     ) -> RemoveReplicaPilotHost {
         DurableHost::new(
-            MeasuredPilotCheckpointStore::with_decoder(
+            MeasuredDurableCheckpointStore::with_decoder(
                 execution.execution_id(),
-                super::super::pilot_store::DurableCheckpointStore::InMemory(backend),
+                super::super::checkpoint_store::DurableCheckpointStore::InMemory(backend),
                 checkpoint_measurement_decoder(),
             ),
             HostEpoch::from_bytes([epoch; 16]),

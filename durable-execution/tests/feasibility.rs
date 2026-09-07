@@ -185,7 +185,7 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
     let mut host = DurableHost::new(
         store,
         HostEpoch::from_bytes([1; 16]),
-        CheckpointLimits::new(16, 100_000).unwrap(),
+        CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
     );
     let first_turn = block_on(host.turn(
         &SelectedOrdinaryAsyncSurface,

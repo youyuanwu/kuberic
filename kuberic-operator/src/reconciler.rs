@@ -3267,7 +3267,7 @@ fn loaded_pilot_terminal(
 fn enrich_pilot_terminal_result(
     result: DurableSwitchoverStepResult,
     observations: &OperationObservations,
-    measurements: crate::durable::pilot_store::PilotCheckpointMeasurementsSnapshot,
+    measurements: crate::durable::checkpoint_store::DurableCheckpointMeasurementsSnapshot,
 ) -> DurableSwitchoverStepResult {
     match result {
         DurableSwitchoverStepResult::Complete {
@@ -5837,7 +5837,7 @@ mod dispatch_planning_tests {
         let mut host = kuberic_durable_execution::DurableHost::new(
             kuberic_durable_execution::InMemoryCheckpointStore::new(),
             kuberic_durable_execution::HostEpoch::from_bytes([seed.wrapping_add(1); 16]),
-            kuberic_durable_execution::CheckpointLimits::new(4, 128 * 1024).unwrap(),
+            kuberic_durable_execution::CheckpointLimits::new(4, 128 * 1024, 128 * 1024).unwrap(),
         );
         let workflow = OnePreparedPilotActivity {
             input: crate::durable::pilot::DurableSwitchoverActivityInput {
@@ -6362,11 +6362,11 @@ mod dispatch_planning_tests {
     #[cfg(feature = "durable-switchover-pilot")]
     #[tokio::test]
     async fn bridge_dispatches_one_persisted_command_from_the_fused_permit() {
+        use crate::durable::checkpoint_store::MeasuredDurableCheckpointStore;
         use crate::durable::pilot::{
-            DurableSwitchoverWorkflow, PilotCheckpointStore, PilotPreparedActivityResolver,
+            DurableCheckpointStore, DurableSwitchoverWorkflow, PilotPreparedActivityResolver,
             decode_pilot_activity_input, execution_spec, initial_operation, new_pilot_reference,
         };
-        use crate::durable::pilot_store::MeasuredPilotCheckpointStore;
         use kuberic_durable_execution::{
             DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
         };
@@ -6388,9 +6388,9 @@ mod dispatch_planning_tests {
         reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
         let execution = execution_spec(&reference).unwrap();
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+                DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
             ),
             HostEpoch::from_bytes([21; 16]),
             crate::durable::pilot::checkpoint_limits(),
@@ -6496,11 +6496,11 @@ mod dispatch_planning_tests {
     #[tokio::test]
     async fn missing_external_observation_rejects_preparation_before_exposure_then_dispatches_exactly()
      {
+        use crate::durable::checkpoint_store::MeasuredDurableCheckpointStore;
         use crate::durable::pilot::{
-            DurableSwitchoverWorkflow, PilotCheckpointStore, PilotPreparedActivityResolver,
+            DurableCheckpointStore, DurableSwitchoverWorkflow, PilotPreparedActivityResolver,
             decode_pilot_activity_input, execution_spec, initial_operation, new_pilot_reference,
         };
-        use crate::durable::pilot_store::MeasuredPilotCheckpointStore;
         use kuberic_durable_execution::{
             CheckpointError, DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
             PreparedActivityError,
@@ -6543,9 +6543,9 @@ mod dispatch_planning_tests {
         reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
         let execution = execution_spec(&reference).unwrap();
         let backend = InMemoryCheckpointStore::new();
-        let measured = MeasuredPilotCheckpointStore::new(
+        let measured = MeasuredDurableCheckpointStore::new(
             execution.execution_id(),
-            PilotCheckpointStore::InMemory(backend.clone()),
+            DurableCheckpointStore::InMemory(backend.clone()),
         );
         let mut host = DurableHost::new(
             measured,
@@ -6644,11 +6644,11 @@ mod dispatch_planning_tests {
     #[cfg(feature = "durable-switchover-pilot")]
     #[tokio::test]
     async fn precondition_rejection_waits_for_fresh_observations_before_redelivery() {
+        use crate::durable::checkpoint_store::MeasuredDurableCheckpointStore;
         use crate::durable::pilot::{
-            DurableSwitchoverWorkflow, PilotCheckpointStore, PilotPreparedActivityResolver,
+            DurableCheckpointStore, DurableSwitchoverWorkflow, PilotPreparedActivityResolver,
             decode_pilot_activity_input, execution_spec, initial_operation, new_pilot_reference,
         };
-        use crate::durable::pilot_store::MeasuredPilotCheckpointStore;
         use kuberic_durable_execution::{
             ActivityState, DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
         };
@@ -6671,9 +6671,9 @@ mod dispatch_planning_tests {
         let execution = execution_spec(&reference).unwrap();
         let backend = InMemoryCheckpointStore::new();
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(backend),
+                DurableCheckpointStore::InMemory(backend),
             ),
             HostEpoch::from_bytes([22; 16]),
             crate::durable::pilot::checkpoint_limits(),

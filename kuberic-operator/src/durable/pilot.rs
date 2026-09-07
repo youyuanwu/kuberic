@@ -35,15 +35,15 @@ use crate::crd::{
     PendingActionStatus, StablePartitionSnapshotStatus,
 };
 
+pub use super::checkpoint_store::DurableCheckpointStore;
+#[cfg(test)]
+use super::checkpoint_store::MeasuredDurableCheckpointStore;
+use super::checkpoint_store::{
+    CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
+};
 use super::effects::{
     LabelEffectCommand, PilotEffectPreparationError, ReplicaEffectCommand, exact_label_command,
     prepare_replica_effect_command, validate_pilot_replica_action_kind,
-};
-pub use super::pilot_store::DurableCheckpointStore as PilotCheckpointStore;
-#[cfg(test)]
-use super::pilot_store::MeasuredPilotCheckpointStore;
-use super::pilot_store::{
-    CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
 };
 use super::workflow_host::{DurableOperatorHost, DurablePermitGuard, DurableWorkflowRuntime};
 use super::{
@@ -133,7 +133,7 @@ impl DurableSwitchoverPilotRuntime {
         set_name: &str,
         set_uid: &str,
         execution_id: &str,
-    ) -> Option<super::pilot_store::PilotCheckpointMeasurementsSnapshot> {
+    ) -> Option<super::checkpoint_store::DurableCheckpointMeasurementsSnapshot> {
         self.inner
             .measurements(namespace, set_name, set_uid, "switchover", execution_id)
             .await
@@ -1386,6 +1386,7 @@ pub fn checkpoint_limits() -> CheckpointLimits {
     CheckpointLimits::new(
         PILOT_MAX_ACTIVITY_RECORDS,
         PILOT_MAX_ENCODED_CHECKPOINT_BYTES,
+        PILOT_MAX_ENCODED_CHECKPOINT_BYTES,
     )
     .expect("durable switchover pilot limits are nonzero")
 }
@@ -1892,11 +1893,9 @@ fn maximum_active_payload(
         ExactBytes::new(vec![u8::MAX; PILOT_MAX_OPERATION_BYTES]),
         PILOT_MAX_TERMINAL_BYTES,
     );
-    let contract = ExecutionContract::new(
-        execution,
-        u64::try_from(admitted_max_encoded_checkpoint_bytes)
-            .map_err(|_| "pilot checkpoint limit does not fit u64".to_string())?,
-    );
+    let admitted = u64::try_from(admitted_max_encoded_checkpoint_bytes)
+        .map_err(|_| "pilot checkpoint limit does not fit u64".to_string())?;
+    let contract = ExecutionContract::with_encoded_limits(execution, admitted, admitted);
     let name = ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
         .map_err(|error| format!("construct pilot activity name: {error}"))?;
     let activities = (0..PILOT_MAX_ACTIVITY_RECORDS)
@@ -2112,10 +2111,10 @@ mod durable_switchover_pilot_tests {
         );
 
         let payload = maximum_active_payload(encoded).unwrap();
-        let exact = CheckpointLimits::new(PILOT_MAX_ACTIVITY_RECORDS, encoded).unwrap();
+        let exact = CheckpointLimits::new(PILOT_MAX_ACTIVITY_RECORDS, encoded, encoded).unwrap();
         assert!(CheckpointEnvelope::encode_with_limits(&payload, exact).is_ok());
         let one_byte_short =
-            CheckpointLimits::new(PILOT_MAX_ACTIVITY_RECORDS, encoded - 1).unwrap();
+            CheckpointLimits::new(PILOT_MAX_ACTIVITY_RECORDS, encoded - 1, encoded - 1).unwrap();
         assert!(CheckpointEnvelope::encode_with_limits(&payload, one_byte_short).is_err());
     }
 
@@ -2252,9 +2251,9 @@ mod durable_switchover_pilot_tests {
         reference.initial_operation_json = serde_json::to_string(&initial).unwrap();
         let execution = execution_spec(&reference).unwrap();
         let store = InMemoryCheckpointStore::new();
-        let measured = MeasuredPilotCheckpointStore::new(
+        let measured = MeasuredDurableCheckpointStore::new(
             execution.execution_id(),
-            PilotCheckpointStore::InMemory(store),
+            DurableCheckpointStore::InMemory(store),
         );
         let mut host = DurableHost::new(
             measured,
@@ -2354,9 +2353,9 @@ mod durable_switchover_pilot_tests {
         let execution = execution_spec(&reference).unwrap();
         let backend = InMemoryCheckpointStore::new();
         let mut first_host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(backend.clone()),
+                DurableCheckpointStore::InMemory(backend.clone()),
             ),
             HostEpoch::from_bytes([3; 16]),
             checkpoint_limits(),
@@ -2365,9 +2364,9 @@ mod durable_switchover_pilot_tests {
         let permit = expose_next(&mut first_host, &workflow, &execution).await;
 
         let mut restarted_host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(backend),
+                DurableCheckpointStore::InMemory(backend),
             ),
             HostEpoch::from_bytes([4; 16]),
             checkpoint_limits(),
@@ -2387,9 +2386,9 @@ mod durable_switchover_pilot_tests {
         let operation = initial_operation(&reference).unwrap();
         let store = InMemoryCheckpointStore::new();
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(store),
+                DurableCheckpointStore::InMemory(store),
             ),
             HostEpoch::from_bytes([8; 16]),
             checkpoint_limits(),
@@ -2435,9 +2434,9 @@ mod durable_switchover_pilot_tests {
         let execution = execution_spec(&reference).unwrap();
         let operation = initial_operation(&reference).unwrap();
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+                DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
             ),
             HostEpoch::from_bytes([12; 16]),
             checkpoint_limits(),
@@ -2930,9 +2929,9 @@ mod durable_switchover_pilot_tests {
         reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
         let execution = execution_spec(&reference).unwrap();
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+                DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
             ),
             HostEpoch::from_bytes([13; 16]),
             checkpoint_limits(),
@@ -2976,9 +2975,9 @@ mod durable_switchover_pilot_tests {
         reference.initial_operation_json = serde_json::to_string(&failed).unwrap();
         let execution = execution_spec(&reference).unwrap();
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+                DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
             ),
             HostEpoch::from_bytes([14; 16]),
             checkpoint_limits(),
@@ -3027,9 +3026,9 @@ mod durable_switchover_pilot_tests {
             PILOT_MAX_TERMINAL_BYTES,
         );
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+                DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
             ),
             HostEpoch::from_bytes([9; 16]),
             checkpoint_limits(),
@@ -3117,9 +3116,9 @@ mod durable_switchover_pilot_tests {
         reference.initial_operation_json = serde_json::to_string(&initial).unwrap();
         let execution = execution_spec(&reference).unwrap();
         let mut host = DurableHost::new(
-            MeasuredPilotCheckpointStore::new(
+            MeasuredDurableCheckpointStore::new(
                 execution.execution_id(),
-                PilotCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+                DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
             ),
             HostEpoch::from_bytes([31; 16]),
             checkpoint_limits(),
@@ -3636,9 +3635,9 @@ mod durable_switchover_pilot_tests {
             let backend = InMemoryCheckpointStore::new();
             backend.fail_next_compare_and_swap(fault);
             let mut host = DurableHost::new(
-                MeasuredPilotCheckpointStore::new(
+                MeasuredDurableCheckpointStore::new(
                     execution.execution_id(),
-                    PilotCheckpointStore::InMemory(backend),
+                    DurableCheckpointStore::InMemory(backend),
                 ),
                 HostEpoch::from_bytes([15; 16]),
                 checkpoint_limits(),
@@ -3699,9 +3698,9 @@ mod durable_switchover_pilot_tests {
             let execution = execution_spec(&reference).unwrap();
             let backend = InMemoryCheckpointStore::new();
             let mut host = DurableHost::new(
-                MeasuredPilotCheckpointStore::new(
+                MeasuredDurableCheckpointStore::new(
                     execution.execution_id(),
-                    PilotCheckpointStore::InMemory(backend.clone()),
+                    DurableCheckpointStore::InMemory(backend.clone()),
                 ),
                 HostEpoch::from_bytes([18; 16]),
                 checkpoint_limits(),
@@ -3732,9 +3731,9 @@ mod durable_switchover_pilot_tests {
             ));
 
             let mut restarted = DurableHost::new(
-                MeasuredPilotCheckpointStore::new(
+                MeasuredDurableCheckpointStore::new(
                     execution.execution_id(),
-                    PilotCheckpointStore::InMemory(backend),
+                    DurableCheckpointStore::InMemory(backend),
                 ),
                 HostEpoch::from_bytes([19; 16]),
                 checkpoint_limits(),
@@ -3785,9 +3784,9 @@ mod durable_switchover_pilot_tests {
             let execution = execution_spec(&reference).unwrap();
             let backend = InMemoryCheckpointStore::new();
             let mut host = DurableHost::new(
-                MeasuredPilotCheckpointStore::new(
+                MeasuredDurableCheckpointStore::new(
                     execution.execution_id(),
-                    PilotCheckpointStore::InMemory(backend.clone()),
+                    DurableCheckpointStore::InMemory(backend.clone()),
                 ),
                 HostEpoch::from_bytes([20; 16]),
                 checkpoint_limits(),
@@ -3813,9 +3812,9 @@ mod durable_switchover_pilot_tests {
             ));
 
             let mut restarted = DurableHost::new(
-                MeasuredPilotCheckpointStore::new(
+                MeasuredDurableCheckpointStore::new(
                     execution.execution_id(),
-                    PilotCheckpointStore::InMemory(backend),
+                    DurableCheckpointStore::InMemory(backend),
                 ),
                 HostEpoch::from_bytes([21; 16]),
                 checkpoint_limits(),

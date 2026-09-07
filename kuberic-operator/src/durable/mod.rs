@@ -8,20 +8,25 @@ use crate::crd::{
 };
 
 mod add_replica;
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
+pub mod checkpoint_store;
 mod create_partition;
 pub mod effects;
 mod failover;
 pub mod failover_election;
 #[cfg(feature = "durable-switchover-pilot")]
 pub mod pilot;
+mod remove_replica;
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub mod remove_replica_pilot;
 #[cfg(any(
     feature = "durable-switchover-pilot",
     feature = "durable-remove-replica-pilot"
 ))]
-pub mod pilot_store;
-mod remove_replica;
-#[cfg(feature = "durable-remove-replica-pilot")]
-pub mod remove_replica_pilot;
+pub mod runner;
 mod switchover;
 #[cfg(any(
     feature = "durable-switchover-pilot",

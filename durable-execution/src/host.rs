@@ -143,6 +143,7 @@ define_host_outcomes! {
     },
     WorkflowCompleted {
         outcome: TerminalOutcome,
+        completed_activity_count: u64,
         revision: StorageRevision,
         boundary: PersistenceBoundary,
     },
@@ -210,9 +211,10 @@ impl<S: CheckpointStore> DurableHost<S> {
                 Ok(payload) => payload,
                 Err(error) => return HostOutcome::CheckpointRejected(error),
             };
-            if let Some((outcome, _)) = payload.terminal_outcome() {
+            if let Some((outcome, completed_activity_count)) = payload.terminal_outcome() {
                 return HostOutcome::WorkflowCompleted {
                     outcome: outcome.clone(),
+                    completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
                 };
@@ -286,10 +288,14 @@ impl<S: CheckpointStore> DurableHost<S> {
                 )
                 .await
             }
-            Evaluation::Terminal { outcome, .. } => {
+            Evaluation::Terminal {
+                outcome,
+                completed_activity_count,
+            } => {
                 let stored = loaded.expect("terminal evaluation requires a loaded checkpoint");
                 HostOutcome::WorkflowCompleted {
                     outcome,
+                    completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
                 }
@@ -348,9 +354,10 @@ impl<S: CheckpointStore> DurableHost<S> {
                 Ok(payload) => payload,
                 Err(error) => return HostOutcome::CheckpointRejected(error),
             };
-            if let Some((outcome, _)) = payload.terminal_outcome() {
+            if let Some((outcome, completed_activity_count)) = payload.terminal_outcome() {
                 return HostOutcome::WorkflowCompleted {
                     outcome: outcome.clone(),
+                    completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
                 };
@@ -428,10 +435,14 @@ impl<S: CheckpointStore> DurableHost<S> {
                 )
                 .await
             }
-            Evaluation::Terminal { outcome, .. } => {
+            Evaluation::Terminal {
+                outcome,
+                completed_activity_count,
+            } => {
                 let stored = loaded.expect("terminal evaluation requires a loaded checkpoint");
                 HostOutcome::WorkflowCompleted {
                     outcome,
+                    completed_activity_count,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
                 }
@@ -668,8 +679,12 @@ impl<S: CheckpointStore> DurableHost<S> {
             Evaluation::Pending { .. } => {
                 HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
             }
-            Evaluation::Terminal { outcome, .. } => HostOutcome::WorkflowCompleted {
+            Evaluation::Terminal {
                 outcome,
+                completed_activity_count,
+            } => HostOutcome::WorkflowCompleted {
+                outcome,
+                completed_activity_count,
                 revision: stored.revision().clone(),
                 boundary: PersistenceBoundary::Completion,
             },
@@ -719,10 +734,10 @@ impl<S: CheckpointStore> DurableHost<S> {
             .cloned()
             .expect("scheduled evaluation requires an activity record");
         let reserved_encoded_bytes = payload.maximum_activity_completed_encoded_len()?;
-        if reserved_encoded_bytes > self.limits.max_encoded_bytes() {
+        if reserved_encoded_bytes > self.limits.max_active_encoded_bytes() {
             return Err(CheckpointError::EncodedCheckpointLimitExceeded {
                 actual: reserved_encoded_bytes,
-                maximum: self.limits.max_encoded_bytes(),
+                maximum: self.limits.max_active_encoded_bytes(),
             });
         }
         let attempt_id = self.next_attempt();
@@ -811,6 +826,7 @@ impl<S: CheckpointStore> DurableHost<S> {
         {
             Ok(CasOutcome::Accepted(revision)) => HostOutcome::WorkflowCompleted {
                 outcome,
+                completed_activity_count,
                 revision,
                 boundary,
             },
@@ -909,7 +925,7 @@ mod tests {
         let mut host = DurableHost::new(
             store,
             HostEpoch::from_bytes([1; 16]),
-            CheckpointLimits::new(16, 100_000).unwrap(),
+            CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
         );
         assert_send(host.turn(&OneActivity, execution.clone()));
         assert_send(host.turn_and_expose(&OneActivity, execution.clone()));
@@ -936,7 +952,7 @@ mod tests {
             let mut host = DurableHost::new(
                 store.clone(),
                 HostEpoch::from_bytes([1; 16]),
-                CheckpointLimits::new(16, 100_000).unwrap(),
+                CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
             );
             assert!(matches!(
                 host.turn(&OneActivity, execution()).await,
@@ -996,7 +1012,7 @@ mod tests {
                 let mut host = DurableHost::new(
                     store.clone(),
                     HostEpoch::from_bytes([3; 16]),
-                    CheckpointLimits::new(16, 100_000).unwrap(),
+                    CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
                 );
                 let outcome = host
                     .turn_and_expose_with(
@@ -1041,7 +1057,7 @@ mod tests {
             let mut host = DurableHost::new(
                 store.clone(),
                 HostEpoch::from_bytes([6; 16]),
-                CheckpointLimits::new(16, 100_000).unwrap(),
+                CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
             );
 
             assert!(matches!(
@@ -1085,7 +1101,7 @@ mod tests {
             let mut host = DurableHost::new(
                 store.clone(),
                 HostEpoch::from_bytes([11; 16]),
-                CheckpointLimits::new(16, 100_000).unwrap(),
+                CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
             );
 
             assert!(matches!(
@@ -1125,7 +1141,7 @@ mod tests {
             let mut result_host = DurableHost::new(
                 result_store.clone(),
                 HostEpoch::from_bytes([8; 16]),
-                CheckpointLimits::new(16, 100_000).unwrap(),
+                CheckpointLimits::new(16, 100_000, 100_000).unwrap(),
             );
             let unrepresentable_result = ActivitySpec::new(
                 ActivityName::new("prepared", 1).unwrap(),
@@ -1151,7 +1167,7 @@ mod tests {
             let mut input_host = DurableHost::new(
                 input_store.clone(),
                 HostEpoch::from_bytes([9; 16]),
-                CheckpointLimits::new(16, 512).unwrap(),
+                CheckpointLimits::new(16, 512, 100_000).unwrap(),
             );
             let oversized_prepared = ActivitySpec::new(
                 ActivityName::new("prepared", 1).unwrap(),
