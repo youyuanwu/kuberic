@@ -1370,6 +1370,37 @@ fn make_pilot_set(name: &str, replicas: i32, status: Option<KubericSetStatus>) -
     set
 }
 
+async fn accept_pilot_switchover(
+    api: &KvClusterApi,
+    name: &str,
+    healthy: &KubericSetStatus,
+    original_primary: &str,
+    target: &str,
+    store: kuberic_durable_execution::InMemoryCheckpointStore,
+) -> (ReconcilerState, KubericSetStatus) {
+    let state = ReconcilerState::with_durable_switchover_store(store);
+    reconcile_set(
+        &make_pilot_set(
+            name,
+            3,
+            Some(KubericSetStatus {
+                current_primary: Some(original_primary.to_string()),
+                target_primary: Some(target.to_string()),
+                ..healthy.clone()
+            }),
+        ),
+        api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let accepted = api.last_status().unwrap();
+    assert_eq!(accepted.phase, Phase::Switchover);
+    assert!(accepted.operation.is_none());
+    assert!(accepted.durable_switchover_pilot.is_some());
+    (state, accepted)
+}
+
 #[cfg(feature = "durable-remove-replica-pilot")]
 fn make_remove_pilot_set(
     name: &str,
@@ -4207,6 +4238,411 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     assert!(
         explicit_status.durable_switchover_pilot.is_none(),
         "a retained terminal pilot reference must not hijack a later explicit switchover"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix() {
+    use kuberic_durable_execution::{
+        ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome,
+        CheckpointEnvelope, CheckpointPayload, CheckpointStore, ExactBytes, ExecutionContract,
+        ExecutionSpec, InMemoryFault, StoreError, StoreErrorKind,
+    };
+
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let healthy = create_healthy_set(&api, &bootstrap, "pilot-fr017", 3).await;
+    let original_primary = healthy.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    let mut observed = Vec::new();
+
+    let active_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (active_state, active) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        active_store,
+    )
+    .await;
+    api.fail_status_after_successes(&original_primary, 0, InjectedStatusError::Unavailable);
+    api.reset_operations();
+    let action = reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(active)),
+        &api,
+        &active_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(action, kuberic_operator::reconciler::ReconcileAction::Requeue(delay) if delay == Duration::from_secs(1))
+    );
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "DurableSwitchoverPilot"
+                    && condition.reason == "AwaitingEffectPreparation"
+            })
+    );
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+    observed.push("active");
+
+    let incompatible_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (incompatible_state, incompatible) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        incompatible_store.clone(),
+    )
+    .await;
+    let incompatible_execution = kuberic_operator::durable::pilot::execution_spec(
+        incompatible.durable_switchover_pilot.as_ref().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        incompatible_store
+            .compare_and_swap(
+                incompatible_execution.execution_id(),
+                None,
+                CheckpointEnvelope::new(2, ExactBytes::new(b"legacy")),
+            )
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(incompatible)),
+        &api,
+        &incompatible_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == "Blocked"
+                    && condition
+                        .message
+                        .contains("switchover checkpoint is incompatible")
+            })
+    );
+    observed.push("incompatible");
+
+    let rejected_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (rejected_state, rejected) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        rejected_store.clone(),
+    )
+    .await;
+    let rejected_execution = kuberic_operator::durable::pilot::execution_spec(
+        rejected.durable_switchover_pilot.as_ref().unwrap(),
+    )
+    .unwrap();
+    let mismatched_execution = ExecutionSpec::new(
+        rejected_execution.execution_id(),
+        ExactBytes::new(b"mismatched-switchover-input"),
+        kuberic_operator::durable::pilot::PILOT_MAX_TERMINAL_BYTES,
+    );
+    let rejected_checkpoint = CheckpointEnvelope::encode_with_limits(
+        &CheckpointPayload::active(
+            ExecutionContract::with_encoded_limits(
+                mismatched_execution,
+                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
+                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
+            ),
+            vec![],
+        ),
+        kuberic_operator::durable::pilot::checkpoint_limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        rejected_store
+            .compare_and_swap(rejected_execution.execution_id(), None, rejected_checkpoint,)
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(rejected)),
+        &api,
+        &rejected_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == "Blocked"
+                    && condition.message.contains("switchover checkpoint rejected")
+            })
+    );
+    observed.push("rejected");
+
+    let isolated_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (isolated_state, isolated) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        isolated_store,
+    )
+    .await;
+    let original_target_uid = {
+        let mut pods = api.pods.lock().unwrap();
+        let target_pod = pods
+            .iter_mut()
+            .find(|pod| pod.metadata.name.as_deref() == Some(target.as_str()))
+            .unwrap();
+        target_pod
+            .metadata
+            .uid
+            .replace("replacement-target-uid".to_string())
+            .unwrap()
+    };
+    reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(isolated)),
+        &api,
+        &isolated_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == "Blocked"
+                    && condition.message.contains("switchover execution isolated")
+                    && condition.message.contains("incarnation changed")
+            })
+    );
+    api.pods
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|pod| pod.metadata.name.as_deref() == Some(target.as_str()))
+        .unwrap()
+        .metadata
+        .uid = Some(original_target_uid);
+    observed.push("isolated");
+
+    let conflict_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (conflict_state, conflict) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        conflict_store.clone(),
+    )
+    .await;
+    conflict_store.fail_next_compare_and_swap(InMemoryFault::ConflictWithoutApply);
+    reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(conflict)),
+        &api,
+        &conflict_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == "ReloadRequired" && condition.message.contains("Conflict")
+            })
+    );
+    observed.push("conflicted");
+
+    let unknown_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (unknown_state, unknown) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        unknown_store.clone(),
+    )
+    .await;
+    unknown_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
+    reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(unknown)),
+        &api,
+        &unknown_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == "ReloadRequired" && condition.message.contains("OutcomeUnknown")
+            })
+    );
+    observed.push("unknown-write");
+
+    let failed_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (failed_state, failed) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        failed_store.clone(),
+    )
+    .await;
+    failed_store.fail_next_load(StoreError::new(
+        StoreErrorKind::Unavailable,
+        "injected switchover load failure",
+    ));
+    reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(failed)),
+        &api,
+        &failed_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == "StorageUnavailable"
+                    && condition
+                        .message
+                        .contains("injected switchover load failure")
+            })
+    );
+    observed.push("persistence-failure");
+
+    let nondeterministic_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (nondeterministic_state, nondeterministic) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        nondeterministic_store.clone(),
+    )
+    .await;
+    let nondeterministic_execution = kuberic_operator::durable::pilot::execution_spec(
+        nondeterministic.durable_switchover_pilot.as_ref().unwrap(),
+    )
+    .unwrap();
+    let drifted_activity = ActivitySpec::new(
+        ActivityName::new("kuberic.switchover.injected-drift", 1).unwrap(),
+        ExactBytes::new(b"{}"),
+        64,
+    );
+    let nondeterministic_checkpoint = CheckpointEnvelope::encode_with_limits(
+        &CheckpointPayload::active(
+            ExecutionContract::with_encoded_limits(
+                nondeterministic_execution.clone(),
+                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
+                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
+            ),
+            vec![ActivityRecord::completed(
+                ActivitySequence::new(0),
+                drifted_activity,
+                ExactBytes::new(b"{}"),
+            )],
+        ),
+        kuberic_operator::durable::pilot::checkpoint_limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        nondeterministic_store
+            .compare_and_swap(
+                nondeterministic_execution.execution_id(),
+                None,
+                nondeterministic_checkpoint,
+            )
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    reconcile_set(
+        &make_pilot_set("pilot-fr017", 3, Some(nondeterministic)),
+        &api,
+        &nondeterministic_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.reason == "Blocked"
+                    && condition.message.contains("switchover workflow changed")
+            })
+    );
+    observed.push("nondeterministic");
+
+    let terminal_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (terminal_state, terminal) = accept_pilot_switchover(
+        &api,
+        "pilot-fr017",
+        &healthy,
+        &original_primary,
+        &target,
+        terminal_store,
+    )
+    .await;
+    let terminal = drive_pilot_switchover(&api, &terminal_state, "pilot-fr017", 3, terminal).await;
+    assert_eq!(terminal.phase, Phase::Healthy);
+    assert_eq!(terminal.current_primary.as_deref(), Some(target.as_str()));
+    observed.push("terminal");
+
+    assert_eq!(
+        observed,
+        vec![
+            "active",
+            "incompatible",
+            "rejected",
+            "isolated",
+            "conflicted",
+            "unknown-write",
+            "persistence-failure",
+            "nondeterministic",
+            "terminal",
+        ],
+        "all nine FR-017 outcomes are reachable for switchover; there is no contract-impossible matrix member"
     );
 }
 

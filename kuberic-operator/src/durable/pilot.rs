@@ -4335,6 +4335,179 @@ mod durable_switchover_pilot_tests {
         ));
     }
 
+    struct MeasuredSwitchoverWorkflow {
+        inputs: Vec<DurableSwitchoverActivityInput>,
+        terminal: TerminalOutcome,
+    }
+
+    #[async_trait]
+    impl Workflow for MeasuredSwitchoverWorkflow {
+        async fn run(
+            &self,
+            context: &mut WorkflowContext<'_>,
+            _input: ExactBytes,
+        ) -> TerminalOutcome {
+            for input in &self.inputs {
+                if let Err(error) = context
+                    .call::<DurableSwitchoverActivity>(input.clone())
+                    .await
+                {
+                    return TerminalOutcome::failed(error.to_string().into_bytes());
+                }
+            }
+            self.terminal.clone()
+        }
+    }
+
+    struct MeasuredSwitchoverResolver;
+
+    impl PreparedActivityResolver for MeasuredSwitchoverResolver {
+        fn resolve(
+            &self,
+            logical: &ActivitySpec,
+            _recorded: Option<&ActivitySpec>,
+        ) -> Result<ActivitySpec, PreparedActivityError> {
+            Ok(logical.clone())
+        }
+    }
+
+    struct MeasuredSwitchoverAdapter {
+        resolver: MeasuredSwitchoverResolver,
+        result: DurableSwitchoverStepResult,
+    }
+
+    #[async_trait]
+    impl DurableOperationAdapter for MeasuredSwitchoverAdapter {
+        type Resolver = MeasuredSwitchoverResolver;
+        type Terminal = TerminalOutcome;
+        type Publication = TerminalOutcome;
+
+        fn resolver(&self) -> &Self::Resolver {
+            &self.resolver
+        }
+
+        async fn observe_or_dispatch(
+            &mut self,
+            activity: &LogicalActivityId,
+            attempt_id: kuberic_durable_execution::AttemptId,
+            permit: &mut DurablePermitGuard,
+        ) -> DurableAdapterBoundary {
+            if let Err(error) = permit.consume(activity.spec(), activity, attempt_id, "switchover")
+            {
+                return DurableAdapterBoundary::Isolated(error);
+            }
+            DurableAdapterBoundary::Observed(ActivityObservation::new(
+                activity.clone(),
+                encode_step_result(&self.result).unwrap(),
+            ))
+        }
+
+        async fn resolve_quarantine(
+            &mut self,
+            activity: LogicalActivityId,
+            _attempt_id: kuberic_durable_execution::AttemptId,
+        ) -> DurableAdapterBoundary {
+            DurableAdapterBoundary::Observed(ActivityObservation::new(
+                activity,
+                encode_step_result(&self.result).unwrap(),
+            ))
+        }
+
+        fn deadline_unix_seconds(&self) -> i64 {
+            100
+        }
+
+        fn validate_terminal(
+            &mut self,
+            outcome: TerminalOutcome,
+            _completed_activity_count: u64,
+        ) -> Result<Self::Terminal, DurableAdapterBoundary> {
+            Ok(outcome)
+        }
+
+        fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication {
+            terminal
+        }
+    }
+
+    #[tokio::test]
+    async fn measurements_switchover_runner_preserves_happy_path_accounting() {
+        use crate::durable::runner::{DurableRunner, DurableRunnerOutcome};
+
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let state = compact(&initial);
+        let label = LabelEffectCommand {
+            target_id: 2,
+            pod_name: "set-1".to_string(),
+            expected_uid: "pod-2-uid".to_string(),
+            role: "secondary".to_string(),
+            identity_signature: "measurement".to_string(),
+        };
+        let mut inputs = vec![
+            DurableSwitchoverActivityInput {
+                version: PILOT_VERSION,
+                state: state.clone(),
+                kind: PilotActivityKind::PassiveObservation,
+            };
+            3
+        ];
+        inputs.extend((0..9).map(|_| DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: state.clone(),
+            kind: PilotActivityKind::PreparedLabel {
+                command: label.clone(),
+            },
+        }));
+
+        let mut completed = initial.clone();
+        completed.phase = DurableOperationPhase::Completed;
+        completed.frozen_lsn = Some(42);
+        let terminal = terminal_success(DurableSwitchoverPilotTerminal::Complete {
+            operation: completed.clone(),
+            snapshot: completed.target_snapshot.clone(),
+            compensated: false,
+            accounting: PilotActivityAccounting::new(9, 3),
+        });
+        let workflow = MeasuredSwitchoverWorkflow { inputs, terminal };
+        let execution = ExecutionSpec::new(
+            ExecutionId::from_bytes([44; 16]),
+            ExactBytes::new(b"switchover-runner-measurement"),
+            PILOT_MAX_TERMINAL_BYTES,
+        );
+        let measured = MeasuredDurableCheckpointStore::with_decoder(
+            execution.execution_id(),
+            DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            checkpoint_measurement_decoder(),
+        );
+        let mut host = DurableOperatorHost::new(
+            measured,
+            HostEpoch::from_bytes([45; 16]),
+            checkpoint_limits(),
+        );
+        let mut adapter = MeasuredSwitchoverAdapter {
+            resolver: MeasuredSwitchoverResolver,
+            result: DurableSwitchoverStepResult::Advance { operation: state },
+        };
+
+        let outcome = DurableRunner::new(PILOT_MAX_ACTIVITY_RECORDS)
+            .unwrap()
+            .run(&mut host, &workflow, execution, &mut adapter, 0)
+            .await;
+        assert!(matches!(
+            outcome,
+            DurableRunnerOutcome::Terminal(TerminalOutcome::Succeeded(_))
+        ));
+
+        let measurements = host.store().measurements();
+        assert_eq!(measurements.completed_external_effect_count, Some(9));
+        assert_eq!(measurements.completed_passive_observation_count, Some(3));
+        assert_eq!(measurements.completed_activity_count, Some(12));
+        assert_eq!(measurements.accepted_writes, 13);
+        assert!(measurements.maximum_active_checkpoint_bytes > 0);
+        assert!(measurements.maximum_terminal_checkpoint_bytes > 0);
+    }
+
     #[test]
     fn success_and_rollback_transcripts_fit_with_redelivery_headroom() {
         let success = projected_success_transcript(PILOT_MAX_REPLICAS);
