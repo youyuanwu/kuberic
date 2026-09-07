@@ -247,6 +247,10 @@ pub fn prepare_lifecycle_replica_effect_command(
     )
 }
 
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 fn prepare_replica_effect_command_with_lifecycle_support(
     pending: &PendingActionStatus,
     observed: &ReplicaStatusInfo,

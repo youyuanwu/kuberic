@@ -248,6 +248,7 @@ pub struct RemoveReplicaTerminalCommitAuthority {
     pub input_signature: String,
     pub primary_agent_generation: String,
     pub configuration_signature: String,
+    pub binding_signature: String,
 }
 
 impl RemoveReplicaActivityAccounting {
@@ -572,16 +573,19 @@ fn terminal_from_operation(
                 .clone()
                 .ok_or_else(|| "completed remove terminal has no cleanup evidence".to_string())?;
             validate_completed_cleanup(&cleanup)?;
+            let mut authority = RemoveReplicaTerminalCommitAuthority {
+                attempt: intent.attempt,
+                attempt_id: intent.attempt_id.clone(),
+                action_id: intent.action_id.clone(),
+                input_signature: intent.input_signature.clone(),
+                primary_agent_generation: commit_evidence.primary_agent_generation.clone(),
+                configuration_signature: commit_evidence.configuration_signature.clone(),
+                binding_signature: String::new(),
+            };
+            authority.binding_signature = terminal_commit_authority_binding(operation, &authority)?;
             Ok(DurableRemoveReplicaPilotTerminal::Completed {
                 snapshot: operation.target_snapshot.clone(),
-                authority: RemoveReplicaTerminalCommitAuthority {
-                    attempt: intent.attempt,
-                    attempt_id: intent.attempt_id.clone(),
-                    action_id: intent.action_id.clone(),
-                    input_signature: intent.input_signature.clone(),
-                    primary_agent_generation: commit_evidence.primary_agent_generation.clone(),
-                    configuration_signature: commit_evidence.configuration_signature.clone(),
-                },
+                authority,
                 commit_evidence,
                 cleanup,
                 accounting,
@@ -778,6 +782,8 @@ pub fn validate_loaded_terminal(
                         .configuration_signature
                         .contains(&format!("{}@{}:", member.id, member.instance_id))
                 });
+            let exact_binding = terminal_commit_authority_binding(&initial, authority)?
+                == authority.binding_signature;
             if snapshot != &initial.target_snapshot {
                 return Err("completed remove terminal changed frozen snapshot".to_string());
             }
@@ -801,6 +807,7 @@ pub fn validate_loaded_terminal(
                 .configuration_signature
                 .starts_with(&expected_quorum_prefix)
                 || !retained_identities_match
+                || !exact_binding
             {
                 return Err("completed remove terminal changed reduced configuration".to_string());
             }
@@ -847,6 +854,33 @@ fn terminal_accounting(
         | DurableRemoveReplicaPilotTerminal::UnsafeAmbiguity { accounting, .. }
         | DurableRemoveReplicaPilotTerminal::Rejected { accounting, .. } => *accounting,
     }
+}
+
+fn terminal_commit_authority_binding(
+    operation: &DurableOperationStatus,
+    authority: &RemoveReplicaTerminalCommitAuthority,
+) -> Result<String, String> {
+    let encoded = serde_json::to_vec(&(
+        &operation.operation_id,
+        operation.remove_mode,
+        operation.old_primary_id,
+        operation.target_replica_id,
+        &operation.target_instance_id,
+        &operation.target_pod_name,
+        &operation.target_pod_uid,
+        &operation.target_snapshot,
+        authority.attempt,
+        &authority.attempt_id,
+        &authority.action_id,
+        &authority.input_signature,
+        &authority.primary_agent_generation,
+        &authority.configuration_signature,
+    ))
+    .map_err(|error| format!("encode remove terminal commit authority: {error}"))?;
+    let hash = encoded.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    Ok(format!("{hash:016x}"))
 }
 
 fn encode_terminal(terminal: DurableRemoveReplicaPilotTerminal) -> TerminalOutcome {
@@ -1576,6 +1610,7 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
         input_signature: maximum.clone(),
         primary_agent_generation: "f".repeat(32),
         configuration_signature: configuration_signature.clone(),
+        binding_signature: "f".repeat(16),
     };
     let accounting = RemoveReplicaActivityAccounting {
         external_effect_count: u64::MAX,
@@ -2756,6 +2791,31 @@ mod remove_replica_pilot_tests {
             validate_loaded_terminal(&reference, &encode_terminal(inexact), 0)
                 .unwrap_err()
                 .contains("action identity")
+        );
+
+        let mut inexact_signature = terminal.clone();
+        let DurableRemoveReplicaPilotTerminal::Completed { authority, .. } = &mut inexact_signature
+        else {
+            unreachable!();
+        };
+        authority.input_signature.push_str("-drift");
+        assert!(
+            validate_loaded_terminal(&reference, &encode_terminal(inexact_signature), 0)
+                .unwrap_err()
+                .contains("reduced configuration")
+        );
+
+        let mut inexact_configuration = terminal.clone();
+        let DurableRemoveReplicaPilotTerminal::Completed { authority, .. } =
+            &mut inexact_configuration
+        else {
+            unreachable!();
+        };
+        authority.configuration_signature.push_str("-drift");
+        assert!(
+            validate_loaded_terminal(&reference, &encode_terminal(inexact_configuration), 0)
+                .unwrap_err()
+                .contains("reduced configuration")
         );
 
         let mut nonterminal = terminal;
