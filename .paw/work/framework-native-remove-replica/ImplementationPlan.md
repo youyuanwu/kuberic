@@ -221,8 +221,9 @@ pull requests. This planning activity creates no commit.
   - Keep reconcile as the scheduler and return bounded wait/requeue or validated
     terminal handoff results; do not publish topology in the generic layer.
   - Add fake-adapter tests for active, terminal, rejected, isolated,
-    conflicted, unknown-write, persistence-failure, nondeterministic, one-use
-    permit, bounded-fuel, and deadline-clamped outcomes.
+    incompatible, conflicted, unknown-write, persistence-failure,
+    nondeterministic, one-use permit, bounded-fuel, and deadline-clamped
+    outcomes.
 - **`kuberic-operator/src/durable/mod.rs`**:
   - Export `checkpoint_store`, `runner`, and existing host services under
     production-neutral names while legacy workflows are still present.
@@ -421,9 +422,11 @@ pull requests. This planning activity creates no commit.
     conflict, outcome-unknown, stale UID/incarnation/generation, Force
     authority, repeated identity, terminal reload, publication ordering, and
     post-commit ambiguity fixtures.
-  - Add a named native-remove common-outcome matrix covering every FR-017
-    outcome: active, terminal, incompatible, rejected, isolated, conflict
-    reload, unknown-write reload, persistence-failure, and nondeterminism.
+  - Add a named native-remove common-outcome matrix covering every applicable
+    FR-017 outcome: active, terminal, incompatible, rejected, isolated,
+    conflict reload, unknown-write reload, persistence-failure, and
+    nondeterminism. If the native contract makes an outcome unreachable, assert
+    and document that fact.
   - Add named tests covering all six remove FR-019 responsibilities:
     observation collection, authority/preparation, exact effect dispatch,
     deadline policy, terminal validation, and publication.
@@ -466,7 +469,8 @@ pull requests. This planning activity creates no commit.
 - [ ] Every row in `SafetyTraceability.md` names at least one test that passed
   in this phase.
 - [ ] The switchover and native-remove common-outcome matrices cover every
-  FR-017 outcome, and each operation has named passing tests for all six FR-019
+  applicable FR-017 outcome and assert any contract-impossible outcome as
+  unreachable; each operation has named passing tests for all six FR-019
   responsibilities.
 
 #### Manual Verification

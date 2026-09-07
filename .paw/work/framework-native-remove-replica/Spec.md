@@ -1,13 +1,13 @@
 # Feature Specification: Framework-Native Remove Replica
 
-**Branch**: `feature/framework-native-remove-replica` | **Created**: 2026-09-07 | **Status**: Approved for Planning
+**Branch**: `feature/framework-native-remove-replica` | **Created**: 2026-09-07 | **Updated**: 2026-09-07 | **Status**: Approved for Planning
 **Input Brief**: Graduate remove-replica from an explicit-versus-durable pilot into the default and only framework-native production workflow.
 
 ## Overview
 
 Kuberic operators need remove-replica operations to recover deterministically across controller restarts, ambiguous external outcomes, and concurrent persistence updates without choosing between two execution modes. Remove-replica must operate through one production behavior with one persisted execution contract and one set of safety semantics.
 
-The migration must preserve the exact authority, fencing, cleanup, and publication guarantees already exercised by the existing implementations while removing pilot-only configuration, comparison reporting, telemetry, and documentation. Old experimental execution records may be rejected rather than migrated because the prior path was default-off and the project permits breaking changes, but they must never be silently interpreted as the new production contract.
+The migration must preserve the exact authority, fencing, cleanup, and publication guarantees already exercised by the existing implementations while removing pilot-only configuration, comparison reporting, telemetry, and documentation. Pre-migration pilot and explicit remove execution records may be rejected rather than migrated because the pilot was default-off and the project permits breaking changes, but they must never be silently interpreted as the new production contract.
 
 The production operation must keep durable records compact, bounded, and understandable rather than allowing repeated copies of complete state to dominate persistence. Common recovery behavior must be consistent across supported operations, and the migration must leave a documented, testable reuse pattern for the next operation without adding new operational services.
 
@@ -95,7 +95,7 @@ Independent Test: Search public and deployment surfaces for remove-replica mode 
 Acceptance Scenarios:
 
 1. Given a current or newly generated custom resource, when remove-replica is requested, then no explicit/durable selector is available or required.
-2. Given an old pilot execution record, when production loads it, then it returns an explicit incompatible-contract outcome and is never treated as a valid current record or fresh execution.
+2. Given an old pilot or explicit remove execution record, when production loads it, then it returns an explicit incompatible-contract outcome and is never treated as a valid current record or fresh execution.
 3. Given updated documentation, when readers review remove-replica, then it is described as a production framework-native migration with current measurements and stable contracts.
 
 ### Edge Cases
@@ -116,7 +116,7 @@ Acceptance Scenarios:
 ### Functional Requirements
 
 - **FR-001**: Remove-replica shall have one production execution behavior and shall expose no operator-selectable legacy/current execution mode. (Stories: P1 single workflow, P2 pilot removal)
-- **FR-002**: The production execution contract shall have an explicit version identifier; any prior experimental contract shall produce a typed incompatible-contract outcome and shall not be converted, resumed, or treated as absent. (Stories: P1 recovery, P2 pilot removal)
+- **FR-002**: The production execution contract shall have an explicit version identifier; any pre-migration pilot or explicit remove execution contract shall produce a typed incompatible-contract outcome and shall not be converted, resumed, or treated as absent. (Stories: P1 recovery, P2 pilot removal)
 - **FR-003**: Admission shall validate exact primary and target identity, target non-primary membership, operation mode, quorum/minimum constraints, generation, control version, protocol, epoch, incarnation, UID, and configuration authority. (Stories: P1 single workflow, P1 authority)
 - **FR-004**: Temporary absence of exact primary or target status shall produce a wait outcome without operation-generation or status churn. (Stories: P1 authority)
 - **FR-005**: Every external command shall be immutable, shall include deterministic operation, action, attempt, primary, target, epoch, incarnation, UID, and configuration authority, shall be validated by an exact deterministic signature, and shall be exposed only after durable preparation. (Stories: P1 recovery, P1 authority)
@@ -131,7 +131,7 @@ Acceptance Scenarios:
 - **FR-014**: The representative no-fault three-member ScaleDown path shall perform exactly three external effects, exactly two passive observations, exactly five total durable boundaries, and exactly six accepted persistence writes. (Stories: P1 compact persistence)
 - **FR-015**: Every representative active persisted-record sample shall remain at or below 49,152 encoded bytes, measured from the canonical encoded execution record. (Stories: P1 compact persistence)
 - **FR-016**: Fault and retry histories shall enforce at most 16 history records, at most 4,096 decoded bytes per boundary input, at most 2,048 decoded bytes per boundary result, at most 262,144 encoded bytes per active execution record, at most 12,288 encoded bytes per terminal execution record, and at most 4,096 decoded bytes per terminal payload. (Stories: P1 compact persistence)
-- **FR-017**: Active, terminal, incompatible, rejected, isolated, conflicted, unknown-write, persistence-failure, and nondeterministic outcomes shall follow one common bounded recovery behavior across switchover and remove-replica. (Stories: P2 shared recovery)
+- **FR-017**: Active, terminal, incompatible, rejected, isolated, conflicted, unknown-write, persistence-failure, and nondeterministic outcomes shall use one common bounded recovery vocabulary and behavior across switchover and remove-replica wherever the outcome is applicable; an outcome that is impossible for an operation's contract shall be asserted and documented as unreachable. (Stories: P2 shared recovery)
 - **FR-018**: When one durable observation provides all authority required for the next transition, progression shall continue in the same recovery cycle; when the next external command requires newer cluster, epoch, incarnation, UID, or configuration evidence, progression shall stop and collect a fresh observation before exposing that command. (Stories: P2 shared recovery)
 - **FR-019**: Each operation shall retain independently testable rules for collecting observations, validating authority, constructing and dispatching exact effects, calculating deadlines, validating terminal evidence, and publishing final status. (Stories: P2 shared recovery)
 - **FR-020**: The old explicit remove implementation shall be deleted only after a traceability matrix maps every inventory item listed in SC-002 to at least one passing production-workflow test and identifies the replacement test by name. (Stories: P1 single workflow, P1 recovery, P1 authority)
@@ -168,8 +168,8 @@ Acceptance Scenarios:
 - **SC-005**: Every representative no-fault sample reports exactly three external effects, two passive observations, five durable boundaries, and six accepted persistence writes. (FR-014)
 - **SC-006**: Across at least three representative no-fault samples, every per-run active persisted-record maximum is at most 49,152 bytes, a minimum 47.6% improvement over the measured 93,841-byte baseline. (FR-013, FR-015)
 - **SC-007**: Independent boundary tests reject the seventeenth history record, a 4,097-byte boundary input, a 2,049-byte boundary result, a 262,145-byte active execution record, a 12,289-byte terminal execution record, and a 4,097-byte terminal payload. (FR-016)
-- **SC-008**: Old pilot records produce the incompatible-contract outcome; malformed, corrupt, oversized, or wrong-execution records produce their defined rejection or isolation outcomes; none starts a fresh production execution. (FR-002, FR-012)
-- **SC-009**: Switchover and native remove-replica produce every common outcome listed in FR-017 from one production behavior, while separate tests exercise all six operation-specific responsibilities listed in FR-019. (FR-017–FR-019)
+- **SC-008**: Old pilot and explicit remove records produce the incompatible-contract outcome; malformed, corrupt, oversized, or wrong-execution records produce their defined rejection or isolation outcomes; none starts a fresh production execution. (FR-002, FR-012)
+- **SC-009**: Switchover and native remove-replica exercise every applicable common outcome listed in FR-017 through one shared recovery behavior, explicitly assert any contract-impossible outcome as unreachable, and separately test all six operation-specific responsibilities listed in FR-019. (FR-017–FR-019)
 - **SC-010**: All existing quality checks and default, optional-capability, durable-persistence, reconciliation, remove/add/failover lifecycle, persistence-measurement, real-provider, and live-cluster regression suites affected by the migration pass without weakening an asserted safety invariant. (FR-020, FR-023)
 - **SC-011**: Updated documentation reports representative boundaries, accepted writes, per-run active maxima, terminal record size, and terminal payload size with correct lifecycle-versus-run-variation labels. (FR-022)
 - **SC-012**: No replica control protocol or replica-agent semantic change is present unless separately approved following evidence that a required authority or cleanup proof is unavailable. (FR-024)
@@ -177,7 +177,7 @@ Acceptance Scenarios:
 
 ## Assumptions
 
-- The prior durable remove path was default-off and experimental, so rejecting its persisted records is acceptable if incompatibility is explicit and documented.
+- The prior durable remove path was default-off and experimental, and breaking API changes are allowed, so rejecting both pilot and in-flight explicit remove records is acceptable if incompatibility is explicit, durable, and documented.
 - The current remove domain remains bounded to three-member configurations.
 - The compact 49,152-byte gate is based on the measured 93,841-byte maximum and a conservative 43,509-byte compact-contract projection with approximately 13% headroom.
 - Five semantic boundaries remain necessary because fresh observation separates authority-sensitive external effects; accepted writes include the terminal write.
@@ -215,7 +215,7 @@ Acceptance Scenarios:
 
 ## Risks & Mitigations
 
-- **Compatibility ambiguity**: Old pilot records could resemble current state. **Mitigation**: use a new explicit contract version and test fail-closed incompatibility.
+- **Compatibility ambiguity**: Old pilot or explicit remove records could resemble current state. **Mitigation**: use a new explicit contract version and test durable fail-closed incompatibility for both legacy sources.
 - **Stale authority during same-cycle progression**: Progression could schedule a command from outdated observations. **Mitigation**: continue in the same cycle only for proven-safe transitions and require fresh authority before sensitive commands.
 - **Over-generalized reuse**: Common behavior could obscure operation safety or encode remove-specific assumptions. **Mitigation**: share only lifecycle outcomes and keep evidence, effects, deadlines, validation, and publication independently testable.
 - **Payload regression**: Compact records could gradually reacquire complete state copies. **Mitigation**: enforce the 48 KiB representative gate plus per-boundary and total admission bounds.
