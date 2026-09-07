@@ -1528,6 +1528,50 @@ async fn current_remove_pilot_operation(
 }
 
 #[cfg(feature = "durable-remove-replica-pilot")]
+async fn live_remove_pilot_progress(
+    api: &KvClusterApi,
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    name: &str,
+    replicas: i32,
+    status: &KubericSetStatus,
+) -> Option<RemoveReplicaProgress> {
+    let operation = current_remove_pilot_operation(store, status).await?;
+    let intent = operation.remove_intent.as_ref()?;
+    let primary = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| {
+            pod.metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                .and_then(|index| index.parse::<i64>().ok())
+                .map(|index| index + 1)
+                == Some(operation.old_primary_id)
+        })
+        .cloned()?;
+    let handle = api
+        .create_replica_handle(
+            operation.old_primary_id,
+            &primary,
+            &make_set(name, replicas, None).spec,
+        )
+        .await
+        .ok()?;
+    let observed = handle.get_status().await.ok()?;
+    observed
+        .agent
+        .current_action
+        .as_ref()
+        .into_iter()
+        .chain(observed.agent.retained_terminal_actions.iter().rev())
+        .find(|observation| observation.action.action_id == intent.action_id)
+        .and_then(|observation| observation.action.remove_replica_progress.clone())
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
 async fn remove_pilot_checkpoint_is_terminal(
     store: &kuberic_durable_execution::InMemoryCheckpointStore,
     status: &KubericSetStatus,
@@ -7006,12 +7050,7 @@ async fn assert_remove_terminal_reload_after_status_failure(name: &str) {
         let ready_for_terminal = current_remove_pilot_operation(&store, &status)
             .await
             .is_some_and(|operation| {
-                matches!(
-                    operation.phase,
-                    DurableOperationPhase::RemovePublishTopology
-                        | DurableOperationPhase::RemoveFinalize
-                        | DurableOperationPhase::Completed
-                )
+                operation.phase == DurableOperationPhase::RemoveDeleteTargetPod
             });
         if ready_for_terminal && !remove_pilot_checkpoint_is_terminal(&store, &status).await {
             break;
@@ -7092,6 +7131,7 @@ async fn test_durable_execution_remove_replica_pilot_post_commit_ambiguity() {
     let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
     let mut status = accept_remove_pilot(&api, &state, "remove-pilot-post-commit", 2, status).await;
     api.reset_operations();
+    api.fail_after_next_durable_action(ControlOperation::RemoveReplicaIntent);
 
     for _ in 0..240 {
         reconcile_set(
@@ -7102,31 +7142,30 @@ async fn test_durable_execution_remove_replica_pilot_post_commit_ambiguity() {
         .await
         .unwrap();
         status = api.last_status().unwrap();
-        if current_remove_pilot_operation(&store, &status)
-            .await
-            .is_some_and(|operation| {
-                operation.remove_commit_evidence.is_none()
-                    && operation
-                        .remove_intent
-                        .as_ref()
-                        .is_some_and(|intent| intent.current_install_dispatched)
-            })
+        if api
+            .operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
+        api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent),
+        "test must dispatch the coarse remove intent before primary restart"
+    );
+    assert!(
         current_remove_pilot_operation(&store, &status)
             .await
-            .is_some_and(|operation| {
-                operation.remove_commit_evidence.is_none()
-                    && operation
-                        .remove_intent
-                        .as_ref()
-                        .is_some_and(|intent| intent.current_install_dispatched)
-            }),
-        "test must observe current-install exposure before durable commit evidence"
+            .is_some_and(|operation| operation.remove_commit_evidence.is_none()),
+        "lost reply must leave commit evidence absent from the checkpoint"
+    );
+    assert!(
+        live_remove_pilot_progress(&api, &store, "remove-pilot-post-commit", 2, &status)
+            .await
+            .is_some_and(|progress| progress.current_install_dispatched),
+        "the primary must report current-install dispatch before the ambiguous restart"
     );
 
     api.crash_pod(&primary);
