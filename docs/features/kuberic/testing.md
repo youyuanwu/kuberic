@@ -417,7 +417,10 @@ three passive observations, giving 12 completed durable boundaries and 13
 accepted checkpoint writes including terminal persistence. Seven former
 preparation-only records are now part of their corresponding effect exposure.
 The measured maximum active checkpoint is 31,605 bytes and the terminal
-checkpoint is 3,965 bytes. `external_effects` counts ReplicaAgent commands and
+checkpoint is 4,085 bytes. The terminal payload carries the external-effect
+and passive-observation counts, so a fresh measurement store can recover the
+9/3 classification without prior active-checkpoint cache state.
+`external_effects` counts ReplicaAgent commands and
 UID-fenced label patches; `passive_observations` counts evidence-only
 activities; `durable_boundaries` is their completed total.
 `checkpoint_write_attempts` counts checkpoint CAS calls, while

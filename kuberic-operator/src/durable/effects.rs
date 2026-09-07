@@ -588,6 +588,7 @@ pub(crate) fn operation_after_dispatch_error(
 #[cfg(feature = "durable-switchover-pilot")]
 pub enum PilotEffectBridgeOutcome {
     Observe(Box<DurableSwitchoverStepResult>),
+    ObserveAfterFenceRefresh(Box<DurableSwitchoverStepResult>),
     Exposed,
     AwaitEvidence,
 }
@@ -624,6 +625,9 @@ pub async fn bridge_pilot_permitted_step(
                     command.action_id.clone(),
                     &error,
                 ) {
+                    Some(result) if dispatch_rejection_requires_refresh(&error) => Ok(
+                        PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(Box::new(result)),
+                    ),
                     Some(result) => Ok(PilotEffectBridgeOutcome::Observe(Box::new(result))),
                     None => Ok(PilotEffectBridgeOutcome::Exposed),
                 },

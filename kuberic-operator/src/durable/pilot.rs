@@ -304,6 +304,28 @@ pub enum PilotActivityKind {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PilotActivityAccounting {
+    pub external_effect_count: u64,
+    pub passive_observation_count: u64,
+}
+
+impl PilotActivityAccounting {
+    pub const fn new(external_effect_count: u64, passive_observation_count: u64) -> Self {
+        Self {
+            external_effect_count,
+            passive_observation_count,
+        }
+    }
+
+    pub fn matches_completed_activity_count(self, completed_activity_count: u64) -> bool {
+        self.external_effect_count
+            .checked_add(self.passive_observation_count)
+            == Some(completed_activity_count)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DurableSwitchoverStepResult {
@@ -319,6 +341,8 @@ pub enum DurableSwitchoverStepResult {
         operation: DurableSwitchoverState,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounting: Option<PilotActivityAccounting>,
     },
     Stopped {
         operation: DurableSwitchoverState,
@@ -344,6 +368,7 @@ pub enum DurableSwitchoverPilotTerminal {
         operation: DurableOperationStatus,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+        accounting: PilotActivityAccounting,
     },
     Stopped {
         operation: Option<DurableOperationStatus>,
@@ -358,11 +383,23 @@ enum DurableSwitchoverTerminalRecord {
         state: DurableSwitchoverState,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+        #[serde(default)]
+        accounting: PilotActivityAccounting,
     },
     Stopped {
         state: Option<DurableSwitchoverState>,
         message: String,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum DurableSwitchoverTerminalAccountingRecord {
+    Complete {
+        #[serde(default)]
+        accounting: Option<PilotActivityAccounting>,
+    },
+    Stopped {},
 }
 
 // COMPLEXITY-BOUNDARY: pilot-workflow:start
@@ -498,6 +535,7 @@ impl Workflow for DurableSwitchoverWorkflow {
                     operation: completed_state,
                     snapshot,
                     compensated,
+                    accounting,
                 } => {
                     let completed = match completed_state.apply_to(&initial) {
                         Ok(completed) => completed,
@@ -511,10 +549,18 @@ impl Workflow for DurableSwitchoverWorkflow {
                     if let Err(error) = validate_terminal(&completed, &snapshot, compensated) {
                         return terminal_failure(Some(operation), error);
                     }
+                    let Some(accounting) = accounting else {
+                        return terminal_failure(
+                            Some(operation),
+                            "pilot completion is missing authoritative activity accounting"
+                                .to_string(),
+                        );
+                    };
                     return terminal_success(DurableSwitchoverPilotTerminal::Complete {
                         operation: completed,
                         snapshot,
                         compensated,
+                        accounting,
                     });
                 }
                 DurableSwitchoverStepResult::Stopped {
@@ -731,10 +777,12 @@ pub fn decode_terminal(
             state,
             snapshot,
             compensated,
+            accounting,
         } => DurableSwitchoverPilotTerminal::Complete {
             operation: state.apply_to(initial)?,
             snapshot,
             compensated,
+            accounting,
         },
         DurableSwitchoverTerminalRecord::Stopped { state, message } => {
             DurableSwitchoverPilotTerminal::Stopped {
@@ -742,6 +790,22 @@ pub fn decode_terminal(
                 message,
             }
         }
+    })
+}
+
+pub fn decode_terminal_activity_accounting(
+    outcome: &TerminalOutcome,
+) -> Result<Option<PilotActivityAccounting>, String> {
+    let record: DurableSwitchoverTerminalAccountingRecord =
+        serde_json::from_slice(outcome.payload().as_slice()).map_err(|error| {
+            format!("decode durable switchover terminal activity accounting: {error}")
+        })?;
+    Ok(match (outcome, record) {
+        (
+            TerminalOutcome::Succeeded(_),
+            DurableSwitchoverTerminalAccountingRecord::Complete { accounting },
+        ) => accounting,
+        _ => None,
     })
 }
 
@@ -759,6 +823,7 @@ pub fn validate_loaded_terminal(
                 operation,
                 snapshot,
                 compensated,
+                ..
             },
         ) => {
             validate_transition(&initial, operation)?;
@@ -821,6 +886,7 @@ pub fn evaluate_adapter_step(
             operation: DurableSwitchoverState::from_operation(&operation),
             snapshot,
             compensated,
+            accounting: None,
         })),
         Decision::Wait => PilotAdapterDecision::AwaitEvidence,
         external @ (Decision::Execute { .. }
@@ -977,6 +1043,11 @@ impl PreparedActivityResolver for PilotPreparedActivityResolver<'_> {
         let logical_input = decode_activity_input::<DurableSwitchoverActivity>(logical.input())
             .map_err(|_| PreparedActivityError::Encoding)?;
         if let Some(recorded) = recorded {
+            if recorded.name() != logical.name()
+                || recorded.max_result_bytes() != logical.max_result_bytes()
+            {
+                return Ok(logical.clone());
+            }
             let Ok(recorded_input) =
                 decode_activity_input::<DurableSwitchoverActivity>(recorded.input())
             else {
@@ -1176,10 +1247,12 @@ fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactByt
             operation,
             snapshot,
             compensated,
+            accounting,
         } => DurableSwitchoverTerminalRecord::Complete {
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: snapshot.clone(),
             compensated: *compensated,
+            accounting: *accounting,
         },
         DurableSwitchoverPilotTerminal::Stopped { operation, message } => {
             DurableSwitchoverTerminalRecord::Stopped {
@@ -1474,11 +1547,13 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
             operation: state.clone(),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
+            accounting: Some(PilotActivityAccounting::new(u64::MAX, u64::MAX)),
         },
         DurableSwitchoverStepResult::Complete {
             operation: state,
             snapshot: previous.clone(),
             compensated: true,
+            accounting: Some(PilotActivityAccounting::new(u64::MAX, u64::MAX)),
         },
         DurableSwitchoverStepResult::Stopped {
             operation: DurableSwitchoverState::from_operation(&stopped),
@@ -1493,11 +1568,13 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
+            accounting: PilotActivityAccounting::new(u64::MAX, u64::MAX),
         },
         DurableSwitchoverTerminalRecord::Complete {
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: previous,
             compensated: true,
+            accounting: PilotActivityAccounting::new(u64::MAX, u64::MAX),
         },
         DurableSwitchoverTerminalRecord::Stopped {
             state: Some(DurableSwitchoverState::from_operation(&stopped)),
@@ -1974,6 +2051,7 @@ mod durable_switchover_pilot_tests {
                         operation: compact(&advanced),
                         snapshot: terminal_snapshot.clone(),
                         compensated: false,
+                        accounting: Some(PilotActivityAccounting::new(0, 1)),
                     })
                     .unwrap(),
                 ),
@@ -1997,6 +2075,7 @@ mod durable_switchover_pilot_tests {
                 operation: advanced,
                 snapshot: terminal_snapshot,
                 compensated: false,
+                accounting: PilotActivityAccounting::new(0, 1),
             }
         );
         let polls_before_terminal_reload = polls.load(Ordering::SeqCst);
@@ -2456,6 +2535,68 @@ mod durable_switchover_pilot_tests {
     }
 
     #[test]
+    fn replay_rejects_changed_activity_name_version_and_result_bound() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let logical = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&initial),
+            kind: PilotActivityKind::PassiveObservation,
+        })
+        .unwrap();
+        let observations = OperationObservations::new();
+        let addressed = BTreeMap::new();
+        let resolver = PilotPreparedActivityResolver::new(&initial, &observations, &addressed, 100);
+        assert_eq!(resolver.resolve(&logical, Some(&logical)).unwrap(), logical);
+
+        let changed_name = ActivitySpec::new(
+            ActivityName::new("kuberic.switchover.changed-name", logical.name().version()).unwrap(),
+            logical.input().clone(),
+            logical.max_result_bytes(),
+        );
+        let changed_version = ActivitySpec::new(
+            ActivityName::new(
+                logical.name().name(),
+                logical.name().version().saturating_add(1),
+            )
+            .unwrap(),
+            logical.input().clone(),
+            logical.max_result_bytes(),
+        );
+        let changed_result_bound = ActivitySpec::new(
+            logical.name().clone(),
+            logical.input().clone(),
+            logical.max_result_bytes().saturating_add(1),
+        );
+        let execution = execution_spec(&reference).unwrap();
+
+        for changed in [changed_name, changed_version, changed_result_bound] {
+            assert_eq!(resolver.resolve(&logical, Some(&changed)).unwrap(), logical);
+            let payload = CheckpointPayload::active(
+                ExecutionContract::new(
+                    execution.clone(),
+                    u64::try_from(PILOT_MAX_ENCODED_CHECKPOINT_BYTES).unwrap(),
+                ),
+                vec![ActivityRecord::scheduled(ActivitySequence::new(0), changed)],
+            );
+            let checkpoint =
+                CheckpointEnvelope::encode_with_limits(&payload, checkpoint_limits()).unwrap();
+            assert!(matches!(
+                kuberic_durable_execution::evaluate_prepared(
+                    &DurableSwitchoverWorkflow,
+                    &execution,
+                    Some(&checkpoint),
+                    checkpoint_limits(),
+                    &resolver,
+                ),
+                kuberic_durable_execution::Evaluation::Nondeterminism(
+                    kuberic_durable_execution::Nondeterminism::ActivityMismatch { .. }
+                )
+            ));
+        }
+    }
+
+    #[test]
     fn legacy_activity_v1_without_kind_replays_with_exact_recorded_bytes() {
         let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let initial = initial_operation(&reference).unwrap();
@@ -2606,6 +2747,7 @@ mod durable_switchover_pilot_tests {
                         operation: compact(&failed),
                         snapshot: previous.clone(),
                         compensated: true,
+                        accounting: Some(PilotActivityAccounting::new(0, 1)),
                     })
                     .unwrap(),
                 ),
@@ -2624,6 +2766,7 @@ mod durable_switchover_pilot_tests {
                 operation: failed,
                 snapshot: previous,
                 compensated: true,
+                accounting: PilotActivityAccounting::new(0, 1),
             }
         );
     }
@@ -2770,6 +2913,7 @@ mod durable_switchover_pilot_tests {
             snapshot: operation.previous_snapshot.cloned().unwrap(),
             operation: operation.clone(),
             compensated: true,
+            accounting: PilotActivityAccounting::new(10, 3),
         };
         let outcome = TerminalOutcome::succeeded(encode_terminal(&terminal).unwrap());
         assert_eq!(decode_terminal(&outcome, &operation).unwrap(), terminal);
@@ -2784,6 +2928,7 @@ mod durable_switchover_pilot_tests {
             snapshot: operation.target_snapshot.clone(),
             operation: operation.clone(),
             compensated: false,
+            accounting: PilotActivityAccounting::new(9, 3),
         };
         let success = TerminalOutcome::succeeded(encode_terminal(&valid).unwrap());
         assert_eq!(
@@ -2801,6 +2946,7 @@ mod durable_switchover_pilot_tests {
                 snapshot: wrong_identity.target_snapshot.clone(),
                 operation: wrong_identity,
                 compensated: false,
+                accounting: PilotActivityAccounting::new(9, 3),
             })
             .unwrap(),
         );
@@ -2825,6 +2971,7 @@ mod durable_switchover_pilot_tests {
                 operation,
                 snapshot: wrong_snapshot,
                 compensated: false,
+                accounting: PilotActivityAccounting::new(9, 3),
             })
             .unwrap(),
         );
@@ -2837,6 +2984,7 @@ mod durable_switchover_pilot_tests {
             operation: failed.clone(),
             snapshot: compensated.clone(),
             compensated: true,
+            accounting: PilotActivityAccounting::new(10, 3),
         };
         assert!(
             validate_loaded_terminal(
@@ -2877,6 +3025,7 @@ mod durable_switchover_pilot_tests {
                     operation: failed.clone(),
                     snapshot,
                     compensated: true,
+                    accounting: PilotActivityAccounting::new(10, 3),
                 })
                 .unwrap(),
             );

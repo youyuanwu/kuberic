@@ -44,10 +44,10 @@ use crate::durable::pilot::DurableSwitchoverPilotRuntime;
 #[cfg(feature = "durable-switchover-pilot")]
 use crate::durable::pilot::{
     DurableSwitchoverPilotTerminal, DurableSwitchoverStepResult, DurableSwitchoverWorkflow,
-    PilotActivityKind, PilotAdapterDecision, PilotPermitGuard, PilotPreparedActivityResolver,
-    decode_pilot_activity_input, encode_step_result, evaluate_adapter_step, execution_spec,
-    initial_operation, new_pilot_reference, validate_loaded_terminal, validate_pilot_operation,
-    validate_prepared_activity,
+    PilotActivityAccounting, PilotActivityKind, PilotAdapterDecision, PilotPermitGuard,
+    PilotPreparedActivityResolver, decode_pilot_activity_input, encode_step_result,
+    evaluate_adapter_step, execution_spec, initial_operation, new_pilot_reference,
+    validate_loaded_terminal, validate_pilot_operation, validate_prepared_activity,
 };
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
@@ -2741,7 +2741,11 @@ async fn reconcile_durable_switchover_pilot(
                 if prepared.kind == PilotActivityKind::PassiveObservation {
                     match evaluate_adapter_step(&operation, &observations, now)? {
                         PilotAdapterDecision::Observe(result) => {
-                            let result = enrich_pilot_terminal_result(*result, &observations);
+                            let result = enrich_pilot_terminal_result(
+                                *result,
+                                &observations,
+                                host.store().measurements(),
+                            );
                             outcome = host
                                 .observe_and_turn_with(
                                     &DurableSwitchoverWorkflow,
@@ -2791,7 +2795,11 @@ async fn reconcile_durable_switchover_pilot(
                 .await?
                 {
                     PilotEffectBridgeOutcome::Observe(result) => {
-                        let result = enrich_pilot_terminal_result(*result, &observations);
+                        let result = enrich_pilot_terminal_result(
+                            *result,
+                            &observations,
+                            host.store().measurements(),
+                        );
                         outcome = host
                             .observe_and_turn_with(
                                 &DurableSwitchoverWorkflow,
@@ -2801,6 +2809,32 @@ async fn reconcile_durable_switchover_pilot(
                             )
                             .await;
                         continue;
+                    }
+                    PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(result) => {
+                        let result = enrich_pilot_terminal_result(
+                            *result,
+                            &observations,
+                            host.store().measurements(),
+                        );
+                        outcome = host
+                            .observe(
+                                &execution,
+                                ActivityObservation::new(activity, encode_step_result(&result)?),
+                            )
+                            .await;
+                        host.store().correlate_host_outcome(&outcome);
+                        if matches!(outcome, HostOutcome::ObservationAccepted { .. }) {
+                            record_pilot_wait_condition(
+                                set,
+                                api,
+                                "RefreshingReplicaObservation",
+                                "proven non-admission was persisted; retry awaits refreshed replica observations",
+                                now,
+                            )
+                            .await;
+                            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+                        }
+                        return pilot_host_outcome_action(set, api, &outcome, now).await;
                     }
                     PilotEffectBridgeOutcome::Exposed => {
                         record_pilot_wait_condition(
@@ -2834,8 +2868,13 @@ async fn reconcile_durable_switchover_pilot(
                 let decision = evaluate_adapter_step(&operation, &observations, now)?;
                 match resolve_pilot_quarantine(&operation, &prepared.kind, decision, &observations)?
                 {
-                    PilotEffectBridgeOutcome::Observe(result) => {
-                        let result = enrich_pilot_terminal_result(*result, &observations);
+                    PilotEffectBridgeOutcome::Observe(result)
+                    | PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(result) => {
+                        let result = enrich_pilot_terminal_result(
+                            *result,
+                            &observations,
+                            host.store().measurements(),
+                        );
                         outcome = host
                             .observe_and_turn_with(
                                 &DurableSwitchoverWorkflow,
@@ -3015,16 +3054,23 @@ fn loaded_pilot_terminal(
 fn enrich_pilot_terminal_result(
     result: DurableSwitchoverStepResult,
     observations: &OperationObservations,
+    measurements: crate::durable::pilot_store::PilotCheckpointMeasurementsSnapshot,
 ) -> DurableSwitchoverStepResult {
     match result {
         DurableSwitchoverStepResult::Complete {
             operation,
             snapshot,
             compensated,
+            accounting,
         } => DurableSwitchoverStepResult::Complete {
             operation,
             snapshot: snapshot_with_observed_metadata(snapshot, observations),
             compensated,
+            accounting: measurements
+                .completed_external_effect_count
+                .zip(measurements.completed_passive_observation_count)
+                .map(|(external, passive)| PilotActivityAccounting::new(external, passive))
+                .or(accounting),
         },
         other => other,
     }
@@ -3063,6 +3109,7 @@ async fn publish_pilot_terminal(
             operation,
             snapshot,
             compensated,
+            ..
         } => {
             let primary_name = set
                 .status
@@ -4709,6 +4756,7 @@ mod dispatch_planning_tests {
     #[cfg(feature = "durable-switchover-pilot")]
     struct BusyPilotHandle {
         requests: StdArc<StdMutex<Vec<CorrelatedControlActionRequest>>>,
+        refresh_required: bool,
     }
 
     #[cfg(feature = "durable-switchover-pilot")]
@@ -4749,7 +4797,13 @@ mod dispatch_planning_tests {
             request: CorrelatedControlActionRequest,
         ) -> kuberic_core::Result<CorrelatedControlActionAcknowledgement> {
             self.requests.lock().unwrap().push(request);
-            Err(KubericError::AgentBusy)
+            if self.refresh_required {
+                Err(KubericError::RemoteAgentPreconditionRejected(
+                    "generation changed before dispatch".to_string(),
+                ))
+            } else {
+                Err(KubericError::AgentBusy)
+            }
         }
     }
 
@@ -5377,6 +5431,7 @@ mod dispatch_planning_tests {
             1,
             Box::new(BusyPilotHandle {
                 requests: requests.clone(),
+                refresh_required: false,
             }) as Box<dyn ReplicaHandle>,
         )]);
         let observations = pilot_observations(observed(
@@ -5465,6 +5520,173 @@ mod dispatch_planning_tests {
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(api.exact_uid_patches.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[tokio::test]
+    async fn precondition_rejection_waits_for_fresh_observations_before_redelivery() {
+        use crate::durable::pilot::{
+            DurableSwitchoverWorkflow, PilotCheckpointStore, PilotPreparedActivityResolver,
+            decode_pilot_activity_input, execution_spec, initial_operation, new_pilot_reference,
+        };
+        use crate::durable::pilot_store::MeasuredPilotCheckpointStore;
+        use kuberic_durable_execution::{
+            ActivityState, DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
+        };
+
+        let mut reference = new_pilot_reference("set-uid", pilot_snapshot(), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let PilotAdapterDecision::Observe(result) = crate::durable::pilot::evaluate_adapter_step(
+            &initial,
+            &OperationObservations::new(),
+            100,
+        )
+        .unwrap() else {
+            panic!("expected persisted revoke intent");
+        };
+        let DurableSwitchoverStepResult::Advance { operation: pending } = *result else {
+            panic!("expected compact revoke intent");
+        };
+        let pending = pending.apply_to(&initial).unwrap();
+        reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let backend = InMemoryCheckpointStore::new();
+        let mut host = DurableHost::new(
+            MeasuredPilotCheckpointStore::new(
+                execution.execution_id(),
+                PilotCheckpointStore::InMemory(backend),
+            ),
+            HostEpoch::from_bytes([22; 16]),
+            crate::durable::pilot::checkpoint_limits(),
+        );
+        let workflow = DurableSwitchoverWorkflow;
+        let requests = StdArc::new(StdMutex::new(Vec::new()));
+        let handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::from([(
+            1,
+            Box::new(BusyPilotHandle {
+                requests: requests.clone(),
+                refresh_required: true,
+            }) as Box<dyn ReplicaHandle>,
+        )]);
+        let generation_one = pilot_observations(observed(
+            kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+        ));
+        let addressed_instances = handles
+            .iter()
+            .map(|(replica_id, handle)| (*replica_id, handle.instance_id()))
+            .collect();
+        let resolver = PilotPreparedActivityResolver::new(
+            &pending,
+            &generation_one,
+            &addressed_instances,
+            100,
+        );
+        let HostOutcome::DispatchPermitted { permit, .. } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &resolver)
+            .await
+        else {
+            panic!("expected generation-one dispatch permit");
+        };
+        let prepared = decode_pilot_activity_input(permit.activity().input()).unwrap();
+        let prepared_operation = prepared.state.apply_to(&pending).unwrap();
+        let activity = permit.activity().clone();
+        let attempt = permit.attempt_id();
+        let mut guard = PilotPermitGuard::new(permit);
+        let PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(result) =
+            bridge_pilot_permitted_step(
+                &mut guard,
+                &prepared_operation,
+                &prepared.kind,
+                &activity,
+                attempt,
+                &generation_one,
+                &handles,
+                &BridgeTestApi {
+                    exact_uid_patches: AtomicUsize::new(0),
+                    exact_uid_commands: StdMutex::new(Vec::new()),
+                },
+                "default",
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("precondition rejection must require a fresh observation cycle");
+        };
+        let DurableSwitchoverStepResult::ProvenNoAdmission {
+            operation,
+            action_id,
+            redelivery,
+        } = &*result
+        else {
+            panic!("precondition rejection must persist proven non-admission");
+        };
+        let retry_operation = operation.apply_to(&pending).unwrap();
+        let retry_pending = retry_operation.pending_action.as_ref().unwrap();
+        assert_eq!(retry_pending.action_id, *action_id);
+        assert_eq!(*redelivery, 1);
+        assert!(retry_pending.dispatch_agent_generation.is_none());
+        assert!(retry_pending.dispatch_agent_control_version.is_none());
+        assert!(retry_pending.dispatch_observed_runtime_epoch.is_none());
+
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(activity, encode_step_result(&result).unwrap()),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { .. }
+        ));
+        let stored = host
+            .store()
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(&execution, crate::durable::pilot::checkpoint_limits())
+            .unwrap();
+        let activities = payload.active_activities().unwrap();
+        assert_eq!(activities.len(), 1);
+        assert!(matches!(
+            activities[0].state(),
+            ActivityState::Completed { .. }
+        ));
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "the stale reconcile must not dispatch the retry"
+        );
+
+        let mut generation_two_status =
+            observed(kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION);
+        generation_two_status.agent.generation =
+            AgentGeneration::parse("fedcba9876543210fedcba9876543210").unwrap();
+        generation_two_status.agent.control_version = AgentControlVersion::new(8);
+        let generation_two = pilot_observations(generation_two_status);
+        let refreshed_resolver = PilotPreparedActivityResolver::new(
+            &pending,
+            &generation_two,
+            &addressed_instances,
+            101,
+        );
+        let HostOutcome::DispatchPermitted { permit, .. } = host
+            .turn_and_expose_with(&workflow, execution, &refreshed_resolver)
+            .await
+        else {
+            panic!("the next reconcile may expose the one bounded redelivery");
+        };
+        let retry = decode_pilot_activity_input(permit.activity().input()).unwrap();
+        let PilotActivityKind::PreparedReplica { command } = retry.kind else {
+            panic!("redelivery must retain an exact prepared replica command");
+        };
+        assert_eq!(command.action_id, *action_id);
+        assert_eq!(
+            command.expected_agent_generation,
+            "fedcba9876543210fedcba9876543210"
+        );
+        assert_eq!(command.expected_control_version, 8);
+        assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
     #[cfg(feature = "durable-switchover-pilot")]
@@ -5566,6 +5788,7 @@ mod dispatch_planning_tests {
                 1,
                 Box::new(BusyPilotHandle {
                     requests: requests.clone(),
+                    refresh_required: false,
                 }) as Box<dyn ReplicaHandle>,
             )]);
             let observations = pilot_observations(status);
