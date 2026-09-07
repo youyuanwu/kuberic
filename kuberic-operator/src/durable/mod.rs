@@ -18,6 +18,8 @@ pub mod pilot;
 pub mod pilot_store;
 mod remove_replica;
 mod switchover;
+#[cfg(feature = "durable-switchover-pilot")]
+pub mod workflow_host;
 
 pub(crate) use add_replica::final_attestation as attest_add_replica;
 pub use add_replica::{decide_add_replica, start_add_replica};
