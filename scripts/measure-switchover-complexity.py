@@ -60,6 +60,15 @@ MEASUREMENTS = [
             )
         ],
     ),
+    (
+        "switchover_effect_recovery_integration",
+        [
+            Segment(
+                "kuberic-operator/src/durable/effects.rs",
+                "switchover-effect-recovery",
+            )
+        ],
+    ),
     ("pilot_store_integration", [Segment("kuberic-operator/src/durable/pilot_store.rs", "pilot-store")]),
     (
         "pilot_effect_bridge_integration",
@@ -241,6 +250,7 @@ def main() -> None:
             "shared_operator_effect_adapters",
             "shared_operator_checkpoint_support",
             "shared_operator_workflow_host",
+            "switchover_effect_recovery_integration",
             "pilot_store_integration",
             "pilot_effect_bridge_integration",
             "pilot_reconcile_integration",
@@ -259,6 +269,7 @@ def main() -> None:
     )
     shared_growth = subtract(shared, SHARED_BEFORE)
     integration = add(
+        measured["switchover_effect_recovery_integration"],
         measured["pilot_store_integration"],
         measured["pilot_effect_bridge_integration"],
         measured["pilot_reconcile_integration"],

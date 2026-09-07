@@ -641,13 +641,90 @@ pub(crate) fn operation_after_dispatch_error(
     }
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
-pub enum PilotEffectBridgeOutcome {
-    Observe(Box<DurableSwitchoverStepResult>),
-    ObserveAfterFenceRefresh(Box<DurableSwitchoverStepResult>),
+/// Workflow-neutral outcome of resolving or dispatching a prepared effect.
+pub enum DurableEffectBridgeOutcome<T> {
+    Observe(T),
+    ObserveAfterFenceRefresh(T),
     Exposed,
     AwaitEvidence,
 }
+
+/// Exact replica decision reconstructed by a workflow during quarantine.
+pub struct QuarantinedReplicaDecision {
+    pub target_id: ReplicaId,
+    pub action_id: String,
+    pub action: DurableReplicaAction,
+}
+
+pub fn resolve_quarantined_observation<T>(
+    result: T,
+    authoritative: bool,
+) -> DurableEffectBridgeOutcome<T> {
+    if authoritative {
+        DurableEffectBridgeOutcome::Observe(result)
+    } else {
+        DurableEffectBridgeOutcome::AwaitEvidence
+    }
+}
+
+pub fn resolve_quarantined_replica_effect<T>(
+    operation: &DurableOperationStatus,
+    command: &ReplicaEffectCommand,
+    decision: QuarantinedReplicaDecision,
+    observations: &OperationObservations,
+    proven_no_admission: impl FnOnce(DurableOperationStatus, String) -> T,
+) -> Result<DurableEffectBridgeOutcome<T>, String> {
+    let pending = operation.pending_action.as_ref().ok_or_else(|| {
+        "quarantined prepared replica effect has no pending correlated action".to_string()
+    })?;
+    let recorded = ReplicaEffectCommand::from_pending(pending)
+        .map_err(|error| format!("invalid quarantined prepared replica effect: {error}"))?;
+    let action_identity_matches = decision.target_id == command.target_id
+        && decision.target_id == pending.target_id
+        && decision.action_id == command.action_id
+        && decision.action_id == pending.action_id
+        && decision.action.signature() == command.action_signature
+        && recorded == *command;
+    if !action_identity_matches {
+        return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
+    }
+    if generation_change_proves_no_admission(operation, command.target_id, observations) {
+        let mut next = operation.clone();
+        let next_pending = next
+            .pending_action
+            .as_mut()
+            .expect("validated pending action remains present");
+        clear_dispatch_evidence(next_pending);
+        return Ok(DurableEffectBridgeOutcome::Observe(proven_no_admission(
+            next,
+            command.action_id.clone(),
+        )));
+    }
+    Ok(DurableEffectBridgeOutcome::AwaitEvidence)
+}
+
+pub(crate) fn generation_change_proves_no_admission(
+    operation: &DurableOperationStatus,
+    target_id: ReplicaId,
+    observations: &OperationObservations,
+) -> bool {
+    let Some(pending) = operation.pending_action.as_ref() else {
+        return false;
+    };
+    let Some(dispatched_generation) = pending.dispatch_agent_generation.as_deref() else {
+        return false;
+    };
+    let Some(observed) = observations.get(&target_id) else {
+        return false;
+    };
+    observed.status.agent.generation.as_str() != dispatched_generation
+        && correlated_action_observation(&observed.status, &pending.action_id).is_none()
+}
+// COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:end
+
+// COMPLEXITY-BOUNDARY: switchover-effect-recovery:start
+#[cfg(feature = "durable-switchover-pilot")]
+pub type PilotEffectBridgeOutcome = DurableEffectBridgeOutcome<Box<DurableSwitchoverStepResult>>;
 
 #[cfg(feature = "durable-switchover-pilot")]
 #[allow(clippy::too_many_arguments)]
@@ -754,11 +831,7 @@ pub fn resolve_pilot_quarantine(
     if let PilotAdapterDecision::Observe(result) = decision {
         let authoritative = matches!(prepared, PilotActivityKind::PassiveObservation)
             || quarantine_result_is_authoritative(operation, &result, observations);
-        return Ok(if authoritative {
-            PilotEffectBridgeOutcome::Observe(result)
-        } else {
-            PilotEffectBridgeOutcome::AwaitEvidence
-        });
+        return Ok(resolve_quarantined_observation(result, authoritative));
     }
     let (PilotActivityKind::PreparedReplica { command }, PilotAdapterDecision::External(decision)) =
         (prepared, decision)
@@ -773,36 +846,23 @@ pub fn resolve_pilot_quarantine(
     else {
         return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
     };
-    let pending = operation.pending_action.as_ref().ok_or_else(|| {
-        "quarantined prepared replica effect has no pending correlated action".to_string()
-    })?;
-    let recorded = ReplicaEffectCommand::from_pending(pending)
-        .map_err(|error| format!("invalid quarantined prepared replica effect: {error}"))?;
-    let action_identity_matches = target_id == command.target_id
-        && target_id == pending.target_id
-        && action_id == command.action_id
-        && action_id == pending.action_id
-        && action.signature() == command.action_signature
-        && recorded == *command;
-    if !action_identity_matches {
-        return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
-    }
-    if generation_change_proves_no_admission(operation, command.target_id, observations) {
-        let mut next = operation.clone();
-        let next_pending = next
-            .pending_action
-            .as_mut()
-            .expect("validated pending action remains present");
-        clear_dispatch_evidence(next_pending);
-        return Ok(PilotEffectBridgeOutcome::Observe(Box::new(
-            DurableSwitchoverStepResult::ProvenNoAdmission {
+    resolve_quarantined_replica_effect(
+        operation,
+        command,
+        QuarantinedReplicaDecision {
+            target_id,
+            action_id,
+            action,
+        },
+        observations,
+        |next, action_id| {
+            Box::new(DurableSwitchoverStepResult::ProvenNoAdmission {
                 operation: DurableSwitchoverState::from_operation(&next),
-                action_id: command.action_id.clone(),
+                action_id,
                 redelivery: 1,
-            },
-        )));
-    }
-    Ok(PilotEffectBridgeOutcome::AwaitEvidence)
+            })
+        },
+    )
 }
 
 #[cfg(feature = "durable-switchover-pilot")]
@@ -839,25 +899,6 @@ fn quarantine_result_is_authoritative(
             is_switchover_postcondition_transition(operation, &next, pending)
         }
     }
-}
-
-#[cfg(feature = "durable-switchover-pilot")]
-pub(crate) fn generation_change_proves_no_admission(
-    operation: &DurableOperationStatus,
-    target_id: ReplicaId,
-    observations: &OperationObservations,
-) -> bool {
-    let Some(pending) = operation.pending_action.as_ref() else {
-        return false;
-    };
-    let Some(dispatched_generation) = pending.dispatch_agent_generation.as_deref() else {
-        return false;
-    };
-    let Some(observed) = observations.get(&target_id) else {
-        return false;
-    };
-    observed.status.agent.generation.as_str() != dispatched_generation
-        && correlated_action_observation(&observed.status, &pending.action_id).is_none()
 }
 
 #[cfg(feature = "durable-switchover-pilot")]
@@ -902,7 +943,7 @@ pub(crate) fn exact_label_command(
 fn bounded(value: &str) -> String {
     value.chars().take(MAX_EFFECT_DIAGNOSTIC_BYTES).collect()
 }
-// COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:end
+// COMPLEXITY-BOUNDARY: switchover-effect-recovery:end
 
 #[cfg(test)]
 mod tests {

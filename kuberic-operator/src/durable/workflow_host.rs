@@ -3,8 +3,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use kuberic_durable_execution::{
-    CheckpointLimits, DurableHost, ExecutionId, HostEpoch, InMemoryCheckpointStore,
-    KubernetesCheckpointStore, KubernetesCheckpointStoreOptions,
+    ActivitySpec, AttemptId, CheckpointLimits, DispatchPermit, DurableHost, ExecutionId, HostEpoch,
+    InMemoryCheckpointStore, KubernetesCheckpointStore, KubernetesCheckpointStoreOptions,
+    LogicalActivityId,
 };
 use rand::random;
 use tokio::sync::Mutex;
@@ -18,6 +19,48 @@ use super::pilot_store::{
 const MAX_COMPLETED_MEASUREMENT_SNAPSHOTS: usize = 64;
 
 pub type DurableOperatorHost = DurableHost<MeasuredDurableCheckpointStore>;
+
+/// Single-use prepared-effect permit guard shared by operator workflows.
+pub struct DurablePermitGuard {
+    permit: Option<DispatchPermit>,
+}
+
+impl DurablePermitGuard {
+    pub fn new(permit: DispatchPermit) -> Self {
+        Self {
+            permit: Some(permit),
+        }
+    }
+
+    pub fn consume(
+        &mut self,
+        expected_spec: &ActivitySpec,
+        expected_activity: &LogicalActivityId,
+        attempt_id: AttemptId,
+        workflow: &str,
+    ) -> Result<DispatchPermit, String> {
+        let permit = self
+            .permit
+            .as_ref()
+            .ok_or_else(|| format!("durable {workflow} dispatch permit was already consumed"))?;
+        if permit.attempt_id() != attempt_id
+            || permit.activity() != expected_activity
+            || permit.activity().spec() != expected_spec
+        {
+            return Err(format!(
+                "durable {workflow} dispatch permit does not match prepared activity or attempt"
+            ));
+        }
+        Ok(self
+            .permit
+            .take()
+            .expect("permit existence checked before consumption"))
+    }
+
+    pub fn activity(&self) -> Option<&LogicalActivityId> {
+        self.permit.as_ref().map(DispatchPermit::activity)
+    }
+}
 
 #[derive(Clone)]
 enum DurableStoreFactory {

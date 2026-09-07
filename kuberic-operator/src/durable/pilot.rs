@@ -45,7 +45,7 @@ use super::pilot_store::MeasuredPilotCheckpointStore;
 use super::pilot_store::{
     CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
 };
-use super::workflow_host::{DurableOperatorHost, DurableWorkflowRuntime};
+use super::workflow_host::{DurableOperatorHost, DurablePermitGuard, DurableWorkflowRuntime};
 use super::{
     Decision, OperationObservations, decide, start_switchover,
     switchover::{
@@ -1100,13 +1100,13 @@ fn preparation_error(error: PilotEffectPreparationError) -> PreparedActivityErro
 }
 
 pub struct PilotPermitGuard {
-    permit: Option<DispatchPermit>,
+    inner: DurablePermitGuard,
 }
 
 impl PilotPermitGuard {
     pub fn new(permit: DispatchPermit) -> Self {
         Self {
-            permit: Some(permit),
+            inner: DurablePermitGuard::new(permit),
         }
     }
 
@@ -1122,27 +1122,12 @@ impl PilotPermitGuard {
             state: DurableSwitchoverState::from_operation(operation),
             kind: prepared.clone(),
         })?;
-        let permit = self
-            .permit
-            .as_ref()
-            .ok_or_else(|| "durable switchover dispatch permit was already consumed".to_string())?;
-        if permit.attempt_id() != attempt_id
-            || permit.activity() != expected_activity
-            || permit.activity().spec() != &expected
-        {
-            return Err(
-                "durable switchover dispatch permit does not match prepared operation or attempt"
-                    .to_string(),
-            );
-        }
-        Ok(self
-            .permit
-            .take()
-            .expect("permit existence checked before consumption"))
+        self.inner
+            .consume(&expected, expected_activity, attempt_id, "switchover")
     }
 
     pub fn activity(&self) -> Option<&LogicalActivityId> {
-        self.permit.as_ref().map(DispatchPermit::activity)
+        self.inner.activity()
     }
 }
 

@@ -511,7 +511,8 @@ pub type DurableCheckpointEventResult = PilotCheckpointEventResult;
 mod durable_switchover_pilot_tests {
     use super::*;
     use kuberic_durable_execution::{
-        ExactBytes, ExecutionContract, ExecutionSpec, InMemoryFault, ReloadReason, TerminalOutcome,
+        ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ExactBytes,
+        ExecutionContract, ExecutionSpec, InMemoryFault, ReloadReason, TerminalOutcome,
     };
 
     fn checkpoint(value: &[u8]) -> CheckpointEnvelope {
@@ -561,6 +562,63 @@ mod durable_switchover_pilot_tests {
                 passive_observation_count: 1,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn measured_store_uses_workflow_provided_decoder() {
+        let execution_id = ExecutionId::from_bytes([31; 16]);
+        let contract = ExecutionContract::new(
+            ExecutionSpec::new(execution_id, ExactBytes::new(b"workflow"), 128),
+            100_000,
+        );
+        let spec = |input: &'static [u8]| {
+            ActivitySpec::new(
+                ActivityName::new("fixture.activity", 1).unwrap(),
+                ExactBytes::new(input),
+                32,
+            )
+        };
+        let checkpoint = CheckpointEnvelope::encode(&CheckpointPayload::active(
+            contract,
+            vec![
+                ActivityRecord::completed(
+                    ActivitySequence::new(0),
+                    spec(b"effect"),
+                    ExactBytes::new(b"ok"),
+                ),
+                ActivityRecord::completed(
+                    ActivitySequence::new(1),
+                    spec(b"effect"),
+                    ExactBytes::new(b"ok"),
+                ),
+                ActivityRecord::completed(
+                    ActivitySequence::new(2),
+                    spec(b"observation"),
+                    ExactBytes::new(b"ok"),
+                ),
+            ],
+        ))
+        .unwrap();
+        let store = MeasuredPilotCheckpointStore::with_decoder(
+            execution_id,
+            DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            CheckpointMeasurementDecoder::new(
+                "fixture",
+                fixture_activity_decoder,
+                fixture_terminal_decoder,
+            ),
+        );
+
+        assert!(matches!(
+            store
+                .compare_and_swap(execution_id, None, checkpoint)
+                .await
+                .unwrap(),
+            CasOutcome::Accepted(_)
+        ));
+        let measurements = store.measurements();
+        assert_eq!(measurements.completed_external_effect_count, Some(2));
+        assert_eq!(measurements.completed_passive_observation_count, Some(1));
     }
 
     async fn terminal_accounting_measurements(
