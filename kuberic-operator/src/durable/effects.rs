@@ -61,10 +61,25 @@ pub struct ReplicaEffectCommand {
 
 impl ReplicaEffectCommand {
     pub fn from_pending(pending: &PendingActionStatus) -> Result<Self, String> {
-        let action = kuberic_core::grpc::convert::decode_correlated_action_payload(
-            &pending.dispatch_action_payload,
+        Self::from_pending_with_decoder(
+            pending,
+            kuberic_core::grpc::convert::decode_direct_correlated_action_payload,
         )
-        .map_err(|error| format!("decode frozen correlated action: {error}"))?;
+    }
+
+    pub fn from_lifecycle_pending(pending: &PendingActionStatus) -> Result<Self, String> {
+        Self::from_pending_with_decoder(
+            pending,
+            kuberic_core::grpc::convert::decode_correlated_action_payload,
+        )
+    }
+
+    fn from_pending_with_decoder(
+        pending: &PendingActionStatus,
+        decode: fn(&str) -> Result<DurableReplicaAction, String>,
+    ) -> Result<Self, String> {
+        let action = decode(&pending.dispatch_action_payload)
+            .map_err(|error| format!("decode frozen correlated action: {error}"))?;
         Ok(Self {
             action_id: pending.action_id.clone(),
             action_signature: action.signature(),
@@ -207,6 +222,38 @@ pub fn prepare_replica_effect_command(
     addressed_instance: &ReplicaInstanceId,
     action: &DurableReplicaAction,
 ) -> Result<(PendingActionStatus, ReplicaEffectCommand), DurableEffectPreparationError> {
+    prepare_replica_effect_command_with_lifecycle_support(
+        pending,
+        observed,
+        addressed_instance,
+        action,
+        false,
+    )
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub fn prepare_lifecycle_replica_effect_command(
+    pending: &PendingActionStatus,
+    observed: &ReplicaStatusInfo,
+    addressed_instance: &ReplicaInstanceId,
+    action: &DurableReplicaAction,
+) -> Result<(PendingActionStatus, ReplicaEffectCommand), DurableEffectPreparationError> {
+    prepare_replica_effect_command_with_lifecycle_support(
+        pending,
+        observed,
+        addressed_instance,
+        action,
+        true,
+    )
+}
+
+fn prepare_replica_effect_command_with_lifecycle_support(
+    pending: &PendingActionStatus,
+    observed: &ReplicaStatusInfo,
+    addressed_instance: &ReplicaInstanceId,
+    action: &DurableReplicaAction,
+    allow_lifecycle_intent: bool,
+) -> Result<(PendingActionStatus, ReplicaEffectCommand), DurableEffectPreparationError> {
     let exact_incarnation = addressed_instance.as_str() == pending.target_instance_id
         && observed.instance_id.as_str() == pending.target_instance_id;
     if !exact_incarnation {
@@ -222,8 +269,12 @@ pub fn prepare_replica_effect_command(
         || pending.dispatch_observed_runtime_epoch.is_some()
         || !pending.dispatch_action_payload.is_empty();
     if has_frozen_evidence {
-        let command = ReplicaEffectCommand::from_pending(pending)
-            .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
+        let command = if allow_lifecycle_intent {
+            ReplicaEffectCommand::from_lifecycle_pending(pending)
+        } else {
+            ReplicaEffectCommand::from_pending(pending)
+        }
+        .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
         let observed_epoch = EpochStatus {
             data_loss_number: observed.epoch.data_loss_number,
             configuration_number: observed.epoch.configuration_number,
@@ -234,29 +285,44 @@ pub fn prepare_replica_effect_command(
         {
             return Err(DurableEffectPreparationError::WaitForExactIncarnation);
         }
-        let decoded =
+        let decoded = if allow_lifecycle_intent {
             kuberic_core::grpc::convert::decode_correlated_action_payload(&command.action_payload)
-                .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
+        } else {
+            kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+                &command.action_payload,
+            )
+        }
+        .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
         if decoded.signature() != action.signature() {
             return Err(DurableEffectPreparationError::InvalidCommand);
         }
         return Ok((pending.clone(), command));
     }
-    let planned =
-        match freeze_dispatch_evidence(pending, observed, addressed_instance, action, true) {
-            Ok(planned) => planned,
-            Err(DispatchEvidencePlan::WaitForExactIncarnation) => {
-                return Err(DurableEffectPreparationError::WaitForExactIncarnation);
-            }
-            Err(DispatchEvidencePlan::WaitForSupportedProtocol) => {
-                return Err(DurableEffectPreparationError::WaitForSupportedProtocol);
-            }
-            Err(DispatchEvidencePlan::Ready | DispatchEvidencePlan::Persist(_)) => {
-                unreachable!("dispatch evidence freezing returns only wait errors")
-            }
-        };
-    let command = ReplicaEffectCommand::from_pending(&planned)
-        .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
+    let planned = match freeze_dispatch_evidence(
+        pending,
+        observed,
+        addressed_instance,
+        action,
+        true,
+        allow_lifecycle_intent,
+    ) {
+        Ok(planned) => planned,
+        Err(DispatchEvidencePlan::WaitForExactIncarnation) => {
+            return Err(DurableEffectPreparationError::WaitForExactIncarnation);
+        }
+        Err(DispatchEvidencePlan::WaitForSupportedProtocol) => {
+            return Err(DurableEffectPreparationError::WaitForSupportedProtocol);
+        }
+        Err(DispatchEvidencePlan::Ready | DispatchEvidencePlan::Persist(_)) => {
+            unreachable!("dispatch evidence freezing returns only wait errors")
+        }
+    };
+    let command = if allow_lifecycle_intent {
+        ReplicaEffectCommand::from_lifecycle_pending(&planned)
+    } else {
+        ReplicaEffectCommand::from_pending(&planned)
+    }
+    .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
     if command.action_id != pending.action_id
         || command.target_id != pending.target_id
         || command.target_instance_id != pending.target_instance_id
@@ -264,9 +330,14 @@ pub fn prepare_replica_effect_command(
     {
         return Err(DurableEffectPreparationError::InvalidCommand);
     }
-    let decoded =
+    let decoded = if allow_lifecycle_intent {
         kuberic_core::grpc::convert::decode_correlated_action_payload(&command.action_payload)
-            .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
+    } else {
+        kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+            &command.action_payload,
+        )
+    }
+    .map_err(|_| DurableEffectPreparationError::InvalidCommand)?;
     if decoded.signature() != action.signature() {
         return Err(DurableEffectPreparationError::InvalidCommand);
     }
@@ -376,6 +447,7 @@ pub(crate) fn plan_dispatch_evidence(
         addressed_instance,
         action,
         persist_action_payload,
+        false,
     ) {
         Ok(planned) => planned,
         Err(wait) => return wait,
@@ -394,6 +466,7 @@ fn freeze_dispatch_evidence(
     addressed_instance: &ReplicaInstanceId,
     action: &DurableReplicaAction,
     persist_action_payload: bool,
+    allow_lifecycle_intent: bool,
 ) -> Result<PendingActionStatus, DispatchEvidencePlan> {
     let mut planned = pending.clone();
     let exact_incarnation = addressed_instance.as_str() == pending.target_instance_id
@@ -421,8 +494,12 @@ fn freeze_dispatch_evidence(
     if persist_action_payload {
         if planned.dispatch_action_payload.is_empty() || (!evidence_matches && !local_record_exists)
         {
-            let Ok(payload) = kuberic_core::grpc::convert::encode_correlated_action_payload(action)
-            else {
+            let payload = if allow_lifecycle_intent {
+                kuberic_core::grpc::convert::encode_correlated_action_payload(action)
+            } else {
+                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(action)
+            };
+            let Ok(payload) = payload else {
                 return Err(DispatchEvidencePlan::WaitForSupportedProtocol);
             };
             planned.dispatch_action_payload = payload;
@@ -693,7 +770,7 @@ pub fn resolve_quarantined_replica_effect<T>(
     let pending = operation.pending_action.as_ref().ok_or_else(|| {
         "quarantined prepared replica effect has no pending correlated action".to_string()
     })?;
-    let recorded = ReplicaEffectCommand::from_pending(pending)
+    let recorded = ReplicaEffectCommand::from_lifecycle_pending(pending)
         .map_err(|error| format!("invalid quarantined prepared replica effect: {error}"))?;
     let action_identity_matches = decision.target_id == command.target_id
         && decision.target_id == pending.target_id

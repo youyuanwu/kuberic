@@ -29,8 +29,8 @@ use crate::crd::{
 
 use super::effects::{
     DeleteEffectCommand, DurableEffectPreparationError, LabelEffectCommand, ReplicaEffectCommand,
-    prepare_remove_delete_effect_command, prepare_remove_label_effect_command,
-    prepare_replica_effect_command, validate_remove_replica_action_kind,
+    prepare_lifecycle_replica_effect_command, prepare_remove_delete_effect_command,
+    prepare_remove_label_effect_command, validate_remove_replica_action_kind,
     validate_remove_replica_dispatch_authority,
 };
 use super::pilot_store::{
@@ -239,6 +239,17 @@ pub struct RemoveReplicaActivityAccounting {
     pub passive_observation_count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveReplicaTerminalCommitAuthority {
+    pub attempt: u32,
+    pub attempt_id: String,
+    pub action_id: String,
+    pub input_signature: String,
+    pub primary_agent_generation: String,
+    pub configuration_signature: String,
+}
+
 impl RemoveReplicaActivityAccounting {
     fn record(&mut self, completion: RemoveReplicaActivityCompletion) -> Result<(), String> {
         match completion {
@@ -295,6 +306,7 @@ impl DurableActivity for DurableRemoveReplicaActivity {
 pub enum DurableRemoveReplicaPilotTerminal {
     Completed {
         snapshot: StablePartitionSnapshotStatus,
+        authority: RemoveReplicaTerminalCommitAuthority,
         commit_evidence: RemoveReplicaCommitEvidenceStatus,
         cleanup: RemoveReplicaCleanupStatus,
         accounting: RemoveReplicaActivityAccounting,
@@ -551,6 +563,10 @@ fn terminal_from_operation(
                 .remove_commit_evidence
                 .clone()
                 .ok_or_else(|| "completed remove terminal has no commit evidence".to_string())?;
+            let intent = operation
+                .remove_intent
+                .as_deref()
+                .ok_or_else(|| "completed remove terminal has no frozen intent".to_string())?;
             let cleanup = operation
                 .remove_cleanup
                 .clone()
@@ -558,6 +574,14 @@ fn terminal_from_operation(
             validate_completed_cleanup(&cleanup)?;
             Ok(DurableRemoveReplicaPilotTerminal::Completed {
                 snapshot: operation.target_snapshot.clone(),
+                authority: RemoveReplicaTerminalCommitAuthority {
+                    attempt: intent.attempt,
+                    attempt_id: intent.attempt_id.clone(),
+                    action_id: intent.action_id.clone(),
+                    input_signature: intent.input_signature.clone(),
+                    primary_agent_generation: commit_evidence.primary_agent_generation.clone(),
+                    configuration_signature: commit_evidence.configuration_signature.clone(),
+                },
                 commit_evidence,
                 cleanup,
                 accounting,
@@ -604,8 +628,17 @@ fn terminal_from_operation(
 }
 
 fn validate_completed_cleanup(cleanup: &RemoveReplicaCleanupStatus) -> Result<(), String> {
+    let terminal_retirement = matches!(
+        cleanup.target_retirement,
+        Some(
+            TargetRetirementObservationStatus::Completed
+                | TargetRetirementObservationStatus::Unavailable
+                | TargetRetirementObservationStatus::Stale
+                | TargetRetirementObservationStatus::Failed
+        )
+    );
     if cleanup.connection_absent
-        && cleanup.target_retirement.is_some()
+        && terminal_retirement
         && cleanup.target_labels_fenced
         && cleanup.target_pod_deleted
     {
@@ -726,15 +759,59 @@ pub fn validate_loaded_terminal(
     match &terminal {
         DurableRemoveReplicaPilotTerminal::Completed {
             snapshot,
+            authority,
             commit_evidence,
             cleanup,
             ..
         } => {
-            if snapshot != &initial.target_snapshot
-                || commit_evidence.action_id.is_empty()
-                || commit_evidence.configuration_signature.is_empty()
+            let expected_attempt_id =
+                format!("{}:attempt-{}", initial.operation_id, authority.attempt);
+            let expected_action_id = format!("{}:RemoveReplicaIntent", authority.attempt_id);
+            let expected_quorum_prefix = format!("q{}[", initial.target_snapshot.write_quorum);
+            let retained_identities_match = initial
+                .target_snapshot
+                .members
+                .iter()
+                .filter(|member| member.id != initial.target_snapshot.primary_id)
+                .all(|member| {
+                    authority
+                        .configuration_signature
+                        .contains(&format!("{}@{}:", member.id, member.instance_id))
+                });
+            if snapshot != &initial.target_snapshot {
+                return Err("completed remove terminal changed frozen snapshot".to_string());
+            }
+            if authority.attempt == 0
+                || authority.attempt
+                    > kuberic_core::remove_replica::MAX_REMOVE_REPLICA_PRE_COMMIT_ATTEMPTS
+                || authority.attempt_id != expected_attempt_id
+                || authority.action_id != expected_action_id
             {
-                return Err("completed remove terminal changed frozen publication".to_string());
+                return Err("completed remove terminal changed action identity".to_string());
+            }
+            if authority.input_signature.is_empty()
+                || kuberic_core::types::AgentGeneration::parse(
+                    authority.primary_agent_generation.clone(),
+                )
+                .is_err()
+            {
+                return Err("completed remove terminal changed dispatch authority".to_string());
+            }
+            if !authority
+                .configuration_signature
+                .starts_with(&expected_quorum_prefix)
+                || !retained_identities_match
+            {
+                return Err("completed remove terminal changed reduced configuration".to_string());
+            }
+            if commit_evidence.attempt_id != authority.attempt_id
+                || commit_evidence.action_id != authority.action_id
+                || commit_evidence.primary_agent_generation != authority.primary_agent_generation
+                || commit_evidence.configuration_signature != authority.configuration_signature
+            {
+                return Err(
+                    "completed remove terminal has inconsistent exact commit authority".to_string(),
+                );
             }
             validate_completed_cleanup(cleanup)?;
         }
@@ -949,7 +1026,7 @@ impl<'a> RemoveReplicaPreparedActivityResolver<'a> {
                     ) {
                         return Err(PreparedActivityError::Derivation);
                     }
-                    let (planned, command) = prepare_replica_effect_command(
+                    let (planned, command) = prepare_lifecycle_replica_effect_command(
                         pending,
                         &observed.status,
                         addressed,
@@ -1083,7 +1160,7 @@ pub fn validate_prepared_activity(
                 .pending_action
                 .as_ref()
                 .ok_or_else(|| "prepared remove command has no pending action".to_string())?;
-            let expected = ReplicaEffectCommand::from_pending(pending)?;
+            let expected = ReplicaEffectCommand::from_lifecycle_pending(pending)?;
             let action = kuberic_core::grpc::convert::decode_correlated_action_payload(
                 &command.action_payload,
             )
@@ -1486,11 +1563,19 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
         target_pod_deleted: true,
     };
     let commit_evidence = RemoveReplicaCommitEvidenceStatus {
-        attempt_id,
-        action_id,
+        attempt_id: attempt_id.clone(),
+        action_id: action_id.clone(),
         primary_agent_generation: "f".repeat(32),
         configuration_signature: configuration_signature.clone(),
         observed_unix_seconds: i64::MAX,
+    };
+    let authority = RemoveReplicaTerminalCommitAuthority {
+        attempt: u32::MAX,
+        attempt_id,
+        action_id,
+        input_signature: maximum.clone(),
+        primary_agent_generation: "f".repeat(32),
+        configuration_signature: configuration_signature.clone(),
     };
     let accounting = RemoveReplicaActivityAccounting {
         external_effect_count: u64::MAX,
@@ -1512,6 +1597,7 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
     for terminal in [
         DurableRemoveReplicaPilotTerminal::Completed {
             snapshot: operation.target_snapshot.clone(),
+            authority,
             commit_evidence: commit_evidence.clone(),
             cleanup: cleanup.clone(),
             accounting,
@@ -2377,6 +2463,33 @@ mod remove_replica_pilot_tests {
     }
 
     #[test]
+    fn remove_replica_lifecycle_payload_does_not_weaken_direct_command_boundary() {
+        let initial = initial(DurableRemoveMode::ScaleDown);
+        let (operation, observations) = freeze_and_dispatch(DurableRemoveMode::ScaleDown);
+        let prepared = resolve_kind(
+            &initial,
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+        )
+        .unwrap();
+        let RemoveReplicaActivityKind::PreparedReplica { command } = prepared else {
+            panic!("expected prepared lifecycle command");
+        };
+        let mut pending = operation.pending_action.as_ref().unwrap().clone();
+        pending.dispatch_agent_generation = Some(command.expected_agent_generation.clone());
+        pending.dispatch_agent_control_version = Some(command.expected_control_version);
+        pending.dispatch_observed_runtime_epoch = Some(command.observed_runtime_epoch.clone());
+        pending.dispatch_action_payload = command.action_payload.clone();
+        assert!(ReplicaEffectCommand::from_pending(&pending).is_err());
+        assert_eq!(
+            ReplicaEffectCommand::from_lifecycle_pending(&pending).unwrap(),
+            command
+        );
+    }
+
+    #[test]
     fn remove_replica_pilot_requires_correlated_primary_connection_lifecycle_uid_and_role_evidence()
     {
         let initial = initial(DurableRemoveMode::ScaleDown);
@@ -2613,6 +2726,48 @@ mod remove_replica_pilot_tests {
             .unwrap(),
             DurableRemoveReplicaPilotTerminal::UnsafeAmbiguity { .. }
         ));
+    }
+
+    #[test]
+    fn completed_terminal_rejects_inexact_commit_authority_and_nonterminal_retirement() {
+        let initial = initial(DurableRemoveMode::ScaleDown);
+        let execution_id = ExecutionId::from_bytes([121; 16]);
+        let reference = DurableRemoveReplicaPilotExecution {
+            version: REMOVE_REPLICA_PILOT_VERSION,
+            execution_id: encode_execution_id(execution_id),
+            checkpoint_name: KubernetesCheckpointStore::object_name(execution_id),
+            initial_operation_json: serde_json::to_string(&initial).unwrap(),
+        };
+        let terminal = terminal_from_operation(
+            &completed_stages().completed,
+            RemoveReplicaActivityAccounting::default(),
+        )
+        .unwrap();
+        let outcome = encode_terminal(terminal.clone());
+        let loaded = validate_loaded_terminal(&reference, &outcome, 0);
+        assert!(loaded.is_ok(), "{loaded:?}");
+
+        let mut inexact = terminal.clone();
+        let DurableRemoveReplicaPilotTerminal::Completed { authority, .. } = &mut inexact else {
+            unreachable!();
+        };
+        authority.action_id.push_str("-drift");
+        assert!(
+            validate_loaded_terminal(&reference, &encode_terminal(inexact), 0)
+                .unwrap_err()
+                .contains("action identity")
+        );
+
+        let mut nonterminal = terminal;
+        let DurableRemoveReplicaPilotTerminal::Completed { cleanup, .. } = &mut nonterminal else {
+            unreachable!();
+        };
+        cleanup.target_retirement = Some(TargetRetirementObservationStatus::InProgress);
+        assert!(
+            validate_loaded_terminal(&reference, &encode_terminal(nonterminal), 0)
+                .unwrap_err()
+                .contains("cleanup evidence")
+        );
     }
 
     #[tokio::test]
@@ -3034,12 +3189,12 @@ mod remove_replica_pilot_tests {
         ));
     }
 
-    #[test]
-    fn remove_replica_pilot_restarts_at_every_durable_boundary_without_command_drift() {
+    #[tokio::test]
+    async fn remove_replica_pilot_restarts_at_every_durable_boundary_without_command_drift() {
         let initial = initial(DurableRemoveMode::ScaleDown);
         let (dispatched, _) = freeze_and_dispatch(DurableRemoveMode::ScaleDown);
         let stages = completed_stages();
-        for operation in [
+        for (index, operation) in [
             initial.clone(),
             dispatched,
             stages.committed,
@@ -3048,11 +3203,70 @@ mod remove_replica_pilot_tests {
             stages.publishing,
             stages.finalizing,
             stages.completed,
-        ] {
-            let state = DurableRemoveReplicaState::from_operation(&operation);
-            let encoded = serde_json::to_vec(&state).unwrap();
-            let replayed: DurableRemoveReplicaState = serde_json::from_slice(&encoded).unwrap();
-            assert_eq!(replayed.apply_to(&initial).unwrap(), operation);
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let kind = if operation.phase == DurableOperationPhase::RemoveAwaitCoordination {
+                resolve_kind(
+                    &initial,
+                    &operation,
+                    &observations(&operation),
+                    &pod_identities(),
+                    Some("secondary"),
+                )
+                .unwrap()
+            } else if operation.phase == DurableOperationPhase::RemoveDeleteTargetPod {
+                RemoveReplicaActivityKind::PreparedDelete {
+                    command: DeleteEffectCommand::new(3, "set-2".to_string(), "three".to_string()),
+                }
+            } else {
+                RemoveReplicaActivityKind::PassiveObservation
+            };
+            let input = DurableRemoveReplicaActivityInput {
+                version: REMOVE_REPLICA_PILOT_VERSION,
+                state: DurableRemoveReplicaState::from_operation(&operation),
+                kind,
+            };
+            let execution = ExecutionSpec::new(
+                ExecutionId::from_bytes([u8::try_from(index + 40).unwrap(); 16]),
+                ExactBytes::new(b"boundary-replay"),
+                REMOVE_REPLICA_PILOT_MAX_TERMINAL_BYTES,
+            );
+            let backend = InMemoryCheckpointStore::new();
+            let mut host = measured_host(
+                &execution,
+                backend.clone(),
+                u8::try_from(index + 70).unwrap(),
+            );
+            let HostOutcome::DispatchPermitted { permit, .. } = host
+                .turn_and_expose(
+                    &OneActivityWorkflow {
+                        input: input.clone(),
+                    },
+                    execution.clone(),
+                )
+                .await
+            else {
+                panic!("expected accepted boundary exposure");
+            };
+            let accepted = decode_remove_activity_input(permit.activity().spec().input()).unwrap();
+            assert_eq!(accepted, input);
+
+            let mut restarted =
+                measured_host(&execution, backend, u8::try_from(index + 90).unwrap());
+            let HostOutcome::Quarantined { activity, .. } = restarted
+                .turn(
+                    &OneActivityWorkflow {
+                        input: accepted.clone(),
+                    },
+                    execution,
+                )
+                .await
+            else {
+                panic!("expected quarantined accepted boundary after restart");
+            };
+            assert_eq!(activity.spec(), permit.activity().spec());
         }
     }
 
