@@ -2025,6 +2025,14 @@ mod tests {
             operation.pending_action.as_ref().unwrap().kind,
             DurableActionKind::RemoveReplicaIntent
         );
+        assert!(
+            operation
+                .pending_action
+                .as_ref()
+                .unwrap()
+                .dispatch_action_payload
+                .is_empty()
+        );
         let Decision::Execute {
             target_id,
             action_id,
@@ -2043,9 +2051,12 @@ mod tests {
         assert_eq!(target_id, 1);
         assert_eq!(action_id, intent.action_id);
         assert!(matches!(
-            action,
+            &action,
             DurableReplicaAction::RemoveReplicaIntent { .. }
         ));
+        assert!(
+            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(&action).is_err()
+        );
     }
 
     #[test]

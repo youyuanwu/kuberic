@@ -69,6 +69,39 @@ def segment_lines(segment: Segment) -> list[str]:
     return lines[start:end]
 
 
+def segment_locations(segment: Segment) -> set[tuple[str, int]]:
+    path = ROOT / segment.path
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if segment.boundary is None:
+        return {(segment.path, line) for line in range(1, len(lines) + 1)}
+    start_marker = f"// COMPLEXITY-BOUNDARY: {segment.boundary}:start"
+    end_marker = f"// COMPLEXITY-BOUNDARY: {segment.boundary}:end"
+    stripped = [line.strip() for line in lines]
+    try:
+        start = stripped.index(start_marker) + 2
+        end = stripped.index(end_marker) + 1
+    except ValueError as error:
+        raise SystemExit(
+            f"{path}: missing complexity boundary for {segment.boundary}"
+        ) from error
+    return {(segment.path, line) for line in range(start, end)}
+
+
+def validate_nonoverlapping(labels: list[str]) -> None:
+    occupied: dict[tuple[str, int], str] = {}
+    measurements = dict(MEASUREMENTS)
+    for label in labels:
+        for segment in measurements[label]:
+            for location in segment_locations(segment):
+                previous = occupied.get(location)
+                if previous is not None:
+                    raise SystemExit(
+                        f"complexity scopes overlap: {previous} and {label} at "
+                        f"{location[0]}:{location[1]}"
+                    )
+                occupied[location] = label
+
+
 def measure(segments: list[Segment]) -> tuple[int, int]:
     lines = [line for segment in segments for line in segment_lines(segment)]
     executable = [
@@ -84,6 +117,17 @@ def add(*values: tuple[int, int]) -> tuple[int, int]:
 
 
 def main() -> None:
+    validate_nonoverlapping(
+        [
+            "pilot_module",
+            "shared_operator_effect_adapters",
+            "pilot_store_integration",
+            "pilot_effect_bridge_integration",
+            "pilot_reconcile_integration",
+            "shared_kernel_typed",
+            "shared_kernel_fused",
+        ]
+    )
     measured = {label: measure(segments) for label, segments in MEASUREMENTS}
     print("implementation,executable_lines,decision_points")
     for label, _ in MEASUREMENTS:
@@ -118,10 +162,10 @@ def main() -> None:
     print(f"operator_integration,{integration[0]},{integration[1]}")
     print(f"pilot_nonoverlapping_total,{total[0]},{total[1]}")
     print(f"combined_explicit_shared_and_pilot_total,{combined[0]},{combined[1]}")
-    print("baseline_explicit,1258,141")
-    print("baseline_pilot_workflow_subset,538,73")
-    print("baseline_pilot_nonoverlapping_total,2254,194")
-    print("baseline_combined_explicit_and_pilot_total,3512,335")
+    print("baseline_explicit,1449,172")
+    print("baseline_pilot_workflow_subset,820,99")
+    print("baseline_pilot_nonoverlapping_total,3709,295")
+    print("baseline_combined_explicit_and_pilot_total,5158,467")
     print()
     print(
         "note: pilot_workflow_body is the new workflow-only scope; "
@@ -129,7 +173,8 @@ def main() -> None:
         "comparison; both are nested in pilot_module and are not added twice; shared "
         "reusable infrastructure is charged in pilot total but can amortize across "
         "workflows; the combined total also charges shared protocol changes retained "
-        "inside explicit_switchover"
+        "inside explicit_switchover; charged scopes are checked for line overlap before "
+        "totals are emitted"
     )
 
 

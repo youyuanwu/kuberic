@@ -6,7 +6,7 @@
 //! lifecycle policy.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, OnceLock},
 };
 
@@ -18,8 +18,9 @@ use kuberic_durable_execution::{
     DurableHost, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch,
     InMemoryCheckpointStore, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, LogicalActivityId,
-    StorageRevision, StoreError, StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
-    decode_activity_input, decode_activity_result, encode_activity_input, encode_activity_result,
+    PreparedActivityError, PreparedActivityResolver, StorageRevision, StoreError, StoredCheckpoint,
+    TerminalOutcome, Workflow, WorkflowContext, decode_activity_input, decode_activity_result,
+    encode_activity_input, encode_activity_result,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,10 @@ use crate::crd::{
     PendingActionStatus, StablePartitionSnapshotStatus,
 };
 
+use super::effects::{
+    LabelEffectCommand, PilotEffectPreparationError, ReplicaEffectCommand, exact_label_command,
+    prepare_replica_effect_command, validate_pilot_replica_action_kind,
+};
 use super::pilot_store::MeasuredPilotCheckpointStore;
 use super::{
     Decision, OperationObservations, decide, start_switchover,
@@ -45,12 +50,14 @@ pub const PILOT_MAX_REPLICAS: usize = 3;
 pub const PILOT_MAX_ACTIVITY_RECORDS: usize = 32;
 pub const PILOT_MAX_TRANSITION_FUEL: usize = 64;
 pub const PILOT_MAX_OPERATION_BYTES: usize = 3_000;
+pub const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = 8_192;
 pub const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = 4_096;
 pub const PILOT_MAX_TERMINAL_BYTES: u64 = 4_096;
 pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 752 * 1_024;
 
 const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.effect-boundary";
 const PILOT_ACTIVITY_VERSION: u32 = 1;
+const MAX_COMPLETED_MEASUREMENT_SNAPSHOTS: usize = 64;
 
 #[derive(Clone)]
 pub enum PilotCheckpointStore {
@@ -114,6 +121,8 @@ pub struct DurableSwitchoverPilotRuntime {
     factory: PilotStoreFactory,
     host_epoch: HostEpoch,
     hosts: Mutex<HashMap<PilotHostKey, Arc<Mutex<PilotHost>>>>,
+    completed_measurements:
+        Mutex<HashMap<PilotHostKey, super::pilot_store::PilotCheckpointMeasurementsSnapshot>>,
 }
 
 impl DurableSwitchoverPilotRuntime {
@@ -122,6 +131,7 @@ impl DurableSwitchoverPilotRuntime {
             factory: PilotStoreFactory::Kubernetes(client),
             host_epoch: HostEpoch::from_bytes(random()),
             hosts: Mutex::new(HashMap::new()),
+            completed_measurements: Mutex::new(HashMap::new()),
         }
     }
 
@@ -130,6 +140,7 @@ impl DurableSwitchoverPilotRuntime {
             factory: PilotStoreFactory::InMemory(store),
             host_epoch: HostEpoch::from_bytes(random()),
             hosts: Mutex::new(HashMap::new()),
+            completed_measurements: Mutex::new(HashMap::new()),
         }
     }
 
@@ -151,6 +162,7 @@ impl DurableSwitchoverPilotRuntime {
         if let Some(host) = hosts.get(&key) {
             return Ok(host.clone());
         }
+        self.completed_measurements.lock().await.remove(&key);
         let store = match &self.factory {
             PilotStoreFactory::Kubernetes(client) => {
                 let options = checkpoint_store_options(namespace, set_name, set_uid)?;
@@ -178,12 +190,23 @@ impl DurableSwitchoverPilotRuntime {
     }
 
     pub async fn forget(&self, namespace: &str, set_name: &str, set_uid: &str, execution_id: &str) {
-        self.hosts.lock().await.remove(&PilotHostKey {
+        let key = PilotHostKey {
             namespace: namespace.to_string(),
             set_name: set_name.to_string(),
             set_uid: set_uid.to_string(),
             execution_id: execution_id.to_string(),
-        });
+        };
+        let host = self.hosts.lock().await.remove(&key);
+        if let Some(host) = host {
+            let measurements = host.lock().await.store().measurements();
+            let mut completed = self.completed_measurements.lock().await;
+            if completed.len() == MAX_COMPLETED_MEASUREMENT_SNAPSHOTS {
+                if let Some(eviction_candidate) = completed.keys().next().cloned() {
+                    completed.remove(&eviction_candidate);
+                }
+            }
+            completed.insert(key, measurements);
+        }
     }
 
     pub async fn host_count(&self) -> usize {
@@ -197,18 +220,16 @@ impl DurableSwitchoverPilotRuntime {
         set_uid: &str,
         execution_id: &str,
     ) -> Option<super::pilot_store::PilotCheckpointMeasurementsSnapshot> {
-        let host = self
-            .hosts
-            .lock()
-            .await
-            .get(&PilotHostKey {
-                namespace: namespace.to_string(),
-                set_name: set_name.to_string(),
-                set_uid: set_uid.to_string(),
-                execution_id: execution_id.to_string(),
-            })
-            .cloned()?;
-        Some(host.lock().await.store().measurements())
+        let key = PilotHostKey {
+            namespace: namespace.to_string(),
+            set_name: set_name.to_string(),
+            set_uid: set_uid.to_string(),
+            execution_id: execution_id.to_string(),
+        };
+        if let Some(host) = self.hosts.lock().await.get(&key).cloned() {
+            return Some(host.lock().await.store().measurements());
+        }
+        self.completed_measurements.lock().await.get(&key).copied()
     }
 }
 
@@ -266,6 +287,43 @@ impl DurableSwitchoverState {
 pub struct DurableSwitchoverActivityInput {
     pub version: u32,
     pub state: DurableSwitchoverState,
+    #[serde(default)]
+    pub kind: PilotActivityKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PilotActivityKind {
+    #[default]
+    PassiveObservation,
+    PreparedReplica {
+        command: ReplicaEffectCommand,
+    },
+    PreparedLabel {
+        command: LabelEffectCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PilotActivityAccounting {
+    pub external_effect_count: u64,
+    pub passive_observation_count: u64,
+}
+
+impl PilotActivityAccounting {
+    pub const fn new(external_effect_count: u64, passive_observation_count: u64) -> Self {
+        Self {
+            external_effect_count,
+            passive_observation_count,
+        }
+    }
+
+    pub fn matches_completed_activity_count(self, completed_activity_count: u64) -> bool {
+        self.external_effect_count
+            .checked_add(self.passive_observation_count)
+            == Some(completed_activity_count)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -283,6 +341,8 @@ pub enum DurableSwitchoverStepResult {
         operation: DurableSwitchoverState,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounting: Option<PilotActivityAccounting>,
     },
     Stopped {
         operation: DurableSwitchoverState,
@@ -298,7 +358,7 @@ impl DurableActivity for DurableSwitchoverActivity {
 
     const NAME: &'static str = PILOT_ACTIVITY_NAME;
     const VERSION: u32 = PILOT_ACTIVITY_VERSION;
-    const MAX_INPUT_BYTES: u64 = PILOT_MAX_OPERATION_BYTES as u64;
+    const MAX_INPUT_BYTES: u64 = PILOT_MAX_ACTIVITY_INPUT_BYTES as u64;
     const MAX_RESULT_BYTES: u64 = PILOT_MAX_ACTIVITY_RESULT_BYTES as u64;
 }
 
@@ -308,6 +368,7 @@ pub enum DurableSwitchoverPilotTerminal {
         operation: DurableOperationStatus,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+        accounting: PilotActivityAccounting,
     },
     Stopped {
         operation: Option<DurableOperationStatus>,
@@ -322,11 +383,27 @@ enum DurableSwitchoverTerminalRecord {
         state: DurableSwitchoverState,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+        #[serde(default)]
+        accounting: PilotActivityAccounting,
     },
     Stopped {
         state: Option<DurableSwitchoverState>,
         message: String,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum DurableSwitchoverTerminalAccountingRecord {
+    Complete {
+        state: Box<DurableSwitchoverState>,
+        snapshot: StablePartitionSnapshotStatus,
+        #[serde(default)]
+        compensated: bool,
+        #[serde(default)]
+        accounting: Option<PilotActivityAccounting>,
+    },
+    Stopped {},
 }
 
 // COMPLEXITY-BOUNDARY: pilot-workflow:start
@@ -392,6 +469,7 @@ impl Workflow for DurableSwitchoverWorkflow {
                 .call::<DurableSwitchoverActivity>(DurableSwitchoverActivityInput {
                     version: PILOT_VERSION,
                     state: state.clone(),
+                    kind: PilotActivityKind::PassiveObservation,
                 })
                 .await
             {
@@ -461,6 +539,7 @@ impl Workflow for DurableSwitchoverWorkflow {
                     operation: completed_state,
                     snapshot,
                     compensated,
+                    accounting,
                 } => {
                     let completed = match completed_state.apply_to(&initial) {
                         Ok(completed) => completed,
@@ -474,10 +553,36 @@ impl Workflow for DurableSwitchoverWorkflow {
                     if let Err(error) = validate_terminal(&completed, &snapshot, compensated) {
                         return terminal_failure(Some(operation), error);
                     }
+                    let Some(accounting) = accounting else {
+                        return terminal_failure(
+                            Some(operation),
+                            "pilot completion is missing authoritative activity accounting"
+                                .to_string(),
+                        );
+                    };
+                    let Some(completed_activity_count) = accounting
+                        .external_effect_count
+                        .checked_add(accounting.passive_observation_count)
+                    else {
+                        return terminal_failure(
+                            Some(operation),
+                            "pilot terminal activity accounting overflowed".to_string(),
+                        );
+                    };
+                    if let Err(error) = validate_terminal_activity_accounting(
+                        &initial,
+                        &completed,
+                        compensated,
+                        accounting,
+                        completed_activity_count,
+                    ) {
+                        return terminal_failure(Some(operation), error);
+                    }
                     return terminal_success(DurableSwitchoverPilotTerminal::Complete {
                         operation: completed,
                         snapshot,
                         compensated,
+                        accounting,
                     });
                 }
                 DurableSwitchoverStepResult::Stopped {
@@ -556,6 +661,12 @@ pub fn encode_step_result(result: &DurableSwitchoverStepResult) -> Result<ExactB
 }
 
 pub fn decode_activity_input_state(input: &ExactBytes) -> Result<DurableSwitchoverState, String> {
+    Ok(decode_pilot_activity_input(input)?.state)
+}
+
+pub fn decode_pilot_activity_input(
+    input: &ExactBytes,
+) -> Result<DurableSwitchoverActivityInput, String> {
     let input = decode_activity_input::<DurableSwitchoverActivity>(input)
         .map_err(|error| format!("decode current durable switchover activity: {error}"))?;
     if input.version != PILOT_VERSION {
@@ -564,7 +675,109 @@ pub fn decode_activity_input_state(input: &ExactBytes) -> Result<DurableSwitchov
             input.version
         ));
     }
-    Ok(input.state)
+    Ok(input)
+}
+
+pub fn validate_prepared_activity(
+    operation: &DurableOperationStatus,
+    kind: &PilotActivityKind,
+) -> Result<(), String> {
+    match kind {
+        PilotActivityKind::PassiveObservation => Ok(()),
+        PilotActivityKind::PreparedReplica { command } => {
+            let pending = operation
+                .pending_action
+                .as_ref()
+                .ok_or_else(|| "prepared replica activity has no pending action".to_string())?;
+            let expected = ReplicaEffectCommand::from_pending(pending)?;
+            if &expected != command {
+                return Err(
+                    "prepared replica activity differs from frozen pending action".to_string(),
+                );
+            }
+            let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+                &command.action_payload,
+            )
+            .map_err(|error| format!("decode prepared replica activity: {error}"))?;
+            let signature_matches = action.signature() == command.action_signature;
+            let kind_matches = validate_pilot_replica_action_kind(pending.kind, &action);
+            let fixed_semantics_match =
+                action_matches_fixed_operation_semantics(operation, pending, &action);
+            if !signature_matches || !kind_matches || !fixed_semantics_match {
+                return Err(format!(
+                    "prepared replica activity has invalid action identity \
+                     (kind={:?}, signature_matches={signature_matches}, \
+                     kind_matches={kind_matches}, \
+                     fixed_semantics_match={fixed_semantics_match})",
+                    pending.kind
+                ));
+            }
+            Ok(())
+        }
+        PilotActivityKind::PreparedLabel { command } => {
+            let pending = operation
+                .pending_action
+                .as_ref()
+                .ok_or_else(|| "prepared label activity has no pending action".to_string())?;
+            let expected_uid = operation
+                .previous_snapshot
+                .members
+                .iter()
+                .chain(operation.target_snapshot.members.iter())
+                .find(|member| member.id == command.target_id)
+                .map(|member| member.instance_id.as_str());
+            let expected_role = match pending.kind {
+                crate::crd::DurableActionKind::LabelTargetPrimary
+                | crate::crd::DurableActionKind::CompensateLabelOldPrimary => Some("primary"),
+                crate::crd::DurableActionKind::LabelOldSecondary
+                | crate::crd::DurableActionKind::CompensateLabelTargetSecondary => {
+                    Some("secondary")
+                }
+                _ => None,
+            };
+            if command.target_id != pending.target_id
+                || command.expected_uid != pending.target_instance_id
+                || expected_uid != Some(command.expected_uid.as_str())
+                || command.pod_name.is_empty()
+                || expected_role != Some(command.role.as_str())
+                || !command.has_valid_identity_signature()
+            {
+                return Err("prepared label activity has invalid UID-fenced identity".to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn action_matches_fixed_operation_semantics(
+    operation: &DurableOperationStatus,
+    pending: &PendingActionStatus,
+    action: &kuberic_core::types::DurableReplicaAction,
+) -> bool {
+    use kuberic_core::types::{DurableReplicaAction, Role};
+    let target_epoch = &operation.target_snapshot.epoch;
+    let has_target_epoch = |epoch: &kuberic_core::types::Epoch| {
+        epoch.data_loss_number == target_epoch.data_loss_number
+            && epoch.configuration_number == target_epoch.configuration_number
+    };
+    match action {
+        DurableReplicaAction::ChangeRole { epoch, role } => {
+            let expected_role =
+                pending
+                    .desired_postcondition
+                    .role
+                    .as_ref()
+                    .map(|role| match role {
+                        crate::crd::StableReplicaRoleStatus::Primary => Role::Primary,
+                        crate::crd::StableReplicaRoleStatus::ActiveSecondary => {
+                            Role::ActiveSecondary
+                        }
+                    });
+            has_target_epoch(epoch) && expected_role.as_ref() == Some(role)
+        }
+        DurableReplicaAction::UpdateEpoch { epoch } => has_target_epoch(epoch),
+        _ => true,
+    }
 }
 
 pub fn decode_activity_step_result(
@@ -586,10 +799,12 @@ pub fn decode_terminal(
             state,
             snapshot,
             compensated,
+            accounting,
         } => DurableSwitchoverPilotTerminal::Complete {
             operation: state.apply_to(initial)?,
             snapshot,
             compensated,
+            accounting,
         },
         DurableSwitchoverTerminalRecord::Stopped { state, message } => {
             DurableSwitchoverPilotTerminal::Stopped {
@@ -600,9 +815,42 @@ pub fn decode_terminal(
     })
 }
 
+pub fn decode_terminal_activity_accounting(
+    outcome: &TerminalOutcome,
+    completed_activity_count: u64,
+) -> Result<Option<PilotActivityAccounting>, String> {
+    let record: DurableSwitchoverTerminalAccountingRecord =
+        serde_json::from_slice(outcome.payload().as_slice()).map_err(|error| {
+            format!("decode durable switchover terminal activity accounting: {error}")
+        })?;
+    Ok(match (outcome, record) {
+        (
+            TerminalOutcome::Succeeded(_),
+            DurableSwitchoverTerminalAccountingRecord::Complete {
+                state,
+                snapshot,
+                compensated,
+                accounting: Some(accounting),
+            },
+        ) if validate_terminal_accounting_shape(
+            TerminalAccountingContext::from_state(&state),
+            snapshot.members.len(),
+            compensated,
+            accounting,
+            completed_activity_count,
+        )
+        .is_ok() =>
+        {
+            Some(accounting)
+        }
+        _ => None,
+    })
+}
+
 pub fn validate_loaded_terminal(
     reference: &DurableSwitchoverPilotStatus,
     outcome: &TerminalOutcome,
+    completed_activity_count: u64,
 ) -> Result<DurableSwitchoverPilotTerminal, String> {
     let initial = initial_operation(reference)?;
     validate_pilot_admission(&initial)?;
@@ -614,10 +862,18 @@ pub fn validate_loaded_terminal(
                 operation,
                 snapshot,
                 compensated,
+                accounting,
             },
         ) => {
             validate_transition(&initial, operation)?;
             validate_terminal(operation, snapshot, *compensated)?;
+            validate_terminal_activity_accounting(
+                &initial,
+                operation,
+                *compensated,
+                *accounting,
+                completed_activity_count,
+            )?;
         }
         (
             TerminalOutcome::Failed(_),
@@ -672,11 +928,7 @@ pub fn evaluate_adapter_step(
             operation,
             snapshot,
             compensated,
-        } => PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Complete {
-            operation: DurableSwitchoverState::from_operation(&operation),
-            snapshot,
-            compensated,
-        })),
+        } => terminal_adapter_decision(operation, snapshot, compensated),
         Decision::Wait => PilotAdapterDecision::AwaitEvidence,
         external @ (Decision::Execute { .. }
         | Decision::PatchPodRole { .. }
@@ -689,6 +941,228 @@ pub fn evaluate_adapter_step(
             ));
         }
     })
+}
+
+fn terminal_adapter_decision(
+    operation: DurableOperationStatus,
+    snapshot: StablePartitionSnapshotStatus,
+    compensated: bool,
+) -> PilotAdapterDecision {
+    let terminal_state = DurableSwitchoverState::from_operation(&operation);
+    if compensated
+        && projected_compensation_transcripts(
+            TerminalAccountingContext::from_state(&terminal_state),
+            operation.previous_snapshot.members.len(),
+        )
+        .is_empty()
+    {
+        let message = operation.last_error.clone().unwrap_or_else(|| {
+            "durable switchover failed before a compensation path completed".to_string()
+        });
+        let mut stopped = operation;
+        stopped.phase = DurableOperationPhase::Poisoned;
+        stopped.pending_action = None;
+        stopped.last_error = Some(message.clone());
+        PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Stopped {
+            operation: DurableSwitchoverState::from_operation(&stopped),
+            message,
+        }))
+    } else {
+        PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Complete {
+            operation: terminal_state,
+            snapshot,
+            compensated,
+            accounting: None,
+        }))
+    }
+}
+
+pub struct PilotPreparedActivityResolver<'a> {
+    initial: &'a DurableOperationStatus,
+    observations: &'a OperationObservations,
+    addressed_instances: &'a BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+    now: i64,
+}
+
+impl<'a> PilotPreparedActivityResolver<'a> {
+    pub fn new(
+        initial: &'a DurableOperationStatus,
+        observations: &'a OperationObservations,
+        addressed_instances: &'a BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+        now: i64,
+    ) -> Self {
+        Self {
+            initial,
+            observations,
+            addressed_instances,
+            now,
+        }
+    }
+
+    fn prepare(
+        &self,
+        logical: &DurableSwitchoverActivityInput,
+    ) -> Result<DurableSwitchoverActivityInput, PreparedActivityError> {
+        if logical.version != PILOT_VERSION || logical.kind != PilotActivityKind::PassiveObservation
+        {
+            return Err(PreparedActivityError::Validation);
+        }
+        let operation = logical
+            .state
+            .apply_to(self.initial)
+            .map_err(|_| PreparedActivityError::Validation)?;
+        let decision = evaluate_adapter_step(&operation, self.observations, self.now)
+            .map_err(|_| PreparedActivityError::Derivation)?;
+        let mut prepared = logical.clone();
+        match decision {
+            PilotAdapterDecision::Observe(_) => {}
+            PilotAdapterDecision::AwaitEvidence => {
+                if operation.pending_action.is_some() {
+                    return Err(PreparedActivityError::Derivation);
+                }
+            }
+            PilotAdapterDecision::External(decision) => match *decision {
+                Decision::Execute {
+                    target_id,
+                    action_id,
+                    action,
+                } => {
+                    let pending = operation
+                        .pending_action
+                        .as_ref()
+                        .ok_or(PreparedActivityError::Validation)?;
+                    if pending.action_id != action_id || pending.target_id != target_id {
+                        return Err(PreparedActivityError::Validation);
+                    }
+                    let observed = self
+                        .observations
+                        .get(&target_id)
+                        .ok_or(PreparedActivityError::Derivation)?;
+                    let addressed = self
+                        .addressed_instances
+                        .get(&target_id)
+                        .ok_or(PreparedActivityError::Derivation)?;
+                    let (planned, command) = prepare_replica_effect_command(
+                        pending,
+                        &observed.status,
+                        addressed,
+                        &action,
+                    )
+                    .map_err(preparation_error)?;
+                    let mut operation = operation;
+                    operation.pending_action = Some(planned);
+                    prepared.state = DurableSwitchoverState::from_operation(&operation);
+                    prepared.kind = PilotActivityKind::PreparedReplica { command };
+                }
+                Decision::PatchPodRole { target_id, role } => {
+                    let command =
+                        exact_label_command(&operation, target_id, &role, self.observations)
+                            .map_err(|_| PreparedActivityError::Derivation)?;
+                    prepared.kind = PilotActivityKind::PreparedLabel { command };
+                }
+                Decision::PatchPodRoleExactUid {
+                    target_id,
+                    expected_uid,
+                    role,
+                } => {
+                    let command =
+                        exact_label_command(&operation, target_id, &role, self.observations)
+                            .map_err(|_| PreparedActivityError::Derivation)?;
+                    if command.expected_uid != expected_uid {
+                        return Err(PreparedActivityError::Validation);
+                    }
+                    prepared.kind = PilotActivityKind::PreparedLabel { command };
+                }
+                _ => return Err(PreparedActivityError::Validation),
+            },
+        }
+        Ok(prepared)
+    }
+
+    fn validate_recorded(
+        &self,
+        logical: &DurableSwitchoverActivityInput,
+        recorded: &DurableSwitchoverActivityInput,
+    ) -> Result<(), PreparedActivityError> {
+        if logical.version != PILOT_VERSION
+            || recorded.version != PILOT_VERSION
+            || logical.kind != PilotActivityKind::PassiveObservation
+        {
+            return Err(PreparedActivityError::Validation);
+        }
+        let mut logical_predecessor = recorded.state.clone();
+        if let Some(pending) = logical_predecessor.pending_action.as_mut() {
+            pending.dispatch_agent_generation = None;
+            pending.dispatch_agent_control_version = None;
+            pending.dispatch_observed_runtime_epoch = None;
+            pending.dispatch_action_payload.clear();
+        }
+        if recorded.state != logical.state && logical_predecessor != logical.state {
+            return Err(PreparedActivityError::Validation);
+        }
+        let operation = recorded
+            .state
+            .apply_to(self.initial)
+            .map_err(|_| PreparedActivityError::Validation)?;
+        if matches!(recorded.kind, PilotActivityKind::PassiveObservation)
+            && recorded.state != logical.state
+        {
+            return Err(PreparedActivityError::Validation);
+        }
+        validate_prepared_activity(&operation, &recorded.kind)
+            .map_err(|_| PreparedActivityError::Validation)
+    }
+}
+
+impl PreparedActivityResolver for PilotPreparedActivityResolver<'_> {
+    fn resolve(
+        &self,
+        logical: &ActivitySpec,
+        recorded: Option<&ActivitySpec>,
+    ) -> Result<ActivitySpec, PreparedActivityError> {
+        let logical_input = decode_activity_input::<DurableSwitchoverActivity>(logical.input())
+            .map_err(|_| PreparedActivityError::Encoding)?;
+        if let Some(recorded) = recorded {
+            if recorded.name() != logical.name()
+                || recorded.max_result_bytes() != logical.max_result_bytes()
+            {
+                return Ok(logical.clone());
+            }
+            let Ok(recorded_input) =
+                decode_activity_input::<DurableSwitchoverActivity>(recorded.input())
+            else {
+                return Ok(logical.clone());
+            };
+            if self
+                .validate_recorded(&logical_input, &recorded_input)
+                .is_err()
+            {
+                return Ok(logical.clone());
+            }
+            return Ok(recorded.clone());
+        }
+        let prepared = self.prepare(&logical_input)?;
+        let spec = activity_spec(&prepared).map_err(|_| PreparedActivityError::Encoding)?;
+        let actual_bytes = u64::try_from(spec.input().as_slice().len())
+            .map_err(|_| PreparedActivityError::Encoding)?;
+        if actual_bytes > DurableSwitchoverActivity::MAX_INPUT_BYTES {
+            return Err(PreparedActivityError::InputTooLarge {
+                actual_bytes,
+                max_bytes: DurableSwitchoverActivity::MAX_INPUT_BYTES,
+            });
+        }
+        Ok(spec)
+    }
+}
+
+fn preparation_error(error: PilotEffectPreparationError) -> PreparedActivityError {
+    match error {
+        PilotEffectPreparationError::WaitForExactIncarnation
+        | PilotEffectPreparationError::WaitForSupportedProtocol => {
+            PreparedActivityError::Derivation
+        }
+        PilotEffectPreparationError::InvalidCommand => PreparedActivityError::Validation,
+    }
 }
 
 pub struct PilotPermitGuard {
@@ -705,15 +1179,26 @@ impl PilotPermitGuard {
     pub fn consume_for(
         &mut self,
         operation: &DurableOperationStatus,
+        prepared: &PilotActivityKind,
+        expected_activity: &LogicalActivityId,
+        attempt_id: kuberic_durable_execution::AttemptId,
     ) -> Result<DispatchPermit, String> {
-        let expected = activity_spec(operation)?;
+        let expected = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: DurableSwitchoverState::from_operation(operation),
+            kind: prepared.clone(),
+        })?;
         let permit = self
             .permit
             .as_ref()
             .ok_or_else(|| "durable switchover dispatch permit was already consumed".to_string())?;
-        if permit.activity().spec() != &expected {
+        if permit.attempt_id() != attempt_id
+            || permit.activity() != expected_activity
+            || permit.activity().spec() != &expected
+        {
             return Err(
-                "durable switchover dispatch permit does not match current operation".to_string(),
+                "durable switchover dispatch permit does not match prepared operation or attempt"
+                    .to_string(),
             );
         }
         Ok(self
@@ -727,15 +1212,11 @@ impl PilotPermitGuard {
     }
 }
 
-fn activity_spec(operation: &DurableOperationStatus) -> Result<ActivitySpec, String> {
-    let input = DurableSwitchoverActivityInput {
-        version: PILOT_VERSION,
-        state: DurableSwitchoverState::from_operation(operation),
-    };
+fn activity_spec(input: &DurableSwitchoverActivityInput) -> Result<ActivitySpec, String> {
     Ok(ActivitySpec::new(
         ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
             .map_err(|error| format!("construct pilot activity name: {error}"))?,
-        encode_activity_input::<DurableSwitchoverActivity>(&input)
+        encode_activity_input::<DurableSwitchoverActivity>(input)
             .map_err(|error| format!("serialize pilot activity input: {error}"))?,
         PILOT_MAX_ACTIVITY_RESULT_BYTES as u64,
     ))
@@ -846,10 +1327,12 @@ fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactByt
             operation,
             snapshot,
             compensated,
+            accounting,
         } => DurableSwitchoverTerminalRecord::Complete {
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: snapshot.clone(),
             compensated: *compensated,
+            accounting: *accounting,
         },
         DurableSwitchoverPilotTerminal::Stopped { operation, message } => {
             DurableSwitchoverTerminalRecord::Stopped {
@@ -1015,16 +1498,19 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
         .previous_snapshot
         .as_ref()
         .ok_or_else(|| "durable switchover pilot has no previous snapshot".to_string())?;
-    let success_steps = projected_success_steps(previous_snapshot.members.len());
-    let rollback_steps = projected_rollback_steps(previous_snapshot.members.len());
-    let projected_steps = success_steps.len().max(rollback_steps.len());
+    let success = projected_success_transcript(previous_snapshot.members.len());
+    let rollback = projected_rollback_transcript(previous_snapshot.members.len());
+    let projected_steps = success
+        .maximum_activity_count()
+        .max(rollback.maximum_activity_count());
     if projected_steps > PILOT_MAX_ACTIVITY_RECORDS {
         return Err(format!(
             "durable switchover requires {projected_steps} projected activities; maximum is {PILOT_MAX_ACTIVITY_RECORDS}"
         ));
     }
-    let projected_transitions = (success_steps.len() + projected_success_pure_transitions())
-        .max(rollback_steps.len() + projected_rollback_pure_transitions());
+    let projected_transitions = (success.maximum_activity_count()
+        + projected_success_pure_transitions())
+    .max(rollback.maximum_activity_count() + projected_rollback_pure_transitions());
     if projected_transitions > PILOT_MAX_TRANSITION_FUEL {
         return Err(format!(
             "durable switchover requires {projected_transitions} projected transitions; maximum is {PILOT_MAX_TRANSITION_FUEL}"
@@ -1073,37 +1559,303 @@ fn maximum_projected_checkpoint_bytes() -> Result<usize, String> {
         .clone()
 }
 
-fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
-    let mut steps = vec![
-        "revoke.observe",
-        "revoke.effect",
-        "capture-lsn",
-        "target-catch-up",
-        "demote.observe",
-        "demote.effect",
-        "promote.observe",
-        "promote.effect",
-    ];
-    for _ in 0..member_count.saturating_sub(2) {
-        steps.extend(["epoch.observe", "epoch.effect"]);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectedActivityKind {
+    ReplicaEffect,
+    OtherExternalEffect,
+    PassiveObservation,
+    ExternalOrPassive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProjectedActivity {
+    name: &'static str,
+    kind: ProjectedActivityKind,
+}
+
+impl ProjectedActivity {
+    const fn replica_effect(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::ReplicaEffect,
+        }
     }
-    steps.extend([
-        "catch-up-config.observe",
-        "catch-up-config.effect",
-        "quorum.observe",
-        "quorum.effect",
-        "current-config.observe",
-        "current-config.effect",
-        "target-label.effect",
-        "old-label.effect",
-        "final-attestation",
-    ]);
-    let redelivery_headroom = external_effect_count(&steps);
-    steps.extend(std::iter::repeat_n(
-        "proven-no-admission-redelivery",
-        redelivery_headroom,
+
+    const fn external_effect(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::OtherExternalEffect,
+        }
+    }
+
+    const fn passive(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::PassiveObservation,
+        }
+    }
+
+    const fn external_or_passive(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::ExternalOrPassive,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectedTranscript {
+    activities: Vec<ProjectedActivity>,
+}
+
+impl ProjectedTranscript {
+    fn new(activities: Vec<ProjectedActivity>) -> Self {
+        Self { activities }
+    }
+
+    #[cfg(test)]
+    fn maximum_external_effect_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| {
+                matches!(
+                    activity.kind,
+                    ProjectedActivityKind::ReplicaEffect
+                        | ProjectedActivityKind::OtherExternalEffect
+                        | ProjectedActivityKind::ExternalOrPassive
+                )
+            })
+            .count()
+    }
+
+    fn redelivery_slot_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| activity.kind == ProjectedActivityKind::ReplicaEffect)
+            .count()
+    }
+
+    fn maximum_activity_count(&self) -> usize {
+        self.activities.len() + self.redelivery_slot_count()
+    }
+
+    fn required_external_effect_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| {
+                matches!(
+                    activity.kind,
+                    ProjectedActivityKind::ReplicaEffect
+                        | ProjectedActivityKind::OtherExternalEffect
+                )
+            })
+            .count()
+    }
+
+    fn required_passive_observation_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| activity.kind == ProjectedActivityKind::PassiveObservation)
+            .count()
+    }
+
+    fn flexible_activity_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| activity.kind == ProjectedActivityKind::ExternalOrPassive)
+            .count()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, name: &str) -> bool {
+        self.activities.iter().any(|activity| activity.name == name)
+    }
+
+    /// Returns whether the accounting is produced by one valid base
+    /// transcript plus zero or one proven-no-admission redelivery for each
+    /// activity that was actually exposed as an external effect.
+    fn contains_accounting(&self, accounting: PilotActivityAccounting) -> bool {
+        let required_external = self.required_external_effect_count();
+        let required_passive = self.required_passive_observation_count();
+        let flexible = self.flexible_activity_count();
+        (0..=flexible).any(|external_flexible| {
+            let base_external = required_external + external_flexible;
+            let passive = required_passive + flexible - external_flexible;
+            let maximum_external = base_external + self.redelivery_slot_count();
+            usize::try_from(accounting.passive_observation_count) == Ok(passive)
+                && usize::try_from(accounting.external_effect_count)
+                    .is_ok_and(|external| (base_external..=maximum_external).contains(&external))
+        })
+    }
+}
+
+fn projected_success_transcript(member_count: usize) -> ProjectedTranscript {
+    let mut activities = vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("demote.effect"),
+        ProjectedActivity::replica_effect("promote.effect"),
+    ];
+    activities.extend(std::iter::repeat_n(
+        ProjectedActivity::replica_effect("epoch.effect"),
+        member_count.saturating_sub(2),
     ));
-    steps
+    activities.extend([
+        ProjectedActivity::replica_effect("catch-up-config.effect"),
+        ProjectedActivity::replica_effect("quorum.effect"),
+        ProjectedActivity::replica_effect("current-config.effect"),
+        ProjectedActivity::external_effect("target-label.effect"),
+        ProjectedActivity::external_effect("old-label.effect"),
+        ProjectedActivity::passive("final-attestation"),
+    ]);
+    ProjectedTranscript::new(activities)
+}
+
+fn projected_pre_catch_up_restore_transcript() -> ProjectedTranscript {
+    ProjectedTranscript::new(vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("restore-previous.effect"),
+        ProjectedActivity::passive("rollback-final-attestation"),
+    ])
+}
+
+fn projected_demote_restore_transcript() -> ProjectedTranscript {
+    ProjectedTranscript::new(vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("demote.effect"),
+        ProjectedActivity::replica_effect("restore-previous.effect"),
+        ProjectedActivity::passive("rollback-final-attestation"),
+    ])
+}
+
+fn is_full_pilot_start(initial: &DurableOperationStatus) -> bool {
+    initial.phase == DurableOperationPhase::Revoke
+        && initial.pending_action.is_none()
+        && initial.frozen_lsn.is_none()
+        && initial.next_secondary_index == 0
+        && (2..=PILOT_MAX_REPLICAS).contains(&initial.previous_snapshot.members.len())
+}
+
+fn validate_terminal_activity_accounting(
+    initial: &DurableOperationStatus,
+    terminal: &DurableOperationStatus,
+    compensated: bool,
+    accounting: PilotActivityAccounting,
+    completed_activity_count: u64,
+) -> Result<(), String> {
+    if !is_full_pilot_start(initial) {
+        return Ok(());
+    }
+    validate_terminal_accounting_shape(
+        TerminalAccountingContext::from_state(&DurableSwitchoverState::from_operation(terminal)),
+        initial.previous_snapshot.members.len(),
+        compensated,
+        accounting,
+        completed_activity_count,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalAccountingContext {
+    phase: DurableOperationPhase,
+    frozen_lsn: Option<i64>,
+    next_secondary_index: u32,
+    has_pending_action: bool,
+    has_last_error: bool,
+}
+
+impl TerminalAccountingContext {
+    fn from_state(state: &DurableSwitchoverState) -> Self {
+        Self {
+            phase: state.phase,
+            frozen_lsn: state.frozen_lsn,
+            next_secondary_index: state.next_secondary_index,
+            has_pending_action: state.pending_action.is_some(),
+            has_last_error: state.last_error.is_some(),
+        }
+    }
+}
+
+fn validate_terminal_accounting_shape(
+    terminal: TerminalAccountingContext,
+    member_count: usize,
+    compensated: bool,
+    accounting: PilotActivityAccounting,
+    completed_activity_count: u64,
+) -> Result<(), String> {
+    if !accounting.matches_completed_activity_count(completed_activity_count) {
+        return Err(format!(
+            "pilot terminal activity accounting {}/{} does not total the authoritative \
+             completed activity count {completed_activity_count}",
+            accounting.external_effect_count, accounting.passive_observation_count,
+        ));
+    }
+
+    if !compensated {
+        let projection = projected_success_transcript(member_count);
+        if terminal.phase != DurableOperationPhase::Completed
+            || terminal.has_pending_action
+            || !projection.contains_accounting(accounting)
+        {
+            return Err(format!(
+                "successful full pilot requires exactly three passive observations and 9..=16 \
+                 external effects (the base nine plus at most one projected redelivery per \
+                 ReplicaAgent effect), got {}/{}",
+                accounting.external_effect_count, accounting.passive_observation_count,
+            ));
+        }
+        return Ok(());
+    }
+
+    let compensation_projections = projected_compensation_transcripts(terminal, member_count);
+    if compensation_projections
+        .iter()
+        .all(|projection| !projection.contains_accounting(accounting))
+    {
+        return Err(format!(
+            "compensated pilot activity accounting {}/{} is not reachable from the terminal \
+             operation's compensation transcript and its per-effect bounded redelivery slots",
+            accounting.external_effect_count, accounting.passive_observation_count,
+        ));
+    }
+    Ok(())
+}
+
+fn projected_compensation_transcripts(
+    terminal: TerminalAccountingContext,
+    member_count: usize,
+) -> Vec<ProjectedTranscript> {
+    if terminal.phase != DurableOperationPhase::Failed
+        || terminal.has_pending_action
+        || terminal.frozen_lsn.is_none()
+        || terminal.has_last_error
+    {
+        return Vec::new();
+    }
+    if terminal.next_secondary_index == 0 {
+        return vec![
+            projected_pre_catch_up_restore_transcript(),
+            projected_demote_restore_transcript(),
+        ];
+    }
+    if usize::try_from(terminal.next_secondary_index) == Ok(member_count.saturating_sub(1)) {
+        return vec![projected_rollback_transcript(member_count)];
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+fn projected_label_effect_count(transcript: &ProjectedTranscript) -> usize {
+    transcript
+        .activities
+        .iter()
+        .filter(|activity| activity.name.contains("label.effect"))
+        .count()
 }
 
 fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), String> {
@@ -1132,11 +1884,13 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
             operation: state.clone(),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
+            accounting: Some(PilotActivityAccounting::new(u64::MAX, u64::MAX)),
         },
         DurableSwitchoverStepResult::Complete {
             operation: state,
             snapshot: previous.clone(),
             compensated: true,
+            accounting: Some(PilotActivityAccounting::new(u64::MAX, u64::MAX)),
         },
         DurableSwitchoverStepResult::Stopped {
             operation: DurableSwitchoverState::from_operation(&stopped),
@@ -1151,11 +1905,13 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
+            accounting: PilotActivityAccounting::new(u64::MAX, u64::MAX),
         },
         DurableSwitchoverTerminalRecord::Complete {
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: previous,
             compensated: true,
+            accounting: PilotActivityAccounting::new(u64::MAX, u64::MAX),
         },
         DurableSwitchoverTerminalRecord::Stopped {
             state: Some(DurableSwitchoverState::from_operation(&stopped)),
@@ -1167,44 +1923,27 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
     Ok(())
 }
 
-fn projected_rollback_steps(member_count: usize) -> Vec<&'static str> {
-    let mut steps = vec![
-        "revoke.observe",
-        "revoke.effect",
-        "capture-lsn",
-        "target-catch-up",
-        "demote.observe",
-        "demote.effect",
-        "promote.observe",
-        "promote.effect",
-        "rollback-promote.observe",
-        "rollback-promote.effect",
+fn projected_rollback_transcript(member_count: usize) -> ProjectedTranscript {
+    let mut activities = vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("demote.effect"),
+        ProjectedActivity::replica_effect("promote.effect"),
+        ProjectedActivity::replica_effect("rollback-promote.effect"),
     ];
-    for _ in 0..member_count.saturating_sub(1) {
-        steps.extend(["rollback-epoch.observe", "rollback-epoch.effect"]);
-    }
-    steps.extend([
-        "rollback-catch-up.observe",
-        "rollback-catch-up.effect",
-        "rollback-current.observe",
-        "rollback-current.effect",
-        "rollback-old-label.effect",
-        "rollback-target-label.effect",
-        "rollback-final-attestation",
-    ]);
-    let redelivery_headroom = external_effect_count(&steps);
-    steps.extend(std::iter::repeat_n(
-        "proven-no-admission-redelivery",
-        redelivery_headroom,
+    activities.extend(std::iter::repeat_n(
+        ProjectedActivity::replica_effect("rollback-epoch.effect"),
+        member_count.saturating_sub(1),
     ));
-    steps
-}
-
-fn external_effect_count(steps: &[&str]) -> usize {
-    steps
-        .iter()
-        .filter(|step| step.ends_with(".effect"))
-        .count()
+    activities.extend([
+        ProjectedActivity::replica_effect("rollback-catch-up.effect"),
+        ProjectedActivity::replica_effect("rollback-current.effect"),
+        ProjectedActivity::external_or_passive("rollback-old-label.effect"),
+        ProjectedActivity::external_or_passive("rollback-target-label.effect"),
+        ProjectedActivity::passive("rollback-final-attestation"),
+    ]);
+    ProjectedTranscript::new(activities)
 }
 
 const fn projected_success_pure_transitions() -> usize {
@@ -1241,7 +1980,7 @@ fn maximum_active_payload(
         .map(|sequence| {
             let spec = ActivitySpec::new(
                 name.clone(),
-                ExactBytes::new(vec![u8::MAX; PILOT_MAX_OPERATION_BYTES]),
+                ExactBytes::new(vec![u8::MAX; PILOT_MAX_ACTIVITY_INPUT_BYTES]),
                 u64::try_from(PILOT_MAX_ACTIVITY_RESULT_BYTES)
                     .expect("pilot result bound fits u64"),
             );
@@ -1255,6 +1994,55 @@ fn maximum_active_payload(
         })
         .collect();
     Ok(CheckpointPayload::active(contract, activities))
+}
+
+#[cfg(test)]
+fn maximum_prepared_activity_input() -> Result<ExactBytes, String> {
+    let maximum_fence = "x".repeat(512);
+    let input = DurableSwitchoverActivityInput {
+        version: PILOT_VERSION,
+        state: DurableSwitchoverState {
+            phase: DurableOperationPhase::Poisoned,
+            frozen_lsn: Some(i64::MAX),
+            next_secondary_index: u32::MAX,
+            phase_deadline_unix_seconds: i64::MAX,
+            pending_action: None,
+            last_error: Some(maximum_fence.clone()),
+        },
+        kind: PilotActivityKind::PreparedReplica {
+            command: ReplicaEffectCommand {
+                action_id: maximum_fence.clone(),
+                action_signature: maximum_fence.clone(),
+                target_id: i64::MAX,
+                target_instance_id: maximum_fence.clone(),
+                expected_epoch: crate::crd::EpochStatus {
+                    data_loss_number: i64::MAX,
+                    configuration_number: i64::MAX,
+                },
+                desired_postcondition: crate::crd::DurablePostconditionStatus {
+                    kind: crate::crd::DurablePostconditionKind::CurrentConfiguration,
+                    role: Some(crate::crd::StableReplicaRoleStatus::Primary),
+                },
+                expected_agent_generation: maximum_fence.clone(),
+                expected_control_version: u64::MAX,
+                observed_runtime_epoch: crate::crd::EpochStatus {
+                    data_loss_number: i64::MAX,
+                    configuration_number: i64::MAX,
+                },
+                action_payload: "x".repeat(4_096),
+            },
+        },
+    };
+    let encoded = encode_activity_input::<DurableSwitchoverActivity>(&input)
+        .map_err(|error| format!("encode maximum prepared pilot activity: {error}"))?;
+    if encoded.as_slice().len() > PILOT_MAX_ACTIVITY_INPUT_BYTES {
+        return Err(format!(
+            "maximum prepared pilot activity is {} bytes; maximum is {}",
+            encoded.as_slice().len(),
+            PILOT_MAX_ACTIVITY_INPUT_BYTES
+        ));
+    }
+    Ok(encoded)
 }
 
 fn encode_execution_id(execution_id: ExecutionId) -> String {
@@ -1382,6 +2170,15 @@ mod durable_switchover_pilot_tests {
 
     #[test]
     fn maximum_projected_history_fits_both_budgets() {
+        let prepared_input = maximum_prepared_activity_input().unwrap();
+        assert!(
+            prepared_input.as_slice().len() > PILOT_MAX_ACTIVITY_INPUT_BYTES / 2,
+            "prepared fixture must exercise large commands and fences"
+        );
+        assert!(matches!(
+            decode_pilot_activity_input(&prepared_input).unwrap().kind,
+            PilotActivityKind::PreparedReplica { .. }
+        ));
         let checkpoint = maximum_active_checkpoint().unwrap();
         let encoded = checkpoint.encoded_len().unwrap();
         assert!(encoded <= PILOT_MAX_ENCODED_CHECKPOINT_BYTES);
@@ -1579,6 +2376,7 @@ mod durable_switchover_pilot_tests {
                         operation: compact(&advanced),
                         snapshot: terminal_snapshot.clone(),
                         compensated: false,
+                        accounting: Some(PilotActivityAccounting::new(1, 1)),
                     })
                     .unwrap(),
                 ),
@@ -1602,6 +2400,7 @@ mod durable_switchover_pilot_tests {
                 operation: advanced,
                 snapshot: terminal_snapshot,
                 compensated: false,
+                accounting: PilotActivityAccounting::new(1, 1),
             }
         );
         let polls_before_terminal_reload = polls.load(Ordering::SeqCst);
@@ -1721,23 +2520,429 @@ mod durable_switchover_pilot_tests {
             checkpoint_limits(),
         );
         let permit = expose_next(&mut host, &DurableSwitchoverWorkflow, &execution).await;
-        let current = decode_activity_input_state(permit.activity().input())
-            .unwrap()
-            .apply_to(&operation)
-            .unwrap();
+        let prepared = decode_pilot_activity_input(permit.activity().input()).unwrap();
+        let current = prepared.state.apply_to(&operation).unwrap();
+        let activity = permit.activity().clone();
+        let attempt_id = permit.attempt_id();
         let mut guard = PilotPermitGuard::new(permit);
         assert!(guard.activity().is_some());
-        let consumed = guard.consume_for(&current).unwrap();
+        let wrong_attempt =
+            kuberic_durable_execution::AttemptId::new(HostEpoch::from_bytes([99; 16]), 1).unwrap();
+        assert!(
+            guard
+                .consume_for(&current, &prepared.kind, &activity, wrong_attempt)
+                .is_err()
+        );
+        let wrong_kind = PilotActivityKind::PreparedLabel {
+            command: LabelEffectCommand::new(
+                1,
+                "database-0".to_string(),
+                "pod-1-uid".to_string(),
+                "primary".to_string(),
+            ),
+        };
+        assert!(
+            guard
+                .consume_for(&current, &wrong_kind, &activity, attempt_id)
+                .is_err()
+        );
+        let consumed = guard
+            .consume_for(&current, &prepared.kind, &activity, attempt_id)
+            .unwrap();
         assert_eq!(
             consumed.activity().input().as_slice(),
             encode_activity_input::<DurableSwitchoverActivity>(&DurableSwitchoverActivityInput {
                 version: PILOT_VERSION,
                 state: compact(&current),
+                kind: prepared.kind.clone(),
             })
             .unwrap()
             .as_slice()
         );
-        assert!(guard.consume_for(&current).is_err());
+        assert!(
+            guard
+                .consume_for(&current, &prepared.kind, &activity, attempt_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_replica_spec_binds_every_dispatch_fence() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let operation = initial_operation(&reference).unwrap();
+        let command = ReplicaEffectCommand {
+            action_id: "execution:1:RevokeWrite".to_string(),
+            action_signature: kuberic_core::types::DurableReplicaAction::RevokeWriteStatus
+                .signature(),
+            target_id: 1,
+            target_instance_id: "pod-1-uid".to_string(),
+            expected_epoch: EpochStatus {
+                data_loss_number: 4,
+                configuration_number: 8,
+            },
+            desired_postcondition: crate::crd::DurablePostconditionStatus {
+                kind: crate::crd::DurablePostconditionKind::WriteRevoked,
+                role: None,
+            },
+            expected_agent_generation: "0123456789abcdef0123456789abcdef".to_string(),
+            expected_control_version: 7,
+            observed_runtime_epoch: EpochStatus {
+                data_loss_number: 4,
+                configuration_number: 8,
+            },
+            action_payload: kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::RevokeWriteStatus,
+            )
+            .unwrap(),
+        };
+        let input = |command| DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&operation),
+            kind: PilotActivityKind::PreparedReplica { command },
+        };
+        let baseline = activity_spec(&input(command.clone())).unwrap();
+        let mut variants = Vec::new();
+        let mut changed = command.clone();
+        changed.action_id.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.action_signature.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_id = 2;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_instance_id = "replacement-uid".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.desired_postcondition.kind = crate::crd::DurablePostconditionKind::Role;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_agent_generation = "fedcba9876543210fedcba9876543210".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_control_version += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.observed_runtime_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command;
+        changed.action_payload =
+            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::Close,
+            )
+            .unwrap();
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(activity_spec(&input(changed)).unwrap(), baseline);
+        }
+    }
+
+    #[test]
+    fn restart_validation_rejects_consistently_rewritten_role_and_epoch_payloads() {
+        use kuberic_core::types::{DurableReplicaAction, Epoch, Role};
+
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut operation = initial_operation(&reference).unwrap();
+        operation.phase = DurableOperationPhase::PromoteTarget;
+        let target = operation
+            .target_snapshot
+            .members
+            .iter()
+            .find(|member| member.id == operation.target_primary_id)
+            .unwrap();
+        let target_epoch = Epoch {
+            data_loss_number: operation.target_snapshot.epoch.data_loss_number,
+            configuration_number: operation.target_snapshot.epoch.configuration_number,
+        };
+        let mut pending = PendingActionStatus {
+            action_id: "execution:3:PromoteTarget".to_string(),
+            sequence: 3,
+            kind: crate::crd::DurableActionKind::PromoteTarget,
+            target_id: target.id,
+            target_instance_id: target.instance_id.clone(),
+            expected_epoch: operation.previous_snapshot.epoch.clone(),
+            desired_postcondition: crate::crd::DurablePostconditionStatus {
+                kind: crate::crd::DurablePostconditionKind::Role,
+                role: Some(crate::crd::StableReplicaRoleStatus::Primary),
+            },
+            attempts: 0,
+            deadline_unix_seconds: 100,
+            last_error: None,
+            dispatch_authorized: true,
+            dispatch_agent_generation: Some("0123456789abcdef0123456789abcdef".to_string()),
+            dispatch_agent_control_version: Some(7),
+            dispatch_observed_runtime_epoch: Some(operation.previous_snapshot.epoch.clone()),
+            dispatch_action_payload:
+                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                    &DurableReplicaAction::ChangeRole {
+                        epoch: target_epoch,
+                        role: Role::Primary,
+                    },
+                )
+                .unwrap(),
+        };
+        operation.pending_action = Some(pending.clone());
+        validate_prepared_activity(
+            &operation,
+            &PilotActivityKind::PreparedReplica {
+                command: ReplicaEffectCommand::from_pending(&pending).unwrap(),
+            },
+        )
+        .unwrap();
+
+        for rewritten in [
+            DurableReplicaAction::ChangeRole {
+                epoch: Epoch {
+                    configuration_number: target_epoch.configuration_number + 1,
+                    ..target_epoch
+                },
+                role: Role::Primary,
+            },
+            DurableReplicaAction::ChangeRole {
+                epoch: target_epoch,
+                role: Role::ActiveSecondary,
+            },
+        ] {
+            pending.dispatch_action_payload =
+                kuberic_core::grpc::convert::encode_direct_correlated_action_payload(&rewritten)
+                    .unwrap();
+            operation.pending_action = Some(pending.clone());
+            assert!(
+                validate_prepared_activity(
+                    &operation,
+                    &PilotActivityKind::PreparedReplica {
+                        command: ReplicaEffectCommand::from_pending(&pending).unwrap(),
+                    },
+                )
+                .is_err(),
+                "restart validation accepted rewritten fixed role/epoch semantics"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_rejects_recorded_command_semantic_drift_as_activity_mismatch() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let PilotAdapterDecision::Observe(result) =
+            evaluate_adapter_step(&initial, &OperationObservations::new(), 100).unwrap()
+        else {
+            panic!("expected revoke intent");
+        };
+        let DurableSwitchoverStepResult::Advance { operation: state } = *result else {
+            panic!("expected pending revoke state");
+        };
+        let logical = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: state.clone(),
+            kind: PilotActivityKind::PassiveObservation,
+        })
+        .unwrap();
+        let mut prepared_operation = state.apply_to(&initial).unwrap();
+        let pending = prepared_operation.pending_action.as_mut().unwrap();
+        pending.dispatch_agent_generation = Some("0123456789abcdef0123456789abcdef".to_string());
+        pending.dispatch_agent_control_version = Some(7);
+        pending.dispatch_observed_runtime_epoch = Some(EpochStatus {
+            data_loss_number: 4,
+            configuration_number: 8,
+        });
+        pending.dispatch_action_payload =
+            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::RevokeWriteStatus,
+            )
+            .unwrap();
+        let command = ReplicaEffectCommand::from_pending(pending).unwrap();
+        let prepared = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&prepared_operation),
+            kind: PilotActivityKind::PreparedReplica {
+                command: command.clone(),
+            },
+        })
+        .unwrap();
+        validate_prepared_activity(
+            &prepared_operation,
+            &PilotActivityKind::PreparedReplica {
+                command: command.clone(),
+            },
+        )
+        .unwrap();
+        let observations = OperationObservations::new();
+        let addressed = BTreeMap::new();
+        let resolver = PilotPreparedActivityResolver::new(&initial, &observations, &addressed, 100);
+        assert_eq!(
+            resolver.resolve(&logical, Some(&prepared)).unwrap(),
+            prepared
+        );
+
+        let execution = execution_spec(&reference).unwrap();
+        let mut variants = Vec::new();
+        let mut changed = command.clone();
+        changed.action_id.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.action_signature.push_str("-other");
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_id = 2;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.target_instance_id = "replacement-uid".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.desired_postcondition.kind = crate::crd::DurablePostconditionKind::Role;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_agent_generation = "fedcba9876543210fedcba9876543210".to_string();
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.expected_control_version += 1;
+        variants.push(changed);
+        let mut changed = command.clone();
+        changed.observed_runtime_epoch.configuration_number += 1;
+        variants.push(changed);
+        let mut changed = command;
+        changed.action_payload =
+            kuberic_core::grpc::convert::encode_direct_correlated_action_payload(
+                &kuberic_core::types::DurableReplicaAction::Close,
+            )
+            .unwrap();
+        variants.push(changed);
+
+        for changed in variants {
+            assert!(
+                validate_prepared_activity(
+                    &prepared_operation,
+                    &PilotActivityKind::PreparedReplica {
+                        command: changed.clone(),
+                    },
+                )
+                .is_err(),
+                "restart validation must reject any changed prepared command"
+            );
+            let drifted = activity_spec(&DurableSwitchoverActivityInput {
+                version: PILOT_VERSION,
+                state: compact(&prepared_operation),
+                kind: PilotActivityKind::PreparedReplica { command: changed },
+            })
+            .unwrap();
+            assert_eq!(resolver.resolve(&logical, Some(&drifted)).unwrap(), logical);
+            let payload = CheckpointPayload::active(
+                ExecutionContract::new(
+                    execution.clone(),
+                    u64::try_from(PILOT_MAX_ENCODED_CHECKPOINT_BYTES).unwrap(),
+                ),
+                vec![ActivityRecord::scheduled(ActivitySequence::new(0), drifted)],
+            );
+            let checkpoint =
+                CheckpointEnvelope::encode_with_limits(&payload, checkpoint_limits()).unwrap();
+            assert!(matches!(
+                kuberic_durable_execution::evaluate_prepared(
+                    &DurableSwitchoverWorkflow,
+                    &execution,
+                    Some(&checkpoint),
+                    checkpoint_limits(),
+                    &resolver,
+                ),
+                kuberic_durable_execution::Evaluation::Nondeterminism(
+                    kuberic_durable_execution::Nondeterminism::ActivityMismatch { .. }
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn replay_rejects_changed_activity_name_version_and_result_bound() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let logical = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&initial),
+            kind: PilotActivityKind::PassiveObservation,
+        })
+        .unwrap();
+        let observations = OperationObservations::new();
+        let addressed = BTreeMap::new();
+        let resolver = PilotPreparedActivityResolver::new(&initial, &observations, &addressed, 100);
+        assert_eq!(resolver.resolve(&logical, Some(&logical)).unwrap(), logical);
+
+        let changed_name = ActivitySpec::new(
+            ActivityName::new("kuberic.switchover.changed-name", logical.name().version()).unwrap(),
+            logical.input().clone(),
+            logical.max_result_bytes(),
+        );
+        let changed_version = ActivitySpec::new(
+            ActivityName::new(
+                logical.name().name(),
+                logical.name().version().saturating_add(1),
+            )
+            .unwrap(),
+            logical.input().clone(),
+            logical.max_result_bytes(),
+        );
+        let changed_result_bound = ActivitySpec::new(
+            logical.name().clone(),
+            logical.input().clone(),
+            logical.max_result_bytes().saturating_add(1),
+        );
+        let execution = execution_spec(&reference).unwrap();
+
+        for changed in [changed_name, changed_version, changed_result_bound] {
+            assert_eq!(resolver.resolve(&logical, Some(&changed)).unwrap(), logical);
+            let payload = CheckpointPayload::active(
+                ExecutionContract::new(
+                    execution.clone(),
+                    u64::try_from(PILOT_MAX_ENCODED_CHECKPOINT_BYTES).unwrap(),
+                ),
+                vec![ActivityRecord::scheduled(ActivitySequence::new(0), changed)],
+            );
+            let checkpoint =
+                CheckpointEnvelope::encode_with_limits(&payload, checkpoint_limits()).unwrap();
+            assert!(matches!(
+                kuberic_durable_execution::evaluate_prepared(
+                    &DurableSwitchoverWorkflow,
+                    &execution,
+                    Some(&checkpoint),
+                    checkpoint_limits(),
+                    &resolver,
+                ),
+                kuberic_durable_execution::Evaluation::Nondeterminism(
+                    kuberic_durable_execution::Nondeterminism::ActivityMismatch { .. }
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_activity_v1_without_kind_replays_with_exact_recorded_bytes() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let logical = activity_spec(&DurableSwitchoverActivityInput {
+            version: PILOT_VERSION,
+            state: compact(&initial),
+            kind: PilotActivityKind::PassiveObservation,
+        })
+        .unwrap();
+        let mut legacy_json: serde_json::Value =
+            serde_json::from_slice(logical.input().as_slice()).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("kind");
+        let legacy = ActivitySpec::new(
+            logical.name().clone(),
+            ExactBytes::new(serde_json::to_vec(&legacy_json).unwrap()),
+            logical.max_result_bytes(),
+        );
+        let observations = OperationObservations::new();
+        let addressed = BTreeMap::new();
+        let resolver = PilotPreparedActivityResolver::new(&initial, &observations, &addressed, 100);
+        assert_eq!(resolver.resolve(&logical, Some(&legacy)).unwrap(), legacy);
     }
 
     #[test]
@@ -1867,6 +3072,7 @@ mod durable_switchover_pilot_tests {
                         operation: compact(&failed),
                         snapshot: previous.clone(),
                         compensated: true,
+                        accounting: Some(PilotActivityAccounting::new(0, 1)),
                     })
                     .unwrap(),
                 ),
@@ -1885,6 +3091,7 @@ mod durable_switchover_pilot_tests {
                 operation: failed,
                 snapshot: previous,
                 compensated: true,
+                accounting: PilotActivityAccounting::new(0, 1),
             }
         );
     }
@@ -1955,6 +3162,7 @@ mod durable_switchover_pilot_tests {
             encode_activity_input::<DurableSwitchoverActivity>(&DurableSwitchoverActivityInput {
                 version: PILOT_VERSION,
                 state: state.clone(),
+                kind: PilotActivityKind::PassiveObservation,
             })
             .unwrap();
         let result =
@@ -2030,6 +3238,7 @@ mod durable_switchover_pilot_tests {
             snapshot: operation.previous_snapshot.cloned().unwrap(),
             operation: operation.clone(),
             compensated: true,
+            accounting: PilotActivityAccounting::new(10, 3),
         };
         let outcome = TerminalOutcome::succeeded(encode_terminal(&terminal).unwrap());
         assert_eq!(decode_terminal(&outcome, &operation).unwrap(), terminal);
@@ -2044,15 +3253,68 @@ mod durable_switchover_pilot_tests {
             snapshot: operation.target_snapshot.clone(),
             operation: operation.clone(),
             compensated: false,
+            accounting: PilotActivityAccounting::new(9, 3),
         };
         let success = TerminalOutcome::succeeded(encode_terminal(&valid).unwrap());
         assert_eq!(
-            validate_loaded_terminal(&reference, &success).unwrap(),
+            validate_loaded_terminal(&reference, &success, 12).unwrap(),
             valid
         );
+        for accounting in [
+            PilotActivityAccounting::new(10, 3),
+            PilotActivityAccounting::new(16, 3),
+        ] {
+            let redelivered_success = TerminalOutcome::succeeded(
+                encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                    snapshot: operation.target_snapshot.clone(),
+                    operation: operation.clone(),
+                    compensated: false,
+                    accounting,
+                })
+                .unwrap(),
+            );
+            assert_eq!(
+                validate_loaded_terminal(
+                    &reference,
+                    &redelivered_success,
+                    accounting.external_effect_count + accounting.passive_observation_count,
+                )
+                .unwrap(),
+                DurableSwitchoverPilotTerminal::Complete {
+                    snapshot: operation.target_snapshot.clone(),
+                    operation: operation.clone(),
+                    compensated: false,
+                    accounting,
+                }
+            );
+        }
+        for accounting in [
+            PilotActivityAccounting::new(10, 2),
+            PilotActivityAccounting::new(8, 3),
+            PilotActivityAccounting::new(17, 3),
+        ] {
+            let invalid_accounting = TerminalOutcome::succeeded(
+                encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                    snapshot: operation.target_snapshot.clone(),
+                    operation: operation.clone(),
+                    compensated: false,
+                    accounting,
+                })
+                .unwrap(),
+            );
+            assert!(
+                validate_loaded_terminal(
+                    &reference,
+                    &invalid_accounting,
+                    accounting.external_effect_count + accounting.passive_observation_count,
+                )
+                .is_err(),
+                "successful terminal accepted invalid accounting {accounting:?}"
+            );
+        }
 
         let failed_kind = TerminalOutcome::failed(encode_terminal(&valid).unwrap());
-        assert!(validate_loaded_terminal(&reference, &failed_kind).is_err());
+        assert!(validate_loaded_terminal(&reference, &failed_kind, 12).is_err());
 
         let mut wrong_identity = operation.clone();
         wrong_identity.operation_id.push_str("-other");
@@ -2061,10 +3323,11 @@ mod durable_switchover_pilot_tests {
                 snapshot: wrong_identity.target_snapshot.clone(),
                 operation: wrong_identity,
                 compensated: false,
+                accounting: PilotActivityAccounting::new(9, 3),
             })
             .unwrap(),
         );
-        let canonical = validate_loaded_terminal(&reference, &wrong_identity).unwrap();
+        let canonical = validate_loaded_terminal(&reference, &wrong_identity, 12).unwrap();
         let DurableSwitchoverPilotTerminal::Complete {
             operation: canonical,
             ..
@@ -2085,26 +3348,62 @@ mod durable_switchover_pilot_tests {
                 operation,
                 snapshot: wrong_snapshot,
                 compensated: false,
+                accounting: PilotActivityAccounting::new(9, 3),
             })
             .unwrap(),
         );
-        assert!(validate_loaded_terminal(&reference, &wrong_snapshot).is_err());
+        assert!(validate_loaded_terminal(&reference, &wrong_snapshot, 12).is_err());
 
         let mut failed = initial_operation(&reference).unwrap();
         failed.phase = crate::crd::DurableOperationPhase::Failed;
+        failed.frozen_lsn = Some(42);
+        failed.next_secondary_index = u32::try_from(PILOT_MAX_REPLICAS.saturating_sub(1)).unwrap();
+        failed.last_error = None;
         let compensated = failed.previous_snapshot.cloned().unwrap();
         let valid_compensation = DurableSwitchoverPilotTerminal::Complete {
             operation: failed.clone(),
             snapshot: compensated.clone(),
             compensated: true,
+            accounting: PilotActivityAccounting::new(8, 5),
         };
         assert!(
             validate_loaded_terminal(
                 &reference,
                 &TerminalOutcome::succeeded(encode_terminal(&valid_compensation).unwrap()),
+                13,
             )
             .is_ok()
         );
+        let invalid_compensation = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                operation: failed.clone(),
+                snapshot: compensated.clone(),
+                compensated: true,
+                accounting: PilotActivityAccounting::new(21, 3),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &invalid_compensation, 24).is_err());
+        let impossible_passive_split = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                operation: failed.clone(),
+                snapshot: compensated.clone(),
+                compensated: true,
+                accounting: PilotActivityAccounting::new(1, 22),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &impossible_passive_split, 23).is_err());
+        let impossible_redelivery_split = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                operation: failed.clone(),
+                snapshot: compensated.clone(),
+                compensated: true,
+                accounting: PilotActivityAccounting::new(10, 13),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &impossible_redelivery_split, 23).is_err());
 
         let mut malformed = Vec::new();
         let mut missing = compensated.clone();
@@ -2137,11 +3436,242 @@ mod durable_switchover_pilot_tests {
                     operation: failed.clone(),
                     snapshot,
                     compensated: true,
+                    accounting: PilotActivityAccounting::new(8, 5),
                 })
                 .unwrap(),
             );
-            assert!(validate_loaded_terminal(&reference, &outcome).is_err());
+            assert!(validate_loaded_terminal(&reference, &outcome, 13).is_err());
         }
+
+        assert!(
+            validate_loaded_terminal(&reference, &success, 11).is_err(),
+            "loaded terminal validation must compare accounting with the authoritative count"
+        );
+    }
+
+    #[test]
+    fn terminal_accounting_matches_exact_reachable_projection_pairs() {
+        let successful = TerminalAccountingContext {
+            phase: DurableOperationPhase::Completed,
+            frozen_lsn: Some(42),
+            next_secondary_index: 1,
+            has_pending_action: false,
+            has_last_error: false,
+        };
+        let restored = TerminalAccountingContext {
+            phase: DurableOperationPhase::Failed,
+            frozen_lsn: Some(42),
+            next_secondary_index: 0,
+            has_pending_action: false,
+            has_last_error: false,
+        };
+        let fully_compensated = TerminalAccountingContext {
+            next_secondary_index: u32::try_from(PILOT_MAX_REPLICAS - 1).unwrap(),
+            ..restored
+        };
+        let incomplete_compensation = TerminalAccountingContext {
+            next_secondary_index: 1,
+            ..restored
+        };
+        let uncompensated_failure = TerminalAccountingContext {
+            frozen_lsn: None,
+            has_last_error: true,
+            ..restored
+        };
+        let cases = [
+            ("success base", successful, false, 9, 3, true),
+            ("success one redelivery", successful, false, 10, 3, true),
+            ("success all redeliveries", successful, false, 16, 3, true),
+            (
+                "success too many redeliveries",
+                successful,
+                false,
+                17,
+                3,
+                false,
+            ),
+            (
+                "success wrong passive split",
+                successful,
+                false,
+                10,
+                2,
+                false,
+            ),
+            ("pre-catch-up restore", restored, true, 2, 3, true),
+            (
+                "pre-catch-up restore redeliveries",
+                restored,
+                true,
+                4,
+                3,
+                true,
+            ),
+            ("demote restore", restored, true, 3, 3, true),
+            ("demote restore redeliveries", restored, true, 6, 3, true),
+            (
+                "restore path excess redelivery",
+                restored,
+                true,
+                7,
+                3,
+                false,
+            ),
+            (
+                "failed-promotion compensation",
+                fully_compensated,
+                true,
+                8,
+                5,
+                true,
+            ),
+            (
+                "failed-promotion compensation redeliveries",
+                fully_compensated,
+                true,
+                16,
+                5,
+                true,
+            ),
+            (
+                "failed-promotion one label effect",
+                fully_compensated,
+                true,
+                9,
+                4,
+                true,
+            ),
+            (
+                "failed-promotion all effects",
+                fully_compensated,
+                true,
+                10,
+                3,
+                true,
+            ),
+            (
+                "failed-promotion all redeliveries",
+                fully_compensated,
+                true,
+                18,
+                3,
+                true,
+            ),
+            (
+                "failed-promotion one label and all replica redeliveries",
+                fully_compensated,
+                true,
+                17,
+                4,
+                true,
+            ),
+            (
+                "failed-promotion excess redelivery",
+                fully_compensated,
+                true,
+                17,
+                5,
+                false,
+            ),
+            (
+                "unreachable low split",
+                fully_compensated,
+                true,
+                1,
+                1,
+                false,
+            ),
+            (
+                "phase-inconsistent restore accounting",
+                fully_compensated,
+                true,
+                2,
+                3,
+                false,
+            ),
+            (
+                "incomplete compensation phase",
+                incomplete_compensation,
+                true,
+                8,
+                5,
+                false,
+            ),
+            (
+                "failure without compensation",
+                uncompensated_failure,
+                true,
+                1,
+                1,
+                false,
+            ),
+        ];
+        for (name, terminal, compensated, external, passive, expected) in cases {
+            let accounting = PilotActivityAccounting::new(external, passive);
+            assert_eq!(
+                validate_terminal_accounting_shape(
+                    terminal,
+                    PILOT_MAX_REPLICAS,
+                    compensated,
+                    accounting,
+                    external + passive,
+                )
+                .is_ok(),
+                expected,
+                "{name}: {accounting:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn failure_before_compensation_stops_instead_of_emitting_unreachable_accounting() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut failed = initial_operation(&reference).unwrap();
+        failed.phase = DurableOperationPhase::Failed;
+        failed.last_error = Some("revoke failed before compensation".to_string());
+        let previous = failed.previous_snapshot.cloned().unwrap();
+        let PilotAdapterDecision::Observe(result) =
+            terminal_adapter_decision(failed, previous, true)
+        else {
+            panic!("early safe failure must become a stopped pilot result");
+        };
+        let DurableSwitchoverStepResult::Stopped { operation, message } = *result else {
+            panic!("early safe failure must not claim compensated completion");
+        };
+        assert_eq!(operation.phase, DurableOperationPhase::Poisoned);
+        assert!(operation.pending_action.is_none());
+        assert_eq!(message, "revoke failed before compensation");
+    }
+
+    #[test]
+    fn two_member_terminal_accounting_uses_its_authoritative_projection() {
+        let reference = new_pilot_reference("set-uid", snapshot(2), 2, 100).unwrap();
+        let mut completed = initial_operation(&reference).unwrap();
+        completed.phase = DurableOperationPhase::Completed;
+        completed.frozen_lsn = Some(42);
+        let valid = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                snapshot: completed.target_snapshot.clone(),
+                operation: completed.clone(),
+                compensated: false,
+                accounting: PilotActivityAccounting::new(8, 3),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &valid, 11).is_ok());
+
+        let excessive_two_member_redeliveries = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                snapshot: completed.target_snapshot.clone(),
+                operation: completed,
+                compensated: false,
+                accounting: PilotActivityAccounting::new(15, 3),
+            })
+            .unwrap(),
+        );
+        assert!(
+            validate_loaded_terminal(&reference, &excessive_two_member_redeliveries, 18).is_err()
+        );
     }
 
     #[test]
@@ -2444,17 +3974,35 @@ mod durable_switchover_pilot_tests {
 
     #[test]
     fn success_and_rollback_transcripts_fit_with_redelivery_headroom() {
-        let success = projected_success_steps(PILOT_MAX_REPLICAS);
-        let rollback = projected_rollback_steps(PILOT_MAX_REPLICAS);
-        assert_eq!(success.len(), 28);
-        assert_eq!(rollback.len(), 31);
-        assert!(success.len() <= PILOT_MAX_ACTIVITY_RECORDS);
-        assert!(rollback.len() <= PILOT_MAX_ACTIVITY_RECORDS);
-        assert!(success.len() + projected_success_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL);
-        assert!(
-            rollback.len() + projected_rollback_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL
+        let success = projected_success_transcript(PILOT_MAX_REPLICAS);
+        let rollback = projected_rollback_transcript(PILOT_MAX_REPLICAS);
+        assert_eq!(success.maximum_activity_count(), 19);
+        assert_eq!(rollback.maximum_activity_count(), 21);
+        assert_eq!(success.maximum_external_effect_count(), 9);
+        assert_eq!(rollback.maximum_external_effect_count(), 10);
+        assert_eq!(success.redelivery_slot_count(), 7);
+        assert_eq!(rollback.redelivery_slot_count(), 8);
+        let success_label_effects = projected_label_effect_count(&success);
+        assert_eq!(success_label_effects, 2);
+        assert_eq!(
+            success.maximum_external_effect_count() - success_label_effects,
+            7
         );
-        assert!(success.contains(&"proven-no-admission-redelivery"));
-        assert!(rollback.contains(&"rollback-promote.effect"));
+        assert_eq!(success.required_passive_observation_count(), 3);
+        assert_eq!(success.flexible_activity_count(), 0);
+        assert_eq!(rollback.required_passive_observation_count(), 3);
+        assert_eq!(rollback.flexible_activity_count(), 2);
+        assert!(success.maximum_activity_count() <= PILOT_MAX_ACTIVITY_RECORDS);
+        assert!(rollback.maximum_activity_count() <= PILOT_MAX_ACTIVITY_RECORDS);
+        assert!(
+            success.maximum_activity_count() + projected_success_pure_transitions()
+                <= PILOT_MAX_TRANSITION_FUEL
+        );
+        assert!(
+            rollback.maximum_activity_count() + projected_rollback_pure_transitions()
+                <= PILOT_MAX_TRANSITION_FUEL
+        );
+        assert!(success.contains("revoke.effect"));
+        assert!(rollback.contains("rollback-promote.effect"));
     }
 }

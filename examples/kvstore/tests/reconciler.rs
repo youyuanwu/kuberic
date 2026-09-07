@@ -258,6 +258,7 @@ struct ObservedHandle {
     pod_name: String,
     exposed_control_address: Option<String>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
+    reject_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_terminal_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
@@ -376,6 +377,23 @@ impl ReplicaHandle for ObservedHandle {
         let operation = Self::operation_for(&request.action);
         self.record(operation);
         if self
+            .reject_before_next_durable_action
+            .lock()
+            .unwrap()
+            .as_ref()
+            == Some(&operation)
+        {
+            self.reject_before_next_durable_action
+                .lock()
+                .unwrap()
+                .take();
+            return Err(
+                kuberic_core::error::KubericError::RemoteAgentPreconditionRejected(
+                    "injected proven non-admission".to_string(),
+                ),
+            );
+        }
+        if self
             .fail_before_next_durable_action
             .lock()
             .unwrap()
@@ -488,6 +506,7 @@ struct KvClusterApi {
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
+    reject_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_next_status_patch: Mutex<bool>,
     fail_after_next_status_patch: Mutex<bool>,
     fail_next_status_conflict: Mutex<bool>,
@@ -521,6 +540,7 @@ impl KvClusterApi {
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(Vec::new())),
+            reject_before_next_durable_action: Arc::new(Mutex::new(None)),
             fail_next_status_patch: Mutex::new(false),
             fail_after_next_status_patch: Mutex::new(false),
             fail_next_status_conflict: Mutex::new(false),
@@ -628,6 +648,10 @@ impl KvClusterApi {
 
     fn fail_before_next_durable_action(&self, operation: ControlOperation) {
         *self.fail_before_next_durable_action.lock().unwrap() = Some(operation);
+    }
+
+    fn reject_before_next_durable_action(&self, operation: ControlOperation) {
+        *self.reject_before_next_durable_action.lock().unwrap() = Some(operation);
     }
 
     fn fail_after_next_durable_action(&self, operation: ControlOperation) {
@@ -1065,6 +1089,7 @@ impl ClusterApi for KvClusterApi {
                 .get(pod_name)
                 .cloned(),
             operations: self.operations.clone(),
+            reject_before_next_durable_action: self.reject_before_next_durable_action.clone(),
             fail_before_next_durable_action: self.fail_before_next_durable_action.clone(),
             fail_after_next_durable_action: self.fail_after_next_durable_action.clone(),
             fail_terminal_next_durable_action: self.fail_terminal_next_durable_action.clone(),
@@ -3830,19 +3855,79 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
             kuberic_operator::durable::pilot::checkpoint_limits(),
         )
         .unwrap();
-    let durable_boundary_count = terminal_payload.terminal_outcome().unwrap().1;
+    let (terminal_outcome, durable_boundary_count) = terminal_payload.terminal_outcome().unwrap();
+    let terminal_payload_bytes = terminal_outcome.payload().as_slice().len();
+    let measurements = pilot_state
+        .durable_switchover_pilot
+        .as_ref()
+        .unwrap()
+        .measurements(
+            "default",
+            "pilot-happy",
+            "test-uid",
+            &reference.execution_id,
+        )
+        .await
+        .expect("completed pilot measurements must remain available");
+    let authoritative_external_effects = measurements
+        .completed_external_effect_count
+        .expect("accepted active checkpoints must classify external effects");
+    let authoritative_passive_observations = measurements
+        .completed_passive_observation_count
+        .expect("accepted active checkpoints must classify passive observations");
+    assert_eq!(external_effect_commands, 9);
+    assert_eq!(authoritative_external_effects, 9);
+    assert_eq!(authoritative_passive_observations, 3);
+    assert_eq!(durable_boundary_count, 12);
+    assert!(durable_boundary_count <= 12);
+    assert_eq!(
+        measurements.completed_activity_count,
+        Some(durable_boundary_count)
+    );
+    assert!(measurements.accepted_writes <= 13);
+    assert_eq!(measurements.accepted_writes, 13);
+    assert_eq!(
+        measurements.latest_terminal_checkpoint_bytes,
+        Some(terminal_bytes)
+    );
+    assert!(measurements.latest_active_checkpoint_bytes.is_some());
+    assert!(measurements.maximum_active_checkpoint_bytes >= terminal_bytes);
+    assert!(
+        measurements.maximum_active_checkpoint_bytes
+            <= kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES
+    );
+    assert!(
+        terminal_payload_bytes
+            <= usize::try_from(kuberic_operator::durable::pilot::PILOT_MAX_TERMINAL_BYTES).unwrap()
+    );
     println!(
         concat!(
             "KUBERIC_SWITCHOVER_MEASUREMENT engine=durable_pilot ",
-            "logical_external_effect_commands={} durable_boundary_count={} ",
-            "terminal_checkpoint_bytes={} accepted_status_writes_after_acceptance={} ",
-            "status_write_attempts={} status_write_conflicts={} status_write_unknowns={} ",
+            "external_effects={} passive_observations={} durable_boundaries={} ",
+            "checkpoint_accepted_writes={} checkpoint_write_attempts={} ",
+            "checkpoint_conflicts={} checkpoint_unknowns={} checkpoint_definite_failures={} ",
+            "latest_authoritative_checkpoint_bytes={} maximum_authoritative_checkpoint_bytes={} ",
+            "latest_active_checkpoint_bytes={} maximum_active_checkpoint_bytes={} ",
+            "terminal_checkpoint_bytes={} maximum_terminal_checkpoint_bytes={} ",
+            "accepted_status_writes_after_acceptance={} status_write_attempts={} ",
+            "status_write_conflicts={} status_write_unknowns={} ",
             "status_write_definite_failures={} uid_label_attempts={} uid_label_accepted={} ",
             "pod_list_api_calls={} requeues=unavailable(reason=harness_does_not_execute_controller_actions)"
         ),
-        external_effect_commands,
+        authoritative_external_effects,
+        authoritative_passive_observations,
         durable_boundary_count,
+        measurements.accepted_writes,
+        measurements.write_attempts,
+        measurements.conflicts,
+        measurements.unknown_outcomes,
+        measurements.definite_failures,
+        measurements.latest_authoritative_checkpoint_bytes.unwrap(),
+        measurements.maximum_authoritative_checkpoint_bytes,
+        measurements.latest_active_checkpoint_bytes.unwrap(),
+        measurements.maximum_active_checkpoint_bytes,
         terminal_bytes,
+        measurements.maximum_terminal_checkpoint_bytes,
         api.statuses
             .lock()
             .unwrap()
@@ -3920,6 +4005,133 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     assert!(
         explicit_status.durable_switchover_pilot.is_none(),
         "a retained terminal pilot reference must not hijack a later explicit switchover"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_switchover_pilot_completed_redelivery_accounts_terminal() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "pilot-redelivery", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let pilot_state = ReconcilerState::with_durable_switchover_store(checkpoint_store.clone());
+
+    reconcile_set(
+        &make_pilot_set(
+            "pilot-redelivery",
+            3,
+            Some(KubericSetStatus {
+                current_primary: Some(original_primary),
+                target_primary: Some(target.clone()),
+                ..status
+            }),
+        ),
+        &api,
+        &pilot_state,
+    )
+    .await
+    .unwrap();
+    let accepted = api.last_status().unwrap();
+    let reference = accepted.durable_switchover_pilot.clone().unwrap();
+    api.reset_operations();
+    api.reject_before_next_durable_action(ControlOperation::RevokeWriteStatus);
+
+    let status_calls_before_rejection: usize =
+        api.status_call_counts.lock().unwrap().values().sum();
+    reconcile_set(
+        &make_pilot_set("pilot-redelivery", 3, Some(accepted)),
+        &api,
+        &pilot_state,
+    )
+    .await
+    .unwrap();
+    let after_rejection = api.last_status().unwrap();
+    let status_calls_after_rejection: usize = api.status_call_counts.lock().unwrap().values().sum();
+    assert!(status_calls_after_rejection > status_calls_before_rejection);
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+            .count(),
+        1,
+        "the proven-no-admission reconcile must not dispatch a retry"
+    );
+    assert!(after_rejection.conditions.iter().any(|condition| {
+        condition.type_ == "DurableSwitchoverPilot"
+            && condition.reason == "RefreshingReplicaObservation"
+    }));
+
+    reconcile_set(
+        &make_pilot_set("pilot-redelivery", 3, Some(after_rejection)),
+        &api,
+        &pilot_state,
+    )
+    .await
+    .unwrap();
+    let after_retry = api.last_status().unwrap();
+    let status_calls_after_retry: usize = api.status_call_counts.lock().unwrap().values().sum();
+    assert!(
+        status_calls_after_retry > status_calls_after_rejection,
+        "the retry must be prepared from a fresh observation cycle"
+    );
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+            .count(),
+        2,
+        "the fresh reconcile must successfully dispatch the bounded retry"
+    );
+
+    let completed =
+        drive_pilot_switchover(&api, &pilot_state, "pilot-redelivery", 3, after_retry).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
+
+    use kuberic_durable_execution::CheckpointStore;
+    let execution = kuberic_operator::durable::pilot::execution_spec(&reference).unwrap();
+    let terminal = checkpoint_store
+        .load(execution.execution_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let terminal_payload = terminal
+        .checkpoint()
+        .decode_and_validate(
+            &execution,
+            kuberic_operator::durable::pilot::checkpoint_limits(),
+        )
+        .unwrap();
+    assert_eq!(terminal_payload.terminal_outcome().unwrap().1, 13);
+
+    let measurements = pilot_state
+        .durable_switchover_pilot
+        .as_ref()
+        .unwrap()
+        .measurements(
+            "default",
+            "pilot-redelivery",
+            "test-uid",
+            &reference.execution_id,
+        )
+        .await
+        .expect("completed redelivery measurements must remain available");
+    assert_eq!(measurements.completed_external_effect_count, Some(10));
+    assert_eq!(measurements.completed_passive_observation_count, Some(3));
+    assert_eq!(measurements.completed_activity_count, Some(13));
+    assert_eq!(
+        measurements.accepted_writes, 15,
+        "the non-fused rejection observation and fresh retry exposure add two writes"
     );
 }
 
@@ -4081,6 +4293,22 @@ async fn test_durable_execution_switchover_pilot_compensates_failed_promotion() 
             && condition.reason == "CompensatedOrSafeFailure"
             && condition.status == "False"
     }));
+    let reference = completed.durable_switchover_pilot.as_ref().unwrap();
+    let measurements = state
+        .durable_switchover_pilot
+        .as_ref()
+        .unwrap()
+        .measurements(
+            "default",
+            "pilot-rollback",
+            "test-uid",
+            &reference.execution_id,
+        )
+        .await
+        .expect("completed compensation measurements must remain available");
+    assert_eq!(measurements.completed_external_effect_count, Some(8));
+    assert_eq!(measurements.completed_passive_observation_count, Some(5));
+    assert_eq!(measurements.completed_activity_count, Some(13));
     assert_eq!(
         api.operations()
             .iter()
@@ -4502,6 +4730,11 @@ async fn test_durable_execution_switchover_pilot_rejects_stale_target_incarnatio
             })
     );
     assert!(api.operations().is_empty());
+    assert_eq!(
+        *api.uid_label_patch_attempts.lock().unwrap(),
+        0,
+        "a replacement UID must not receive a stale prepared label command"
+    );
 }
 
 #[test_log::test(tokio::test)]
@@ -4571,6 +4804,41 @@ async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_req
                 .iter()
                 .all(|operation| *operation == ControlOperation::GetStatus)
         );
+        use kuberic_durable_execution::CheckpointStore;
+        let reference = api.last_status().unwrap().durable_switchover_pilot.unwrap();
+        let execution = kuberic_operator::durable::pilot::execution_spec(&reference).unwrap();
+        let loaded = store.load(execution.execution_id()).await.unwrap();
+        match fault {
+            kuberic_durable_execution::InMemoryFault::OutcomeUnknownWithoutApply => {
+                assert!(
+                    loaded.is_none(),
+                    "unknown-without-apply must retain the empty authoritative predecessor"
+                );
+            }
+            kuberic_durable_execution::InMemoryFault::OutcomeUnknownAfterApply => {
+                let checkpoint =
+                    loaded.expect("unknown-after-apply must retain the accepted prepared exposure");
+                let payload = checkpoint
+                    .checkpoint()
+                    .decode_and_validate(
+                        &execution,
+                        kuberic_operator::durable::pilot::checkpoint_limits(),
+                    )
+                    .unwrap();
+                let exposed = payload.active_activities().unwrap().last().unwrap();
+                assert!(matches!(
+                    exposed.state(),
+                    kuberic_durable_execution::ActivityState::DispatchExposed { .. }
+                ));
+                assert!(matches!(
+                    kuberic_operator::durable::pilot::decode_pilot_activity_input(exposed.input())
+                        .unwrap()
+                        .kind,
+                    kuberic_operator::durable::pilot::PilotActivityKind::PreparedReplica { .. }
+                ));
+            }
+            _ => unreachable!("test covers only unknown checkpoint outcomes"),
+        }
     }
 }
 
@@ -6143,6 +6411,12 @@ async fn test_durable_remove_coarse_activation() {
             .last_observed_result,
         Some(RemoveReplicaTerminalResultStatus::CommittedClean)
     );
+    let remove_operation = status.operation.as_ref().unwrap();
+    let remove_intent = remove_operation.remove_intent.as_ref().unwrap();
+    assert_eq!(
+        remove_intent.action_id,
+        format!("{}:RemoveReplicaIntent", remove_intent.attempt_id)
+    );
     assert_eq!(injected, expected);
     assert_stable_snapshot(&api, &status, 2);
     assert!(persisted_phases.contains(&DurableOperationPhase::RemoveFreezeIntent));
@@ -6156,6 +6430,16 @@ async fn test_durable_remove_coarse_activation() {
 
     let history = api.statuses.lock().unwrap();
     let removal_history = &history[history_start..];
+    assert!(
+        removal_history.iter().all(|entry| {
+            entry
+                .operation
+                .as_ref()
+                .and_then(|operation| operation.pending_action.as_ref())
+                .is_none_or(|pending| pending.dispatch_action_payload.is_empty())
+        }),
+        "coarse remove dispatch must retain its structured intent without a direct payload"
+    );
     let first_reduced = removal_history
         .iter()
         .position(|entry| {

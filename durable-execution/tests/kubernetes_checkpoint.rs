@@ -282,7 +282,13 @@ async fn create_and_replace_round_trip_exact_opaque_revisions_and_metrics() {
     );
 
     let metrics = store.metrics().snapshot();
+    let authoritative_write_attempts = requests
+        .iter()
+        .filter(|request| matches!(request.method, Method::POST | Method::PUT))
+        .count() as u64;
+    assert_eq!(authoritative_write_attempts, 2);
     assert_eq!(metrics.accepted_writes(), 2);
+    assert_eq!(metrics.accepted_writes(), authoritative_write_attempts);
     assert_eq!(
         metrics.checkpoint_bytes(),
         (serde_json::to_vec(&first).expect("JSON").len()

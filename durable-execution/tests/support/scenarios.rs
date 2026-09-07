@@ -6,8 +6,8 @@ use kuberic_durable_execution::{
     CheckpointPayload, CheckpointState, CheckpointStore, DispatchPermit, DurableHost, ExactBytes,
     ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore,
     InMemoryFault, LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
-    ReloadReason, StorageRevision, StoreError, StoreErrorKind, StoreOperation, StoredCheckpoint,
-    TerminalOutcome, Workflow, WorkflowContext,
+    PreparedActivityError, PreparedActivityResolver, ReloadReason, StorageRevision, StoreError,
+    StoreErrorKind, StoreOperation, StoredCheckpoint, TerminalOutcome, Workflow, WorkflowContext,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -385,6 +385,24 @@ async fn contending_turns(
 #[derive(Clone)]
 pub struct LinearWorkflow {
     activities: Vec<ActivitySpec>,
+}
+
+struct PreparedPrefixResolver;
+
+impl PreparedActivityResolver for PreparedPrefixResolver {
+    fn resolve(
+        &self,
+        logical: &ActivitySpec,
+        _recorded: Option<&ActivitySpec>,
+    ) -> Result<ActivitySpec, PreparedActivityError> {
+        let mut input = b"prepared:".to_vec();
+        input.extend_from_slice(logical.input().as_slice());
+        Ok(ActivitySpec::new(
+            logical.name().clone(),
+            ExactBytes::new(input),
+            logical.max_result_bytes(),
+        ))
+    }
 }
 
 impl LinearWorkflow {
@@ -3303,7 +3321,7 @@ async fn fused_schedule_exposure(id: ScenarioId) -> ScenarioEvidence {
     let mut durable_host = host(store.clone(), 180);
 
     let outcome = durable_host
-        .turn_and_expose(&workflow, execution.clone())
+        .turn_and_expose_with(&workflow, execution.clone(), &PreparedPrefixResolver)
         .await;
     let permit_identity = match &outcome {
         HostOutcome::DispatchPermitted { permit, .. } => {
@@ -3327,6 +3345,7 @@ async fn fused_schedule_exposure(id: ScenarioId) -> ScenarioEvidence {
                     ActivityState::DispatchExposed { attempt_id }
                         if permit_identity.as_ref().map(|identity| identity.1) == Some(*attempt_id)
                 )
+                && record.input().as_slice() == b"prepared:command"
         });
 
     ScenarioEvidence::new(
@@ -3355,6 +3374,7 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
     let mut no_false_permits = true;
     let mut boundaries_are_fused = true;
     let mut applied_unknown_quarantines = false;
+    let mut unapplied_unknown_keeps_predecessor = false;
 
     for (index, fault) in faults.into_iter().enumerate() {
         let store = InMemoryCheckpointStore::new();
@@ -3362,9 +3382,9 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
         let workflow = LinearWorkflow::one("fused-fault", 1, b"command");
         let execution_id = execution(181 + index as u8);
         let execution = execution_spec(execution_id, bytes(b"workflow"));
-        let mut durable_host = host(store, 181 + index as u8);
+        let mut durable_host = host(store.clone(), 181 + index as u8);
         let outcome = durable_host
-            .turn_and_expose(&workflow, execution.clone())
+            .turn_and_expose_with(&workflow, execution.clone(), &PreparedPrefixResolver)
             .await;
         no_false_permits &= !matches!(&outcome, HostOutcome::DispatchPermitted { .. });
         boundaries_are_fused &= matches!(
@@ -3379,9 +3399,13 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
         );
         if fault == InMemoryFault::OutcomeUnknownAfterApply {
             applied_unknown_quarantines = matches!(
-                durable_host.turn_and_expose(&workflow, execution).await,
+                durable_host
+                    .turn_and_expose_with(&workflow, execution, &PreparedPrefixResolver)
+                    .await,
                 HostOutcome::Quarantined { .. }
             );
+        } else if fault == InMemoryFault::OutcomeUnknownWithoutApply {
+            unapplied_unknown_keeps_predecessor = store.load(execution_id).await.unwrap().is_none();
         }
     }
 
@@ -3401,6 +3425,10 @@ async fn fused_schedule_exposure_faults(id: ScenarioId) -> ScenarioEvidence {
                 "unknown-after-apply reloads as conservative quarantine",
                 applied_unknown_quarantines,
             ),
+            (
+                "unknown-without-apply retains the authoritative predecessor",
+                unapplied_unknown_keeps_predecessor,
+            ),
         ],
     )
 }
@@ -3412,7 +3440,7 @@ async fn fused_observation_next_exposure(id: ScenarioId) -> ScenarioEvidence {
     let execution = execution_spec(execution_id, bytes(b"workflow"));
     let mut durable_host = host(store.clone(), 186);
     let first = match durable_host
-        .turn_and_expose(&workflow, execution.clone())
+        .turn_and_expose_with(&workflow, execution.clone(), &PreparedPrefixResolver)
         .await
     {
         HostOutcome::DispatchPermitted { permit, .. } => permit,
@@ -3425,10 +3453,11 @@ async fn fused_observation_next_exposure(id: ScenarioId) -> ScenarioEvidence {
         }
     };
     let outcome = durable_host
-        .observe_and_turn(
+        .observe_and_turn_with(
             &workflow,
             &execution,
             ActivityObservation::new(first.activity().clone(), bytes(b"one")),
+            &PreparedPrefixResolver,
         )
         .await;
     let second = match &outcome {
@@ -3475,7 +3504,7 @@ async fn fused_observation_terminal(id: ScenarioId) -> ScenarioEvidence {
     let execution = execution_spec(execution_id, bytes(b"workflow"));
     let mut durable_host = host(store.clone(), 187);
     let permit = match durable_host
-        .turn_and_expose(&workflow, execution.clone())
+        .turn_and_expose_with(&workflow, execution.clone(), &PreparedPrefixResolver)
         .await
     {
         HostOutcome::DispatchPermitted { permit, .. } => permit,
@@ -3488,10 +3517,11 @@ async fn fused_observation_terminal(id: ScenarioId) -> ScenarioEvidence {
         }
     };
     let outcome = durable_host
-        .observe_and_turn(
+        .observe_and_turn_with(
             &workflow,
             &execution,
             ActivityObservation::new(permit.activity().clone(), bytes(b"done")),
+            &PreparedPrefixResolver,
         )
         .await;
     let stored = store.load(execution_id).await.unwrap().unwrap();
@@ -3546,7 +3576,7 @@ async fn fused_observation_faults(id: ScenarioId) -> ScenarioEvidence {
         let execution = execution_spec(execution_id, bytes(b"workflow"));
         let mut durable_host = host(store.clone(), 188 + index as u8);
         let permit = match durable_host
-            .turn_and_expose(&workflow, execution.clone())
+            .turn_and_expose_with(&workflow, execution.clone(), &PreparedPrefixResolver)
             .await
         {
             HostOutcome::DispatchPermitted { permit, .. } => permit,
@@ -3557,10 +3587,11 @@ async fn fused_observation_faults(id: ScenarioId) -> ScenarioEvidence {
         };
         store.fail_next_compare_and_swap(fault);
         let outcome = durable_host
-            .observe_and_turn(
+            .observe_and_turn_with(
                 &workflow,
                 &execution,
                 ActivityObservation::new(permit.activity().clone(), bytes(b"one")),
+                &PreparedPrefixResolver,
             )
             .await;
         no_false_permits &= !matches!(&outcome, HostOutcome::DispatchPermitted { .. });
@@ -3576,7 +3607,9 @@ async fn fused_observation_faults(id: ScenarioId) -> ScenarioEvidence {
                 ..
             }
         );
-        let reloaded = durable_host.turn_and_expose(&workflow, execution).await;
+        let reloaded = durable_host
+            .turn_and_expose_with(&workflow, execution, &PreparedPrefixResolver)
+            .await;
         reloads_quarantine &= match fault {
             InMemoryFault::OutcomeUnknownAfterApply => matches!(
                 reloaded,
@@ -3629,7 +3662,7 @@ async fn fused_terminal_faults(id: ScenarioId) -> ScenarioEvidence {
         let execution = execution_spec(execution_id, bytes(b"workflow"));
         let mut durable_host = host(store.clone(), 193 + index as u8);
         let permit = match durable_host
-            .turn_and_expose(&workflow, execution.clone())
+            .turn_and_expose_with(&workflow, execution.clone(), &PreparedPrefixResolver)
             .await
         {
             HostOutcome::DispatchPermitted { permit, .. } => permit,
@@ -3640,10 +3673,11 @@ async fn fused_terminal_faults(id: ScenarioId) -> ScenarioEvidence {
         };
         store.fail_next_compare_and_swap(fault);
         let outcome = durable_host
-            .observe_and_turn(
+            .observe_and_turn_with(
                 &workflow,
                 &execution,
                 ActivityObservation::new(permit.activity().clone(), bytes(b"done")),
+                &PreparedPrefixResolver,
             )
             .await;
         no_false_permits_or_completion &= !matches!(
@@ -3662,7 +3696,9 @@ async fn fused_terminal_faults(id: ScenarioId) -> ScenarioEvidence {
                 ..
             }
         );
-        let reloaded = durable_host.turn_and_expose(&workflow, execution).await;
+        let reloaded = durable_host
+            .turn_and_expose_with(&workflow, execution, &PreparedPrefixResolver)
+            .await;
         reload_classification_is_exact &= match fault {
             InMemoryFault::OutcomeUnknownAfterApply => matches!(
                 reloaded,
@@ -3705,7 +3741,11 @@ async fn fused_capacity_reservation(id: ScenarioId) -> ScenarioEvidence {
     let execution_id = execution(192);
     let mut durable_host = host(store.clone(), 192);
     let outcome = durable_host
-        .turn_and_expose(&workflow, execution_spec(execution_id, bytes(b"workflow")))
+        .turn_and_expose_with(
+            &workflow,
+            execution_spec(execution_id, bytes(b"workflow")),
+            &PreparedPrefixResolver,
+        )
         .await;
 
     ScenarioEvidence::new(

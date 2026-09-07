@@ -166,31 +166,54 @@ uses compact mutable state, combines deterministic transitions in memory, and
 uses fused host progression while preserving exact durable commands,
 authoritative observations, and conservative quarantine.
 
-A representative successful execution now uses 19 durable
-effect/observation boundaries and 20 accepted checkpoint writes, versus the
-merged pilot's 88. Maximum active size fell from 141,529 to 41,385 bytes;
-terminal size fell from 5,433 bytes to an observed 3,961–3,969-byte range.
-The explicit comparison still uses 42 accepted status writes; the redesigned
-pilot uses two after acceptance. Its nine external-effect commands mean the
-strict `E + 4` write gate is 13, so 20 is an explicitly retained failed gate.
-The additional boundaries durably freeze or attest replica-agent fences and
-postconditions; omitting them would weaken exact replay or
-durable-before-dispatch safety. Active size passes 64 KiB but not the 32 KiB
-stretch gate, and terminal size passes its baseline gate.
+A representative successful three-member execution now records exactly nine
+external effects and three passive observations: 12 durable boundaries and 13
+accepted checkpoint writes, including terminal persistence. Seven
+ReplicaAgent preparation-only records were removed by preparing the exact
+command inside the same accepted exposure that authorizes dispatch; no effect
+or required observation was removed. In the authoritative happy-path
+measurement, checkpoint write attempts and accepted writes were both 13, with
+no conflict, unknown, or definite-failure outcomes. Six repeated remediation
+runs observed maximum active checkpoints from 31,597 to 31,605 bytes and compact
+terminal checkpoints from 4,077 to 4,081 bytes. These values are run-specific
+snapshots, not exact byte contracts; runtime-generated serialized values can
+change their lengths. The stable admission contracts remain the configured
+770,048-byte (752 KiB) encoded-checkpoint ceiling and 4,096-byte terminal
+payload ceiling. The executable measurement checks authoritative
+self-consistency and those limits.
 
-The lexical report distinguishes a 173-line/28-decision workflow body and the
-comparable 535/59 legacy workflow scope (merged baseline 538/73). Shared typed,
-fused, and effect-adapter infrastructure is 996/92; operator integration is
-887/47; the honestly charged non-overlapping total is 3,052/230 versus the
-merged pilot's 2,254/194. The shared protocol remains measured with the
-explicit implementation: that scope increased from 1,258/141 to 1,449/172.
-Charging it as well yields a combined 4,501/402 versus the combined baseline
-3,512/335. Shared code may amortize across later workflows, but this pilot
-does not claim that amortization yet.
+The terminal carries authoritative external-effect and passive-observation
+accounting, making the classification recoverable after a process restart.
+Successful terminal semantics require exactly three passive observations and
+the base nine external effects plus only the reachable per-effect bounded
+redeliveries. Only the seven ReplicaAgent effects have such retry slots; the
+two UID-fenced label effects do not. The no-redelivery path therefore remains
+exactly 9/3, while fault paths may use additional boundaries and writes. Compensation uses the
+exact reachable accounting pairs for the terminal operation's restore or
+failed-promotion transcript rather than a broad rollback upper bound. Active
+size passes both the 64 KiB baseline and 32 KiB stretch gates, and terminal
+size passes its baseline gate.
 
-A public compact reducer remains deferred. Deterministic transitions already
-add zero history records, so the failed write gate is not reducer-addressable
-under the evidence rule. No reducer prototype or API is introduced.
+These fields have deliberately different meanings. External effects are the
+seven ReplicaAgent mutations and two UID-fenced label patches. Passive
+observations are the three durable evidence-only steps. Their sum is the
+completed durable-boundary count. A write attempt is any checkpoint CAS call,
+whereas an accepted write is confirmed only by an authoritative accepted
+revision. Active and terminal sizes are canonical encoded checkpoint sizes for
+different lifecycle states and are reported separately.
+
+The lexical report distinguishes a 201-line/29-decision workflow body and the
+comparable 930/108 legacy-marker scope. Shared typed, fused, and effect-adapter
+infrastructure is 1,208/110; operator integration is 1,047/55; the honestly
+charged non-overlapping total is 4,161/326. The explicit implementation remains
+measured at 1,449/172. Charging it as well yields a combined 5,610/498. The
+measurement script rejects overlapping charged scopes. Shared code may
+amortize across later workflows, but this pilot does not claim that
+amortization yet.
+
+A public compact reducer remains deferred. The achieved write gate comes from
+atomic prepared exposure, not history compaction, and no reducer prototype or
+API is introduced.
 
 The remaining step stays deferred: generalize only if later evidence justifies
 the additional operational and implementation cost. No other workflow,

@@ -3,6 +3,58 @@ use thiserror::Error;
 
 use crate::{ActivityName, ActivitySpec, ExactBytes};
 
+/// Deterministic failure while resolving a logical activity into the exact
+/// specification that may be exposed.
+#[derive(Clone, Debug, Deserialize, Eq, Error, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PreparedActivityError {
+    #[error("prepared activity derivation failed")]
+    Derivation,
+    #[error("prepared activity validation failed")]
+    Validation,
+    #[error("prepared activity encoding failed")]
+    Encoding,
+    #[error(
+        "prepared activity input is {actual_bytes} bytes, exceeding the {max_bytes}-byte bound"
+    )]
+    InputTooLarge { actual_bytes: u64, max_bytes: u64 },
+    #[error(
+        "prepared activity result bound is {actual_bytes} bytes, exceeding the {max_bytes}-byte bound"
+    )]
+    ResultBoundTooLarge { actual_bytes: u64, max_bytes: u64 },
+}
+
+/// Opt-in resolver for replacing a logical request with its exact bounded
+/// dispatch specification.
+///
+/// `recorded` is the authoritative complete specification during replay.
+/// Implementations must validate it against the logical request and return the
+/// exact specification they expect; the kernel performs the final byte-for-byte
+/// comparison.
+pub trait PreparedActivityResolver: Sync {
+    fn resolve(
+        &self,
+        logical: &ActivitySpec,
+        recorded: Option<&ActivitySpec>,
+    ) -> Result<ActivitySpec, PreparedActivityError>;
+}
+
+/// Identity preparation used by all existing workflow callers.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdentityActivityResolver;
+
+impl PreparedActivityResolver for IdentityActivityResolver {
+    fn resolve(
+        &self,
+        logical: &ActivitySpec,
+        _recorded: Option<&ActivitySpec>,
+    ) -> Result<ActivitySpec, PreparedActivityError> {
+        Ok(logical.clone())
+    }
+}
+
+pub(crate) static IDENTITY_ACTIVITY_RESOLVER: IdentityActivityResolver = IdentityActivityResolver;
+
 /// A versioned, bounded durable activity contract.
 ///
 /// Workflow bodies invoke an activity with [`crate::WorkflowContext::call`].

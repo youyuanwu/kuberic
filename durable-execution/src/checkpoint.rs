@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,
-    ExecutionSpec, LogicalActivityId, TerminalOutcome,
+    ExecutionSpec, LogicalActivityId, PreparedActivityError, TerminalOutcome,
 };
 
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
@@ -457,6 +457,8 @@ pub enum ActivityState {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CheckpointError {
+    #[error("prepared activity was rejected: {0}")]
+    PreparedActivityRejected(PreparedActivityError),
     #[error("checkpoint format {actual} is unsupported; this build supports {supported}")]
     UnsupportedFormat { actual: u32, supported: u32 },
     #[error("checkpoint JSON is invalid: {0}")]
