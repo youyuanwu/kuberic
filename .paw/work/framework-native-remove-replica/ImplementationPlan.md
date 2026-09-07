@@ -443,7 +443,7 @@ pull requests. This planning activity creates no commit.
 - **`durable-execution/tests/kubernetes_checkpoint_real.rs`**:
   - Run the existing exact-owner garbage-collection real-API test against the
     isolated Kuberic `kind` cluster before the deletion gate.
-- **`durable-execution/src/feasibility.rs`**:
+- **`durable-execution/tests/feasibility.rs`**:
   - Retain and run the cleanup-role authorization test proving the writer
     cannot delete retained records and the distinct cleanup identity can.
 
