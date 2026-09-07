@@ -224,12 +224,10 @@ impl MeasuredPilotCheckpointStore {
                 measurements.maximum_terminal_checkpoint_bytes =
                     measurements.maximum_terminal_checkpoint_bytes.max(bytes);
                 measurements.completed_activity_count = Some(*completed_activity_count);
-                let accounting = decode_terminal_activity_accounting(outcome)
-                    .ok()
-                    .flatten()
-                    .filter(|accounting| {
-                        accounting.matches_completed_activity_count(*completed_activity_count)
-                    });
+                let accounting =
+                    decode_terminal_activity_accounting(outcome, *completed_activity_count)
+                        .ok()
+                        .flatten();
                 if let Some(accounting) = accounting {
                     measurements.completed_external_effect_count =
                         Some(accounting.external_effect_count);
@@ -391,6 +389,38 @@ mod durable_switchover_pilot_tests {
 
     fn checkpoint(value: &[u8]) -> CheckpointEnvelope {
         CheckpointEnvelope::new(3, ExactBytes::new(value))
+    }
+
+    async fn terminal_accounting_measurements(
+        seed: u8,
+        terminal_payload: &'static [u8],
+        completed_activity_count: u64,
+    ) -> PilotCheckpointMeasurementsSnapshot {
+        let execution_id = ExecutionId::from_bytes([seed; 16]);
+        let contract = ExecutionContract::new(
+            ExecutionSpec::new(execution_id, ExactBytes::new(b"workflow"), 128),
+            100_000,
+        );
+        let store = MeasuredPilotCheckpointStore::new(
+            execution_id,
+            PilotCheckpointStore::InMemory(
+                kuberic_durable_execution::InMemoryCheckpointStore::new(),
+            ),
+        );
+        let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
+            contract,
+            TerminalOutcome::succeeded(ExactBytes::new(terminal_payload)),
+            completed_activity_count,
+        ))
+        .unwrap();
+        assert!(matches!(
+            store
+                .compare_and_swap(execution_id, None, terminal)
+                .await
+                .unwrap(),
+            CasOutcome::Accepted(_)
+        ));
+        store.measurements()
     }
 
     #[tokio::test]
@@ -602,6 +632,65 @@ mod durable_switchover_pilot_tests {
         assert_eq!(mismatched.completed_activity_count, Some(11));
         assert_eq!(mismatched.completed_external_effect_count, None);
         assert_eq!(mismatched.completed_passive_observation_count, None);
+
+        let wrong_split = terminal_accounting_measurements(
+            12,
+            br#"{"status":"complete","compensated":false,"accounting":{"externalEffectCount":10,"passiveObservationCount":2}}"#,
+            12,
+        )
+        .await;
+        assert_eq!(wrong_split.completed_activity_count, Some(12));
+        assert_eq!(wrong_split.completed_external_effect_count, None);
+        assert_eq!(wrong_split.completed_passive_observation_count, None);
+
+        let compensation = terminal_accounting_measurements(
+            13,
+            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":8,"passiveObservationCount":5}}"#,
+            13,
+        )
+        .await;
+        assert_eq!(compensation.completed_activity_count, Some(13));
+        assert_eq!(compensation.completed_external_effect_count, Some(8));
+        assert_eq!(compensation.completed_passive_observation_count, Some(5));
+
+        let impossible_compensation = terminal_accounting_measurements(
+            14,
+            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":21,"passiveObservationCount":3}}"#,
+            24,
+        )
+        .await;
+        assert_eq!(
+            impossible_compensation.completed_external_effect_count,
+            None
+        );
+        assert_eq!(
+            impossible_compensation.completed_passive_observation_count,
+            None
+        );
+
+        let impossible_split = terminal_accounting_measurements(
+            15,
+            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":1,"passiveObservationCount":22}}"#,
+            23,
+        )
+        .await;
+        assert_eq!(impossible_split.completed_external_effect_count, None);
+        assert_eq!(impossible_split.completed_passive_observation_count, None);
+
+        let impossible_redelivery_split = terminal_accounting_measurements(
+            16,
+            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":10,"passiveObservationCount":13}}"#,
+            23,
+        )
+        .await;
+        assert_eq!(
+            impossible_redelivery_split.completed_external_effect_count,
+            None
+        );
+        assert_eq!(
+            impossible_redelivery_split.completed_passive_observation_count,
+            None
+        );
     }
 
     #[tokio::test]

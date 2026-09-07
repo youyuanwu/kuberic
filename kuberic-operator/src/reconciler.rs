@@ -2738,6 +2738,7 @@ async fn reconcile_durable_switchover_pilot(
                 let accepted_attempt = permit.attempt_id();
                 let prepared = decode_pilot_activity_input(permit.activity().input())?;
                 let operation = prepared.state.apply_to(&initial)?;
+                validate_prepared_activity(&operation, &prepared.kind)?;
                 if prepared.kind == PilotActivityKind::PassiveObservation {
                     match evaluate_adapter_step(&operation, &observations, now)? {
                         PilotAdapterDecision::Observe(result) => {
@@ -5519,6 +5520,155 @@ mod dispatch_planning_tests {
             .is_err()
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(api.exact_uid_patches.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[tokio::test]
+    async fn missing_external_observation_rejects_preparation_before_exposure_then_dispatches_exactly()
+     {
+        use crate::durable::pilot::{
+            DurableSwitchoverWorkflow, PilotCheckpointStore, PilotPreparedActivityResolver,
+            decode_pilot_activity_input, execution_spec, initial_operation, new_pilot_reference,
+        };
+        use crate::durable::pilot_store::MeasuredPilotCheckpointStore;
+        use kuberic_durable_execution::{
+            CheckpointError, DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
+            PreparedActivityError,
+        };
+
+        let mut reference = new_pilot_reference("set-uid", pilot_snapshot(), 2, 100).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let PilotAdapterDecision::Observe(result) = crate::durable::pilot::evaluate_adapter_step(
+            &initial,
+            &OperationObservations::new(),
+            100,
+        )
+        .unwrap() else {
+            panic!("expected persisted revoke intent");
+        };
+        let DurableSwitchoverStepResult::Advance { operation: pending } = *result else {
+            panic!("expected compact revoke intent");
+        };
+        let pending = pending.apply_to(&initial).unwrap();
+        assert!(pending.pending_action.is_some());
+        assert!(matches!(
+            crate::durable::pilot::evaluate_adapter_step(
+                &pending,
+                &OperationObservations::new(),
+                100,
+            )
+            .unwrap(),
+            PilotAdapterDecision::AwaitEvidence
+        ));
+        assert!(
+            resolve_pilot_quarantine(
+                &pending,
+                &PilotActivityKind::PassiveObservation,
+                PilotAdapterDecision::AwaitEvidence,
+                &OperationObservations::new(),
+            )
+            .is_err(),
+            "quarantine must reject a pending external effect classified as passive"
+        );
+        reference.initial_operation_json = serde_json::to_string(&pending).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let backend = InMemoryCheckpointStore::new();
+        let measured = MeasuredPilotCheckpointStore::new(
+            execution.execution_id(),
+            PilotCheckpointStore::InMemory(backend.clone()),
+        );
+        let mut host = DurableHost::new(
+            measured,
+            HostEpoch::from_bytes([21; 16]),
+            crate::durable::pilot::checkpoint_limits(),
+        );
+        let no_observations = OperationObservations::new();
+        let no_handles = BTreeMap::new();
+        let unavailable_resolver =
+            PilotPreparedActivityResolver::new(&pending, &no_observations, &no_handles, 100);
+
+        assert_eq!(
+            host.turn_and_expose_with(
+                &DurableSwitchoverWorkflow,
+                execution.clone(),
+                &unavailable_resolver,
+            )
+            .await,
+            HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(
+                PreparedActivityError::Derivation,
+            ))
+        );
+        assert!(
+            backend
+                .load(execution.execution_id())
+                .await
+                .unwrap()
+                .is_none(),
+            "preparation rejection must leave the authoritative predecessor unchanged"
+        );
+        assert_eq!(host.store().measurements().write_attempts, 0);
+        assert_eq!(host.store().measurements().accepted_writes, 0);
+
+        let requests = StdArc::new(StdMutex::new(Vec::new()));
+        let handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::from([(
+            1,
+            Box::new(BusyPilotHandle {
+                requests: requests.clone(),
+                refresh_required: false,
+            }) as Box<dyn ReplicaHandle>,
+        )]);
+        let observations = pilot_observations(observed(
+            kuberic_core::replica_agent::CORRELATED_CONTROL_PROTOCOL_VERSION,
+        ));
+        let addressed_instances = handles
+            .iter()
+            .map(|(replica_id, handle)| (*replica_id, handle.instance_id()))
+            .collect();
+        let ready_resolver =
+            PilotPreparedActivityResolver::new(&pending, &observations, &addressed_instances, 101);
+        let HostOutcome::DispatchPermitted { permit, .. } = host
+            .turn_and_expose_with(&DurableSwitchoverWorkflow, execution, &ready_resolver)
+            .await
+        else {
+            panic!("fresh observation must expose the exact prepared effect");
+        };
+        let activity = permit.activity().clone();
+        let attempt = permit.attempt_id();
+        let prepared = decode_pilot_activity_input(activity.input()).unwrap();
+        let PilotActivityKind::PreparedReplica { command } = &prepared.kind else {
+            panic!("pending external action was not prepared as a replica effect");
+        };
+        assert_eq!(
+            command.action_id,
+            pending.pending_action.as_ref().unwrap().action_id
+        );
+        let prepared_operation = prepared.state.apply_to(&pending).unwrap();
+        let api = BridgeTestApi {
+            exact_uid_patches: AtomicUsize::new(0),
+            exact_uid_commands: StdMutex::new(Vec::new()),
+        };
+        let mut guard = PilotPermitGuard::new(permit);
+        assert!(matches!(
+            bridge_pilot_permitted_step(
+                &mut guard,
+                &prepared_operation,
+                &prepared.kind,
+                &activity,
+                attempt,
+                &observations,
+                &handles,
+                &api,
+                "default",
+            )
+            .await
+            .unwrap(),
+            PilotEffectBridgeOutcome::Observe(_)
+        ));
+        let dispatched = requests.lock().unwrap();
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].action_id, command.action_id);
+        assert_eq!(dispatched[0].action.signature(), command.action_signature);
         assert_eq!(api.exact_uid_patches.load(Ordering::SeqCst), 0);
     }
 

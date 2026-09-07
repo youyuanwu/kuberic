@@ -682,6 +682,19 @@ pub fn resolve_pilot_quarantine(
     decision: PilotAdapterDecision,
     observations: &OperationObservations,
 ) -> Result<PilotEffectBridgeOutcome, String> {
+    if matches!(
+        (&prepared, &decision),
+        (
+            PilotActivityKind::PassiveObservation,
+            PilotAdapterDecision::AwaitEvidence
+        )
+    ) && operation.pending_action.is_some()
+    {
+        return Err(
+            "quarantined pending external pilot effect was misclassified as a passive observation"
+                .to_string(),
+        );
+    }
     if let PilotAdapterDecision::Observe(result) = decision {
         let authoritative = matches!(prepared, PilotActivityKind::PassiveObservation)
             || quarantine_result_is_authoritative(operation, &result, observations);

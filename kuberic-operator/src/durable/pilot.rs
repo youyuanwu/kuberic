@@ -397,6 +397,8 @@ enum DurableSwitchoverTerminalRecord {
 enum DurableSwitchoverTerminalAccountingRecord {
     Complete {
         #[serde(default)]
+        compensated: bool,
+        #[serde(default)]
         accounting: Option<PilotActivityAccounting>,
     },
     Stopped {},
@@ -556,6 +558,14 @@ impl Workflow for DurableSwitchoverWorkflow {
                                 .to_string(),
                         );
                     };
+                    if let Err(error) = validate_terminal_activity_accounting(
+                        &initial,
+                        &completed,
+                        compensated,
+                        accounting,
+                    ) {
+                        return terminal_failure(Some(operation), error);
+                    }
                     return terminal_success(DurableSwitchoverPilotTerminal::Complete {
                         operation: completed,
                         snapshot,
@@ -795,6 +805,7 @@ pub fn decode_terminal(
 
 pub fn decode_terminal_activity_accounting(
     outcome: &TerminalOutcome,
+    completed_activity_count: u64,
 ) -> Result<Option<PilotActivityAccounting>, String> {
     let record: DurableSwitchoverTerminalAccountingRecord =
         serde_json::from_slice(outcome.payload().as_slice()).map_err(|error| {
@@ -803,8 +814,20 @@ pub fn decode_terminal_activity_accounting(
     Ok(match (outcome, record) {
         (
             TerminalOutcome::Succeeded(_),
-            DurableSwitchoverTerminalAccountingRecord::Complete { accounting },
-        ) => accounting,
+            DurableSwitchoverTerminalAccountingRecord::Complete {
+                compensated,
+                accounting: Some(accounting),
+            },
+        ) if validate_terminal_accounting_shape(
+            None,
+            compensated,
+            accounting,
+            completed_activity_count,
+        )
+        .is_ok() =>
+        {
+            Some(accounting)
+        }
         _ => None,
     })
 }
@@ -823,11 +846,12 @@ pub fn validate_loaded_terminal(
                 operation,
                 snapshot,
                 compensated,
-                ..
+                accounting,
             },
         ) => {
             validate_transition(&initial, operation)?;
             validate_terminal(operation, snapshot, *compensated)?;
+            validate_terminal_activity_accounting(&initial, operation, *compensated, *accounting)?;
         }
         (
             TerminalOutcome::Failed(_),
@@ -940,7 +964,12 @@ impl<'a> PilotPreparedActivityResolver<'a> {
             .map_err(|_| PreparedActivityError::Derivation)?;
         let mut prepared = logical.clone();
         match decision {
-            PilotAdapterDecision::Observe(_) | PilotAdapterDecision::AwaitEvidence => {}
+            PilotAdapterDecision::Observe(_) => {}
+            PilotAdapterDecision::AwaitEvidence => {
+                if operation.pending_action.is_some() {
+                    return Err(PreparedActivityError::Derivation);
+                }
+            }
             PilotAdapterDecision::External(decision) => match *decision {
                 Decision::Execute {
                     target_id,
@@ -1505,12 +1534,112 @@ fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
     steps
 }
 
-#[cfg(test)]
 fn projected_passive_observation_count(steps: &[&str]) -> usize {
     steps
         .iter()
         .filter(|step| !step.ends_with(".effect") && **step != "proven-no-admission-redelivery")
         .count()
+}
+
+fn projected_activity_accounting(steps: &[&str]) -> PilotActivityAccounting {
+    PilotActivityAccounting::new(
+        u64::try_from(external_effect_count(steps))
+            .expect("projected external-effect count fits u64"),
+        u64::try_from(projected_passive_observation_count(steps))
+            .expect("projected passive-observation count fits u64"),
+    )
+}
+
+fn is_full_pilot_start(initial: &DurableOperationStatus) -> bool {
+    initial.phase == DurableOperationPhase::Revoke
+        && initial.pending_action.is_none()
+        && initial.frozen_lsn.is_none()
+        && initial.next_secondary_index == 0
+        && initial.previous_snapshot.members.len() == PILOT_MAX_REPLICAS
+}
+
+fn validate_terminal_activity_accounting(
+    initial: &DurableOperationStatus,
+    terminal: &DurableOperationStatus,
+    compensated: bool,
+    accounting: PilotActivityAccounting,
+) -> Result<(), String> {
+    if !is_full_pilot_start(initial) {
+        return Ok(());
+    }
+    validate_terminal_accounting_shape(
+        Some(terminal.phase),
+        compensated,
+        accounting,
+        accounting
+            .external_effect_count
+            .checked_add(accounting.passive_observation_count)
+            .ok_or_else(|| "pilot terminal activity accounting overflowed".to_string())?,
+    )
+}
+
+fn validate_terminal_accounting_shape(
+    terminal_phase: Option<DurableOperationPhase>,
+    compensated: bool,
+    accounting: PilotActivityAccounting,
+    completed_activity_count: u64,
+) -> Result<(), String> {
+    if !accounting.matches_completed_activity_count(completed_activity_count) {
+        return Err(format!(
+            "pilot terminal activity accounting {}/{} does not total the authoritative \
+             completed activity count {completed_activity_count}",
+            accounting.external_effect_count, accounting.passive_observation_count,
+        ));
+    }
+
+    if !compensated {
+        let expected = projected_activity_accounting(&projected_success_steps(PILOT_MAX_REPLICAS));
+        if terminal_phase.is_some_and(|phase| phase != DurableOperationPhase::Completed)
+            || accounting != expected
+        {
+            return Err(format!(
+                "successful full pilot requires authoritative activity accounting {}/{}, got {}/{}",
+                expected.external_effect_count,
+                expected.passive_observation_count,
+                accounting.external_effect_count,
+                accounting.passive_observation_count,
+            ));
+        }
+        return Ok(());
+    }
+
+    let rollback_steps = projected_rollback_steps(PILOT_MAX_REPLICAS);
+    let rollback = projected_activity_accounting(&rollback_steps);
+    let maximum_external_effects = rollback
+        .external_effect_count
+        .checked_mul(2)
+        .ok_or_else(|| "pilot rollback activity accounting overflowed".to_string())?;
+    let maximum_completed_activities =
+        u64::try_from(rollback_steps.len()).expect("projected rollback activity count fits u64");
+    let maximum_non_redelivery_activities = maximum_completed_activities
+        .checked_sub(rollback.external_effect_count)
+        .expect("rollback projection includes its redelivery headroom");
+    let minimum_external_for_total = completed_activity_count
+        .saturating_sub(maximum_non_redelivery_activities)
+        .checked_mul(2)
+        .ok_or_else(|| "pilot rollback redelivery accounting overflowed".to_string())?;
+    if terminal_phase.is_some_and(|phase| phase != DurableOperationPhase::Failed)
+        || accounting.external_effect_count == 0
+        || accounting.external_effect_count > maximum_external_effects
+        || accounting.passive_observation_count == 0
+        || accounting.passive_observation_count > maximum_non_redelivery_activities
+        || accounting.external_effect_count < minimum_external_for_total
+        || completed_activity_count > maximum_completed_activities
+    {
+        return Err(format!(
+            "compensated pilot activity accounting {}/{} is outside the authoritative rollback \
+             projection (external 1..={maximum_external_effects}, passive <= \
+             {maximum_non_redelivery_activities}, total <= {maximum_completed_activities}, \
+             every redelivery requires its preceding external attempt)",
+            accounting.external_effect_count, accounting.passive_observation_count,
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2051,7 +2180,7 @@ mod durable_switchover_pilot_tests {
                         operation: compact(&advanced),
                         snapshot: terminal_snapshot.clone(),
                         compensated: false,
-                        accounting: Some(PilotActivityAccounting::new(0, 1)),
+                        accounting: Some(PilotActivityAccounting::new(1, 1)),
                     })
                     .unwrap(),
                 ),
@@ -2075,7 +2204,7 @@ mod durable_switchover_pilot_tests {
                 operation: advanced,
                 snapshot: terminal_snapshot,
                 compensated: false,
-                accounting: PilotActivityAccounting::new(0, 1),
+                accounting: PilotActivityAccounting::new(1, 1),
             }
         );
         let polls_before_terminal_reload = polls.load(Ordering::SeqCst);
@@ -2935,6 +3064,24 @@ mod durable_switchover_pilot_tests {
             validate_loaded_terminal(&reference, &success).unwrap(),
             valid
         );
+        for accounting in [
+            PilotActivityAccounting::new(10, 2),
+            PilotActivityAccounting::new(8, 3),
+        ] {
+            let invalid_accounting = TerminalOutcome::succeeded(
+                encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                    snapshot: operation.target_snapshot.clone(),
+                    operation: operation.clone(),
+                    compensated: false,
+                    accounting,
+                })
+                .unwrap(),
+            );
+            assert!(
+                validate_loaded_terminal(&reference, &invalid_accounting).is_err(),
+                "successful terminal accepted invalid accounting {accounting:?}"
+            );
+        }
 
         let failed_kind = TerminalOutcome::failed(encode_terminal(&valid).unwrap());
         assert!(validate_loaded_terminal(&reference, &failed_kind).is_err());
@@ -2984,7 +3131,7 @@ mod durable_switchover_pilot_tests {
             operation: failed.clone(),
             snapshot: compensated.clone(),
             compensated: true,
-            accounting: PilotActivityAccounting::new(10, 3),
+            accounting: PilotActivityAccounting::new(8, 5),
         };
         assert!(
             validate_loaded_terminal(
@@ -2993,6 +3140,36 @@ mod durable_switchover_pilot_tests {
             )
             .is_ok()
         );
+        let invalid_compensation = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                operation: failed.clone(),
+                snapshot: compensated.clone(),
+                compensated: true,
+                accounting: PilotActivityAccounting::new(21, 3),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &invalid_compensation).is_err());
+        let impossible_passive_split = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                operation: failed.clone(),
+                snapshot: compensated.clone(),
+                compensated: true,
+                accounting: PilotActivityAccounting::new(1, 22),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &impossible_passive_split).is_err());
+        let impossible_redelivery_split = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                operation: failed.clone(),
+                snapshot: compensated.clone(),
+                compensated: true,
+                accounting: PilotActivityAccounting::new(10, 13),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &impossible_redelivery_split).is_err());
 
         let mut malformed = Vec::new();
         let mut missing = compensated.clone();
@@ -3025,7 +3202,7 @@ mod durable_switchover_pilot_tests {
                     operation: failed.clone(),
                     snapshot,
                     compensated: true,
-                    accounting: PilotActivityAccounting::new(10, 3),
+                    accounting: PilotActivityAccounting::new(8, 5),
                 })
                 .unwrap(),
             );
