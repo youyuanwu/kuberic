@@ -1790,8 +1790,8 @@ mod remove_replica_pilot_tests {
         },
     };
     use kuberic_durable_execution::{
-        ActivityObservation, CasOutcome, CheckpointState, CheckpointStore, DurableHost, HostEpoch,
-        HostOutcome, InMemoryFault, ReloadReason,
+        ActivityObservation, ActivityState, CasOutcome, CheckpointState, CheckpointStore,
+        DurableHost, HostEpoch, HostOutcome, InMemoryFault, PersistenceBoundary, ReloadReason,
     };
 
     use crate::{
@@ -2302,6 +2302,93 @@ mod remove_replica_pilot_tests {
             HostEpoch::from_bytes([epoch; 16]),
             checkpoint_limits(),
         )
+    }
+
+    async fn assert_exposed_history(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        permit: &DispatchPermit,
+        expected_specs: &[ActivitySpec],
+    ) {
+        let stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(execution, checkpoint_limits())
+            .unwrap();
+        let activities = payload.active_activities().unwrap();
+        assert_eq!(activities.len(), expected_specs.len());
+        for (record, expected) in activities.iter().zip(expected_specs) {
+            assert_eq!(record.spec(), expected);
+        }
+        assert!(
+            activities[..activities.len() - 1]
+                .iter()
+                .all(|record| matches!(record.state(), ActivityState::Completed { .. }))
+        );
+        let exposed = activities.last().unwrap();
+        assert_eq!(
+            exposed.logical_id(execution.execution_id()),
+            *permit.activity()
+        );
+        assert!(matches!(
+            exposed.state(),
+            ActivityState::DispatchExposed { attempt_id }
+                if *attempt_id == permit.attempt_id()
+        ));
+    }
+
+    async fn assert_completed_history(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        expected_specs: &[ActivitySpec],
+    ) -> usize {
+        let stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let encoded_len = stored.checkpoint().encoded_len().unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(execution, checkpoint_limits())
+            .unwrap();
+        let activities = payload.active_activities().unwrap();
+        assert_eq!(activities.len(), expected_specs.len());
+        for (record, expected) in activities.iter().zip(expected_specs) {
+            assert_eq!(record.spec(), expected);
+            assert!(matches!(record.state(), ActivityState::Completed { .. }));
+        }
+        encoded_len
+    }
+
+    async fn restart_into_quarantine(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        epoch: u8,
+        permit: &DispatchPermit,
+    ) -> RemoveReplicaPilotHost {
+        let before = backend.load(execution.execution_id()).await.unwrap();
+        let mut restarted = measured_host(execution, backend.clone(), epoch);
+        let HostOutcome::Quarantined {
+            activity,
+            attempt_id,
+        } = restarted
+            .turn(&DurableRemoveReplicaWorkflow, execution.clone())
+            .await
+        else {
+            panic!("expected exposed remove activity to be quarantined after restart");
+        };
+        assert_eq!(activity, *permit.activity());
+        assert_eq!(attempt_id, permit.attempt_id());
+        assert_eq!(
+            backend.load(execution.execution_id()).await.unwrap(),
+            before
+        );
+        restarted
     }
 
     #[test]
@@ -3251,83 +3338,495 @@ mod remove_replica_pilot_tests {
 
     #[tokio::test]
     async fn remove_replica_pilot_restarts_at_every_durable_boundary_without_command_drift() {
-        let initial = initial(DurableRemoveMode::ScaleDown);
-        let (dispatched, _) = freeze_and_dispatch(DurableRemoveMode::ScaleDown);
-        let stages = completed_stages();
-        for (index, operation) in [
-            initial.clone(),
-            dispatched,
-            stages.committed,
-            stages.awaiting_cleanup,
-            stages.deleting,
-            stages.publishing,
-            stages.finalizing,
-            stages.completed,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let kind = if operation.phase == DurableOperationPhase::RemoveAwaitCoordination {
-                resolve_kind(
-                    &initial,
-                    &operation,
-                    &observations(&operation),
-                    &pod_identities(),
-                    Some("secondary"),
-                )
-                .unwrap()
-            } else if operation.phase == DurableOperationPhase::RemoveDeleteTargetPod {
-                RemoveReplicaActivityKind::PreparedDelete {
-                    command: DeleteEffectCommand::new(3, "set-2".to_string(), "three".to_string()),
-                }
-            } else {
-                RemoveReplicaActivityKind::PassiveObservation
-            };
-            let input = DurableRemoveReplicaActivityInput {
-                version: REMOVE_REPLICA_PILOT_VERSION,
-                state: DurableRemoveReplicaState::from_operation(&operation),
-                kind,
-            };
-            let execution = ExecutionSpec::new(
-                ExecutionId::from_bytes([u8::try_from(index + 40).unwrap(); 16]),
-                ExactBytes::new(b"boundary-replay"),
-                REMOVE_REPLICA_PILOT_MAX_TERMINAL_BYTES,
-            );
-            let backend = InMemoryCheckpointStore::new();
-            let mut host = measured_host(
-                &execution,
-                backend.clone(),
-                u8::try_from(index + 70).unwrap(),
-            );
-            let HostOutcome::DispatchPermitted { permit, .. } = host
-                .turn_and_expose(
-                    &OneActivityWorkflow {
-                        input: input.clone(),
-                    },
-                    execution.clone(),
-                )
-                .await
-            else {
-                panic!("expected accepted boundary exposure");
-            };
-            let accepted = decode_remove_activity_input(permit.activity().spec().input()).unwrap();
-            assert_eq!(accepted, input);
+        let reference = reference(DurableRemoveMode::ScaleDown);
+        let execution = execution_spec(&reference).unwrap();
+        let initial = initial_operation(&reference).unwrap();
+        let pods = pod_identities();
+        let initial_observations = observations(&initial);
+        let initial_addressed = addressed(&initial_observations);
+        let initial_resolver = RemoveReplicaPreparedActivityResolver::new(
+            &initial,
+            &initial_observations,
+            &pods,
+            Some("secondary"),
+            &initial_addressed,
+            10,
+        );
+        let backend = InMemoryCheckpointStore::new();
+        let workflow = DurableRemoveReplicaWorkflow;
+        let mut history_specs = Vec::new();
 
-            let mut restarted =
-                measured_host(&execution, backend, u8::try_from(index + 90).unwrap());
-            let HostOutcome::Quarantined { activity, .. } = restarted
-                .turn(
-                    &OneActivityWorkflow {
-                        input: accepted.clone(),
-                    },
-                    execution,
-                )
-                .await
-            else {
-                panic!("expected quarantined accepted boundary after restart");
-            };
-            assert_eq!(activity.spec(), permit.activity().spec());
+        let mut host = measured_host(&execution, backend.clone(), 61);
+        let HostOutcome::ScheduleAccepted {
+            activity: freeze_activity,
+            ..
+        } = host.turn(&workflow, execution.clone()).await
+        else {
+            panic!("expected accepted freeze-observation schedule");
+        };
+        let scheduled = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let scheduled_payload = scheduled
+            .checkpoint()
+            .decode_and_validate(&execution, checkpoint_limits())
+            .unwrap();
+        let scheduled_records = scheduled_payload.active_activities().unwrap();
+        assert_eq!(scheduled_records.len(), 1);
+        assert_eq!(
+            scheduled_records[0].logical_id(execution.execution_id()),
+            freeze_activity
+        );
+        assert!(matches!(
+            scheduled_records[0].state(),
+            ActivityState::Scheduled
+        ));
+
+        let mut host = measured_host(&execution, backend.clone(), 62);
+        let HostOutcome::DispatchPermitted {
+            permit: freeze_permit,
+            boundary: PersistenceBoundary::Exposure,
+            ..
+        } = host.turn(&workflow, execution.clone()).await
+        else {
+            panic!("expected accepted freeze-observation exposure");
+        };
+        assert_eq!(*freeze_permit.activity(), freeze_activity);
+        let freeze_input =
+            decode_remove_activity_input(freeze_permit.activity().spec().input()).unwrap();
+        assert_eq!(
+            freeze_input,
+            DurableRemoveReplicaActivityInput {
+                version: REMOVE_REPLICA_PILOT_VERSION,
+                state: DurableRemoveReplicaState::from_operation(&initial),
+                kind: RemoveReplicaActivityKind::PassiveObservation,
+            }
+        );
+        history_specs.push(freeze_permit.activity().spec().clone());
+        assert_exposed_history(&backend, &execution, &freeze_permit, &history_specs).await;
+
+        let host = restart_into_quarantine(&backend, &execution, 63, &freeze_permit).await;
+        let freeze_decision = evaluate_adapter_step(
+            &initial,
+            &initial_observations,
+            &pods,
+            Some("secondary"),
+            10,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    freeze_permit.activity().clone(),
+                    encode_step_result(
+                        &completed_step(freeze_decision, &freeze_input.kind).unwrap()
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *freeze_permit.activity()
+        ));
+        assert_completed_history(&backend, &execution, &history_specs).await;
+
+        let mut host = measured_host(&execution, backend.clone(), 64);
+        let HostOutcome::DispatchPermitted {
+            permit: replica_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &initial_resolver)
+            .await
+        else {
+            panic!("expected exact coarse remove exposure after observation restart");
+        };
+        let replica_input =
+            decode_remove_activity_input(replica_permit.activity().spec().input()).unwrap();
+        let RemoveReplicaActivityKind::PreparedReplica {
+            command: replica_command,
+        } = &replica_input.kind
+        else {
+            panic!("expected exact prepared replica command");
+        };
+        let replica_operation = replica_input.state.apply_to(&initial).unwrap();
+        let intent = replica_operation.remove_intent.as_ref().unwrap().clone();
+        assert_eq!(replica_command.target_id, initial.old_primary_id);
+        assert_eq!(
+            replica_command.target_instance_id,
+            intent.primary_instance_id
+        );
+        assert_eq!(replica_command.action_id, intent.action_id);
+        assert_eq!(replica_command.action_signature, intent.input_signature);
+        history_specs.push(replica_permit.activity().spec().clone());
+        assert_exposed_history(&backend, &execution, &replica_permit, &history_specs).await;
+
+        let host = restart_into_quarantine(&backend, &execution, 65, &replica_permit).await;
+        let mut committed_observations = observations(&replica_operation);
+        {
+            let primary = committed_observations.get_mut(&1).unwrap();
+            primary.status.configuration = Some(configuration(
+                &replica_operation.target_snapshot,
+                ReplicaConfigurationMode::Current,
+            ));
+            primary.status.active_replica_connections.clear();
         }
+        set_remove_action_progress(
+            &replica_operation,
+            &mut committed_observations,
+            RemoveReplicaProgress {
+                phase: RemoveReplicaCoordinatorPhase::Attesting,
+                attempt_id: intent.attempt_id.clone(),
+                commit_observed: true,
+                commit_observed_unix_seconds: Some(123),
+                connection_absent: true,
+                target_retirement: TargetRetirementObservation::Completed,
+                retirement_expiry_unix_seconds: Some(183),
+                compensation_expiry_unix_seconds: None,
+                error: None,
+                current_install_dispatched: true,
+            },
+            DurableActionState::Completed,
+            Some(RemoveReplicaTerminalResult::CommittedClean),
+        );
+        let replica_decision = evaluate_adapter_step(
+            &replica_operation,
+            &committed_observations,
+            &pods,
+            Some("secondary"),
+            200,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    replica_permit.activity().clone(),
+                    encode_step_result(
+                        &completed_step(replica_decision, &replica_input.kind).unwrap()
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *replica_permit.activity()
+        ));
+        assert_completed_history(&backend, &execution, &history_specs).await;
+
+        let committed_addressed = addressed(&committed_observations);
+        let committed_resolver = RemoveReplicaPreparedActivityResolver::new(
+            &initial,
+            &committed_observations,
+            &pods,
+            Some("secondary"),
+            &committed_addressed,
+            200,
+        );
+        let mut host = measured_host(&execution, backend.clone(), 66);
+        let HostOutcome::DispatchPermitted {
+            permit: commit_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &committed_resolver)
+            .await
+        else {
+            panic!("expected post-commit cleanup observation after restart");
+        };
+        let commit_input =
+            decode_remove_activity_input(commit_permit.activity().spec().input()).unwrap();
+        let commit_operation = commit_input.state.apply_to(&initial).unwrap();
+        assert_eq!(
+            commit_operation.phase,
+            DurableOperationPhase::RemoveAwaitCoordination
+        );
+        assert!(commit_operation.remove_commit_evidence.is_none());
+        assert_eq!(
+            commit_input.kind,
+            RemoveReplicaActivityKind::PassiveObservation
+        );
+        history_specs.push(commit_permit.activity().spec().clone());
+        assert_exposed_history(&backend, &execution, &commit_permit, &history_specs).await;
+
+        let host = restart_into_quarantine(&backend, &execution, 67, &commit_permit).await;
+        let commit_decision = evaluate_adapter_step(
+            &commit_operation,
+            &committed_observations,
+            &pods,
+            Some("secondary"),
+            200,
+        )
+        .unwrap();
+        let RemoveReplicaAdapterDecision::Advance(commit_state) = &commit_decision else {
+            panic!("expected authoritative observation to record commit evidence");
+        };
+        assert_eq!(
+            commit_state.phase,
+            DurableOperationPhase::RemoveRecordCommit
+        );
+        assert_eq!(
+            commit_state.committed_snapshot,
+            Some(initial.target_snapshot.clone())
+        );
+        assert!(commit_state.remove_commit_evidence.is_some());
+        let mut cleanup_observations = committed_observations;
+        let target = cleanup_observations.get_mut(&3).unwrap();
+        target.status.role = Role::None;
+        target.status.healthy = false;
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    commit_permit.activity().clone(),
+                    encode_step_result(
+                        &completed_step(commit_decision, &commit_input.kind).unwrap()
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *commit_permit.activity()
+        ));
+        assert_completed_history(&backend, &execution, &history_specs).await;
+
+        let cleanup_addressed = addressed(&cleanup_observations);
+        let cleanup_resolver = RemoveReplicaPreparedActivityResolver::new(
+            &initial,
+            &cleanup_observations,
+            &pods,
+            Some("secondary"),
+            &cleanup_addressed,
+            200,
+        );
+        let mut host = measured_host(&execution, backend.clone(), 68);
+        let HostOutcome::DispatchPermitted {
+            permit: label_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &cleanup_resolver)
+            .await
+        else {
+            panic!("expected exact-UID retired-label exposure after restart");
+        };
+        let label_input =
+            decode_remove_activity_input(label_permit.activity().spec().input()).unwrap();
+        let RemoveReplicaActivityKind::PreparedLabel {
+            command: label_command,
+        } = &label_input.kind
+        else {
+            panic!("expected exact-UID retired-label command");
+        };
+        let label_operation = label_input.state.apply_to(&initial).unwrap();
+        assert_eq!(
+            label_operation.phase,
+            DurableOperationPhase::RemoveAwaitCleanup
+        );
+        assert_eq!(
+            label_operation.committed_snapshot,
+            Some(initial.target_snapshot.clone())
+        );
+        assert!(label_operation.remove_commit_evidence.is_some());
+        assert_eq!(label_command.target_id, 3);
+        assert_eq!(label_command.pod_name, "set-2");
+        assert_eq!(label_command.expected_uid, "three");
+        assert_eq!(label_command.role, "retired");
+        assert!(label_command.has_valid_identity_signature());
+        assert!(!remove_label_postcondition_satisfied(
+            label_command,
+            &pods,
+            Some("secondary")
+        ));
+        assert!(remove_label_postcondition_satisfied(
+            label_command,
+            &pods,
+            Some("retired")
+        ));
+        let mut replacement_pods = pods.clone();
+        replacement_pods.insert(3, "replacement".to_string());
+        assert!(remove_label_postcondition_satisfied(
+            label_command,
+            &replacement_pods,
+            Some("secondary")
+        ));
+        history_specs.push(label_permit.activity().spec().clone());
+        assert_exposed_history(&backend, &execution, &label_permit, &history_specs).await;
+        let host = restart_into_quarantine(&backend, &execution, 69, &label_permit).await;
+        let label_decision = evaluate_adapter_step(
+            &label_operation,
+            &cleanup_observations,
+            &pods,
+            Some("retired"),
+            200,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    label_permit.activity().clone(),
+                    encode_step_result(
+                        &completed_step(label_decision, &label_input.kind).unwrap()
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *label_permit.activity()
+        ));
+        assert_completed_history(&backend, &execution, &history_specs).await;
+
+        let retired_resolver = RemoveReplicaPreparedActivityResolver::new(
+            &initial,
+            &cleanup_observations,
+            &pods,
+            Some("retired"),
+            &cleanup_addressed,
+            200,
+        );
+        let mut host = measured_host(&execution, backend.clone(), 70);
+        let HostOutcome::DispatchPermitted {
+            permit: delete_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &retired_resolver)
+            .await
+        else {
+            panic!("expected exact-UID delete exposure after restart");
+        };
+        let delete_input =
+            decode_remove_activity_input(delete_permit.activity().spec().input()).unwrap();
+        let RemoveReplicaActivityKind::PreparedDelete {
+            command: delete_command,
+        } = &delete_input.kind
+        else {
+            panic!("expected exact-UID delete command");
+        };
+        assert_eq!(delete_command.target_id, 3);
+        assert_eq!(delete_command.pod_name, "set-2");
+        assert_eq!(delete_command.expected_uid, "three");
+        assert!(delete_command.has_valid_identity_signature());
+        assert!(!remove_delete_postcondition_satisfied(
+            delete_command,
+            &pods
+        ));
+        assert!(remove_delete_postcondition_satisfied(
+            delete_command,
+            &replacement_pods
+        ));
+        history_specs.push(delete_permit.activity().spec().clone());
+        assert_exposed_history(&backend, &execution, &delete_permit, &history_specs).await;
+
+        let host = restart_into_quarantine(&backend, &execution, 71, &delete_permit).await;
+        let delete_operation = delete_input.state.apply_to(&initial).unwrap();
+        let mut deleted_pods = pods.clone();
+        deleted_pods.remove(&3);
+        let delete_decision = evaluate_adapter_step(
+            &delete_operation,
+            &cleanup_observations,
+            &deleted_pods,
+            None,
+            200,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    delete_permit.activity().clone(),
+                    encode_step_result(
+                        &completed_step(delete_decision, &delete_input.kind).unwrap()
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *delete_permit.activity()
+        ));
+        let active_encoded_len =
+            assert_completed_history(&backend, &execution, &history_specs).await;
+
+        let deleted_resolver = RemoveReplicaPreparedActivityResolver::new(
+            &initial,
+            &cleanup_observations,
+            &deleted_pods,
+            None,
+            &cleanup_addressed,
+            200,
+        );
+        let mut host = measured_host(&execution, backend.clone(), 72);
+        let HostOutcome::WorkflowCompleted {
+            outcome,
+            boundary: PersistenceBoundary::Completion,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &deleted_resolver)
+            .await
+        else {
+            panic!("expected compact completed terminal after observation restart");
+        };
+        assert!(matches!(
+            validate_loaded_terminal(&reference, &outcome, 5).unwrap(),
+            DurableRemoveReplicaPilotTerminal::Completed {
+                cleanup: RemoveReplicaCleanupStatus {
+                    connection_absent: true,
+                    target_retirement: Some(TargetRetirementObservationStatus::Completed),
+                    target_labels_fenced: true,
+                    target_pod_deleted: true,
+                },
+                accounting: RemoveReplicaActivityAccounting {
+                    external_effect_count: 3,
+                    passive_observation_count: 2,
+                },
+                ..
+            }
+        ));
+        let terminal_stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(terminal_stored.checkpoint().encoded_len().unwrap() < active_encoded_len);
+        let terminal_payload = terminal_stored
+            .checkpoint()
+            .decode_and_validate(&execution, checkpoint_limits())
+            .unwrap();
+        assert!(terminal_payload.active_activities().is_none());
+        assert!(matches!(
+            terminal_payload.state(),
+            CheckpointState::Terminal {
+                completed_activity_count: 5,
+                ..
+            }
+        ));
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut reloaded = measured_host(&execution, backend, 73);
+        let HostOutcome::WorkflowCompleted {
+            outcome: reloaded_outcome,
+            boundary: PersistenceBoundary::Completion,
+            ..
+        } = reloaded
+            .turn(
+                &PollCountingWorkflow {
+                    polls: polls.clone(),
+                },
+                execution,
+            )
+            .await
+        else {
+            panic!("expected terminal reload without workflow polling");
+        };
+        assert_eq!(reloaded_outcome, outcome);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
