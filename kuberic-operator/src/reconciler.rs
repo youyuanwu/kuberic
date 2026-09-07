@@ -3596,41 +3596,41 @@ async fn reconcile_durable_remove_replica_pilot(
     let mut outcome = host
         .turn_and_expose_with(&DurableRemoveReplicaWorkflow, execution.clone(), &resolver)
         .await;
-    host.store().correlate_host_outcome(&outcome);
-    match outcome {
-        HostOutcome::DispatchPermitted { permit, .. } => {
-            let activity = permit.activity().clone();
-            let accepted_attempt = permit.attempt_id();
-            let prepared = remove_pilot::decode_remove_activity_input(permit.activity().input())?;
-            let operation = prepared.state.apply_to(&initial)?;
-            remove_pilot::validate_prepared_activity(&operation, &prepared.kind)?;
-            if prepared.kind == RemoveReplicaActivityKind::PassiveObservation {
-                match remove_pilot::evaluate_adapter_step(
-                    &operation,
-                    &observations,
-                    &pod_identities,
-                    target_pod_role_label,
-                    now,
-                )? {
-                    decision @ RemoveReplicaAdapterDecision::Advance(_) => {
-                        let result = remove_pilot::completed_step(decision, &prepared.kind)?;
-                        outcome = host
-                            .observe(
-                                &execution,
-                                ActivityObservation::new(
-                                    activity,
-                                    remove_pilot::encode_step_result(&result)?,
-                                ),
-                            )
-                            .await;
-                        host.store().correlate_host_outcome(&outcome);
-                        if matches!(outcome, HostOutcome::ObservationAccepted { .. }) {
-                            return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+    for _ in 0..remove_pilot::REMOVE_REPLICA_PILOT_MAX_ACTIVITY_RECORDS {
+        host.store().correlate_host_outcome(&outcome);
+        match outcome {
+            HostOutcome::DispatchPermitted { permit, .. } => {
+                let activity = permit.activity().clone();
+                let accepted_attempt = permit.attempt_id();
+                let prepared =
+                    remove_pilot::decode_remove_activity_input(permit.activity().input())?;
+                let operation = prepared.state.apply_to(&initial)?;
+                remove_pilot::validate_prepared_activity(&operation, &prepared.kind)?;
+                if prepared.kind == RemoveReplicaActivityKind::PassiveObservation {
+                    match remove_pilot::evaluate_adapter_step(
+                        &operation,
+                        &observations,
+                        &pod_identities,
+                        target_pod_role_label,
+                        now,
+                    )? {
+                        decision @ RemoveReplicaAdapterDecision::Advance(_) => {
+                            let result = remove_pilot::completed_step(decision, &prepared.kind)?;
+                            outcome = host
+                                .observe_and_turn_with(
+                                    &DurableRemoveReplicaWorkflow,
+                                    &execution,
+                                    ActivityObservation::new(
+                                        activity,
+                                        remove_pilot::encode_step_result(&result)?,
+                                    ),
+                                    &resolver,
+                                )
+                                .await;
+                            continue;
                         }
-                        return remove_pilot_host_outcome_action(set, api, &outcome, now).await;
-                    }
-                    RemoveReplicaAdapterDecision::AwaitEvidence => {
-                        record_remove_pilot_wait_condition(
+                        RemoveReplicaAdapterDecision::AwaitEvidence => {
+                            record_remove_pilot_wait_condition(
                                 set,
                                 api,
                                 "AwaitingAuthoritativeObservation",
@@ -3638,20 +3638,20 @@ async fn reconcile_durable_remove_replica_pilot(
                                 now,
                             )
                             .await;
-                        return Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
-                            &operation, now,
-                        )));
-                    }
-                    RemoveReplicaAdapterDecision::External(_) => {
-                        return Err(
+                            return Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
+                                &operation, now,
+                            )));
+                        }
+                        RemoveReplicaAdapterDecision::External(_) => {
+                            return Err(
                                 "durable remove resolver exposed an external effect as a passive observation"
                                     .to_string(),
                             );
+                        }
                     }
                 }
-            }
-            let mut guard = RemoveReplicaPermitGuard::new(permit);
-            match crate::durable::effects::bridge_remove_replica_permitted_step(
+                let mut guard = RemoveReplicaPermitGuard::new(permit);
+                match crate::durable::effects::bridge_remove_replica_permitted_step(
                 &mut guard,
                 &operation,
                 &prepared.kind,
@@ -3666,19 +3666,17 @@ async fn reconcile_durable_remove_replica_pilot(
             {
                 crate::durable::effects::DurableEffectBridgeOutcome::Observe(result) => {
                     outcome = host
-                        .observe(
+                        .observe_and_turn_with(
+                            &DurableRemoveReplicaWorkflow,
                             &execution,
                             ActivityObservation::new(
                                 activity,
                                 remove_pilot::encode_step_result(&result)?,
                             ),
+                            &resolver,
                         )
                         .await;
-                    host.store().correlate_host_outcome(&outcome);
-                    if matches!(outcome, HostOutcome::ObservationAccepted { .. }) {
-                        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-                    }
-                    return remove_pilot_host_outcome_action(set, api, &outcome, now).await;
+                    continue;
                 }
                 crate::durable::effects::DurableEffectBridgeOutcome::ObserveAfterFenceRefresh(
                     result,
@@ -3727,29 +3725,42 @@ async fn reconcile_durable_remove_replica_pilot(
                         .await;
                 }
             }
-            Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
-                &operation, now,
-            )))
-        }
-        HostOutcome::Quarantined { activity, .. } => {
-            let prepared = remove_pilot::decode_remove_activity_input(activity.input())?;
-            let operation = prepared.state.apply_to(&initial)?;
-            remove_pilot::validate_prepared_activity(&operation, &prepared.kind)?;
-            let decision = remove_pilot::evaluate_adapter_step(
-                &operation,
-                &observations,
-                &pod_identities,
-                target_pod_role_label,
-                now,
-            )?;
-            match crate::durable::effects::resolve_remove_replica_quarantine(
+                return Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
+                    &operation, now,
+                )));
+            }
+            HostOutcome::Quarantined { activity, .. } => {
+                let prepared = remove_pilot::decode_remove_activity_input(activity.input())?;
+                let operation = prepared.state.apply_to(&initial)?;
+                remove_pilot::validate_prepared_activity(&operation, &prepared.kind)?;
+                let decision = remove_pilot::evaluate_adapter_step(
+                    &operation,
+                    &observations,
+                    &pod_identities,
+                    target_pod_role_label,
+                    now,
+                )?;
+                match crate::durable::effects::resolve_remove_replica_quarantine(
                 &operation,
                 &prepared.kind,
                 decision,
                 &observations,
             )? {
-                crate::durable::effects::DurableEffectBridgeOutcome::Observe(result)
-                | crate::durable::effects::DurableEffectBridgeOutcome::ObserveAfterFenceRefresh(
+                crate::durable::effects::DurableEffectBridgeOutcome::Observe(result) => {
+                    outcome = host
+                        .observe_and_turn_with(
+                            &DurableRemoveReplicaWorkflow,
+                            &execution,
+                            ActivityObservation::new(
+                                activity,
+                                remove_pilot::encode_step_result(&result)?,
+                            ),
+                            &resolver,
+                        )
+                        .await;
+                    continue;
+                }
+                crate::durable::effects::DurableEffectBridgeOutcome::ObserveAfterFenceRefresh(
                     result,
                 ) => {
                     outcome = host
@@ -3763,6 +3774,14 @@ async fn reconcile_durable_remove_replica_pilot(
                         .await;
                     host.store().correlate_host_outcome(&outcome);
                     if matches!(outcome, HostOutcome::ObservationAccepted { .. }) {
+                        record_remove_pilot_wait_condition(
+                            set,
+                            api,
+                            "RefreshingReplicaObservation",
+                            "proven non-admission was persisted; retry awaits refreshed replica observations",
+                            now,
+                        )
+                        .await;
                         return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
                     }
                     return remove_pilot_host_outcome_action(set, api, &outcome, now).await;
@@ -3777,42 +3796,45 @@ async fn reconcile_durable_remove_replica_pilot(
                             now,
                         )
                         .await;
-                    Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
+                    return Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
                         &operation, now,
-                    )))
+                    )));
                 }
             }
-        }
-        HostOutcome::WorkflowCompleted { outcome, .. } => {
-            let completed_activity_count = host
-                .store()
-                .measurements()
-                .completed_activity_count
-                .ok_or_else(|| {
-                    "completed durable remove-replica has no authoritative activity count"
-                        .to_string()
-                })?;
-            let terminal = remove_pilot::validate_loaded_terminal(
-                reference,
-                &outcome,
-                completed_activity_count,
-            )?;
-            drop(host);
-            publish_remove_pilot_terminal(set, api, state, terminal, now).await
-        }
-        outcome @ (HostOutcome::ReloadRequired { .. } | HostOutcome::StoreFailed { .. }) => {
-            remove_pilot_host_outcome_action(set, api, &outcome, now).await
-        }
-        HostOutcome::ScheduleAccepted { .. } | HostOutcome::ObservationAccepted { .. } => Err(
-            "fused durable remove-replica host returned an unfused persistence outcome".to_string(),
-        ),
-        HostOutcome::Nondeterminism(error) => {
-            Err(format!("durable remove-replica workflow changed: {error}"))
-        }
-        HostOutcome::CheckpointRejected(
-            kuberic_durable_execution::CheckpointError::PreparedActivityRejected(error),
-        ) => {
-            record_remove_pilot_wait_condition(
+            }
+            HostOutcome::WorkflowCompleted { outcome, .. } => {
+                let completed_activity_count = host
+                    .store()
+                    .measurements()
+                    .completed_activity_count
+                    .ok_or_else(|| {
+                        "completed durable remove-replica has no authoritative activity count"
+                            .to_string()
+                    })?;
+                let terminal = remove_pilot::validate_loaded_terminal(
+                    reference,
+                    &outcome,
+                    completed_activity_count,
+                )?;
+                drop(host);
+                return publish_remove_pilot_terminal(set, api, state, terminal, now).await;
+            }
+            outcome @ (HostOutcome::ReloadRequired { .. } | HostOutcome::StoreFailed { .. }) => {
+                return remove_pilot_host_outcome_action(set, api, &outcome, now).await;
+            }
+            HostOutcome::ScheduleAccepted { .. } | HostOutcome::ObservationAccepted { .. } => {
+                return Err(
+                    "fused durable remove-replica host returned an unfused persistence outcome"
+                        .to_string(),
+                );
+            }
+            HostOutcome::Nondeterminism(error) => {
+                return Err(format!("durable remove-replica workflow changed: {error}"));
+            }
+            HostOutcome::CheckpointRejected(
+                kuberic_durable_execution::CheckpointError::PreparedActivityRejected(error),
+            ) => {
+                record_remove_pilot_wait_condition(
                     set,
                     api,
                     "AwaitingEffectPreparation",
@@ -3822,15 +3844,21 @@ async fn reconcile_durable_remove_replica_pilot(
                     now,
                 )
                 .await;
-            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+            }
+            HostOutcome::CheckpointRejected(error) => {
+                return Err(format!(
+                    "durable remove-replica checkpoint rejected: {error}"
+                ));
+            }
+            HostOutcome::ObservationRejected(error) => {
+                return Err(format!(
+                    "durable remove-replica observation rejected: {error:?}"
+                ));
+            }
         }
-        HostOutcome::CheckpointRejected(error) => Err(format!(
-            "durable remove-replica checkpoint rejected: {error}"
-        )),
-        HostOutcome::ObservationRejected(error) => Err(format!(
-            "durable remove-replica observation rejected: {error:?}"
-        )),
     }
+    Err("durable remove-replica exhausted bounded fused progression".to_string())
 }
 
 #[cfg(feature = "durable-remove-replica-pilot")]

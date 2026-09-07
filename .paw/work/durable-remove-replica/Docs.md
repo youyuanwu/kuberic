@@ -131,11 +131,18 @@ successful no-fault three-member ScaleDown executions recorded:
 - 3 external effects
 - 2 passive observations
 - 5 completed durable boundaries
-- 11 accepted checkpoint writes
-- approximately 101.6 KiB per-run active-checkpoint maxima
-- a 5,009–101,633-byte aggregate lifecycle minimum-to-maximum active range
+- 6 accepted checkpoint writes
+- approximately 91.6 KiB per-run active-checkpoint maxima
+- a 5,005–93,837-byte aggregate lifecycle minimum-to-maximum active range
 - 8,121–8,125-byte terminal checkpoints
 - 2,188-byte terminal payloads
+
+The original production integration recorded 11 accepted writes because each
+of the five activity exposures and observations was persisted separately before
+terminal persistence. The fused runner records one initial exposure and five
+fused observation/progression writes. This corrects an integration artifact
+without changing the three external effects, two passive observations, five
+durable boundaries, or any effect identity or fencing rule.
 
 The active maximum passes the stable 770,048-byte encoded-checkpoint admission
 ceiling but exceeds the switchover 65,536-byte (64 KiB) baseline gate and
@@ -154,12 +161,12 @@ The fixed measurement scopes report:
 |---|---:|---:|
 | Explicit remove baseline | 1,627 | 219 |
 | Complete kernel remove workflow | 1,611 | 155 |
-| Remove-specific operator integration | 1,086 | 82 |
+| Remove-specific operator integration | 1,114 | 81 |
 | Shared-infrastructure growth | 374 | 3 |
-| Total marginal cost | 3,071 | 240 |
+| Total marginal cost | 3,099 | 239 |
 
-The marginal ratios are 1.8875 times the explicit implementation in executable
-lines and 1.0959 times in decision points. Shared growth is 30.96% in lines and
+The marginal ratios are 1.9047 times the explicit implementation in executable
+lines and 1.0913 times in decision points. Shared growth is 30.96% in lines and
 2.73% in decisions. Both dimensions classify as negative.
 
 The isolated async workflow body is only 138 lines / 18 decisions, but that

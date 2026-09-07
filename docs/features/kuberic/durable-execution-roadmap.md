@@ -217,10 +217,10 @@ API is introduced.
 The second kernel-hosted workflow did **not** demonstrate source-cost
 amortization. The explicit remove-replica baseline is 1,627 executable lines /
 219 decision points. The complete kernel remove workflow is 1,611/155,
-remove-specific operator integration is 1,086/82, and shared reusable
+remove-specific operator integration is 1,114/81, and shared reusable
 infrastructure grew by 374/3 from the frozen 1,208/110 baseline. The resulting
-marginal cost is 3,071/240: 1.8875 times the explicit baseline in executable
-lines and 1.0959 times in decision points. Shared growth is 30.96% in lines and
+marginal cost is 3,099/239: 1.9047 times the explicit baseline in executable
+lines and 1.0913 times in decision points. Shared growth is 30.96% in lines and
 2.73% in decisions. Both dimensions therefore classify as negative under the
 fixed measurement thresholds.
 
@@ -233,14 +233,21 @@ demonstrated.
 
 Three representative successful no-fault three-member ScaleDown executions
 recorded three external effects and two passive observations: five completed
-durable boundaries and 11 accepted checkpoint writes. Each run reached an
-active-checkpoint maximum of approximately 101.6 KiB. The reported
-5,009–101,633-byte interval is the aggregate lifecycle minimum-to-maximum range
+durable boundaries and six accepted checkpoint writes. The original unfused
+production reconcile loop recorded 11 accepted writes—one exposure and one
+observation write per activity plus terminal persistence. That amplification
+was an integration artifact, not an intrinsic workflow requirement. Fused
+observation/progression now records one initial exposure plus five fused writes
+without changing the three effects, two observations, or five boundaries.
+
+Each run reached an active-checkpoint maximum of approximately 91.6 KiB. The
+reported 5,005–93,837-byte interval is the aggregate lifecycle
+minimum-to-maximum range
 within those executions, not a range of per-run maxima. Terminal checkpoints
 ranged from 8,121 to 8,125 bytes, and the terminal payload was 2,188 bytes.
 These are run-specific snapshots, not exact byte contracts.
 
-The approximately 101.6 KiB active maximum passes the stable 770,048-byte
+The approximately 91.6 KiB active maximum passes the stable 770,048-byte
 encoded-checkpoint admission ceiling, but exceeds both switchover comparison
 gates: the 65,536-byte (64 KiB) baseline and 32,768-byte (32 KiB) stretch gate.
 This does not violate a formal remove-replica acceptance gate because those

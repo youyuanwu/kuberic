@@ -525,9 +525,14 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
 ```
 
 The sampled no-fault ScaleDown path records three external effects, two passive
-observations, five durable boundaries, and 11 accepted writes. Run-specific
-active-checkpoint maxima are approximately 101.6 KiB. The
-5,009–101,633-byte interval is the aggregate lifecycle minimum-to-maximum range,
+observations, five durable boundaries, and six accepted writes. The earlier 11
+accepted writes came from an unfused production loop that persisted exposure
+and observation separately for each activity. The fused runner persists one
+initial exposure plus five fused observation/progression writes without
+changing the semantic boundary counts.
+
+Run-specific active-checkpoint maxima are approximately 91.6 KiB. The
+5,005–93,837-byte interval is the aggregate lifecycle minimum-to-maximum range,
 not a range of per-run maxima. Terminal checkpoints range from 8,121 to 8,125
 bytes; the terminal payload is 2,188 bytes.
 

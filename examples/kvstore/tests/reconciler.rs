@@ -7230,7 +7230,7 @@ async fn test_durable_execution_remove_replica_pilot_three_no_fault_measurement_
         assert_eq!(evidence.0, 3);
         assert_eq!(evidence.1, 2);
         assert_eq!(evidence.2, 5);
-        assert_eq!(evidence.3, 11);
+        assert_eq!(evidence.3, 6);
         assert!(
             evidence.5
                 <= kuberic_operator::durable::remove_replica_pilot::REMOVE_REPLICA_PILOT_MAX_ENCODED_CHECKPOINT_BYTES
