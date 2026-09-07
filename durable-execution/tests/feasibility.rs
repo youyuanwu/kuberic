@@ -40,6 +40,77 @@ struct PredicateEvidence {
     passed: bool,
 }
 
+fn root_manifest_table(manifest: &str, table: &str) -> Option<String> {
+    let header = format!("[{table}]");
+    let mut lines = manifest.lines().skip_while(|line| line.trim() != header);
+    lines.next()?;
+    Some(
+        lines
+            .take_while(|line| {
+                let trimmed = line.trim();
+                !(trimmed.starts_with('[') && trimmed.ends_with(']'))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn library_dependencies_are_runtime_neutral(manifest: &str) -> bool {
+    let Some(dependencies) = root_manifest_table(manifest, "dependencies") else {
+        return false;
+    };
+    const ASYNC_RUNTIMES: [&str; 4] = ["tokio", "async-std", "smol", "glommio"];
+    !dependencies.lines().any(|line| {
+        let dependency = line
+            .split_once('=')
+            .map(|(name, _)| name.trim().trim_matches('"'));
+        dependency.is_some_and(|name| ASYNC_RUNTIMES.contains(&name))
+    })
+}
+
+#[test]
+fn runtime_neutrality_inspects_only_root_library_dependencies() {
+    let test_only_runtime = r#"
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+runtime-test = ["tokio/test-util"]
+"#;
+    assert!(library_dependencies_are_runtime_neutral(test_only_runtime));
+
+    let library_runtime = r#"
+[dependencies]
+serde.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+"#;
+    assert!(!library_dependencies_are_runtime_neutral(library_runtime));
+
+    let target_and_quoted_tables_do_not_replace_root_dependencies = r#"
+[dependencies]
+serde.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+tokio.workspace = true
+
+["dev-dependencies"]
+tokio.workspace = true
+"#;
+    assert!(library_dependencies_are_runtime_neutral(
+        target_and_quoted_tables_do_not_replace_root_dependencies
+    ));
+
+    assert!(!library_dependencies_are_runtime_neutral(
+        "[dev-dependencies]\ntokio.workspace = true\n"
+    ));
+}
+
 #[test]
 fn mechanically_assesses_the_selected_surface_and_full_denominator() {
     let scenarios = block_on(run_conformance_matrix());
@@ -178,7 +249,7 @@ fn mechanically_assesses_the_selected_surface_and_full_denominator() {
         && store_source.contains("async fn compare_and_swap")
         && host_source.contains("pub async fn turn")
         && host_source.contains("pub async fn observe")
-        && !crate_manifest.contains("tokio");
+        && library_dependencies_are_runtime_neutral(crate_manifest);
     let readme = include_str!("../README.md");
     let kernel_scope_documented = readme.contains("not an end-user runtime")
         && readme.contains("Deferred usability roadmap")

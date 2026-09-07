@@ -496,6 +496,41 @@ When no authorized cluster is available, the required local measurement,
 fault, replay, and bounds gates above remain authoritative; absence of the
 optional environment is not evidence of real-API coverage.
 
+**Pattern 7b: Feature-gated durable-execution remove-replica pilot** ✅
+`test_durable_execution_remove_replica_pilot_*` keeps explicit
+remove-replica as the default and exercises the opt-in kernel path through
+prepared replica, exact-UID label, and exact-UID deletion effects. The matrix
+covers unsupported feature selection, every-turn restart, lost replies,
+proven-no-admission redelivery, checkpoint conflict and unknown outcomes,
+terminal reload after status failure, identity drift, Force authority,
+post-commit ambiguity, and repeated execution identity.
+
+Run the durable remove-replica operator and reconciler gates with:
+
+```console
+CARGO_BUILD_JOBS=2 cargo test -p kuberic-operator \
+  --features durable-remove-replica-pilot remove_replica_pilot_
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
+  -p kvstore --features durable-remove-replica-pilot --test reconciler \
+  test_durable_execution_remove_replica_pilot_ -- --nocapture
+```
+
+Run the representative three-sample measurement separately:
+
+```console
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
+  -p kvstore --features durable-remove-replica-pilot --test reconciler \
+  test_durable_execution_remove_replica_pilot_three_no_fault_measurement_samples \
+  -- --nocapture
+```
+
+The sampled no-fault ScaleDown path records three external effects, two passive
+observations, five durable boundaries, and 11 accepted writes. Run-specific
+maximum active checkpoints range from 5,009 to 101,633 bytes and terminal
+checkpoints from 8,121 to 8,125 bytes; the terminal payload is 2,188 bytes.
+The stable ceilings remain 770,048 encoded checkpoint bytes and 4,096 terminal
+payload bytes.
+
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the
 single coarse operator-to-primary reply, replaces controller state, and proves

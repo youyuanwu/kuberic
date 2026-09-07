@@ -370,9 +370,10 @@ assertion, measures the FR-012 surface, and applies the exhaustive FR-014
 three-way classifier. The revised evidence contains 45 unique contiguous
 scenarios and 134 structured assertions; all pass. All five FR-012 authoring
 predicates and all five provider, bounding, lifecycle, and documentation
-predicates also pass. The mechanically derived result is **conditionally
-feasible** within this kernel's stated boundary because the operator pilot
-retains a documented write-efficiency exception.
+predicates also pass. The async runtime-neutrality predicate examines the
+library `[dependencies]` table rather than test-only dependencies and retains a
+negative fixture for a real library runtime dependency. The mechanically
+derived result is **feasible** within this kernel's stated boundary.
 
 ## Deferred usability roadmap
 
@@ -403,6 +404,10 @@ passive convergence, tracing/inspection, timers, retries, parallelism, generic
 lifecycle APIs, queries, external events, child workflows, workers, queues,
 leases, and distributed runtime ownership are excluded. So are migrations,
 upgrade guarantees, broad rollout, and production diagnostics. The
-feature-gated pilot integrates typed calls and operator-owned effect adapters;
-it does not change `ReplicaAgent`, the gRPC protocol, default explicit
-switchover, or any other topology workflow.
+feature-gated switchover and remove-replica pilots integrate typed calls and
+operator-owned effect adapters. Neither changes `ReplicaAgent` or the gRPC
+protocol, and both retain their explicit implementations as the default. The
+second workflow did not demonstrate source-cost amortization: its complete
+workflow-specific module and operator integration outweighed the small async
+workflow body. The measured result and boundary are recorded in the
+[Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
