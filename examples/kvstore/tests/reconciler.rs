@@ -4212,7 +4212,8 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_completed_redelivery_accounts_terminal() {
+async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves_fresh_fence_redelivery()
+ {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-redelivery", 3).await;
@@ -4250,13 +4251,21 @@ async fn test_durable_execution_switchover_pilot_completed_redelivery_accounts_t
 
     let status_calls_before_rejection: usize =
         api.status_call_counts.lock().unwrap().values().sum();
-    reconcile_set(
+    let refresh_action = reconcile_set(
         &make_pilot_set("pilot-redelivery", 3, Some(accepted)),
         &api,
         &pilot_state,
     )
     .await
     .unwrap();
+    assert!(
+        matches!(
+            refresh_action,
+            kuberic_operator::reconciler::ReconcileAction::Requeue(delay)
+                if delay == Duration::from_secs(1)
+        ),
+        "fresh-fence recovery must retain the one-second observation refresh policy"
+    );
     let after_rejection = api.last_status().unwrap();
     let status_calls_after_rejection: usize = api.status_call_counts.lock().unwrap().values().sum();
     assert!(status_calls_after_rejection > status_calls_before_rejection);
@@ -4339,7 +4348,8 @@ async fn test_durable_execution_switchover_pilot_completed_redelivery_accounts_t
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_survives_operator_restart_every_turn() {
+async fn test_durable_execution_switchover_pilot_fr019_observation_collection_survives_restart_every_turn()
+ {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-restart", 3).await;
@@ -4422,7 +4432,7 @@ async fn test_durable_execution_switchover_pilot_survives_operator_restart_every
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_compensates_failed_promotion() {
+async fn test_durable_execution_switchover_pilot_fr019_publication_compensates_failed_promotion() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-rollback", 3).await;
@@ -4590,7 +4600,8 @@ async fn test_durable_execution_switchover_pilot_observes_lost_promotion_reply_o
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_observes_every_lost_effect_reply_once() {
+async fn test_durable_execution_switchover_pilot_fr019_exact_effect_dispatch_observes_every_lost_reply_once()
+ {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-all-lost-replies", 3).await;
@@ -4674,7 +4685,8 @@ async fn test_durable_execution_switchover_pilot_observes_every_lost_effect_repl
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_reloads_terminal_after_status_failure() {
+async fn test_durable_execution_switchover_pilot_fr019_terminal_validation_reloads_before_publication()
+ {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-terminal-reload", 3).await;
@@ -4869,7 +4881,8 @@ async fn test_durable_execution_switchover_pilot_reloads_after_terminal_cas_conf
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_rejects_stale_target_incarnation() {
+async fn test_durable_execution_switchover_pilot_fr019_authority_preparation_rejects_stale_target_incarnation()
+ {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-stale-target", 3).await;

@@ -194,6 +194,10 @@ impl<S: CheckpointStore> DurableHost<S> {
         &self.store
     }
 
+    pub const fn checkpoint_limits(&self) -> CheckpointLimits {
+        self.limits
+    }
+
     /// Evaluate and, when needed, commit exactly one schedule or exposure turn.
     pub async fn turn<W: Workflow>(
         &mut self,

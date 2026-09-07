@@ -7,15 +7,21 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use async_trait::async_trait;
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::ResourceExt;
+use kuberic_core::driver::ReplicaHandle;
 use kuberic_durable_execution::{
-    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CheckpointEnvelope,
-    CheckpointLimits, CheckpointPayload, DispatchPermit, DurableActivity, ExactBytes,
-    ExecutionContract, ExecutionId, ExecutionSpec, InMemoryCheckpointStore,
+    ActivityName, ActivityObservation, ActivityRecord, ActivitySequence, ActivitySpec,
+    CheckpointEnvelope, CheckpointLimits, CheckpointPayload, DispatchPermit, DurableActivity,
+    ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, InMemoryCheckpointStore,
     KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope, KubernetesCheckpointStore,
     KubernetesCheckpointStoreOptions, LogicalActivityId, PreparedActivityError,
     PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext, decode_activity_input,
@@ -31,19 +37,24 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::crd::{
-    DurableOperationPhase, DurableOperationStatus, DurableSwitchoverPilotStatus,
+    DurableOperationPhase, DurableOperationStatus, DurableSwitchoverPilotStatus, KubericSet,
     PendingActionStatus, StablePartitionSnapshotStatus,
 };
+use crate::{cluster_api::ClusterApi, reconciler::snapshot_with_observed_metadata};
 
 pub use super::checkpoint_store::DurableCheckpointStore;
-#[cfg(test)]
-use super::checkpoint_store::MeasuredDurableCheckpointStore;
 use super::checkpoint_store::{
     CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
+    MeasuredDurableCheckpointStore,
 };
 use super::effects::{
-    LabelEffectCommand, PilotEffectPreparationError, ReplicaEffectCommand, exact_label_command,
-    prepare_replica_effect_command, validate_pilot_replica_action_kind,
+    LabelEffectCommand, PilotEffectBridgeOutcome, PilotEffectPreparationError,
+    ReplicaEffectCommand, bridge_pilot_runner_step, exact_label_command,
+    prepare_replica_effect_command, resolve_pilot_quarantine, validate_pilot_replica_action_kind,
+};
+use super::runner::{
+    DurableAdapterBoundary, DurableAdapterWait, DurableCheckpointDisposition,
+    DurableOperationAdapter,
 };
 use super::workflow_host::{DurableOperatorHost, DurablePermitGuard, DurableWorkflowRuntime};
 use super::{
@@ -915,25 +926,52 @@ fn terminal_adapter_decision(
     }
 }
 
-pub struct PilotPreparedActivityResolver<'a> {
-    initial: &'a DurableOperationStatus,
-    observations: &'a OperationObservations,
-    addressed_instances: &'a BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+pub struct PilotPreparedActivityResolver {
+    initial: DurableOperationStatus,
+    observations: OperationObservations,
+    addressed_instances: BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
     now: i64,
+    deadline: Option<Arc<AtomicI64>>,
 }
 
-impl<'a> PilotPreparedActivityResolver<'a> {
+impl PilotPreparedActivityResolver {
     pub fn new(
-        initial: &'a DurableOperationStatus,
-        observations: &'a OperationObservations,
-        addressed_instances: &'a BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+        initial: &DurableOperationStatus,
+        observations: &OperationObservations,
+        addressed_instances: &BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
         now: i64,
     ) -> Self {
         Self {
-            initial,
-            observations,
-            addressed_instances,
+            initial: initial.clone(),
+            observations: observations.clone(),
+            addressed_instances: addressed_instances.clone(),
             now,
+            deadline: None,
+        }
+    }
+
+    fn with_deadline(
+        initial: &DurableOperationStatus,
+        observations: &OperationObservations,
+        addressed_instances: &BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+        now: i64,
+        deadline: Arc<AtomicI64>,
+    ) -> Self {
+        Self {
+            initial: initial.clone(),
+            observations: observations.clone(),
+            addressed_instances: addressed_instances.clone(),
+            now,
+            deadline: Some(deadline),
+        }
+    }
+
+    fn record_deadline(&self, operation: &DurableOperationStatus) {
+        if let Some(deadline) = &self.deadline {
+            deadline.store(
+                switchover_deadline_unix_seconds(operation),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -947,9 +985,10 @@ impl<'a> PilotPreparedActivityResolver<'a> {
         }
         let operation = logical
             .state
-            .apply_to(self.initial)
+            .apply_to(&self.initial)
             .map_err(|_| PreparedActivityError::Validation)?;
-        let decision = evaluate_adapter_step(&operation, self.observations, self.now)
+        self.record_deadline(&operation);
+        let decision = evaluate_adapter_step(&operation, &self.observations, self.now)
             .map_err(|_| PreparedActivityError::Derivation)?;
         let mut prepared = logical.clone();
         match decision {
@@ -994,7 +1033,7 @@ impl<'a> PilotPreparedActivityResolver<'a> {
                 }
                 Decision::PatchPodRole { target_id, role } => {
                     let command =
-                        exact_label_command(&operation, target_id, &role, self.observations)
+                        exact_label_command(&operation, target_id, &role, &self.observations)
                             .map_err(|_| PreparedActivityError::Derivation)?;
                     prepared.kind = PilotActivityKind::PreparedLabel { command };
                 }
@@ -1004,7 +1043,7 @@ impl<'a> PilotPreparedActivityResolver<'a> {
                     role,
                 } => {
                     let command =
-                        exact_label_command(&operation, target_id, &role, self.observations)
+                        exact_label_command(&operation, target_id, &role, &self.observations)
                             .map_err(|_| PreparedActivityError::Derivation)?;
                     if command.expected_uid != expected_uid {
                         return Err(PreparedActivityError::Validation);
@@ -1040,8 +1079,9 @@ impl<'a> PilotPreparedActivityResolver<'a> {
         }
         let operation = recorded
             .state
-            .apply_to(self.initial)
+            .apply_to(&self.initial)
             .map_err(|_| PreparedActivityError::Validation)?;
+        self.record_deadline(&operation);
         if matches!(recorded.kind, PilotActivityKind::PassiveObservation)
             && recorded.state != logical.state
         {
@@ -1052,7 +1092,7 @@ impl<'a> PilotPreparedActivityResolver<'a> {
     }
 }
 
-impl PreparedActivityResolver for PilotPreparedActivityResolver<'_> {
+impl PreparedActivityResolver for PilotPreparedActivityResolver {
     fn resolve(
         &self,
         logical: &ActivitySpec,
@@ -1103,6 +1143,396 @@ fn preparation_error(error: PilotEffectPreparationError) -> PreparedActivityErro
     }
 }
 
+pub struct SwitchoverRunnerContext {
+    pub observations: OperationObservations,
+    pub handles: BTreeMap<i64, Box<dyn ReplicaHandle>>,
+    pub addressed_instances: BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
+}
+
+pub async fn collect_switchover_runner_context(
+    initial: &DurableOperationStatus,
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    current_pods: &[(i64, kuberic_core::types::ReplicaInstanceId, &Pod)],
+) -> Result<SwitchoverRunnerContext, String> {
+    for member in &initial.previous_snapshot.members {
+        let Some((_, instance_id, _)) = current_pods.iter().find(|(id, _, _)| *id == member.id)
+        else {
+            return Err(format!(
+                "durable switchover pilot replica {} has no current pod",
+                member.id
+            ));
+        };
+        if instance_id.as_str() != member.instance_id {
+            return Err(format!(
+                "durable switchover pilot replica {} incarnation changed",
+                member.id
+            ));
+        }
+    }
+
+    let mut handles: BTreeMap<i64, Box<dyn ReplicaHandle>> = BTreeMap::new();
+    let mut observations = OperationObservations::new();
+    for (replica_id, _, pod) in current_pods {
+        if !initial
+            .target_snapshot
+            .members
+            .iter()
+            .any(|member| member.id == *replica_id)
+        {
+            continue;
+        }
+        let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await else {
+            continue;
+        };
+        if let Ok(status) = handle.get_status().await {
+            observations.insert(
+                *replica_id,
+                super::ReplicaObservation {
+                    status,
+                    control_address: handle.control_address(),
+                    replicator_address: handle.replicator_address(),
+                    pod_name: pod.name_any(),
+                    pod_role_label: pod
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("kuberic.io/role"))
+                        .cloned(),
+                },
+            );
+        }
+        handles.insert(*replica_id, handle);
+    }
+    let addressed_instances = handles
+        .iter()
+        .map(|(replica_id, handle)| (*replica_id, handle.instance_id()))
+        .collect();
+    Ok(SwitchoverRunnerContext {
+        observations,
+        handles,
+        addressed_instances,
+    })
+}
+
+pub struct SwitchoverRunnerAdapter<'a> {
+    reference: &'a DurableSwitchoverPilotStatus,
+    initial: &'a DurableOperationStatus,
+    set: &'a KubericSet,
+    current_pods: &'a [(i64, kuberic_core::types::ReplicaInstanceId, &'a Pod)],
+    resolver: PilotPreparedActivityResolver,
+    context: Option<SwitchoverRunnerContext>,
+    api: &'a dyn ClusterApi,
+    namespace: String,
+    store: MeasuredDurableCheckpointStore,
+    now: i64,
+    deadline: Arc<AtomicI64>,
+}
+
+impl<'a> SwitchoverRunnerAdapter<'a> {
+    pub fn new(
+        reference: &'a DurableSwitchoverPilotStatus,
+        initial: &'a DurableOperationStatus,
+        set: &'a KubericSet,
+        current_pods: &'a [(i64, kuberic_core::types::ReplicaInstanceId, &'a Pod)],
+        api: &'a dyn ClusterApi,
+        store: MeasuredDurableCheckpointStore,
+        now: i64,
+    ) -> Self {
+        let deadline = Arc::new(AtomicI64::new(switchover_deadline_unix_seconds(initial)));
+        let observations = OperationObservations::new();
+        let addressed_instances = BTreeMap::new();
+        Self {
+            reference,
+            initial,
+            set,
+            current_pods,
+            resolver: PilotPreparedActivityResolver::with_deadline(
+                initial,
+                &observations,
+                &addressed_instances,
+                now,
+                deadline.clone(),
+            ),
+            context: None,
+            api,
+            namespace: set.namespace().unwrap_or_default(),
+            store,
+            now,
+            deadline,
+        }
+    }
+
+    fn context(&self) -> Result<&SwitchoverRunnerContext, String> {
+        self.context
+            .as_ref()
+            .ok_or_else(|| "durable switchover adapter was not prepared".to_string())
+    }
+
+    fn decode_operation(
+        &self,
+        activity: &LogicalActivityId,
+    ) -> Result<(DurableOperationStatus, PilotActivityKind), String> {
+        let prepared = decode_pilot_activity_input(activity.input())?;
+        let operation = prepared.state.apply_to(self.initial)?;
+        validate_prepared_activity(&operation, &prepared.kind)?;
+        self.deadline.store(
+            switchover_deadline_unix_seconds(&operation),
+            Ordering::Relaxed,
+        );
+        Ok((operation, prepared.kind))
+    }
+
+    fn observation(
+        &self,
+        activity: LogicalActivityId,
+        result: DurableSwitchoverStepResult,
+    ) -> Result<ActivityObservation, String> {
+        let result = enrich_runner_result(
+            result,
+            &self.context()?.observations,
+            self.store.measurements(),
+        );
+        Ok(ActivityObservation::new(
+            activity,
+            encode_step_result(&result)?,
+        ))
+    }
+
+    fn bridge_boundary(
+        &self,
+        activity: LogicalActivityId,
+        outcome: PilotEffectBridgeOutcome,
+        quarantine: bool,
+    ) -> DurableAdapterBoundary {
+        match outcome {
+            PilotEffectBridgeOutcome::Observe(result) => self
+                .observation(activity, *result)
+                .map(DurableAdapterBoundary::Observed)
+                .unwrap_or_else(DurableAdapterBoundary::Isolated),
+            PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(result) if !quarantine => self
+                .observation(activity, *result)
+                .map(|observation| DurableAdapterBoundary::ObserveAndWait {
+                    observation: Box::new(observation),
+                    reason: "RefreshingReplicaObservation".to_string(),
+                    detail: "proven non-admission was persisted; retry awaits refreshed replica observations".to_string(),
+                    requeue_after_seconds: 1,
+                })
+                .unwrap_or_else(DurableAdapterBoundary::Isolated),
+            PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(result) => self
+                .observation(activity, *result)
+                .map(DurableAdapterBoundary::Observed)
+                .unwrap_or_else(DurableAdapterBoundary::Isolated),
+            PilotEffectBridgeOutcome::Exposed if quarantine => DurableAdapterBoundary::Wait {
+                reason: "Quarantined".to_string(),
+                detail: "exposed pilot activity remains quarantined pending authoritative evidence"
+                    .to_string(),
+            },
+            PilotEffectBridgeOutcome::AwaitEvidence if quarantine => {
+                DurableAdapterBoundary::Wait {
+                    reason: "Quarantined".to_string(),
+                    detail: "exposed pilot activity remains quarantined pending authoritative evidence"
+                        .to_string(),
+                }
+            }
+            PilotEffectBridgeOutcome::Exposed => DurableAdapterBoundary::Wait {
+                reason: "EffectExposed".to_string(),
+                detail:
+                    "correlated effect was exposed and awaits authoritative observation".to_string(),
+            },
+            PilotEffectBridgeOutcome::AwaitEvidence => DurableAdapterBoundary::Wait {
+                reason: "AwaitingReplicaObservation".to_string(),
+                detail: "pilot activity is waiting for an exact replica or authoritative effect evidence"
+                    .to_string(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
+    type Resolver = PilotPreparedActivityResolver;
+    type Terminal = DurableSwitchoverPilotTerminal;
+    type Publication = DurableSwitchoverPilotTerminal;
+
+    fn resolver(&self) -> &Self::Resolver {
+        &self.resolver
+    }
+
+    async fn prepare(&mut self) -> Result<(), DurableAdapterBoundary> {
+        let context =
+            collect_switchover_runner_context(self.initial, self.set, self.api, self.current_pods)
+                .await
+                .map_err(DurableAdapterBoundary::Isolated)?;
+        self.resolver = PilotPreparedActivityResolver::with_deadline(
+            self.initial,
+            &context.observations,
+            &context.addressed_instances,
+            self.now,
+            self.deadline.clone(),
+        );
+        self.context = Some(context);
+        Ok(())
+    }
+
+    async fn observe_or_dispatch(
+        &mut self,
+        activity: &LogicalActivityId,
+        attempt_id: kuberic_durable_execution::AttemptId,
+        permit: &mut DurablePermitGuard,
+    ) -> DurableAdapterBoundary {
+        let (operation, prepared) = match self.decode_operation(activity) {
+            Ok(decoded) => decoded,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        if prepared == PilotActivityKind::PassiveObservation {
+            if let Err(error) = permit.consume(activity.spec(), activity, attempt_id, "switchover")
+            {
+                return DurableAdapterBoundary::Isolated(error);
+            }
+            let observations = match self.context() {
+                Ok(context) => &context.observations,
+                Err(error) => return DurableAdapterBoundary::Isolated(error),
+            };
+            return match evaluate_adapter_step(&operation, observations, self.now) {
+                Ok(PilotAdapterDecision::Observe(result)) => self
+                    .observation(activity.clone(), *result)
+                    .map(DurableAdapterBoundary::Observed)
+                    .unwrap_or_else(DurableAdapterBoundary::Isolated),
+                Ok(PilotAdapterDecision::AwaitEvidence) => DurableAdapterBoundary::Wait {
+                    reason: "AwaitingReplicaObservation".to_string(),
+                    detail: "pilot activity is waiting for authoritative observation".to_string(),
+                },
+                Ok(PilotAdapterDecision::External(_)) => DurableAdapterBoundary::Isolated(
+                    "pilot resolver exposed an external effect as a passive observation"
+                        .to_string(),
+                ),
+                Err(error) => DurableAdapterBoundary::Isolated(error),
+            };
+        }
+        let context = match self.context() {
+            Ok(context) => context,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        match bridge_pilot_runner_step(
+            permit,
+            &operation,
+            &prepared,
+            activity,
+            attempt_id,
+            &context.observations,
+            &context.handles,
+            self.api,
+            &self.namespace,
+        )
+        .await
+        {
+            Ok(outcome) => self.bridge_boundary(activity.clone(), outcome, false),
+            Err(error) => DurableAdapterBoundary::Isolated(error),
+        }
+    }
+
+    async fn resolve_quarantine(
+        &mut self,
+        activity: LogicalActivityId,
+        _attempt_id: kuberic_durable_execution::AttemptId,
+    ) -> DurableAdapterBoundary {
+        let (operation, prepared) = match self.decode_operation(&activity) {
+            Ok(decoded) => decoded,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        let observations = match self.context() {
+            Ok(context) => &context.observations,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        let decision = match evaluate_adapter_step(&operation, observations, self.now) {
+            Ok(decision) => decision,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        match resolve_pilot_quarantine(&operation, &prepared, decision, observations) {
+            Ok(outcome) => self.bridge_boundary(activity, outcome, true),
+            Err(error) => DurableAdapterBoundary::Isolated(error),
+        }
+    }
+
+    fn deadline_unix_seconds(&self) -> i64 {
+        self.deadline.load(Ordering::Relaxed)
+    }
+
+    fn preparation_wait(
+        &self,
+        _error: &kuberic_durable_execution::CheckpointError,
+    ) -> DurableAdapterWait {
+        DurableAdapterWait {
+            reason: "AwaitingEffectPreparation".to_string(),
+            detail:
+                "pilot effect could not be prepared from the current authoritative observations"
+                    .to_string(),
+            requeue_after_seconds: Some(1),
+        }
+    }
+
+    fn checkpoint_disposition(
+        &self,
+        error: &kuberic_durable_execution::CheckpointError,
+    ) -> DurableCheckpointDisposition {
+        if matches!(
+            error,
+            kuberic_durable_execution::CheckpointError::UnsupportedFormat { .. }
+        ) {
+            DurableCheckpointDisposition::Incompatible
+        } else {
+            DurableCheckpointDisposition::Rejected
+        }
+    }
+
+    fn validate_terminal(
+        &mut self,
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
+    ) -> Result<Self::Terminal, DurableAdapterBoundary> {
+        validate_loaded_terminal(self.reference, &outcome, completed_activity_count)
+            .map_err(DurableAdapterBoundary::Rejected)
+    }
+
+    fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication {
+        terminal
+    }
+}
+
+fn enrich_runner_result(
+    result: DurableSwitchoverStepResult,
+    observations: &OperationObservations,
+    measurements: super::checkpoint_store::DurableCheckpointMeasurementsSnapshot,
+) -> DurableSwitchoverStepResult {
+    match result {
+        DurableSwitchoverStepResult::Complete {
+            operation,
+            snapshot,
+            compensated,
+            accounting,
+        } => DurableSwitchoverStepResult::Complete {
+            operation,
+            snapshot: snapshot_with_observed_metadata(snapshot, observations),
+            compensated,
+            accounting: measurements
+                .completed_external_effect_count
+                .zip(measurements.completed_passive_observation_count)
+                .map(|(external, passive)| PilotActivityAccounting::new(external, passive))
+                .or(accounting),
+        },
+        other => other,
+    }
+}
+
+pub fn switchover_deadline_unix_seconds(operation: &DurableOperationStatus) -> i64 {
+    operation
+        .pending_action
+        .as_ref()
+        .map(|pending| pending.deadline_unix_seconds)
+        .unwrap_or(operation.phase_deadline_unix_seconds)
+}
+
 pub struct PilotPermitGuard {
     inner: DurablePermitGuard,
 }
@@ -1143,6 +1573,17 @@ fn activity_spec(input: &DurableSwitchoverActivityInput) -> Result<ActivitySpec,
             .map_err(|error| format!("serialize pilot activity input: {error}"))?,
         PILOT_MAX_ACTIVITY_RESULT_BYTES as u64,
     ))
+}
+
+pub(crate) fn prepared_activity_spec(
+    operation: &DurableOperationStatus,
+    prepared: &PilotActivityKind,
+) -> Result<ActivitySpec, String> {
+    activity_spec(&DurableSwitchoverActivityInput {
+        version: PILOT_VERSION,
+        state: DurableSwitchoverState::from_operation(operation),
+        kind: prepared.clone(),
+    })
 }
 
 fn validate_transition(

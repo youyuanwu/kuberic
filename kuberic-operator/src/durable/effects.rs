@@ -40,6 +40,8 @@ use super::remove_replica_pilot::{
     RemoveReplicaActivityKind, RemoveReplicaAdapterDecision, RemoveReplicaPermitGuard,
 };
 #[cfg(feature = "durable-switchover-pilot")]
+use super::workflow_host::DurablePermitGuard;
+#[cfg(feature = "durable-switchover-pilot")]
 use super::{Decision, switchover::is_switchover_postcondition_transition};
 use super::{
     OperationObservations, correlated_action_observation, fail_closed, record_activity_error,
@@ -1169,6 +1171,36 @@ pub async fn bridge_pilot_permitted_step(
     namespace: &str,
 ) -> Result<PilotEffectBridgeOutcome, String> {
     let _permit = guard.consume_for(operation, prepared, accepted_activity, accepted_attempt)?;
+    bridge_preconsumed_pilot_step(operation, prepared, observations, handles, api, namespace).await
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+#[allow(clippy::too_many_arguments)]
+pub async fn bridge_pilot_runner_step(
+    guard: &mut DurablePermitGuard,
+    operation: &DurableOperationStatus,
+    prepared: &super::pilot::PilotActivityKind,
+    accepted_activity: &kuberic_durable_execution::LogicalActivityId,
+    accepted_attempt: kuberic_durable_execution::AttemptId,
+    observations: &OperationObservations,
+    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
+    api: &dyn ClusterApi,
+    namespace: &str,
+) -> Result<PilotEffectBridgeOutcome, String> {
+    let expected = super::pilot::prepared_activity_spec(operation, prepared)?;
+    let _permit = guard.consume(&expected, accepted_activity, accepted_attempt, "switchover")?;
+    bridge_preconsumed_pilot_step(operation, prepared, observations, handles, api, namespace).await
+}
+
+#[cfg(feature = "durable-switchover-pilot")]
+async fn bridge_preconsumed_pilot_step(
+    operation: &DurableOperationStatus,
+    prepared: &super::pilot::PilotActivityKind,
+    observations: &OperationObservations,
+    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
+    api: &dyn ClusterApi,
+    namespace: &str,
+) -> Result<PilotEffectBridgeOutcome, String> {
     match prepared {
         super::pilot::PilotActivityKind::PassiveObservation => {
             Err("passive pilot observation unexpectedly reached the effect bridge".to_string())
