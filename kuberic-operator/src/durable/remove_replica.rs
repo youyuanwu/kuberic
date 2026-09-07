@@ -1231,6 +1231,7 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
             operation.version, REMOVE_REPLICA_OPERATION_VERSION
         ));
     }
+
     if operation.kind != DurableOperationKind::RemoveReplica {
         return Err("remove decision received another operation kind".to_string());
     }
@@ -1296,6 +1297,22 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
     if operation.remove_commit_evidence.is_some() && operation.remove_intent.is_none() {
         return Err("remove commit evidence has no frozen intent".to_string());
     }
+    if let Some(evidence) = &operation.remove_commit_evidence {
+        let intent = operation
+            .remove_intent
+            .as_ref()
+            .expect("commit evidence presence checked with frozen intent");
+        if operation.committed_snapshot.as_ref() != Some(&operation.target_snapshot)
+            || evidence.attempt_id != intent.attempt_id
+            || evidence.action_id != intent.action_id
+            || evidence.configuration_signature
+                != core_intent(operation)?
+                    .reduced_current_configuration
+                    .signature()
+        {
+            return Err("remove commit evidence does not match frozen authority".to_string());
+        }
+    }
     if operation.remove_mode == Some(DurableRemoveMode::ScaleDown) {
         let generation = operation
             .remove_target_agent_generation
@@ -1334,6 +1351,13 @@ fn validate_operation(operation: &DurableOperationStatus) -> Result<(), String> 
         return Err("remove disposition is not pinned in Poisoned".to_string());
     }
     Ok(())
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+pub(crate) fn validate_remove_replica_operation(
+    operation: &DurableOperationStatus,
+) -> Result<(), String> {
+    validate_operation(operation)
 }
 
 fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), String> {
