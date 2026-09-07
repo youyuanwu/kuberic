@@ -84,6 +84,12 @@ class ComplexityMeasurementTests(unittest.TestCase):
             measure_complexity.SHARED_BEFORE,
         )
 
+    def test_ratio_calculation_is_dimension_specific(self) -> None:
+        self.assertEqual(
+            measure_complexity.ratio((600, 25), (1200, 100)),
+            (0.5, 0.25),
+        )
+
     def test_amortization_classifications(self) -> None:
         self.assertEqual(
             measure_complexity.classify_amortization(
