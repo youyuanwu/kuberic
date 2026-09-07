@@ -198,16 +198,16 @@ The following completed successfully on the final Phase 5 checkout:
 - 11 durable switchover reconciler tests;
 - 17 durable remove-replica reconciler tests;
 - explicit add, remove, and failover lifecycle regressions;
-- 42 replica-agent and 6 replica-lifecycle tests;
+- 40 replica-agent and 6 replica-lifecycle tests in the final focused run;
 - complexity measurement and its 12 standard-library Python tests.
 
 The workspace-wide `cargo test --all --all-features` command reached the two
 live-cluster KV tests, but both
 `kuberic-tests::kvstore_k8s::test_kvstore_k8s_write_read` and
 `kuberic-tests::kvstore_k8s::test_kvstore_k8s_status_healthy` failed because
-the pre-existing operator deployment was in `ImagePullBackOff`. This is a local
-cluster deployment exception rather than a code-test failure. The deployment
-was not modified to work around it.
+the local environment could not execute `kubectl` (`No such file or
+directory`). This is an environment exception rather than a code-test failure.
+No cluster or deployment was modified to work around it.
 
 ## Limitations
 
