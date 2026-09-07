@@ -132,9 +132,18 @@ successful no-fault three-member ScaleDown executions recorded:
 - 2 passive observations
 - 5 completed durable boundaries
 - 11 accepted checkpoint writes
-- 5,009–101,633-byte maximum active checkpoints
+- approximately 101.6 KiB per-run active-checkpoint maxima
+- a 5,009–101,633-byte aggregate lifecycle minimum-to-maximum active range
 - 8,121–8,125-byte terminal checkpoints
 - 2,188-byte terminal payloads
+
+The active maximum passes the stable 770,048-byte encoded-checkpoint admission
+ceiling but exceeds the switchover 65,536-byte (64 KiB) baseline gate and
+32,768-byte (32 KiB) stretch gate. The smaller gates were not assigned as
+formal remove-replica acceptance criteria. Active checkpoint size grows
+approximately as durable-activity count multiplied by serialized workflow-state
+size. Complete retained activity history and repeated full-state projections in
+activity inputs and results are the dominant contributors.
 
 ## Source-Cost Result
 

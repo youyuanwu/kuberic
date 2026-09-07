@@ -526,10 +526,18 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
 
 The sampled no-fault ScaleDown path records three external effects, two passive
 observations, five durable boundaries, and 11 accepted writes. Run-specific
-maximum active checkpoints range from 5,009 to 101,633 bytes and terminal
-checkpoints from 8,121 to 8,125 bytes; the terminal payload is 2,188 bytes.
-The stable ceilings remain 770,048 encoded checkpoint bytes and 4,096 terminal
-payload bytes.
+active-checkpoint maxima are approximately 101.6 KiB. The
+5,009–101,633-byte interval is the aggregate lifecycle minimum-to-maximum range,
+not a range of per-run maxima. Terminal checkpoints range from 8,121 to 8,125
+bytes; the terminal payload is 2,188 bytes.
+
+The active maximum passes the stable 770,048-byte encoded-checkpoint admission
+ceiling but exceeds the switchover 65,536-byte baseline gate and 32,768-byte
+stretch gate. Those smaller gates were not assigned as formal remove-replica
+acceptance gates. Active size grows approximately as durable-activity count
+multiplied by serialized workflow-state size; retained full activity history
+and repeated full-state activity inputs and results dominate the measurement.
+The stable terminal-payload ceiling remains 4,096 bytes.
 
 **Pattern 8: Durable add/rejoin boundary and ambiguity recovery** ✅
 `test_durable_add_survives_state_loss_and_every_lost_runtime_reply` loses the
