@@ -103,6 +103,20 @@ checkpoint acceptance and required cleanup evidence.
 - A terminal checkpoint can be reloaded after process restart or final status
   write failure without re-polling workflow code.
 
+### Safety Mapping
+
+| Safety contract | As-built behavior |
+|---|---|
+| Admission and quorum | The durable path accepts only the same non-primary stable secondary, retained minimum, and previous-write-quorum conditions as the explicit operation. |
+| Primary authority | Prepared replica commands bind the exact primary incarnation, generation, control version, runtime epoch, protocol, and frozen configuration identity. |
+| ScaleDown versus Force | ScaleDown retains target lifecycle authority and exact generation requirements; Force permits missing target authority without relaxing primary, topology, quorum, epoch, or UID fences. |
+| Unknown effect outcome | The next reconcile reloads checkpoint and agent/cluster authority; it does not infer admission or issue a second permit. |
+| Irreversible commit | Reduced-Current commit evidence is persisted before any cleanup and cannot authorize restoration of previous Current after ambiguous dispatch. |
+| UID-fenced cleanup | Retired-label and deletion commands bind the admitted Pod name and UID; replacement Pods are not mutated. |
+| Unsafe ambiguity | Unresolved post-dispatch ambiguity terminates with the explicit workflow's typed poisoned disposition. |
+| Terminal ordering | The compact terminal checkpoint is accepted or reloaded before final topology and operation status publication. |
+| Replay | Tests reconstruct fresh hosts across accepted schedule, exposure, observation, commit, cleanup, and terminal boundaries using accumulated checkpoint history. |
+
 ## Configuration and Contracts
 
 - Cargo feature: `durable-remove-replica-pilot` (default off)
@@ -169,6 +183,31 @@ The corrected runtime-neutrality predicate checks only root library
 dependencies. A runtime used only by tests passes; a real async runtime in the
 library dependency table fails. With the current manifest and complete
 evidence registry, the mechanical classification is `feasible`.
+
+### Validation Results
+
+The following completed successfully on the final Phase 5 checkout:
+
+- formatting, all-target check/build, and all-feature clippy with warnings
+  denied;
+- durable-execution default and Kubernetes-feature suites, including the
+  authorized real-API checkpoint test;
+- the feasibility suite, with all FR-012 and revision predicates passing and
+  classification `feasible`;
+- 199 combined operator tests;
+- 11 durable switchover reconciler tests;
+- 17 durable remove-replica reconciler tests;
+- explicit add, remove, and failover lifecycle regressions;
+- 42 replica-agent and 6 replica-lifecycle tests;
+- complexity measurement and its 12 standard-library Python tests.
+
+The workspace-wide `cargo test --all --all-features` command reached the two
+live-cluster KV tests, but both
+`kuberic-tests::kvstore_k8s::test_kvstore_k8s_write_read` and
+`kuberic-tests::kvstore_k8s::test_kvstore_k8s_status_healthy` failed because
+the pre-existing operator deployment was in `ImagePullBackOff`. This is a local
+cluster deployment exception rather than a code-test failure. The deployment
+was not modified to work around it.
 
 ## Limitations
 
