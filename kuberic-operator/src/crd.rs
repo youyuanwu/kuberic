@@ -138,6 +138,11 @@ pub struct KubericSetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durable_remove_replica_pilot: Option<DurableRemoveReplicaPilotStatus>,
 
+    /// Structured immutable authority for framework-native remove execution.
+    /// Admission routing does not select this contract yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_replica_execution: Option<RemoveReplicaExecutionStatus>,
+
     /// Kubernetes-style conditions describing durable operation state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<StatusCondition>,
@@ -236,6 +241,40 @@ pub struct DurableRemoveReplicaPilotStatus {
     /// Exact JSON encoding of the initial operation accepted before checkpoint
     /// creation or effect dispatch.
     pub initial_operation_json: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveReplicaExecutionStatus {
+    pub contract_version: u32,
+    pub execution_id: String,
+    pub checkpoint_name: String,
+    pub input: RemoveReplicaAdmissionInputStatus,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveReplicaAdmissionInputStatus {
+    pub operation_authority: String,
+    pub operation_id: String,
+    pub mode: DurableRemoveMode,
+    pub previous_snapshot: StablePartitionSnapshotStatus,
+    pub target: RemoveReplicaAdmissionTargetStatus,
+    pub minimum_committed_replicas: u32,
+    pub accepted_unix_seconds: i64,
+    pub overall_deadline_unix_seconds: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveReplicaAdmissionTargetStatus {
+    pub replica_id: i64,
+    pub instance_id: String,
+    pub pod_name: String,
+    pub pod_uid: String,
+    pub replicator_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_generation: Option<String>,
 }
 // COMPLEXITY-BOUNDARY: remove-replica-crd-integration:end
 
@@ -1041,6 +1080,7 @@ mod tests {
         assert!(status.operation.is_none());
         assert!(status.durable_switchover_pilot.is_none());
         assert!(status.durable_remove_replica_pilot.is_none());
+        assert!(status.remove_replica_execution.is_none());
         assert!(status.conditions.is_empty());
         assert!(
             serde_json::to_value(status)
@@ -1124,6 +1164,25 @@ mod tests {
             assert!(
                 deployment.contains(required),
                 "missing deployed durable remove schema {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn framework_native_remove_reference_has_structured_immutable_input_schema() {
+        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        for required in [
+            "removeReplicaExecution",
+            "contractVersion",
+            "operationAuthority",
+            "operationId",
+            "previousSnapshot",
+            "minimumCommittedReplicas",
+            "overallDeadlineUnixSeconds",
+        ] {
+            assert!(
+                generated.contains(required),
+                "missing native remove schema {required}"
             );
         }
     }

@@ -2783,6 +2783,7 @@ async fn apply_failover_decision(
                 operation: None,
                 durable_switchover_pilot: None,
                 durable_remove_replica_pilot: None,
+                remove_replica_execution: None,
                 conditions: Vec::new(),
                 primary_failing_since: None,
                 stable_election_metadata_refresh: None,

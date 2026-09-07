@@ -229,6 +229,18 @@ impl MeasuredDurableCheckpointStore {
         )
     }
 
+    #[cfg(feature = "durable-remove-replica-pilot")]
+    pub fn with_native_remove_decoder(
+        execution_id: ExecutionId,
+        inner: DurableCheckpointStore,
+    ) -> Self {
+        Self::with_decoder(
+            execution_id,
+            inner,
+            super::remove_replica_execution::checkpoint_measurement_decoder(),
+        )
+    }
+
     #[cfg(feature = "durable-switchover-pilot")]
     pub fn with_collector(
         execution_id: ExecutionId,

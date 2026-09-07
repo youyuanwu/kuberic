@@ -21,6 +21,8 @@ pub mod failover_election;
 pub mod pilot;
 mod remove_replica;
 #[cfg(feature = "durable-remove-replica-pilot")]
+pub mod remove_replica_execution;
+#[cfg(feature = "durable-remove-replica-pilot")]
 pub mod remove_replica_pilot;
 #[cfg(any(
     feature = "durable-switchover-pilot",
