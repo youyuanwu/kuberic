@@ -396,6 +396,8 @@ enum DurableSwitchoverTerminalRecord {
 #[serde(tag = "status", rename_all = "snake_case")]
 enum DurableSwitchoverTerminalAccountingRecord {
     Complete {
+        state: Box<DurableSwitchoverState>,
+        snapshot: StablePartitionSnapshotStatus,
         #[serde(default)]
         compensated: bool,
         #[serde(default)]
@@ -558,11 +560,21 @@ impl Workflow for DurableSwitchoverWorkflow {
                                 .to_string(),
                         );
                     };
+                    let Some(completed_activity_count) = accounting
+                        .external_effect_count
+                        .checked_add(accounting.passive_observation_count)
+                    else {
+                        return terminal_failure(
+                            Some(operation),
+                            "pilot terminal activity accounting overflowed".to_string(),
+                        );
+                    };
                     if let Err(error) = validate_terminal_activity_accounting(
                         &initial,
                         &completed,
                         compensated,
                         accounting,
+                        completed_activity_count,
                     ) {
                         return terminal_failure(Some(operation), error);
                     }
@@ -815,11 +827,14 @@ pub fn decode_terminal_activity_accounting(
         (
             TerminalOutcome::Succeeded(_),
             DurableSwitchoverTerminalAccountingRecord::Complete {
+                state,
+                snapshot,
                 compensated,
                 accounting: Some(accounting),
             },
         ) if validate_terminal_accounting_shape(
-            None,
+            TerminalAccountingContext::from_state(&state),
+            snapshot.members.len(),
             compensated,
             accounting,
             completed_activity_count,
@@ -835,6 +850,7 @@ pub fn decode_terminal_activity_accounting(
 pub fn validate_loaded_terminal(
     reference: &DurableSwitchoverPilotStatus,
     outcome: &TerminalOutcome,
+    completed_activity_count: u64,
 ) -> Result<DurableSwitchoverPilotTerminal, String> {
     let initial = initial_operation(reference)?;
     validate_pilot_admission(&initial)?;
@@ -851,7 +867,13 @@ pub fn validate_loaded_terminal(
         ) => {
             validate_transition(&initial, operation)?;
             validate_terminal(operation, snapshot, *compensated)?;
-            validate_terminal_activity_accounting(&initial, operation, *compensated, *accounting)?;
+            validate_terminal_activity_accounting(
+                &initial,
+                operation,
+                *compensated,
+                *accounting,
+                completed_activity_count,
+            )?;
         }
         (
             TerminalOutcome::Failed(_),
@@ -906,12 +928,7 @@ pub fn evaluate_adapter_step(
             operation,
             snapshot,
             compensated,
-        } => PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Complete {
-            operation: DurableSwitchoverState::from_operation(&operation),
-            snapshot,
-            compensated,
-            accounting: None,
-        })),
+        } => terminal_adapter_decision(operation, snapshot, compensated),
         Decision::Wait => PilotAdapterDecision::AwaitEvidence,
         external @ (Decision::Execute { .. }
         | Decision::PatchPodRole { .. }
@@ -924,6 +941,40 @@ pub fn evaluate_adapter_step(
             ));
         }
     })
+}
+
+fn terminal_adapter_decision(
+    operation: DurableOperationStatus,
+    snapshot: StablePartitionSnapshotStatus,
+    compensated: bool,
+) -> PilotAdapterDecision {
+    let terminal_state = DurableSwitchoverState::from_operation(&operation);
+    if compensated
+        && projected_compensation_transcripts(
+            TerminalAccountingContext::from_state(&terminal_state),
+            operation.previous_snapshot.members.len(),
+        )
+        .is_empty()
+    {
+        let message = operation.last_error.clone().unwrap_or_else(|| {
+            "durable switchover failed before a compensation path completed".to_string()
+        });
+        let mut stopped = operation;
+        stopped.phase = DurableOperationPhase::Poisoned;
+        stopped.pending_action = None;
+        stopped.last_error = Some(message.clone());
+        PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Stopped {
+            operation: DurableSwitchoverState::from_operation(&stopped),
+            message,
+        }))
+    } else {
+        PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Complete {
+            operation: terminal_state,
+            snapshot,
+            compensated,
+            accounting: None,
+        }))
+    }
 }
 
 pub struct PilotPreparedActivityResolver<'a> {
@@ -1447,16 +1498,19 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
         .previous_snapshot
         .as_ref()
         .ok_or_else(|| "durable switchover pilot has no previous snapshot".to_string())?;
-    let success_steps = projected_success_steps(previous_snapshot.members.len());
-    let rollback_steps = projected_rollback_steps(previous_snapshot.members.len());
-    let projected_steps = success_steps.len().max(rollback_steps.len());
+    let success = projected_success_transcript(previous_snapshot.members.len());
+    let rollback = projected_rollback_transcript(previous_snapshot.members.len());
+    let projected_steps = success
+        .maximum_activity_count()
+        .max(rollback.maximum_activity_count());
     if projected_steps > PILOT_MAX_ACTIVITY_RECORDS {
         return Err(format!(
             "durable switchover requires {projected_steps} projected activities; maximum is {PILOT_MAX_ACTIVITY_RECORDS}"
         ));
     }
-    let projected_transitions = (success_steps.len() + projected_success_pure_transitions())
-        .max(rollback_steps.len() + projected_rollback_pure_transitions());
+    let projected_transitions = (success.maximum_activity_count()
+        + projected_success_pure_transitions())
+    .max(rollback.maximum_activity_count() + projected_rollback_pure_transitions());
     if projected_transitions > PILOT_MAX_TRANSITION_FUEL {
         return Err(format!(
             "durable switchover requires {projected_transitions} projected transitions; maximum is {PILOT_MAX_TRANSITION_FUEL}"
@@ -1505,49 +1559,178 @@ fn maximum_projected_checkpoint_bytes() -> Result<usize, String> {
         .clone()
 }
 
-fn projected_success_steps(member_count: usize) -> Vec<&'static str> {
-    let mut steps = vec![
-        "revoke.effect",
-        "capture-lsn",
-        "target-catch-up",
-        "demote.effect",
-        "promote.effect",
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectedActivityKind {
+    ReplicaEffect,
+    OtherExternalEffect,
+    PassiveObservation,
+    ExternalOrPassive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProjectedActivity {
+    name: &'static str,
+    kind: ProjectedActivityKind,
+}
+
+impl ProjectedActivity {
+    const fn replica_effect(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::ReplicaEffect,
+        }
+    }
+
+    const fn external_effect(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::OtherExternalEffect,
+        }
+    }
+
+    const fn passive(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::PassiveObservation,
+        }
+    }
+
+    const fn external_or_passive(name: &'static str) -> Self {
+        Self {
+            name,
+            kind: ProjectedActivityKind::ExternalOrPassive,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectedTranscript {
+    activities: Vec<ProjectedActivity>,
+}
+
+impl ProjectedTranscript {
+    fn new(activities: Vec<ProjectedActivity>) -> Self {
+        Self { activities }
+    }
+
+    #[cfg(test)]
+    fn maximum_external_effect_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| {
+                matches!(
+                    activity.kind,
+                    ProjectedActivityKind::ReplicaEffect
+                        | ProjectedActivityKind::OtherExternalEffect
+                        | ProjectedActivityKind::ExternalOrPassive
+                )
+            })
+            .count()
+    }
+
+    fn redelivery_slot_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| activity.kind == ProjectedActivityKind::ReplicaEffect)
+            .count()
+    }
+
+    fn maximum_activity_count(&self) -> usize {
+        self.activities.len() + self.redelivery_slot_count()
+    }
+
+    fn required_external_effect_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| {
+                matches!(
+                    activity.kind,
+                    ProjectedActivityKind::ReplicaEffect
+                        | ProjectedActivityKind::OtherExternalEffect
+                )
+            })
+            .count()
+    }
+
+    fn required_passive_observation_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| activity.kind == ProjectedActivityKind::PassiveObservation)
+            .count()
+    }
+
+    fn flexible_activity_count(&self) -> usize {
+        self.activities
+            .iter()
+            .filter(|activity| activity.kind == ProjectedActivityKind::ExternalOrPassive)
+            .count()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, name: &str) -> bool {
+        self.activities.iter().any(|activity| activity.name == name)
+    }
+
+    /// Returns whether the accounting is produced by one valid base
+    /// transcript plus zero or one proven-no-admission redelivery for each
+    /// activity that was actually exposed as an external effect.
+    fn contains_accounting(&self, accounting: PilotActivityAccounting) -> bool {
+        let required_external = self.required_external_effect_count();
+        let required_passive = self.required_passive_observation_count();
+        let flexible = self.flexible_activity_count();
+        (0..=flexible).any(|external_flexible| {
+            let base_external = required_external + external_flexible;
+            let passive = required_passive + flexible - external_flexible;
+            let maximum_external = base_external + self.redelivery_slot_count();
+            usize::try_from(accounting.passive_observation_count) == Ok(passive)
+                && usize::try_from(accounting.external_effect_count)
+                    .is_ok_and(|external| (base_external..=maximum_external).contains(&external))
+        })
+    }
+}
+
+fn projected_success_transcript(member_count: usize) -> ProjectedTranscript {
+    let mut activities = vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("demote.effect"),
+        ProjectedActivity::replica_effect("promote.effect"),
     ];
-    steps.extend(std::iter::repeat_n(
-        "epoch.effect",
+    activities.extend(std::iter::repeat_n(
+        ProjectedActivity::replica_effect("epoch.effect"),
         member_count.saturating_sub(2),
     ));
-
-    steps.extend([
-        "catch-up-config.effect",
-        "quorum.effect",
-        "current-config.effect",
-        "target-label.effect",
-        "old-label.effect",
-        "final-attestation",
+    activities.extend([
+        ProjectedActivity::replica_effect("catch-up-config.effect"),
+        ProjectedActivity::replica_effect("quorum.effect"),
+        ProjectedActivity::replica_effect("current-config.effect"),
+        ProjectedActivity::external_effect("target-label.effect"),
+        ProjectedActivity::external_effect("old-label.effect"),
+        ProjectedActivity::passive("final-attestation"),
     ]);
-    let redelivery_headroom = external_effect_count(&steps);
-    steps.extend(std::iter::repeat_n(
-        "proven-no-admission-redelivery",
-        redelivery_headroom,
-    ));
-    steps
+    ProjectedTranscript::new(activities)
 }
 
-fn projected_passive_observation_count(steps: &[&str]) -> usize {
-    steps
-        .iter()
-        .filter(|step| !step.ends_with(".effect") && **step != "proven-no-admission-redelivery")
-        .count()
+fn projected_pre_catch_up_restore_transcript() -> ProjectedTranscript {
+    ProjectedTranscript::new(vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("restore-previous.effect"),
+        ProjectedActivity::passive("rollback-final-attestation"),
+    ])
 }
 
-fn projected_activity_accounting(steps: &[&str]) -> PilotActivityAccounting {
-    PilotActivityAccounting::new(
-        u64::try_from(external_effect_count(steps))
-            .expect("projected external-effect count fits u64"),
-        u64::try_from(projected_passive_observation_count(steps))
-            .expect("projected passive-observation count fits u64"),
-    )
+fn projected_demote_restore_transcript() -> ProjectedTranscript {
+    ProjectedTranscript::new(vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("demote.effect"),
+        ProjectedActivity::replica_effect("restore-previous.effect"),
+        ProjectedActivity::passive("rollback-final-attestation"),
+    ])
 }
 
 fn is_full_pilot_start(initial: &DurableOperationStatus) -> bool {
@@ -1555,7 +1738,7 @@ fn is_full_pilot_start(initial: &DurableOperationStatus) -> bool {
         && initial.pending_action.is_none()
         && initial.frozen_lsn.is_none()
         && initial.next_secondary_index == 0
-        && initial.previous_snapshot.members.len() == PILOT_MAX_REPLICAS
+        && (2..=PILOT_MAX_REPLICAS).contains(&initial.previous_snapshot.members.len())
 }
 
 fn validate_terminal_activity_accounting(
@@ -1563,23 +1746,44 @@ fn validate_terminal_activity_accounting(
     terminal: &DurableOperationStatus,
     compensated: bool,
     accounting: PilotActivityAccounting,
+    completed_activity_count: u64,
 ) -> Result<(), String> {
     if !is_full_pilot_start(initial) {
         return Ok(());
     }
     validate_terminal_accounting_shape(
-        Some(terminal.phase),
+        TerminalAccountingContext::from_state(&DurableSwitchoverState::from_operation(terminal)),
+        initial.previous_snapshot.members.len(),
         compensated,
         accounting,
-        accounting
-            .external_effect_count
-            .checked_add(accounting.passive_observation_count)
-            .ok_or_else(|| "pilot terminal activity accounting overflowed".to_string())?,
+        completed_activity_count,
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TerminalAccountingContext {
+    phase: DurableOperationPhase,
+    frozen_lsn: Option<i64>,
+    next_secondary_index: u32,
+    has_pending_action: bool,
+    has_last_error: bool,
+}
+
+impl TerminalAccountingContext {
+    fn from_state(state: &DurableSwitchoverState) -> Self {
+        Self {
+            phase: state.phase,
+            frozen_lsn: state.frozen_lsn,
+            next_secondary_index: state.next_secondary_index,
+            has_pending_action: state.pending_action.is_some(),
+            has_last_error: state.last_error.is_some(),
+        }
+    }
+}
+
 fn validate_terminal_accounting_shape(
-    terminal_phase: Option<DurableOperationPhase>,
+    terminal: TerminalAccountingContext,
+    member_count: usize,
     compensated: bool,
     accounting: PilotActivityAccounting,
     completed_activity_count: u64,
@@ -1593,60 +1797,64 @@ fn validate_terminal_accounting_shape(
     }
 
     if !compensated {
-        let expected = projected_activity_accounting(&projected_success_steps(PILOT_MAX_REPLICAS));
-        if terminal_phase.is_some_and(|phase| phase != DurableOperationPhase::Completed)
-            || accounting != expected
+        let projection = projected_success_transcript(member_count);
+        if terminal.phase != DurableOperationPhase::Completed
+            || terminal.has_pending_action
+            || !projection.contains_accounting(accounting)
         {
             return Err(format!(
-                "successful full pilot requires authoritative activity accounting {}/{}, got {}/{}",
-                expected.external_effect_count,
-                expected.passive_observation_count,
-                accounting.external_effect_count,
-                accounting.passive_observation_count,
+                "successful full pilot requires exactly three passive observations and 9..=16 \
+                 external effects (the base nine plus at most one projected redelivery per \
+                 ReplicaAgent effect), got {}/{}",
+                accounting.external_effect_count, accounting.passive_observation_count,
             ));
         }
         return Ok(());
     }
 
-    let rollback_steps = projected_rollback_steps(PILOT_MAX_REPLICAS);
-    let rollback = projected_activity_accounting(&rollback_steps);
-    let maximum_external_effects = rollback
-        .external_effect_count
-        .checked_mul(2)
-        .ok_or_else(|| "pilot rollback activity accounting overflowed".to_string())?;
-    let maximum_completed_activities =
-        u64::try_from(rollback_steps.len()).expect("projected rollback activity count fits u64");
-    let maximum_non_redelivery_activities = maximum_completed_activities
-        .checked_sub(rollback.external_effect_count)
-        .expect("rollback projection includes its redelivery headroom");
-    let minimum_external_for_total = completed_activity_count
-        .saturating_sub(maximum_non_redelivery_activities)
-        .checked_mul(2)
-        .ok_or_else(|| "pilot rollback redelivery accounting overflowed".to_string())?;
-    if terminal_phase.is_some_and(|phase| phase != DurableOperationPhase::Failed)
-        || accounting.external_effect_count == 0
-        || accounting.external_effect_count > maximum_external_effects
-        || accounting.passive_observation_count == 0
-        || accounting.passive_observation_count > maximum_non_redelivery_activities
-        || accounting.external_effect_count < minimum_external_for_total
-        || completed_activity_count > maximum_completed_activities
+    let compensation_projections = projected_compensation_transcripts(terminal, member_count);
+    if compensation_projections
+        .iter()
+        .all(|projection| !projection.contains_accounting(accounting))
     {
         return Err(format!(
-            "compensated pilot activity accounting {}/{} is outside the authoritative rollback \
-             projection (external 1..={maximum_external_effects}, passive <= \
-             {maximum_non_redelivery_activities}, total <= {maximum_completed_activities}, \
-             every redelivery requires its preceding external attempt)",
+            "compensated pilot activity accounting {}/{} is not reachable from the terminal \
+             operation's compensation transcript and its per-effect bounded redelivery slots",
             accounting.external_effect_count, accounting.passive_observation_count,
         ));
     }
     Ok(())
 }
 
+fn projected_compensation_transcripts(
+    terminal: TerminalAccountingContext,
+    member_count: usize,
+) -> Vec<ProjectedTranscript> {
+    if terminal.phase != DurableOperationPhase::Failed
+        || terminal.has_pending_action
+        || terminal.frozen_lsn.is_none()
+        || terminal.has_last_error
+    {
+        return Vec::new();
+    }
+    if terminal.next_secondary_index == 0 {
+        return vec![
+            projected_pre_catch_up_restore_transcript(),
+            projected_demote_restore_transcript(),
+        ];
+    }
+    if usize::try_from(terminal.next_secondary_index) == Ok(member_count.saturating_sub(1)) {
+        return vec![projected_rollback_transcript(member_count)];
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
-fn projected_label_effect_count(steps: &[&str]) -> usize {
-    steps
+fn projected_label_effect_count(transcript: &ProjectedTranscript) -> usize {
+    transcript
+        .activities
         .iter()
-        .filter(|step| step.contains("label.effect"))
+        .filter(|activity| activity.name.contains("label.effect"))
         .count()
 }
 
@@ -1715,39 +1923,27 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
     Ok(())
 }
 
-fn projected_rollback_steps(member_count: usize) -> Vec<&'static str> {
-    let mut steps = vec![
-        "revoke.effect",
-        "capture-lsn",
-        "target-catch-up",
-        "demote.effect",
-        "promote.effect",
-        "rollback-promote.effect",
+fn projected_rollback_transcript(member_count: usize) -> ProjectedTranscript {
+    let mut activities = vec![
+        ProjectedActivity::replica_effect("revoke.effect"),
+        ProjectedActivity::passive("capture-lsn"),
+        ProjectedActivity::passive("target-catch-up"),
+        ProjectedActivity::replica_effect("demote.effect"),
+        ProjectedActivity::replica_effect("promote.effect"),
+        ProjectedActivity::replica_effect("rollback-promote.effect"),
     ];
-    steps.extend(std::iter::repeat_n(
-        "rollback-epoch.effect",
+    activities.extend(std::iter::repeat_n(
+        ProjectedActivity::replica_effect("rollback-epoch.effect"),
         member_count.saturating_sub(1),
     ));
-    steps.extend([
-        "rollback-catch-up.effect",
-        "rollback-current.effect",
-        "rollback-old-label.effect",
-        "rollback-target-label.effect",
-        "rollback-final-attestation",
+    activities.extend([
+        ProjectedActivity::replica_effect("rollback-catch-up.effect"),
+        ProjectedActivity::replica_effect("rollback-current.effect"),
+        ProjectedActivity::external_or_passive("rollback-old-label.effect"),
+        ProjectedActivity::external_or_passive("rollback-target-label.effect"),
+        ProjectedActivity::passive("rollback-final-attestation"),
     ]);
-    let redelivery_headroom = external_effect_count(&steps);
-    steps.extend(std::iter::repeat_n(
-        "proven-no-admission-redelivery",
-        redelivery_headroom,
-    ));
-    steps
-}
-
-fn external_effect_count(steps: &[&str]) -> usize {
-    steps
-        .iter()
-        .filter(|step| step.ends_with(".effect"))
-        .count()
+    ProjectedTranscript::new(activities)
 }
 
 const fn projected_success_pure_transitions() -> usize {
@@ -3061,12 +3257,41 @@ mod durable_switchover_pilot_tests {
         };
         let success = TerminalOutcome::succeeded(encode_terminal(&valid).unwrap());
         assert_eq!(
-            validate_loaded_terminal(&reference, &success).unwrap(),
+            validate_loaded_terminal(&reference, &success, 12).unwrap(),
             valid
         );
         for accounting in [
+            PilotActivityAccounting::new(10, 3),
+            PilotActivityAccounting::new(16, 3),
+        ] {
+            let redelivered_success = TerminalOutcome::succeeded(
+                encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                    snapshot: operation.target_snapshot.clone(),
+                    operation: operation.clone(),
+                    compensated: false,
+                    accounting,
+                })
+                .unwrap(),
+            );
+            assert_eq!(
+                validate_loaded_terminal(
+                    &reference,
+                    &redelivered_success,
+                    accounting.external_effect_count + accounting.passive_observation_count,
+                )
+                .unwrap(),
+                DurableSwitchoverPilotTerminal::Complete {
+                    snapshot: operation.target_snapshot.clone(),
+                    operation: operation.clone(),
+                    compensated: false,
+                    accounting,
+                }
+            );
+        }
+        for accounting in [
             PilotActivityAccounting::new(10, 2),
             PilotActivityAccounting::new(8, 3),
+            PilotActivityAccounting::new(17, 3),
         ] {
             let invalid_accounting = TerminalOutcome::succeeded(
                 encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
@@ -3078,13 +3303,18 @@ mod durable_switchover_pilot_tests {
                 .unwrap(),
             );
             assert!(
-                validate_loaded_terminal(&reference, &invalid_accounting).is_err(),
+                validate_loaded_terminal(
+                    &reference,
+                    &invalid_accounting,
+                    accounting.external_effect_count + accounting.passive_observation_count,
+                )
+                .is_err(),
                 "successful terminal accepted invalid accounting {accounting:?}"
             );
         }
 
         let failed_kind = TerminalOutcome::failed(encode_terminal(&valid).unwrap());
-        assert!(validate_loaded_terminal(&reference, &failed_kind).is_err());
+        assert!(validate_loaded_terminal(&reference, &failed_kind, 12).is_err());
 
         let mut wrong_identity = operation.clone();
         wrong_identity.operation_id.push_str("-other");
@@ -3097,7 +3327,7 @@ mod durable_switchover_pilot_tests {
             })
             .unwrap(),
         );
-        let canonical = validate_loaded_terminal(&reference, &wrong_identity).unwrap();
+        let canonical = validate_loaded_terminal(&reference, &wrong_identity, 12).unwrap();
         let DurableSwitchoverPilotTerminal::Complete {
             operation: canonical,
             ..
@@ -3122,10 +3352,13 @@ mod durable_switchover_pilot_tests {
             })
             .unwrap(),
         );
-        assert!(validate_loaded_terminal(&reference, &wrong_snapshot).is_err());
+        assert!(validate_loaded_terminal(&reference, &wrong_snapshot, 12).is_err());
 
         let mut failed = initial_operation(&reference).unwrap();
         failed.phase = crate::crd::DurableOperationPhase::Failed;
+        failed.frozen_lsn = Some(42);
+        failed.next_secondary_index = u32::try_from(PILOT_MAX_REPLICAS.saturating_sub(1)).unwrap();
+        failed.last_error = None;
         let compensated = failed.previous_snapshot.cloned().unwrap();
         let valid_compensation = DurableSwitchoverPilotTerminal::Complete {
             operation: failed.clone(),
@@ -3137,6 +3370,7 @@ mod durable_switchover_pilot_tests {
             validate_loaded_terminal(
                 &reference,
                 &TerminalOutcome::succeeded(encode_terminal(&valid_compensation).unwrap()),
+                13,
             )
             .is_ok()
         );
@@ -3149,7 +3383,7 @@ mod durable_switchover_pilot_tests {
             })
             .unwrap(),
         );
-        assert!(validate_loaded_terminal(&reference, &invalid_compensation).is_err());
+        assert!(validate_loaded_terminal(&reference, &invalid_compensation, 24).is_err());
         let impossible_passive_split = TerminalOutcome::succeeded(
             encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
                 operation: failed.clone(),
@@ -3159,7 +3393,7 @@ mod durable_switchover_pilot_tests {
             })
             .unwrap(),
         );
-        assert!(validate_loaded_terminal(&reference, &impossible_passive_split).is_err());
+        assert!(validate_loaded_terminal(&reference, &impossible_passive_split, 23).is_err());
         let impossible_redelivery_split = TerminalOutcome::succeeded(
             encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
                 operation: failed.clone(),
@@ -3169,7 +3403,7 @@ mod durable_switchover_pilot_tests {
             })
             .unwrap(),
         );
-        assert!(validate_loaded_terminal(&reference, &impossible_redelivery_split).is_err());
+        assert!(validate_loaded_terminal(&reference, &impossible_redelivery_split, 23).is_err());
 
         let mut malformed = Vec::new();
         let mut missing = compensated.clone();
@@ -3206,8 +3440,238 @@ mod durable_switchover_pilot_tests {
                 })
                 .unwrap(),
             );
-            assert!(validate_loaded_terminal(&reference, &outcome).is_err());
+            assert!(validate_loaded_terminal(&reference, &outcome, 13).is_err());
         }
+
+        assert!(
+            validate_loaded_terminal(&reference, &success, 11).is_err(),
+            "loaded terminal validation must compare accounting with the authoritative count"
+        );
+    }
+
+    #[test]
+    fn terminal_accounting_matches_exact_reachable_projection_pairs() {
+        let successful = TerminalAccountingContext {
+            phase: DurableOperationPhase::Completed,
+            frozen_lsn: Some(42),
+            next_secondary_index: 1,
+            has_pending_action: false,
+            has_last_error: false,
+        };
+        let restored = TerminalAccountingContext {
+            phase: DurableOperationPhase::Failed,
+            frozen_lsn: Some(42),
+            next_secondary_index: 0,
+            has_pending_action: false,
+            has_last_error: false,
+        };
+        let fully_compensated = TerminalAccountingContext {
+            next_secondary_index: u32::try_from(PILOT_MAX_REPLICAS - 1).unwrap(),
+            ..restored
+        };
+        let incomplete_compensation = TerminalAccountingContext {
+            next_secondary_index: 1,
+            ..restored
+        };
+        let uncompensated_failure = TerminalAccountingContext {
+            frozen_lsn: None,
+            has_last_error: true,
+            ..restored
+        };
+        let cases = [
+            ("success base", successful, false, 9, 3, true),
+            ("success one redelivery", successful, false, 10, 3, true),
+            ("success all redeliveries", successful, false, 16, 3, true),
+            (
+                "success too many redeliveries",
+                successful,
+                false,
+                17,
+                3,
+                false,
+            ),
+            (
+                "success wrong passive split",
+                successful,
+                false,
+                10,
+                2,
+                false,
+            ),
+            ("pre-catch-up restore", restored, true, 2, 3, true),
+            (
+                "pre-catch-up restore redeliveries",
+                restored,
+                true,
+                4,
+                3,
+                true,
+            ),
+            ("demote restore", restored, true, 3, 3, true),
+            ("demote restore redeliveries", restored, true, 6, 3, true),
+            (
+                "restore path excess redelivery",
+                restored,
+                true,
+                7,
+                3,
+                false,
+            ),
+            (
+                "failed-promotion compensation",
+                fully_compensated,
+                true,
+                8,
+                5,
+                true,
+            ),
+            (
+                "failed-promotion compensation redeliveries",
+                fully_compensated,
+                true,
+                16,
+                5,
+                true,
+            ),
+            (
+                "failed-promotion one label effect",
+                fully_compensated,
+                true,
+                9,
+                4,
+                true,
+            ),
+            (
+                "failed-promotion all effects",
+                fully_compensated,
+                true,
+                10,
+                3,
+                true,
+            ),
+            (
+                "failed-promotion all redeliveries",
+                fully_compensated,
+                true,
+                18,
+                3,
+                true,
+            ),
+            (
+                "failed-promotion one label and all replica redeliveries",
+                fully_compensated,
+                true,
+                17,
+                4,
+                true,
+            ),
+            (
+                "failed-promotion excess redelivery",
+                fully_compensated,
+                true,
+                17,
+                5,
+                false,
+            ),
+            (
+                "unreachable low split",
+                fully_compensated,
+                true,
+                1,
+                1,
+                false,
+            ),
+            (
+                "phase-inconsistent restore accounting",
+                fully_compensated,
+                true,
+                2,
+                3,
+                false,
+            ),
+            (
+                "incomplete compensation phase",
+                incomplete_compensation,
+                true,
+                8,
+                5,
+                false,
+            ),
+            (
+                "failure without compensation",
+                uncompensated_failure,
+                true,
+                1,
+                1,
+                false,
+            ),
+        ];
+        for (name, terminal, compensated, external, passive, expected) in cases {
+            let accounting = PilotActivityAccounting::new(external, passive);
+            assert_eq!(
+                validate_terminal_accounting_shape(
+                    terminal,
+                    PILOT_MAX_REPLICAS,
+                    compensated,
+                    accounting,
+                    external + passive,
+                )
+                .is_ok(),
+                expected,
+                "{name}: {accounting:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn failure_before_compensation_stops_instead_of_emitting_unreachable_accounting() {
+        let reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut failed = initial_operation(&reference).unwrap();
+        failed.phase = DurableOperationPhase::Failed;
+        failed.last_error = Some("revoke failed before compensation".to_string());
+        let previous = failed.previous_snapshot.cloned().unwrap();
+        let PilotAdapterDecision::Observe(result) =
+            terminal_adapter_decision(failed, previous, true)
+        else {
+            panic!("early safe failure must become a stopped pilot result");
+        };
+        let DurableSwitchoverStepResult::Stopped { operation, message } = *result else {
+            panic!("early safe failure must not claim compensated completion");
+        };
+        assert_eq!(operation.phase, DurableOperationPhase::Poisoned);
+        assert!(operation.pending_action.is_none());
+        assert_eq!(message, "revoke failed before compensation");
+    }
+
+    #[test]
+    fn two_member_terminal_accounting_uses_its_authoritative_projection() {
+        let reference = new_pilot_reference("set-uid", snapshot(2), 2, 100).unwrap();
+        let mut completed = initial_operation(&reference).unwrap();
+        completed.phase = DurableOperationPhase::Completed;
+        completed.frozen_lsn = Some(42);
+        let valid = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                snapshot: completed.target_snapshot.clone(),
+                operation: completed.clone(),
+                compensated: false,
+                accounting: PilotActivityAccounting::new(8, 3),
+            })
+            .unwrap(),
+        );
+        assert!(validate_loaded_terminal(&reference, &valid, 11).is_ok());
+
+        let excessive_two_member_redeliveries = TerminalOutcome::succeeded(
+            encode_terminal(&DurableSwitchoverPilotTerminal::Complete {
+                snapshot: completed.target_snapshot.clone(),
+                operation: completed,
+                compensated: false,
+                accounting: PilotActivityAccounting::new(15, 3),
+            })
+            .unwrap(),
+        );
+        assert!(
+            validate_loaded_terminal(&reference, &excessive_two_member_redeliveries, 18).is_err()
+        );
     }
 
     #[test]
@@ -3510,36 +3974,35 @@ mod durable_switchover_pilot_tests {
 
     #[test]
     fn success_and_rollback_transcripts_fit_with_redelivery_headroom() {
-        let success = projected_success_steps(PILOT_MAX_REPLICAS);
-        let rollback = projected_rollback_steps(PILOT_MAX_REPLICAS);
-        assert_eq!(success.len(), 21);
-        assert_eq!(rollback.len(), 23);
-        let success_external_effects = external_effect_count(&success);
-        let rollback_external_effects = external_effect_count(&rollback);
-        assert_eq!(success_external_effects, 9);
+        let success = projected_success_transcript(PILOT_MAX_REPLICAS);
+        let rollback = projected_rollback_transcript(PILOT_MAX_REPLICAS);
+        assert_eq!(success.maximum_activity_count(), 19);
+        assert_eq!(rollback.maximum_activity_count(), 21);
+        assert_eq!(success.maximum_external_effect_count(), 9);
+        assert_eq!(rollback.maximum_external_effect_count(), 10);
+        assert_eq!(success.redelivery_slot_count(), 7);
+        assert_eq!(rollback.redelivery_slot_count(), 8);
         let success_label_effects = projected_label_effect_count(&success);
         assert_eq!(success_label_effects, 2);
-        assert_eq!(success_external_effects - success_label_effects, 7);
-        assert_eq!(projected_passive_observation_count(&success), 3);
         assert_eq!(
-            success.len() - success_external_effects,
-            12,
-            "success projection includes three passive observations and nine redeliveries"
+            success.maximum_external_effect_count() - success_label_effects,
+            7
         );
-        assert_eq!(rollback_external_effects, 10);
-        assert_eq!(projected_passive_observation_count(&rollback), 3);
-        assert_eq!(
-            rollback.len() - rollback_external_effects,
-            13,
-            "rollback projection retains three passive observations and ten redeliveries"
-        );
-        assert!(success.len() <= PILOT_MAX_ACTIVITY_RECORDS);
-        assert!(rollback.len() <= PILOT_MAX_ACTIVITY_RECORDS);
-        assert!(success.len() + projected_success_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL);
+        assert_eq!(success.required_passive_observation_count(), 3);
+        assert_eq!(success.flexible_activity_count(), 0);
+        assert_eq!(rollback.required_passive_observation_count(), 3);
+        assert_eq!(rollback.flexible_activity_count(), 2);
+        assert!(success.maximum_activity_count() <= PILOT_MAX_ACTIVITY_RECORDS);
+        assert!(rollback.maximum_activity_count() <= PILOT_MAX_ACTIVITY_RECORDS);
         assert!(
-            rollback.len() + projected_rollback_pure_transitions() <= PILOT_MAX_TRANSITION_FUEL
+            success.maximum_activity_count() + projected_success_pure_transitions()
+                <= PILOT_MAX_TRANSITION_FUEL
         );
-        assert!(success.contains(&"proven-no-admission-redelivery"));
-        assert!(rollback.contains(&"rollback-promote.effect"));
+        assert!(
+            rollback.maximum_activity_count() + projected_rollback_pure_transitions()
+                <= PILOT_MAX_TRANSITION_FUEL
+        );
+        assert!(success.contains("revoke.effect"));
+        assert!(rollback.contains("rollback-promote.effect"));
     }
 }

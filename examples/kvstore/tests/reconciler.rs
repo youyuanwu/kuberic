@@ -258,6 +258,7 @@ struct ObservedHandle {
     pod_name: String,
     exposed_control_address: Option<String>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
+    reject_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_terminal_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
@@ -376,6 +377,23 @@ impl ReplicaHandle for ObservedHandle {
         let operation = Self::operation_for(&request.action);
         self.record(operation);
         if self
+            .reject_before_next_durable_action
+            .lock()
+            .unwrap()
+            .as_ref()
+            == Some(&operation)
+        {
+            self.reject_before_next_durable_action
+                .lock()
+                .unwrap()
+                .take();
+            return Err(
+                kuberic_core::error::KubericError::RemoteAgentPreconditionRejected(
+                    "injected proven non-admission".to_string(),
+                ),
+            );
+        }
+        if self
             .fail_before_next_durable_action
             .lock()
             .unwrap()
@@ -488,6 +506,7 @@ struct KvClusterApi {
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
+    reject_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_next_status_patch: Mutex<bool>,
     fail_after_next_status_patch: Mutex<bool>,
     fail_next_status_conflict: Mutex<bool>,
@@ -521,6 +540,7 @@ impl KvClusterApi {
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(Vec::new())),
+            reject_before_next_durable_action: Arc::new(Mutex::new(None)),
             fail_next_status_patch: Mutex::new(false),
             fail_after_next_status_patch: Mutex::new(false),
             fail_next_status_conflict: Mutex::new(false),
@@ -628,6 +648,10 @@ impl KvClusterApi {
 
     fn fail_before_next_durable_action(&self, operation: ControlOperation) {
         *self.fail_before_next_durable_action.lock().unwrap() = Some(operation);
+    }
+
+    fn reject_before_next_durable_action(&self, operation: ControlOperation) {
+        *self.reject_before_next_durable_action.lock().unwrap() = Some(operation);
     }
 
     fn fail_after_next_durable_action(&self, operation: ControlOperation) {
@@ -1065,6 +1089,7 @@ impl ClusterApi for KvClusterApi {
                 .get(pod_name)
                 .cloned(),
             operations: self.operations.clone(),
+            reject_before_next_durable_action: self.reject_before_next_durable_action.clone(),
             fail_before_next_durable_action: self.fail_before_next_durable_action.clone(),
             fail_after_next_durable_action: self.fail_after_next_durable_action.clone(),
             fail_terminal_next_durable_action: self.fail_terminal_next_durable_action.clone(),
@@ -3830,7 +3855,8 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
             kuberic_operator::durable::pilot::checkpoint_limits(),
         )
         .unwrap();
-    let durable_boundary_count = terminal_payload.terminal_outcome().unwrap().1;
+    let (terminal_outcome, durable_boundary_count) = terminal_payload.terminal_outcome().unwrap();
+    let terminal_payload_bytes = terminal_outcome.payload().as_slice().len();
     let measurements = pilot_state
         .durable_switchover_pilot
         .as_ref()
@@ -3866,6 +3892,14 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     );
     assert!(measurements.latest_active_checkpoint_bytes.is_some());
     assert!(measurements.maximum_active_checkpoint_bytes >= terminal_bytes);
+    assert!(
+        measurements.maximum_active_checkpoint_bytes
+            <= kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES
+    );
+    assert!(
+        terminal_payload_bytes
+            <= usize::try_from(kuberic_operator::durable::pilot::PILOT_MAX_TERMINAL_BYTES).unwrap()
+    );
     println!(
         concat!(
             "KUBERIC_SWITCHOVER_MEASUREMENT engine=durable_pilot ",
@@ -3971,6 +4005,133 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     assert!(
         explicit_status.durable_switchover_pilot.is_none(),
         "a retained terminal pilot reference must not hijack a later explicit switchover"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_durable_execution_switchover_pilot_completed_redelivery_accounts_terminal() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let status = create_healthy_set(&api, &bootstrap, "pilot-redelivery", 3).await;
+    let original_primary = status.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let pilot_state = ReconcilerState::with_durable_switchover_store(checkpoint_store.clone());
+
+    reconcile_set(
+        &make_pilot_set(
+            "pilot-redelivery",
+            3,
+            Some(KubericSetStatus {
+                current_primary: Some(original_primary),
+                target_primary: Some(target.clone()),
+                ..status
+            }),
+        ),
+        &api,
+        &pilot_state,
+    )
+    .await
+    .unwrap();
+    let accepted = api.last_status().unwrap();
+    let reference = accepted.durable_switchover_pilot.clone().unwrap();
+    api.reset_operations();
+    api.reject_before_next_durable_action(ControlOperation::RevokeWriteStatus);
+
+    let status_calls_before_rejection: usize =
+        api.status_call_counts.lock().unwrap().values().sum();
+    reconcile_set(
+        &make_pilot_set("pilot-redelivery", 3, Some(accepted)),
+        &api,
+        &pilot_state,
+    )
+    .await
+    .unwrap();
+    let after_rejection = api.last_status().unwrap();
+    let status_calls_after_rejection: usize = api.status_call_counts.lock().unwrap().values().sum();
+    assert!(status_calls_after_rejection > status_calls_before_rejection);
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+            .count(),
+        1,
+        "the proven-no-admission reconcile must not dispatch a retry"
+    );
+    assert!(after_rejection.conditions.iter().any(|condition| {
+        condition.type_ == "DurableSwitchoverPilot"
+            && condition.reason == "RefreshingReplicaObservation"
+    }));
+
+    reconcile_set(
+        &make_pilot_set("pilot-redelivery", 3, Some(after_rejection)),
+        &api,
+        &pilot_state,
+    )
+    .await
+    .unwrap();
+    let after_retry = api.last_status().unwrap();
+    let status_calls_after_retry: usize = api.status_call_counts.lock().unwrap().values().sum();
+    assert!(
+        status_calls_after_retry > status_calls_after_rejection,
+        "the retry must be prepared from a fresh observation cycle"
+    );
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+            .count(),
+        2,
+        "the fresh reconcile must successfully dispatch the bounded retry"
+    );
+
+    let completed =
+        drive_pilot_switchover(&api, &pilot_state, "pilot-redelivery", 3, after_retry).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
+
+    use kuberic_durable_execution::CheckpointStore;
+    let execution = kuberic_operator::durable::pilot::execution_spec(&reference).unwrap();
+    let terminal = checkpoint_store
+        .load(execution.execution_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let terminal_payload = terminal
+        .checkpoint()
+        .decode_and_validate(
+            &execution,
+            kuberic_operator::durable::pilot::checkpoint_limits(),
+        )
+        .unwrap();
+    assert_eq!(terminal_payload.terminal_outcome().unwrap().1, 13);
+
+    let measurements = pilot_state
+        .durable_switchover_pilot
+        .as_ref()
+        .unwrap()
+        .measurements(
+            "default",
+            "pilot-redelivery",
+            "test-uid",
+            &reference.execution_id,
+        )
+        .await
+        .expect("completed redelivery measurements must remain available");
+    assert_eq!(measurements.completed_external_effect_count, Some(10));
+    assert_eq!(measurements.completed_passive_observation_count, Some(3));
+    assert_eq!(measurements.completed_activity_count, Some(13));
+    assert_eq!(
+        measurements.accepted_writes, 15,
+        "the non-fused rejection observation and fresh retry exposure add two writes"
     );
 }
 
@@ -4132,6 +4293,22 @@ async fn test_durable_execution_switchover_pilot_compensates_failed_promotion() 
             && condition.reason == "CompensatedOrSafeFailure"
             && condition.status == "False"
     }));
+    let reference = completed.durable_switchover_pilot.as_ref().unwrap();
+    let measurements = state
+        .durable_switchover_pilot
+        .as_ref()
+        .unwrap()
+        .measurements(
+            "default",
+            "pilot-rollback",
+            "test-uid",
+            &reference.execution_id,
+        )
+        .await
+        .expect("completed compensation measurements must remain available");
+    assert_eq!(measurements.completed_external_effect_count, Some(8));
+    assert_eq!(measurements.completed_passive_observation_count, Some(5));
+    assert_eq!(measurements.completed_activity_count, Some(13));
     assert_eq!(
         api.operations()
             .iter()

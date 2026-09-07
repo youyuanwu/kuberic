@@ -393,7 +393,7 @@ mod durable_switchover_pilot_tests {
 
     async fn terminal_accounting_measurements(
         seed: u8,
-        terminal_payload: &'static [u8],
+        terminal_payload: &[u8],
         completed_activity_count: u64,
     ) -> PilotCheckpointMeasurementsSnapshot {
         let execution_id = ExecutionId::from_bytes([seed; 16]);
@@ -421,6 +421,99 @@ mod durable_switchover_pilot_tests {
             CasOutcome::Accepted(_)
         ));
         store.measurements()
+    }
+
+    fn terminal_accounting_payload(
+        compensated: bool,
+        phase: &str,
+        frozen_lsn: Option<i64>,
+        next_secondary_index: u32,
+        last_error: Option<&str>,
+        external_effect_count: u64,
+        passive_observation_count: u64,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "status": "complete",
+            "state": {
+                "phase": phase,
+                "frozenLsn": frozen_lsn,
+                "nextSecondaryIndex": next_secondary_index,
+                "phaseDeadlineUnixSeconds": 100,
+                "pendingAction": null,
+                "lastError": last_error,
+            },
+            "snapshot": {
+                "epoch": {
+                    "dataLossNumber": 4,
+                    "configurationNumber": 9,
+                },
+                "primaryId": 2,
+                "members": [
+                    {
+                        "id": 1,
+                        "instanceId": "pod-1-uid",
+                        "role": "activeSecondary",
+                    },
+                    {
+                        "id": 2,
+                        "instanceId": "pod-2-uid",
+                        "role": "primary",
+                    },
+                    {
+                        "id": 3,
+                        "instanceId": "pod-3-uid",
+                        "role": "activeSecondary",
+                    },
+                ],
+                "writeQuorum": 2,
+            },
+            "compensated": compensated,
+            "accounting": {
+                "externalEffectCount": external_effect_count,
+                "passiveObservationCount": passive_observation_count,
+            },
+        }))
+        .unwrap()
+    }
+
+    fn two_member_terminal_accounting_payload() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "status": "complete",
+            "state": {
+                "phase": "completed",
+                "frozenLsn": 42,
+                "nextSecondaryIndex": 0,
+                "phaseDeadlineUnixSeconds": 100,
+                "pendingAction": null,
+                "lastError": null,
+            },
+            "snapshot": {
+                "epoch": {
+                    "dataLossNumber": 4,
+                    "configurationNumber": 9,
+                },
+                "primaryId": 2,
+                "members": [
+                    {
+                        "id": 1,
+                        "instanceId": "pod-1-uid",
+                        "role": "activeSecondary",
+                    },
+                    {
+                        "id": 2,
+                        "instanceId": "pod-2-uid",
+                        "role": "primary",
+                    },
+                ],
+                "writeQuorum": 2,
+            },
+            "compensated": false,
+            "accounting": {
+                "externalEffectCount": 8,
+                "passiveObservationCount": 3,
+            },
+        }))
+        .unwrap()
     }
 
     #[tokio::test]
@@ -556,11 +649,11 @@ mod durable_switchover_pilot_tests {
         else {
             panic!("active checkpoint was not accepted");
         };
+        let terminal_payload =
+            terminal_accounting_payload(false, "completed", Some(42), 1, None, 9, 3);
         let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             contract,
-            TerminalOutcome::succeeded(ExactBytes::new(
-                br#"{"status":"complete","accounting":{"externalEffectCount":9,"passiveObservationCount":3}}"#,
-            )),
+            TerminalOutcome::succeeded(ExactBytes::new(terminal_payload)),
             12,
         ))
         .unwrap();
@@ -612,15 +705,20 @@ mod durable_switchover_pilot_tests {
             ExecutionSpec::new(mismatched_execution_id, ExactBytes::new(b"workflow"), 128),
             100_000,
         );
-        let mismatched_terminal =
-            CheckpointEnvelope::encode(&CheckpointPayload::terminal(
-                mismatched_contract,
-                TerminalOutcome::succeeded(ExactBytes::new(
-                    br#"{"status":"complete","accounting":{"externalEffectCount":9,"passiveObservationCount":3}}"#,
-                )),
-                11,
-            ))
-            .unwrap();
+        let mismatched_terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
+            mismatched_contract,
+            TerminalOutcome::succeeded(ExactBytes::new(terminal_accounting_payload(
+                false,
+                "completed",
+                Some(42),
+                1,
+                None,
+                9,
+                3,
+            ))),
+            11,
+        ))
+        .unwrap();
         assert!(matches!(
             mismatched_store
                 .compare_and_swap(mismatched_execution_id, None, mismatched_terminal)
@@ -633,32 +731,55 @@ mod durable_switchover_pilot_tests {
         assert_eq!(mismatched.completed_external_effect_count, None);
         assert_eq!(mismatched.completed_passive_observation_count, None);
 
-        let wrong_split = terminal_accounting_measurements(
-            12,
-            br#"{"status":"complete","compensated":false,"accounting":{"externalEffectCount":10,"passiveObservationCount":2}}"#,
-            12,
-        )
-        .await;
+        let wrong_split_payload =
+            terminal_accounting_payload(false, "completed", Some(42), 1, None, 10, 2);
+        let wrong_split = terminal_accounting_measurements(12, &wrong_split_payload, 12).await;
         assert_eq!(wrong_split.completed_activity_count, Some(12));
         assert_eq!(wrong_split.completed_external_effect_count, None);
         assert_eq!(wrong_split.completed_passive_observation_count, None);
 
-        let compensation = terminal_accounting_measurements(
-            13,
-            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":8,"passiveObservationCount":5}}"#,
-            13,
-        )
-        .await;
+        let successful_redelivery_payload =
+            terminal_accounting_payload(false, "completed", Some(42), 1, None, 10, 3);
+        let successful_redelivery =
+            terminal_accounting_measurements(13, &successful_redelivery_payload, 13).await;
+        assert_eq!(
+            successful_redelivery.completed_external_effect_count,
+            Some(10)
+        );
+        assert_eq!(
+            successful_redelivery.completed_passive_observation_count,
+            Some(3)
+        );
+
+        let two_member_payload = two_member_terminal_accounting_payload();
+        let two_member = terminal_accounting_measurements(14, &two_member_payload, 11).await;
+        assert_eq!(two_member.completed_external_effect_count, Some(8));
+        assert_eq!(two_member.completed_passive_observation_count, Some(3));
+
+        let compensation_payload =
+            terminal_accounting_payload(true, "failed", Some(42), 2, None, 8, 5);
+        let compensation = terminal_accounting_measurements(15, &compensation_payload, 13).await;
         assert_eq!(compensation.completed_activity_count, Some(13));
         assert_eq!(compensation.completed_external_effect_count, Some(8));
         assert_eq!(compensation.completed_passive_observation_count, Some(5));
 
-        let impossible_compensation = terminal_accounting_measurements(
-            14,
-            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":21,"passiveObservationCount":3}}"#,
-            24,
-        )
-        .await;
+        let compensation_redelivery_payload =
+            terminal_accounting_payload(true, "failed", Some(42), 2, None, 16, 5);
+        let compensation_redelivery =
+            terminal_accounting_measurements(16, &compensation_redelivery_payload, 21).await;
+        assert_eq!(
+            compensation_redelivery.completed_external_effect_count,
+            Some(16)
+        );
+        assert_eq!(
+            compensation_redelivery.completed_passive_observation_count,
+            Some(5)
+        );
+
+        let impossible_compensation_payload =
+            terminal_accounting_payload(true, "failed", Some(42), 2, None, 21, 3);
+        let impossible_compensation =
+            terminal_accounting_measurements(17, &impossible_compensation_payload, 24).await;
         assert_eq!(
             impossible_compensation.completed_external_effect_count,
             None
@@ -668,27 +789,27 @@ mod durable_switchover_pilot_tests {
             None
         );
 
-        let impossible_split = terminal_accounting_measurements(
-            15,
-            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":1,"passiveObservationCount":22}}"#,
-            23,
-        )
-        .await;
+        let impossible_split_payload =
+            terminal_accounting_payload(true, "failed", Some(42), 2, None, 1, 1);
+        let impossible_split =
+            terminal_accounting_measurements(18, &impossible_split_payload, 2).await;
         assert_eq!(impossible_split.completed_external_effect_count, None);
         assert_eq!(impossible_split.completed_passive_observation_count, None);
 
-        let impossible_redelivery_split = terminal_accounting_measurements(
-            16,
-            br#"{"status":"complete","compensated":true,"accounting":{"externalEffectCount":10,"passiveObservationCount":13}}"#,
-            23,
-        )
-        .await;
+        let phase_inconsistent_payload =
+            terminal_accounting_payload(true, "failed", Some(42), 0, None, 8, 5);
+        let phase_inconsistent =
+            terminal_accounting_measurements(19, &phase_inconsistent_payload, 13).await;
+        assert_eq!(phase_inconsistent.completed_external_effect_count, None);
+        assert_eq!(phase_inconsistent.completed_passive_observation_count, None);
+
+        let uncompensated_failure_payload =
+            terminal_accounting_payload(true, "failed", None, 0, Some("revoke failed"), 1, 1);
+        let uncompensated_failure =
+            terminal_accounting_measurements(20, &uncompensated_failure_payload, 2).await;
+        assert_eq!(uncompensated_failure.completed_external_effect_count, None);
         assert_eq!(
-            impossible_redelivery_split.completed_external_effect_count,
-            None
-        );
-        assert_eq!(
-            impossible_redelivery_split.completed_passive_observation_count,
+            uncompensated_failure.completed_passive_observation_count,
             None
         );
     }

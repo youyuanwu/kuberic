@@ -173,15 +173,26 @@ ReplicaAgent preparation-only records were removed by preparing the exact
 command inside the same accepted exposure that authorizes dispatch; no effect
 or required observation was removed. In the authoritative happy-path
 measurement, checkpoint write attempts and accepted writes were both 13, with
-no conflict, unknown, or definite-failure outcomes. The maximum active
-checkpoint was 31,605 bytes and the compact terminal checkpoint was 4,081
-bytes. The terminal carries authoritative external-effect and
-passive-observation accounting, making the 9/3 classification recoverable
-after a process restart. Successful terminal semantics require the exact 9/3
-split rather than merely accepting any split totaling 12; compensation uses
-its own bounded rollback projection. Active size therefore passes both the 64
-KiB baseline and 32 KiB stretch gates, and terminal size passes its baseline
-gate.
+no conflict, unknown, or definite-failure outcomes. Six repeated remediation
+runs observed maximum active checkpoints from 31,597 to 31,605 bytes and compact
+terminal checkpoints from 4,077 to 4,081 bytes. These values are run-specific
+snapshots, not exact byte contracts; runtime-generated serialized values can
+change their lengths. The stable admission contracts remain the configured
+770,048-byte (752 KiB) encoded-checkpoint ceiling and 4,096-byte terminal
+payload ceiling. The executable measurement checks authoritative
+self-consistency and those limits.
+
+The terminal carries authoritative external-effect and passive-observation
+accounting, making the classification recoverable after a process restart.
+Successful terminal semantics require exactly three passive observations and
+the base nine external effects plus only the reachable per-effect bounded
+redeliveries. Only the seven ReplicaAgent effects have such retry slots; the
+two UID-fenced label effects do not. The no-redelivery path therefore remains
+exactly 9/3, while fault paths may use additional boundaries and writes. Compensation uses the
+exact reachable accounting pairs for the terminal operation's restore or
+failed-promotion transcript rather than a broad rollback upper bound. Active
+size passes both the 64 KiB baseline and 32 KiB stretch gates, and terminal
+size passes its baseline gate.
 
 These fields have deliberately different meanings. External effects are the
 seven ReplicaAgent mutations and two UID-fenced label patches. Passive
@@ -191,11 +202,11 @@ whereas an accepted write is confirmed only by an authoritative accepted
 revision. Active and terminal sizes are canonical encoded checkpoint sizes for
 different lifecycle states and are reported separately.
 
-The lexical report distinguishes a 191-line/29-decision workflow body and the
-comparable 882/105 legacy-marker scope. Shared typed, fused, and effect-adapter
-infrastructure is 1,208/110; operator integration is 1,036/54; the honestly
-charged non-overlapping total is 3,975/324. The explicit implementation remains
-measured at 1,449/172. Charging it as well yields a combined 5,424/496. The
+The lexical report distinguishes a 201-line/29-decision workflow body and the
+comparable 930/108 legacy-marker scope. Shared typed, fused, and effect-adapter
+infrastructure is 1,208/110; operator integration is 1,047/55; the honestly
+charged non-overlapping total is 4,161/326. The explicit implementation remains
+measured at 1,449/172. Charging it as well yields a combined 5,610/498. The
 measurement script rejects overlapping charged scopes. Shared code may
 amortize across later workflows, but this pilot does not claim that
 amortization yet.

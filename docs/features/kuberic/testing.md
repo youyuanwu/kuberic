@@ -416,14 +416,26 @@ The authoritative happy-path gate expects exactly nine external effects plus
 three passive observations, giving 12 completed durable boundaries and 13
 accepted checkpoint writes including terminal persistence. Seven former
 preparation-only records are now part of their corresponding effect exposure.
-The measured maximum active checkpoint is 31,605 bytes and the terminal
-checkpoint is 4,081 bytes. The terminal payload carries the external-effect
-and passive-observation counts, so a fresh measurement store can recover the
-9/3 classification without prior active-checkpoint cache state. Recovery
-requires that exact split for a successful full pilot and rejects alternate
-splits such as 10/2 even when the total remains 12. Compensated completion is
-validated against its rollback projection instead of the successful-path
-split.
+Six repeated remediation runs observed maximum active checkpoints from 31,597
+to 31,605 bytes and terminal checkpoints from 4,077 to 4,081 bytes. These are
+run-specific snapshots because runtime-generated values affect serialized
+length; no exact byte value is a compatibility contract. The stable admission
+contracts are the configured 770,048-byte (752 KiB) encoded-checkpoint ceiling
+and 4,096-byte terminal-payload ceiling, and the executable gate checks its
+authoritative measurements against those ceilings.
+
+The terminal payload carries the external-effect and passive-observation
+counts, so a fresh measurement store can recover the classification without
+prior active-checkpoint cache state. A successful full pilot requires exactly
+three passive observations and `9 + r` external boundaries, where `r` is the
+number of proven-no-admission redeliveries and is limited to the seven
+projected ReplicaAgent-effect slots; UID-fenced label effects have no
+redelivery path. The no-redelivery target remains 9/3, 12
+boundaries, and 13 accepted writes; fault paths may consume additional
+boundaries and writes. Compensated completion is validated against the exact
+reachable pairs for its restore or failed-promotion compensation transcript,
+including only redelivery slots belonging to effects that were actually
+exposed.
 `external_effects` counts ReplicaAgent commands and
 UID-fenced label patches; `passive_observations` counts evidence-only
 activities; `durable_boundaries` is their completed total.

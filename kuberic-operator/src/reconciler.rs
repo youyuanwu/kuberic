@@ -2902,7 +2902,16 @@ async fn reconcile_durable_switchover_pilot(
                 }
             }
             HostOutcome::WorkflowCompleted { outcome, .. } => {
-                let terminal = validate_loaded_terminal(reference, &outcome)?;
+                let completed_activity_count = host
+                    .store()
+                    .measurements()
+                    .completed_activity_count
+                    .ok_or_else(|| {
+                        "completed durable switchover has no authoritative activity count"
+                            .to_string()
+                    })?;
+                let terminal =
+                    validate_loaded_terminal(reference, &outcome, completed_activity_count)?;
                 drop(host);
                 return publish_pilot_terminal(set, api, state, terminal, now).await;
             }
@@ -3046,7 +3055,9 @@ fn loaded_pilot_terminal(
         .decode_and_validate(execution, crate::durable::pilot::checkpoint_limits())
         .map_err(|error| format!("decode durable switchover checkpoint: {error}"))?;
     match payload.terminal_outcome() {
-        Some((outcome, _)) => validate_loaded_terminal(reference, outcome).map(Some),
+        Some((outcome, completed_activity_count)) => {
+            validate_loaded_terminal(reference, outcome, completed_activity_count).map(Some)
+        }
         None => Ok(None),
     }
 }
