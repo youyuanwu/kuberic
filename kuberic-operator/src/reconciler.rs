@@ -2852,16 +2852,17 @@ async fn reconcile_durable_switchover_pilot(
     let mut adapter =
         SwitchoverRunnerAdapter::new(reference, &initial, set, &current_pods, api, store, now);
     let mut host = host.lock().await;
-    let outcome = DurableRunner::new(crate::durable::pilot::PILOT_MAX_ACTIVITY_RECORDS)
-        .map_err(|error| format!("construct durable switchover runner: {error}"))?
-        .run(
-            &mut host,
-            &DurableSwitchoverWorkflow,
-            execution,
-            &mut adapter,
-            now,
-        )
-        .await;
+    let outcome =
+        DurableRunner::new(crate::durable::switchover_execution::SWITCHOVER_MAX_RUNNER_FUEL)
+            .map_err(|error| format!("construct durable switchover runner: {error}"))?
+            .run(
+                &mut host,
+                &DurableSwitchoverWorkflow,
+                execution,
+                &mut adapter,
+                now,
+            )
+            .await;
     drop(host);
     match outcome {
         DurableRunnerOutcome::Terminal(terminal) => {

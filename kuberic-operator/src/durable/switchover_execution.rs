@@ -39,7 +39,8 @@ use tokio::sync::Mutex;
 use crate::crd::{
     DurableOperationPhase, DurableOperationStatus, DurableSwitchoverPilotStatus, KubericSet,
     PendingActionStatus, StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus,
-    SwitchoverExecutionStatus, SwitchoverIncompatibilitySource, SwitchoverIncompatibilityStatus,
+    SwitchoverExecutionState, SwitchoverExecutionStatus, SwitchoverIncompatibilitySource,
+    SwitchoverIncompatibilityStatus,
 };
 use crate::{cluster_api::ClusterApi, reconciler::snapshot_with_observed_metadata};
 
@@ -1750,7 +1751,7 @@ fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactByt
 }
 
 fn terminal_failure(operation: Option<DurableOperationStatus>, message: String) -> TerminalOutcome {
-    let bounded_message: String = message.chars().take(SWITCHOVER_MAX_ERROR_BYTES).collect();
+    let bounded_message = bounded_utf8(&message, SWITCHOVER_MAX_ERROR_BYTES);
     let terminal = DurableSwitchoverTerminalRecord::Stopped {
         state: operation
             .as_ref()
@@ -1761,6 +1762,17 @@ fn terminal_failure(operation: Option<DurableOperationStatus>, message: String) 
         ExactBytes::new(br#"{"status":"stopped","state":null,"message":"pilot terminal payload exceeded its bound"}"#)
     });
     TerminalOutcome::failed(payload)
+}
+
+fn bounded_utf8(value: &str, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value.to_string();
+    }
+    let mut boundary = maximum_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_string()
 }
 
 fn encode_terminal_record(
@@ -1825,13 +1837,14 @@ pub fn new_switchover_execution(
         contract_version: SWITCHOVER_CONTRACT_VERSION,
         execution_id: execution_hex,
         checkpoint_name: KubernetesCheckpointStore::object_name(execution_id),
-        input: Some(SwitchoverAdmissionInputStatus {
-            operation_authority: operation_authority.to_string(),
-            previous_snapshot,
-            target_primary_id,
-            accepted_unix_seconds: now,
-        }),
-        incompatibility: None,
+        state: SwitchoverExecutionState::Admitted {
+            input: SwitchoverAdmissionInputStatus {
+                operation_authority: operation_authority.to_string(),
+                previous_snapshot,
+                target_primary_id,
+                accepted_unix_seconds: now,
+            },
+        },
     };
     native_execution_spec(&reference)?;
     Ok(reference)
@@ -1857,14 +1870,15 @@ pub fn incompatible_switchover_execution(
         checkpoint_name: legacy_checkpoint_name
             .clone()
             .unwrap_or_else(|| format!("kuberic-switchover-incompatible-{fingerprint}")),
-        input: None,
-        incompatibility: Some(SwitchoverIncompatibilityStatus {
-            source,
-            legacy_contract_version,
-            legacy_execution_id,
-            legacy_checkpoint_name,
-            fingerprint,
-        }),
+        state: SwitchoverExecutionState::Incompatible {
+            incompatibility: SwitchoverIncompatibilityStatus {
+                source,
+                legacy_contract_version,
+                legacy_execution_id,
+                legacy_checkpoint_name,
+                fingerprint,
+            },
+        },
     }
 }
 
@@ -1884,12 +1898,10 @@ pub fn native_execution_id(reference: &SwitchoverExecutionStatus) -> Result<Exec
             reference.contract_version
         ));
     }
-    if reference.input.is_some() == reference.incompatibility.is_some() {
-        return Err(
-            "switchover execution must contain exactly one of input or incompatibility".to_string(),
-        );
-    }
-    if reference.incompatibility.is_some() {
+    if matches!(
+        reference.state,
+        SwitchoverExecutionState::Incompatible { .. }
+    ) {
         return Err("incompatible switchover execution cannot be resumed".to_string());
     }
     let bytes = decode_execution_id(&reference.execution_id)?;
@@ -1907,10 +1919,9 @@ pub fn native_execution_id(reference: &SwitchoverExecutionStatus) -> Result<Exec
 pub fn native_initial_operation(
     reference: &SwitchoverExecutionStatus,
 ) -> Result<DurableOperationStatus, String> {
-    let input = reference
-        .input
-        .as_ref()
-        .ok_or_else(|| "framework-native switchover has no admission input".to_string())?;
+    let SwitchoverExecutionState::Admitted { input } = &reference.state else {
+        return Err("incompatible switchover execution cannot be reconstructed".to_string());
+    };
     start_switchover(
         &format!(
             "{}:framework-native:{}",
@@ -2661,7 +2672,7 @@ mod durable_switchover_pilot_tests {
     use super::*;
     use crate::crd::{
         EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
-        SwitchoverIncompatibilitySource, SwitchoverIncompatibilityStatus,
+        SwitchoverIncompatibilitySource,
     };
     use crate::durable::{Decision, decide};
     use kuberic_durable_execution::ActivityObservation;
@@ -2715,21 +2726,25 @@ mod durable_switchover_pilot_tests {
     }
 
     #[test]
-    fn framework_native_reference_requires_exactly_one_state_variant() {
-        let mut reference = new_switchover_execution("set-uid", snapshot(3), 2, 100).unwrap();
-        reference.incompatibility = Some(SwitchoverIncompatibilityStatus {
-            source: SwitchoverIncompatibilitySource::LegacyPilotV2,
-            legacy_contract_version: 2,
-            legacy_execution_id: "legacy".to_string(),
-            legacy_checkpoint_name: Some("legacy-checkpoint".to_string()),
-            fingerprint: "fingerprint".to_string(),
+    fn framework_native_reference_schema_requires_exactly_one_state_variant() {
+        let reference = new_switchover_execution("set-uid", snapshot(3), 2, 100).unwrap();
+        let mut both = serde_json::to_value(&reference).unwrap();
+        both["state"]["incompatibility"] = serde_json::json!({
+            "source": "legacyPilotV2",
+            "legacyContractVersion": 2,
+            "legacyExecutionId": "legacy",
+            "legacyCheckpointName": "legacy-checkpoint",
+            "fingerprint": "fingerprint"
         });
-        assert!(native_execution_id(&reference).is_err());
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(both).is_err());
 
-        reference.input = None;
-        assert!(native_execution_id(&reference).is_err());
-        reference.incompatibility = None;
-        assert!(native_execution_id(&reference).is_err());
+        let neither = serde_json::json!({
+            "contractVersion": SWITCHOVER_CONTRACT_VERSION,
+            "executionId": reference.execution_id,
+            "checkpointName": reference.checkpoint_name,
+            "state": {"kind": "admitted"}
+        });
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(neither).is_err());
     }
 
     #[test]
@@ -2750,8 +2765,12 @@ mod durable_switchover_pilot_tests {
             encoded,
         );
         assert_eq!(first, second);
-        assert!(first.input.is_none());
-        let marker = first.incompatibility.unwrap();
+        let SwitchoverExecutionState::Incompatible {
+            incompatibility: marker,
+        } = first.state
+        else {
+            panic!("expected incompatible marker");
+        };
         assert_eq!(
             marker.source,
             SwitchoverIncompatibilitySource::LegacyPilotV2
@@ -2789,6 +2808,17 @@ mod durable_switchover_pilot_tests {
             SWITCHOVER_MAX_TRANSITION_FUEL,
             SWITCHOVER_MAX_RUNNER_FUEL
         );
+    }
+
+    #[test]
+    fn framework_native_error_limit_is_utf8_byte_bounded() {
+        let bounded = bounded_utf8(
+            &"é".repeat(SWITCHOVER_MAX_ERROR_BYTES),
+            SWITCHOVER_MAX_ERROR_BYTES,
+        );
+        assert_eq!(bounded.len(), SWITCHOVER_MAX_ERROR_BYTES);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert_eq!(bounded, "é".repeat(SWITCHOVER_MAX_ERROR_BYTES / 2));
     }
 
     #[test]

@@ -225,10 +225,36 @@ pub struct SwitchoverExecutionStatus {
     pub contract_version: u32,
     pub execution_id: String,
     pub checkpoint_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<SwitchoverAdmissionInputStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incompatibility: Option<SwitchoverIncompatibilityStatus>,
+    #[schemars(with = "SwitchoverExecutionStateSchema")]
+    pub state: SwitchoverExecutionState,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum SwitchoverExecutionState {
+    Admitted {
+        input: SwitchoverAdmissionInputStatus,
+    },
+    Incompatible {
+        incompatibility: SwitchoverIncompatibilityStatus,
+    },
+}
+
+#[derive(JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct SwitchoverExecutionStateSchema {
+    kind: SwitchoverExecutionStateKind,
+    input: Option<SwitchoverAdmissionInputStatus>,
+    incompatibility: Option<SwitchoverIncompatibilityStatus>,
+}
+
+#[derive(JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+enum SwitchoverExecutionStateKind {
+    Admitted,
+    Incompatible,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -1229,40 +1255,44 @@ mod tests {
             contract_version: 3,
             execution_id: "0123456789abcdef0123456789abcdef".to_string(),
             checkpoint_name: "kuberic-checkpoint-0123456789abcdef0123456789abcdef".to_string(),
-            input: Some(SwitchoverAdmissionInputStatus {
-                operation_authority: "set-uid".to_string(),
-                previous_snapshot: StablePartitionSnapshotStatus {
-                    epoch: EpochStatus {
-                        data_loss_number: 1,
-                        configuration_number: 2,
+            state: SwitchoverExecutionState::Admitted {
+                input: SwitchoverAdmissionInputStatus {
+                    operation_authority: "set-uid".to_string(),
+                    previous_snapshot: StablePartitionSnapshotStatus {
+                        epoch: EpochStatus {
+                            data_loss_number: 1,
+                            configuration_number: 2,
+                        },
+                        primary_id: 1,
+                        members: vec![],
+                        write_quorum: 1,
                     },
-                    primary_id: 1,
-                    members: vec![],
-                    write_quorum: 1,
+                    target_primary_id: 2,
+                    accepted_unix_seconds: 100,
                 },
-                target_primary_id: 2,
-                accepted_unix_seconds: 100,
-            }),
-            incompatibility: None,
+            },
         };
         let encoded = serde_json::to_value(&admitted).unwrap();
-        assert!(encoded.get("input").is_some());
-        assert!(encoded.get("incompatibility").is_none());
+        assert_eq!(encoded["state"]["kind"], "admitted");
+        assert!(encoded["state"].get("input").is_some());
+        assert!(encoded["state"].get("incompatibility").is_none());
 
         let incompatible = SwitchoverExecutionStatus {
-            input: None,
-            incompatibility: Some(SwitchoverIncompatibilityStatus {
-                source: SwitchoverIncompatibilitySource::LegacyPilotV2,
-                legacy_contract_version: 2,
-                legacy_execution_id: "legacy-execution".to_string(),
-                legacy_checkpoint_name: Some("legacy-checkpoint".to_string()),
-                fingerprint: "stable-fingerprint".to_string(),
-            }),
+            state: SwitchoverExecutionState::Incompatible {
+                incompatibility: SwitchoverIncompatibilityStatus {
+                    source: SwitchoverIncompatibilitySource::LegacyPilotV2,
+                    legacy_contract_version: 2,
+                    legacy_execution_id: "legacy-execution".to_string(),
+                    legacy_checkpoint_name: Some("legacy-checkpoint".to_string()),
+                    fingerprint: "stable-fingerprint".to_string(),
+                },
+            },
             ..admitted
         };
         let encoded = serde_json::to_value(&incompatible).unwrap();
-        assert!(encoded.get("input").is_none());
-        assert!(encoded.get("incompatibility").is_some());
+        assert_eq!(encoded["state"]["kind"], "incompatible");
+        assert!(encoded["state"].get("input").is_none());
+        assert!(encoded["state"].get("incompatibility").is_some());
     }
 
     #[test]
