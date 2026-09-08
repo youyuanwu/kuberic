@@ -2055,6 +2055,16 @@ fn validate_terminal_payload_bytes(actual: usize) -> Result<(), String> {
     }
 }
 
+fn validate_error_bytes(actual: usize) -> Result<(), String> {
+    if actual > SWITCHOVER_MAX_ERROR_BYTES {
+        Err(format!(
+            "framework-native switchover error is {actual} bytes; maximum is {SWITCHOVER_MAX_ERROR_BYTES}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_transition_fuel(actual: usize) -> Result<(), String> {
     if actual > SWITCHOVER_MAX_TRANSITION_FUEL {
         Err(format!(
@@ -2148,6 +2158,16 @@ pub fn validate_pilot_operation(operation: &DurableOperationStatus) -> Result<()
         return Err(format!(
             "durable switchover operation is {operation_bytes} bytes; maximum is {PILOT_MAX_OPERATION_BYTES}"
         ));
+    }
+    if let Some(error) = operation.last_error.as_deref() {
+        validate_error_bytes(error.len())?;
+    }
+    if let Some(error) = operation
+        .pending_action
+        .as_ref()
+        .and_then(|pending| pending.last_error.as_deref())
+    {
+        validate_error_bytes(error.len())?;
     }
     Ok(())
 }
@@ -2567,6 +2587,16 @@ pub fn maximum_active_checkpoint() -> Result<CheckpointEnvelope, String> {
 fn maximum_active_payload(
     admitted_max_encoded_checkpoint_bytes: usize,
 ) -> Result<CheckpointPayload, String> {
+    active_payload_with_records(
+        admitted_max_encoded_checkpoint_bytes,
+        PILOT_MAX_ACTIVITY_RECORDS,
+    )
+}
+
+fn active_payload_with_records(
+    admitted_max_encoded_checkpoint_bytes: usize,
+    record_count: usize,
+) -> Result<CheckpointPayload, String> {
     let execution_id = ExecutionId::from_bytes([u8::MAX; 16]);
     let execution = ExecutionSpec::new(
         execution_id,
@@ -2582,7 +2612,7 @@ fn maximum_active_payload(
     );
     let name = ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
         .map_err(|error| format!("construct pilot activity name: {error}"))?;
-    let activities = (0..PILOT_MAX_ACTIVITY_RECORDS)
+    let activities = (0..record_count)
         .map(|sequence| {
             let spec = ActivitySpec::new(
                 name.clone(),
@@ -2600,6 +2630,17 @@ fn maximum_active_payload(
         })
         .collect();
     Ok(CheckpointPayload::active(contract, activities))
+}
+
+#[cfg(test)]
+fn projected_active_checkpoint_bytes(record_count: usize) -> Result<usize, String> {
+    CheckpointEnvelope::encode_with_limits(
+        &active_payload_with_records(SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES, record_count)?,
+        checkpoint_limits(),
+    )
+    .map_err(|error| format!("encode projected switchover checkpoint: {error}"))?
+    .encoded_len()
+    .map_err(|error| format!("measure projected switchover checkpoint: {error}"))
 }
 
 pub fn maximum_terminal_checkpoint() -> Result<CheckpointEnvelope, String> {
@@ -2925,13 +2966,13 @@ mod framework_native_switchover_tests {
         ));
         assert!(matches!(
             encode_activity_input::<NativeInputBound>(
-                &"x".repeat(SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES)
+                &"x".repeat(SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES - 1)
             ),
             Err(ActivityCallError::InputTooLarge { .. })
         ));
         assert!(matches!(
             encode_activity_result::<NativeResultBound>(
-                &"x".repeat(SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES)
+                &"x".repeat(SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES - 1)
             ),
             Err(ActivityCallError::ResultTooLarge { .. })
         ));
@@ -2946,6 +2987,7 @@ mod framework_native_switchover_tests {
         );
         assert!(validate_transition_fuel(SWITCHOVER_MAX_TRANSITION_FUEL + 1).is_err());
         assert!(validate_runner_fuel(SWITCHOVER_MAX_RUNNER_FUEL + 1).is_err());
+        assert!(validate_error_bytes(SWITCHOVER_MAX_ERROR_BYTES + 1).is_err());
         assert!(
             new_switchover_execution("set-uid", snapshot(SWITCHOVER_MAX_REPLICAS + 1), 2, 100)
                 .is_err()
@@ -3059,25 +3101,13 @@ mod framework_native_switchover_tests {
     }
 
     #[test]
-    fn wrapped_workflow_input_is_bounded_before_checkpoint_creation() {
+    fn workflow_error_is_bounded_before_checkpoint_creation() {
         let mut reference = new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let mut operation = initial_operation(&reference).unwrap();
-        let mut found_wrapped_overflow = false;
-        for length in (1..=PILOT_MAX_OPERATION_BYTES).rev() {
-            operation.last_error = Some("x".repeat(length));
-            let operation_json = serde_json::to_string(&operation).unwrap();
-            if operation_json.len() <= PILOT_MAX_OPERATION_BYTES {
-                reference.initial_operation_json = operation_json;
-                let error = execution_spec(&reference).unwrap_err();
-                assert!(error.contains("pilot input is"), "{error}");
-                found_wrapped_overflow = true;
-                break;
-            }
-        }
-        assert!(
-            found_wrapped_overflow,
-            "test must construct an operation that fits while its workflow wrapper does not"
-        );
+        operation.last_error = Some("x".repeat(SWITCHOVER_MAX_ERROR_BYTES + 1));
+        reference.initial_operation_json = serde_json::to_string(&operation).unwrap();
+        let error = execution_spec(&reference).unwrap_err();
+        assert!(error.contains("switchover error is 513 bytes"), "{error}");
     }
 
     #[test]
@@ -5027,6 +5057,19 @@ mod framework_native_switchover_tests {
         assert!(
             rollback.maximum_activity_count() + projected_rollback_pure_transitions()
                 <= PILOT_MAX_TRANSITION_FUEL
+        );
+        let success_bytes =
+            projected_active_checkpoint_bytes(success.maximum_activity_count()).unwrap();
+        let rollback_bytes =
+            projected_active_checkpoint_bytes(rollback.maximum_activity_count()).unwrap();
+        assert!(success_bytes <= SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES);
+        assert!(rollback_bytes <= SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES);
+        eprintln!(
+            "framework-native switchover history projections: success_records={} success_bytes={} rollback_records={} rollback_bytes={}",
+            success.maximum_activity_count(),
+            success_bytes,
+            rollback.maximum_activity_count(),
+            rollback_bytes
         );
         assert!(success.contains("revoke.effect"));
         assert!(rollback.contains("rollback-promote.effect"));

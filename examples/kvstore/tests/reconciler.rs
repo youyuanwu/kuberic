@@ -37,7 +37,6 @@ use kuberic_operator::crd::{
     DurableActionKind, DurableAddMode, DurableOperationKind, DurableOperationPhase,
     DurableRemoveMode, KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
     RemoveReplicaIncompatibilitySource, ReplicaElectionObservationStatus, StableReplicaRoleStatus,
-    SwitchoverExecutionMode,
 };
 use kuberic_operator::durable::{RemoveReplicaTarget, start_remove_replica};
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
@@ -1366,9 +1365,7 @@ async fn drive_switchover(
 }
 
 fn make_pilot_set(name: &str, replicas: i32, status: Option<KubericSetStatus>) -> KubericSet {
-    let mut set = make_set(name, replicas, status);
-    set.spec.switchover_execution_mode = SwitchoverExecutionMode::DurablePilot;
-    set
+    make_set(name, replicas, status)
 }
 
 async fn accept_pilot_switchover(
@@ -5181,6 +5178,149 @@ async fn test_framework_native_switchover_repeated_intent_gets_distinct_identity
 
 #[test_log::test(tokio::test)]
 #[serial]
+async fn test_framework_native_switchover_compatibility_fixtures_fail_closed() {
+    use kuberic_durable_execution::{
+        CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointStore, ExactBytes,
+        ExecutionContract, TerminalOutcome,
+    };
+
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let healthy = create_healthy_set(&api, &bootstrap, "native-compatibility", 3).await;
+    let original_primary = healthy.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+
+    let (version_state, mut unsupported_version) = accept_pilot_switchover(
+        &api,
+        "native-compatibility",
+        &healthy,
+        &original_primary,
+        &target,
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    )
+    .await;
+    unsupported_version
+        .switchover_execution
+        .as_mut()
+        .unwrap()
+        .contract_version += 1;
+    reconcile_set(
+        &make_set("native-compatibility", 3, Some(unsupported_version)),
+        &api,
+        &version_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "Blocked"
+                    && condition.message.contains("unsupported")
+            })
+    );
+
+    let (identity_state, mut inconsistent_identity) = accept_pilot_switchover(
+        &api,
+        "native-compatibility",
+        &healthy,
+        &original_primary,
+        &target,
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    )
+    .await;
+    inconsistent_identity
+        .switchover_execution
+        .as_mut()
+        .unwrap()
+        .checkpoint_name
+        .push_str("-changed");
+    reconcile_set(
+        &make_set("native-compatibility", 3, Some(inconsistent_identity)),
+        &api,
+        &identity_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "Blocked"
+                    && condition.message.contains("checkpoint name mismatch")
+            })
+    );
+
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (terminal_state, malformed_terminal) = accept_pilot_switchover(
+        &api,
+        "native-compatibility",
+        &healthy,
+        &original_primary,
+        &target,
+        store.clone(),
+    )
+    .await;
+    let reference = malformed_terminal.switchover_execution.as_ref().unwrap();
+    let execution =
+        kuberic_operator::durable::switchover_execution::native_execution_spec(reference).unwrap();
+    let checkpoint = CheckpointEnvelope::encode_with_limits(
+        &CheckpointPayload::terminal(
+            ExecutionContract::with_encoded_limits(
+                execution.clone(),
+                kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
+                    as u64,
+                kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
+                    as u64,
+            ),
+            TerminalOutcome::succeeded(ExactBytes::new(b"{}".to_vec())),
+            0,
+        ),
+        kuberic_operator::durable::switchover_execution::checkpoint_limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .compare_and_swap(execution.execution_id(), None, checkpoint)
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    reconcile_set(
+        &make_set("native-compatibility", 3, Some(malformed_terminal)),
+        &api,
+        &terminal_state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "Rejected"
+                    && condition.message.contains("terminal")
+            })
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
 #[ignore = "superseded by framework-native restart-every-turn coverage"]
 async fn test_durable_switchover_survives_state_loss_at_every_boundary() {
     let api = KvClusterApi::new();
@@ -8621,6 +8761,7 @@ async fn test_add_target_same_pod_process_restart_invalidates_build_proof() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native command-fence and fresh-observation tests"]
 async fn test_missing_dispatch_fences_are_reobserved_before_dispatch() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
