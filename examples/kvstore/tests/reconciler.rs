@@ -1379,7 +1379,7 @@ async fn accept_pilot_switchover(
     target: &str,
     store: kuberic_durable_execution::InMemoryCheckpointStore,
 ) -> (ReconcilerState, KubericSetStatus) {
-    let state = ReconcilerState::with_durable_switchover_store(store);
+    let state = ReconcilerState::with_switchover_store(store);
     reconcile_set(
         &make_pilot_set(
             name,
@@ -1398,7 +1398,7 @@ async fn accept_pilot_switchover(
     let accepted = api.last_status().unwrap();
     assert_eq!(accepted.phase, Phase::Switchover);
     assert!(accepted.operation.is_none());
-    assert!(accepted.durable_switchover_pilot.is_some());
+    assert!(accepted.switchover_execution.is_some());
     (state, accepted)
 }
 
@@ -1431,20 +1431,23 @@ async fn pilot_checkpoint_ready_for_terminal(
     status: &KubericSetStatus,
 ) -> bool {
     use kuberic_durable_execution::{ActivityState, CheckpointStore};
-    use kuberic_operator::durable::pilot::{
+    use kuberic_operator::durable::switchover_execution::{
         DurableSwitchoverStepResult, checkpoint_limits, decode_activity_input_state,
-        decode_activity_step_result, execution_id, execution_spec,
+        decode_activity_step_result, native_execution_id, native_execution_spec,
     };
 
-    let Some(reference) = status.durable_switchover_pilot.as_ref() else {
+    let Some(reference) = status.switchover_execution.as_ref() else {
         return false;
     };
-    let Ok(Some(stored)) = store.load(execution_id(reference).unwrap()).await else {
+    let Ok(Some(stored)) = store.load(native_execution_id(reference).unwrap()).await else {
         return false;
     };
     let payload = stored
         .checkpoint()
-        .decode_and_validate(&execution_spec(reference).unwrap(), checkpoint_limits())
+        .decode_and_validate(
+            &native_execution_spec(reference).unwrap(),
+            checkpoint_limits(),
+        )
         .unwrap();
     let Some(last) = payload
         .active_activities()
@@ -3627,7 +3630,7 @@ async fn test_reconciler_switchover() {
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_happy_path() {
+async fn test_framework_native_switchover_happy_path() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-happy", 3).await;
@@ -3641,7 +3644,7 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         .find(|name| name != &original_primary)
         .unwrap();
     let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let pilot_state = ReconcilerState::with_durable_switchover_store(checkpoint_store.clone());
+    let pilot_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
 
     reconcile_set(
         &make_pilot_set(
@@ -3669,13 +3672,13 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     let label_accepted_after_acceptance = *api.uid_label_patch_accepted.lock().unwrap();
     assert_eq!(accepted.phase, Phase::Switchover);
     assert!(accepted.operation.is_none());
-    assert!(accepted.durable_switchover_pilot.is_some());
+    assert!(accepted.switchover_execution.is_some());
 
     api.reset_operations();
     let completed = drive_pilot_switchover(&api, &pilot_state, "pilot-happy", 3, accepted).await;
     assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
     assert!(completed.operation.is_none());
-    assert!(completed.durable_switchover_pilot.is_some());
+    assert!(completed.switchover_execution.is_some());
     assert_stable_snapshot(&api, &completed, 3);
     let operations = api.operations();
     assert_eq!(
@@ -3703,8 +3706,9 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         .unwrap()
         .saturating_sub(label_accepted_after_acceptance);
     let external_effect_commands = mutations.len() as u64 + accepted_label_effects;
-    let reference = completed.durable_switchover_pilot.as_ref().unwrap();
-    let execution = kuberic_operator::durable::pilot::execution_spec(reference).unwrap();
+    let reference = completed.switchover_execution.as_ref().unwrap();
+    let execution =
+        kuberic_operator::durable::switchover_execution::native_execution_spec(reference).unwrap();
     use kuberic_durable_execution::CheckpointStore;
     let terminal = checkpoint_store
         .load(execution.execution_id())
@@ -3716,16 +3720,13 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         .checkpoint()
         .decode_and_validate(
             &execution,
-            kuberic_operator::durable::pilot::checkpoint_limits(),
+            kuberic_operator::durable::switchover_execution::checkpoint_limits(),
         )
         .unwrap();
     let (terminal_outcome, durable_boundary_count) = terminal_payload.terminal_outcome().unwrap();
     let terminal_payload_bytes = terminal_outcome.payload().as_slice().len();
     let measurements = pilot_state
-        .durable_switchover_pilot
-        .as_ref()
-        .unwrap()
-        .measurements(
+        .framework_native_switchover_measurements(
             "default",
             "pilot-happy",
             "test-uid",
@@ -3758,21 +3759,24 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
     assert!(measurements.maximum_active_checkpoint_bytes >= terminal_bytes);
     assert!(
         measurements.maximum_active_checkpoint_bytes
-            <= kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES
+            <= kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
     );
     assert!(
         terminal_payload_bytes
-            <= usize::try_from(kuberic_operator::durable::pilot::PILOT_MAX_TERMINAL_BYTES).unwrap()
+            <= usize::try_from(
+                kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES
+            )
+            .unwrap()
     );
     println!(
         concat!(
-            "KUBERIC_SWITCHOVER_MEASUREMENT engine=durable_pilot ",
+            "KUBERIC_SWITCHOVER_MEASUREMENT engine=framework_native ",
             "external_effects={} passive_observations={} durable_boundaries={} ",
             "checkpoint_accepted_writes={} checkpoint_write_attempts={} ",
             "checkpoint_conflicts={} checkpoint_unknowns={} checkpoint_definite_failures={} ",
             "latest_authoritative_checkpoint_bytes={} maximum_authoritative_checkpoint_bytes={} ",
             "latest_active_checkpoint_bytes={} maximum_active_checkpoint_bytes={} ",
-            "terminal_checkpoint_bytes={} maximum_terminal_checkpoint_bytes={} ",
+            "terminal_checkpoint_bytes={} maximum_terminal_checkpoint_bytes={} terminal_payload_bytes={} ",
             "accepted_status_writes_after_acceptance={} status_write_attempts={} ",
             "status_write_conflicts={} status_write_unknowns={} ",
             "status_write_definite_failures={} uid_label_attempts={} uid_label_accepted={} ",
@@ -3792,6 +3796,7 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         measurements.maximum_active_checkpoint_bytes,
         terminal_bytes,
         measurements.maximum_terminal_checkpoint_bytes,
+        terminal_payload_bytes,
         api.statuses
             .lock()
             .unwrap()
@@ -3837,14 +3842,9 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         "pilot must retain the Service Fabric-aligned mutation order"
     );
     assert_eq!(
-        pilot_state
-            .durable_switchover_pilot
-            .as_ref()
-            .unwrap()
-            .host_count()
-            .await,
+        pilot_state.framework_native_switchover_host_count().await,
         0,
-        "terminal status publication must release process-local pilot host state"
+        "terminal status publication must release process-local native host state"
     );
 
     let mut explicit_status = KubericSetStatus {
@@ -3865,16 +3865,16 @@ async fn test_durable_execution_switchover_pilot_happy_path() {
         }
     }
     assert_eq!(explicit_status.phase, Phase::Switchover);
-    assert!(explicit_status.operation.is_some());
+    assert!(explicit_status.operation.is_none());
     assert!(
-        explicit_status.durable_switchover_pilot.is_none(),
-        "a retained terminal pilot reference must not hijack a later explicit switchover"
+        explicit_status.switchover_execution.is_some(),
+        "a retained terminal reference must not hijack a later native switchover"
     );
 }
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix() {
+async fn test_framework_native_switchover_operation_outcome_matrix() {
     use kuberic_durable_execution::{
         ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome,
         CheckpointEnvelope, CheckpointPayload, CheckpointStore, ExactBytes, ExecutionContract,
@@ -3923,7 +3923,7 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
             .conditions
             .iter()
             .any(|condition| {
-                condition.type_ == "DurableSwitchoverPilot"
+                condition.type_ == "FrameworkNativeSwitchover"
                     && condition.reason == "AwaitingEffectPreparation"
             })
     );
@@ -3944,10 +3944,11 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
         incompatible_store.clone(),
     )
     .await;
-    let incompatible_execution = kuberic_operator::durable::pilot::execution_spec(
-        incompatible.durable_switchover_pilot.as_ref().unwrap(),
-    )
-    .unwrap();
+    let incompatible_execution =
+        kuberic_operator::durable::switchover_execution::native_execution_spec(
+            incompatible.switchover_execution.as_ref().unwrap(),
+        )
+        .unwrap();
     assert!(matches!(
         incompatible_store
             .compare_and_swap(
@@ -3972,7 +3973,7 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
             .conditions
             .iter()
             .any(|condition| {
-                condition.reason == "Blocked"
+                condition.reason == "Incompatible"
                     && condition
                         .message
                         .contains("switchover checkpoint is incompatible")
@@ -3990,25 +3991,28 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
         rejected_store.clone(),
     )
     .await;
-    let rejected_execution = kuberic_operator::durable::pilot::execution_spec(
-        rejected.durable_switchover_pilot.as_ref().unwrap(),
-    )
-    .unwrap();
+    let rejected_execution =
+        kuberic_operator::durable::switchover_execution::native_execution_spec(
+            rejected.switchover_execution.as_ref().unwrap(),
+        )
+        .unwrap();
     let mismatched_execution = ExecutionSpec::new(
         rejected_execution.execution_id(),
         ExactBytes::new(b"mismatched-switchover-input"),
-        kuberic_operator::durable::pilot::PILOT_MAX_TERMINAL_BYTES,
+        kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
     );
     let rejected_checkpoint = CheckpointEnvelope::encode_with_limits(
         &CheckpointPayload::active(
             ExecutionContract::with_encoded_limits(
                 mismatched_execution,
-                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
-                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
+                kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
+                    as u64,
+                kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
+                    as u64,
             ),
             vec![],
         ),
-        kuberic_operator::durable::pilot::checkpoint_limits(),
+        kuberic_operator::durable::switchover_execution::checkpoint_limits(),
     )
     .unwrap();
     assert!(matches!(
@@ -4031,7 +4035,7 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
             .conditions
             .iter()
             .any(|condition| {
-                condition.reason == "Blocked"
+                condition.reason == "Rejected"
                     && condition.message.contains("switchover checkpoint rejected")
             })
     );
@@ -4072,7 +4076,7 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
             .conditions
             .iter()
             .any(|condition| {
-                condition.reason == "Blocked"
+                condition.reason == "Isolated"
                     && condition.message.contains("switchover execution isolated")
                     && condition.message.contains("incarnation changed")
             })
@@ -4190,10 +4194,11 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
         nondeterministic_store.clone(),
     )
     .await;
-    let nondeterministic_execution = kuberic_operator::durable::pilot::execution_spec(
-        nondeterministic.durable_switchover_pilot.as_ref().unwrap(),
-    )
-    .unwrap();
+    let nondeterministic_execution =
+        kuberic_operator::durable::switchover_execution::native_execution_spec(
+            nondeterministic.switchover_execution.as_ref().unwrap(),
+        )
+        .unwrap();
     let drifted_activity = ActivitySpec::new(
         ActivityName::new("kuberic.switchover.injected-drift", 1).unwrap(),
         ExactBytes::new(b"{}"),
@@ -4203,8 +4208,10 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
         &CheckpointPayload::active(
             ExecutionContract::with_encoded_limits(
                 nondeterministic_execution.clone(),
-                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
-                kuberic_operator::durable::pilot::PILOT_MAX_ENCODED_CHECKPOINT_BYTES as u64,
+                kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
+                    as u64,
+                kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
+                    as u64,
             ),
             vec![ActivityRecord::completed(
                 ActivitySequence::new(0),
@@ -4212,7 +4219,7 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
                 ExactBytes::new(b"{}"),
             )],
         ),
-        kuberic_operator::durable::pilot::checkpoint_limits(),
+        kuberic_operator::durable::switchover_execution::checkpoint_limits(),
     )
     .unwrap();
     assert!(matches!(
@@ -4239,7 +4246,7 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
             .conditions
             .iter()
             .any(|condition| {
-                condition.reason == "Blocked"
+                condition.reason == "Nondeterministic"
                     && condition.message.contains("switchover workflow changed")
             })
     );
@@ -4279,8 +4286,7 @@ async fn test_durable_execution_switchover_pilot_fr017_operation_outcome_matrix(
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves_fresh_fence_redelivery()
- {
+async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_redelivery() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-redelivery", 3).await;
@@ -4294,7 +4300,7 @@ async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves
         .find(|name| name != &original_primary)
         .unwrap();
     let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let pilot_state = ReconcilerState::with_durable_switchover_store(checkpoint_store.clone());
+    let pilot_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
 
     reconcile_set(
         &make_pilot_set(
@@ -4312,7 +4318,7 @@ async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves
     .await
     .unwrap();
     let accepted = api.last_status().unwrap();
-    let reference = accepted.durable_switchover_pilot.clone().unwrap();
+    let reference = accepted.switchover_execution.clone().unwrap();
     api.reset_operations();
     api.reject_before_next_durable_action(ControlOperation::RevokeWriteStatus);
 
@@ -4345,7 +4351,7 @@ async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves
         "the proven-no-admission reconcile must not dispatch a retry"
     );
     assert!(after_rejection.conditions.iter().any(|condition| {
-        condition.type_ == "DurableSwitchoverPilot"
+        condition.type_ == "FrameworkNativeSwitchover"
             && condition.reason == "RefreshingReplicaObservation"
     }));
 
@@ -4377,7 +4383,8 @@ async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves
     assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
 
     use kuberic_durable_execution::CheckpointStore;
-    let execution = kuberic_operator::durable::pilot::execution_spec(&reference).unwrap();
+    let execution =
+        kuberic_operator::durable::switchover_execution::native_execution_spec(&reference).unwrap();
     let terminal = checkpoint_store
         .load(execution.execution_id())
         .await
@@ -4387,16 +4394,13 @@ async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves
         .checkpoint()
         .decode_and_validate(
             &execution,
-            kuberic_operator::durable::pilot::checkpoint_limits(),
+            kuberic_operator::durable::switchover_execution::checkpoint_limits(),
         )
         .unwrap();
     assert_eq!(terminal_payload.terminal_outcome().unwrap().1, 13);
 
     let measurements = pilot_state
-        .durable_switchover_pilot
-        .as_ref()
-        .unwrap()
-        .measurements(
+        .framework_native_switchover_measurements(
             "default",
             "pilot-redelivery",
             "test-uid",
@@ -4415,8 +4419,7 @@ async fn test_durable_execution_switchover_pilot_fr019_deadline_policy_preserves
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_fr019_observation_collection_survives_restart_every_turn()
- {
+async fn test_framework_native_switchover_observation_collection_survives_restart_every_turn() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-restart", 3).await;
@@ -4430,7 +4433,7 @@ async fn test_durable_execution_switchover_pilot_fr019_observation_collection_su
         .find(|name| name != &original_primary)
         .unwrap();
     let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let initial_state = ReconcilerState::with_durable_switchover_store(checkpoint_store.clone());
+    let initial_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
     reconcile_set(
         &make_pilot_set(
             "pilot-restart",
@@ -4448,7 +4451,7 @@ async fn test_durable_execution_switchover_pilot_fr019_observation_collection_su
     .unwrap();
     let mut status = api.last_status().unwrap();
     let execution_id = status
-        .durable_switchover_pilot
+        .switchover_execution
         .as_ref()
         .unwrap()
         .execution_id
@@ -4456,7 +4459,7 @@ async fn test_durable_execution_switchover_pilot_fr019_observation_collection_su
     api.reset_operations();
 
     for _ in 0..180 {
-        let restarted = ReconcilerState::with_durable_switchover_store(checkpoint_store.clone());
+        let restarted = ReconcilerState::with_switchover_store(checkpoint_store.clone());
         reconcile_set(
             &make_pilot_set("pilot-restart", 3, Some(status.clone())),
             &api,
@@ -4473,11 +4476,7 @@ async fn test_durable_execution_switchover_pilot_fr019_observation_collection_su
     assert_eq!(status.phase, Phase::Healthy);
     assert_eq!(status.current_primary.as_deref(), Some(target.as_str()));
     assert_eq!(
-        status
-            .durable_switchover_pilot
-            .as_ref()
-            .unwrap()
-            .execution_id,
+        status.switchover_execution.as_ref().unwrap().execution_id,
         execution_id
     );
     let operations = api.operations();
@@ -4499,7 +4498,7 @@ async fn test_durable_execution_switchover_pilot_fr019_observation_collection_su
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_fr019_publication_compensates_failed_promotion() {
+async fn test_framework_native_switchover_publication_compensates_failed_promotion() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-rollback", 3).await;
@@ -4512,7 +4511,7 @@ async fn test_durable_execution_switchover_pilot_fr019_publication_compensates_f
         .map(|pod| pod.metadata.name.clone().unwrap())
         .find(|name| name != &original_primary)
         .unwrap();
-    let state = ReconcilerState::with_durable_switchover_store(
+    let state = ReconcilerState::with_switchover_store(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     reconcile_set(
@@ -4568,16 +4567,13 @@ async fn test_durable_execution_switchover_pilot_fr019_publication_compensates_f
             .id
     );
     assert!(completed.conditions.iter().any(|condition| {
-        condition.type_ == "DurableSwitchoverPilot"
+        condition.type_ == "FrameworkNativeSwitchover"
             && condition.reason == "CompensatedOrSafeFailure"
             && condition.status == "False"
     }));
-    let reference = completed.durable_switchover_pilot.as_ref().unwrap();
+    let reference = completed.switchover_execution.as_ref().unwrap();
     let measurements = state
-        .durable_switchover_pilot
-        .as_ref()
-        .unwrap()
-        .measurements(
+        .framework_native_switchover_measurements(
             "default",
             "pilot-rollback",
             "test-uid",
@@ -4600,7 +4596,7 @@ async fn test_durable_execution_switchover_pilot_fr019_publication_compensates_f
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_observes_lost_promotion_reply_once() {
+async fn test_framework_native_switchover_observes_lost_promotion_reply_once() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-lost-reply", 3).await;
@@ -4613,7 +4609,7 @@ async fn test_durable_execution_switchover_pilot_observes_lost_promotion_reply_o
         .map(|pod| pod.metadata.name.clone().unwrap())
         .find(|name| name != &original_primary)
         .unwrap();
-    let state = ReconcilerState::with_durable_switchover_store(
+    let state = ReconcilerState::with_switchover_store(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     reconcile_set(
@@ -4667,8 +4663,7 @@ async fn test_durable_execution_switchover_pilot_observes_lost_promotion_reply_o
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_fr019_exact_effect_dispatch_observes_every_lost_reply_once()
- {
+async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_lost_reply_once() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-all-lost-replies", 3).await;
@@ -4681,7 +4676,7 @@ async fn test_durable_execution_switchover_pilot_fr019_exact_effect_dispatch_obs
         .map(|pod| pod.metadata.name.clone().unwrap())
         .find(|name| name != &original_primary)
         .unwrap();
-    let state = ReconcilerState::with_durable_switchover_store(
+    let state = ReconcilerState::with_switchover_store(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     reconcile_set(
@@ -4752,8 +4747,7 @@ async fn test_durable_execution_switchover_pilot_fr019_exact_effect_dispatch_obs
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_fr019_terminal_validation_reloads_before_publication()
- {
+async fn test_framework_native_switchover_terminal_validation_reloads_before_publication() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-terminal-reload", 3).await;
@@ -4767,7 +4761,7 @@ async fn test_durable_execution_switchover_pilot_fr019_terminal_validation_reloa
         .find(|name| name != &original_primary)
         .unwrap();
     let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let state = ReconcilerState::with_durable_switchover_store(store.clone());
+    let state = ReconcilerState::with_switchover_store(store.clone());
     reconcile_set(
         &make_pilot_set(
             "pilot-terminal-reload",
@@ -4812,7 +4806,7 @@ async fn test_durable_execution_switchover_pilot_fr019_terminal_validation_reloa
         .unwrap();
         status = api.last_status().unwrap();
         if status.conditions.iter().any(|condition| {
-            condition.type_ == "DurableSwitchoverPilot"
+            condition.type_ == "FrameworkNativeSwitchover"
                 && condition.reason == "Blocked"
                 && condition
                     .message
@@ -4843,7 +4837,7 @@ async fn test_durable_execution_switchover_pilot_fr019_terminal_validation_reloa
     );
     api.reset_operations();
     api.pods.lock().unwrap().clear();
-    let restarted = ReconcilerState::with_durable_switchover_store(store);
+    let restarted = ReconcilerState::with_switchover_store(store);
     reconcile_set(
         &make_pilot_set("pilot-terminal-reload", 3, Some(status)),
         &api,
@@ -4862,7 +4856,7 @@ async fn test_durable_execution_switchover_pilot_fr019_terminal_validation_reloa
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_reloads_after_terminal_cas_conflict() {
+async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-terminal-conflict", 3).await;
@@ -4876,7 +4870,7 @@ async fn test_durable_execution_switchover_pilot_reloads_after_terminal_cas_conf
         .find(|name| name != &original_primary)
         .unwrap();
     let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let state = ReconcilerState::with_durable_switchover_store(store.clone());
+    let state = ReconcilerState::with_switchover_store(store.clone());
     reconcile_set(
         &make_pilot_set(
             "pilot-terminal-conflict",
@@ -4929,7 +4923,7 @@ async fn test_durable_execution_switchover_pilot_reloads_after_terminal_cas_conf
     );
     status = api.last_status().unwrap();
     assert!(status.conditions.iter().any(|condition| {
-        condition.type_ == "DurableSwitchoverPilot"
+        condition.type_ == "FrameworkNativeSwitchover"
             && condition.reason == "ReloadRequired"
             && condition.message.contains("ObservationProgression")
     }));
@@ -4948,8 +4942,7 @@ async fn test_durable_execution_switchover_pilot_reloads_after_terminal_cas_conf
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_fr019_authority_preparation_rejects_stale_target_incarnation()
- {
+async fn test_framework_native_switchover_authority_preparation_rejects_stale_target_incarnation() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let status = create_healthy_set(&api, &bootstrap, "pilot-stale-target", 3).await;
@@ -4962,7 +4955,7 @@ async fn test_durable_execution_switchover_pilot_fr019_authority_preparation_rej
         .map(|pod| pod.metadata.name.clone().unwrap())
         .find(|name| name != &original_primary)
         .unwrap();
-    let state = ReconcilerState::with_durable_switchover_store(
+    let state = ReconcilerState::with_switchover_store(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     reconcile_set(
@@ -5006,8 +4999,8 @@ async fn test_durable_execution_switchover_pilot_fr019_authority_preparation_rej
             .conditions
             .iter()
             .any(|condition| {
-                condition.type_ == "DurableSwitchoverPilot"
-                    && condition.reason == "Blocked"
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "Isolated"
                     && condition.message.contains("incarnation changed")
             })
     );
@@ -5021,8 +5014,7 @@ async fn test_durable_execution_switchover_pilot_fr019_authority_preparation_rej
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_requeue_without_effect()
- {
+async fn test_framework_native_switchover_unknown_checkpoint_outcomes_requeue_without_effect() {
     for (name, fault) in [
         (
             "pilot-unknown-unapplied",
@@ -5046,7 +5038,7 @@ async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_req
             .find(|pod_name| pod_name != &original_primary)
             .unwrap();
         let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-        let state = ReconcilerState::with_durable_switchover_store(store.clone());
+        let state = ReconcilerState::with_switchover_store(store.clone());
         reconcile_set(
             &make_pilot_set(
                 name,
@@ -5077,7 +5069,7 @@ async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_req
                 .conditions
                 .iter()
                 .any(|condition| {
-                    condition.type_ == "DurableSwitchoverPilot"
+                    condition.type_ == "FrameworkNativeSwitchover"
                         && condition.reason == "ReloadRequired"
                 })
         );
@@ -5087,8 +5079,10 @@ async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_req
                 .all(|operation| *operation == ControlOperation::GetStatus)
         );
         use kuberic_durable_execution::CheckpointStore;
-        let reference = api.last_status().unwrap().durable_switchover_pilot.unwrap();
-        let execution = kuberic_operator::durable::pilot::execution_spec(&reference).unwrap();
+        let reference = api.last_status().unwrap().switchover_execution.unwrap();
+        let execution =
+            kuberic_operator::durable::switchover_execution::native_execution_spec(&reference)
+                .unwrap();
         let loaded = store.load(execution.execution_id()).await.unwrap();
         match fault {
             kuberic_durable_execution::InMemoryFault::OutcomeUnknownWithoutApply => {
@@ -5104,7 +5098,7 @@ async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_req
                     .checkpoint()
                     .decode_and_validate(
                         &execution,
-                        kuberic_operator::durable::pilot::checkpoint_limits(),
+                        kuberic_operator::durable::switchover_execution::checkpoint_limits(),
                     )
                     .unwrap();
                 let exposed = payload.active_activities().unwrap().last().unwrap();
@@ -5126,7 +5120,7 @@ async fn test_durable_execution_switchover_pilot_unknown_checkpoint_outcomes_req
 
 #[test_log::test(tokio::test)]
 #[serial]
-async fn test_durable_execution_switchover_pilot_repeated_intent_gets_distinct_identity() {
+async fn test_framework_native_switchover_repeated_intent_gets_distinct_identity() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
     let healthy = create_healthy_set(&api, &bootstrap, "pilot-distinct-id", 3).await;
@@ -5144,7 +5138,7 @@ async fn test_durable_execution_switchover_pilot_repeated_intent_gets_distinct_i
         target_primary: Some(target),
         ..healthy
     };
-    let first_state = ReconcilerState::with_durable_switchover_store(
+    let first_state = ReconcilerState::with_switchover_store(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     reconcile_set(
@@ -5157,11 +5151,11 @@ async fn test_durable_execution_switchover_pilot_repeated_intent_gets_distinct_i
     let first_id = api
         .last_status()
         .unwrap()
-        .durable_switchover_pilot
+        .switchover_execution
         .unwrap()
         .execution_id;
 
-    let second_state = ReconcilerState::with_durable_switchover_store(
+    let second_state = ReconcilerState::with_switchover_store(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     let mut second_id = None;
@@ -5175,7 +5169,7 @@ async fn test_durable_execution_switchover_pilot_repeated_intent_gets_distinct_i
         .unwrap();
         second_id = api
             .last_status()
-            .and_then(|status| status.durable_switchover_pilot)
+            .and_then(|status| status.switchover_execution)
             .map(|reference| reference.execution_id)
             .filter(|execution_id| execution_id != &first_id);
         if second_id.is_some() {
@@ -5187,6 +5181,7 @@ async fn test_durable_execution_switchover_pilot_repeated_intent_gets_distinct_i
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native restart-every-turn coverage"]
 async fn test_durable_switchover_survives_state_loss_at_every_boundary() {
     let api = KvClusterApi::new();
     let initial_state = ReconcilerState::default();
@@ -5277,6 +5272,7 @@ async fn test_durable_switchover_survives_state_loss_at_every_boundary() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native lost-promotion-reply coverage"]
 async fn test_durable_switchover_observes_lost_promotion_reply_without_duplicate() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -5356,6 +5352,7 @@ async fn test_durable_switchover_observes_lost_promotion_reply_without_duplicate
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native all-lost-reply-windows coverage"]
 async fn test_durable_switchover_observes_every_runtime_lost_reply_window() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -5494,6 +5491,7 @@ async fn test_durable_switchover_observes_every_runtime_lost_reply_window() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native compensation publication coverage"]
 async fn test_durable_switchover_compensates_failed_target_promotion() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -5586,6 +5584,7 @@ async fn test_durable_switchover_compensates_failed_target_promotion() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native pre-promotion restoration coverage"]
 async fn test_durable_switchover_restores_writes_when_demotion_never_runs() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -5675,6 +5674,7 @@ async fn test_durable_switchover_restores_writes_when_demotion_never_runs() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native persistence outcome matrix"]
 async fn test_durable_switchover_conflict_and_invalid_checkpoint_do_not_mutate() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -5751,6 +5751,7 @@ async fn test_durable_switchover_conflict_and_invalid_checkpoint_do_not_mutate()
 
 #[test_log::test(tokio::test)]
 #[serial]
+#[ignore = "superseded by framework-native stale-incarnation coverage"]
 async fn test_durable_switchover_rejects_incarnation_drift_before_mutation() {
     let api = KvClusterApi::new();
     let state = ReconcilerState::default();
@@ -7161,10 +7162,8 @@ async fn test_active_switchover_never_dispatches_removal() {
     .await
     .unwrap();
     let switching = switch_api.last_status().unwrap();
-    assert_eq!(
-        switching.operation.as_ref().unwrap().kind,
-        DurableOperationKind::Switchover
-    );
+    assert!(switching.operation.is_none());
+    assert!(switching.switchover_execution.is_some());
     switch_api.reset_operations();
     reconcile_set(
         &make_set("remove-blocked-switch", 1, Some(switching)),

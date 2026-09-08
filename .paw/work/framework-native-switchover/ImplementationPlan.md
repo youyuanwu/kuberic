@@ -152,7 +152,7 @@ obsolete tests and documentation.
 - [x] **Phase 2: Native Admission, Recovery, and Publication Path** - Add the
   complete native path and fail-closed legacy conversion alongside the old
   production routing so replacement behavior can be proven before cutover.
-- [ ] **Phase 3: Replacement Safety Coverage and Cutover** - Prove the native
+- [x] **Phase 3: Replacement Safety Coverage and Cutover** - Prove the native
   path covers the complete safety matrix, then make it the sole admission and
   recovery route.
 - [ ] **Phase 4: Remove Obsolete Surfaces and Update Delivery Artifacts** -

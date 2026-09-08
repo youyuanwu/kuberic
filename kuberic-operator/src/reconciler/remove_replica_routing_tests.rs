@@ -857,6 +857,68 @@ async fn framework_native_switchover_conversion_is_atomic_and_fail_closed() {
 }
 
 #[tokio::test]
+async fn framework_native_switchover_production_conversion_covers_pilot_versions_and_malformed_status()
+ {
+    for (version, expected_source) in [
+        (1, SwitchoverIncompatibilitySource::LegacyPilotV1),
+        (2, SwitchoverIncompatibilitySource::LegacyPilotV2),
+    ] {
+        let mut legacy =
+            switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
+        let status = legacy.status.as_mut().unwrap();
+        status.switchover_execution = None;
+        status.durable_switchover_pilot = Some(crate::crd::DurableSwitchoverPilotStatus {
+            version,
+            execution_id: format!("{version:032x}"),
+            checkpoint_name: format!("kuberic-checkpoint-{version:032x}"),
+            initial_operation_json: "{}".to_string(),
+        });
+        let api = RoutingApi::new(Vec::new());
+        reconcile_set(&legacy, &api, &ReconcilerState::default())
+            .await
+            .unwrap();
+        let converted = api.last_status().unwrap();
+        let SwitchoverExecutionState::Incompatible { incompatibility } =
+            &converted.switchover_execution.as_ref().unwrap().state
+        else {
+            panic!("pilot v{version} was not converted");
+        };
+        assert_eq!(incompatibility.source, expected_source);
+        assert!(converted.durable_switchover_pilot.is_none());
+    }
+
+    let mut malformed =
+        switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
+    let status = malformed.status.as_mut().unwrap();
+    status.switchover_execution = None;
+    status.legacy_status_fields.insert(
+        "durableSwitchoverPilot".to_string(),
+        serde_json::json!({
+            "version": "unsupported",
+            "executionId": 7,
+            "checkpointName": null,
+            "unexpected": true
+        }),
+    );
+    let api = RoutingApi::new(Vec::new());
+    reconcile_set(&malformed, &api, &ReconcilerState::default())
+        .await
+        .unwrap();
+    let converted = api.last_status().unwrap();
+    let SwitchoverExecutionState::Incompatible { incompatibility } =
+        &converted.switchover_execution.as_ref().unwrap().state
+    else {
+        panic!("malformed legacy status was not converted");
+    };
+    assert_eq!(
+        incompatibility.source,
+        SwitchoverIncompatibilitySource::UnsupportedStatus
+    );
+    assert_eq!(incompatibility.legacy_execution_id, "unknown");
+    assert!(converted.legacy_status_fields.is_empty());
+}
+
+#[tokio::test]
 async fn framework_native_switchover_publication_retry_cleans_native_host() {
     let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
     let store = InMemoryCheckpointStore::new();

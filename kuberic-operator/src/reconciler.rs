@@ -47,7 +47,7 @@ use crate::durable::pilot::DurableSwitchoverPilotRuntime;
 use crate::durable::pilot::{
     DurableSwitchoverPilotTerminal, DurableSwitchoverWorkflow, PilotActivityKind,
     PilotAdapterDecision, PilotPermitGuard, SwitchoverRunnerAdapter, execution_spec,
-    initial_operation, new_pilot_reference,
+    initial_operation,
 };
 #[cfg(all(test, feature = "durable-switchover-pilot"))]
 use crate::durable::pilot::{DurableSwitchoverStepResult, encode_step_result};
@@ -57,6 +57,8 @@ use crate::durable::remove_replica_execution::{
     RemoveReplicaTerminal, RemoveReplicaWorkflow,
 };
 use crate::durable::runner::{DurableActiveReason, DurableRunner, DurableRunnerOutcome};
+#[cfg(test)]
+use crate::durable::start_switchover;
 use crate::durable::switchover_execution::{
     DurableSwitchoverPilotTerminal as NativeSwitchoverTerminal, DurableSwitchoverRuntime,
     DurableSwitchoverWorkflow as NativeSwitchoverWorkflow,
@@ -70,7 +72,7 @@ use crate::durable::{
     attest_add_replica, correlated_action_observation, decide, decide_add_replica,
     decide_create_partition, decide_failover, fail_closed, failover_action_for,
     failover_pending_label, operation_condition, record_activity_error, record_observation,
-    start_add_replica, start_create_partition, start_failover, start_switchover,
+    start_add_replica, start_create_partition, start_failover,
 };
 
 /// Shared state across reconciliation loops.
@@ -238,6 +240,10 @@ impl ReconcilerState {
             .measurements(namespace, set_name, set_uid, execution_id)
             .await
     }
+
+    pub async fn framework_native_switchover_host_count(&self) -> usize {
+        self.framework_native_switchover.host_count().await
+    }
 }
 
 /// Result of a reconciliation — either requeue after a duration, or done.
@@ -285,6 +291,7 @@ fn validate_active_operation_phase(
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_new_switchover_engine(mode: crate::crd::SwitchoverExecutionMode) -> Result<(), String> {
     match mode {
         crate::crd::SwitchoverExecutionMode::Explicit => Ok(()),
@@ -357,6 +364,7 @@ fn accept_framework_native_switchover(
     let mut status = KubericSetStatus {
         phase: Phase::Switchover,
         operation: None,
+        durable_switchover_pilot: None,
         switchover_execution: Some(reference),
         ..set.status.clone().unwrap_or_default()
     };
@@ -438,6 +446,31 @@ fn legacy_switchover_marker(
             pilot.version,
             pilot.execution_id.clone(),
             Some(pilot.checkpoint_name.clone()),
+            &encoded,
+        )));
+    }
+    if let Some(legacy) = current.legacy_status_fields.get("durableSwitchoverPilot") {
+        let encoded = serde_json::to_vec(legacy)
+            .map_err(|error| format!("serialize unsupported switchover status marker: {error}"))?;
+        let version = legacy
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default();
+        let execution_id = legacy
+            .get("executionId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let checkpoint_name = legacy
+            .get("checkpointName")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        return Ok(Some(incompatible_switchover_execution(
+            SwitchoverIncompatibilitySource::UnsupportedStatus,
+            version,
+            execution_id,
+            checkpoint_name,
             &encoded,
         )));
     }
@@ -807,6 +840,10 @@ pub async fn reconcile_set(
     let set_key = format!("{}/{}", namespace, name);
 
     info!(name, namespace, "reconciling KubericSet");
+
+    if persist_legacy_switchover_incompatibility(set, api, unix_seconds()).await? {
+        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+    }
 
     if persist_legacy_remove_incompatibility(set, api, state.removal_clock.unix_seconds()).await? {
         return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
@@ -1680,7 +1717,6 @@ pub async fn reconcile_set(
             if let (Some(current), Some(target)) = (&current_primary, &target_primary)
                 && current != target
             {
-                validate_new_switchover_engine(set.spec.switchover_execution_mode)?;
                 let target_id = current_pods
                     .iter()
                     .find(|(_, _, pod)| pod.name_any() == *target)
@@ -1700,58 +1736,8 @@ pub async fn reconcile_set(
                 drop(drivers);
                 info!(name, current = %current, target = %target, "switchover requested");
                 let now = unix_seconds();
-                #[cfg(feature = "durable-switchover-pilot")]
-                if set.spec.switchover_execution_mode
-                    == crate::crd::SwitchoverExecutionMode::DurablePilot
-                {
-                    if state.durable_switchover_pilot.is_none() {
-                        return Err(
-                            "durable switchover pilot runtime is not configured".to_string()
-                        );
-                    }
-                    let reference = new_pilot_reference(
-                        set.metadata.uid.as_deref().ok_or_else(|| {
-                            "durable switchover pilot requires KubericSet UID".to_string()
-                        })?,
-                        previous_snapshot,
-                        target_id,
-                        now,
-                    )?;
-                    let mut status = KubericSetStatus {
-                        phase: Phase::Switchover,
-                        operation: None,
-                        durable_switchover_pilot: Some(reference),
-                        ..set.status.clone().unwrap_or_default()
-                    };
-                    set_pilot_condition(
-                        &mut status,
-                        "Accepted",
-                        "pilot reference persisted before checkpoint creation",
-                        now,
-                    );
-                    api.patch_set_status(
-                        &namespace,
-                        &name,
-                        &status,
-                        set.metadata.resource_version.as_deref(),
-                    )
-                    .await?;
-                    state.drivers.lock().await.remove(&set_key);
-                    return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-                }
-                let operation = start_switchover(
-                    set.metadata.uid.as_deref().unwrap_or(&set_key),
-                    previous_snapshot,
-                    target_id,
-                    now,
-                )?;
-                let mut status = KubericSetStatus {
-                    phase: Phase::Switchover,
-                    operation: Some(operation.clone()),
-                    durable_switchover_pilot: None,
-                    ..set.status.clone().unwrap_or_default()
-                };
-                set_operation_condition(&mut status, operation_condition(&operation, now));
+                let status =
+                    accept_framework_native_switchover(set, previous_snapshot, target_id, now)?;
                 api.patch_set_status(
                     &namespace,
                     &name,
@@ -1943,37 +1929,14 @@ pub async fn reconcile_set(
         }
 
         Phase::Switchover => {
-            #[cfg(feature = "durable-switchover-pilot")]
-            if set.status.as_ref().is_some_and(|status| {
-                status.operation.is_none() && status.durable_switchover_pilot.is_some()
-            }) {
-                return match Box::pin(reconcile_durable_switchover_pilot(
-                    set,
-                    api,
-                    state,
-                    &pods,
-                    &ready_pods,
-                ))
-                .await
-                {
-                    Ok(action) => Ok(action),
-                    Err(error) => {
-                        warn!(name, error, "durable switchover pilot reconcile blocked");
-                        record_pilot_wait_condition(set, api, "Blocked", &error, unix_seconds())
-                            .await;
-                        Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
-                    }
-                };
+            if set
+                .status
+                .as_ref()
+                .is_some_and(|status| status.switchover_execution.is_some())
+            {
+                return reconcile_framework_native_switchover(set, api, state, &pods).await;
             }
-            Box::pin(reconcile_durable_operation(
-                set,
-                api,
-                state,
-                &pods,
-                &ready_pods,
-                &set_key,
-            ))
-            .await
+            Err("switchover phase has no production execution reference".to_string())
         }
 
         Phase::RemovingReplica => {
@@ -2976,6 +2939,7 @@ async fn apply_failover_decision(
 }
 
 #[cfg(feature = "durable-switchover-pilot")]
+#[allow(dead_code)]
 async fn reconcile_durable_switchover_pilot(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -3113,6 +3077,7 @@ async fn record_pilot_wait_condition(
 }
 
 #[cfg(feature = "durable-switchover-pilot")]
+#[allow(dead_code)]
 async fn publish_pilot_terminal(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -3297,6 +3262,7 @@ async fn reconcile_framework_native_switchover_with_fuel(
     pods: &[Pod],
     runner_fuel: usize,
 ) -> Result<ReconcileAction, String> {
+    crate::durable::switchover_execution::validate_runner_fuel(runner_fuel)?;
     let namespace = set.namespace().unwrap_or_default();
     let name = set.name_any();
     let set_uid =

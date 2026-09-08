@@ -18,6 +18,11 @@ use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use kuberic_core::driver::ReplicaHandle;
+#[cfg(test)]
+use kuberic_durable_execution::{
+    ActivityCallError, CasOutcome, CheckpointError, CheckpointStore, DurableHost, HostEpoch,
+    StorageRevision, StoreError, StoredCheckpoint,
+};
 use kuberic_durable_execution::{
     ActivityName, ActivityObservation, ActivityRecord, ActivitySequence, ActivitySpec,
     CheckpointEnvelope, CheckpointLimits, CheckpointPayload, DispatchPermit, DurableActivity,
@@ -26,11 +31,6 @@ use kuberic_durable_execution::{
     KubernetesCheckpointStoreOptions, LogicalActivityId, PreparedActivityError,
     PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext, decode_activity_input,
     decode_activity_result, encode_activity_input, encode_activity_result,
-};
-#[cfg(test)]
-use kuberic_durable_execution::{
-    CasOutcome, CheckpointStore, DurableHost, HostEpoch, StorageRevision, StoreError,
-    StoredCheckpoint,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -1787,13 +1787,7 @@ fn encode_terminal_record(
 ) -> Result<ExactBytes, String> {
     let encoded = serde_json::to_vec(terminal)
         .map_err(|error| format!("serialize durable switchover terminal outcome: {error}"))?;
-    if encoded.len() > PILOT_MAX_TERMINAL_BYTES as usize {
-        return Err(format!(
-            "durable switchover terminal outcome is {} bytes; maximum is {}",
-            encoded.len(),
-            PILOT_MAX_TERMINAL_BYTES
-        ));
-    }
+    validate_terminal_payload_bytes(encoded.len())?;
     Ok(ExactBytes::new(encoded))
 }
 
@@ -1953,13 +1947,7 @@ pub fn native_execution_spec(
     };
     let input = serde_json::to_vec(&input)
         .map_err(|error| format!("serialize framework-native switchover input: {error}"))?;
-    if input.len() > SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES {
-        return Err(format!(
-            "framework-native switchover input is {} bytes; maximum is {}",
-            input.len(),
-            SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES
-        ));
-    }
+    validate_workflow_input_bytes(input.len())?;
     Ok(ExecutionSpec::new(
         execution_id,
         ExactBytes::new(input),
@@ -2027,6 +2015,66 @@ pub fn checkpoint_limits() -> CheckpointLimits {
     .expect("framework-native switchover limits are nonzero")
 }
 
+fn validate_workflow_input_bytes(actual: usize) -> Result<(), String> {
+    if actual > SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES {
+        Err(format!(
+            "framework-native switchover workflow input is {actual} bytes; maximum is {SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_active_checkpoint_bytes(actual: usize) -> Result<(), String> {
+    if actual > SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES {
+        Err(format!(
+            "framework-native switchover active checkpoint is {actual} bytes; maximum is {SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_terminal_checkpoint_bytes(actual: usize) -> Result<(), String> {
+    if actual > SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES {
+        Err(format!(
+            "framework-native switchover terminal checkpoint is {actual} bytes; maximum is {SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_terminal_payload_bytes(actual: usize) -> Result<(), String> {
+    if actual > SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES as usize {
+        Err(format!(
+            "framework-native switchover terminal payload is {actual} bytes; maximum is {SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_transition_fuel(actual: usize) -> Result<(), String> {
+    if actual > SWITCHOVER_MAX_TRANSITION_FUEL {
+        Err(format!(
+            "framework-native switchover requires {actual} transitions; maximum is {SWITCHOVER_MAX_TRANSITION_FUEL}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_runner_fuel(actual: usize) -> Result<(), String> {
+    if actual == 0 || actual > SWITCHOVER_MAX_RUNNER_FUEL {
+        Err(format!(
+            "framework-native switchover runner fuel is {actual}; allowed range is 1..={SWITCHOVER_MAX_RUNNER_FUEL}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn checkpoint_store_options(
     namespace: &str,
     set_name: &str,
@@ -2071,25 +2119,13 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
     let projected_transitions = (success.maximum_activity_count()
         + projected_success_pure_transitions())
     .max(rollback.maximum_activity_count() + projected_rollback_pure_transitions());
-    if projected_transitions > PILOT_MAX_TRANSITION_FUEL {
-        return Err(format!(
-            "durable switchover requires {projected_transitions} projected transitions; maximum is {PILOT_MAX_TRANSITION_FUEL}"
-        ));
-    }
+    validate_transition_fuel(projected_transitions)?;
     let projected_bytes = maximum_projected_checkpoint_bytes()?;
-    if projected_bytes > SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES {
-        return Err(format!(
-            "durable switchover projected checkpoint is {projected_bytes} bytes; maximum is {SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES}"
-        ));
-    }
+    validate_active_checkpoint_bytes(projected_bytes)?;
     let projected_terminal = maximum_terminal_checkpoint()?
         .encoded_len()
         .map_err(|error| format!("measure maximum switchover terminal checkpoint: {error}"))?;
-    if projected_terminal > SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES {
-        return Err(format!(
-            "durable switchover projected terminal is {projected_terminal} bytes; maximum is {SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES}"
-        ));
-    }
+    validate_terminal_checkpoint_bytes(projected_terminal)?;
     Ok(())
 }
 
@@ -2675,7 +2711,7 @@ fn decode_hex(value: u8) -> Result<u8, String> {
 }
 
 #[cfg(test)]
-mod durable_switchover_pilot_tests {
+mod framework_native_switchover_tests {
     use super::*;
     use crate::crd::{
         EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
@@ -2826,6 +2862,100 @@ mod durable_switchover_pilot_tests {
         assert_eq!(bounded.len(), SWITCHOVER_MAX_ERROR_BYTES);
         assert!(bounded.is_char_boundary(bounded.len()));
         assert_eq!(bounded, "é".repeat(SWITCHOVER_MAX_ERROR_BYTES / 2));
+    }
+
+    struct NativeInputBound;
+
+    impl DurableActivity for NativeInputBound {
+        type Input = String;
+        type Output = ();
+
+        const NAME: &'static str = "native-switchover-input-bound";
+        const VERSION: u32 = 1;
+        const MAX_INPUT_BYTES: u64 = SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES as u64;
+        const MAX_RESULT_BYTES: u64 = 1;
+    }
+
+    struct NativeResultBound;
+
+    impl DurableActivity for NativeResultBound {
+        type Input = ();
+        type Output = String;
+
+        const NAME: &'static str = "native-switchover-result-bound";
+        const VERSION: u32 = 1;
+        const MAX_INPUT_BYTES: u64 = 1;
+        const MAX_RESULT_BYTES: u64 = SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES as u64;
+    }
+
+    #[test]
+    fn framework_native_switchover_rejects_every_independent_one_over_bound() {
+        let execution = ExecutionSpec::new(
+            ExecutionId::from_bytes([9; 16]),
+            ExactBytes::new(vec![9; SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES]),
+            SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
+        );
+        let logical = ActivitySpec::new(
+            ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION).unwrap(),
+            ExactBytes::new(b"{}".to_vec()),
+            SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES as u64,
+        );
+        let activities = (0..=SWITCHOVER_MAX_ACTIVITY_RECORDS)
+            .map(|sequence| {
+                ActivityRecord::completed(
+                    ActivitySequence::new(sequence as u64),
+                    logical.clone(),
+                    ExactBytes::new(b"{}".to_vec()),
+                )
+            })
+            .collect();
+        assert!(matches!(
+            CheckpointEnvelope::encode_with_limits(
+                &CheckpointPayload::active(
+                    ExecutionContract::with_encoded_limits(
+                        execution,
+                        SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
+                        SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
+                    ),
+                    activities,
+                ),
+                checkpoint_limits(),
+            ),
+            Err(CheckpointError::ActivityRecordLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            encode_activity_input::<NativeInputBound>(
+                &"x".repeat(SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES)
+            ),
+            Err(ActivityCallError::InputTooLarge { .. })
+        ));
+        assert!(matches!(
+            encode_activity_result::<NativeResultBound>(
+                &"x".repeat(SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES)
+            ),
+            Err(ActivityCallError::ResultTooLarge { .. })
+        ));
+        assert!(validate_workflow_input_bytes(SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES + 1).is_err());
+        assert!(validate_active_checkpoint_bytes(SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES + 1).is_err());
+        assert!(
+            validate_terminal_checkpoint_bytes(SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES + 1).is_err()
+        );
+        assert!(
+            validate_terminal_payload_bytes(SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES as usize + 1)
+                .is_err()
+        );
+        assert!(validate_transition_fuel(SWITCHOVER_MAX_TRANSITION_FUEL + 1).is_err());
+        assert!(validate_runner_fuel(SWITCHOVER_MAX_RUNNER_FUEL + 1).is_err());
+        assert!(
+            new_switchover_execution("set-uid", snapshot(SWITCHOVER_MAX_REPLICAS + 1), 2, 100)
+                .is_err()
+        );
+        let bounded = bounded_utf8(
+            &"é".repeat(SWITCHOVER_MAX_ERROR_BYTES),
+            SWITCHOVER_MAX_ERROR_BYTES,
+        );
+        assert_eq!(bounded.len(), SWITCHOVER_MAX_ERROR_BYTES);
+        assert!("é".repeat(SWITCHOVER_MAX_ERROR_BYTES).len() > SWITCHOVER_MAX_ERROR_BYTES);
     }
 
     #[test]
