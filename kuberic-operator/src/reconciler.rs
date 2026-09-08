@@ -3266,6 +3266,28 @@ async fn reconcile_framework_native_switchover(
     state: &ReconcilerState,
     pods: &[Pod],
 ) -> Result<ReconcileAction, String> {
+    match reconcile_framework_native_switchover_inner(set, api, state, pods).await {
+        Ok(action) => Ok(action),
+        Err(error) => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "Blocked",
+                &error,
+                unix_seconds(),
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+    }
+}
+
+async fn reconcile_framework_native_switchover_inner(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+) -> Result<ReconcileAction, String> {
     let namespace = set.namespace().unwrap_or_default();
     let name = set.name_any();
     let set_uid =
@@ -3328,9 +3350,17 @@ async fn reconcile_framework_native_switchover(
         DurableRunnerOutcome::Active {
             reason: DurableActiveReason::FuelExhausted,
             ..
-        } => Err(
-            "framework-native switchover exhausted in-process fused progression fuel".to_string(),
-        ),
+        } => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "FuelExhausted",
+                "framework-native switchover exhausted in-process fused progression fuel",
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
         DurableRunnerOutcome::ReloadRequired { boundary, reason } => {
             record_framework_native_switchover_condition(
                 set,
@@ -3353,18 +3383,50 @@ async fn reconcile_framework_native_switchover(
             .await;
             Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
         }
-        DurableRunnerOutcome::Incompatible(error) => Err(format!(
-            "framework-native switchover checkpoint is incompatible: {error}"
-        )),
-        DurableRunnerOutcome::Rejected(error) => Err(format!(
-            "framework-native switchover checkpoint rejected: {error}"
-        )),
-        DurableRunnerOutcome::Isolated(error) => Err(format!(
-            "framework-native switchover execution isolated: {error}"
-        )),
-        DurableRunnerOutcome::Nondeterministic(error) => Err(format!(
-            "framework-native switchover workflow changed: {error}"
-        )),
+        DurableRunnerOutcome::Incompatible(error) => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "Incompatible",
+                &format!("framework-native switchover checkpoint is incompatible: {error}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        DurableRunnerOutcome::Rejected(error) => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "Rejected",
+                &format!("framework-native switchover checkpoint rejected: {error}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        DurableRunnerOutcome::Isolated(error) => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "Isolated",
+                &format!("framework-native switchover execution isolated: {error}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        DurableRunnerOutcome::Nondeterministic(error) => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "Nondeterministic",
+                &format!("framework-native switchover workflow changed: {error}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
     }
 }
 
@@ -4685,6 +4747,18 @@ async fn cleanup_persisted_durable_execution(
         state.durable_switchover_pilot.as_ref(),
     ) {
         runtime
+            .forget(
+                &set.namespace().unwrap_or_default(),
+                &set.name_any(),
+                uid,
+                &reference.execution_id,
+            )
+            .await;
+        cleaned = true;
+    }
+    if let Some(reference) = status.switchover_execution.as_ref() {
+        state
+            .framework_native_switchover
             .forget(
                 &set.namespace().unwrap_or_default(),
                 &set.name_any(),

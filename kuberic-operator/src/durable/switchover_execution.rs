@@ -1730,7 +1730,9 @@ fn terminal_success(terminal: DurableSwitchoverPilotTerminal) -> TerminalOutcome
     }
 }
 
-fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactBytes, String> {
+pub(crate) fn encode_terminal(
+    terminal: &DurableSwitchoverPilotTerminal,
+) -> Result<ExactBytes, String> {
     let record = match terminal {
         DurableSwitchoverPilotTerminal::Complete {
             operation,

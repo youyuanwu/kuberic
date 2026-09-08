@@ -318,7 +318,10 @@ obsolete tests and documentation.
 
 - [ ] `cargo check -p kuberic-operator --all-targets`
 - [ ] `cargo test -p kuberic-operator framework_native_switchover`
-- [ ] `CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test -p kvstore --test reconciler test_framework_native_switchover_ -- --nocapture`
+- [ ] Direct operator routing tests cover native admission, compatibility
+  conversion, runner dispositions, terminal reload/publication, and
+  publication retry cleanup. The full kvstore matrix remains the Phase 3
+  cutover gate.
 
 #### Manual Verification
 
