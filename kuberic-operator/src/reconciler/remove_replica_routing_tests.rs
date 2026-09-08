@@ -14,8 +14,9 @@ use kuberic_core::types::{
     ReplicaInstanceId, ReplicaStatusInfo, Role,
 };
 use kuberic_durable_execution::{
-    CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointStore, ExactBytes,
-    ExecutionContract, InMemoryCheckpointStore, InMemoryFault, StoreErrorKind, TerminalOutcome,
+    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CasOutcome, CheckpointEnvelope,
+    CheckpointPayload, CheckpointStore, ExactBytes, ExecutionContract, InMemoryCheckpointStore,
+    InMemoryFault, StoreErrorKind, TerminalOutcome,
 };
 
 use super::*;
@@ -43,6 +44,7 @@ struct RoutingApi {
     fail_status_patch: StdMutex<bool>,
     replica_statuses: StdArc<StdMutex<BTreeMap<ReplicaId, ReplicaStatusInfo>>>,
     status_failures: StdArc<StdMutex<BTreeMap<ReplicaId, StatusFailure>>>,
+    reject_dispatch_as_busy: StdArc<StdMutex<bool>>,
 }
 
 impl RoutingApi {
@@ -68,6 +70,10 @@ impl RoutingApi {
             .unwrap()
             .insert(replica_id, failure);
     }
+
+    fn reject_dispatch_as_busy(&self) {
+        *self.reject_dispatch_as_busy.lock().unwrap() = true;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +86,7 @@ struct RoutingHandle {
     replica_id: ReplicaId,
     statuses: StdArc<StdMutex<BTreeMap<ReplicaId, ReplicaStatusInfo>>>,
     failures: StdArc<StdMutex<BTreeMap<ReplicaId, StatusFailure>>>,
+    reject_dispatch_as_busy: StdArc<StdMutex<bool>>,
 }
 
 #[async_trait]
@@ -138,6 +145,9 @@ impl ReplicaHandle for RoutingHandle {
         &self,
         _: CorrelatedControlActionRequest,
     ) -> kuberic_core::Result<CorrelatedControlActionAcknowledgement> {
+        if *self.reject_dispatch_as_busy.lock().unwrap() {
+            return Err(KubericError::AgentBusy);
+        }
         panic!("authority-gap tests must not dispatch effects")
     }
 }
@@ -199,6 +209,7 @@ impl ClusterApi for RoutingApi {
             replica_id,
             statuses: self.replica_statuses.clone(),
             failures: self.status_failures.clone(),
+            reject_dispatch_as_busy: self.reject_dispatch_as_busy.clone(),
         }))
     }
 
@@ -707,6 +718,21 @@ async fn store_switchover_terminal(
         compensated: false,
         accounting: PilotActivityAccounting::new(9, 3),
     };
+    store_switchover_terminal_outcome(
+        store,
+        reference,
+        TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
+        12,
+    )
+    .await;
+}
+
+async fn store_switchover_terminal_outcome(
+    store: &InMemoryCheckpointStore,
+    reference: &SwitchoverExecutionStatus,
+    outcome: TerminalOutcome,
+    completed_activity_count: u64,
+) {
     let execution = native_execution_spec(reference).unwrap();
     let envelope = CheckpointEnvelope::encode_with_limits(
         &CheckpointPayload::terminal(
@@ -715,8 +741,8 @@ async fn store_switchover_terminal(
                 SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
                 SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
             ),
-            TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
-            12,
+            outcome,
+            completed_activity_count,
         ),
         switchover_checkpoint_limits(),
     )
@@ -974,4 +1000,189 @@ async fn framework_native_switchover_route_records_reload_and_persistence_failur
         ],
     )
     .await;
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_records_adapter_wait_and_fuel_exhaustion() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, unix_seconds()).unwrap();
+    let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    api.fail_status(1, StatusFailure::Unavailable);
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover(&switchover_set(reference), &api, &state, &current_pods)
+        .await
+        .unwrap();
+    let waiting = api.last_status().unwrap();
+    assert!(
+        waiting.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover"
+                && condition.reason == "AwaitingEffectPreparation"
+        }),
+        "{:?}",
+        waiting.conditions
+    );
+
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, unix_seconds()).unwrap();
+    let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    api.reject_dispatch_as_busy();
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover_with_fuel(
+        &switchover_set(reference),
+        &api,
+        &state,
+        &current_pods,
+        1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "FuelExhausted"
+            })
+    );
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_records_nondeterminism() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let execution = native_execution_spec(&reference).unwrap();
+    let store = InMemoryCheckpointStore::new();
+    let wrong = ActivitySpec::new(
+        ActivityName::new("kuberic.switchover.wrong-boundary", 1).unwrap(),
+        ExactBytes::new(b"{}".to_vec()),
+        1,
+    );
+    let envelope = CheckpointEnvelope::encode_with_limits(
+        &CheckpointPayload::active(
+            ExecutionContract::with_encoded_limits(
+                execution.clone(),
+                SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
+                SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
+            ),
+            vec![ActivityRecord::scheduled(ActivitySequence::new(0), wrong)],
+        ),
+        switchover_checkpoint_limits(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .compare_and_swap(execution.execution_id(), None, envelope)
+            .await
+            .unwrap(),
+        CasOutcome::Accepted(_)
+    ));
+    assert_native_switchover_condition_for_store(
+        reference,
+        store,
+        "Nondeterministic",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_publishes_compensation_and_quarantine() {
+    let compensation_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let initial = native_initial_operation(&compensation_reference).unwrap();
+    let mut failed = initial.clone();
+    failed.phase = DurableOperationPhase::Failed;
+    failed.frozen_lsn = Some(42);
+    failed.next_secondary_index = 2;
+    let terminal = DurableSwitchoverPilotTerminal::Complete {
+        operation: failed,
+        snapshot: initial.previous_snapshot.cloned().unwrap(),
+        compensated: true,
+        accounting: PilotActivityAccounting::new(8, 5),
+    };
+    let store = InMemoryCheckpointStore::new();
+    store_switchover_terminal_outcome(
+        &store,
+        &compensation_reference,
+        TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
+        13,
+    )
+    .await;
+    let state = ReconcilerState::with_switchover_store(store);
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover(
+        &switchover_set(compensation_reference),
+        &api,
+        &state,
+        &current_pods,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover"
+                    && condition.reason == "CompensatedOrSafeFailure"
+                    && condition.status == "False"
+            })
+    );
+
+    let quarantine_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let initial = native_initial_operation(&quarantine_reference).unwrap();
+    let terminal = DurableSwitchoverPilotTerminal::Stopped {
+        operation: Some(initial),
+        message: "unknown exposed effect".to_string(),
+    };
+    let store = InMemoryCheckpointStore::new();
+    store_switchover_terminal_outcome(
+        &store,
+        &quarantine_reference,
+        TerminalOutcome::failed(encode_switchover_terminal(&terminal).unwrap()),
+        0,
+    )
+    .await;
+    let state = ReconcilerState::with_switchover_store(store);
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+    let current_pods = api.pods.lock().unwrap().clone();
+    reconcile_framework_native_switchover(
+        &switchover_set(quarantine_reference),
+        &api,
+        &state,
+        &current_pods,
+    )
+    .await
+    .unwrap();
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Quarantined"
+            })
+    );
 }

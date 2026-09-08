@@ -3266,7 +3266,15 @@ async fn reconcile_framework_native_switchover(
     state: &ReconcilerState,
     pods: &[Pod],
 ) -> Result<ReconcileAction, String> {
-    match reconcile_framework_native_switchover_inner(set, api, state, pods).await {
+    match reconcile_framework_native_switchover_with_fuel(
+        set,
+        api,
+        state,
+        pods,
+        crate::durable::switchover_execution::SWITCHOVER_MAX_RUNNER_FUEL,
+    )
+    .await
+    {
         Ok(action) => Ok(action),
         Err(error) => {
             record_framework_native_switchover_condition(
@@ -3282,11 +3290,12 @@ async fn reconcile_framework_native_switchover(
     }
 }
 
-async fn reconcile_framework_native_switchover_inner(
+async fn reconcile_framework_native_switchover_with_fuel(
     set: &KubericSet,
     api: &dyn ClusterApi,
     state: &ReconcilerState,
     pods: &[Pod],
+    runner_fuel: usize,
 ) -> Result<ReconcileAction, String> {
     let namespace = set.namespace().unwrap_or_default();
     let name = set.name_any();
@@ -3319,17 +3328,16 @@ async fn reconcile_framework_native_switchover_inner(
     let mut adapter =
         NativeSwitchoverRunnerAdapter::new(&initial, set, &current_pods, api, store, now);
     let mut host = host.lock().await;
-    let outcome =
-        DurableRunner::new(crate::durable::switchover_execution::SWITCHOVER_MAX_RUNNER_FUEL)
-            .map_err(|error| format!("construct framework-native switchover runner: {error}"))?
-            .run(
-                &mut host,
-                &NativeSwitchoverWorkflow,
-                execution,
-                &mut adapter,
-                now,
-            )
-            .await;
+    let outcome = DurableRunner::new(runner_fuel)
+        .map_err(|error| format!("construct framework-native switchover runner: {error}"))?
+        .run(
+            &mut host,
+            &NativeSwitchoverWorkflow,
+            execution,
+            &mut adapter,
+            now,
+        )
+        .await;
     drop(host);
     match outcome {
         DurableRunnerOutcome::Terminal(terminal) => {
