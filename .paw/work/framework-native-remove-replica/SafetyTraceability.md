@@ -1,8 +1,11 @@
-# Phase 4 Remove-Replica Safety Traceability
+# Framework-Native Remove-Replica Safety Traceability
 
-Deletion gate status: **passed and revalidated through Phase 6 on 2026-09-08**. Every SC-002 invariant maps to
-retained framework-native, shared runner/kernel, Kubernetes provider, or
-live-cluster coverage. No row relies only on the legacy remove pilot.
+Deletion gate status: **passed and reconciled with the final Phase 7
+documentation on 2026-09-08**. Every SC-002 invariant maps to retained
+framework-native, shared runner/kernel, Kubernetes provider, or live-cluster
+coverage. No row relies on the deleted legacy remove paths. The as-built
+architecture, compatibility contract, measurements, and operating guidance are
+in [`Docs.md`](Docs.md).
 
 | # | SC-002 invariant | Retained passing replacement test(s) | Coverage |
 |---:|---|---|---|
@@ -172,3 +175,17 @@ The six independently named native remove tests are:
   replicas afterward.
 - All 34 SC-002 rows above retain their named replacement tests. No mapped
   test was removed during production graduation or Phase 6 measurement work.
+
+## Phase 7 Reconciliation
+
+- The final matrix still names all 34 SC-002 invariants and their retained
+  tests.
+- The six FR-019 responsibility tests and all nine FR-017 common outcomes are
+  documented in `Docs.md`.
+- Current documentation treats remove-replica as the single production
+  framework-native path. Pilot and explicit-path wording is retained only where
+  it describes incompatible historical records.
+- Phase 7 validation passed `cargo test --doc --workspace`, the targeted native
+  remove/runner/store/reconciler gates, and
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test --all --all-features`
+  with PostgreSQL 16 tooling available.

@@ -614,9 +614,10 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
         "retention contract",
         "separately authorized",
         "configurable 786,432-byte default",
-        "operator workflow pilot",
+        "shared bounded operator runner",
+        "production framework-native",
         "switchover",
-        "workflow-ownership change",
+        "without another executor or scheduler",
     ] {
         assert!(
             roadmap.contains(required),

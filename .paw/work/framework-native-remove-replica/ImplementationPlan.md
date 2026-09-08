@@ -173,7 +173,7 @@ pull requests. This planning activity creates no commit.
 - [x] **Phase 4: Native Integration and Safety Traceability** - Integrate remove with the runner and establish passing replacement coverage for every deletion-gate invariant.
 - [x] **Phase 5: Production Graduation and Legacy Removal** - Make native remove the only production path and delete explicit/pilot surfaces after the safety gate passes.
 - [x] **Phase 6: Measurements and Full Validation** - Lock semantic/byte measurements, update CI, and run complete local plus isolated-Kind validation.
-- [ ] **Phase 7: Documentation** - Produce the as-built record and update all project documentation for the production contract.
+- [x] **Phase 7: Documentation** - Produce the as-built record and update all project documentation for the production contract.
 
 ## Phase Candidates
 
@@ -746,23 +746,23 @@ pass before any explicit remove orchestration or legacy test is deleted.
 
 #### Automated Verification
 
-- [ ] Rust documentation tests pass: `cargo test --doc --workspace`
-- [ ] Documentation command examples match passing Phase 6 commands.
-- [ ] Repository search finds no current remove pilot/mode terminology outside
+- [x] Rust documentation tests pass: `cargo test --doc --workspace`
+- [x] Documentation command examples match passing Phase 6 commands.
+- [x] Repository search finds no current remove pilot/mode terminology outside
   historical PAW research:
   `rg 'remove-replica pilot|removeReplicaExecutionMode|durableRemoveReplicaPilot|durable-remove-replica-pilot' README.md durable-execution docs kuberic-operator examples .github scripts`
 
 #### Manual Verification
 
-- [ ] Documentation names every common lifecycle outcome from FR-017 and all
+- [x] Documentation names every common lifecycle outcome from FR-017 and all
   six operation-specific responsibilities from FR-019.
-- [ ] Documentation explicitly states that add-replica is not migrated and
+- [x] Documentation explicitly states that add-replica is not migrated and
   explains how a future adapter would supply its observation, authority/effect,
   deadline, terminal-validation, and publication behavior.
-- [ ] Measurements distinguish external effects, passive observations,
+- [x] Measurements distinguish external effects, passive observations,
   boundaries, accepted writes, active record size, terminal record size, and
   terminal payload size.
-- [ ] Compatibility, owner garbage collection, separately authorized orphan
+- [x] Compatibility, owner garbage collection, separately authorized orphan
   cleanup, and no-extra-service architecture are described accurately.
 
 ### Local Commit

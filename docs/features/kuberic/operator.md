@@ -202,10 +202,12 @@ Legacy resources without a snapshot fail closed. A missing or inconsistent
 stable primary routes directly into durable failover before driver recovery;
 non-primary incarnation changes are handled by topology reconciliation or the
 phase-specific failover fence. Durable `Creating`, `Switchover`,
-`AddingReplica`, `RemovingReplica`, and `FailingOver` resume from
-`status.operation`. Completed topology snapshots are refreshed with exact
-election metadata before they are used as unavailable-candidate comparison
-evidence. See `operator-failure-scenarios.md` §8.
+`AddingReplica`, and `FailingOver` resume from `status.operation`.
+`RemovingReplica` resumes from the production
+`status.removeReplicaExecution` reference and its ConfigMap checkpoint.
+Completed topology snapshots are refreshed with exact election metadata before
+they are used as unavailable-candidate comparison evidence. See
+`operator-failure-scenarios.md` §8.
 
 A container restart can keep the Pod UID while resetting role, epoch and all
 agent/runtime process-local state. Status exposes a new `AgentGeneration`, so
@@ -215,6 +217,38 @@ runtime role/epoch is persisted into the established durable
 force-remove/rebuild path before mutation. A stale primary enters durable
 failover. Missing prior-generation local state is never proof that an
 ambiguous effect did not run.
+
+## Framework-Native Durable Runner
+
+The operator hosts one bounded in-process runner for production
+remove-replica and optional switchover. It owns authoritative load/reload,
+terminal short-circuit, bounded host-outcome fuel, one-use dispatch permits,
+fused observation/progression, quarantine, persistence outcome classification,
+and deadline-clamped requeues. Its common outcomes are active, terminal,
+incompatible, rejected, isolated, conflict reload, unknown-write reload,
+persistence failure, and nondeterminism.
+
+Topology policy remains outside the runner. Each adapter independently owns
+observation collection, authority and exact-command preparation, effect
+dispatch and quarantine interpretation, deadline policy, terminal validation,
+and publication/conditions. This boundary is the extension point for a future
+add-replica migration; add-replica is not migrated now.
+
+The runner uses the existing kube controller as its scheduler and normal
+Set/Pod watches as wakeups. It does not add a worker, queue, lease, watcher,
+distributed execution owner, or retry scheduler.
+
+Each framework checkpoint is a same-namespace ConfigMap with a non-controlling,
+non-blocking owner reference to the exact `KubericSet` UID. The writer has
+`get`, `create`, and `update`, not delete. Active history is replaced by a
+compact terminal record, which remains until owner garbage collection or a
+separately authorized orphan-cleanup actor applies retention and recovery
+policy. Loads and replacements reject a changed owner relationship.
+
+Terminal acceptance alone cannot publish topology. The runner reloads and
+validates terminal state through the operation adapter before producing the
+publication handoff. A status conflict can therefore retry publication from
+the retained terminal without polling replicas or redispatching effects.
 
 ## Durable Partition Creation
 
@@ -365,18 +399,33 @@ authorize `Force`.
 The operator then:
 
 1. validates `minReplicas` and retained previous-write-quorum safety;
-2. persists remove operation v2 with the previous and frozen reduced
-   snapshots, exact target incarnation/pod UID, mode, deadlines, and a maximum
-   of three pre-commit attempts;
-3. freezes one generation-qualified `RemoveReplicaIntent` v1 and dispatches it
+2. persists framework-native remove contract v3 with immutable previous
+   topology, exact target incarnation/pod UID/authority, mode, minimum, and
+   deadlines; the reduced topology and domain remove operation v2 are derived;
+3. records compact passive-observation or exact-command boundaries through the
+   shared runner, which grants one dispatch permit only after exact exposure is
+   accepted;
+4. freezes one generation-qualified `RemoveReplicaIntent` v1 and dispatches it
    only to the exact current primary through correlated control v3;
-4. observes bounded primary coordinator evidence until the exact reduced
+5. observes bounded primary coordinator evidence until the exact reduced
    Current configuration commits, compensation succeeds, redrive is safe, or
    the operation poisons;
-5. persists the primary's exact commit timestamp, configuration signature, and
+6. persists the primary's exact commit timestamp, configuration signature, and
    the reduced workflow-scoped `committedSnapshot` before global cleanup;
-6. fences the old pod's role label to `retired`, deletes only the frozen UID,
-   and publishes the reduced `stableSnapshot`.
+7. fences the old pod's role label to `retired` and deletes only the frozen
+   UID through exact prepared boundaries; and
+8. persists and reloads the compact terminal before publishing the reduced
+   `stableSnapshot`.
+
+There is no remove execution-mode selector or build feature. Legacy pilot and
+explicit remove records become durable incompatibility markers and never
+authorize a fresh execution. The compact contract limits history to 16
+records, boundary inputs/results to 4,096/2,048 bytes, active/terminal records
+to 262,144/12,288 bytes, and terminal payloads to 4,096 bytes. The
+representative no-fault path is exactly three external effects, two passive
+observations, five durable boundaries, and six accepted writes; final
+three-sample active records ranged from 3,373 to 18,693 bytes, with a
+4,245-byte terminal record and 683-byte terminal payload.
 
 The primary `ReplicaAgent` owns the transient sequence:
 
@@ -407,9 +456,11 @@ frozen reachable peer authority, while `Force` permits missing authority and
 degraded post-commit retirement. Neither mode weakens exact target admission
 or quorum.
 
-Primary progress is volatile and bounded; CRD status is the durable authority.
-A new primary-agent generation may receive a new pre-commit attempt only when
-exact previous Current or reduced CatchUp survives, up to three attempts.
+Primary progress is volatile and bounded. Immutable CRD admission plus the
+framework checkpoint are the durable execution authority, and the published
+CRD snapshot remains the topology authority. A new primary-agent generation
+may receive a new pre-commit attempt only when exact previous Current or
+reduced CatchUp survives, up to three attempts.
 The three terminal operator dispositions are:
 
 - `FailedPreCommitIncomplete` for a known pre-commit state after deadline or

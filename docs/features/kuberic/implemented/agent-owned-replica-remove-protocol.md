@@ -43,9 +43,11 @@ publication. The primary agent owns only transient membership-removal
 coordination. The target agent owns target-local retirement admission.
 `PodRuntime` owns ordered effects only.
 
-CRD status is the sole durable global authority. Agent action and peer ledgers
-are bounded, generation-qualified, and volatile. There is no durable
-agent-local workflow or exactly-once guarantee.
+CRD status owns immutable admission and published topology. The
+framework-native ConfigMap checkpoint owns durable execution history and
+terminal evidence. Agent action and peer ledgers are bounded,
+generation-qualified, and volatile. There is no durable agent-local workflow
+or exactly-once guarantee.
 
 ## Protocols and Versions
 
@@ -56,7 +58,8 @@ agent-local workflow or exactly-once guarantee.
 - `ReplicaLifecyclePeer` protocol: **2**.
 - Remove `Retire` stage semantic version: **1**.
 - Durable add operation version: **3**.
-- Durable remove operation version: **2**.
+- Remove domain operation version: **2**.
+- Framework-native remove execution contract: **3**.
 
 The intent signs operation/action/attempt identity, mode, epoch, exact primary
 and target identities, primary generation/control version/endpoints, optional
@@ -72,6 +75,58 @@ There is no old peer alias, version fallback, mixed-version support, or
 per-step removal compatibility path. Operators must quiesce add/rebuild
 and removal work before deploying the coordinated operator/runtime clean
 break.
+
+## Production Durable Execution Contract
+
+Remove-replica has one production framework-native execution path. No Cargo
+feature or `KubericSet` execution-mode selector chooses another remove engine.
+`ScaleDown` and `Force` remain immutable domain safety modes selected by
+admission.
+
+Contract version 3 stores immutable admission once: execution and operation
+identity, accepted mode, previous stable topology, exact target
+identity/UID/address/generation, minimum committed replicas, and deadlines.
+The reduced topology and remove domain operation are reconstructed
+deterministically. The version-3 encoding stores the already encoded protobuf
+action as binary exact bytes rather than hexadecimal text.
+
+Durable boundaries are compact tagged passive observations, exact prepared
+replica commands, exact UID-fenced label/delete commands, compact evidence or
+effect results, and bounded proven-no-admission redelivery evidence. A boundary
+does not copy the complete mutable operation or full multi-configuration state.
+The representative no-fault path is exactly three external effects, two
+passive observations, five completed boundaries, and six accepted writes.
+
+The contract admits at most 16 records, 4,096 bytes per boundary input, 2,048
+bytes per result, 262,144 active encoded bytes, 12,288 terminal encoded bytes,
+and a 4,096-byte terminal payload. The final three samples observed active
+records from 3,373 to 18,693 bytes, a 4,245-byte terminal record, and a
+683-byte terminal payload. These measurements are run-specific; 49,152 bytes
+(48 KiB) is the representative active acceptance gate.
+
+The shared runner persists an exact prepared command before yielding one
+private one-use dispatch permit. Conflict or unknown-write outcomes reload
+before a later permit. Lost or unresolved exposed effects remain quarantined
+until authoritative agent/runtime/Kubernetes evidence resolves them.
+
+Terminal state is accepted and then reloaded before status or topology
+publication. The remove adapter validates immutable admission, completed
+boundary accounting, commit evidence, and cleanup proof before handing the
+terminal to the reconciler. Publication conflict therefore retries from the
+retained terminal without redispatch.
+
+The checkpoint ConfigMap is in the `KubericSet` namespace and has a
+non-controlling, non-blocking owner reference to the exact set UID. The writer
+does not delete terminal records. Owner deletion permits Kubernetes garbage
+collection; explicit orphan cleanup uses a separately authorized lifecycle
+identity and retention policy.
+
+Legacy pilot references/checkpoints, legacy explicit remove status, and native
+versions other than 3 are incompatible. Legacy status is atomically replaced
+by a durable marker containing source, version, identity, and fingerprint. It
+is never converted, resumed, cleared as absent, or treated as permission for a
+new execution. This clean break does not change correlated control v3,
+`RemoveReplicaIntent` v1, lifecycle-peer v2/Retire v1, or their signatures.
 
 ## Commit, Compensation, and Publication
 
