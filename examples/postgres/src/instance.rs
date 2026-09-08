@@ -57,12 +57,12 @@ impl PgInstanceManager {
         &self.data_dir
     }
 
-    /// Connection string for local UDS access.
+    /// Connection string for local TCP access.
     /// Uses the current OS user (initdb creates a superuser matching the OS user).
     pub fn connection_string(&self) -> String {
         format!(
             "host={} port={} dbname=postgres",
-            self.data_dir.display(),
+            self.listen_host(),
             self.port,
         )
     }
@@ -211,7 +211,7 @@ impl PgInstanceManager {
         // (complements the exit monitor above). Exits quietly on shutdown.
         let port = self.port;
         let ft = fault_tx;
-        let data_dir = self.data_dir.clone();
+        let host = self.listen_host().to_string();
         let pg_bin = self.pg_bin.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -222,14 +222,7 @@ impl PgInstanceManager {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
                 }
                 let status = Command::new(pg_bin.join("pg_isready"))
-                    .args([
-                        "-h",
-                        &data_dir.to_string_lossy(),
-                        "-p",
-                        &port.to_string(),
-                        "-d",
-                        "postgres",
-                    ])
+                    .args(["-h", &host, "-p", &port.to_string(), "-d", "postgres"])
                     .output()
                     .await;
                 match status {
@@ -263,7 +256,7 @@ impl PgInstanceManager {
             let output = Command::new(self.pg_bin.join("pg_isready"))
                 .args([
                     "-h",
-                    &self.data_dir.to_string_lossy(),
+                    self.listen_host(),
                     "-p",
                     &self.port.to_string(),
                     "-d",
@@ -398,7 +391,7 @@ impl PgInstanceManager {
         Ok(())
     }
 
-    /// Connect to the local PG instance via UDS.
+    /// Connect to the local PG instance via TCP.
     pub async fn connect(
         &self,
     ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), PgError> {
