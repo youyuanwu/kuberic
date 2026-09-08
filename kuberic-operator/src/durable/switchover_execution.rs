@@ -3860,10 +3860,10 @@ mod framework_native_switchover_tests {
         let TestAdapterDecision::Observe(result) =
             evaluate_adapter_step(&operation, &observations, 100).unwrap()
         else {
-            panic!("initial explicit decision must persist the correlated revoke action");
+            panic!("initial switchover decision must persist the correlated revoke action");
         };
         let DurableSwitchoverStepResult::Advance { operation: pending } = *result else {
-            panic!("initial explicit decision must advance compact state");
+            panic!("initial switchover decision must advance compact state");
         };
         let pending = pending.apply_to(&operation).unwrap();
         assert!(pending.pending_action.is_some());

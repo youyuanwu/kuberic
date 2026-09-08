@@ -3775,27 +3775,27 @@ async fn test_framework_native_switchover_happy_path() {
         "terminal status publication must release process-local native host state"
     );
 
-    let mut explicit_status = KubericSetStatus {
+    let mut next_status = KubericSetStatus {
         target_primary: Some(original_primary),
         ..completed
     };
     for _ in 0..10 {
         reconcile_set(
-            &make_set("native-happy", 3, Some(explicit_status.clone())),
+            &make_set("native-happy", 3, Some(next_status.clone())),
             &api,
             &native_state,
         )
         .await
         .unwrap();
-        explicit_status = api.last_status().unwrap();
-        if explicit_status.phase == Phase::Switchover {
+        next_status = api.last_status().unwrap();
+        if next_status.phase == Phase::Switchover {
             break;
         }
     }
-    assert_eq!(explicit_status.phase, Phase::Switchover);
-    assert!(explicit_status.operation.is_none());
+    assert_eq!(next_status.phase, Phase::Switchover);
+    assert!(next_status.operation.is_none());
     assert!(
-        explicit_status.switchover_execution.is_some(),
+        next_status.switchover_execution.is_some(),
         "a retained terminal reference must not hijack a later native switchover"
     );
 }

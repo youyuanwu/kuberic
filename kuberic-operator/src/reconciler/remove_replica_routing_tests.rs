@@ -32,7 +32,7 @@ use crate::durable::remove_replica_execution::{
 };
 use crate::durable::switchover_execution::{
     SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES, SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
-    SwitchoverActivityAccounting as PilotActivityAccounting, SwitchoverTerminal,
+    SwitchoverActivityAccounting, SwitchoverTerminal,
     checkpoint_limits as switchover_checkpoint_limits,
     encode_terminal as encode_switchover_terminal, native_execution_spec, native_initial_operation,
     new_switchover_execution,
@@ -715,7 +715,7 @@ async fn store_switchover_terminal(
         operation: completed.clone(),
         snapshot: completed.target_snapshot.clone(),
         compensated: false,
-        accounting: PilotActivityAccounting::new(9, 3),
+        accounting: SwitchoverActivityAccounting::new(9, 3),
     };
     store_switchover_terminal_outcome(
         store,
@@ -1174,7 +1174,7 @@ async fn framework_native_switchover_route_publishes_compensation_and_quarantine
         operation: failed,
         snapshot: initial.previous_snapshot.cloned().unwrap(),
         compensated: true,
-        accounting: PilotActivityAccounting::new(8, 5),
+        accounting: SwitchoverActivityAccounting::new(8, 5),
     };
     let store = InMemoryCheckpointStore::new();
     store_switchover_terminal_outcome(
