@@ -531,6 +531,14 @@ impl CheckpointStore for MeasuredDurableCheckpointStore {
 #[cfg(test)]
 mod checkpoint_store_tests {
     use super::*;
+    use crate::crd::DurableOperationPhase;
+    use crate::durable::effects::{DeleteEffectCommand, LabelEffectCommand};
+    use crate::durable::remove_replica_execution::{
+        CompactReplicaEffectCommand, REMOVE_REPLICA_MAX_ACTIVE_ENCODED_BYTES,
+        REMOVE_REPLICA_MAX_TERMINAL_ENCODED_BYTES, REMOVE_REPLICA_MAX_TERMINAL_PAYLOAD_BYTES,
+        RemoveReplicaActivityAccounting, RemoveReplicaBoundaryInput, RemoveReplicaTerminal,
+        activity_spec, checkpoint_limits,
+    };
     use kuberic_durable_execution::{
         ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ExactBytes,
         ExecutionContract, ExecutionSpec, InMemoryFault, ReloadReason, TerminalOutcome,
@@ -640,6 +648,116 @@ mod checkpoint_store_tests {
         let measurements = store.measurements();
         assert_eq!(measurements.completed_external_effect_count, Some(2));
         assert_eq!(measurements.completed_passive_observation_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn native_remove_measurements_classify_six_writes_and_both_lifecycles() {
+        let execution_id = ExecutionId::from_bytes([32; 16]);
+        let execution = ExecutionSpec::new(
+            execution_id,
+            ExactBytes::new(b"native-remove-measurement"),
+            REMOVE_REPLICA_MAX_TERMINAL_PAYLOAD_BYTES,
+        );
+        let contract = ExecutionContract::with_encoded_limits(
+            execution,
+            REMOVE_REPLICA_MAX_ACTIVE_ENCODED_BYTES as u64,
+            REMOVE_REPLICA_MAX_TERMINAL_ENCODED_BYTES as u64,
+        );
+        let inputs = [
+            RemoveReplicaBoundaryInput::Observe {
+                phase: DurableOperationPhase::RemoveFreezeIntent,
+                attempt: 0,
+            },
+            RemoveReplicaBoundaryInput::ReplicaCommand {
+                command: CompactReplicaEffectCommand {
+                    expected_agent_generation: "generation".to_string(),
+                    expected_control_version: 1,
+                    observed_runtime_epoch: [1, 1],
+                    action_payload: ExactBytes::new(b"payload"),
+                },
+            },
+            RemoveReplicaBoundaryInput::Observe {
+                phase: DurableOperationPhase::RemoveAwaitCleanup,
+                attempt: 1,
+            },
+            RemoveReplicaBoundaryInput::LabelCommand {
+                command: LabelEffectCommand::new(
+                    3,
+                    "set-2".to_string(),
+                    "target-uid".to_string(),
+                    "retired".to_string(),
+                ),
+            },
+            RemoveReplicaBoundaryInput::DeleteCommand {
+                command: DeleteEffectCommand::new(3, "set-2".to_string(), "target-uid".to_string()),
+            },
+        ];
+        let activities = inputs
+            .iter()
+            .enumerate()
+            .map(|(sequence, input)| {
+                ActivityRecord::completed(
+                    ActivitySequence::new(sequence as u64),
+                    activity_spec(input).unwrap(),
+                    ExactBytes::new(b"{}".to_vec()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let store = MeasuredDurableCheckpointStore::with_native_remove_decoder(
+            execution_id,
+            DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+        );
+        let mut revision = None;
+        for completed in 1..=activities.len() {
+            let checkpoint = CheckpointEnvelope::encode_with_limits(
+                &CheckpointPayload::active(contract.clone(), activities[..completed].to_vec()),
+                checkpoint_limits(),
+            )
+            .unwrap();
+            let CasOutcome::Accepted(next_revision) = store
+                .compare_and_swap(execution_id, revision, checkpoint)
+                .await
+                .unwrap()
+            else {
+                panic!("native active measurement write must be accepted");
+            };
+            revision = Some(next_revision);
+        }
+        let terminal_payload = serde_json::to_vec(&RemoveReplicaTerminal::Rejected {
+            message: "fixture".to_string(),
+            accounting: RemoveReplicaActivityAccounting {
+                external_effect_count: 3,
+                passive_observation_count: 2,
+            },
+        })
+        .unwrap();
+        let terminal = CheckpointEnvelope::encode_with_limits(
+            &CheckpointPayload::terminal(
+                contract,
+                TerminalOutcome::failed(ExactBytes::new(terminal_payload)),
+                5,
+            ),
+            checkpoint_limits(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .compare_and_swap(execution_id, revision, terminal)
+                .await
+                .unwrap(),
+            CasOutcome::Accepted(_)
+        ));
+
+        let measurements = store.measurements();
+        assert_eq!(measurements.accepted_writes, 6);
+        assert_eq!(measurements.completed_activity_count, Some(5));
+        assert_eq!(measurements.completed_external_effect_count, Some(3));
+        assert_eq!(measurements.completed_passive_observation_count, Some(2));
+        assert!(measurements.minimum_active_checkpoint_bytes.is_some());
+        assert!(measurements.maximum_active_checkpoint_bytes > 0);
+        assert!(measurements.latest_terminal_checkpoint_bytes.is_some());
+        assert!(measurements.minimum_terminal_checkpoint_bytes.is_some());
+        assert!(measurements.maximum_terminal_checkpoint_bytes > 0);
     }
 
     #[cfg(feature = "durable-switchover-pilot")]

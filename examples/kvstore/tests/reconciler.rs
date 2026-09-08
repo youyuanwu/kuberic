@@ -6780,6 +6780,103 @@ async fn test_framework_native_remove_replica_is_the_default_production_path() {
 
 #[test_log::test(tokio::test)]
 #[serial]
+async fn test_framework_native_remove_replica_three_no_fault_measurement_samples() {
+    use kuberic_durable_execution::CheckpointStore;
+    use kuberic_operator::durable::remove_replica_execution::{checkpoint_limits, execution_spec};
+
+    for sample in 1..=3 {
+        let name = format!("native-remove-measurement-{sample}");
+        let api = KvClusterApi::new();
+        let bootstrap = ReconcilerState::default();
+        let healthy = create_healthy_set(&api, &bootstrap, &name, 3).await;
+        let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let state = ReconcilerState::with_remove_replica_store(backend.clone());
+
+        reconcile_set(&make_set(&name, 2, Some(healthy)), &api, &state)
+            .await
+            .unwrap();
+        let accepted = api.last_status().unwrap();
+        let reference = accepted
+            .remove_replica_execution
+            .clone()
+            .expect("native remove admission reference");
+        let execution = execution_spec(&reference).unwrap();
+
+        api.reset_operations();
+        let completed = drive_framework_native_remove(&api, &state, &name, 2, accepted).await;
+        assert_eq!(completed.phase, Phase::Healthy);
+        assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 2);
+
+        let measurements = state
+            .framework_native_remove_replica_measurements(
+                "default",
+                &name,
+                "test-uid",
+                &reference.execution_id,
+            )
+            .await
+            .expect("completed native remove measurements");
+        let stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .expect("terminal native remove checkpoint");
+        let terminal_record_bytes = stored.checkpoint().encoded_len().unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(&execution, checkpoint_limits())
+            .unwrap();
+        let (terminal, durable_boundaries) = payload.terminal_outcome().unwrap();
+        let terminal_payload_bytes = terminal.payload().as_slice().len();
+        let active_min = measurements
+            .minimum_active_checkpoint_bytes
+            .expect("at least one active checkpoint");
+        let terminal_record = measurements
+            .latest_terminal_checkpoint_bytes
+            .expect("terminal checkpoint measurement");
+
+        println!(
+            concat!(
+                "KUBERIC_REMOVE_REPLICA_MEASUREMENT sample={} external_effects={:?} ",
+                "passive_observations={:?} durable_boundaries={} checkpoint_accepted_writes={} ",
+                "active_min_bytes={} active_max_bytes={} terminal_record_bytes={} ",
+                "terminal_payload_bytes={}"
+            ),
+            sample,
+            measurements.completed_external_effect_count,
+            measurements.completed_passive_observation_count,
+            durable_boundaries,
+            measurements.accepted_writes,
+            active_min,
+            measurements.maximum_active_checkpoint_bytes,
+            terminal_record_bytes,
+            terminal_payload_bytes,
+        );
+        assert_eq!(measurements.completed_external_effect_count, Some(3));
+        assert_eq!(measurements.completed_passive_observation_count, Some(2));
+        assert_eq!(measurements.completed_activity_count, Some(5));
+        assert_eq!(durable_boundaries, 5);
+        assert_eq!(measurements.accepted_writes, 6);
+        assert!(active_min <= measurements.maximum_active_checkpoint_bytes);
+        assert!(
+            measurements.maximum_active_checkpoint_bytes <= 49_152,
+            "sample {sample} active maximum was {} bytes",
+            measurements.maximum_active_checkpoint_bytes
+        );
+        assert_eq!(terminal_record, terminal_record_bytes);
+        assert_eq!(
+            measurements.minimum_terminal_checkpoint_bytes,
+            Some(terminal_record_bytes)
+        );
+        assert_eq!(
+            measurements.maximum_terminal_checkpoint_bytes,
+            terminal_record_bytes
+        );
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
 async fn test_framework_native_remove_replica_legacy_pilot_marker_survives_restarts() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();

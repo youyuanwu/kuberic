@@ -1,6 +1,6 @@
 # Phase 4 Remove-Replica Safety Traceability
 
-Deletion gate status: **passed on 2026-09-08**. Every SC-002 invariant maps to
+Deletion gate status: **passed and revalidated through Phase 6 on 2026-09-08**. Every SC-002 invariant maps to
 retained framework-native, shared runner/kernel, Kubernetes provider, or
 live-cluster coverage. No row relies only on the legacy remove pilot.
 
@@ -111,3 +111,64 @@ The six independently named native remove tests are:
 - Real owner-GC deletion gate:
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real validates_real_api_cas_watch_compaction_and_ambiguous_recovery -- --nocapture`
   — **passed**, including `KUBERNETES_CHECKPOINT_LIFECYCLE owner_gc=passed`.
+
+## Phase 6 Final Results
+
+- Canonical no-fault measurement:
+  `cargo test -p kvstore --test reconciler test_framework_native_remove_replica_three_no_fault_measurement_samples -- --nocapture`
+  — **passed, 3 samples**. Every sample recorded exactly 3 external effects,
+  2 passive observations, 5 durable boundaries, and 6 accepted writes.
+
+  | Sample | Active minimum | Active maximum | Terminal record | Terminal payload |
+  |---:|---:|---:|---:|---:|
+  | 1 | 3,373 bytes | 18,685 bytes | 4,245 bytes | 683 bytes |
+  | 2 | 3,373 bytes | 18,685 bytes | 4,245 bytes | 683 bytes |
+  | 3 | 3,381 bytes | 18,693 bytes | 4,245 bytes | 683 bytes |
+
+- Exact one-byte-over matrix:
+  `cargo test -p kuberic-operator remove_replica_execution_rejects_all_six_one_byte_over_bounds`
+  — **passed** for 17 records, 4,097-byte input, 2,049-byte result,
+  262,145-byte active record, 12,289-byte terminal record, and 4,097-byte
+  terminal payload.
+- Theoretical maximum-fault projection:
+  `cargo test -p kuberic-operator remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds -- --nocapture`
+  — **passed** with 16 records, 4,096-byte input, 2,048-byte result,
+  182,589-byte projected active record, 11,453-byte projected terminal record,
+  and a 4,096-byte terminal payload ceiling.
+- Isolated-Kind validation exposed a real 4,096-byte prepared-command
+  regression with production-length Kubernetes identities. The native contract
+  now stores the already-encoded protobuf action as binary `ExactBytes` rather
+  than hex text, and the serialized contract version advanced from 2 to 3.
+  The representative prepared command decreased from 3,064 to 2,070 bytes in
+  the unit fixture, and the live native removal subsequently passed.
+- Default native/shared gates passed:
+  `cargo test -p kuberic-operator framework_native_remove_replica`,
+  `cargo test -p kuberic-operator durable_runner_tests`,
+  `cargo test -p kuberic-operator checkpoint_store`, and
+  `cargo test -p kvstore --test reconciler test_framework_native_remove_replica_`.
+- Local repository gates passed:
+  `cargo check --all-targets`, `cargo fmt --all -- --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo build --all-targets`,
+  `cargo test -p kuberic-core -p kuberic-operator -p kvstore -p sqlite-replicated`,
+  `cargo test --doc --workspace`, and the complexity script/unit tests.
+- Full all-feature validation passed with the dedicated kubeconfig and
+  repository-local PostgreSQL 16 tooling:
+  `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test --all --all-features`.
+  The live-test crate reported **5 passed, 1 ignored**; the reconciler target
+  reported **81 passed**; PostgreSQL instance tests reported **3 passed**.
+- Dedicated Kind validation passed without enumerating or touching CAPI
+  clusters: isolated cluster probe, `just images`, the real provider test,
+  `test_kvstore_k8s_status_healthy`, `test_kvstore_k8s_write_read`, and
+  `test_kvstore_k8s_framework_native_remove_replica`.
+- Real provider measurements remained:
+  active checkpoint 673 bytes, terminal checkpoint 521 bytes, 2 accepted
+  writes, 1 watch event / 1,163 canonical typed-event bytes, and
+  `owner_gc=passed`.
+- Final live native removal evidence:
+  owner UID `901e4eb3-3df6-431f-8afb-e3e67c274dcf`, checkpoint
+  `kuberic-checkpoint-c8b119b0d9a560b84ba18361a5334b9d`, terminal checkpoint
+  4,769 bytes, removed pod `kvstore-2`, and 2 surviving pods with unchanged
+  admitted UIDs. The test restored the shared live fixture to three healthy
+  replicas afterward.
+- All 34 SC-002 rows above retain their named replacement tests. No mapped
+  test was removed during production graduation or Phase 6 measurement work.

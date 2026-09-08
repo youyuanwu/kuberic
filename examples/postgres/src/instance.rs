@@ -69,14 +69,23 @@ impl PgInstanceManager {
 
     /// Initialize a new PG cluster with data checksums.
     pub async fn init_db(&self) -> Result<(), PgError> {
-        let output = Command::new(self.pg_bin.join("initdb"))
-            .args([
-                "--data-checksums",
-                "-D",
-                &self.data_dir.to_string_lossy(),
-                "--auth=trust",
-                "--no-instructions",
-            ])
+        let mut command = Command::new(self.pg_bin.join("initdb"));
+        command.args([
+            "--data-checksums",
+            "-D",
+            &self.data_dir.to_string_lossy(),
+            "--auth=trust",
+            "--no-instructions",
+        ]);
+        if let Some(version) = self.pg_bin.parent().and_then(|path| path.file_name())
+            && let Some(usr_dir) = self.pg_bin.ancestors().nth(4)
+        {
+            let share_dir = usr_dir.join("share").join("postgresql").join(version);
+            if share_dir.is_dir() {
+                command.arg("-L").arg(share_dir);
+            }
+        }
+        let output = command
             .env("LC_ALL", "C")
             .output()
             .await

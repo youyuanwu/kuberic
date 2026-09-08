@@ -78,9 +78,26 @@ class ComplexityMeasurementTests(unittest.TestCase):
             "8d773ef2b32fd3073e11849a131fe2c2f5e6b97b",
         )
 
-    def test_remove_comparison_scopes_are_retired(self) -> None:
+    def test_registry_contains_only_supported_switchover_and_shared_scopes(self) -> None:
         labels = {label for label, _segments in measure_complexity.MEASUREMENTS}
-        self.assertFalse(any(label.startswith("remove_") for label in labels))
+        self.assertEqual(
+            labels,
+            {
+                "explicit_switchover",
+                "pilot_module",
+                "pilot_workflow_subset",
+                "pilot_workflow_body",
+                "shared_operator_effect_adapters",
+                "shared_operator_checkpoint_support",
+                "shared_operator_workflow_host",
+                "switchover_effect_recovery_integration",
+                "checkpoint_store_integration",
+                "pilot_effect_bridge_integration",
+                "pilot_reconcile_integration",
+                "shared_kernel_typed",
+                "shared_kernel_fused",
+            },
+        )
 
 
 if __name__ == "__main__":

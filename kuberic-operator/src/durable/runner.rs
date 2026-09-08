@@ -86,6 +86,12 @@ pub enum DurableAdapterBoundary {
         detail: String,
         requeue_after_seconds: u64,
     },
+    ObserveAndProgressThenWait {
+        observation: Box<ActivityObservation>,
+        reason: String,
+        detail: String,
+        requeue_after_seconds: u64,
+    },
     Wait {
         reason: String,
         detail: String,
@@ -269,8 +275,25 @@ impl DurableRunner {
             .turn_and_expose_with(workflow, execution.clone(), adapter.resolver())
             .await;
         let mut observation_wait = None;
+        let mut progression_wait = None;
         for _ in 0..self.max_host_outcomes {
             host.store().correlate_host_outcome(&outcome);
+            if let Some((condition_reason, detail, requeue_after_seconds)) = progression_wait.take()
+                && matches!(
+                    &outcome,
+                    HostOutcome::DispatchPermitted { .. }
+                        | HostOutcome::Quarantined { .. }
+                        | HostOutcome::ScheduleAccepted { .. }
+                        | HostOutcome::ObservationAccepted { .. }
+                )
+            {
+                return DurableRunnerOutcome::Active {
+                    reason: DurableActiveReason::Adapter,
+                    condition_reason,
+                    detail,
+                    requeue_after_seconds,
+                };
+            }
             outcome = match outcome {
                 HostOutcome::DispatchPermitted { permit, .. } => {
                     let activity = permit.activity().clone();
@@ -304,6 +327,21 @@ impl DurableRunner {
                             observation_wait = Some((reason, detail, requeue_after_seconds));
                             host.observe(&execution, observation).await
                         }
+                        AdapterHandling::ObserveAndProgressThenWait {
+                            observation,
+                            reason,
+                            detail,
+                            requeue_after_seconds,
+                        } => {
+                            progression_wait = Some((reason, detail, requeue_after_seconds));
+                            host.observe_and_turn_with(
+                                workflow,
+                                &execution,
+                                observation,
+                                adapter.resolver(),
+                            )
+                            .await
+                        }
                         AdapterHandling::Return(result) => return result,
                     }
                 }
@@ -330,6 +368,21 @@ impl DurableRunner {
                         } => {
                             observation_wait = Some((reason, detail, requeue_after_seconds));
                             host.observe(&execution, observation).await
+                        }
+                        AdapterHandling::ObserveAndProgressThenWait {
+                            observation,
+                            reason,
+                            detail,
+                            requeue_after_seconds,
+                        } => {
+                            progression_wait = Some((reason, detail, requeue_after_seconds));
+                            host.observe_and_turn_with(
+                                workflow,
+                                &execution,
+                                observation,
+                                adapter.resolver(),
+                            )
+                            .await
                         }
                         AdapterHandling::Return(result) => return result,
                     }
@@ -454,6 +507,17 @@ impl DurableRunner {
                 detail,
                 requeue_after_seconds,
             },
+            DurableAdapterBoundary::ObserveAndProgressThenWait {
+                observation,
+                reason,
+                detail,
+                requeue_after_seconds,
+            } => AdapterHandling::ObserveAndProgressThenWait {
+                observation: *observation,
+                reason,
+                detail,
+                requeue_after_seconds,
+            },
             DurableAdapterBoundary::Wait { reason, detail } => {
                 AdapterHandling::Return(DurableRunnerOutcome::Active {
                     reason: DurableActiveReason::Adapter,
@@ -486,6 +550,12 @@ enum AdapterHandling<P> {
         detail: String,
         requeue_after_seconds: u64,
     },
+    ObserveAndProgressThenWait {
+        observation: ActivityObservation,
+        reason: String,
+        detail: String,
+        requeue_after_seconds: u64,
+    },
     Return(DurableRunnerOutcome<P>),
 }
 
@@ -493,7 +563,9 @@ impl<P> AdapterHandling<P> {
     fn into_result(self) -> DurableRunnerOutcome<P> {
         match self {
             Self::Return(result) => result,
-            Self::Observe(_) | Self::ObserveAndWait { .. } => {
+            Self::Observe(_)
+            | Self::ObserveAndWait { .. }
+            | Self::ObserveAndProgressThenWait { .. } => {
                 DurableRunnerOutcome::Nondeterministic(Nondeterminism::UnsupportedSuspension)
             }
         }

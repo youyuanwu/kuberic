@@ -174,6 +174,18 @@ impl ReconcilerState {
             )),
         }
     }
+
+    pub async fn framework_native_remove_replica_measurements(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        set_uid: &str,
+        execution_id: &str,
+    ) -> Option<crate::durable::checkpoint_store::DurableCheckpointMeasurementsSnapshot> {
+        self.framework_native_remove_replica
+            .measurements(namespace, set_name, set_uid, execution_id)
+            .await
+    }
 }
 
 /// Result of a reconciliation — either requeue after a duration, or done.

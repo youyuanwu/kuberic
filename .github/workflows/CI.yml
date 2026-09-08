@@ -68,8 +68,12 @@ jobs:
         RUST_MIN_STACK: 4194304
       run: |
         cargo test -p kuberic-operator framework_native_remove_replica
-        cargo test -p kuberic-operator durable_effect_outcome
+        cargo test -p kuberic-operator durable_runner_tests
+        cargo test -p kuberic-operator checkpoint_store
+        cargo test -p kuberic-operator remove_replica_execution_rejects_all_six_one_byte_over_bounds
+        cargo test -p kuberic-operator remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds -- --nocapture
         cargo test -p kvstore --test reconciler test_framework_native_remove_replica_
+        cargo test -p kvstore --test reconciler test_framework_native_remove_replica_three_no_fault_measurement_samples -- --nocapture
 
     - name: Build all targets
       run: cargo build --all-targets

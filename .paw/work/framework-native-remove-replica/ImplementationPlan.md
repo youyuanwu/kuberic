@@ -172,7 +172,7 @@ pull requests. This planning activity creates no commit.
 - [x] **Phase 3: Compact Native Remove Contract** - Build the versioned compact remove workflow, explicit incompatibility handling, and bounded admission.
 - [x] **Phase 4: Native Integration and Safety Traceability** - Integrate remove with the runner and establish passing replacement coverage for every deletion-gate invariant.
 - [x] **Phase 5: Production Graduation and Legacy Removal** - Make native remove the only production path and delete explicit/pilot surfaces after the safety gate passes.
-- [ ] **Phase 6: Measurements and Full Validation** - Lock semantic/byte measurements, update CI, and run complete local plus isolated-Kind validation.
+- [x] **Phase 6: Measurements and Full Validation** - Lock semantic/byte measurements, update CI, and run complete local plus isolated-Kind validation.
 - [ ] **Phase 7: Documentation** - Produce the as-built record and update all project documentation for the production contract.
 
 ## Phase Candidates
@@ -641,59 +641,59 @@ pass before any explicit remove orchestration or legacy test is deleted.
 
 #### Automated Verification
 
-- [ ] Representative measurement passes:
+- [x] Representative measurement passes:
   `cargo test -p kvstore --test reconciler test_framework_native_remove_replica_three_no_fault_measurement_samples -- --nocapture`
-- [ ] Bounds/admission matrix passes:
+- [x] Bounds/admission matrix passes:
   `cargo test -p kuberic-operator framework_native_remove_replica`
-- [ ] Complexity tooling passes:
+- [x] Complexity tooling passes:
   `python3 scripts/measure-switchover-complexity.py && python3 -m unittest scripts.tests.test_measure_switchover_complexity`
-- [ ] Type check passes: `cargo check --all-targets`
-- [ ] Formatting passes: `cargo fmt --all -- --check`
-- [ ] Clippy passes: `cargo clippy --all-targets -- -D warnings`
-- [ ] Build passes: `cargo build --all-targets`
-- [ ] Targeted component suite passes:
+- [x] Type check passes: `cargo check --all-targets`
+- [x] Formatting passes: `cargo fmt --all -- --check`
+- [x] Clippy passes: `cargo clippy --all-targets -- -D warnings`
+- [x] Build passes: `cargo build --all-targets`
+- [x] Targeted component suite passes:
   `cargo test -p kuberic-core -p kuberic-operator -p kvstore -p sqlite-replicated`
-- [ ] Documentation tests pass: `cargo test --doc --workspace`
-- [ ] Full workspace/all-feature suite passes:
+- [x] Documentation tests pass: `cargo test --doc --workspace`
+- [x] Full workspace/all-feature suite passes:
   `cargo test --all --all-features`
 
 #### Isolated Kind Verification
 
-- [ ] Probe only the isolated kubeconfig with
+- [x] Probe only the isolated kubeconfig with
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" kubectl --kubeconfig "$HOME/.kube/kuberic-kind-config" cluster-info`.
   If that exact config is absent or unhealthy, create only cluster `kind` with
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" kind create cluster --name kind --config deploy/kind-config.yaml --kubeconfig "$HOME/.kube/kuberic-kind-config"`.
   Do not enumerate Kind clusters and never read, switch to, modify, or delete
   `capi-kamaji-management` or `capi-worker-spike`.
-- [ ] Build/load repository images with `just images` while
+- [x] Build/load repository images with `just images` while
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config"`; the repository recipe targets
   cluster name `kind`.
-- [ ] Real provider/owner-GC tests pass against that cluster:
+- [x] Real provider/owner-GC tests pass against that cluster:
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real -- --nocapture`
-- [ ] Existing live smoke tests pass before mutation:
+- [x] Existing live smoke tests pass before mutation:
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests test_kvstore_k8s_status_healthy -- --nocapture`
   and
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests test_kvstore_k8s_write_read -- --nocapture`.
-- [ ] Live native removal passes:
+- [x] Live native removal passes:
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests test_kvstore_k8s_framework_native_remove_replica -- --nocapture`.
-- [ ] Inspect the live object and checkpoint to confirm no mode selector is
+- [x] Inspect the live object and checkpoint to confirm no mode selector is
   required, the admitted owner UID is retained, terminal durability precedes
   the published two-member topology, and no replacement UID is mutated. Every
   `kubectl` invocation uses both
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config"` and
   `--kubeconfig "$HOME/.kube/kuberic-kind-config"`.
-- [ ] Leave the dedicated `kind` cluster and isolated kubeconfig intact after
+- [x] Leave the dedicated `kind` cluster and isolated kubeconfig intact after
   validation unless this workflow created the cluster and cleanup is
   intentionally required; never clean up any CAPI cluster.
 
 #### Manual Verification
 
-- [ ] All three representative samples are at or below 49,152 active bytes and
+- [x] All three representative samples are at or below 49,152 active bytes and
   preserve the exact semantic/write counts.
-- [ ] Theoretical fault capacity remains explicitly bounded at 262,144 active
+- [x] Theoretical fault capacity remains explicitly bounded at 262,144 active
   bytes even though the no-fault representative gate is 49,152 bytes.
-- [ ] CI contains no remove comparison or pilot feature gate.
-- [ ] The safety traceability matrix still maps every SC-002 row to a passing,
+- [x] CI contains no remove comparison or pilot feature gate.
+- [x] The safety traceability matrix still maps every SC-002 row to a passing,
   retained test.
 
 ### Local Commit

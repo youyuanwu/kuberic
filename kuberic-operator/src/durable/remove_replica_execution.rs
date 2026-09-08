@@ -69,7 +69,7 @@ use super::{
     record_activity_error, start_remove_replica,
 };
 
-pub const REMOVE_REPLICA_CONTRACT_VERSION: u32 = 2;
+pub const REMOVE_REPLICA_CONTRACT_VERSION: u32 = 3;
 pub const REMOVE_REPLICA_MAX_MEMBERS: usize = 3;
 pub const REMOVE_REPLICA_MAX_ACTIVITY_RECORDS: usize = 16;
 pub const REMOVE_REPLICA_MAX_WORKFLOW_INPUT_BYTES: usize = 2_048;
@@ -132,7 +132,7 @@ pub struct CompactReplicaEffectCommand {
     #[serde(rename = "r")]
     pub observed_runtime_epoch: [i64; 2],
     #[serde(rename = "d")]
-    pub action_payload: String,
+    pub action_payload: ExactBytes,
 }
 
 impl From<ReplicaEffectCommand> for CompactReplicaEffectCommand {
@@ -144,16 +144,16 @@ impl From<ReplicaEffectCommand> for CompactReplicaEffectCommand {
                 command.observed_runtime_epoch.data_loss_number,
                 command.observed_runtime_epoch.configuration_number,
             ],
-            action_payload: command.action_payload,
+            action_payload: compact_action_payload(&command.action_payload),
         }
     }
 }
 
 impl CompactReplicaEffectCommand {
     pub fn effect_command(&self) -> Result<ReplicaEffectCommand, String> {
-        let action =
-            kuberic_core::grpc::convert::decode_correlated_action_payload(&self.action_payload)
-                .map_err(|error| format!("decode compact native remove command: {error}"))?;
+        let action_payload = expand_action_payload(&self.action_payload);
+        let action = kuberic_core::grpc::convert::decode_correlated_action_payload(&action_payload)
+            .map_err(|error| format!("decode compact native remove command: {error}"))?;
         let DurableReplicaAction::RemoveReplicaIntent { intent } = &action else {
             return Err("compact native remove command contains another action".to_string());
         };
@@ -176,9 +176,29 @@ impl CompactReplicaEffectCommand {
                 data_loss_number: self.observed_runtime_epoch[0],
                 configuration_number: self.observed_runtime_epoch[1],
             },
-            action_payload: self.action_payload.clone(),
+            action_payload,
         })
     }
+}
+
+fn compact_action_payload(encoded: &str) -> ExactBytes {
+    let bytes: Vec<u8> = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("generated action payload is ASCII");
+            u8::from_str_radix(pair, 16).expect("generated action payload is hexadecimal")
+        })
+        .collect();
+    ExactBytes::new(bytes)
+}
+
+fn expand_action_payload(encoded: &ExactBytes) -> String {
+    encoded
+        .as_slice()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl RemoveReplicaBoundaryInput {
@@ -1311,6 +1331,7 @@ fn logical_boundary(operation: &DurableOperationStatus) -> RemoveReplicaBoundary
 pub struct RemoveReplicaPreparedActivityResolver {
     operation: DurableOperationStatus,
     history: Vec<DurableOperationStatus>,
+    force_observation: bool,
     observations: OperationObservations,
     pod_identities: OperationPodIdentities,
     target_role_label: Option<String>,
@@ -1331,6 +1352,7 @@ impl RemoveReplicaPreparedActivityResolver {
         Self {
             operation: operation.clone(),
             history: vec![operation.clone()],
+            force_observation: false,
             observations: observations.clone(),
             pod_identities: pod_identities.clone(),
             target_role_label: target_role_label.map(ToOwned::to_owned),
@@ -1344,12 +1366,20 @@ impl RemoveReplicaPreparedActivityResolver {
         self
     }
 
+    fn force_observation(mut self, force_observation: bool) -> Self {
+        self.force_observation = force_observation;
+        self
+    }
+
     fn prepare(
         &self,
         logical: &RemoveReplicaBoundaryInput,
     ) -> Result<RemoveReplicaBoundaryInput, PreparedActivityError> {
         if logical != &logical_boundary(&self.operation) {
             return Err(PreparedActivityError::Validation);
+        }
+        if self.force_observation {
+            return Ok(logical.clone());
         }
         match decide_remove_replica(
             &self.operation,
@@ -2579,6 +2609,7 @@ impl<'a> FrameworkNativeRemoveReplicaAdapter<'a> {
         &mut self,
         activity: LogicalActivityId,
         result: RemoveReplicaBoundaryResult,
+        force_next_observation: bool,
         stop_for_fresh_authority: bool,
     ) -> DurableAdapterBoundary {
         let encoded = match encode_boundary_result(&result) {
@@ -2602,9 +2633,17 @@ impl<'a> FrameworkNativeRemoveReplicaAdapter<'a> {
             &context.addressed_instances,
             self.now,
         )
-        .with_history(self.operation_history.clone());
+        .with_history(self.operation_history.clone())
+        .force_observation(force_next_observation);
         let observation = ActivityObservation::new(activity, encoded);
-        if stop_for_fresh_authority {
+        if force_next_observation {
+            DurableAdapterBoundary::ObserveAndProgressThenWait {
+                observation: Box::new(observation),
+                reason: "RefreshingAuthority".to_string(),
+                detail: "native remove persisted effect evidence and exposed a passive boundary for fresh authority before another command".to_string(),
+                requeue_after_seconds: 1,
+            }
+        } else if stop_for_fresh_authority {
             DurableAdapterBoundary::ObserveAndWait {
                 observation: Box::new(observation),
                 reason: "RefreshingAuthority".to_string(),
@@ -2726,6 +2765,7 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                     activity.clone(),
                     RemoveReplicaBoundaryResult::Observation { evidence },
                     false,
+                    false,
                 )
             }
             RemoveReplicaBoundaryInput::ReplicaCommand { command } => {
@@ -2769,6 +2809,7 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                                 redelivery: 1,
                                 evidence,
                             },
+                            false,
                             dispatch_rejection_requires_refresh(&error),
                         )
                     }
@@ -2782,7 +2823,7 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                                 &error.to_string(),
                             ),
                         };
-                        self.observation(activity.clone(), result, true)
+                        self.observation(activity.clone(), result, false, true)
                     }
                     Err(_) => self.wait(
                         "EffectExposed",
@@ -2825,6 +2866,7 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                 activity,
                 RemoveReplicaBoundaryResult::Observation { evidence },
                 false,
+                false,
             ),
             RemoveReplicaBoundaryInput::ReplicaCommand { command } => {
                 let exact = match command.effect_command() {
@@ -2849,6 +2891,7 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                             outcome: DurableEffectOutcome::Applied(evidence),
                         },
                         true,
+                        false,
                     );
                 }
                 if generation_change_proves_no_admission(
@@ -2863,6 +2906,7 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                             redelivery: 1,
                             evidence,
                         },
+                        false,
                         true,
                     );
                 }
@@ -2886,7 +2930,8 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                         RemoveReplicaBoundaryResult::Effect {
                             outcome: DurableEffectOutcome::Applied(evidence),
                         },
-                        true,
+                        false,
+                        false,
                     )
                 } else {
                     self.wait(
@@ -2906,7 +2951,8 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                         RemoveReplicaBoundaryResult::Effect {
                             outcome: DurableEffectOutcome::Applied(evidence),
                         },
-                        true,
+                        false,
+                        false,
                     )
                 } else {
                     self.wait(
@@ -4599,15 +4645,16 @@ mod remove_replica_execution_tests {
         changed.observed_runtime_epoch[1] = changed.observed_runtime_epoch[1].saturating_add(1);
         changed_commands.push(changed);
         let mut changed = command.clone();
-        changed.action_payload.push('x');
+        changed.action_payload = ExactBytes::new(b"invalid");
         changed_commands.push(changed);
         let (other_operation, _) = freeze_and_dispatch();
         let other_action = DurableReplicaAction::RemoveReplicaIntent {
             intent: Box::new(core_intent(&other_operation).unwrap()),
         };
         let mut changed = command.clone();
-        changed.action_payload =
-            kuberic_core::grpc::convert::encode_correlated_action_payload(&other_action).unwrap();
+        changed.action_payload = compact_action_payload(
+            &kuberic_core::grpc::convert::encode_correlated_action_payload(&other_action).unwrap(),
+        );
         changed_commands.push(changed);
         for changed in changed_commands {
             let changed =
@@ -5344,13 +5391,19 @@ mod remove_replica_execution_tests {
             .unwrap()
             .action_id
             .clone();
-        api.statuses
-            .lock()
-            .unwrap()
-            .get_mut(&exposed_operation.old_primary_id)
-            .unwrap()
-            .agent
-            .current_action = Some(completed_action(&exposed_operation, action_id));
+        {
+            let mut statuses = api.statuses.lock().unwrap();
+            let primary = statuses.get_mut(&exposed_operation.old_primary_id).unwrap();
+            primary.configuration = Some(
+                core_intent(&exposed_operation)
+                    .unwrap()
+                    .reduced_current_status(),
+            );
+            primary
+                .active_replica_connections
+                .retain(|connection| connection.id != exposed_operation.target_replica_id.unwrap());
+            primary.agent.current_action = Some(completed_action(&exposed_operation, action_id));
+        }
         let reloaded_store = adapter_store(&execution, backend);
         let mut reloaded_host = RemoveReplicaHost::new(
             reloaded_store.clone(),
