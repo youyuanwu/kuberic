@@ -982,7 +982,7 @@ async fn bridge_preconsumed_switchover_step(
 ) -> Result<SwitchoverEffectBridgeOutcome, String> {
     match prepared {
         super::switchover_execution::SwitchoverActivityKind::PassiveObservation => {
-            Err("passive pilot observation unexpectedly reached the effect bridge".to_string())
+            Err("passive switchover observation unexpectedly reached the effect bridge".to_string())
         }
         super::switchover_execution::SwitchoverActivityKind::PreparedReplica { command } => {
             let Some(handle) = handles.get(&command.target_id) else {
@@ -1062,7 +1062,7 @@ pub fn resolve_switchover_quarantine(
     ) && operation.pending_action.is_some()
     {
         return Err(
-            "quarantined pending external pilot effect was misclassified as a passive observation"
+            "quarantined pending external switchover effect was misclassified as a passive observation"
                 .to_string(),
         );
     }
@@ -1160,14 +1160,14 @@ pub(crate) fn exact_label_command(
         })
         .map(|member| member.instance_id.clone())
         .ok_or_else(|| {
-            format!("pilot label target {target_id} is not in the operation snapshot")
+            format!("switchover label target {target_id} is not in the operation snapshot")
         })?;
     let observed = observations
         .get(&target_id)
-        .ok_or_else(|| format!("pilot label target {target_id} is unavailable"))?;
+        .ok_or_else(|| format!("switchover label target {target_id} is unavailable"))?;
     if observed.status.instance_id.as_str() != expected_uid {
         return Err(format!(
-            "pilot label target {target_id} incarnation changed before patch"
+            "switchover label target {target_id} incarnation changed before patch"
         ));
     }
     Ok(LabelEffectCommand::new(
@@ -1235,7 +1235,7 @@ mod tests {
 
     fn pending_command() -> PendingActionStatus {
         PendingActionStatus {
-            action_id: "pilot:7:effect".to_string(),
+            action_id: "switchover:7:effect".to_string(),
             sequence: 7,
             kind: crate::crd::DurableActionKind::RevokeWrite,
             target_id: 2,
@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_seven_pilot_replica_actions_prepare_and_dispatch_exact_fenced_commands() {
+    async fn all_seven_switchover_replica_actions_prepare_and_dispatch_exact_fenced_commands() {
         let actions = [
             DurableReplicaAction::RevokeWriteStatus,
             DurableReplicaAction::ChangeRole {
@@ -1428,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn pilot_preparation_rejects_incarnation_protocol_and_action_identity_drift() {
+    fn switchover_preparation_rejects_incarnation_protocol_and_action_identity_drift() {
         let pending = pending_command();
         let action = DurableReplicaAction::RevokeWriteStatus;
         assert_eq!(
