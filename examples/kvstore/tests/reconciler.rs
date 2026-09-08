@@ -1423,7 +1423,7 @@ async fn drive_native_switchover(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("durable execution switchover pilot did not reach Healthy: {status:?}");
+    panic!("framework-native switchover did not reach Healthy: {status:?}");
 }
 
 async fn native_checkpoint_ready_for_terminal(
@@ -3561,7 +3561,7 @@ async fn test_reconciler_switchover() {
 async fn test_framework_native_switchover_happy_path() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-happy", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-happy", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -3572,11 +3572,11 @@ async fn test_framework_native_switchover_happy_path() {
         .find(|name| name != &original_primary)
         .unwrap();
     let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let pilot_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
+    let native_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
 
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-happy",
+            "native-happy",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary.clone()),
@@ -3585,12 +3585,12 @@ async fn test_framework_native_switchover_happy_path() {
             }),
         ),
         &api,
-        &pilot_state,
+        &native_state,
     )
     .await
     .unwrap();
     let accepted = api.last_status().unwrap();
-    let pilot_status_writes_after_acceptance = api.statuses.lock().unwrap().len();
+    let native_status_writes_after_acceptance = api.statuses.lock().unwrap().len();
     let status_attempts_after_acceptance = *api.status_patch_attempts.lock().unwrap();
     let status_conflicts_after_acceptance = *api.status_patch_conflicts.lock().unwrap();
     let status_unknowns_after_acceptance = *api.status_patch_unknowns.lock().unwrap();
@@ -3603,7 +3603,7 @@ async fn test_framework_native_switchover_happy_path() {
     assert!(accepted.switchover_execution.is_some());
 
     api.reset_operations();
-    let completed = drive_native_switchover(&api, &pilot_state, "pilot-happy", 3, accepted).await;
+    let completed = drive_native_switchover(&api, &native_state, "native-happy", 3, accepted).await;
     assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
     assert!(completed.operation.is_none());
     assert!(completed.switchover_execution.is_some());
@@ -3653,15 +3653,15 @@ async fn test_framework_native_switchover_happy_path() {
         .unwrap();
     let (terminal_outcome, durable_boundary_count) = terminal_payload.terminal_outcome().unwrap();
     let terminal_payload_bytes = terminal_outcome.payload().as_slice().len();
-    let measurements = pilot_state
+    let measurements = native_state
         .framework_native_switchover_measurements(
             "default",
-            "pilot-happy",
+            "native-happy",
             "test-uid",
             &reference.execution_id,
         )
         .await
-        .expect("completed pilot measurements must remain available");
+        .expect("completed native measurements must remain available");
     let authoritative_external_effects = measurements
         .completed_external_effect_count
         .expect("accepted active checkpoints must classify external effects");
@@ -3729,7 +3729,7 @@ async fn test_framework_native_switchover_happy_path() {
             .lock()
             .unwrap()
             .len()
-            .saturating_sub(pilot_status_writes_after_acceptance),
+            .saturating_sub(native_status_writes_after_acceptance),
         api.status_patch_attempts
             .lock()
             .unwrap()
@@ -3767,10 +3767,10 @@ async fn test_framework_native_switchover_happy_path() {
             ControlOperation::WaitForCatchUpQuorum,
             ControlOperation::UpdateCurrentConfiguration,
         ],
-        "pilot must retain the Service Fabric-aligned mutation order"
+        "native switchover must retain the Service Fabric-aligned mutation order"
     );
     assert_eq!(
-        pilot_state.framework_native_switchover_host_count().await,
+        native_state.framework_native_switchover_host_count().await,
         0,
         "terminal status publication must release process-local native host state"
     );
@@ -3781,9 +3781,9 @@ async fn test_framework_native_switchover_happy_path() {
     };
     for _ in 0..10 {
         reconcile_set(
-            &make_set("pilot-happy", 3, Some(explicit_status.clone())),
+            &make_set("native-happy", 3, Some(explicit_status.clone())),
             &api,
-            &pilot_state,
+            &native_state,
         )
         .await
         .unwrap();
@@ -3811,7 +3811,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
 
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let healthy = create_healthy_set(&api, &bootstrap, "pilot-fr017", 3).await;
+    let healthy = create_healthy_set(&api, &bootstrap, "native-outcomes", 3).await;
     let original_primary = healthy.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -3826,7 +3826,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let active_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (active_state, active) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -3836,7 +3836,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     api.fail_status_after_successes(&original_primary, 0, InjectedStatusError::Unavailable);
     api.reset_operations();
     let action = reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(active)),
+        &make_native_switchover_set("native-outcomes", 3, Some(active)),
         &api,
         &active_state,
     )
@@ -3865,7 +3865,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let incompatible_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (incompatible_state, incompatible) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -3889,7 +3889,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
         CasOutcome::Accepted(_)
     ));
     reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(incompatible)),
+        &make_native_switchover_set("native-outcomes", 3, Some(incompatible)),
         &api,
         &incompatible_state,
     )
@@ -3912,7 +3912,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let rejected_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (rejected_state, rejected) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -3951,7 +3951,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
         CasOutcome::Accepted(_)
     ));
     reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(rejected)),
+        &make_native_switchover_set("native-outcomes", 3, Some(rejected)),
         &api,
         &rejected_state,
     )
@@ -3972,7 +3972,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let isolated_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (isolated_state, isolated) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -3992,7 +3992,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
             .unwrap()
     };
     reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(isolated)),
+        &make_native_switchover_set("native-outcomes", 3, Some(isolated)),
         &api,
         &isolated_state,
     )
@@ -4022,7 +4022,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let conflict_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (conflict_state, conflict) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -4031,7 +4031,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     .await;
     conflict_store.fail_next_compare_and_swap(InMemoryFault::ConflictWithoutApply);
     reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(conflict)),
+        &make_native_switchover_set("native-outcomes", 3, Some(conflict)),
         &api,
         &conflict_state,
     )
@@ -4051,7 +4051,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let unknown_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (unknown_state, unknown) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -4060,7 +4060,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     .await;
     unknown_store.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownAfterApply);
     reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(unknown)),
+        &make_native_switchover_set("native-outcomes", 3, Some(unknown)),
         &api,
         &unknown_state,
     )
@@ -4080,7 +4080,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let failed_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (failed_state, failed) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -4092,7 +4092,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
         "injected switchover load failure",
     ));
     reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(failed)),
+        &make_native_switchover_set("native-outcomes", 3, Some(failed)),
         &api,
         &failed_state,
     )
@@ -4115,7 +4115,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let nondeterministic_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (nondeterministic_state, nondeterministic) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
@@ -4162,7 +4162,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
         CasOutcome::Accepted(_)
     ));
     reconcile_set(
-        &make_native_switchover_set("pilot-fr017", 3, Some(nondeterministic)),
+        &make_native_switchover_set("native-outcomes", 3, Some(nondeterministic)),
         &api,
         &nondeterministic_state,
     )
@@ -4183,14 +4183,15 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
     let terminal_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let (terminal_state, terminal) = accept_native_switchover(
         &api,
-        "pilot-fr017",
+        "native-outcomes",
         &healthy,
         &original_primary,
         &target,
         terminal_store,
     )
     .await;
-    let terminal = drive_native_switchover(&api, &terminal_state, "pilot-fr017", 3, terminal).await;
+    let terminal =
+        drive_native_switchover(&api, &terminal_state, "native-outcomes", 3, terminal).await;
     assert_eq!(terminal.phase, Phase::Healthy);
     assert_eq!(terminal.current_primary.as_deref(), Some(target.as_str()));
     observed.push("terminal");
@@ -4217,7 +4218,7 @@ async fn test_framework_native_switchover_operation_outcome_matrix() {
 async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_redelivery() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-redelivery", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-redelivery", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4228,11 +4229,11 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
         .find(|name| name != &original_primary)
         .unwrap();
     let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let pilot_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
+    let native_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
 
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-redelivery",
+            "native-redelivery",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary),
@@ -4241,7 +4242,7 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
             }),
         ),
         &api,
-        &pilot_state,
+        &native_state,
     )
     .await
     .unwrap();
@@ -4253,9 +4254,9 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
     let status_calls_before_rejection: usize =
         api.status_call_counts.lock().unwrap().values().sum();
     let refresh_action = reconcile_set(
-        &make_native_switchover_set("pilot-redelivery", 3, Some(accepted)),
+        &make_native_switchover_set("native-redelivery", 3, Some(accepted)),
         &api,
-        &pilot_state,
+        &native_state,
     )
     .await
     .unwrap();
@@ -4284,9 +4285,9 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
     }));
 
     reconcile_set(
-        &make_native_switchover_set("pilot-redelivery", 3, Some(after_rejection)),
+        &make_native_switchover_set("native-redelivery", 3, Some(after_rejection)),
         &api,
-        &pilot_state,
+        &native_state,
     )
     .await
     .unwrap();
@@ -4306,7 +4307,7 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
     );
 
     let completed =
-        drive_native_switchover(&api, &pilot_state, "pilot-redelivery", 3, after_retry).await;
+        drive_native_switchover(&api, &native_state, "native-redelivery", 3, after_retry).await;
     assert_eq!(completed.phase, Phase::Healthy);
     assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
 
@@ -4327,10 +4328,10 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
         .unwrap();
     assert_eq!(terminal_payload.terminal_outcome().unwrap().1, 13);
 
-    let measurements = pilot_state
+    let measurements = native_state
         .framework_native_switchover_measurements(
             "default",
-            "pilot-redelivery",
+            "native-redelivery",
             "test-uid",
             &reference.execution_id,
         )
@@ -4350,7 +4351,7 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
 async fn test_framework_native_switchover_observation_collection_survives_restart_every_turn() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-restart", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-restart", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4364,7 +4365,7 @@ async fn test_framework_native_switchover_observation_collection_survives_restar
     let initial_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-restart",
+            "native-restart",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary),
@@ -4389,7 +4390,7 @@ async fn test_framework_native_switchover_observation_collection_survives_restar
     for _ in 0..180 {
         let restarted = ReconcilerState::with_switchover_store(checkpoint_store.clone());
         reconcile_set(
-            &make_native_switchover_set("pilot-restart", 3, Some(status.clone())),
+            &make_native_switchover_set("native-restart", 3, Some(status.clone())),
             &api,
             &restarted,
         )
@@ -4429,7 +4430,7 @@ async fn test_framework_native_switchover_observation_collection_survives_restar
 async fn test_framework_native_switchover_publication_compensates_failed_promotion() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-rollback", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-rollback", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4444,7 +4445,7 @@ async fn test_framework_native_switchover_publication_compensates_failed_promoti
     );
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-rollback",
+            "native-rollback",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary.clone()),
@@ -4462,7 +4463,7 @@ async fn test_framework_native_switchover_publication_compensates_failed_promoti
 
     for _ in 0..100 {
         reconcile_set(
-            &make_native_switchover_set("pilot-rollback", 3, Some(status.clone())),
+            &make_native_switchover_set("native-rollback", 3, Some(status.clone())),
             &api,
             &state,
         )
@@ -4480,7 +4481,7 @@ async fn test_framework_native_switchover_publication_compensates_failed_promoti
         }
     }
     api.fail_terminal_next_durable_action(ControlOperation::ChangeRole);
-    let completed = drive_native_switchover(&api, &state, "pilot-rollback", 3, status).await;
+    let completed = drive_native_switchover(&api, &state, "native-rollback", 3, status).await;
     assert_eq!(
         completed.current_primary.as_deref(),
         Some(original_primary.as_str())
@@ -4503,7 +4504,7 @@ async fn test_framework_native_switchover_publication_compensates_failed_promoti
     let measurements = state
         .framework_native_switchover_measurements(
             "default",
-            "pilot-rollback",
+            "native-rollback",
             "test-uid",
             &reference.execution_id,
         )
@@ -4527,7 +4528,7 @@ async fn test_framework_native_switchover_publication_compensates_failed_promoti
 async fn test_framework_native_switchover_observes_lost_promotion_reply_once() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-lost-reply", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-lost-reply", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4542,7 +4543,7 @@ async fn test_framework_native_switchover_observes_lost_promotion_reply_once() {
     );
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-lost-reply",
+            "native-lost-reply",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary),
@@ -4559,7 +4560,7 @@ async fn test_framework_native_switchover_observes_lost_promotion_reply_once() {
     api.reset_operations();
     for _ in 0..100 {
         reconcile_set(
-            &make_native_switchover_set("pilot-lost-reply", 3, Some(status.clone())),
+            &make_native_switchover_set("native-lost-reply", 3, Some(status.clone())),
             &api,
             &state,
         )
@@ -4577,7 +4578,7 @@ async fn test_framework_native_switchover_observes_lost_promotion_reply_once() {
         }
     }
     api.fail_after_next_durable_action(ControlOperation::ChangeRole);
-    let completed = drive_native_switchover(&api, &state, "pilot-lost-reply", 3, status).await;
+    let completed = drive_native_switchover(&api, &state, "native-lost-reply", 3, status).await;
     assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
     assert_eq!(
         api.operations()
@@ -4594,7 +4595,7 @@ async fn test_framework_native_switchover_observes_lost_promotion_reply_once() {
 async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_lost_reply_once() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-all-lost-replies", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-all-lost-replies", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4609,7 +4610,7 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
     );
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-all-lost-replies",
+            "native-all-lost-replies",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary),
@@ -4637,7 +4638,7 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
     api.fail_after_next_durable_action(expected[armed_index]);
     for _ in 0..220 {
         reconcile_set(
-            &make_native_switchover_set("pilot-all-lost-replies", 3, Some(status.clone())),
+            &make_native_switchover_set("native-all-lost-replies", 3, Some(status.clone())),
             &api,
             &state,
         )
@@ -4678,7 +4679,7 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
 async fn test_framework_native_switchover_terminal_validation_reloads_before_publication() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-terminal-reload", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-terminal-reload", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4692,7 +4693,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
     let state = ReconcilerState::with_switchover_store(store.clone());
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-terminal-reload",
+            "native-terminal-reload",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary),
@@ -4709,7 +4710,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
     api.reset_operations();
     for _ in 0..160 {
         reconcile_set(
-            &make_native_switchover_set("pilot-terminal-reload", 3, Some(status.clone())),
+            &make_native_switchover_set("native-terminal-reload", 3, Some(status.clone())),
             &api,
             &state,
         )
@@ -4726,7 +4727,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
     api.fail_next_status_patch();
     for _ in 0..60 {
         reconcile_set(
-            &make_native_switchover_set("pilot-terminal-reload", 3, Some(status.clone())),
+            &make_native_switchover_set("native-terminal-reload", 3, Some(status.clone())),
             &api,
             &state,
         )
@@ -4746,7 +4747,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
     assert_eq!(status.phase, Phase::Switchover);
     api.fail_next_status_patch();
     let retry = reconcile_set(
-        &make_native_switchover_set("pilot-terminal-reload", 3, Some(status.clone())),
+        &make_native_switchover_set("native-terminal-reload", 3, Some(status.clone())),
         &api,
         &state,
     )
@@ -4755,7 +4756,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
     assert!(
         matches!(retry, kuberic_operator::reconciler::ReconcileAction::Requeue(delay) if delay == Duration::from_secs(1))
     );
-    let mut replacement = make_native_switchover_set("pilot-terminal-reload", 3, None);
+    let mut replacement = make_native_switchover_set("native-terminal-reload", 3, None);
     replacement.metadata.uid = Some("replacement-set-uid".to_string());
     reconcile_set(&replacement, &api, &state).await.unwrap();
     assert_eq!(
@@ -4767,7 +4768,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
     api.pods.lock().unwrap().clear();
     let restarted = ReconcilerState::with_switchover_store(store);
     reconcile_set(
-        &make_native_switchover_set("pilot-terminal-reload", 3, Some(status)),
+        &make_native_switchover_set("native-terminal-reload", 3, Some(status)),
         &api,
         &restarted,
     )
@@ -4787,7 +4788,7 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
 async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-terminal-conflict", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-terminal-conflict", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4801,7 +4802,7 @@ async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() 
     let state = ReconcilerState::with_switchover_store(store.clone());
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-terminal-conflict",
+            "native-terminal-conflict",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary),
@@ -4818,7 +4819,7 @@ async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() 
     api.reset_operations();
     for _ in 0..180 {
         reconcile_set(
-            &make_native_switchover_set("pilot-terminal-conflict", 3, Some(status.clone())),
+            &make_native_switchover_set("native-terminal-conflict", 3, Some(status.clone())),
             &api,
             &state,
         )
@@ -4840,7 +4841,7 @@ async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() 
         kuberic_durable_execution::InMemoryFault::ConflictWithoutApply,
     );
     let action = reconcile_set(
-        &make_native_switchover_set("pilot-terminal-conflict", 3, Some(status.clone())),
+        &make_native_switchover_set("native-terminal-conflict", 3, Some(status.clone())),
         &api,
         &state,
     )
@@ -4856,7 +4857,7 @@ async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() 
             && condition.message.contains("ObservationProgression")
     }));
     let completed =
-        drive_native_switchover(&api, &state, "pilot-terminal-conflict", 3, status).await;
+        drive_native_switchover(&api, &state, "native-terminal-conflict", 3, status).await;
     assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
     assert_eq!(
         api.operations()
@@ -4873,7 +4874,7 @@ async fn test_framework_native_switchover_reloads_after_terminal_cas_conflict() 
 async fn test_framework_native_switchover_authority_preparation_rejects_stale_target_incarnation() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "pilot-stale-target", 3).await;
+    let status = create_healthy_set(&api, &bootstrap, "native-stale-target", 3).await;
     let original_primary = status.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -4888,7 +4889,7 @@ async fn test_framework_native_switchover_authority_preparation_rejects_stale_ta
     );
     reconcile_set(
         &make_native_switchover_set(
-            "pilot-stale-target",
+            "native-stale-target",
             3,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary),
@@ -4912,7 +4913,7 @@ async fn test_framework_native_switchover_authority_preparation_rejects_stale_ta
         .uid = Some("replacement-target-uid".to_string());
     api.reset_operations();
     let action = reconcile_set(
-        &make_native_switchover_set("pilot-stale-target", 3, Some(accepted)),
+        &make_native_switchover_set("native-stale-target", 3, Some(accepted)),
         &api,
         &state,
     )
@@ -4945,11 +4946,11 @@ async fn test_framework_native_switchover_authority_preparation_rejects_stale_ta
 async fn test_framework_native_switchover_unknown_checkpoint_outcomes_requeue_without_effect() {
     for (name, fault) in [
         (
-            "pilot-unknown-unapplied",
+            "native-unknown-unapplied",
             kuberic_durable_execution::InMemoryFault::OutcomeUnknownWithoutApply,
         ),
         (
-            "pilot-unknown-applied",
+            "native-unknown-applied",
             kuberic_durable_execution::InMemoryFault::OutcomeUnknownAfterApply,
         ),
     ] {
@@ -5057,7 +5058,7 @@ async fn test_framework_native_switchover_unknown_checkpoint_outcomes_requeue_wi
 async fn test_framework_native_switchover_repeated_intent_gets_distinct_identity() {
     let api = KvClusterApi::new();
     let bootstrap = ReconcilerState::default();
-    let healthy = create_healthy_set(&api, &bootstrap, "pilot-distinct-id", 3).await;
+    let healthy = create_healthy_set(&api, &bootstrap, "native-distinct-id", 3).await;
     let original_primary = healthy.current_primary.clone().unwrap();
     let target = api
         .pods
@@ -5076,7 +5077,7 @@ async fn test_framework_native_switchover_repeated_intent_gets_distinct_identity
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     reconcile_set(
-        &make_native_switchover_set("pilot-distinct-id", 3, Some(request.clone())),
+        &make_native_switchover_set("native-distinct-id", 3, Some(request.clone())),
         &api,
         &first_state,
     )
@@ -5095,7 +5096,7 @@ async fn test_framework_native_switchover_repeated_intent_gets_distinct_identity
     let mut second_id = None;
     for _ in 0..5 {
         reconcile_set(
-            &make_native_switchover_set("pilot-distinct-id", 3, Some(request.clone())),
+            &make_native_switchover_set("native-distinct-id", 3, Some(request.clone())),
             &api,
             &second_state,
         )
