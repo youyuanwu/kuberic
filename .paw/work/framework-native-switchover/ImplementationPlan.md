@@ -158,7 +158,7 @@ obsolete tests and documentation.
 - [x] **Phase 4: Remove Obsolete Surfaces and Update Delivery Artifacts** -
   Delete the selector, build feature, split routing/status/conditions, stale
   test helpers, and update the checked-in schema, examples, and CI gates.
-- [ ] **Phase 5: Documentation and Full Validation** - Record the as-built
+- [x] **Phase 5: Documentation and Full Validation** - Record the as-built
   architecture and measurements, update project documentation, and run the
   complete repository validation matrix.
 

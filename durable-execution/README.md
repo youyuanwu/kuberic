@@ -3,8 +3,7 @@
 `kuberic-durable-execution` is a focused kernel for deterministic, linear
 workflow replay. It has no dependency on `kuberic-core` or
 `kuberic-operator`; the operator uses it for production framework-native
-remove-replica and can also use it for the optional switchover workflow. It is
-not an end-user runtime.
+remove-replica and switchover workflows. It is not an end-user runtime.
 
 ## Selected authoring surface
 

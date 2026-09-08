@@ -46,25 +46,16 @@ metadata:
 spec:
   replicas: 3
   image: my-app:latest
-  switchoverExecutionMode: explicit
   controlPort: 50051
   dataPort: 50052
   clientPort: 50053
 ```
 
-## Optional Durable Switchover Pilot
+## Framework-Native Switchover
 
-The existing explicit switchover state machine is the default. A `KubericSet`
-with at most three stable members can opt into the comparison pilot only when
-the operator binary is built with `--features durable-switchover-pilot` and
-the resource sets:
-
-```yaml
-spec:
-  switchoverExecutionMode: durablePilot
-```
-
-The pilot stores format-3 checkpoints in same-namespace ConfigMaps named
+Switchover always uses the framework-native durable workflow. There is no
+execution-mode selector or optional operator build feature. The workflow
+stores format-3 checkpoints in same-namespace ConfigMaps named
 `kuberic-checkpoint-<execution-id>`. They have a non-controlling owner
 reference to the `KubericSet`, remain through terminal reload, and are garbage
 collected with that owner. The operator needs ConfigMap `get`, `create`, and
@@ -72,7 +63,7 @@ collected with that owner. The operator needs ConfigMap `get`, `create`, and
 remains the scheduler and all replica mutations continue through
 `ReplicaAgent`.
 
-The pilot workflow uses typed activity calls and compact effect/observation
+The workflow uses typed activity calls and compact effect/observation
 records. Deterministic switchover transitions replay in memory; fused
 checkpoint CAS operations durably expose an exact command before returning a
 permit and combine authoritative observation with the next command or terminal
@@ -80,14 +71,17 @@ state. Unknown replica or UID-fenced label outcomes remain quarantined and are
 not automatically retried. Set/Pod watches provide normal wakeups, with
 bounded deadline requeues as a fallback.
 
-Use `status.durableSwitchoverPilot` and the `DurableSwitchoverPilot` condition
-to inspect execution identity, storage reloads, exposed/quarantined work, and
-completion. The switchover selector does not apply to creation, add/build,
-removal, or failover; removal already uses the production framework-native
-path.
+Use `status.switchoverExecution` and the `FrameworkNativeSwitchover` condition
+to inspect immutable admission, checkpoint identity, compatibility blocking,
+storage reloads, exposed/quarantined work, and completion. Legacy explicit and
+pilot executions are retained as incompatibility evidence and are not resumed.
+Creation, add/build, removal, and failover retain their existing execution
+models.
 
 The representative integration test reports checkpoint, status, effect,
-label, and Pod-list measurements.
+label, and Pod-list measurements. The canonical three-member path is nine
+external effects, three passive observations, 12 durable boundaries, and 13
+accepted writes.
 
 ## Deployment
 

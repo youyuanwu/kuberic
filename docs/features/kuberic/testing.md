@@ -367,8 +367,8 @@ both ACK paths through correlated Close actions and bounds new/in-flight
 writes.
 
 **Pattern 5: Failure during switchover compensation** ✅
-`test_durable_switchover_compensates_failed_target_promotion` exercises the
-real correlated path and verifies old-primary restoration.
+`test_framework_native_switchover_publication_compensates_failed_promotion`
+exercises the real correlated path and verifies old-primary restoration.
 
 **Pattern 6: Operator process restart recovery** ✅
 `test_operator_restart_recovers_read_only_then_switches_and_scales` replaces
@@ -378,50 +378,43 @@ verifies continued writes, switchover, and scale-up. Companion tests cover
 recovered unhealthy-primary failover, legacy/mismatched snapshot rejection,
 post-recovery pod logical/incarnation drift, and unordered pod listing.
 
-**Pattern 7: Durable switchover boundary and ambiguity recovery** ✅
-`test_durable_switchover_survives_state_loss_at_every_boundary` discards
-`ReconcilerState` after every checkpoint/activity window. Companion tests
-inject a lost target-promotion reply, force target-promotion compensation,
-reject a stale pod incarnation, and reject a status resource-version conflict
-before mutation. Assertions cover deterministic single dispatch of unsafe role
-changes, terminal stable snapshot recovery, and unsupported checkpoint
-versions with no mutating RPC.
+**Pattern 7: Framework-native durable switchover** ✅
+`test_framework_native_switchover_*` drives the only production path through
+the format-3 checkpoint kernel. The matrix covers every-turn operator restart,
+unknown outcomes with and without apply, checkpoint conflict, terminal CAS
+conflict, failed status publication followed by terminal reload without Pods,
+stale target incarnation, target-promotion compensation, and lost replies for
+every replica mutation. It asserts the ordered mutation sequence, one admitted
+unsafe effect per correlation identity, terminal-before-status recovery, and
+fail-closed legacy/unsupported state.
 
-**Pattern 7a: Feature-gated durable-execution switchover pilot** ✅
-`test_durable_execution_switchover_pilot_*` keeps the explicit path as the
-default and drives the opt-in path through the format-3 checkpoint kernel.
-The matrix covers every-turn operator restart, schedule unknown outcomes with
-and without apply, fused terminal CAS conflict, failed status publication
-followed by terminal reload without Pods, stale target incarnation, failed
-target-promotion compensation, and lost replies for every replica mutation. It
-asserts the ordered mutation sequence, one admitted unsafe effect per
-correlation identity, and terminal-before-status recovery. Operator unit tests
-separately prove unknown UID-fenced label exposure remains quarantined,
-ordinary activity payloads exclude full operation snapshots, and activity
-count plus deterministic transition fuel are independently bounded.
-
-Run only the targeted pilot matrix:
+Run the targeted matrix:
 
 ```console
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
-  --test reconciler test_durable_execution_switchover_pilot_ -- --nocapture
+  --test reconciler test_framework_native_switchover_ -- --nocapture
 ```
 
 The authoritative happy-path gate expects exactly nine external effects plus
 three passive observations, giving 12 completed durable boundaries and 13
 accepted checkpoint writes including terminal persistence. Seven former
 preparation-only records are now part of their corresponding effect exposure.
-Six repeated remediation runs observed maximum active checkpoints from 31,597
-to 31,605 bytes and terminal checkpoints from 4,077 to 4,081 bytes. These are
+The graduation sample observed 31,785 maximum active-checkpoint bytes, 4,169
+terminal-checkpoint bytes, and a 1,041-byte terminal payload. These are
 run-specific snapshots because runtime-generated values affect serialized
-length; no exact byte value is a compatibility contract. The stable admission
-contracts are the configured 770,048-byte (752 KiB) encoded-checkpoint ceiling
-and 4,096-byte terminal-payload ceiling, and the executable gate checks its
-authoritative measurements against those ceilings.
+length; no exact byte value is a compatibility contract.
+
+The independent contract limits are 32 activity records, 4,096 workflow-input
+bytes, 8,192 activity-input bytes, 4,096 result bytes, 770,048 active encoded
+bytes, 16,384 terminal encoded bytes, 4,096 terminal-payload bytes, 512 error
+bytes, 64 workflow transitions, and 32 runner outcomes per reconcile. Maximum
+fixtures measure 714,105 active bytes and 15,093 terminal bytes. The
+19-record success-with-redelivery projection is 427,133 bytes; the 21-record
+rollback-with-redelivery projection is 471,285 bytes.
 
 The terminal payload carries the external-effect and passive-observation
 counts, so a fresh measurement store can recover the classification without
-prior active-checkpoint cache state. A successful full pilot requires exactly
+prior active-checkpoint cache state. A successful full switchover requires exactly
 three passive observations and `9 + r` external boundaries, where `r` is the
 number of proven-no-admission redeliveries and is limited to the seven
 projected ReplicaAgent-effect slots; UID-fenced label effects have no
@@ -446,14 +439,16 @@ Run the exact operational measurement and projection gates with:
 
 ```console
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
+  success_and_rollback_transcripts_fit_with_redelivery_headroom -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  --features durable-switchover-pilot maximum_projected_history_fits_both_budgets
+  maximum_projected_history_fits_both_budgets -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
-  --features durable-switchover-pilot measurements_ -- --nocapture
+  framework_native_switchover_rejects_every_independent_one_over_bound
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  measurements_ -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
   -p kvstore --test reconciler \
-  test_durable_execution_switchover_pilot_happy_path -- --nocapture
+  test_framework_native_switchover_happy_path -- --nocapture
 ```
 
 The ambiguity matrix distinguishes exposure conflicts, definite storage
@@ -467,12 +462,12 @@ kernel's 45-scenario conformance matrix also covers fused schedule/exposure,
 observation/next exposure, observation/terminal, exact permit/attempt identity,
 and capacity reservation.
 
-Pilot/operator tests run with a 4 MiB test-thread stack in CI-constrained
+Switchover/operator tests run with a 4 MiB test-thread stack in CI-constrained
 environments:
 
 ```console
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
-  -p kvstore --test reconciler test_durable_execution_switchover_pilot_
+  -p kvstore --test reconciler test_framework_native_switchover_
 ```
 
 The real Kubernetes checkpoint test also creates an owner-bound terminal
