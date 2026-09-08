@@ -2985,8 +2985,10 @@ mod remove_replica_execution_tests {
         CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest, Lsn, ReplicaId,
     };
     use kuberic_durable_execution::{
-        ActivityCallError, CasOutcome, CheckpointError, CheckpointStore, Evaluation, HostEpoch,
-        InMemoryCheckpointStore, PreparedActivityError, encode_activity_result, evaluate,
+        ActivityCallError, ActivityState, CasOutcome, CheckpointError, CheckpointState,
+        CheckpointStore, DispatchPermit, Evaluation, HostEpoch, HostOutcome,
+        InMemoryCheckpointStore, PersistenceBoundary, PreparedActivityError,
+        encode_activity_result, evaluate,
     };
     use serde::de::DeserializeOwned;
 
@@ -3052,6 +3054,20 @@ mod remove_replica_execution_tests {
             snapshot(),
             target(),
             DurableRemoveMode::ScaleDown,
+            2,
+            10,
+        )
+        .unwrap()
+    }
+
+    fn force_reference() -> RemoveReplicaExecution {
+        let mut target = target();
+        target.agent_generation = None;
+        new_execution(
+            "set-uid",
+            snapshot(),
+            target,
+            DurableRemoveMode::Force,
             2,
             10,
         )
@@ -3577,6 +3593,167 @@ mod remove_replica_execution_tests {
         )
     }
 
+    fn native_host(
+        execution: &ExecutionSpec,
+        backend: InMemoryCheckpointStore,
+        epoch: u8,
+    ) -> RemoveReplicaHost {
+        RemoveReplicaHost::new(
+            adapter_store(execution, backend),
+            HostEpoch::from_bytes([epoch; 16]),
+            checkpoint_limits(),
+        )
+    }
+
+    async fn active_history(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+    ) -> Vec<ActivityRecord> {
+        let stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        stored
+            .checkpoint()
+            .decode_and_validate(execution, checkpoint_limits())
+            .unwrap()
+            .active_activities()
+            .unwrap()
+            .to_vec()
+    }
+
+    async fn assert_native_exposed_history(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        permit: &DispatchPermit,
+        expected_specs: &[ActivitySpec],
+    ) {
+        let activities = active_history(backend, execution).await;
+        assert_eq!(activities.len(), expected_specs.len());
+        for (record, expected) in activities.iter().zip(expected_specs) {
+            assert_eq!(record.spec(), expected);
+        }
+        assert!(
+            activities[..activities.len() - 1]
+                .iter()
+                .all(|record| matches!(record.state(), ActivityState::Completed { .. }))
+        );
+        let exposed = activities.last().unwrap();
+        assert_eq!(
+            exposed.logical_id(execution.execution_id()),
+            *permit.activity()
+        );
+        assert!(matches!(
+            exposed.state(),
+            ActivityState::DispatchExposed { attempt_id }
+                if *attempt_id == permit.attempt_id()
+        ));
+    }
+
+    async fn assert_native_completed_history(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        expected_specs: &[ActivitySpec],
+    ) -> usize {
+        let stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let encoded_len = stored.checkpoint().encoded_len().unwrap();
+        let activities = stored
+            .checkpoint()
+            .decode_and_validate(execution, checkpoint_limits())
+            .unwrap()
+            .active_activities()
+            .unwrap()
+            .to_vec();
+        assert_eq!(activities.len(), expected_specs.len());
+        for (record, expected) in activities.iter().zip(expected_specs) {
+            assert_eq!(record.spec(), expected);
+            assert!(matches!(record.state(), ActivityState::Completed { .. }));
+        }
+        encoded_len
+    }
+
+    async fn restart_native_into_quarantine(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        epoch: u8,
+        permit: &DispatchPermit,
+    ) -> RemoveReplicaHost {
+        let before = backend.load(execution.execution_id()).await.unwrap();
+        let mut restarted = native_host(execution, backend.clone(), epoch);
+        let HostOutcome::Quarantined {
+            activity,
+            attempt_id,
+        } = restarted
+            .turn(&RemoveReplicaWorkflow, execution.clone())
+            .await
+        else {
+            panic!("expected exposed native remove activity to be quarantined after restart");
+        };
+        assert_eq!(activity, *permit.activity());
+        assert_eq!(attempt_id, permit.attempt_id());
+        assert_eq!(
+            backend.load(execution.execution_id()).await.unwrap(),
+            before
+        );
+        restarted
+    }
+
+    async fn replayed_native_boundary(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        reference: &RemoveReplicaExecution,
+    ) -> (DurableOperationStatus, Vec<DurableOperationStatus>) {
+        replay_active_operation_history(reference, &active_history(backend, execution).await)
+            .unwrap()
+    }
+
+    fn resolver_for(
+        operation: &DurableOperationStatus,
+        history: Vec<DurableOperationStatus>,
+        observations: &OperationObservations,
+        pods: &OperationPodIdentities,
+        target_role_label: Option<&str>,
+        now: i64,
+    ) -> RemoveReplicaPreparedActivityResolver {
+        let addressed = observations
+            .iter()
+            .map(|(id, observation)| (*id, observation.status.instance_id.clone()))
+            .collect();
+        RemoveReplicaPreparedActivityResolver::new(
+            operation,
+            observations,
+            pods,
+            target_role_label,
+            &addressed,
+            now,
+        )
+        .with_history(history)
+    }
+
+    fn record_exact_effect(
+        effects: &mut BTreeMap<Vec<u8>, usize>,
+        permit: &DispatchPermit,
+    ) -> RemoveReplicaBoundaryInput {
+        let input = decode_boundary_input(permit.activity().spec().input()).unwrap();
+        assert!(matches!(
+            input,
+            RemoveReplicaBoundaryInput::ReplicaCommand { .. }
+                | RemoveReplicaBoundaryInput::LabelCommand { .. }
+                | RemoveReplicaBoundaryInput::DeleteCommand { .. }
+        ));
+        let count = effects
+            .entry(permit.activity().spec().input().as_slice().to_vec())
+            .or_default();
+        *count += 1;
+        assert_eq!(*count, 1, "an exact durable effect was dispatched twice");
+        input
+    }
+
     #[test]
     fn remove_replica_execution_admission_is_structured_compact_and_derives_reduced_topology() {
         let reference = reference();
@@ -3598,6 +3775,168 @@ mod remove_replica_execution_tests {
                 .unwrap()
                 .contains("targetSnapshot")
         );
+    }
+
+    #[test]
+    fn framework_native_remove_replica_force_mode_is_immutable_and_replays_without_target() {
+        let reference = force_reference();
+        assert_eq!(reference.input.mode, DurableRemoveMode::Force);
+        assert!(reference.input.target.agent_generation.is_none());
+
+        let initial = reconstruct_initial_operation(&reference.input).unwrap();
+        assert_eq!(initial.remove_mode, Some(DurableRemoveMode::Force));
+        assert!(initial.remove_target_agent_generation.is_none());
+        let mut changed_mode = initial.clone();
+        changed_mode.remove_mode = Some(DurableRemoveMode::ScaleDown);
+        changed_mode.remove_target_agent_generation = Some(generation(3).to_string());
+        assert!(
+            validate_transition(&initial, &changed_mode)
+                .unwrap_err()
+                .contains("immutable authority")
+        );
+
+        let mut force_observations = observations(&initial);
+        force_observations.remove(&3);
+        let mut force_pods = pod_identities();
+        force_pods.remove(&3);
+        let evidence = RemoveReplicaObservationEvidence::capture(
+            &initial,
+            &force_observations,
+            &force_pods,
+            None,
+            10,
+        )
+        .unwrap();
+        let activity = ActivityRecord::completed(
+            ActivitySequence::new(0),
+            activity_spec(&logical_boundary(&initial)).unwrap(),
+            encode_boundary_result(&RemoveReplicaBoundaryResult::Observation { evidence }).unwrap(),
+        );
+        let replayed = replay_active_operation(&reference, &[activity]).unwrap();
+        let intent = core_intent(&replayed).unwrap();
+        assert_eq!(replayed.remove_mode, Some(DurableRemoveMode::Force));
+        assert_eq!(
+            intent.mode,
+            kuberic_core::remove_replica::RemoveReplicaMode::Force
+        );
+        assert!(intent.expected_target_agent_generation.is_none());
+        assert!(intent.target_control_address.is_none());
+        assert!(intent.target_lifecycle_peer_protocol_version.is_none());
+    }
+
+    #[test]
+    fn framework_native_remove_replica_force_requires_primary_target_and_topology_fences() {
+        let reference = force_reference();
+        let initial = reconstruct_initial_operation(&reference.input).unwrap();
+        let pods = pod_identities();
+        let base = observations(&initial);
+
+        let mut missing_target = base.clone();
+        missing_target.remove(&3);
+        let Decision::Persist(frozen) =
+            decide_remove_replica(&initial, &missing_target, &pods, None, 10).unwrap()
+        else {
+            panic!("Force must freeze from exact primary and retained topology without a target")
+        };
+        assert_eq!(frozen.remove_mode, Some(DurableRemoveMode::Force));
+        let frozen_intent = core_intent(&frozen).unwrap();
+        assert_eq!(
+            frozen_intent.mode,
+            kuberic_core::remove_replica::RemoveReplicaMode::Force
+        );
+        assert!(frozen_intent.expected_target_agent_generation.is_none());
+
+        for mutate in [
+            |observations: &mut OperationObservations| {
+                observations.get_mut(&1).unwrap().status.instance_id =
+                    ReplicaInstanceId::new("replacement-primary");
+            },
+            |observations: &mut OperationObservations| {
+                observations.get_mut(&1).unwrap().status.epoch = Epoch::new(1, 8);
+            },
+            |observations: &mut OperationObservations| {
+                observations.get_mut(&1).unwrap().status.role = Role::ActiveSecondary;
+            },
+        ] as [fn(&mut OperationObservations); 3]
+        {
+            let mut drifted = missing_target.clone();
+            mutate(&mut drifted);
+            assert!(
+                decide_remove_replica(&initial, &drifted, &pods, None, 10).is_err(),
+                "Force accepted drifted primary authority"
+            );
+        }
+
+        let mut wrong_target = base.clone();
+        wrong_target.get_mut(&3).unwrap().status.instance_id =
+            ReplicaInstanceId::new("replacement-target");
+        assert!(
+            decide_remove_replica(&initial, &wrong_target, &pods, Some("secondary"), 10)
+                .unwrap_err()
+                .contains("another incarnation")
+        );
+
+        let mut missing_retained = missing_target.clone();
+        missing_retained.remove(&2);
+        assert!(
+            decide_remove_replica(&initial, &missing_retained, &pods, None, 10)
+                .unwrap_err()
+                .contains("retained replica 2 is unavailable")
+        );
+
+        let mut changed_topology = missing_target;
+        changed_topology
+            .get_mut(&1)
+            .unwrap()
+            .status
+            .configuration
+            .as_mut()
+            .unwrap()
+            .members
+            .retain(|member| member.id != 2);
+        assert!(
+            decide_remove_replica(&initial, &changed_topology, &pods, None, 10)
+                .unwrap_err()
+                .contains("primary configuration is not previous")
+        );
+
+        let Decision::Persist(dispatched) =
+            decide_remove_replica(&frozen, &base, &pods, Some("secondary"), 10).unwrap()
+        else {
+            panic!("Force intent must advance to its exact primary command")
+        };
+        for mutate in [
+            |observations: &mut OperationObservations| {
+                observations.get_mut(&1).unwrap().status.agent.generation = generation(9);
+            },
+            |observations: &mut OperationObservations| {
+                observations
+                    .get_mut(&1)
+                    .unwrap()
+                    .status
+                    .agent
+                    .control_version = AgentControlVersion::new(12);
+            },
+        ] as [fn(&mut OperationObservations); 2]
+        {
+            let mut drifted = base.clone();
+            mutate(&mut drifted);
+            let resolver = resolver_for(
+                &dispatched,
+                vec![dispatched.clone()],
+                &drifted,
+                &pods,
+                Some("secondary"),
+                10,
+            );
+            assert!(
+                !matches!(
+                    resolver.prepare(&logical_boundary(&dispatched)),
+                    Ok(RemoveReplicaBoundaryInput::ReplicaCommand { .. })
+                ),
+                "Force prepared a command after primary generation/control authority drift"
+            );
+        }
     }
 
     #[test]
@@ -3671,6 +4010,464 @@ mod remove_replica_execution_tests {
             panic!("replay did not advance to the exact next boundary");
         };
         assert_eq!(activity.sequence(), ActivitySequence::new(1));
+    }
+
+    #[tokio::test]
+    async fn framework_native_remove_replica_restarts_at_every_durable_boundary_without_duplicate_effects()
+     {
+        let reference = reference();
+        let execution = execution_spec(&reference).unwrap();
+        let initial =
+            advance_to_boundary(reconstruct_initial_operation(&reference.input).unwrap()).unwrap();
+        let initial_observations = observations(&initial);
+        let pods = pod_identities();
+        let backend = InMemoryCheckpointStore::new();
+        let workflow = RemoveReplicaWorkflow;
+        let mut history_specs = Vec::new();
+        let mut effects = BTreeMap::new();
+
+        let mut host = native_host(&execution, backend.clone(), 61);
+        let HostOutcome::ScheduleAccepted {
+            activity: freeze_activity,
+            ..
+        } = host.turn(&workflow, execution.clone()).await
+        else {
+            panic!("expected accepted native freeze-observation schedule");
+        };
+        let scheduled = active_history(&backend, &execution).await;
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(
+            scheduled[0].logical_id(execution.execution_id()),
+            freeze_activity
+        );
+        assert!(matches!(scheduled[0].state(), ActivityState::Scheduled));
+
+        let mut host = native_host(&execution, backend.clone(), 62);
+        let HostOutcome::DispatchPermitted {
+            permit: freeze_permit,
+            boundary: PersistenceBoundary::Exposure,
+            ..
+        } = host.turn(&workflow, execution.clone()).await
+        else {
+            panic!("expected accepted native freeze-observation exposure");
+        };
+        assert_eq!(*freeze_permit.activity(), freeze_activity);
+        assert!(matches!(
+            decode_boundary_input(freeze_permit.activity().spec().input()).unwrap(),
+            RemoveReplicaBoundaryInput::Observe {
+                phase: DurableOperationPhase::RemoveFreezeIntent,
+                attempt: 0
+            }
+        ));
+        history_specs.push(freeze_permit.activity().spec().clone());
+        assert_native_exposed_history(&backend, &execution, &freeze_permit, &history_specs).await;
+
+        let _ = restart_native_into_quarantine(&backend, &execution, 63, &freeze_permit).await;
+        let host = restart_native_into_quarantine(&backend, &execution, 64, &freeze_permit).await;
+        let freeze_result = RemoveReplicaBoundaryResult::Observation {
+            evidence: RemoveReplicaObservationEvidence::capture(
+                &initial,
+                &initial_observations,
+                &pods,
+                Some("secondary"),
+                10,
+            )
+            .unwrap(),
+        };
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    freeze_permit.activity().clone(),
+                    encode_boundary_result(&freeze_result).unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *freeze_permit.activity()
+        ));
+        assert_native_completed_history(&backend, &execution, &history_specs).await;
+
+        let (replica_operation, replica_history) =
+            replayed_native_boundary(&backend, &execution, &reference).await;
+        assert_eq!(
+            replica_operation.phase,
+            DurableOperationPhase::RemoveAwaitCoordination
+        );
+        assert!(replica_operation.remove_commit_evidence.is_none());
+        let replica_resolver = resolver_for(
+            &replica_operation,
+            replica_history,
+            &initial_observations,
+            &pods,
+            Some("secondary"),
+            10,
+        );
+        let mut host = native_host(&execution, backend.clone(), 65);
+        let HostOutcome::DispatchPermitted {
+            permit: replica_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &replica_resolver)
+            .await
+        else {
+            panic!("expected exact native replica-command exposure after restart");
+        };
+        let RemoveReplicaBoundaryInput::ReplicaCommand {
+            command: replica_command,
+        } = record_exact_effect(&mut effects, &replica_permit)
+        else {
+            unreachable!()
+        };
+        let exact_replica_command = replica_command.effect_command().unwrap();
+        let intent = replica_operation.remove_intent.as_ref().unwrap();
+        assert_eq!(exact_replica_command.target_id, initial.old_primary_id);
+        assert_eq!(
+            exact_replica_command.target_instance_id,
+            intent.primary_instance_id
+        );
+        assert_eq!(exact_replica_command.action_id, intent.action_id);
+        assert_eq!(
+            exact_replica_command.action_signature,
+            intent.input_signature
+        );
+        history_specs.push(replica_permit.activity().spec().clone());
+        assert_native_exposed_history(&backend, &execution, &replica_permit, &history_specs).await;
+
+        let _ = restart_native_into_quarantine(&backend, &execution, 66, &replica_permit).await;
+        let host = restart_native_into_quarantine(&backend, &execution, 67, &replica_permit).await;
+        let mut admitted_observations = observations(&replica_operation);
+        let mut admitted_action = completed_action(&replica_operation, intent.action_id.clone());
+        admitted_action.action.state = DurableActionState::Scheduled;
+        admitted_action.action.result = None;
+        admitted_action.action.remove_replica_progress = None;
+        admitted_observations
+            .get_mut(&replica_operation.old_primary_id)
+            .unwrap()
+            .status
+            .agent
+            .current_action = Some(admitted_action);
+        let admitted_result = RemoveReplicaBoundaryResult::Effect {
+            outcome: DurableEffectOutcome::Applied(
+                RemoveReplicaObservationEvidence::capture(
+                    &replica_operation,
+                    &admitted_observations,
+                    &pods,
+                    Some("secondary"),
+                    11,
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    replica_permit.activity().clone(),
+                    encode_boundary_result(&admitted_result).unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *replica_permit.activity()
+        ));
+        assert_native_completed_history(&backend, &execution, &history_specs).await;
+
+        let (commit_operation, commit_history) =
+            replayed_native_boundary(&backend, &execution, &reference).await;
+        assert_eq!(
+            commit_operation.phase,
+            DurableOperationPhase::RemoveAwaitCoordination
+        );
+        assert!(commit_operation.remove_commit_evidence.is_none());
+        let commit_resolver = resolver_for(
+            &commit_operation,
+            commit_history,
+            &admitted_observations,
+            &pods,
+            Some("secondary"),
+            11,
+        );
+        let mut host = native_host(&execution, backend.clone(), 68);
+        let HostOutcome::DispatchPermitted {
+            permit: commit_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &commit_resolver)
+            .await
+        else {
+            panic!("expected post-effect authoritative observation after restart");
+        };
+        assert!(matches!(
+            decode_boundary_input(commit_permit.activity().spec().input()).unwrap(),
+            RemoveReplicaBoundaryInput::Observe {
+                phase: DurableOperationPhase::RemoveAwaitCoordination,
+                attempt: 1
+            }
+        ));
+        history_specs.push(commit_permit.activity().spec().clone());
+        assert_native_exposed_history(&backend, &execution, &commit_permit, &history_specs).await;
+
+        let _ = restart_native_into_quarantine(&backend, &execution, 69, &commit_permit).await;
+        let host = restart_native_into_quarantine(&backend, &execution, 70, &commit_permit).await;
+        let mut committed_observations = observations(&commit_operation);
+        {
+            let primary = committed_observations
+                .get_mut(&commit_operation.old_primary_id)
+                .unwrap();
+            primary.status.configuration = Some(configuration(
+                &commit_operation.target_snapshot,
+                ReplicaConfigurationMode::Current,
+            ));
+            primary.status.active_replica_connections.clear();
+            primary.status.agent.current_action = Some(completed_action(
+                &commit_operation,
+                commit_operation
+                    .remove_intent
+                    .as_ref()
+                    .unwrap()
+                    .action_id
+                    .clone(),
+            ));
+        }
+        let commit_result = RemoveReplicaBoundaryResult::Observation {
+            evidence: RemoveReplicaObservationEvidence::capture(
+                &commit_operation,
+                &committed_observations,
+                &pods,
+                Some("secondary"),
+                20,
+            )
+            .unwrap(),
+        };
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    commit_permit.activity().clone(),
+                    encode_boundary_result(&commit_result).unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *commit_permit.activity()
+        ));
+        assert_native_completed_history(&backend, &execution, &history_specs).await;
+
+        let (label_operation, label_history) =
+            replayed_native_boundary(&backend, &execution, &reference).await;
+        assert_eq!(
+            label_operation.phase,
+            DurableOperationPhase::RemoveAwaitCleanup
+        );
+        assert_eq!(
+            label_operation.committed_snapshot,
+            Some(initial.target_snapshot.clone())
+        );
+        assert!(label_operation.remove_commit_evidence.is_some());
+        let label_resolver = resolver_for(
+            &label_operation,
+            label_history,
+            &committed_observations,
+            &pods,
+            Some("secondary"),
+            20,
+        );
+        let mut host = native_host(&execution, backend.clone(), 71);
+        let HostOutcome::DispatchPermitted {
+            permit: label_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &label_resolver)
+            .await
+        else {
+            panic!("expected exact UID-fenced label exposure after commit restart");
+        };
+        let RemoveReplicaBoundaryInput::LabelCommand {
+            command: label_command,
+        } = record_exact_effect(&mut effects, &label_permit)
+        else {
+            unreachable!()
+        };
+        assert_eq!(label_command.target_id, 3);
+        assert_eq!(label_command.pod_name, "set-2");
+        assert_eq!(label_command.expected_uid, "three");
+        assert_eq!(label_command.role, "retired");
+        assert!(label_command.has_valid_identity_signature());
+        history_specs.push(label_permit.activity().spec().clone());
+        assert_native_exposed_history(&backend, &execution, &label_permit, &history_specs).await;
+
+        let _ = restart_native_into_quarantine(&backend, &execution, 72, &label_permit).await;
+        let host = restart_native_into_quarantine(&backend, &execution, 73, &label_permit).await;
+        let label_result = RemoveReplicaBoundaryResult::Effect {
+            outcome: DurableEffectOutcome::Applied(
+                RemoveReplicaObservationEvidence::capture(
+                    &label_operation,
+                    &committed_observations,
+                    &pods,
+                    Some("retired"),
+                    20,
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    label_permit.activity().clone(),
+                    encode_boundary_result(&label_result).unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *label_permit.activity()
+        ));
+        assert_native_completed_history(&backend, &execution, &history_specs).await;
+
+        let (delete_operation, delete_history) =
+            replayed_native_boundary(&backend, &execution, &reference).await;
+        assert_eq!(
+            delete_operation.phase,
+            DurableOperationPhase::RemoveDeleteTargetPod
+        );
+        let delete_resolver = resolver_for(
+            &delete_operation,
+            delete_history,
+            &committed_observations,
+            &pods,
+            Some("retired"),
+            20,
+        );
+        let mut host = native_host(&execution, backend.clone(), 74);
+        let HostOutcome::DispatchPermitted {
+            permit: delete_permit,
+            boundary: PersistenceBoundary::ScheduleExposure,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &delete_resolver)
+            .await
+        else {
+            panic!("expected exact UID-fenced delete exposure after restart");
+        };
+        let RemoveReplicaBoundaryInput::DeleteCommand {
+            command: delete_command,
+        } = record_exact_effect(&mut effects, &delete_permit)
+        else {
+            unreachable!()
+        };
+        assert_eq!(delete_command.target_id, 3);
+        assert_eq!(delete_command.pod_name, "set-2");
+        assert_eq!(delete_command.expected_uid, "three");
+        assert!(delete_command.has_valid_identity_signature());
+        history_specs.push(delete_permit.activity().spec().clone());
+        assert_native_exposed_history(&backend, &execution, &delete_permit, &history_specs).await;
+
+        let _ = restart_native_into_quarantine(&backend, &execution, 75, &delete_permit).await;
+        let host = restart_native_into_quarantine(&backend, &execution, 76, &delete_permit).await;
+        let mut deleted_pods = pods;
+        deleted_pods.remove(&3);
+        let delete_result = RemoveReplicaBoundaryResult::Effect {
+            outcome: DurableEffectOutcome::Applied(
+                RemoveReplicaObservationEvidence::capture(
+                    &delete_operation,
+                    &committed_observations,
+                    &deleted_pods,
+                    None,
+                    20,
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    delete_permit.activity().clone(),
+                    encode_boundary_result(&delete_result).unwrap(),
+                ),
+            )
+            .await,
+            HostOutcome::ObservationAccepted { activity, .. }
+                if activity == *delete_permit.activity()
+        ));
+        let active_encoded_len =
+            assert_native_completed_history(&backend, &execution, &history_specs).await;
+
+        assert_eq!(history_specs.len(), 5);
+        assert_eq!(effects.len(), 3);
+        assert!(effects.values().all(|count| *count == 1));
+
+        let (completed_operation, completed_history) =
+            replayed_native_boundary(&backend, &execution, &reference).await;
+        assert_eq!(completed_operation.phase, DurableOperationPhase::Completed);
+        let completed_resolver = resolver_for(
+            &completed_operation,
+            completed_history,
+            &committed_observations,
+            &deleted_pods,
+            None,
+            20,
+        );
+        let mut host = native_host(&execution, backend.clone(), 77);
+        let HostOutcome::WorkflowCompleted {
+            outcome,
+            boundary: PersistenceBoundary::Completion,
+            ..
+        } = host
+            .turn_and_expose_with(&workflow, execution.clone(), &completed_resolver)
+            .await
+        else {
+            panic!("expected compact terminal after the final durable-boundary restart");
+        };
+        assert!(matches!(
+            validate_loaded_terminal(&reference, &outcome, 5).unwrap(),
+            RemoveReplicaTerminal::Completed {
+                cleanup: RemoveReplicaCleanupStatus {
+                    connection_absent: true,
+                    target_retirement: Some(TargetRetirementObservationStatus::Completed),
+                    target_labels_fenced: true,
+                    target_pod_deleted: true,
+                },
+                accounting: RemoveReplicaActivityAccounting {
+                    external_effect_count: 3,
+                    passive_observation_count: 2,
+                },
+                ..
+            }
+        ));
+        let terminal = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(terminal.checkpoint().encoded_len().unwrap() < active_encoded_len);
+        let terminal_payload = terminal
+            .checkpoint()
+            .decode_and_validate(&execution, checkpoint_limits())
+            .unwrap();
+        assert!(terminal_payload.active_activities().is_none());
+        assert!(matches!(
+            terminal_payload.state(),
+            CheckpointState::Terminal {
+                completed_activity_count: 5,
+                ..
+            }
+        ));
+
+        let effects_before_terminal_reload = effects.clone();
+        let mut restarted = native_host(&execution, backend, 78);
+        assert!(matches!(
+            restarted.turn(&workflow, execution).await,
+            HostOutcome::WorkflowCompleted {
+                checkpoint_status: kuberic_durable_execution::TerminalCheckpointStatus::Reloaded,
+                ..
+            }
+        ));
+        assert_eq!(effects, effects_before_terminal_reload);
     }
 
     #[test]
