@@ -946,9 +946,11 @@ Key differences:
 1. **Fencing**: CNPG uses annotation-based fencing + liveness probe
    self-fencing. Kuberic uses epoch-based fencing (SF protocol) — simpler,
    distributed after promotion, prevents zombie reads atomically.
-2. **Operator model**: CNPG manages pods directly. Kuberic persists durable
-   topology workflows in CRD status and executes fenced actions through each
-   pod's ReplicaAgent.
+2. **Operator model**: CNPG manages pods directly. For remove-replica, Kuberic
+   records immutable admission and checkpoint identity in
+   `status.removeReplicaExecution`, while compact progress and terminal
+   evidence live in its owner-bound ConfigMap. The operator executes fenced
+   actions through each pod's ReplicaAgent.
 3. **Instance manager**: CNPG's is a full Go binary running as PID 1.
    Kuberic's is a Rust library called by PgService — lighter weight
    but requires the kuberic runtime as the process entry point.

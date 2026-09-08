@@ -679,6 +679,10 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
             include_str!("../../docs/features/kuberic/design-gaps.md"),
         ),
         (
+            "PostgreSQL design",
+            include_str!("../../docs/features/postgres/design.md"),
+        ),
+        (
             "pod-local boundary",
             include_str!(
                 "../../docs/features/kuberic/implemented/pod-local-ra-lite-control-boundary.md"
@@ -751,6 +755,10 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
             include_str!("../../docs/features/kuberic/design-gaps.md"),
         ),
         (
+            "PostgreSQL design",
+            include_str!("../../docs/features/postgres/design.md"),
+        ),
+        (
             "pod-local boundary",
             include_str!(
                 "../../docs/features/kuberic/implemented/pod-local-ra-lite-control-boundary.md"
@@ -768,19 +776,22 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
         ),
     ];
     let forbidden = [
-        "removereplicaexecutionmode",
-        "durableremovereplicapilot",
-        "durable-remove-replica-pilot",
-        "remove-replica pilot",
-        "operation.removeintent",
-        "removecommitevidence",
-        "crd status remains the durable authority",
-        "crd status remains the only durable global store",
-        "crd status remains the sole durable global store",
-        "durable create/add/remove/switchover/failover transitions live in",
-        "every partial state explicit in crd",
-        "its opt-in configmap provider",
-        "enable the optional provider",
+        concat!("remove", "replicaexecutionmode"),
+        concat!("durable", "removereplicapilot"),
+        concat!("durable-remove-", "replica-pilot"),
+        concat!("remove-replica ", "pilot"),
+        concat!("operation.remove", "intent"),
+        concat!("removecommit", "evidence"),
+        concat!("crd status remains the durable ", "authority"),
+        concat!("crd status remains the only durable ", "global store"),
+        concat!("crd status remains the sole durable ", "global store"),
+        concat!(
+            "durable create/add/remove/",
+            "switchover/failover transitions live in"
+        ),
+        concat!("every partial state explicit ", "in crd"),
+        concat!("its opt-in configmap ", "provider"),
+        concat!("enable the optional ", "provider"),
     ];
 
     for (name, document) in current_docs {
@@ -822,8 +833,16 @@ fn historical_paw_remove_research_is_explicitly_labeled_and_exempt() {
         );
     }
 
-    assert!(historical_docs[0].1.contains("durableRemoveReplicaPilot"));
-    assert!(historical_docs[1].1.contains("removeReplicaExecutionMode"));
+    assert!(
+        historical_docs[0]
+            .1
+            .contains(concat!("durableRemoveReplica", "Pilot"))
+    );
+    assert!(
+        historical_docs[1]
+            .1
+            .contains(concat!("removeReplicaExecution", "Mode"))
+    );
 }
 
 const fn status(passed: bool) -> &'static str {
