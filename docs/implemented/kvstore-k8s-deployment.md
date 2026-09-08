@@ -121,16 +121,22 @@ nodes:
 ### 4. Just recipes — `justfile`
 
 ```just
+cluster_name := env_var("KIND_CLUSTER_NAME")
+kubeconfig := env_var("KUBECONFIG")
+cluster_context := "kind-" + cluster_name
+
 kvstore-image: build-rust-bins
     docker build -t localhost/kvstore \
         -f examples/kvstore/deploy/Dockerfile .
-    kind load docker-image localhost/kvstore:latest --name kind
+    kind load docker-image localhost/kvstore:latest --name {{ cluster_name }}
 
-kvstore-deploy:
-    kubectl apply -f examples/kvstore/deploy/kubericset.yaml
+kvstore-deploy: verify-kind-context
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        apply -f examples/kvstore/deploy/kubericset.yaml
 
-kvstore-delete:
-    kubectl delete -f examples/kvstore/deploy/kubericset.yaml
+kvstore-delete: verify-kind-context
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        delete -f examples/kvstore/deploy/kubericset.yaml
 ```
 
 The root `justfile` also defines the Kind cluster and operator image recipes.
@@ -206,7 +212,8 @@ at `localhost:30090`.
 
 ```bash
 # Apply NodePort overlay (done automatically by tests)
-kubectl apply -f examples/kvstore/deploy/nodeport-svc.yaml
+kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
+  apply -f examples/kvstore/deploy/nodeport-svc.yaml
 
 # Connect via gRPC
 grpcurl -plaintext localhost:30090 kvstore.v1.KvStore/Get
@@ -292,6 +299,10 @@ TCP probes on the control port (9090):
 
 ```
 # One-time setup
+export KIND_CLUSTER_NAME="kuberic-kvstore-$(date +%s)"
+export KUBECONFIG="$HOME/.kube/${KIND_CLUSTER_NAME}.config"
+export KIND_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KIND_CONFIG="deploy/kind-isolated-config.yaml"
 just create-kind-cluster
 
 # Build and load images
@@ -306,8 +317,13 @@ just kuberic-operator-deploy
 just kvstore-deploy
 
 # Verify
-kubectl get kubericsets -n xedio
-kubectl get pods -n xedio
+kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
+  get kubericsets -n xedio
+kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
+  get pods -n xedio
+
+# Clean up only this dedicated cluster and kubeconfig
+just delete-kind-cluster
 ```
 
 ## Implementation Summary

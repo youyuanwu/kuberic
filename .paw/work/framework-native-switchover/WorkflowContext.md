@@ -38,4 +38,4 @@ Issue URL: none
 Remote: origin
 Artifact Lifecycle: commit-and-clean
 Artifact Paths: auto-derived
-Additional Inputs: Repository youyuanwu/kuberic; main synchronized with origin/main at merged PR #61. Prior artifacts at .paw/work/framework-native-remove-replica are read-only context and must not be modified.
+Additional Inputs: Repository youyuanwu/kuberic; main synchronized with origin/main at merged PR #61. Prior artifacts at .paw/work/framework-native-remove-replica are read-only context and must not be modified. All KinD testing must create a unique workflow-specific cluster and isolated kubeconfig, verify the exact target context before mutation, never inspect/reuse/touch unrelated or CAPI-related clusters or containers, explicitly target the isolated cluster from kubectl/just/tests, and clean up only resources created for this workflow.

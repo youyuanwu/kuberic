@@ -537,22 +537,35 @@ live-cluster tests in the committed source tree. The six operation-adapter
 responsibilities have dedicated `framework_native_remove_replica_fr019_*`
 tests.
 
-For isolated live validation, use only the dedicated Kuberic Kind kubeconfig:
+For isolated live validation, create a new workflow-specific Kind cluster and
+use only its dedicated kubeconfig. Never reuse or inspect unrelated clusters:
 
 ```console
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" kubectl \
-  --kubeconfig "$HOME/.kube/kuberic-kind-config" cluster-info
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" just images
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test \
+export KIND_CLUSTER_NAME="kuberic-<workflow>-$(date +%s)"
+export KUBECONFIG="$HOME/.kube/${KIND_CLUSTER_NAME}.config"
+export KIND_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KIND_CONFIG="deploy/kind-isolated-config.yaml"
+just create-kind-cluster
+test "$(kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
+  config current-context)" = "$KIND_CONTEXT"
+kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" cluster-info
+just images
+cargo test \
   -p kuberic-durable-execution --features kubernetes \
   --test kubernetes_checkpoint_real -- --nocapture
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+cargo test -p kuberic-tests \
   test_kvstore_k8s_status_healthy -- --nocapture
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+cargo test -p kuberic-tests \
   test_kvstore_k8s_write_read -- --nocapture
-KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-tests \
+cargo test -p kuberic-tests \
   test_kvstore_k8s_framework_native_remove_replica -- --nocapture
+just delete-kind-cluster
 ```
+
+The exported `KUBECONFIG` points every kube client and real-API test at the
+dedicated cluster. The `just` recipes also require `KIND_CLUSTER_NAME`, verify
+the exact `kind-<name>` context before Kubernetes mutations, and delete only
+that named cluster and kubeconfig.
 
 The live removal test verifies selector-free admission, the owner-bound
 terminal checkpoint, exact removal of one pod, preservation of the two

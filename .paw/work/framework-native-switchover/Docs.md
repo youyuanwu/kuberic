@@ -152,6 +152,23 @@ cargo test -p kuberic-durable-execution --features kubernetes \
   --test kubernetes_checkpoint
 ```
 
+### Isolated KinD Validation
+
+All KinD validation must create a new workflow-specific cluster and kubeconfig.
+Set `KIND_CLUSTER_NAME` and `KUBECONFIG`; the `just` recipes reject the default
+`kind` name and default user kubeconfig, verify the exact
+`kind-${KIND_CLUSTER_NAME}` context before Kubernetes mutations, and pass the
+isolated cluster name to every image load. `KIND_CONFIG` defaults to the
+port-unmapped `deploy/kind-isolated-config.yaml`, preventing collisions with
+unrelated local clusters. Cargo real-API tests inherit only the exported
+isolated kubeconfig.
+
+The final validation used the newly created
+`kuberic-fns-20260908-225038` cluster with its workflow-local kubeconfig. No
+existing cluster or container was inspected, reconfigured, stopped, or reused.
+After image loading, real-API testing, and the full workspace attempt, the
+exact dedicated cluster and kubeconfig were deleted.
+
 The canonical three-member measurement is:
 
 - 9 external effects;

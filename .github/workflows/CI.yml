@@ -11,6 +11,9 @@ env:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    env:
+      KIND_CLUSTER_NAME: kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBECONFIG: ${{ runner.temp }}/kuberic-kind-kubeconfig
     strategy:
       matrix:
         os: [ ubuntu-latest ]
@@ -78,8 +81,12 @@ jobs:
       id: kind
       uses: helm/kind-action@v1
       with:
-        cluster_name: kind
-        config: deploy/kind-config.yaml
+        cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+        config: deploy/kind-isolated-config.yaml
+        kubeconfig: ${{ env.KUBECONFIG }}
+
+    - name: Verify isolated KinD context
+      run: just verify-kind-context
 
     - name: Build and load Docker images
       run: just images

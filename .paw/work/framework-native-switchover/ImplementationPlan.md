@@ -514,6 +514,11 @@ obsolete tests and documentation.
     workspace, measurement, and deterministic provider gates.
   - Run the real-API provider test only when an authorized cluster context is
     available; otherwise record that environmental limitation in `Docs.md`.
+  - For every KinD gate, create a new workflow-specific cluster with an
+    isolated kubeconfig, verify its exact context before mutations, pass the
+    cluster name/kubeconfig explicitly to `just`, `kubectl`, and tests, never
+    inspect or reuse unrelated clusters, and clean up only the exact dedicated
+    resources created by this workflow.
 
 ### Success Criteria
 
