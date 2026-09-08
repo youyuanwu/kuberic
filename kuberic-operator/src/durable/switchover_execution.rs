@@ -93,9 +93,6 @@ pub struct DurableSwitchoverRuntime {
 }
 
 #[cfg(test)]
-type DurableSwitchoverPilotRuntime = DurableSwitchoverRuntime;
-
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestSwitchoverReference {
     pub(crate) version: u32,
@@ -3156,7 +3153,7 @@ mod framework_native_switchover_tests {
 
     #[tokio::test]
     async fn runtime_reuses_one_host_per_process_execution() {
-        let runtime = DurableSwitchoverPilotRuntime::in_memory(InMemoryCheckpointStore::new());
+        let runtime = DurableSwitchoverRuntime::in_memory(InMemoryCheckpointStore::new());
         let reference = test_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let first = runtime
             .host("tenant-a", "database", "set-uid", &reference)
@@ -3179,7 +3176,7 @@ mod framework_native_switchover_tests {
 
     #[tokio::test]
     async fn host_cache_identity_includes_owner_coordinates() {
-        let runtime = DurableSwitchoverPilotRuntime::in_memory(InMemoryCheckpointStore::new());
+        let runtime = DurableSwitchoverRuntime::in_memory(InMemoryCheckpointStore::new());
         let reference = test_reference("set-uid", snapshot(3), 2, 100).unwrap();
         let first = runtime
             .host("tenant-a", "database", "set-uid", &reference)
@@ -3192,12 +3189,12 @@ mod framework_native_switchover_tests {
         assert!(!Arc::ptr_eq(&first, &other_owner));
     }
 
-    struct PollCountingPilotWorkflow {
+    struct PollCountingSwitchoverWorkflow {
         polls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
-    impl Workflow for PollCountingPilotWorkflow {
+    impl Workflow for PollCountingSwitchoverWorkflow {
         async fn run(
             &self,
             context: &mut WorkflowContext<'_>,
@@ -3247,7 +3244,7 @@ mod framework_native_switchover_tests {
             checkpoint_limits(),
         );
         let polls = Arc::new(AtomicUsize::new(0));
-        let workflow = PollCountingPilotWorkflow {
+        let workflow = PollCountingSwitchoverWorkflow {
             polls: polls.clone(),
         };
 

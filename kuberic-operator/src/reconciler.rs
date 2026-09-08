@@ -4944,13 +4944,13 @@ mod dispatch_planning_tests {
         (operation, observed)
     }
 
-    struct BusyPilotHandle {
+    struct BusySwitchoverHandle {
         requests: StdArc<StdMutex<Vec<CorrelatedControlActionRequest>>>,
         refresh_required: bool,
     }
 
     #[async_trait::async_trait]
-    impl ReplicaHandle for BusyPilotHandle {
+    impl ReplicaHandle for BusySwitchoverHandle {
         fn id(&self) -> ReplicaId {
             1
         }
@@ -5016,11 +5016,11 @@ mod dispatch_planning_tests {
         }
     }
 
-    struct FixedPilotResolver {
+    struct FixedSwitchoverResolver {
         input: crate::durable::switchover_execution::DurableSwitchoverActivityInput,
     }
 
-    impl kuberic_durable_execution::PreparedActivityResolver for FixedPilotResolver {
+    impl kuberic_durable_execution::PreparedActivityResolver for FixedSwitchoverResolver {
         fn resolve(
             &self,
             logical: &kuberic_durable_execution::ActivitySpec,
@@ -5061,7 +5061,7 @@ mod dispatch_planning_tests {
                 ..input.clone()
             },
         };
-        let resolver = FixedPilotResolver { input };
+        let resolver = FixedSwitchoverResolver { input };
         let HostOutcome::DispatchPermitted { permit, .. } = host
             .turn_and_expose_with(&workflow, execution, &resolver)
             .await
@@ -5624,7 +5624,7 @@ mod dispatch_planning_tests {
         let requests = StdArc::new(StdMutex::new(Vec::new()));
         let handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::from([(
             1,
-            Box::new(BusyPilotHandle {
+            Box::new(BusySwitchoverHandle {
                 requests: requests.clone(),
                 refresh_required: false,
             }) as Box<dyn ReplicaHandle>,
@@ -5813,7 +5813,7 @@ mod dispatch_planning_tests {
         let requests = StdArc::new(StdMutex::new(Vec::new()));
         let handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::from([(
             1,
-            Box::new(BusyPilotHandle {
+            Box::new(BusySwitchoverHandle {
                 requests: requests.clone(),
                 refresh_required: false,
             }) as Box<dyn ReplicaHandle>,
@@ -5919,7 +5919,7 @@ mod dispatch_planning_tests {
         let requests = StdArc::new(StdMutex::new(Vec::new()));
         let handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::from([(
             1,
-            Box::new(BusyPilotHandle {
+            Box::new(BusySwitchoverHandle {
                 requests: requests.clone(),
                 refresh_required: true,
             }) as Box<dyn ReplicaHandle>,
@@ -6144,7 +6144,7 @@ mod dispatch_planning_tests {
             let requests = StdArc::new(StdMutex::new(Vec::new()));
             let handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::from([(
                 1,
-                Box::new(BusyPilotHandle {
+                Box::new(BusySwitchoverHandle {
                     requests: requests.clone(),
                     refresh_required: false,
                 }) as Box<dyn ReplicaHandle>,
