@@ -38,7 +38,8 @@ use crate::crd::{
     PendingActionStatus, Phase, ReconfigurationPhase, RemoveReplicaExecutionStatus,
     RemoveReplicaIncompatibilitySource, RemoveReplicaIncompatibilityStatus,
     StablePartitionSnapshotStatus, StableReplicaElectionMetadataStatus, StableReplicaRoleStatus,
-    StableReplicaSnapshotStatus, StatusCondition,
+    StableReplicaSnapshotStatus, StatusCondition, SwitchoverExecutionState,
+    SwitchoverExecutionStatus, SwitchoverIncompatibilitySource,
 };
 #[cfg(feature = "durable-switchover-pilot")]
 use crate::durable::pilot::DurableSwitchoverPilotRuntime;
@@ -56,6 +57,12 @@ use crate::durable::remove_replica_execution::{
     RemoveReplicaTerminal, RemoveReplicaWorkflow,
 };
 use crate::durable::runner::{DurableActiveReason, DurableRunner, DurableRunnerOutcome};
+use crate::durable::switchover_execution::{
+    DurableSwitchoverPilotTerminal as NativeSwitchoverTerminal, DurableSwitchoverRuntime,
+    DurableSwitchoverWorkflow as NativeSwitchoverWorkflow,
+    SwitchoverRunnerAdapter as NativeSwitchoverRunnerAdapter, incompatible_switchover_execution,
+    native_execution_spec, native_initial_operation, new_switchover_execution,
+};
 use crate::durable::workflow_host::DurableWorkflowRuntime;
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
@@ -76,6 +83,7 @@ pub struct ReconcilerState {
     removal_clock: Arc<dyn RemoveReplicaClock>,
     #[cfg(feature = "durable-switchover-pilot")]
     pub durable_switchover_pilot: Option<Arc<DurableSwitchoverPilotRuntime>>,
+    framework_native_switchover: Arc<DurableSwitchoverRuntime>,
     framework_native_remove_replica: Arc<FrameworkNativeRemoveReplicaRuntime>,
 }
 
@@ -93,6 +101,9 @@ impl Default for ReconcilerState {
             removal_clock: Arc::new(SystemRemoveReplicaClock),
             #[cfg(feature = "durable-switchover-pilot")]
             durable_switchover_pilot: None,
+            framework_native_switchover: Arc::new(DurableSwitchoverRuntime::in_memory(
+                kuberic_durable_execution::InMemoryCheckpointStore::new(),
+            )),
             framework_native_remove_replica: Arc::new(
                 FrameworkNativeRemoveReplicaRuntime::in_memory(
                     kuberic_durable_execution::InMemoryCheckpointStore::new(),
@@ -110,6 +121,9 @@ impl ReconcilerState {
             removal_clock: clock,
             #[cfg(feature = "durable-switchover-pilot")]
             durable_switchover_pilot: None,
+            framework_native_switchover: Arc::new(DurableSwitchoverRuntime::in_memory(
+                kuberic_durable_execution::InMemoryCheckpointStore::new(),
+            )),
             framework_native_remove_replica: Arc::new(
                 FrameworkNativeRemoveReplicaRuntime::in_memory(
                     kuberic_durable_execution::InMemoryCheckpointStore::new(),
@@ -128,6 +142,9 @@ impl ReconcilerState {
             durable_switchover_pilot: Some(Arc::new(DurableSwitchoverPilotRuntime::shared(
                 runtime.clone(),
             ))),
+            framework_native_switchover: Arc::new(DurableSwitchoverRuntime::shared(
+                runtime.clone(),
+            )),
             framework_native_remove_replica: Arc::new(FrameworkNativeRemoveReplicaRuntime::shared(
                 runtime,
             )),
@@ -151,6 +168,9 @@ impl ReconcilerState {
             durable_switchover_pilot: Some(Arc::new(DurableSwitchoverPilotRuntime::shared(
                 runtime.clone(),
             ))),
+            framework_native_switchover: Arc::new(DurableSwitchoverRuntime::shared(
+                runtime.clone(),
+            )),
             framework_native_remove_replica: Arc::new(FrameworkNativeRemoveReplicaRuntime::shared(
                 runtime,
             )),
@@ -167,6 +187,28 @@ impl ReconcilerState {
             removal_clock: Arc::new(SystemRemoveReplicaClock),
             #[cfg(feature = "durable-switchover-pilot")]
             durable_switchover_pilot: None,
+            framework_native_switchover: Arc::new(DurableSwitchoverRuntime::shared(
+                runtime.clone(),
+            )),
+            framework_native_remove_replica: Arc::new(FrameworkNativeRemoveReplicaRuntime::shared(
+                runtime,
+            )),
+        }
+    }
+
+    pub fn with_switchover_store(
+        store: kuberic_durable_execution::InMemoryCheckpointStore,
+    ) -> Self {
+        let runtime = Arc::new(DurableWorkflowRuntime::in_memory(store));
+        Self {
+            drivers: Mutex::new(HashMap::new()),
+            pending_statuses: Mutex::new(HashMap::new()),
+            removal_clock: Arc::new(SystemRemoveReplicaClock),
+            #[cfg(feature = "durable-switchover-pilot")]
+            durable_switchover_pilot: None,
+            framework_native_switchover: Arc::new(DurableSwitchoverRuntime::shared(
+                runtime.clone(),
+            )),
             framework_native_remove_replica: Arc::new(FrameworkNativeRemoveReplicaRuntime::shared(
                 runtime,
             )),
@@ -181,6 +223,18 @@ impl ReconcilerState {
         execution_id: &str,
     ) -> Option<crate::durable::checkpoint_store::DurableCheckpointMeasurementsSnapshot> {
         self.framework_native_remove_replica
+            .measurements(namespace, set_name, set_uid, execution_id)
+            .await
+    }
+
+    pub async fn framework_native_switchover_measurements(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        set_uid: &str,
+        execution_id: &str,
+    ) -> Option<crate::durable::checkpoint_store::DurableCheckpointMeasurementsSnapshot> {
+        self.framework_native_switchover
             .measurements(namespace, set_name, set_uid, execution_id)
             .await
     }
@@ -287,6 +341,35 @@ fn accept_remove_replica(
     Ok(status)
 }
 
+#[allow(dead_code)]
+fn accept_framework_native_switchover(
+    set: &KubericSet,
+    previous_snapshot: StablePartitionSnapshotStatus,
+    target_primary_id: i64,
+    now: i64,
+) -> Result<KubericSetStatus, String> {
+    let authority = set
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| "framework-native switchover requires KubericSet UID".to_string())?;
+    let reference = new_switchover_execution(authority, previous_snapshot, target_primary_id, now)?;
+    let mut status = KubericSetStatus {
+        phase: Phase::Switchover,
+        operation: None,
+        switchover_execution: Some(reference),
+        ..set.status.clone().unwrap_or_default()
+    };
+    status.legacy_status_fields.clear();
+    set_framework_native_switchover_condition(
+        &mut status,
+        "Accepted",
+        "native switchover reference persisted before checkpoint creation",
+        now,
+    );
+    Ok(status)
+}
+
 fn stable_legacy_fingerprint(source: &str, encoded: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in source.as_bytes().iter().chain(encoded) {
@@ -319,6 +402,79 @@ fn legacy_remove_marker(
             fingerprint: stable_legacy_fingerprint(source_name, encoded),
         }),
     }
+}
+
+#[allow(dead_code)]
+fn legacy_switchover_marker(
+    current: &KubericSetStatus,
+) -> Result<Option<SwitchoverExecutionStatus>, String> {
+    if let Some(operation) = current
+        .operation
+        .as_ref()
+        .filter(|operation| operation.kind == DurableOperationKind::Switchover)
+    {
+        let encoded = serde_json::to_vec(operation)
+            .map_err(|error| format!("serialize legacy explicit switchover marker: {error}"))?;
+        return Ok(Some(incompatible_switchover_execution(
+            SwitchoverIncompatibilitySource::LegacyExplicit,
+            operation.version,
+            operation.operation_id.clone(),
+            None,
+            &encoded,
+        )));
+    }
+    if let Some(pilot) = current.durable_switchover_pilot.as_ref() {
+        let encoded = serde_json::to_vec(pilot)
+            .map_err(|error| format!("serialize legacy switchover pilot marker: {error}"))?;
+        let source = if pilot.version == 1 {
+            SwitchoverIncompatibilitySource::LegacyPilotV1
+        } else if pilot.version == 2 {
+            SwitchoverIncompatibilitySource::LegacyPilotV2
+        } else {
+            SwitchoverIncompatibilitySource::UnsupportedStatus
+        };
+        return Ok(Some(incompatible_switchover_execution(
+            source,
+            pilot.version,
+            pilot.execution_id.clone(),
+            Some(pilot.checkpoint_name.clone()),
+            &encoded,
+        )));
+    }
+    Ok(None)
+}
+
+#[allow(dead_code)]
+async fn persist_legacy_switchover_incompatibility(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    now: i64,
+) -> Result<bool, String> {
+    let Some(current) = set.status.as_ref() else {
+        return Ok(false);
+    };
+    let Some(marker) = legacy_switchover_marker(current)? else {
+        return Ok(false);
+    };
+    let mut status = current.clone();
+    status.operation = None;
+    status.durable_switchover_pilot = None;
+    status.legacy_status_fields.clear();
+    status.switchover_execution = Some(marker);
+    set_framework_native_switchover_condition(
+        &mut status,
+        "Incompatible",
+        "legacy switchover execution is durably blocked and cannot be resumed as the production contract",
+        now,
+    );
+    api.patch_set_status(
+        &set.namespace().unwrap_or_default(),
+        &set.name_any(),
+        &status,
+        set.metadata.resource_version.as_deref(),
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn persist_legacy_remove_incompatibility(
@@ -2849,8 +3005,7 @@ async fn reconcile_durable_switchover_pilot(
     let current_pods = checked_pods_by_id(pods)?;
     let now = unix_seconds();
     let initial = initial_operation(reference)?;
-    let mut adapter =
-        SwitchoverRunnerAdapter::new(reference, &initial, set, &current_pods, api, store, now);
+    let mut adapter = SwitchoverRunnerAdapter::new(&initial, set, &current_pods, api, store, now);
     let mut host = host.lock().await;
     let outcome =
         DurableRunner::new(crate::durable::switchover_execution::SWITCHOVER_MAX_RUNNER_FUEL)
@@ -3097,6 +3252,247 @@ async fn publish_pilot_terminal(
             }
             state.drivers.lock().await.remove(&set_key);
             runtime
+                .forget(&namespace, &name, set_uid, &reference.execution_id)
+                .await;
+        }
+    }
+    Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+}
+
+#[allow(dead_code)]
+async fn reconcile_framework_native_switchover(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+) -> Result<ReconcileAction, String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let name = set.name_any();
+    let set_uid =
+        set.metadata.uid.as_deref().ok_or_else(|| {
+            "active framework-native switchover has no KubericSet UID".to_string()
+        })?;
+    let reference = set
+        .status
+        .as_ref()
+        .and_then(|status| status.switchover_execution.as_ref())
+        .ok_or_else(|| {
+            "switchover phase has no framework-native execution reference".to_string()
+        })?;
+    if matches!(
+        reference.state,
+        SwitchoverExecutionState::Incompatible { .. }
+    ) {
+        return Err("incompatible switchover execution cannot be resumed".to_string());
+    }
+    let execution = native_execution_spec(reference)?;
+    let host = state
+        .framework_native_switchover
+        .native_host(&namespace, &name, set_uid, reference)
+        .await?;
+    let store = { host.lock().await.store().clone() };
+    let current_pods = checked_pods_by_id(pods)?;
+    let now = unix_seconds();
+    let initial = native_initial_operation(reference)?;
+    let mut adapter =
+        NativeSwitchoverRunnerAdapter::new(&initial, set, &current_pods, api, store, now);
+    let mut host = host.lock().await;
+    let outcome =
+        DurableRunner::new(crate::durable::switchover_execution::SWITCHOVER_MAX_RUNNER_FUEL)
+            .map_err(|error| format!("construct framework-native switchover runner: {error}"))?
+            .run(
+                &mut host,
+                &NativeSwitchoverWorkflow,
+                execution,
+                &mut adapter,
+                now,
+            )
+            .await;
+    drop(host);
+    match outcome {
+        DurableRunnerOutcome::Terminal(terminal) => {
+            publish_framework_native_switchover_terminal(set, api, state, terminal, now).await
+        }
+        DurableRunnerOutcome::Active {
+            reason: DurableActiveReason::Adapter,
+            condition_reason,
+            detail,
+            requeue_after_seconds,
+        } => {
+            record_framework_native_switchover_condition(set, api, &condition_reason, &detail, now)
+                .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(
+                requeue_after_seconds,
+            )))
+        }
+        DurableRunnerOutcome::Active {
+            reason: DurableActiveReason::FuelExhausted,
+            ..
+        } => Err(
+            "framework-native switchover exhausted in-process fused progression fuel".to_string(),
+        ),
+        DurableRunnerOutcome::ReloadRequired { boundary, reason } => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "ReloadRequired",
+                &format!("checkpoint {boundary:?} requires reload after {reason:?}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        DurableRunnerOutcome::PersistenceFailed { operation, error } => {
+            record_framework_native_switchover_condition(
+                set,
+                api,
+                "StorageUnavailable",
+                &format!("checkpoint {operation:?} failed: {error}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        DurableRunnerOutcome::Incompatible(error) => Err(format!(
+            "framework-native switchover checkpoint is incompatible: {error}"
+        )),
+        DurableRunnerOutcome::Rejected(error) => Err(format!(
+            "framework-native switchover checkpoint rejected: {error}"
+        )),
+        DurableRunnerOutcome::Isolated(error) => Err(format!(
+            "framework-native switchover execution isolated: {error}"
+        )),
+        DurableRunnerOutcome::Nondeterministic(error) => Err(format!(
+            "framework-native switchover workflow changed: {error}"
+        )),
+    }
+}
+
+#[allow(dead_code)]
+async fn publish_framework_native_switchover_terminal(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    terminal: NativeSwitchoverTerminal,
+    now: i64,
+) -> Result<ReconcileAction, String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let name = set.name_any();
+    let set_key = format!("{namespace}/{name}");
+    let set_uid =
+        set.metadata.uid.as_deref().ok_or_else(|| {
+            "terminal framework-native switchover has no KubericSet UID".to_string()
+        })?;
+    let reference = set
+        .status
+        .as_ref()
+        .and_then(|status| status.switchover_execution.as_ref())
+        .ok_or_else(|| "terminal framework-native switchover has no reference".to_string())?;
+    match terminal {
+        NativeSwitchoverTerminal::Stopped { message, .. } => {
+            record_framework_native_switchover_condition(set, api, "Quarantined", &message, now)
+                .await;
+        }
+        NativeSwitchoverTerminal::Complete {
+            operation,
+            snapshot,
+            compensated,
+            ..
+        } => {
+            let primary_name = set
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .members
+                        .iter()
+                        .find(|member| member.id == snapshot.primary_id)
+                })
+                .map(|member| member.name.clone())
+                .ok_or_else(|| {
+                    "terminal native switchover primary is absent from persisted members"
+                        .to_string()
+                })?;
+            let persisted_members = set
+                .status
+                .as_ref()
+                .map(|status| status.members.as_slice())
+                .unwrap_or_default();
+            let mut members = Vec::with_capacity(snapshot.members.len());
+            for member in &snapshot.members {
+                let persisted = persisted_members
+                    .iter()
+                    .find(|persisted| persisted.id == member.id)
+                    .ok_or_else(|| {
+                        format!(
+                            "terminal native switchover member {} is absent from persisted status",
+                            member.id
+                        )
+                    })?;
+                let mut persisted = persisted.clone();
+                persisted.instance_id = member.instance_id.clone();
+                persisted.role = if member.id == snapshot.primary_id {
+                    "primary".to_string()
+                } else {
+                    "secondary".to_string()
+                };
+                members.push(persisted);
+            }
+            let mut status = set.status.clone().unwrap_or_default();
+            status.epoch = snapshot.epoch.clone();
+            status.current_primary = Some(primary_name.clone());
+            status.target_primary = Some(primary_name);
+            status.phase = Phase::Healthy;
+            status.reconfiguration_phase = ReconfigurationPhase::None;
+            status.ready_replicas = members.iter().filter(|member| member.healthy).count() as i32;
+            status.replicas = members.len() as i32;
+            status.members = members;
+            status.stable_snapshot = Some(snapshot);
+            status.operation = None;
+            status.durable_switchover_pilot = None;
+            status.primary_failing_since = None;
+            status.stable_election_metadata_refresh =
+                Some(crate::crd::StableElectionMetadataRefreshStatus {
+                    snapshot_epoch: status.epoch.clone(),
+                    next_member_index: 0,
+                    completed_members: Vec::new(),
+                    pending_action: None,
+                });
+            let (reason, message) = if compensated {
+                (
+                    "CompensatedOrSafeFailure",
+                    operation
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("target promotion failed and the old primary was restored"),
+                )
+            } else {
+                (
+                    "Completed",
+                    "terminal checkpoint accepted before topology publication",
+                )
+            };
+            set_framework_native_switchover_condition(&mut status, reason, message, now);
+            persist_committed_status(api, state, &set_key, set, &status).await?;
+            if let Some(measurements) = state
+                .framework_native_switchover
+                .measurements(&namespace, &name, set_uid, &reference.execution_id)
+                .await
+            {
+                info!(
+                    execution_id = reference.execution_id,
+                    checkpoint_accepted_writes = measurements.accepted_writes,
+                    maximum_active_checkpoint_bytes =
+                        measurements.maximum_active_checkpoint_bytes,
+                    maximum_terminal_checkpoint_bytes =
+                        measurements.maximum_terminal_checkpoint_bytes,
+                    durable_boundary_count = ?measurements.completed_activity_count,
+                    "framework-native switchover process summary"
+                );
+            }
+            state.drivers.lock().await.remove(&set_key);
+            state
+                .framework_native_switchover
                 .forget(&namespace, &name, set_uid, &reference.execution_id)
                 .await;
         }
@@ -4179,6 +4575,64 @@ fn set_framework_native_remove_condition(
     );
 }
 
+fn set_framework_native_switchover_condition(
+    status: &mut KubericSetStatus,
+    reason: &str,
+    message: &str,
+    now: i64,
+) {
+    set_operation_condition(
+        status,
+        StatusCondition {
+            type_: "FrameworkNativeSwitchover".to_string(),
+            status: if matches!(reason, "Completed" | "CompensatedOrSafeFailure") {
+                "False".to_string()
+            } else {
+                "True".to_string()
+            },
+            reason: reason.to_string(),
+            message: message.chars().take(512).collect(),
+            last_transition_time: now.to_string(),
+        },
+    );
+}
+
+async fn record_framework_native_switchover_condition(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    reason: &str,
+    message: &str,
+    now: i64,
+) {
+    let normalized_message: String = message.chars().take(512).collect();
+    let desired_status = if matches!(reason, "Completed" | "CompensatedOrSafeFailure") {
+        "False"
+    } else {
+        "True"
+    };
+    let unchanged = set.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover"
+                && condition.reason == reason
+                && condition.status == desired_status
+                && condition.message == normalized_message
+        })
+    });
+    if unchanged {
+        return;
+    }
+    let mut status = set.status.clone().unwrap_or_default();
+    set_framework_native_switchover_condition(&mut status, reason, &normalized_message, now);
+    let _ = api
+        .patch_set_status(
+            &set.namespace().unwrap_or_default(),
+            &set.name_any(),
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await;
+}
+
 async fn record_framework_native_remove_condition(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -4309,6 +4763,128 @@ mod remove_replica_routing_tests;
 mod tests {
     use super::*;
     use kuberic_core::remove_replica::ManualRemoveReplicaClock;
+
+    fn switchover_snapshot() -> StablePartitionSnapshotStatus {
+        StablePartitionSnapshotStatus {
+            epoch: crate::crd::EpochStatus {
+                data_loss_number: 1,
+                configuration_number: 4,
+            },
+            primary_id: 1,
+            members: vec![
+                StableReplicaSnapshotStatus {
+                    id: 1,
+                    instance_id: "one".to_string(),
+                    role: StableReplicaRoleStatus::Primary,
+                    election_metadata: None,
+                },
+                StableReplicaSnapshotStatus {
+                    id: 2,
+                    instance_id: "two".to_string(),
+                    role: StableReplicaRoleStatus::ActiveSecondary,
+                    election_metadata: None,
+                },
+            ],
+            write_quorum: 2,
+        }
+    }
+
+    fn switchover_set() -> KubericSet {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "kuberic.io/v1",
+            "kind": "KubericSet",
+            "metadata": {
+                "name": "database",
+                "namespace": "tenant",
+                "uid": "set-uid"
+            },
+            "spec": {
+                "image": "test:latest"
+            },
+            "status": {
+                "phase": "Healthy",
+                "stableSnapshot": switchover_snapshot()
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn framework_native_switchover_admission_is_immutable_and_fenced() {
+        let set = switchover_set();
+        let status =
+            accept_framework_native_switchover(&set, switchover_snapshot(), 2, 100).unwrap();
+        assert_eq!(status.phase, Phase::Switchover);
+        assert!(status.operation.is_none());
+        assert!(status.durable_switchover_pilot.is_none());
+        let reference = status.switchover_execution.as_ref().unwrap();
+        let SwitchoverExecutionState::Admitted { input } = &reference.state else {
+            panic!("native admission did not persist admitted state");
+        };
+        assert_eq!(input.operation_authority, "set-uid");
+        assert_eq!(input.target_primary_id, 2);
+        assert_eq!(input.previous_snapshot, switchover_snapshot());
+        assert_eq!(input.accepted_unix_seconds, 100);
+        assert!(status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Accepted"
+        }));
+
+        let already_primary =
+            accept_framework_native_switchover(&set, switchover_snapshot(), 1, 100).unwrap_err();
+        assert!(already_primary.contains("already primary"));
+        let non_member =
+            accept_framework_native_switchover(&set, switchover_snapshot(), 3, 100).unwrap_err();
+        assert!(non_member.contains("not in the stable snapshot"));
+    }
+
+    #[test]
+    fn framework_native_switchover_legacy_markers_preserve_source_identity() {
+        let mut explicit = switchover_set().status.unwrap();
+        explicit.phase = Phase::Switchover;
+        explicit.operation =
+            Some(start_switchover("legacy-set", switchover_snapshot(), 2, 100).unwrap());
+        let marker = legacy_switchover_marker(&explicit).unwrap().unwrap();
+        let SwitchoverExecutionState::Incompatible { incompatibility } = marker.state else {
+            panic!("legacy explicit switchover was not incompatible");
+        };
+        assert_eq!(
+            incompatibility.source,
+            SwitchoverIncompatibilitySource::LegacyExplicit
+        );
+        assert_eq!(incompatibility.legacy_contract_version, 1);
+        assert!(incompatibility.legacy_checkpoint_name.is_none());
+        assert_eq!(incompatibility.fingerprint.len(), 16);
+
+        let mut pilot = KubericSetStatus {
+            phase: Phase::Switchover,
+            durable_switchover_pilot: Some(crate::crd::DurableSwitchoverPilotStatus {
+                version: 2,
+                execution_id: "0123456789abcdef0123456789abcdef".to_string(),
+                checkpoint_name: "kuberic-checkpoint-0123456789abcdef0123456789abcdef".to_string(),
+                initial_operation_json: "{}".to_string(),
+            }),
+            ..Default::default()
+        };
+        let marker = legacy_switchover_marker(&pilot).unwrap().unwrap();
+        let SwitchoverExecutionState::Incompatible { incompatibility } = marker.state else {
+            panic!("legacy pilot switchover was not incompatible");
+        };
+        assert_eq!(
+            incompatibility.source,
+            SwitchoverIncompatibilitySource::LegacyPilotV2
+        );
+        assert!(incompatibility.legacy_checkpoint_name.is_some());
+
+        pilot.durable_switchover_pilot.as_mut().unwrap().version = 1;
+        let marker = legacy_switchover_marker(&pilot).unwrap().unwrap();
+        let SwitchoverExecutionState::Incompatible { incompatibility } = marker.state else {
+            panic!("legacy pilot v1 switchover was not incompatible");
+        };
+        assert_eq!(
+            incompatibility.source,
+            SwitchoverIncompatibilitySource::LegacyPilotV1
+        );
+    }
 
     #[test]
     fn explicit_switchover_engine_is_always_available() {

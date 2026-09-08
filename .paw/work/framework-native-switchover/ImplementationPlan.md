@@ -149,7 +149,7 @@ obsolete tests and documentation.
 - [x] **Phase 1: Native Contract and Compatibility Surface** - Introduce the
   sole versioned switchover execution reference, incompatibility evidence, and
   independent contract bounds while preserving existing routing temporarily.
-- [ ] **Phase 2: Native Admission, Recovery, and Publication Path** - Add the
+- [x] **Phase 2: Native Admission, Recovery, and Publication Path** - Add the
   complete native path and fail-closed legacy conversion alongside the old
   production routing so replacement behavior can be proven before cutover.
 - [ ] **Phase 3: Replacement Safety Coverage and Cutover** - Prove the native

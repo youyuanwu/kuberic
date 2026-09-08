@@ -842,8 +842,16 @@ pub fn validate_loaded_terminal(
     completed_activity_count: u64,
 ) -> Result<DurableSwitchoverPilotTerminal, String> {
     let initial = initial_operation(reference)?;
-    validate_pilot_admission(&initial)?;
-    let terminal = decode_terminal(outcome, &initial)?;
+    validate_loaded_terminal_for_initial(&initial, outcome, completed_activity_count)
+}
+
+pub fn validate_loaded_terminal_for_initial(
+    initial: &DurableOperationStatus,
+    outcome: &TerminalOutcome,
+    completed_activity_count: u64,
+) -> Result<DurableSwitchoverPilotTerminal, String> {
+    validate_pilot_admission(initial)?;
+    let terminal = decode_terminal(outcome, initial)?;
     match (outcome, &terminal) {
         (
             TerminalOutcome::Succeeded(_),
@@ -854,10 +862,10 @@ pub fn validate_loaded_terminal(
                 accounting,
             },
         ) => {
-            validate_transition(&initial, operation)?;
+            validate_transition(initial, operation)?;
             validate_terminal(operation, snapshot, *compensated)?;
             validate_terminal_activity_accounting(
-                &initial,
+                initial,
                 operation,
                 *compensated,
                 *accounting,
@@ -871,7 +879,7 @@ pub fn validate_loaded_terminal(
                 ..
             },
         ) => {
-            validate_transition(&initial, operation)?;
+            validate_transition(initial, operation)?;
         }
         (TerminalOutcome::Failed(_), DurableSwitchoverPilotTerminal::Stopped { .. }) => {}
         _ => {
@@ -1256,7 +1264,6 @@ pub async fn collect_switchover_runner_context(
 }
 
 pub struct SwitchoverRunnerAdapter<'a> {
-    reference: &'a DurableSwitchoverPilotStatus,
     initial: &'a DurableOperationStatus,
     set: &'a KubericSet,
     current_pods: &'a [(i64, kuberic_core::types::ReplicaInstanceId, &'a Pod)],
@@ -1271,7 +1278,6 @@ pub struct SwitchoverRunnerAdapter<'a> {
 
 impl<'a> SwitchoverRunnerAdapter<'a> {
     pub fn new(
-        reference: &'a DurableSwitchoverPilotStatus,
         initial: &'a DurableOperationStatus,
         set: &'a KubericSet,
         current_pods: &'a [(i64, kuberic_core::types::ReplicaInstanceId, &'a Pod)],
@@ -1283,7 +1289,6 @@ impl<'a> SwitchoverRunnerAdapter<'a> {
         let observations = OperationObservations::new();
         let addressed_instances = BTreeMap::new();
         Self {
-            reference,
             initial,
             set,
             current_pods,
@@ -1531,7 +1536,7 @@ impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
         outcome: TerminalOutcome,
         completed_activity_count: u64,
     ) -> Result<Self::Terminal, DurableAdapterBoundary> {
-        validate_loaded_terminal(self.reference, &outcome, completed_activity_count)
+        validate_loaded_terminal_for_initial(self.initial, &outcome, completed_activity_count)
             .map_err(DurableAdapterBoundary::Rejected)
     }
 
