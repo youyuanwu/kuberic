@@ -131,7 +131,7 @@ pub mod test_utils {
             .expect("kvstore pods failed to become ready");
 
         // Wait for operator to reconcile status to Healthy
-        wait_kubericset_healthy(NS_XEDIO, "kvstore", 60)
+        wait_kubericset_healthy(NS_XEDIO, "kvstore", 3, 60)
             .await
             .expect("kvstore KubericSet failed to reach Healthy phase");
         tracing::info!("kvstore deployed and healthy");
@@ -140,6 +140,7 @@ pub mod test_utils {
     pub async fn wait_kubericset_healthy(
         namespace: &str,
         name: &str,
+        expected_replicas: i64,
         timeout_seconds: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let client = kube::Client::try_default().await?;
@@ -164,19 +165,42 @@ pub mod test_utils {
                 .and_then(|s| s.get("phase"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let ready_replicas = obj
+                .data
+                .get("status")
+                .and_then(|s| s.get("readyReplicas"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default();
+            let replicas = obj
+                .data
+                .get("status")
+                .and_then(|s| s.get("replicas"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default();
 
-            if phase == "Healthy" {
+            if phase == "Healthy"
+                && ready_replicas == expected_replicas
+                && replicas == expected_replicas
+            {
                 return Ok(());
             }
 
             if std::time::Instant::now() > deadline {
                 return Err(format!(
-                    "timeout: KubericSet {} phase is {}, expected Healthy",
-                    name, phase
+                    "timeout: KubericSet {name} phase is {phase}, readyReplicas is \
+                     {ready_replicas}, replicas is {replicas}; expected Healthy with \
+                     {expected_replicas} replicas"
                 )
                 .into());
             }
-            tracing::debug!(name, phase, "waiting for Healthy...");
+            tracing::debug!(
+                name,
+                phase,
+                ready_replicas,
+                replicas,
+                expected_replicas,
+                "waiting for converged Healthy status"
+            );
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     }

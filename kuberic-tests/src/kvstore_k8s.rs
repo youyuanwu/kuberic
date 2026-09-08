@@ -227,7 +227,7 @@ async fn test_kvstore_k8s_framework_native_remove_replica() {
     crate::test_utils::wait_pods_ready("xedio", "kuberic.io/set=kvstore", 3, 120)
         .await
         .expect("restored kvstore pods failed to become ready");
-    crate::test_utils::wait_kubericset_healthy("xedio", "kvstore", 120)
+    crate::test_utils::wait_kubericset_healthy("xedio", "kvstore", 3, 120)
         .await
         .expect("restored KubericSet failed to become Healthy");
 }
