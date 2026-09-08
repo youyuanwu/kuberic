@@ -78,3 +78,30 @@ async fn test_kvstore_k8s_status_healthy() {
     assert!(primary.is_some(), "expected a current primary");
     tracing::info!(primary = ?primary, "KubericSet is Healthy");
 }
+
+#[tokio::test]
+#[test_log::test]
+#[ignore = "enabled after Phase 5 makes framework-native remove the production route"]
+async fn test_kvstore_k8s_framework_native_remove_replica() {
+    crate::test_utils::ensure_kvstore_deployed().await;
+    crate::test_utils::patch_kubericset_replicas("xedio", "kvstore", 2)
+        .await
+        .expect("failed to request ScaleDown without a mode selector");
+    let obj = crate::test_utils::wait_kubericset_native_remove_terminal("xedio", "kvstore", 2, 180)
+        .await
+        .expect("framework-native remove did not complete");
+    let status = obj.data.get("status").expect("no terminal status");
+    assert!(
+        status.get("removeReplicaExecution").is_some(),
+        "native terminal reference must remain published"
+    );
+    assert_eq!(
+        status
+            .get("stableSnapshot")
+            .and_then(|snapshot| snapshot.get("members"))
+            .and_then(|members| members.as_array())
+            .map(Vec::len),
+        Some(2),
+        "two-member topology must be published after terminal durability"
+    );
+}

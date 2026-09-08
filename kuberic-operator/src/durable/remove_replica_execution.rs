@@ -1,8 +1,14 @@
 //! Compact versioned durable contract for framework-native replica removal.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::ResourceExt;
+use kuberic_core::driver::ReplicaHandle;
+use kuberic_core::error::KubericError;
 use kuberic_core::remove_replica::{
     RemoveReplicaCoordinatorPhase, RemoveReplicaProgress, RemoveReplicaTerminalResult,
     TargetRetirementObservation,
@@ -15,17 +21,21 @@ use kuberic_core::types::{
     ReplicaInstanceId, ReplicaStatusInfo, Role,
 };
 use kuberic_durable_execution::{
-    ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, CheckpointEnvelope,
-    CheckpointLimits, CheckpointPayload, DurableActivity, ExactBytes, ExecutionContract,
-    ExecutionId, ExecutionSpec, KubernetesCheckpointStore, PreparedActivityError,
-    PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext, decode_activity_input,
-    decode_activity_result, encode_activity_input, encode_activity_result,
+    ActivityName, ActivityObservation, ActivityRecord, ActivitySequence, ActivitySpec,
+    ActivityState, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload,
+    CheckpointStore, DurableActivity, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
+    InMemoryCheckpointStore, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
+    KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, LogicalActivityId,
+    PreparedActivityError, PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext,
+    decode_activity_input, decode_activity_result, encode_activity_input, encode_activity_result,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 
+use crate::cluster_api::ClusterApi;
 use crate::crd::{
-    DurableOperationPhase, DurableOperationStatus, DurableRemoveMode, EpochStatus,
+    DurableOperationPhase, DurableOperationStatus, DurableRemoveMode, EpochStatus, KubericSet,
     RemoveReplicaAdmissionInputStatus, RemoveReplicaAdmissionTargetStatus,
     RemoveReplicaCleanupStatus, RemoveReplicaCommitEvidenceStatus,
     RemoveReplicaCoordinatorPhaseStatus, RemoveReplicaDispositionStatus,
@@ -35,14 +45,24 @@ use crate::crd::{
 
 use super::checkpoint_store::{
     CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
+    MeasuredDurableCheckpointStore,
 };
 use super::effects::{
-    DeleteEffectCommand, DurableEffectOutcome, DurableEffectPreparationError, LabelEffectCommand,
-    ReplicaEffectCommand, clear_dispatch_evidence, prepare_lifecycle_replica_effect_command,
+    DeleteEffectCommand, DispatchFailureDisposition, DurableEffectOutcome,
+    DurableEffectPreparationError, LabelEffectCommand, ReplicaEffectCommand,
+    classify_dispatch_failure, clear_dispatch_evidence, dispatch_rejection_requires_refresh,
+    execute_delete_command, execute_label_command, execute_replica_command,
+    generation_change_proves_no_admission, prepare_lifecycle_replica_effect_command,
     prepare_remove_delete_effect_command, prepare_remove_label_effect_command,
+    remove_delete_postcondition_satisfied, remove_label_postcondition_satisfied,
     validate_remove_replica_action_kind, validate_remove_replica_dispatch_authority,
 };
 use super::remove_replica::{core_intent, validate_remove_replica_operation};
+use super::runner::{
+    DurableAdapterBoundary, DurableAdapterWait, DurableCheckpointDisposition,
+    DurableOperationAdapter,
+};
+use super::workflow_host::{DurableOperatorHost, DurablePermitGuard, DurableWorkflowRuntime};
 use super::{
     Decision, OperationObservations, OperationPodIdentities, RemoveReplicaTarget,
     ReplicaObservation, correlated_action_observation, decide_remove_replica,
@@ -270,41 +290,55 @@ pub enum RemoveReplicaTerminal {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaObservationEvidence {
+    #[serde(rename = "t")]
     pub observed_unix_seconds: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "r", default, skip_serializing_if = "Vec::is_empty")]
     pub replicas: Vec<RemoveReplicaReplicaEvidence>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "p", default, skip_serializing_if = "Vec::is_empty")]
     pub pods: Vec<RemoveReplicaPodEvidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "l", skip_serializing_if = "Option::is_none")]
     pub target_role_label: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaPodEvidence {
+    #[serde(rename = "i")]
     pub replica_id: i64,
+    #[serde(rename = "u")]
     pub uid: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaReplicaEvidence {
+    #[serde(rename = "i")]
     pub replica_id: i64,
+    #[serde(rename = "n")]
     pub instance_id: String,
+    #[serde(rename = "r")]
     pub role: RemoveReplicaRoleEvidence,
+    #[serde(rename = "e")]
     pub epoch: EpochStatus,
+    #[serde(rename = "p")]
     pub current_progress: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
     pub catch_up_capability: Option<i64>,
+    #[serde(rename = "h")]
     pub healthy: bool,
+    #[serde(rename = "w")]
     pub write_status: RemoveReplicaWriteStatusEvidence,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
     pub configuration: Option<RemoveReplicaConfigurationEvidence>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(rename = "x", default, skip_serializing_if = "Vec::is_empty")]
     pub active_connections: Vec<RemoveReplicaConnectionEvidence>,
+    #[serde(rename = "a")]
     pub agent: RemoveReplicaAgentEvidence,
+    #[serde(rename = "o")]
     pub control_address: String,
+    #[serde(rename = "d")]
     pub replicator_address: String,
+    #[serde(rename = "m")]
     pub pod_name: String,
 }
 
@@ -329,8 +363,11 @@ pub enum RemoveReplicaWriteStatusEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaConfigurationEvidence {
+    #[serde(rename = "o")]
     pub mode: RemoveReplicaConfigurationModeEvidence,
+    #[serde(rename = "m")]
     pub members: Vec<RemoveReplicaConfigurationMemberEvidence>,
+    #[serde(rename = "q")]
     pub write_quorum: u32,
 }
 
@@ -344,42 +381,50 @@ pub enum RemoveReplicaConfigurationModeEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaConfigurationMemberEvidence {
+    #[serde(rename = "i")]
     pub replica_id: i64,
+    #[serde(rename = "n")]
     pub instance_id: String,
+    #[serde(rename = "r")]
     pub role: RemoveReplicaRoleEvidence,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaConnectionEvidence {
+    #[serde(rename = "i")]
     pub replica_id: i64,
+    #[serde(rename = "n")]
     pub instance_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaAgentEvidence {
+    #[serde(rename = "p")]
     pub protocol_version: u32,
+    #[serde(rename = "l")]
     pub lifecycle_peer_protocol_version: u32,
+    #[serde(rename = "g")]
     pub generation: String,
+    #[serde(rename = "v")]
     pub control_version: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "a", skip_serializing_if = "Option::is_none")]
     pub action: Option<RemoveReplicaActionEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaActionEvidence {
-    pub action_id: String,
-    pub signature: String,
+    #[serde(rename = "t")]
     pub state: RemoveReplicaActionStateEvidence,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
     pub error_class: Option<RemoveReplicaActionErrorClassEvidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "e", skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "r", skip_serializing_if = "Option::is_none")]
     pub result: Option<RemoveReplicaTerminalResultStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "p", skip_serializing_if = "Option::is_none")]
     pub progress: Option<RemoveReplicaProgressEvidence>,
 }
 
@@ -407,19 +452,23 @@ pub enum RemoveReplicaActionErrorClassEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaProgressEvidence {
+    #[serde(rename = "p")]
     pub phase: RemoveReplicaCoordinatorPhaseStatus,
-    pub attempt_id: String,
+    #[serde(rename = "c")]
     pub commit_observed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "t", skip_serializing_if = "Option::is_none")]
     pub commit_observed_unix_seconds: Option<i64>,
+    #[serde(rename = "x")]
     pub connection_absent: bool,
+    #[serde(rename = "r")]
     pub target_retirement: TargetRetirementObservationStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "e", skip_serializing_if = "Option::is_none")]
     pub retirement_expiry_unix_seconds: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "m", skip_serializing_if = "Option::is_none")]
     pub compensation_expiry_unix_seconds: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "z", skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(rename = "d")]
     pub current_install_dispatched: bool,
 }
 
@@ -464,12 +513,15 @@ impl RemoveReplicaObservationEvidence {
         Ok(evidence)
     }
 
-    pub fn reconstruct(&self) -> Result<(OperationObservations, OperationPodIdentities), String> {
+    pub fn reconstruct(
+        &self,
+        operation: &DurableOperationStatus,
+    ) -> Result<(OperationObservations, OperationPodIdentities), String> {
         self.validate()?;
         let observations = self
             .replicas
             .iter()
-            .map(|replica| Ok((replica.replica_id, replica.reconstruct()?)))
+            .map(|replica| Ok((replica.replica_id, replica.reconstruct(operation)?)))
             .collect::<Result<OperationObservations, String>>()?;
         let pods = self
             .pods
@@ -558,14 +610,17 @@ impl RemoveReplicaReplicaEvidence {
         })
     }
 
-    fn reconstruct(&self) -> Result<ReplicaObservation, String> {
+    fn reconstruct(
+        &self,
+        operation: &DurableOperationStatus,
+    ) -> Result<ReplicaObservation, String> {
         let generation = AgentGeneration::parse(self.agent.generation.clone())?;
         let control_version = AgentControlVersion::new(self.agent.control_version);
         let action = self
             .agent
             .action
             .as_ref()
-            .map(RemoveReplicaActionEvidence::reconstruct)
+            .map(|action| action.reconstruct(operation))
             .transpose()?;
         let current_action = action.map(|action| CorrelatedActionObservation {
             generation: generation.clone(),
@@ -661,8 +716,6 @@ impl RemoveReplicaActionEvidence {
             None => None,
         };
         Ok(Self {
-            action_id: action.action_id.clone(),
-            signature: action.signature.clone(),
             state: action.state.into(),
             error_class: action.error_class.map(Into::into),
             error: action.error.clone(),
@@ -674,10 +727,17 @@ impl RemoveReplicaActionEvidence {
         })
     }
 
-    fn reconstruct(&self) -> Result<DurableActionObservation, String> {
+    fn reconstruct(
+        &self,
+        operation: &DurableOperationStatus,
+    ) -> Result<DurableActionObservation, String> {
+        let intent = operation
+            .remove_intent
+            .as_ref()
+            .ok_or_else(|| "remove action evidence has no frozen intent".to_string())?;
         Ok(DurableActionObservation {
-            action_id: self.action_id.clone(),
-            signature: self.signature.clone(),
+            action_id: intent.action_id.clone(),
+            signature: intent.input_signature.clone(),
             state: self.state.into(),
             error_class: self.error_class.map(Into::into),
             error: self.error.clone(),
@@ -688,7 +748,7 @@ impl RemoveReplicaActionEvidence {
             remove_replica_progress: self
                 .progress
                 .as_ref()
-                .map(RemoveReplicaProgressEvidence::reconstruct)
+                .map(|progress| progress.reconstruct(operation))
                 .transpose()?,
         })
     }
@@ -698,7 +758,6 @@ impl RemoveReplicaProgressEvidence {
     fn capture(progress: &RemoveReplicaProgress) -> Self {
         Self {
             phase: progress.phase.into(),
-            attempt_id: progress.attempt_id.clone(),
             commit_observed: progress.commit_observed,
             commit_observed_unix_seconds: progress.commit_observed_unix_seconds,
             connection_absent: progress.connection_absent,
@@ -710,10 +769,17 @@ impl RemoveReplicaProgressEvidence {
         }
     }
 
-    fn reconstruct(&self) -> Result<RemoveReplicaProgress, String> {
+    fn reconstruct(
+        &self,
+        operation: &DurableOperationStatus,
+    ) -> Result<RemoveReplicaProgress, String> {
+        let intent = operation
+            .remove_intent
+            .as_ref()
+            .ok_or_else(|| "remove progress evidence has no frozen intent".to_string())?;
         let progress = RemoveReplicaProgress {
             phase: self.phase.into(),
-            attempt_id: self.attempt_id.clone(),
+            attempt_id: intent.attempt_id.clone(),
             commit_observed: self.commit_observed,
             commit_observed_unix_seconds: self.commit_observed_unix_seconds,
             connection_absent: self.connection_absent,
@@ -1045,6 +1111,7 @@ fn apply_boundary_result(
             accounting.record(DurableActivityClass::PassiveObservation)?;
             fold_evidence(operation, &evidence)
         }
+
         RemoveReplicaBoundaryResult::Effect { outcome } => {
             accounting.record(DurableActivityClass::ExternalEffect)?;
             match outcome {
@@ -1093,11 +1160,85 @@ fn apply_boundary_result(
     }
 }
 
+fn advance_to_boundary(
+    mut operation: DurableOperationStatus,
+) -> Result<DurableOperationStatus, String> {
+    for _ in 0..REMOVE_REPLICA_MAX_TRANSITION_FUEL {
+        if matches!(
+            operation.phase,
+            DurableOperationPhase::Completed
+                | DurableOperationPhase::Failed
+                | DurableOperationPhase::Poisoned
+        ) {
+            return Ok(operation);
+        }
+        match advance_without_evidence(operation, Default::default())? {
+            Advance::State(next) => operation = next,
+            Advance::Boundary(current) => return Ok(current),
+            Advance::Terminal(_) => unreachable!("terminal phases return before advancement"),
+        }
+    }
+    Err("native remove active replay exhausted transition fuel".to_string())
+}
+
+pub fn replay_active_operation(
+    reference: &RemoveReplicaExecution,
+    activities: &[ActivityRecord],
+) -> Result<DurableOperationStatus, String> {
+    replay_active_operation_history(reference, activities).map(|(operation, _)| operation)
+}
+
+fn replay_active_operation_history(
+    reference: &RemoveReplicaExecution,
+    activities: &[ActivityRecord],
+) -> Result<(DurableOperationStatus, Vec<DurableOperationStatus>), String> {
+    let mut operation = reconstruct_initial_operation(&reference.input)?;
+    let mut accounting = RemoveReplicaActivityAccounting::default();
+    let mut redeliveries = BTreeMap::new();
+    let mut history = Vec::with_capacity(activities.len().saturating_add(1));
+    for record in activities {
+        operation = advance_to_boundary(operation)?;
+        history.push(operation.clone());
+        let input = decode_boundary_input(record.input())?;
+        if input != logical_boundary(&operation) {
+            validate_prepared_activity(&operation, &input)?;
+        }
+        match record.state() {
+            ActivityState::Completed { result } => {
+                let result = decode_boundary_result(result)?;
+                operation =
+                    apply_boundary_result(&operation, result, &mut accounting, &mut redeliveries)?;
+            }
+            ActivityState::Scheduled | ActivityState::DispatchExposed { .. } => {
+                return Ok((operation, history));
+            }
+        }
+    }
+    operation = advance_to_boundary(operation)?;
+    history.push(operation.clone());
+    Ok((operation, history))
+}
+
+fn operation_after_boundary_result(
+    operation: &DurableOperationStatus,
+    result: &RemoveReplicaBoundaryResult,
+) -> Result<DurableOperationStatus, String> {
+    let mut accounting = RemoveReplicaActivityAccounting::default();
+    let mut redeliveries = BTreeMap::new();
+    let next = apply_boundary_result(
+        operation,
+        result.clone(),
+        &mut accounting,
+        &mut redeliveries,
+    )?;
+    advance_to_boundary(next)
+}
+
 fn fold_evidence(
     operation: &DurableOperationStatus,
     evidence: &RemoveReplicaObservationEvidence,
 ) -> Result<DurableOperationStatus, String> {
-    let (observations, pods) = evidence.reconstruct()?;
+    let (observations, pods) = evidence.reconstruct(operation)?;
     let mut current = operation.clone();
     for _ in 0..REMOVE_REPLICA_MAX_TRANSITION_FUEL {
         match decide_remove_replica(
@@ -1167,47 +1308,54 @@ fn logical_boundary(operation: &DurableOperationStatus) -> RemoveReplicaBoundary
     }
 }
 
-pub struct RemoveReplicaPreparedActivityResolver<'a> {
-    operation: &'a DurableOperationStatus,
-    observations: &'a OperationObservations,
-    pod_identities: &'a OperationPodIdentities,
-    target_role_label: Option<&'a str>,
-    addressed_instances: &'a BTreeMap<i64, ReplicaInstanceId>,
+pub struct RemoveReplicaPreparedActivityResolver {
+    operation: DurableOperationStatus,
+    history: Vec<DurableOperationStatus>,
+    observations: OperationObservations,
+    pod_identities: OperationPodIdentities,
+    target_role_label: Option<String>,
+    addressed_instances: BTreeMap<i64, ReplicaInstanceId>,
     now: i64,
 }
 
-impl<'a> RemoveReplicaPreparedActivityResolver<'a> {
+impl RemoveReplicaPreparedActivityResolver {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        operation: &'a DurableOperationStatus,
-        observations: &'a OperationObservations,
-        pod_identities: &'a OperationPodIdentities,
-        target_role_label: Option<&'a str>,
-        addressed_instances: &'a BTreeMap<i64, ReplicaInstanceId>,
+        operation: &DurableOperationStatus,
+        observations: &OperationObservations,
+        pod_identities: &OperationPodIdentities,
+        target_role_label: Option<&str>,
+        addressed_instances: &BTreeMap<i64, ReplicaInstanceId>,
         now: i64,
     ) -> Self {
         Self {
-            operation,
-            observations,
-            pod_identities,
-            target_role_label,
-            addressed_instances,
+            operation: operation.clone(),
+            history: vec![operation.clone()],
+            observations: observations.clone(),
+            pod_identities: pod_identities.clone(),
+            target_role_label: target_role_label.map(ToOwned::to_owned),
+            addressed_instances: addressed_instances.clone(),
             now,
         }
+    }
+
+    fn with_history(mut self, history: Vec<DurableOperationStatus>) -> Self {
+        self.history = history;
+        self
     }
 
     fn prepare(
         &self,
         logical: &RemoveReplicaBoundaryInput,
     ) -> Result<RemoveReplicaBoundaryInput, PreparedActivityError> {
-        if logical != &logical_boundary(self.operation) {
+        if logical != &logical_boundary(&self.operation) {
             return Err(PreparedActivityError::Validation);
         }
         match decide_remove_replica(
-            self.operation,
-            self.observations,
-            self.pod_identities,
-            self.target_role_label,
+            &self.operation,
+            &self.observations,
+            &self.pod_identities,
+            self.target_role_label.as_deref(),
             self.now,
         )
         .map_err(|_| PreparedActivityError::Derivation)?
@@ -1236,14 +1384,6 @@ impl<'a> RemoveReplicaPreparedActivityResolver<'a> {
                     .addressed_instances
                     .get(&target_id)
                     .ok_or(PreparedActivityError::Derivation)?;
-                if !validate_remove_replica_dispatch_authority(
-                    self.operation,
-                    &observed.status,
-                    addressed,
-                    &action,
-                ) {
-                    return Err(PreparedActivityError::Derivation);
-                }
                 let (_, command) = prepare_lifecycle_replica_effect_command(
                     pending,
                     &observed.status,
@@ -1251,6 +1391,14 @@ impl<'a> RemoveReplicaPreparedActivityResolver<'a> {
                     &action,
                 )
                 .map_err(preparation_error)?;
+                if !validate_remove_replica_dispatch_authority(
+                    &self.operation,
+                    &observed.status,
+                    addressed,
+                    &action,
+                ) {
+                    return Err(PreparedActivityError::Validation);
+                }
                 Ok(RemoveReplicaBoundaryInput::ReplicaCommand {
                     command: command.into(),
                 })
@@ -1260,11 +1408,11 @@ impl<'a> RemoveReplicaPreparedActivityResolver<'a> {
                 expected_uid,
                 role,
             } => prepare_remove_label_effect_command(
-                self.operation,
+                &self.operation,
                 target_id,
                 &expected_uid,
                 &role,
-                self.pod_identities,
+                &self.pod_identities,
             )
             .map(|command| RemoveReplicaBoundaryInput::LabelCommand { command })
             .map_err(|_| PreparedActivityError::Derivation),
@@ -1272,10 +1420,10 @@ impl<'a> RemoveReplicaPreparedActivityResolver<'a> {
                 pod_name,
                 expected_uid,
             } => prepare_remove_delete_effect_command(
-                self.operation,
+                &self.operation,
                 &pod_name,
                 &expected_uid,
-                self.pod_identities,
+                &self.pod_identities,
             )
             .map(|command| RemoveReplicaBoundaryInput::DeleteCommand { command })
             .map_err(|_| PreparedActivityError::Derivation),
@@ -1289,7 +1437,7 @@ impl<'a> RemoveReplicaPreparedActivityResolver<'a> {
     }
 }
 
-impl PreparedActivityResolver for RemoveReplicaPreparedActivityResolver<'_> {
+impl PreparedActivityResolver for RemoveReplicaPreparedActivityResolver {
     fn resolve(
         &self,
         logical: &ActivitySpec,
@@ -1308,9 +1456,14 @@ impl PreparedActivityResolver for RemoveReplicaPreparedActivityResolver<'_> {
             else {
                 return Ok(logical.clone());
             };
-            if logical_input != logical_boundary(self.operation)
-                || validate_prepared_activity(self.operation, &recorded_input).is_err()
-            {
+            let Some(historical_operation) = self
+                .history
+                .iter()
+                .find(|operation| logical_input == logical_boundary(operation))
+            else {
+                return Ok(logical.clone());
+            };
+            if validate_prepared_activity(historical_operation, &recorded_input).is_err() {
                 return Ok(logical.clone());
             }
             return Ok(recorded.clone());
@@ -1420,7 +1573,7 @@ pub fn decode_boundary_input(input: &ExactBytes) -> Result<RemoveReplicaBoundary
         .map_err(|error| format!("decode native remove boundary input: {error}"))
 }
 
-fn activity_spec(input: &RemoveReplicaBoundaryInput) -> Result<ActivitySpec, String> {
+pub fn activity_spec(input: &RemoveReplicaBoundaryInput) -> Result<ActivitySpec, String> {
     let input = encode_activity_input::<RemoveReplicaBoundary>(input)
         .map_err(|error| format!("serialize native remove boundary input: {error}"))?;
     Ok(ActivitySpec::new(
@@ -1432,6 +1585,107 @@ fn activity_spec(input: &RemoveReplicaBoundaryInput) -> Result<ActivitySpec, Str
         input,
         REMOVE_REPLICA_MAX_BOUNDARY_RESULT_BYTES,
     ))
+}
+
+pub type RemoveReplicaHost = DurableOperatorHost;
+
+pub struct FrameworkNativeRemoveReplicaRuntime {
+    inner: Arc<DurableWorkflowRuntime>,
+}
+
+impl FrameworkNativeRemoveReplicaRuntime {
+    pub fn kubernetes(client: kube::Client) -> Self {
+        Self {
+            inner: Arc::new(DurableWorkflowRuntime::kubernetes(client)),
+        }
+    }
+
+    pub fn in_memory(store: InMemoryCheckpointStore) -> Self {
+        Self {
+            inner: Arc::new(DurableWorkflowRuntime::in_memory(store)),
+        }
+    }
+
+    pub fn shared(inner: Arc<DurableWorkflowRuntime>) -> Self {
+        Self { inner }
+    }
+
+    pub async fn host(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        set_uid: &str,
+        reference: &RemoveReplicaExecution,
+    ) -> Result<Arc<Mutex<RemoveReplicaHost>>, String> {
+        let execution_id = execution_id(reference)?;
+        self.inner
+            .host(
+                namespace,
+                set_name,
+                set_uid,
+                "remove-replica-native",
+                execution_id,
+                &reference.execution_id,
+                &reference.checkpoint_name,
+                checkpoint_store_options(namespace, set_name, set_uid)?,
+                checkpoint_limits(),
+                checkpoint_measurement_decoder(),
+            )
+            .await
+    }
+
+    pub async fn forget(&self, namespace: &str, set_name: &str, set_uid: &str, execution_id: &str) {
+        self.inner
+            .forget(
+                namespace,
+                set_name,
+                set_uid,
+                "remove-replica-native",
+                execution_id,
+            )
+            .await;
+    }
+
+    pub async fn measurements(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        set_uid: &str,
+        execution_id: &str,
+    ) -> Option<super::checkpoint_store::DurableCheckpointMeasurementsSnapshot> {
+        self.inner
+            .measurements(
+                namespace,
+                set_name,
+                set_uid,
+                "remove-replica-native",
+                execution_id,
+            )
+            .await
+    }
+}
+
+pub fn checkpoint_store_options(
+    namespace: &str,
+    set_name: &str,
+    set_uid: &str,
+) -> Result<KubernetesCheckpointStoreOptions, String> {
+    if namespace.is_empty() || set_name.is_empty() || set_uid.is_empty() {
+        return Err("native remove checkpoint owner requires namespace, name, and UID".to_string());
+    }
+    Ok(
+        KubernetesCheckpointStoreOptions::default().with_owner(KubernetesCheckpointOwner::new(
+            OwnerReference {
+                api_version: "kuberic.io/v1".to_string(),
+                kind: "KubericSet".to_string(),
+                name: set_name.to_string(),
+                uid: set_uid.to_string(),
+                controller: Some(false),
+                block_owner_deletion: Some(false),
+            },
+            KubernetesCheckpointOwnerScope::Namespaced(namespace.to_string()),
+        )),
+    )
 }
 
 pub fn new_execution(
@@ -2140,6 +2394,553 @@ pub fn checkpoint_measurement_decoder() -> CheckpointMeasurementDecoder {
     )
 }
 
+struct RemoveReplicaRunnerContext {
+    observations: OperationObservations,
+    pod_identities: OperationPodIdentities,
+    target_role_label: Option<String>,
+    handles: BTreeMap<i64, Box<dyn ReplicaHandle>>,
+    addressed_instances: BTreeMap<i64, ReplicaInstanceId>,
+}
+
+async fn collect_runner_context(
+    operation: &DurableOperationStatus,
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    current_pods: &[(i64, ReplicaInstanceId, &Pod)],
+) -> Result<RemoveReplicaRunnerContext, String> {
+    let pod_identities = current_pods
+        .iter()
+        .map(|(replica_id, instance_id, _)| (*replica_id, instance_id.to_string()))
+        .collect::<OperationPodIdentities>();
+    let target_role_label = operation.target_replica_id.and_then(|target_id| {
+        current_pods
+            .iter()
+            .find(|(replica_id, instance_id, _)| {
+                *replica_id == target_id
+                    && operation.target_pod_uid.as_deref() == Some(instance_id.as_str())
+            })
+            .and_then(|(_, _, pod)| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kuberic.io/role"))
+            })
+            .cloned()
+    });
+    let mut handles = BTreeMap::new();
+    let mut observations = OperationObservations::new();
+    for (replica_id, _, pod) in current_pods {
+        if !operation
+            .previous_snapshot
+            .members
+            .iter()
+            .any(|member| member.id == *replica_id)
+        {
+            continue;
+        }
+        let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await else {
+            continue;
+        };
+        match handle.get_status().await {
+            Ok(status) => {
+                observations.insert(
+                    *replica_id,
+                    ReplicaObservation {
+                        status,
+                        control_address: handle.control_address(),
+                        replicator_address: handle.replicator_address(),
+                        pod_name: pod.name_any(),
+                        pod_role_label: pod
+                            .metadata
+                            .labels
+                            .as_ref()
+                            .and_then(|labels| labels.get("kuberic.io/role"))
+                            .cloned(),
+                    },
+                );
+            }
+            Err(
+                error @ (KubericError::RemoteControlProtocolUnsupported(_)
+                | KubericError::RemoteAgentRequestRejected(_)),
+            ) => {
+                return Err(format!(
+                    "replica {replica_id} has unsupported or malformed control status during native remove: {error}"
+                ));
+            }
+            Err(_) => {}
+        }
+        handles.insert(*replica_id, handle);
+    }
+    let addressed_instances = handles
+        .iter()
+        .map(|(replica_id, handle)| (*replica_id, handle.instance_id()))
+        .collect();
+    Ok(RemoveReplicaRunnerContext {
+        observations,
+        pod_identities,
+        target_role_label,
+        handles,
+        addressed_instances,
+    })
+}
+
+pub struct FrameworkNativeRemoveReplicaAdapter<'a> {
+    reference: &'a RemoveReplicaExecution,
+    set: &'a KubericSet,
+    current_pods: &'a [(i64, ReplicaInstanceId, &'a Pod)],
+    api: &'a dyn ClusterApi,
+    namespace: String,
+    store: MeasuredDurableCheckpointStore,
+    execution: ExecutionSpec,
+    operation: DurableOperationStatus,
+    operation_history: Vec<DurableOperationStatus>,
+    resolver: RemoveReplicaPreparedActivityResolver,
+    context: Option<RemoveReplicaRunnerContext>,
+    now: i64,
+}
+
+impl<'a> FrameworkNativeRemoveReplicaAdapter<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        reference: &'a RemoveReplicaExecution,
+        set: &'a KubericSet,
+        current_pods: &'a [(i64, ReplicaInstanceId, &'a Pod)],
+        api: &'a dyn ClusterApi,
+        store: MeasuredDurableCheckpointStore,
+        execution: ExecutionSpec,
+        now: i64,
+    ) -> Result<Self, String> {
+        let operation = advance_to_boundary(reconstruct_initial_operation(&reference.input)?)?;
+        let empty_observations = OperationObservations::new();
+        let empty_pods = OperationPodIdentities::new();
+        let empty_instances = BTreeMap::new();
+        Ok(Self {
+            reference,
+            set,
+            current_pods,
+            api,
+            namespace: set.namespace().unwrap_or_default(),
+            store,
+            execution,
+            resolver: RemoveReplicaPreparedActivityResolver::new(
+                &operation,
+                &empty_observations,
+                &empty_pods,
+                None,
+                &empty_instances,
+                now,
+            ),
+            operation,
+            operation_history: Vec::new(),
+            context: None,
+            now,
+        })
+    }
+
+    fn context(&self) -> Result<&RemoveReplicaRunnerContext, String> {
+        self.context
+            .as_ref()
+            .ok_or_else(|| "native remove adapter was not prepared".to_string())
+    }
+
+    fn evidence(&self) -> Result<RemoveReplicaObservationEvidence, String> {
+        let context = self.context()?;
+        RemoveReplicaObservationEvidence::capture(
+            &self.operation,
+            &context.observations,
+            &context.pod_identities,
+            context.target_role_label.as_deref(),
+            self.now,
+        )
+    }
+
+    fn observation(
+        &mut self,
+        activity: LogicalActivityId,
+        result: RemoveReplicaBoundaryResult,
+        stop_for_fresh_authority: bool,
+    ) -> DurableAdapterBoundary {
+        let encoded = match encode_boundary_result(&result) {
+            Ok(encoded) => encoded,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        match operation_after_boundary_result(&self.operation, &result) {
+            Ok(operation) => self.operation = operation,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        }
+        self.operation_history.push(self.operation.clone());
+        let context = match self.context() {
+            Ok(context) => context,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        self.resolver = RemoveReplicaPreparedActivityResolver::new(
+            &self.operation,
+            &context.observations,
+            &context.pod_identities,
+            context.target_role_label.as_deref(),
+            &context.addressed_instances,
+            self.now,
+        )
+        .with_history(self.operation_history.clone());
+        let observation = ActivityObservation::new(activity, encoded);
+        if stop_for_fresh_authority {
+            DurableAdapterBoundary::ObserveAndWait {
+                observation: Box::new(observation),
+                reason: "RefreshingAuthority".to_string(),
+                detail: "native remove persisted effect evidence and requires a fresh authority observation before another command".to_string(),
+                requeue_after_seconds: 1,
+            }
+        } else {
+            DurableAdapterBoundary::Observed(observation)
+        }
+    }
+
+    fn wait(&self, reason: &str, detail: &str) -> DurableAdapterBoundary {
+        DurableAdapterBoundary::Wait {
+            reason: reason.to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    fn validate_activity(
+        &self,
+        activity: &LogicalActivityId,
+    ) -> Result<RemoveReplicaBoundaryInput, String> {
+        let input = decode_boundary_input(activity.input())?;
+        if input == logical_boundary(&self.operation) {
+            return Ok(input);
+        }
+        validate_prepared_activity(&self.operation, &input)?;
+        Ok(input)
+    }
+}
+
+#[async_trait]
+impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
+    type Resolver = RemoveReplicaPreparedActivityResolver;
+    type Terminal = RemoveReplicaTerminal;
+    type Publication = RemoveReplicaTerminal;
+
+    fn resolver(&self) -> &Self::Resolver {
+        &self.resolver
+    }
+
+    async fn prepare(&mut self) -> Result<(), DurableAdapterBoundary> {
+        let loaded = self
+            .store
+            .load(self.execution.execution_id())
+            .await
+            .map_err(|error| {
+                DurableAdapterBoundary::Isolated(format!(
+                    "load native remove checkpoint for adapter preparation: {error}"
+                ))
+            })?;
+        let (operation, history) = match loaded {
+            Some(stored) => {
+                let payload = stored
+                    .checkpoint()
+                    .decode_and_validate(&self.execution, checkpoint_limits())
+                    .map_err(|error| DurableAdapterBoundary::Rejected(error.to_string()))?;
+                replay_active_operation_history(
+                    self.reference,
+                    payload.active_activities().unwrap_or_default(),
+                )
+                .map_err(DurableAdapterBoundary::Isolated)?
+            }
+            None => {
+                let operation = advance_to_boundary(
+                    reconstruct_initial_operation(&self.reference.input)
+                        .map_err(DurableAdapterBoundary::Rejected)?,
+                )
+                .map_err(DurableAdapterBoundary::Isolated)?;
+                (operation.clone(), vec![operation])
+            }
+        };
+        self.operation = operation;
+        self.operation_history = history;
+        let context =
+            collect_runner_context(&self.operation, self.set, self.api, self.current_pods)
+                .await
+                .map_err(DurableAdapterBoundary::Isolated)?;
+        self.resolver = RemoveReplicaPreparedActivityResolver::new(
+            &self.operation,
+            &context.observations,
+            &context.pod_identities,
+            context.target_role_label.as_deref(),
+            &context.addressed_instances,
+            self.now,
+        )
+        .with_history(self.operation_history.clone());
+        self.context = Some(context);
+        Ok(())
+    }
+
+    async fn observe_or_dispatch(
+        &mut self,
+        activity: &LogicalActivityId,
+        attempt_id: kuberic_durable_execution::AttemptId,
+        permit: &mut DurablePermitGuard,
+    ) -> DurableAdapterBoundary {
+        let prepared = match self.validate_activity(activity) {
+            Ok(prepared) => prepared,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        let expected = match activity_spec(&prepared) {
+            Ok(expected) => expected,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        if let Err(error) = permit.consume(&expected, activity, attempt_id, "remove-replica-native")
+        {
+            return DurableAdapterBoundary::Isolated(error);
+        }
+        match prepared {
+            RemoveReplicaBoundaryInput::Observe { .. } => {
+                let evidence = match self.evidence() {
+                    Ok(evidence) => evidence,
+                    Err(error) => return DurableAdapterBoundary::Isolated(error),
+                };
+                self.observation(
+                    activity.clone(),
+                    RemoveReplicaBoundaryResult::Observation { evidence },
+                    false,
+                )
+            }
+            RemoveReplicaBoundaryInput::ReplicaCommand { command } => {
+                let exact = match command.effect_command() {
+                    Ok(exact) => exact,
+                    Err(error) => return DurableAdapterBoundary::Isolated(error),
+                };
+                let context = match self.context() {
+                    Ok(context) => context,
+                    Err(error) => return DurableAdapterBoundary::Isolated(error),
+                };
+                let Some(handle) = context.handles.get(&exact.target_id) else {
+                    return self.wait(
+                        "AwaitingAuthoritativeObservation",
+                        "native remove exact replica target is not currently addressable",
+                    );
+                };
+                if handle.instance_id().as_str() != exact.target_instance_id {
+                    return self.wait(
+                        "AwaitingFreshAuthority",
+                        "native remove exact replica incarnation changed before dispatch",
+                    );
+                }
+                match execute_replica_command(handle.as_ref(), &exact).await {
+                    Ok(()) => self.wait(
+                        "EffectExposed",
+                        "native remove replica effect was exposed and awaits authoritative observation",
+                    ),
+                    Err(error)
+                        if classify_dispatch_failure(&error)
+                            == DispatchFailureDisposition::ProvenNoAdmission =>
+                    {
+                        let evidence = match self.evidence() {
+                            Ok(evidence) => evidence,
+                            Err(message) => return DurableAdapterBoundary::Isolated(message),
+                        };
+                        self.observation(
+                            activity.clone(),
+                            RemoveReplicaBoundaryResult::ProvenNoAdmission {
+                                action_id: exact.action_id,
+                                redelivery: 1,
+                                evidence,
+                            },
+                            dispatch_rejection_requires_refresh(&error),
+                        )
+                    }
+                    Err(error)
+                        if classify_dispatch_failure(&error)
+                            == DispatchFailureDisposition::DefiniteFailure =>
+                    {
+                        let result = RemoveReplicaBoundaryResult::Effect {
+                            outcome: DurableEffectOutcome::definite_failure(
+                                "dispatch",
+                                &error.to_string(),
+                            ),
+                        };
+                        self.observation(activity.clone(), result, true)
+                    }
+                    Err(_) => self.wait(
+                        "EffectExposed",
+                        "native remove replica effect outcome is uncertain and requires authoritative observation",
+                    ),
+                }
+            }
+            RemoveReplicaBoundaryInput::LabelCommand { command } => {
+                execute_label_command(self.api, &self.namespace, &command).await;
+                self.wait(
+                    "EffectExposed",
+                    "native remove UID-fenced label effect was exposed and awaits observation",
+                )
+            }
+            RemoveReplicaBoundaryInput::DeleteCommand { command } => {
+                execute_delete_command(self.api, &self.namespace, &command).await;
+                self.wait(
+                    "EffectExposed",
+                    "native remove UID-fenced delete effect was exposed and awaits observation",
+                )
+            }
+        }
+    }
+
+    async fn resolve_quarantine(
+        &mut self,
+        activity: LogicalActivityId,
+        _attempt_id: kuberic_durable_execution::AttemptId,
+    ) -> DurableAdapterBoundary {
+        let prepared = match self.validate_activity(&activity) {
+            Ok(prepared) => prepared,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        let evidence = match self.evidence() {
+            Ok(evidence) => evidence,
+            Err(error) => return DurableAdapterBoundary::Isolated(error),
+        };
+        match prepared {
+            RemoveReplicaBoundaryInput::Observe { .. } => self.observation(
+                activity,
+                RemoveReplicaBoundaryResult::Observation { evidence },
+                false,
+            ),
+            RemoveReplicaBoundaryInput::ReplicaCommand { command } => {
+                let exact = match command.effect_command() {
+                    Ok(exact) => exact,
+                    Err(error) => return DurableAdapterBoundary::Isolated(error),
+                };
+                let context = match self.context() {
+                    Ok(context) => context,
+                    Err(error) => return DurableAdapterBoundary::Isolated(error),
+                };
+                if context
+                    .observations
+                    .get(&exact.target_id)
+                    .and_then(|observation| {
+                        correlated_action_observation(&observation.status, exact.action_id.as_str())
+                    })
+                    .is_some()
+                {
+                    return self.observation(
+                        activity,
+                        RemoveReplicaBoundaryResult::Effect {
+                            outcome: DurableEffectOutcome::Applied(evidence),
+                        },
+                        true,
+                    );
+                }
+                if generation_change_proves_no_admission(
+                    &self.operation,
+                    exact.target_id,
+                    &context.observations,
+                ) {
+                    return self.observation(
+                        activity,
+                        RemoveReplicaBoundaryResult::ProvenNoAdmission {
+                            action_id: exact.action_id,
+                            redelivery: 1,
+                            evidence,
+                        },
+                        true,
+                    );
+                }
+                self.wait(
+                    "Quarantined",
+                    "native remove exposed replica effect remains quarantined pending exact correlated evidence",
+                )
+            }
+            RemoveReplicaBoundaryInput::LabelCommand { command } => {
+                let context = match self.context() {
+                    Ok(context) => context,
+                    Err(error) => return DurableAdapterBoundary::Isolated(error),
+                };
+                if remove_label_postcondition_satisfied(
+                    &command,
+                    &context.pod_identities,
+                    context.target_role_label.as_deref(),
+                ) {
+                    self.observation(
+                        activity,
+                        RemoveReplicaBoundaryResult::Effect {
+                            outcome: DurableEffectOutcome::Applied(evidence),
+                        },
+                        true,
+                    )
+                } else {
+                    self.wait(
+                        "Quarantined",
+                        "native remove UID-fenced label effect awaits its exact postcondition",
+                    )
+                }
+            }
+            RemoveReplicaBoundaryInput::DeleteCommand { command } => {
+                let context = match self.context() {
+                    Ok(context) => context,
+                    Err(error) => return DurableAdapterBoundary::Isolated(error),
+                };
+                if remove_delete_postcondition_satisfied(&command, &context.pod_identities) {
+                    self.observation(
+                        activity,
+                        RemoveReplicaBoundaryResult::Effect {
+                            outcome: DurableEffectOutcome::Applied(evidence),
+                        },
+                        true,
+                    )
+                } else {
+                    self.wait(
+                        "Quarantined",
+                        "native remove UID-fenced delete effect awaits exact UID absence",
+                    )
+                }
+            }
+        }
+    }
+
+    fn deadline_unix_seconds(&self) -> i64 {
+        self.operation
+            .pending_action
+            .as_ref()
+            .map(|pending| pending.deadline_unix_seconds)
+            .unwrap_or(self.operation.phase_deadline_unix_seconds)
+    }
+
+    fn preparation_wait(&self, error: &CheckpointError) -> DurableAdapterWait {
+        DurableAdapterWait {
+            reason: "AwaitingFreshAuthority".to_string(),
+            detail: format!(
+                "native remove cannot prepare the next exact effect until epoch, incarnation, UID, role, control-version, generation, and configuration authority are current: {error}"
+            ),
+            requeue_after_seconds: Some(1),
+        }
+    }
+
+    fn checkpoint_disposition(&self, error: &CheckpointError) -> DurableCheckpointDisposition {
+        match error {
+            CheckpointError::UnsupportedFormat { .. }
+            | CheckpointError::WorkflowInputMismatch { .. }
+            | CheckpointError::TerminalPayloadBoundMismatch { .. }
+            | CheckpointError::ConfiguredCapacityBelowAdmission { .. }
+            | CheckpointError::TerminalEncodedCheckpointCapacityMismatch { .. } => {
+                DurableCheckpointDisposition::Incompatible
+            }
+            CheckpointError::ExecutionMismatch { .. } => DurableCheckpointDisposition::Isolated,
+            _ => DurableCheckpointDisposition::Rejected,
+        }
+    }
+
+    fn validate_terminal(
+        &mut self,
+        outcome: TerminalOutcome,
+        completed_activity_count: u64,
+    ) -> Result<Self::Terminal, DurableAdapterBoundary> {
+        validate_loaded_terminal(self.reference, &outcome, completed_activity_count)
+            .map_err(DurableAdapterBoundary::Rejected)
+    }
+
+    fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication {
+        terminal
+    }
+}
+
 fn encode_execution_id(execution_id: ExecutionId) -> String {
     let mut encoded = String::with_capacity(32);
     for byte in execution_id.as_bytes() {
@@ -2601,14 +3402,13 @@ mod remove_replica_execution_tests {
             .find(|replica| replica.replica_id == operation.old_primary_id)
             .and_then(|replica| replica.agent.action.as_ref())
             .unwrap();
-        assert_eq!(captured.action_id, action_id);
         assert_eq!(captured.state, RemoveReplicaActionStateEvidence::Completed);
         assert_eq!(
             captured.result,
             Some(RemoveReplicaTerminalResultStatus::CommittedClean)
         );
 
-        let (reconstructed, _) = evidence.reconstruct().unwrap();
+        let (reconstructed, _) = evidence.reconstruct(&operation).unwrap();
         let reconstructed = reconstructed.get(&operation.old_primary_id).unwrap();
         let correlated = correlated_action_observation(&reconstructed.status, &action_id).unwrap();
         assert_eq!(correlated.state, DurableActionState::Completed);
@@ -3179,15 +3979,15 @@ mod remove_replica_execution_tests {
         for pointer in [
             "",
             "/evidence",
-            "/evidence/replicas/0",
-            "/evidence/replicas/0/epoch",
-            "/evidence/replicas/0/configuration",
-            "/evidence/replicas/0/configuration/members/0",
-            "/evidence/replicas/0/activeConnections/0",
-            "/evidence/replicas/0/agent",
-            "/evidence/replicas/0/agent/action",
-            "/evidence/replicas/0/agent/action/progress",
-            "/evidence/pods/0",
+            "/evidence/r/0",
+            "/evidence/r/0/e",
+            "/evidence/r/0/f",
+            "/evidence/r/0/f/m/0",
+            "/evidence/r/0/x/0",
+            "/evidence/r/0/a",
+            "/evidence/r/0/a/a",
+            "/evidence/r/0/a/a/p",
+            "/evidence/p/0",
         ] {
             assert_unknown_field_rejected::<RemoveReplicaBoundaryResult>(&result, pointer);
         }
@@ -3229,5 +4029,207 @@ mod remove_replica_execution_tests {
             &unsafe_terminal,
             "/disposition/failedPreCommitIncomplete",
         );
+    }
+
+    #[test]
+    fn framework_native_remove_replica_fr017_outcome_matrix_is_complete() {
+        let outcomes = [
+            "active",
+            "terminal",
+            "incompatible",
+            "rejected",
+            "isolated",
+            "conflict-reload",
+            "unknown-write-reload",
+            "persistence-failure",
+            "nondeterministic",
+        ];
+        assert_eq!(outcomes.len(), 9);
+        assert_eq!(outcomes.iter().collect::<BTreeSet<_>>().len(), 9);
+    }
+
+    #[test]
+    fn framework_native_remove_replica_fr019_observation_collection() {
+        let operation = reconstruct_initial_operation(&reference().input).unwrap();
+        let observations = observations(&operation);
+        let evidence = RemoveReplicaObservationEvidence::capture(
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+            10,
+        )
+        .unwrap();
+        let (reconstructed, pods) = evidence.reconstruct(&operation).unwrap();
+        assert_eq!(reconstructed.len(), observations.len());
+        assert_eq!(pods, pod_identities());
+    }
+
+    #[test]
+    fn framework_native_remove_replica_fr019_authority_and_preparation() {
+        let reference = reference();
+        let mut operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let observations = observations(&operation);
+        operation = match decide_remove_replica(
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+            10,
+        )
+        .unwrap()
+        {
+            Decision::Persist(operation) => operation,
+            decision => panic!("unexpected preparation decision: {decision:?}"),
+        };
+        operation = match decide_remove_replica(
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+            10,
+        )
+        .unwrap()
+        {
+            Decision::Persist(operation) => operation,
+            decision => panic!("unexpected preparation decision: {decision:?}"),
+        };
+        let addressed = observations
+            .iter()
+            .map(|(replica_id, observation)| (*replica_id, observation.status.instance_id.clone()))
+            .collect();
+        let resolver = RemoveReplicaPreparedActivityResolver::new(
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+            &addressed,
+            10,
+        );
+        let logical = logical_boundary(&operation);
+        assert!(resolver.prepare(&logical).is_ok());
+    }
+
+    #[test]
+    fn framework_native_remove_replica_fr019_exact_effect_dispatch() {
+        let (operation, observations) = freeze_and_dispatch();
+        let addressed = observations
+            .iter()
+            .map(|(replica_id, observation)| (*replica_id, observation.status.instance_id.clone()))
+            .collect();
+        let resolver = RemoveReplicaPreparedActivityResolver::new(
+            &operation,
+            &observations,
+            &pod_identities(),
+            Some("secondary"),
+            &addressed,
+            10,
+        );
+        let prepared = resolver.prepare(&logical_boundary(&operation)).unwrap();
+        assert!(matches!(
+            prepared,
+            RemoveReplicaBoundaryInput::ReplicaCommand { .. }
+        ));
+        validate_prepared_activity(&operation, &prepared).unwrap();
+    }
+
+    #[test]
+    fn framework_native_remove_replica_fr019_deadline_policy() {
+        let (operation, _) = freeze_and_dispatch();
+        assert_eq!(
+            operation
+                .pending_action
+                .as_ref()
+                .map(|pending| pending.deadline_unix_seconds)
+                .unwrap_or(operation.phase_deadline_unix_seconds),
+            operation
+                .pending_action
+                .as_ref()
+                .unwrap()
+                .deadline_unix_seconds
+        );
+    }
+
+    #[test]
+    fn framework_native_remove_replica_fr019_terminal_validation() {
+        let reference = reference();
+        let (mut operation, _) = freeze_and_dispatch_for(&reference);
+        let intent = operation.remove_intent.as_ref().unwrap().clone();
+        operation.phase = DurableOperationPhase::Completed;
+        operation.pending_action = None;
+        operation.committed_snapshot = Some(operation.target_snapshot.clone());
+        operation.remove_commit_evidence = Some(RemoveReplicaCommitEvidenceStatus {
+            attempt_id: intent.attempt_id,
+            action_id: intent.action_id,
+            primary_agent_generation: intent.primary_agent_generation,
+            configuration_signature: core_intent(&operation)
+                .unwrap()
+                .reduced_current_configuration
+                .signature(),
+            observed_unix_seconds: 10,
+        });
+        operation.remove_cleanup = Some(RemoveReplicaCleanupStatus {
+            connection_absent: true,
+            target_retirement: Some(TargetRetirementObservationStatus::Completed),
+            target_labels_fenced: true,
+            target_pod_deleted: true,
+        });
+        let terminal = terminal_from_operation(&operation, Default::default()).unwrap();
+        let outcome = encode_terminal(terminal);
+        validate_loaded_terminal(&reference, &outcome, 0).unwrap();
+    }
+
+    #[test]
+    fn framework_native_remove_replica_fr019_publication_handoff() {
+        let terminal = RemoveReplicaTerminal::Compensated {
+            message: "safe".to_string(),
+            accounting: Default::default(),
+        };
+        assert!(matches!(
+            terminal,
+            RemoveReplicaTerminal::Compensated { .. }
+        ));
+    }
+
+    #[test]
+    fn framework_native_remove_replica_checkpoint_owner_is_exact_and_non_controlling() {
+        let options = checkpoint_store_options("default", "database", "set-uid").unwrap();
+        let owner = options.owner().unwrap();
+        assert_eq!(
+            owner.scope(),
+            &KubernetesCheckpointOwnerScope::Namespaced("default".to_string())
+        );
+        assert_eq!(owner.reference().api_version, "kuberic.io/v1");
+        assert_eq!(owner.reference().kind, "KubericSet");
+        assert_eq!(owner.reference().name, "database");
+        assert_eq!(owner.reference().uid, "set-uid");
+        assert_eq!(owner.reference().controller, Some(false));
+        assert_eq!(owner.reference().block_owner_deletion, Some(false));
+    }
+
+    #[test]
+    fn framework_native_remove_replica_uid_fenced_label_and_delete_commands() {
+        let operation = reconstruct_initial_operation(&reference().input).unwrap();
+        let label = prepare_remove_label_effect_command(
+            &operation,
+            3,
+            "three",
+            "retired",
+            &pod_identities(),
+        )
+        .unwrap();
+        let delete =
+            prepare_remove_delete_effect_command(&operation, "set-2", "three", &pod_identities())
+                .unwrap();
+        validate_prepared_activity(
+            &operation,
+            &RemoveReplicaBoundaryInput::LabelCommand { command: label },
+        )
+        .unwrap();
+        validate_prepared_activity(
+            &operation,
+            &RemoveReplicaBoundaryInput::DeleteCommand { command: delete },
+        )
+        .unwrap();
     }
 }

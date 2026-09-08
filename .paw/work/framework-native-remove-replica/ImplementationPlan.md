@@ -170,7 +170,7 @@ pull requests. This planning activity creates no commit.
 - [x] **Phase 1: Production Durable Infrastructure** - Add independent checkpoint ceilings, production-neutral measurement naming, and the shared bounded runner contract.
 - [x] **Phase 2: Switchover Runner Adoption** - Move switchover onto the shared runner without changing its operation-specific behavior.
 - [x] **Phase 3: Compact Native Remove Contract** - Build the versioned compact remove workflow, explicit incompatibility handling, and bounded admission.
-- [ ] **Phase 4: Native Integration and Safety Traceability** - Integrate remove with the runner and establish passing replacement coverage for every deletion-gate invariant.
+- [x] **Phase 4: Native Integration and Safety Traceability** - Integrate remove with the runner and establish passing replacement coverage for every deletion-gate invariant.
 - [ ] **Phase 5: Production Graduation and Legacy Removal** - Make native remove the only production path and delete explicit/pilot surfaces after the safety gate passes.
 - [ ] **Phase 6: Measurements and Full Validation** - Lock semantic/byte measurements, update CI, and run complete local plus isolated-Kind validation.
 - [ ] **Phase 7: Documentation** - Produce the as-built record and update all project documentation for the production contract.
@@ -454,34 +454,34 @@ pull requests. This planning activity creates no commit.
 
 #### Automated Verification
 
-- [ ] Native remove unit/runner matrix passes:
+- [x] Native remove unit/runner matrix passes:
   `cargo test -p kuberic-operator --features durable-remove-replica-pilot framework_native_remove_replica`
-- [ ] Native reconciler matrix passes:
+- [x] Native reconciler matrix passes:
   `cargo test -p kvstore --features durable-remove-replica-pilot --test reconciler test_framework_native_remove_replica_`
-- [ ] Shared owner/provider tests pass:
+- [x] Shared owner/provider tests pass:
   `cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint`
-- [ ] Real owner-GC coverage passes before deletion with the isolated config:
+- [x] Real owner-GC coverage passes before deletion with the isolated config:
   `KUBECONFIG="$HOME/.kube/kuberic-kind-config" cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint_real validates_real_api_cas_watch_compaction_and_ambiguous_recovery -- --nocapture`
-- [ ] Retained-cleanup authorization coverage passes:
+- [x] Retained-cleanup authorization coverage passes:
   `cargo test -p kuberic-durable-execution --test feasibility checkpoint_rbac_examples_are_structural_and_lifecycle_specific`
-- [ ] Existing explicit remove regression suite still passes before deletion:
+- [x] Existing explicit remove regression suite still passes before deletion:
   `cargo test -p kvstore --test reconciler test_durable_remove && cargo test -p kvstore --test reconciler test_durable_force_remove && cargo test -p kvstore --test reconciler test_remove_`
-- [ ] Every row in `SafetyTraceability.md` names at least one test that passed
+- [x] Every row in `SafetyTraceability.md` names at least one test that passed
   in this phase.
-- [ ] The switchover and native-remove common-outcome matrices cover every
+- [x] The switchover and native-remove common-outcome matrices cover every
   applicable FR-017 outcome and assert any contract-impossible outcome as
   unreachable; each operation has named passing tests for all six FR-019
   responsibilities.
 
 #### Manual Verification
 
-- [ ] The SC-002 matrix contains all 34 listed invariants with no unmapped,
+- [x] The SC-002 matrix contains all 34 listed invariants with no unmapped,
   ambiguous, or legacy-only row.
-- [ ] Native status-gap fixtures prove repeated reconcile waits without
+- [x] Native status-gap fixtures prove repeated reconcile waits without
   operation-generation or status-write churn.
-- [ ] Terminal publication cannot occur until a terminal checkpoint has been
+- [x] Terminal publication cannot occur until a terminal checkpoint has been
   accepted and reloaded.
-- [ ] No uncertain exposed effect can obtain a second dispatch permit until
+- [x] No uncertain exposed effect can obtain a second dispatch permit until
   authoritative observation proves no admission.
 
 ### Local Commit

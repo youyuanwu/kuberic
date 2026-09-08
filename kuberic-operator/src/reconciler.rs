@@ -56,6 +56,13 @@ use crate::durable::pilot::{
 #[cfg(all(test, feature = "durable-switchover-pilot"))]
 use crate::durable::pilot::{DurableSwitchoverStepResult, encode_step_result};
 #[cfg(feature = "durable-remove-replica-pilot")]
+use crate::durable::remove_replica_execution as native_remove;
+#[cfg(feature = "durable-remove-replica-pilot")]
+use crate::durable::remove_replica_execution::{
+    FrameworkNativeRemoveReplicaAdapter, FrameworkNativeRemoveReplicaRuntime,
+    RemoveReplicaTerminal, RemoveReplicaWorkflow,
+};
+#[cfg(feature = "durable-remove-replica-pilot")]
 use crate::durable::remove_replica_pilot as remove_pilot;
 #[cfg(feature = "durable-remove-replica-pilot")]
 use crate::durable::remove_replica_pilot::{
@@ -63,7 +70,10 @@ use crate::durable::remove_replica_pilot::{
     DurableRemoveReplicaStepResult, DurableRemoveReplicaWorkflow, RemoveReplicaActivityKind,
     RemoveReplicaAdapterDecision, RemoveReplicaPermitGuard, RemoveReplicaPreparedActivityResolver,
 };
-#[cfg(feature = "durable-switchover-pilot")]
+#[cfg(any(
+    feature = "durable-switchover-pilot",
+    feature = "durable-remove-replica-pilot"
+))]
 use crate::durable::runner::{DurableActiveReason, DurableRunner, DurableRunnerOutcome};
 #[cfg(any(
     feature = "durable-switchover-pilot",
@@ -92,6 +102,10 @@ pub struct ReconcilerState {
     pub durable_switchover_pilot: Option<Arc<DurableSwitchoverPilotRuntime>>,
     #[cfg(feature = "durable-remove-replica-pilot")]
     pub durable_remove_replica_pilot: Option<Arc<DurableRemoveReplicaPilotRuntime>>,
+    #[cfg(feature = "durable-remove-replica-pilot")]
+    pub framework_native_remove_replica: Option<Arc<FrameworkNativeRemoveReplicaRuntime>>,
+    #[cfg(feature = "durable-remove-replica-pilot")]
+    framework_native_remove_replica_test_harness: bool,
 }
 
 #[derive(Clone)]
@@ -110,6 +124,10 @@ impl Default for ReconcilerState {
             durable_switchover_pilot: None,
             #[cfg(feature = "durable-remove-replica-pilot")]
             durable_remove_replica_pilot: None,
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica: None,
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica_test_harness: false,
         }
     }
 }
@@ -124,6 +142,10 @@ impl ReconcilerState {
             durable_switchover_pilot: None,
             #[cfg(feature = "durable-remove-replica-pilot")]
             durable_remove_replica_pilot: None,
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica: None,
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica_test_harness: false,
         }
     }
 
@@ -143,8 +165,14 @@ impl ReconcilerState {
             ))),
             #[cfg(feature = "durable-remove-replica-pilot")]
             durable_remove_replica_pilot: Some(Arc::new(DurableRemoveReplicaPilotRuntime::shared(
-                runtime,
+                runtime.clone(),
             ))),
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica: Some(Arc::new(
+                FrameworkNativeRemoveReplicaRuntime::shared(runtime),
+            )),
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica_test_harness: false,
         }
     }
     // COMPLEXITY-BOUNDARY: shared-durable-runtime-wiring:end
@@ -167,6 +195,10 @@ impl ReconcilerState {
             ))),
             #[cfg(feature = "durable-remove-replica-pilot")]
             durable_remove_replica_pilot: None,
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica: None,
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            framework_native_remove_replica_test_harness: false,
         }
     }
 
@@ -174,15 +206,20 @@ impl ReconcilerState {
     pub fn with_durable_remove_replica_store(
         store: kuberic_durable_execution::InMemoryCheckpointStore,
     ) -> Self {
+        let runtime = Arc::new(DurableWorkflowRuntime::in_memory(store));
         Self {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
             #[cfg(feature = "durable-switchover-pilot")]
             durable_switchover_pilot: None,
-            durable_remove_replica_pilot: Some(Arc::new(
-                DurableRemoveReplicaPilotRuntime::in_memory(store),
+            durable_remove_replica_pilot: Some(Arc::new(DurableRemoveReplicaPilotRuntime::shared(
+                runtime.clone(),
+            ))),
+            framework_native_remove_replica: Some(Arc::new(
+                FrameworkNativeRemoveReplicaRuntime::shared(runtime),
             )),
+            framework_native_remove_replica_test_harness: true,
         }
     }
 }
@@ -361,6 +398,43 @@ fn accept_remove_replica(
             }
         }
     }
+    Ok(status)
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[doc(hidden)]
+pub fn accept_framework_native_remove_replica_for_test(
+    set: &KubericSet,
+    previous_snapshot: StablePartitionSnapshotStatus,
+    target: RemoveReplicaTarget,
+    mode: DurableRemoveMode,
+    minimum_replicas: usize,
+    now: i64,
+) -> Result<KubericSetStatus, String> {
+    let set_uid = set.metadata.uid.as_deref().ok_or_else(|| {
+        "framework-native remove test acceptance requires KubericSet UID".to_string()
+    })?;
+    let reference = native_remove::new_execution(
+        set_uid,
+        previous_snapshot,
+        target,
+        mode,
+        minimum_replicas,
+        now,
+    )?;
+    let mut status = KubericSetStatus {
+        phase: Phase::RemovingReplica,
+        ..set.status.clone().unwrap_or_default()
+    };
+    status.operation = None;
+    status.durable_remove_replica_pilot = None;
+    status.remove_replica_execution = Some(reference);
+    set_framework_native_remove_condition(
+        &mut status,
+        "Accepted",
+        "framework-native remove reference persisted before checkpoint creation",
+        now,
+    );
     Ok(status)
 }
 // COMPLEXITY-BOUNDARY: remove-replica-routing-integration:end
@@ -1800,6 +1874,13 @@ pub async fn reconcile_set(
         }
 
         Phase::RemovingReplica => {
+            #[cfg(feature = "durable-remove-replica-pilot")]
+            if set.status.as_ref().is_some_and(|status| {
+                status.operation.is_none() && status.remove_replica_execution.is_some()
+            }) && state.framework_native_remove_replica_test_harness
+            {
+                return reconcile_framework_native_remove_replica(set, api, state, &pods).await;
+            }
             if set.status.as_ref().is_some_and(|status| {
                 status.operation.is_none() && status.durable_remove_replica_pilot.is_some()
             }) {
@@ -3123,6 +3204,255 @@ async fn publish_pilot_terminal(
 
 // COMPLEXITY-BOUNDARY: pilot-reconcile:end
 // COMPLEXITY-BOUNDARY: remove-replica-reconcile-integration:start
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn reconcile_framework_native_remove_replica(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    pods: &[Pod],
+) -> Result<ReconcileAction, String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let name = set.name_any();
+    let set_uid = set
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| "active framework-native remove has no KubericSet UID".to_string())?;
+    let reference = set
+        .status
+        .as_ref()
+        .and_then(|status| status.remove_replica_execution.as_ref())
+        .ok_or_else(|| "remove-replica phase has no native execution reference".to_string())?;
+    let runtime = state
+        .framework_native_remove_replica
+        .as_ref()
+        .ok_or_else(|| "framework-native remove runtime is not configured".to_string())?;
+    let execution = match native_remove::execution_spec(reference) {
+        Ok(execution) => execution,
+        Err(error) => {
+            record_framework_native_remove_condition(
+                set,
+                api,
+                "Incompatible",
+                &error,
+                state.removal_clock.unix_seconds(),
+            )
+            .await;
+            return Ok(ReconcileAction::Requeue(Duration::from_secs(10)));
+        }
+    };
+    let host = runtime.host(&namespace, &name, set_uid, reference).await?;
+    let store = { host.lock().await.store().clone() };
+    let current_pods = checked_pods_by_id(pods)?;
+    let now = state.removal_clock.unix_seconds();
+    let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
+        reference,
+        set,
+        &current_pods,
+        api,
+        store,
+        execution.clone(),
+        now,
+    )?;
+    let runner = DurableRunner::new(native_remove::REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
+        .map_err(|error| error.to_string())?;
+    let outcome = {
+        let mut host = host.lock().await;
+        runner
+            .run(
+                &mut host,
+                &RemoveReplicaWorkflow,
+                execution,
+                &mut adapter,
+                now,
+            )
+            .await
+    };
+    match outcome {
+        DurableRunnerOutcome::Terminal(terminal) => {
+            publish_framework_native_remove_terminal(set, api, state, terminal, now).await
+        }
+        DurableRunnerOutcome::Active {
+            reason,
+            condition_reason,
+            detail,
+            requeue_after_seconds,
+        } => {
+            let reason = match reason {
+                DurableActiveReason::Adapter => condition_reason,
+                DurableActiveReason::FuelExhausted => "FuelExhausted".to_string(),
+            };
+            record_framework_native_remove_condition(set, api, &reason, &detail, now).await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(
+                requeue_after_seconds,
+            )))
+        }
+        DurableRunnerOutcome::Incompatible(message) => {
+            record_framework_native_remove_condition(set, api, "Incompatible", &message, now).await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+        }
+        DurableRunnerOutcome::Rejected(message) => {
+            record_framework_native_remove_condition(set, api, "Rejected", &message, now).await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+        }
+        DurableRunnerOutcome::Isolated(message) => {
+            record_framework_native_remove_condition(set, api, "Isolated", &message, now).await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+        }
+        DurableRunnerOutcome::ReloadRequired { boundary, reason } => {
+            record_framework_native_remove_condition(
+                set,
+                api,
+                "ReloadRequired",
+                &format!("checkpoint {boundary:?} requires authoritative reload after {reason:?}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        DurableRunnerOutcome::PersistenceFailed { operation, error } => {
+            record_framework_native_remove_condition(
+                set,
+                api,
+                "PersistenceFailure",
+                &format!("checkpoint {operation:?} failed: {error}"),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        DurableRunnerOutcome::Nondeterministic(error) => {
+            record_framework_native_remove_condition(
+                set,
+                api,
+                "Nondeterministic",
+                &error.to_string(),
+                now,
+            )
+            .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+        }
+    }
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn publish_framework_native_remove_terminal(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    state: &ReconcilerState,
+    terminal: RemoveReplicaTerminal,
+    now: i64,
+) -> Result<ReconcileAction, String> {
+    let namespace = set.namespace().unwrap_or_default();
+    let name = set.name_any();
+    let set_key = format!("{namespace}/{name}");
+    let set_uid = set
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or_else(|| "terminal framework-native remove has no KubericSet UID".to_string())?;
+    let reference = set
+        .status
+        .as_ref()
+        .and_then(|status| status.remove_replica_execution.as_ref())
+        .ok_or_else(|| "terminal framework-native remove has no execution reference".to_string())?;
+    let runtime = state
+        .framework_native_remove_replica
+        .as_ref()
+        .ok_or_else(|| "terminal framework-native remove runtime is not configured".to_string())?;
+    let completed = matches!(&terminal, RemoveReplicaTerminal::Completed { .. });
+    match terminal {
+        RemoveReplicaTerminal::Completed { .. } | RemoveReplicaTerminal::Compensated { .. } => {
+            let snapshot = if completed {
+                native_remove::reconstruct_initial_operation(&reference.input)?.target_snapshot
+            } else {
+                reference.input.previous_snapshot.clone()
+            };
+            let mut status = set.status.clone().unwrap_or_default();
+            let persisted_members = status.members.clone();
+            let mut members = Vec::with_capacity(snapshot.members.len());
+            for member in &snapshot.members {
+                let mut persisted = persisted_members
+                    .iter()
+                    .find(|persisted| persisted.id == member.id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "terminal native remove snapshot member {} is absent from persisted status",
+                            member.id
+                        )
+                    })?;
+                persisted.instance_id = member.instance_id.clone();
+                persisted.role = if member.id == snapshot.primary_id {
+                    "primary".to_string()
+                } else {
+                    "secondary".to_string()
+                };
+                members.push(persisted);
+            }
+            let primary_name = members
+                .iter()
+                .find(|member| member.id == snapshot.primary_id)
+                .map(|member| member.name.clone())
+                .ok_or_else(|| {
+                    "terminal native remove snapshot primary is absent from persisted status"
+                        .to_string()
+                })?;
+            status.epoch = snapshot.epoch.clone();
+            status.current_primary = Some(primary_name.clone());
+            status.target_primary = Some(primary_name);
+            status.phase = Phase::Healthy;
+            status.reconfiguration_phase = ReconfigurationPhase::None;
+            status.ready_replicas = members.iter().filter(|member| member.healthy).count() as i32;
+            status.replicas = members.len() as i32;
+            status.members = members;
+            status.stable_snapshot = Some(snapshot);
+            status.operation = None;
+            status.durable_remove_replica_pilot = None;
+            status.primary_failing_since = None;
+            status.stable_election_metadata_refresh =
+                Some(crate::crd::StableElectionMetadataRefreshStatus {
+                    snapshot_epoch: status.epoch.clone(),
+                    next_member_index: 0,
+                    completed_members: Vec::new(),
+                    pending_action: None,
+                });
+            set_framework_native_remove_condition(
+                &mut status,
+                if completed {
+                    "Completed"
+                } else {
+                    "Compensated"
+                },
+                if completed {
+                    "terminal checkpoint was accepted and reloaded before native remove topology publication"
+                } else {
+                    "terminal checkpoint was accepted and reloaded before compensated topology publication"
+                },
+                now,
+            );
+            persist_committed_status(api, state, &set_key, set, &status).await?;
+            state.drivers.lock().await.remove(&set_key);
+            runtime
+                .forget(&namespace, &name, set_uid, &reference.execution_id)
+                .await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
+        }
+        RemoveReplicaTerminal::Unsafe { message, .. } => {
+            record_framework_native_remove_condition(set, api, "Unsafe", &message, now).await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+        }
+        RemoveReplicaTerminal::Rejected { message, .. } => {
+            record_framework_native_remove_condition(set, api, "Rejected", &message, now).await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+        }
+        RemoveReplicaTerminal::IncompatibleContract { message, .. } => {
+            record_framework_native_remove_condition(set, api, "Incompatible", &message, now).await;
+            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
+        }
+    }
+}
+
 #[cfg(feature = "durable-remove-replica-pilot")]
 async fn reconcile_durable_remove_replica_pilot(
     set: &KubericSet,
@@ -4661,6 +4991,66 @@ fn set_remove_pilot_condition(
 }
 
 #[cfg(feature = "durable-remove-replica-pilot")]
+fn set_framework_native_remove_condition(
+    status: &mut KubericSetStatus,
+    reason: &str,
+    message: &str,
+    now: i64,
+) {
+    set_operation_condition(
+        status,
+        StatusCondition {
+            type_: "FrameworkNativeRemoveReplica".to_string(),
+            status: if matches!(reason, "Completed" | "Compensated") {
+                "False".to_string()
+            } else {
+                "True".to_string()
+            },
+            reason: reason.to_string(),
+            message: message.chars().take(512).collect(),
+            last_transition_time: now.to_string(),
+        },
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn record_framework_native_remove_condition(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    reason: &str,
+    message: &str,
+    now: i64,
+) {
+    let normalized_message: String = message.chars().take(512).collect();
+    let desired_status = if matches!(reason, "Completed" | "Compensated") {
+        "False"
+    } else {
+        "True"
+    };
+    let unchanged = set.status.as_ref().is_some_and(|status| {
+        status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeRemoveReplica"
+                && condition.reason == reason
+                && condition.status == desired_status
+                && condition.message == normalized_message
+        })
+    });
+    if unchanged {
+        return;
+    }
+    let mut status = set.status.clone().unwrap_or_default();
+    set_framework_native_remove_condition(&mut status, reason, &normalized_message, now);
+    let _ = api
+        .patch_set_status(
+            &set.namespace().unwrap_or_default(),
+            &set.name_any(),
+            &status,
+            set.metadata.resource_version.as_deref(),
+        )
+        .await;
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
 async fn record_remove_pilot_wait_condition(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -4732,6 +5122,21 @@ async fn cleanup_persisted_durable_execution(
     if let (Some(reference), Some(runtime)) = (
         status.durable_remove_replica_pilot.as_ref(),
         state.durable_remove_replica_pilot.as_ref(),
+    ) {
+        runtime
+            .forget(
+                &set.namespace().unwrap_or_default(),
+                &set.name_any(),
+                uid,
+                &reference.execution_id,
+            )
+            .await;
+        cleaned = true;
+    }
+    #[cfg(feature = "durable-remove-replica-pilot")]
+    if let (Some(reference), Some(runtime)) = (
+        status.remove_replica_execution.as_ref(),
+        state.framework_native_remove_replica.as_ref(),
     ) {
         runtime
             .forget(
