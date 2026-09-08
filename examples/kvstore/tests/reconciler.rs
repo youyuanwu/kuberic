@@ -6676,7 +6676,7 @@ async fn assert_incompatible_remove_survives_replacements_and_restart(
     );
     assert!(
         serialized_first
-            .get(&["durable", "Remove", "Replica", "Pilot"].concat())
+            .get(["durable", "Remove", "Replica", "Pilot"].concat())
             .is_none()
     );
 
@@ -6875,11 +6875,18 @@ async fn test_framework_native_remove_replica_unsupported_version_survives_resta
         .unwrap()
         .execution_id
         .clone();
+    let accepted_execution = kuberic_operator::durable::remove_replica_execution::execution_spec(
+        incompatible.remove_replica_execution.as_ref().unwrap(),
+    )
+    .unwrap();
     incompatible
         .remove_replica_execution
         .as_mut()
         .unwrap()
         .contract_version += 1;
+    let incompatibility_marker = incompatible.remove_replica_execution.clone().unwrap();
+    api.reset_operations();
+    let replacements_before = api.statuses.lock().unwrap().len();
 
     reconcile_set(
         &make_set("native-remove-old-native", 2, Some(incompatible.clone())),
@@ -6889,13 +6896,28 @@ async fn test_framework_native_remove_replica_unsupported_version_survives_resta
     .await
     .unwrap();
     let first = api.last_status().unwrap();
+    assert_eq!(api.statuses.lock().unwrap().len(), replacements_before + 1);
+    assert_eq!(
+        first.remove_replica_execution.as_ref(),
+        Some(&incompatibility_marker)
+    );
     assert!(first.conditions.iter().any(|condition| {
         condition.type_ == "FrameworkNativeRemoveReplica" && condition.reason == "Incompatible"
     }));
 
-    let restored: KubericSetStatus =
+    let mut restored: KubericSetStatus =
         serde_json::from_value(serde_json::to_value(first).unwrap()).unwrap();
-    let restarted = ReconcilerState::with_remove_replica_store(store);
+    drop(first_state);
+    let restarted = ReconcilerState::with_remove_replica_store(store.clone());
+    // Model a post-restart observation update through the same whole-status
+    // write path without disturbing the incompatible execution reference.
+    restored.ready_replicas = restored.ready_replicas.saturating_sub(1);
+    api.patch_set_status("default", "native-remove-old-native", &restored, None)
+        .await
+        .unwrap();
+    assert_eq!(api.statuses.lock().unwrap().len(), replacements_before + 2);
+    let restored: KubericSetStatus =
+        serde_json::from_value(serde_json::to_value(restored).unwrap()).unwrap();
     reconcile_set(
         &make_set("native-remove-old-native", 2, Some(restored)),
         &api,
@@ -6903,16 +6925,27 @@ async fn test_framework_native_remove_replica_unsupported_version_survives_resta
     )
     .await
     .unwrap();
+    assert_eq!(api.statuses.lock().unwrap().len(), replacements_before + 2);
     let final_status = api.last_status().unwrap();
     assert_eq!(
-        final_status
-            .remove_replica_execution
-            .as_ref()
-            .unwrap()
-            .execution_id,
-        original_id
+        final_status.remove_replica_execution.as_ref(),
+        Some(&incompatibility_marker)
     );
+    assert_eq!(incompatibility_marker.execution_id, original_id);
     assert!(final_status.operation.is_none());
+    assert!(final_status.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeRemoveReplica" && condition.reason == "Incompatible"
+    }));
+    assert!(api.operations().is_empty());
+    use kuberic_durable_execution::CheckpointStore;
+    assert!(
+        store
+            .load(accepted_execution.execution_id())
+            .await
+            .unwrap()
+            .is_none(),
+        "unsupported native contract must not create a fresh durable execution"
+    );
 }
 
 fn assert_no_removal(api: &KvClusterApi) {
