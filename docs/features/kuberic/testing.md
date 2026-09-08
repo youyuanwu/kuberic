@@ -543,12 +543,12 @@ use only its dedicated kubeconfig. Never reuse or inspect unrelated clusters:
 ```console
 export KIND_CLUSTER_NAME="kuberic-<workflow>-$(date +%s)"
 export KUBECONFIG="$HOME/.kube/${KIND_CLUSTER_NAME}.config"
-export KIND_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
 export KIND_CONFIG="deploy/kind-isolated-config.yaml"
 just create-kind-cluster
-test "$(kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
-  config current-context)" = "$KIND_CONTEXT"
-kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" cluster-info
+test "$(kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+  config current-context)" = "$KUBE_CONTEXT"
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" cluster-info
 just images
 cargo test \
   -p kuberic-durable-execution --features kubernetes \

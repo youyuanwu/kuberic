@@ -212,7 +212,7 @@ exact dedicated control-plane container.
 
 ```bash
 # Apply NodePort overlay (done automatically by tests)
-kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
   apply -f examples/kvstore/deploy/nodeport-svc.yaml
 
 # Resolve the dedicated dynamic host port, then connect via gRPC
@@ -303,7 +303,7 @@ TCP probes on the control port (9090):
 # One-time setup
 export KIND_CLUSTER_NAME="kuberic-kvstore-$(date +%s)"
 export KUBECONFIG="$HOME/.kube/${KIND_CLUSTER_NAME}.config"
-export KIND_CONTEXT="kind-${KIND_CLUSTER_NAME}"
+export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
 export KIND_CONFIG="deploy/kind-isolated-config.yaml"
 just create-kind-cluster
 
@@ -319,9 +319,9 @@ just kuberic-operator-deploy
 just kvstore-deploy
 
 # Verify
-kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
   get kubericsets -n xedio
-kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
   get pods -n xedio
 
 # Clean up only this dedicated cluster and kubeconfig

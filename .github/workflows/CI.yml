@@ -85,6 +85,7 @@ jobs:
         cluster_name: ${{ env.KIND_CLUSTER_NAME }}
         config: deploy/kind-isolated-config.yaml
         kubeconfig: ${{ env.KUBECONFIG }}
+        registry: true
         registry_name: kuberic-registry-${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Record isolated KinD ownership
