@@ -412,12 +412,16 @@ pull requests. This planning activity creates no commit.
     owner-bound checkpoint construction.
   - Add standardized typed conditions for wait, incompatible, rejected,
     isolated, persistence failure, unsafe, compensated, and completed outcomes.
-- **`examples/kvstore/tests/reconciler.rs`**:
-  - Migrate and rename the pilot reconciler matrix to
-    `test_framework_native_remove_replica_*`.
-  - Port explicit-only end-to-end assertions for exact primary-status gaps,
-    exact target-status gaps, replacement UID cleanup, post-commit primary
-    restart, malformed agent status, and publication/status conflicts.
+- **`kuberic-operator/src/reconciler/framework_native_remove_routing_tests.rs`**:
+  - Keep the Phase 4 routing/publication matrix inside the operator's
+    `cfg(all(test, feature = "durable-remove-replica-pilot"))` unit-test build
+    so no Cargo feature or public constructor can activate native routing in a
+    production binary.
+  - Retain route-level assertions for exact primary/target status gaps,
+    malformed agent status, terminal reload, incompatible contracts, and
+    publication/status conflicts. Keep replacement UID, restart/redelivery,
+    Force authority, and fencing coverage in the native adapter/workflow and
+    shared-runner unit matrices.
   - Preserve every-boundary restart, lost reply, proven-no-admission,
     conflict, outcome-unknown, stale UID/incarnation/generation, Force
     authority, repeated identity, terminal reload, publication ordering, and
@@ -456,8 +460,8 @@ pull requests. This planning activity creates no commit.
 
 - [x] Native remove unit/runner matrix passes:
   `cargo test -p kuberic-operator --features durable-remove-replica-pilot framework_native_remove_replica`
-- [x] Native reconciler matrix passes:
-  `cargo test -p kvstore --features durable-remove-replica-pilot --test reconciler test_framework_native_remove_replica_`
+- [x] Private native routing matrix passes:
+  `cargo test -p kuberic-operator --all-features framework_native_remove_replica_private_route`
 - [x] Shared owner/provider tests pass:
   `cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint`
 - [x] Real owner-GC coverage passes before deletion with the isolated config:

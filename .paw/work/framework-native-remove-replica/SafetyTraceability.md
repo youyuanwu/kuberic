@@ -7,33 +7,33 @@ live-cluster coverage. No row relies only on the legacy remove pilot.
 | # | SC-002 invariant | Retained passing replacement test(s) | Coverage |
 |---:|---|---|---|
 | 1 | Immutable operation mode | `remove_replica_execution_admission_is_structured_compact_and_derives_reduced_topology`; `scale_down_freeze_rejects_target_generation_drift_after_preadmission` | Native workflow/domain |
-| 2 | Pre-commit restart | `test_framework_native_remove_replica_every_boundary_restart` | Native reconciler |
-| 3 | Post-commit restart | `test_framework_native_remove_replica_every_boundary_restart`; `test_framework_native_remove_replica_terminal_precedes_status_publication` | Native reconciler |
+| 2 | Pre-commit restart | `remove_replica_execution_replays_evidence_deterministically`; `framework_native_remove_replica_fr019_exact_effect_dispatch_and_quarantine` | Native workflow/adapter |
+| 3 | Post-commit restart | `framework_native_remove_replica_private_route_publishes_reloaded_terminal`; `framework_native_remove_replica_private_route_preserves_terminal_before_status_ordering` | Private native reconciler |
 | 4 | Exact prepared command | `remove_replica_execution_reuses_the_exact_prepared_command`; `framework_native_remove_replica_fr019_exact_effect_dispatch_and_quarantine` | Native workflow/adapter |
 | 5 | Direct-dispatch authority | `remove_replica_execution_boundaries_are_tagged_and_never_store_mutable_operation_state`; `framework_native_remove_replica_fr019_exact_effect_dispatch_and_quarantine` | Native workflow/adapter |
 | 6 | One-use dispatch authority | `freshly_accepted_terminal_reloads_before_publication_and_permit_is_one_use` | Shared runner |
-| 7 | Lost effect reply | `test_framework_native_remove_replica_lost_reply_and_quarantine`; `framework_native_remove_replica_fr019_exact_effect_dispatch_and_quarantine` | Native reconciler/adapter |
-| 8 | Uncertain persistence write | `test_framework_native_remove_replica_conflict_and_unknown_write_reload`; `conflict_unknown_write_and_persistence_failure_stop_before_redelivery` | Native reconciler/shared runner |
-| 9 | Conflict reload | `test_framework_native_remove_replica_conflict_and_unknown_write_reload`; `host_rejects_unsupported_format_and_reloads_after_unit_conflict` | Native reconciler/shared provider |
+| 7 | Lost effect reply | `framework_native_remove_replica_fr019_exact_effect_dispatch_and_quarantine` | Native adapter |
+| 8 | Uncertain persistence write | `conflict_unknown_write_and_persistence_failure_stop_before_redelivery` | Shared runner |
+| 9 | Conflict reload | `conflict_unknown_write_and_persistence_failure_stop_before_redelivery`; `host_rejects_unsupported_format_and_reloads_after_unit_conflict` | Shared runner/provider |
 | 10 | Authoritative observation recovery | `remove_replica_execution_replays_evidence_deterministically`; `framework_native_remove_replica_fr019_observation_collection` | Native workflow/adapter |
-| 11 | Exact primary-status gap without churn | `test_framework_native_remove_replica_exact_primary_status_gap_has_no_churn` | Native reconciler |
-| 12 | Exact target-status gap without churn | `test_framework_native_remove_replica_exact_target_status_gap_has_no_churn` | Native reconciler |
+| 11 | Exact primary-status gap without churn | `framework_native_remove_replica_private_route_primary_gap_has_no_status_churn` | Private native reconciler |
+| 12 | Exact target-status gap without churn | `framework_native_remove_replica_private_route_target_gap_has_no_status_churn` | Private native reconciler |
 | 13 | Commit evidence | `remove_replica_execution_transition_validation_is_monotonic`; `framework_native_remove_replica_fr019_terminal_validation` | Native workflow/adapter |
-| 14 | Configuration and Force authority | `test_framework_native_remove_replica_force_requires_missing_target_authority`; `remove_replica_execution_validates_completed_terminal_against_immutable_admission`; `framework_native_remove_replica_fr019_authority_and_preparation` | Native reconciler/workflow/adapter |
+| 14 | Configuration and Force authority | `remove_replica_execution_admission_is_structured_compact_and_derives_reduced_topology`; `remove_replica_execution_validates_completed_terminal_against_immutable_admission`; `framework_native_remove_replica_fr019_authority_and_preparation` | Native workflow/adapter |
 | 15 | Correlated primary role evidence | `remove_replica_execution_captures_exact_retained_terminal_evidence`; `framework_native_remove_replica_fr019_observation_collection` | Native workflow/adapter |
 | 16 | Correlated lifecycle evidence | `remove_replica_execution_captures_exact_retained_terminal_evidence`; `framework_native_remove_replica_fr019_observation_collection` | Native workflow/adapter |
-| 17 | UID-fenced label cleanup | `framework_native_remove_replica_uid_fenced_label_and_delete_commands`; `test_framework_native_remove_replica_uid_fences_replacement` | Native adapter/reconciler |
-| 18 | UID-fenced deletion | `framework_native_remove_replica_uid_fenced_label_and_delete_commands`; `test_framework_native_remove_replica_uid_fences_replacement` | Native adapter/reconciler |
+| 17 | UID-fenced label cleanup | `framework_native_remove_replica_uid_fenced_label_and_delete_commands` | Native adapter |
+| 18 | UID-fenced deletion | `framework_native_remove_replica_uid_fenced_label_and_delete_commands` | Native adapter |
 | 19 | Post-commit connection cleanup | `missing_exact_primary_status_never_proves_connection_absence`; `framework_native_remove_replica_fr019_terminal_validation` | Retained domain/native adapter |
-| 20 | Incarnation fencing | `test_framework_native_remove_replica_stale_primary_incarnation`; `remove_replica_execution_reuses_the_exact_prepared_command`; `framework_native_remove_replica_fr019_authority_and_preparation` | Native reconciler/workflow/adapter |
-| 21 | Epoch and generation fencing | `test_framework_native_remove_replica_stale_target_generation`; `remove_replica_execution_reuses_the_exact_prepared_command`; `framework_native_remove_replica_fr019_authority_and_preparation` | Native reconciler/workflow/adapter |
+| 20 | Incarnation fencing | `remove_replica_execution_reuses_the_exact_prepared_command`; `framework_native_remove_replica_fr019_authority_and_preparation` | Native workflow/adapter |
+| 21 | Epoch and generation fencing | `remove_replica_execution_reuses_the_exact_prepared_command`; `framework_native_remove_replica_fr019_authority_and_preparation` | Native workflow/adapter |
 | 22 | Bounded redrive of at most three attempts | `exhausted_known_catch_up_state_is_failed_precommit_incomplete`; `remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds` | Retained domain/native admission |
-| 23 | Corrupt record and malformed agent-status handling | `remove_replica_execution_distinguishes_incompatible_and_malformed_contracts`; `test_framework_native_remove_replica_malformed_agent_status_is_isolated`; `load_distinguishes_absence_success_and_malformed_objects` | Native workflow/reconciler/Kubernetes provider |
+| 23 | Corrupt record and malformed agent-status handling | `remove_replica_execution_distinguishes_incompatible_and_malformed_contracts`; `framework_native_remove_replica_private_route_isolates_malformed_agent_status`; `load_distinguishes_absence_success_and_malformed_objects` | Native workflow/private reconciler/Kubernetes provider |
 | 24 | Incompatible record handling | `remove_replica_execution_distinguishes_incompatible_and_malformed_contracts`; `checkpoint_dispositions_cover_rejected_and_incompatible` | Native workflow/shared runner |
 | 25 | Distinct unsafe terminal handling | `remove_replica_execution_nested_terminal_denies_unknown_fields`; `restart_and_incomplete_states_use_distinct_typed_dispositions` | Native workflow/retained domain |
 | 26 | Distinct inexact terminal handling | `remove_replica_execution_validates_completed_terminal_against_immutable_admission`; `framework_native_remove_replica_fr019_terminal_validation` | Native workflow/adapter |
-| 27 | Terminal-before-status ordering and publication conflict | `test_framework_native_remove_replica_terminal_precedes_status_publication`; `freshly_accepted_terminal_reloads_before_publication_and_permit_is_one_use` | Native reconciler/shared runner |
-| 28 | Redelivery without duplicated uncertain effects | `test_framework_native_remove_replica_lost_reply_and_quarantine`; `conflict_unknown_write_and_persistence_failure_stop_before_redelivery` | Native reconciler/shared runner |
+| 27 | Terminal-before-status ordering and publication conflict | `framework_native_remove_replica_private_route_preserves_terminal_before_status_ordering`; `freshly_accepted_terminal_reloads_before_publication_and_permit_is_one_use` | Private native reconciler/shared runner |
+| 28 | Redelivery without duplicated uncertain effects | `framework_native_remove_replica_fr019_exact_effect_dispatch_and_quarantine`; `conflict_unknown_write_and_persistence_failure_stop_before_redelivery` | Native adapter/shared runner |
 | 29 | Three-member admission | `remove_replica_execution_admission_is_structured_compact_and_derives_reduced_topology` | Native admission |
 | 30 | Active admission | `remove_replica_execution_rejects_all_six_one_byte_over_bounds`; `remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds` | Native admission/kernel |
 | 31 | Terminal admission | `remove_replica_execution_rejects_all_six_one_byte_over_bounds`; `remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds` | Native admission/kernel |
@@ -58,10 +58,9 @@ enumeration:
 - rejected/incompatible/isolated:
   `checkpoint_dispositions_cover_rejected_and_incompatible`,
   `observation_mismatch_is_isolated`, and
-  `test_framework_native_remove_replica_malformed_agent_status_is_isolated`;
+  `framework_native_remove_replica_private_route_isolates_malformed_agent_status`;
 - conflict reload, unknown-write reload, and persistence failure:
-  `conflict_unknown_write_and_persistence_failure_stop_before_redelivery` and
-  `test_framework_native_remove_replica_conflict_and_unknown_write_reload`;
+  `conflict_unknown_write_and_persistence_failure_stop_before_redelivery`;
 - nondeterminism and bounded fuel:
   `nondeterminism_and_bounded_fuel_have_distinct_outcomes`.
 
@@ -83,14 +82,19 @@ The six independently named native remove tests are:
 ## Phase 4 Verification Record
 
 - Native adapter/FR-017/FR-019 unit matrix: **9 passed**.
-- Native reconciler matrix: **14 passed**, including proven-no-admission,
-  stale incarnation/generation, Force authority, post-commit restart and
-  ambiguity, malformed agent status, and publication conflict.
-- Native test routing: production constructors neither initialize nor enable
-  the route; only the dedicated integration-test harness can construct a state
-  carrying native routing authority.
-- Full operator all-features suite: **292 passed**.
-- Remove-feature operator suite: **239 passed**.
+- Private native routing matrix: **6 passed**, covering terminal reload and
+  publication, publication conflict/restart, incompatible contracts, exact
+  primary/target status gaps without churn, and malformed agent isolation.
+  Fine-grained redelivery, fencing, Force authority, and restart semantics
+  remain covered by the native workflow/adapter and shared-runner tests named
+  above.
+- Native test routing: the runtime field, constructor, route, condition
+  handling, and publication functions exist only under Rust
+  `cfg(all(test, feature = "durable-remove-replica-pilot"))`; normal and
+  all-feature production builds contain no activatable route or public harness
+  API.
+- Full operator all-features suite: **298 passed**.
+- Remove-feature operator suite: **245 passed**.
 - Kubernetes checkpoint provider matrix: **13 passed**.
 - Retained cleanup RBAC authorization: **1 passed**.
 - Explicit remove regressions retained before deletion: **2 + 1 + 2 passed**.
