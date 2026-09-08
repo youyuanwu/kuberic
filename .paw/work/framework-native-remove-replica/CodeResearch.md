@@ -7,9 +7,14 @@ topic: "Framework-Native Remove Replica"
 tags: [research, codebase, durable-execution, remove-replica, operator]
 status: complete
 last_updated: 2026-09-07
+historical_snapshot: true
 ---
 
 # Research: Framework-Native Remove Replica
+
+> **Historical PAW research snapshot:** Findings describe the pre-migration
+> tree at the commit recorded above. They are retained as planning evidence,
+> not as current product documentation.
 
 ## Research Question
 

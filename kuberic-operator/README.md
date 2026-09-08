@@ -27,11 +27,14 @@ passive observations, five durable boundaries, and six accepted writes.
 Terminal checkpoint state is accepted and reloaded before reduced topology is
 published.
 
-Checkpoints are same-namespace ConfigMaps with a non-controlling owner
-reference to the exact `KubericSet` UID. They remain through terminal reload
-and are garbage collected with the owner; separately authorized orphan cleanup
-is not granted to the normal writer. Reconciliation remains the scheduler, so
-there is no extra worker, queue, lease, watcher, or durable service.
+`status.removeReplicaExecution` stores immutable admission, checkpoint
+identity, and incompatibility state. The referenced same-namespace ConfigMap
+stores compact boundary history and terminal evidence with a non-controlling
+owner reference to the exact `KubericSet` UID. It remains through terminal
+reload and is garbage collected with the owner; separately authorized orphan
+cleanup is not granted to the normal writer. Reconciliation remains the
+scheduler, so there is no extra worker, queue, lease, watcher, or durable
+service.
 
 ## CRD Example
 

@@ -31,8 +31,10 @@ The implemented kernel provides:
 - direct terminal outcome reload without workflow polling;
 - ambiguity quarantine and authoritative observation recovery;
 - opt-in atomic observation/replay/next-exposure or terminal progression;
-- an optional, isolated ConfigMap checkpoint-provider spike using opaque
-  Kubernetes `resourceVersion` compare-and-swap;
+- a feature-gated ConfigMap checkpoint provider using opaque Kubernetes
+  `resourceVersion` compare-and-swap; standalone kernel builds may omit it,
+  while the production operator enables it unconditionally for
+  framework-native remove-replica;
 - independently retained checkpoints by default, with validated optional
   non-controlling owner references and separately authorized orphan cleanup;
 - a configurable conservative ConfigMap data budget with documented headroom;
@@ -143,8 +145,10 @@ those runtime facilities rather than growing the kernel speculatively.
 
 ### Kubernetes Integration
 
-The provider and its readiness prerequisites are implemented as an isolated
-spike:
+The provider began as an isolated feasibility spike and its readiness
+prerequisites are implemented. It is now production-required by
+framework-native remove-replica; the crate feature remains optional only for
+standalone kernel consumers that do not host that workflow:
 
 1. **Implemented:** Kubernetes ConfigMap checkpoint storage using opaque
    `resourceVersion` create/replace compare-and-swap, portable errors, and
@@ -185,6 +189,12 @@ and explicit remove records are converted to durable incompatibility markers;
 they are never resumed, migrated, cleared as absent, or used to admit a new
 execution. The `ReplicaAgent`, correlated control v3,
 `RemoveReplicaIntent` v1, and lifecycle-peer v2 protocol are unchanged.
+
+`status.removeReplicaExecution` owns immutable admission, checkpoint identity,
+and incompatibility state. Its referenced same-namespace ConfigMap owns compact
+boundary history, exact prepared commands, and terminal evidence; the other
+explicit operator workflows retain their operation-specific CRD status
+checkpoints.
 
 The version-3 compact contract stores immutable admission once and records only
 tagged observations, exact prepared commands, compact effect results, or

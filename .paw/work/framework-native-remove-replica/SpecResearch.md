@@ -7,9 +7,14 @@ repository: github.com/youyuanwu/kuberic
 topic: "Framework-Native Remove Replica Spec Research"
 tags: [research, specification]
 status: complete
+historical_snapshot: true
 ---
 
 # Spec Research: Framework-Native Remove Replica
+
+> **Historical PAW research snapshot:** Findings describe the pre-migration
+> tree at the commits recorded above. They are retained as specification
+> evidence, not as current product documentation.
 
 ## Summary
 

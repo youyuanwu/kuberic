@@ -340,7 +340,11 @@ CARGO_BUILD_JOBS=2 cargo check --workspace
 CARGO_BUILD_JOBS=2 cargo clippy -p kuberic-durable-execution --all-targets -- -D warnings
 ```
 
-Enable the optional provider for deterministic client-surface validation:
+The standalone kernel exposes the Kubernetes provider behind its
+`kubernetes` feature. The production operator enables that feature
+unconditionally because framework-native remove-replica requires ConfigMap
+checkpoints; the explicit feature flag below is only for crate-local provider
+validation:
 
 ```console
 CARGO_BUILD_JOBS=2 cargo test -p kuberic-durable-execution --features kubernetes --test kubernetes_checkpoint -- --nocapture
@@ -388,6 +392,12 @@ commands, compact results, and bounded redelivery evidence. Legacy pilot and
 explicit remove records, unsupported versions, and changed lifecycle limits
 are incompatible rather than migrated or restarted.
 
+`status.removeReplicaExecution` owns the immutable execution reference,
+admission authority, and incompatibility marker. The referenced same-namespace
+ConfigMap owns active boundary history and the compact terminal record. Other
+explicit operator workflows continue to use their operation-specific CRD
+status checkpoints.
+
 The no-fault three-member path is exactly three external effects, two passive
 observations, five completed durable boundaries, and six accepted writes. The
 final three-sample run observed active records from 3,373 to 18,693 bytes, a
@@ -417,11 +427,15 @@ continuation remain excluded. The remaining ordered deferred work is tracked in
 
 ## Limitations and exclusions
 
-The kernel result remains experimental. Its opt-in ConfigMap provider and
-real-API spike do not establish production persistence fitness, distributed
-execution ownership, a worker, queue, lease, activity handler, automatic
-observation polling, or passive-observation transport. It does not establish a
-canonical exact-byte representation across versions.
+The kernel remains experimental as a general-purpose orchestration framework.
+The ConfigMap provider is production-required, not opt-in, for
+framework-native remove-replica: `kuberic-operator` enables it unconditionally
+and owns the provider contract described above. The earlier isolated
+real-API evaluation does not establish generic persistence fitness for other
+consumers, distributed execution ownership, a worker, queue, lease, activity
+handler, automatic observation polling, or passive-observation transport. The
+kernel does not establish a canonical exact-byte representation across
+versions.
 
 The classifier is recomputed from the current registry rather than assuming a
 positive result. Provider cases distinguish absence from every portable error

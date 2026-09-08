@@ -929,7 +929,7 @@ without pg_rewind.
 
 | Aspect | CNPG | Kuberic PostgreSQL |
 |--------|------|--------------------|
-| **Operator** | Go, full K8s operator with CRD | Rust, CRD-backed durable workflows |
+| **Operator** | Go, full K8s operator with CRD | Rust, Kubernetes-backed durable workflows |
 | **Instance manager** | Go binary (PID 1 in pod) | Rust PgInstanceManager (child process) |
 | **Failover trigger** | HTTP health check failure | gRPC control plane failure |
 | **Candidate selection** | LSN-based (received, then replayed) | LSN-based (PartitionState.current_progress) |

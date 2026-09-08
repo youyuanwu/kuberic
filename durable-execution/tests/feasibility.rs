@@ -638,6 +638,194 @@ fn checkpoint_provider_readiness_contract_is_user_visible() {
     assert!(!real_test.contains("#[ignore"));
 }
 
+#[test]
+fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() {
+    let ownership_docs = [
+        ("kernel README", include_str!("../README.md")),
+        (
+            "operator README",
+            include_str!("../../kuberic-operator/README.md"),
+        ),
+        (
+            "durable roadmap",
+            include_str!("../../docs/features/kuberic/durable-execution-roadmap.md"),
+        ),
+        (
+            "operator design",
+            include_str!("../../docs/features/kuberic/operator.md"),
+        ),
+        (
+            "protocol design",
+            include_str!("../../docs/features/kuberic/protocols.md"),
+        ),
+        (
+            "failure scenarios",
+            include_str!("../../docs/features/operator-failure-scenarios.md"),
+        ),
+        (
+            "rolling upgrade design",
+            include_str!("../../docs/features/kuberic/rolling-upgrade-design.md"),
+        ),
+        (
+            "user API",
+            include_str!("../../docs/features/kuberic/user-api.md"),
+        ),
+        (
+            "status",
+            include_str!("../../docs/features/kuberic/status.md"),
+        ),
+        (
+            "design gaps",
+            include_str!("../../docs/features/kuberic/design-gaps.md"),
+        ),
+        (
+            "pod-local boundary",
+            include_str!(
+                "../../docs/features/kuberic/implemented/pod-local-ra-lite-control-boundary.md"
+            ),
+        ),
+        (
+            "remove protocol",
+            include_str!(
+                "../../docs/features/kuberic/implemented/agent-owned-replica-remove-protocol.md"
+            ),
+        ),
+        (
+            "as-built documentation",
+            include_str!("../../.paw/work/framework-native-remove-replica/Docs.md"),
+        ),
+    ];
+
+    for (name, document) in ownership_docs {
+        assert!(
+            document.contains("status.removeReplicaExecution"),
+            "{name} must name native remove admission ownership"
+        );
+        assert!(
+            document.contains("ConfigMap"),
+            "{name} must name native remove checkpoint ownership"
+        );
+    }
+
+    let current_docs = [
+        ("root README", include_str!("../../README.md")),
+        ("kernel README", include_str!("../README.md")),
+        (
+            "operator README",
+            include_str!("../../kuberic-operator/README.md"),
+        ),
+        (
+            "durable roadmap",
+            include_str!("../../docs/features/kuberic/durable-execution-roadmap.md"),
+        ),
+        (
+            "operator design",
+            include_str!("../../docs/features/kuberic/operator.md"),
+        ),
+        (
+            "protocol design",
+            include_str!("../../docs/features/kuberic/protocols.md"),
+        ),
+        (
+            "testing guide",
+            include_str!("../../docs/features/kuberic/testing.md"),
+        ),
+        (
+            "failure scenarios",
+            include_str!("../../docs/features/operator-failure-scenarios.md"),
+        ),
+        (
+            "rolling upgrade design",
+            include_str!("../../docs/features/kuberic/rolling-upgrade-design.md"),
+        ),
+        (
+            "user API",
+            include_str!("../../docs/features/kuberic/user-api.md"),
+        ),
+        (
+            "status",
+            include_str!("../../docs/features/kuberic/status.md"),
+        ),
+        (
+            "design gaps",
+            include_str!("../../docs/features/kuberic/design-gaps.md"),
+        ),
+        (
+            "pod-local boundary",
+            include_str!(
+                "../../docs/features/kuberic/implemented/pod-local-ra-lite-control-boundary.md"
+            ),
+        ),
+        (
+            "remove protocol",
+            include_str!(
+                "../../docs/features/kuberic/implemented/agent-owned-replica-remove-protocol.md"
+            ),
+        ),
+        (
+            "as-built documentation",
+            include_str!("../../.paw/work/framework-native-remove-replica/Docs.md"),
+        ),
+    ];
+    let forbidden = [
+        "removereplicaexecutionmode",
+        "durableremovereplicapilot",
+        "durable-remove-replica-pilot",
+        "remove-replica pilot",
+        "operation.removeintent",
+        "removecommitevidence",
+        "crd status remains the durable authority",
+        "crd status remains the only durable global store",
+        "crd status remains the sole durable global store",
+        "durable create/add/remove/switchover/failover transitions live in",
+        "every partial state explicit in crd",
+        "its opt-in configmap provider",
+        "enable the optional provider",
+    ];
+
+    for (name, document) in current_docs {
+        let document = document.to_ascii_lowercase();
+        for stale_claim in forbidden {
+            assert!(
+                !document.contains(stale_claim),
+                "{name} retained stale remove ownership or pilot claim {stale_claim:?}"
+            );
+        }
+    }
+
+    let readme = include_str!("../README.md");
+    assert!(readme.contains("production-required, not opt-in"));
+    assert!(readme.contains("`kuberic-operator` enables it unconditionally"));
+}
+
+#[test]
+fn historical_paw_remove_research_is_explicitly_labeled_and_exempt() {
+    let historical_docs = [
+        (
+            "code research",
+            include_str!("../../.paw/work/framework-native-remove-replica/CodeResearch.md"),
+        ),
+        (
+            "spec research",
+            include_str!("../../.paw/work/framework-native-remove-replica/SpecResearch.md"),
+        ),
+    ];
+
+    for (name, document) in historical_docs {
+        assert!(
+            document.contains("historical_snapshot: true"),
+            "{name} must explicitly declare its historical snapshot status"
+        );
+        assert!(
+            document.contains("Historical PAW research snapshot"),
+            "{name} must warn that pre-migration findings are not current documentation"
+        );
+    }
+
+    assert!(historical_docs[0].1.contains("durableRemoveReplicaPilot"));
+    assert!(historical_docs[1].1.contains("removeReplicaExecutionMode"));
+}
+
 const fn status(passed: bool) -> &'static str {
     if passed { "pass" } else { "fail" }
 }

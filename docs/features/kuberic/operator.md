@@ -2,7 +2,7 @@
 
 The Kuberic operator acts as SF's Failover Manager on Kubernetes.
 It watches `KubericSet` CRDs and orchestrates pod lifecycle, failover,
-switchover, and scaling through CRD-backed durable workflows.
+switchover, and scaling through Kubernetes-backed durable workflows.
 
 > Part of the [Kuberic Design](../kuberic-replicator-design.md).
 > Failure scenarios documented in [operator-failure-scenarios.md](../operator-failure-scenarios.md).
@@ -26,14 +26,14 @@ switchover, and scaling through CRD-backed durable workflows.
   complete member logical/incarnation identities and roles, write quorum, and
   optional last-known election progress/deactivation metadata
 - optional compact versioned `operation` checkpoint for durable creation,
-  switchover, replica add/rebuild, and configuration-first replica removal
+  explicit switchover, replica add/rebuild, and failover
 - structured add-replica attempt with frozen primary/target generations,
   endpoints, configuration descriptors, semantic build key, deadlines, and
   commit observation
-- structured remove-replica attempt with exact primary/target authority,
-  previous/reduced configuration descriptors, three-attempt and deadline
-  bounds, bounded coordinator phase/result, exact commit evidence,
-  post-commit cleanup, and typed poison disposition
+- optional `removeReplicaExecution` reference with immutable remove admission,
+  exact checkpoint identity, contract version, and incompatibility marker;
+  compact boundary history, exact prepared commands, and terminal evidence
+  live in the referenced same-namespace ConfigMap
 - Phase-1 failover/data-loss recovery, including optional
   previous/committed topology, target snapshot, one pending correlated action,
   failover observations/assessment/epoch intents, and optional pod-local
@@ -45,20 +45,24 @@ switchover, and scaling through CRD-backed durable workflows.
 - `conditions`
 
 **Reconciliation:** `PartitionDriver` performs read-only stable recovery with
-`GrpcReplicaHandle`; CRD-backed state machines own every mutation. A stable
-operation is complete only after its resulting snapshot is persisted. Durable
-creation persists partial committed bootstrap topology after primary-only and
-each expanded current configuration, so process loss rolls forward from live
-committed authority instead of replaying `Open(New)`.
+`GrpcReplicaHandle`; Kubernetes-backed state machines own every mutation. A
+stable operation is complete only after its resulting snapshot is persisted.
+Durable creation persists partial committed bootstrap topology after
+primary-only and each expanded current configuration, so process loss rolls
+forward from live committed authority instead of replaying `Open(New)`.
 
-Reconciler-driven creation, switchover, replica add/rebuild, replica removal,
-and failover persist a versioned operation checkpoint, reconstruct fresh
-handles and observations on every reconcile, and advance one status transition
-or one mutating activity at a time. Bounded read observations may precede
-either, but a mutation and status patch never share a reconcile. Pending action
-intent is durable before RPC, pod-label, or UID-fenced pod-delete mutation.
-Status patches include the observed Kubernetes `resourceVersion`; no lock is
-held across a durable activity.
+Creation, explicit switchover, replica add/rebuild, and failover persist their
+versioned checkpoints in `status.operation`. Replica removal instead stores
+immutable admission and checkpoint identity in
+`status.removeReplicaExecution`; the referenced owner-bound ConfigMap stores
+its compact boundary history, exact prepared commands, and terminal evidence.
+Every workflow reconstructs fresh handles and observations on reconcile and
+advances one durable transition or one mutating activity at a time. Bounded
+read observations may precede either, but a mutation and durable-record patch
+never share a reconcile. Pending action intent is durable before RPC,
+pod-label, or UID-fenced pod-delete mutation. Status and ConfigMap writes use
+Kubernetes `resourceVersion` fencing; no lock is held across a durable
+activity.
 
 ---
 
@@ -158,8 +162,10 @@ the new incarnation. A missing or unreachable old incarnation enters coarse
 Every control request reaches a pod-local `ReplicaAgent` before
 `PodRuntime`. The agent owns local admission, correlation, serialization and
 bounded completion replay; the runtime owns ordered service/replicator
-effects. This is intentionally narrower than Service Fabric RA: CRD status and
-the operator remain the only owners of distributed workflow state.
+effects. This is intentionally narrower than Service Fabric RA: the operator
+owns distributed workflow progression, CRD status owns stable topology and
+operation admission, and the framework-native remove ConfigMap owns remove
+boundary history and terminal evidence.
 
 Before a pending runtime action is dispatched, reconciliation requires
 replica-agent control protocol version 3 and exact agreement among the
@@ -167,8 +173,9 @@ addressed, runtime, and pending Pod incarnations. It persists the observed
 agent generation, agent control version, and runtime epoch.
 Direct non-add/non-remove actions also freeze their exact encoded payload so
 observation and retry signatures cannot drift with live progress. Add/rebuild
-and removal use structured `operation.addIntent` and
-`operation.removeIntent` as their payload authority.
+uses structured `operation.addIntent` as its payload authority. Removal derives
+its structured intent from immutable `status.removeReplicaExecution` admission
+and persists the exact prepared command in the referenced ConfigMap.
 
 Missing, malformed, or unsupported agent status fails closed. There is no
 capability negotiation or old-peer fallback.

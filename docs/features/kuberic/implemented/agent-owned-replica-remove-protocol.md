@@ -24,7 +24,9 @@ SF separately sends `DeleteReplica` from FM to the target RA
 Use this production flow:
 
 ```
-operator / CRD durable authority
+operator / Kubernetes durable authority
+  → CRD status.removeReplicaExecution admission + checkpoint reference
+  → owner-bound ConfigMap boundary history + terminal evidence
   → one RemoveReplicaIntent v1 over correlated control v3
   → exact current primary ReplicaAgent
       → reduced CatchUp configuration
@@ -143,17 +145,17 @@ commit later. None authorizes compensation or a previous-configuration effect
 without explicit tracked-effect cancellation or quiescence proof; the
 operator poisons the operation.
 
-The operator first persists `removeCommitEvidence` and the exact reduced
-`committedSnapshot`. That snapshot is scoped to the active workflow:
-`stableSnapshot` remains the previous topology until exact connection absence,
-a terminal retirement observation, exact-UID `role=retired` label fencing, and
-exact-UID pod deletion are durable. Final publication then installs the
-reduced stable snapshot. Missing `GetStatus` from an exact still-present
-primary Pod/incarnation is never treated as connection absence. Cleanup waits
-without a deadline until that exact primary reports the target connection
-absent; only primary process absence or replacement proves that the old
-process-local connection is gone. The retirement deadline can degrade target
-peer cleanup, but cannot waive this connection barrier.
+The framework checkpoint first persists exact commit evidence and the reduced
+workflow-scoped `committedSnapshot`. CRD `stableSnapshot` remains the previous
+topology until exact connection absence, a terminal retirement observation,
+exact-UID `role=retired` label fencing, and exact-UID pod deletion are durable.
+Final publication then installs the reduced stable snapshot. Missing
+`GetStatus` from an exact still-present primary Pod/incarnation is never
+treated as connection absence. Cleanup waits without a deadline until that
+exact primary reports the target connection absent; only primary process
+absence or replacement proves that the old process-local connection is gone.
+The retirement deadline can degrade target peer cleanup, but cannot waive this
+connection barrier.
 
 ## ScaleDown and Force
 
