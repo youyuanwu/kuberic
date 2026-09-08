@@ -85,7 +85,6 @@ struct PendingCommittedStatus {
     status: KubericSetStatus,
 }
 
-// COMPLEXITY-BOUNDARY: shared-durable-runtime-wiring:start
 impl Default for ReconcilerState {
     fn default() -> Self {
         Self {
@@ -134,7 +133,6 @@ impl ReconcilerState {
             )),
         }
     }
-    // COMPLEXITY-BOUNDARY: shared-durable-runtime-wiring:end
 
     #[cfg(feature = "durable-switchover-pilot")]
     pub fn with_durable_switchover_client(client: kube::Client) -> Self {
@@ -400,8 +398,6 @@ async fn persist_legacy_remove_incompatibility(
     Ok(true)
 }
 
-// COMPLEXITY-BOUNDARY: remove-replica-routing-integration:end
-
 fn durable_identity_members(
     _status: &KubericSetStatus,
     operation: &DurableOperationStatus,
@@ -560,7 +556,6 @@ fn operation_after_dispatch_error(
     crate::durable::effects::operation_after_dispatch_error(operation, error)
 }
 
-// COMPLEXITY-BOUNDARY: pilot-effect-bridge:start
 #[cfg(feature = "durable-switchover-pilot")]
 /// Result of handling one dispatch-permitted durable pilot activity.
 pub type PilotEffectBridgeOutcome = crate::durable::effects::PilotEffectBridgeOutcome;
@@ -644,7 +639,6 @@ fn exact_pilot_label_target(
     Ok((command.pod_name, command.expected_uid))
 }
 
-// COMPLEXITY-BOUNDARY: pilot-effect-bridge:end
 /// Main reconciliation logic, decoupled from kube-runtime.
 /// Takes a ClusterApi trait object so it can be tested without a real cluster.
 pub async fn reconcile_set(
@@ -2824,7 +2818,6 @@ async fn apply_failover_decision(
     }
 }
 
-// COMPLEXITY-BOUNDARY: pilot-reconcile:start
 #[cfg(feature = "durable-switchover-pilot")]
 async fn reconcile_durable_switchover_pilot(
     set: &KubericSet,
@@ -3109,8 +3102,6 @@ async fn publish_pilot_terminal(
     Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
 }
 
-// COMPLEXITY-BOUNDARY: pilot-reconcile:end
-// COMPLEXITY-BOUNDARY: remove-replica-reconcile-integration:start
 async fn reconcile_framework_native_remove_replica(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -4164,7 +4155,6 @@ fn set_pilot_condition(status: &mut KubericSetStatus, reason: &str, message: &st
     );
 }
 
-// COMPLEXITY-BOUNDARY: remove-replica-status-integration:start
 fn set_framework_native_remove_condition(
     status: &mut KubericSetStatus,
     reason: &str,
@@ -4223,9 +4213,6 @@ async fn record_framework_native_remove_condition(
         .await;
 }
 
-// COMPLEXITY-BOUNDARY: remove-replica-status-integration:end
-
-// COMPLEXITY-BOUNDARY: shared-durable-terminal-cleanup:start
 async fn cleanup_persisted_durable_execution(
     state: &ReconcilerState,
     set: &KubericSet,
@@ -4267,7 +4254,6 @@ async fn cleanup_persisted_durable_execution(
         state.drivers.lock().await.remove(set_key);
     }
 }
-// COMPLEXITY-BOUNDARY: shared-durable-terminal-cleanup:end
 
 fn unix_seconds() -> i64 {
     SystemTime::now()

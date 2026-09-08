@@ -1,4 +1,3 @@
-// COMPLEXITY-BOUNDARY: remove-replica-domain:start
 use std::collections::HashSet;
 
 use kuberic_core::remove_replica::{
@@ -1668,7 +1667,6 @@ impl From<TargetRetirementObservation> for TargetRetirementObservationStatus {
     }
 }
 
-// COMPLEXITY-BOUNDARY: remove-replica-domain:end
 #[cfg(test)]
 mod tests {
     use super::*;

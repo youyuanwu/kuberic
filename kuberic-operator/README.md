@@ -86,9 +86,8 @@ completion. The switchover selector does not apply to creation, add/build,
 removal, or failover; removal already uses the production framework-native
 path.
 
-Run `python3 scripts/measure-switchover-complexity.py` from the repository root
-for workflow/shared/total lexical accounting. The representative integration
-test prints checkpoint, status, effect, label, and Pod-list measurements.
+The representative integration test reports checkpoint, status, effect,
+label, and Pod-list measurements.
 
 ## Deployment
 

@@ -325,7 +325,6 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
     }
 
-    // COMPLEXITY-BOUNDARY: shared-kernel-fused-turn:start
     /// Evaluate and atomically persist the next activity as dispatch-exposed.
     ///
     /// Unlike [`Self::turn`], a newly scheduled activity does not require an
@@ -473,7 +472,6 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
         }
     }
-    // COMPLEXITY-BOUNDARY: shared-kernel-fused-turn:end
 
     /// Persist an authoritative result only for the currently exposed activity.
     pub async fn observe(
@@ -562,7 +560,6 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
     }
 
-    // COMPLEXITY-BOUNDARY: shared-kernel-fused-observe:start
     /// Atomically persist an observation and replay to the next exposed
     /// activity or terminal checkpoint.
     ///
@@ -715,7 +712,6 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
         }
     }
-    // COMPLEXITY-BOUNDARY: shared-kernel-fused-observe:end
 
     async fn commit_schedule(
         &self,

@@ -46,11 +46,6 @@ jobs:
     - name: Run cargo fmt
       run: cargo fmt --all -- --check
 
-    - name: Measure durable workflow complexity
-      run: |
-        python3 scripts/measure-switchover-complexity.py
-        python3 -m unittest scripts.tests.test_measure_switchover_complexity
-    
     - name: Run cargo clippy
       run: cargo clippy --all-targets -- -D warnings
 

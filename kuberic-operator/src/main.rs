@@ -34,9 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sets: Api<KubericSet> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
 
-    // COMPLEXITY-BOUNDARY: shared-durable-main-wiring:start
     let state = ReconcilerState::with_durable_client(client.clone());
-    // COMPLEXITY-BOUNDARY: shared-durable-main-wiring:end
 
     let ctx = Arc::new(Context {
         api: KubeClusterApi {

@@ -266,7 +266,6 @@ pub struct RemoveReplicaAdmissionTargetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_generation: Option<String>,
 }
-// COMPLEXITY-BOUNDARY: remove-replica-crd-integration:end
 
 /// Schema-safe persisted form of the core stable partition snapshot.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]

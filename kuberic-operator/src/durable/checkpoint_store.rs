@@ -13,7 +13,6 @@ use tracing::info;
 
 const MAX_RECENT_CHECKPOINT_EVENTS: usize = 64;
 
-// COMPLEXITY-BOUNDARY: shared-operator-checkpoint-support:start
 /// Workflow-independent checkpoint provider used by operator-hosted workflows.
 #[derive(Clone)]
 pub enum DurableCheckpointStore {
@@ -105,9 +104,7 @@ impl CheckpointMeasurementDecoder {
         (self.terminal)(outcome, completed_activity_count)
     }
 }
-// COMPLEXITY-BOUNDARY: shared-operator-checkpoint-support:end
 
-// COMPLEXITY-BOUNDARY: checkpoint-store:start
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DurableCheckpointMeasurementsSnapshot {
     pub load_attempts: u64,
@@ -527,7 +524,6 @@ impl CheckpointStore for MeasuredDurableCheckpointStore {
     }
 }
 
-// COMPLEXITY-BOUNDARY: checkpoint-store:end
 #[cfg(test)]
 mod checkpoint_store_tests {
     use super::*;

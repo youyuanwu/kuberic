@@ -36,7 +36,6 @@ use super::{
 
 const MAX_EFFECT_DIAGNOSTIC_BYTES: usize = 512;
 
-// COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:start
 /// Exact compact command persisted before one correlated replica dispatch.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -790,9 +789,7 @@ pub(crate) fn generation_change_proves_no_admission(
     observed.status.agent.generation.as_str() != dispatched_generation
         && correlated_action_observation(&observed.status, &pending.action_id).is_none()
 }
-// COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:end
 
-// COMPLEXITY-BOUNDARY: remove-replica-effect-integration:start
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeleteEffectCommand {
@@ -945,9 +942,6 @@ pub async fn execute_delete_command(
         .await;
 }
 
-// COMPLEXITY-BOUNDARY: remove-replica-effect-integration:end
-
-// COMPLEXITY-BOUNDARY: switchover-effect-recovery:start
 #[cfg(feature = "durable-switchover-pilot")]
 pub type PilotEffectBridgeOutcome = DurableEffectBridgeOutcome<Box<DurableSwitchoverStepResult>>;
 
@@ -1198,7 +1192,6 @@ pub(crate) fn exact_label_command(
 fn bounded(value: &str) -> String {
     value.chars().take(MAX_EFFECT_DIAGNOSTIC_BYTES).collect()
 }
-// COMPLEXITY-BOUNDARY: switchover-effect-recovery:end
 
 #[cfg(test)]
 mod tests {

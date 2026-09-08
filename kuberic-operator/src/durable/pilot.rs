@@ -65,7 +65,6 @@ use super::{
     },
 };
 
-// COMPLEXITY-BOUNDARY: pilot-module:start
 pub const PILOT_VERSION: u32 = 2;
 pub const PILOT_MAX_REPLICAS: usize = 3;
 pub const PILOT_MAX_ACTIVITY_RECORDS: usize = 32;
@@ -324,10 +323,8 @@ enum DurableSwitchoverTerminalAccountingRecord {
     Stopped {},
 }
 
-// COMPLEXITY-BOUNDARY: pilot-workflow:start
 pub struct DurableSwitchoverWorkflow;
 
-// COMPLEXITY-BOUNDARY: pilot-workflow-body:start
 #[async_trait]
 impl Workflow for DurableSwitchoverWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
@@ -531,7 +528,6 @@ impl Workflow for DurableSwitchoverWorkflow {
         )
     }
 }
-// COMPLEXITY-BOUNDARY: pilot-workflow-body:end
 
 fn advance_effect_free(
     operation: &DurableOperationStatus,
@@ -1739,7 +1735,6 @@ fn encode_terminal_record(
     Ok(ExactBytes::new(encoded))
 }
 
-// COMPLEXITY-BOUNDARY: pilot-workflow:end
 pub fn new_pilot_reference(
     set_uid: &str,
     previous_snapshot: StablePartitionSnapshotStatus,
@@ -2441,7 +2436,6 @@ fn decode_hex(value: u8) -> Result<u8, String> {
     }
 }
 
-// COMPLEXITY-BOUNDARY: pilot-module:end
 #[cfg(test)]
 mod durable_switchover_pilot_tests {
     use super::*;

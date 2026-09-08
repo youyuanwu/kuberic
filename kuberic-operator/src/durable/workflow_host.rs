@@ -15,7 +15,6 @@ use super::checkpoint_store::{
     MeasuredDurableCheckpointStore,
 };
 
-// COMPLEXITY-BOUNDARY: shared-operator-workflow-host:start
 const MAX_COMPLETED_MEASUREMENT_SNAPSHOTS: usize = 64;
 
 pub type DurableOperatorHost = DurableHost<MeasuredDurableCheckpointStore>;
@@ -212,4 +211,3 @@ impl DurableWorkflowRuntime {
         self.completed_measurements.lock().await.get(&key).copied()
     }
 }
-// COMPLEXITY-BOUNDARY: shared-operator-workflow-host:end

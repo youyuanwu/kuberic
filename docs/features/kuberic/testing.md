@@ -407,11 +407,6 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
   --test reconciler test_durable_execution_switchover_pilot_ -- --nocapture
 ```
 
-`python3 scripts/measure-switchover-complexity.py` reports stable lexical
-implementation boundaries split into workflow body, comparable workflow scope,
-shared typed/fused/effect-adapter infrastructure, operator integration, and
-honestly charged total, and rejects overlap among charged scopes.
-
 The authoritative happy-path gate expects exactly nine external effects plus
 three passive observations, giving 12 completed durable boundaries and 13
 accepted checkpoint writes including terminal persistence. Seven former
@@ -447,10 +442,9 @@ their sizes. The output also reports persistence outcomes, status
 attempts/outcomes, UID-label calls, Pod-list calls, and an explicit reason
 requeues are unavailable in the direct-reconcile harness.
 
-Run the exact measurement and projection gates with:
+Run the exact operational measurement and projection gates with:
 
 ```console
-python3 scripts/measure-switchover-complexity.py
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
   --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
