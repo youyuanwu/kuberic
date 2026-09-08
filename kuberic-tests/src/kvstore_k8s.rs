@@ -81,7 +81,6 @@ async fn test_kvstore_k8s_status_healthy() {
 
 #[tokio::test]
 #[test_log::test]
-#[ignore = "enabled after Phase 5 makes framework-native remove the production route"]
 async fn test_kvstore_k8s_framework_native_remove_replica() {
     crate::test_utils::ensure_kvstore_deployed().await;
     crate::test_utils::patch_kubericset_replicas("xedio", "kvstore", 2)

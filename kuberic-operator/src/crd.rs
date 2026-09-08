@@ -5,6 +5,7 @@ use kuberic_core::types::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::Deref;
 
 /// KubericSet is the primary CRD for managing a stateful replica set.
@@ -54,14 +55,6 @@ pub struct KubericSetSpec {
     #[serde(default)]
     pub switchover_execution_mode: SwitchoverExecutionMode,
 
-    /// Execution engine for newly accepted replica removals.
-    ///
-    /// The durable pilot also requires an operator binary built with the
-    /// matching compile-time feature. Existing and omitted values remain on
-    /// the explicit CRD-backed state machine.
-    #[serde(default)]
-    pub remove_replica_execution_mode: RemoveReplicaExecutionMode,
-
     /// Port for the application container.
     #[serde(default = "default_port")]
     pub port: i32,
@@ -86,6 +79,7 @@ pub struct KubericSetSpec {
 /// Status of the KubericSet.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
+#[schemars(extend("x-kubernetes-preserve-unknown-fields" = true))]
 pub struct KubericSetStatus {
     /// Current epoch.
     #[serde(default)]
@@ -133,13 +127,14 @@ pub struct KubericSetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durable_switchover_pilot: Option<DurableSwitchoverPilotStatus>,
 
-    /// Immutable reference for the current or most recent durable-execution
-    /// remove-replica pilot. Per-phase progress lives only in its checkpoint.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub durable_remove_replica_pilot: Option<DurableRemoveReplicaPilotStatus>,
+    /// Unknown legacy status fields are accepted for one reconciliation and
+    /// omitted from every replacement status.
+    #[serde(flatten, default, skip_serializing)]
+    #[schemars(skip)]
+    pub legacy_status_fields: BTreeMap<String, serde_json::Value>,
 
-    /// Structured immutable authority for framework-native remove execution.
-    /// Admission routing does not select this contract yet.
+    /// Structured immutable authority or incompatibility marker for the
+    /// framework-native remove execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remove_replica_execution: Option<RemoveReplicaExecutionStatus>,
 
@@ -219,37 +214,32 @@ pub struct DurableSwitchoverPilotStatus {
     pub initial_operation_json: String,
 }
 
-// COMPLEXITY-BOUNDARY: remove-replica-crd-integration:start
-/// Execution engine selected when a new replica removal is accepted.
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Copy, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum RemoveReplicaExecutionMode {
-    #[default]
-    Explicit,
-    DurablePilot,
-}
-
-/// Immutable authority needed to reconstruct one durable remove execution.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DurableRemoveReplicaPilotStatus {
-    pub version: u32,
-    /// Lowercase hexadecimal kernel execution identity.
-    pub execution_id: String,
-    /// Deterministic provider object name derived from `execution_id`.
-    pub checkpoint_name: String,
-    /// Exact JSON encoding of the initial operation accepted before checkpoint
-    /// creation or effect dispatch.
-    pub initial_operation_json: String,
-}
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoveReplicaExecutionStatus {
     pub contract_version: u32,
     pub execution_id: String,
     pub checkpoint_name: String,
-    pub input: RemoveReplicaAdmissionInputStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<RemoveReplicaAdmissionInputStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incompatibility: Option<RemoveReplicaIncompatibilityStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoveReplicaIncompatibilityStatus {
+    pub source: RemoveReplicaIncompatibilitySource,
+    pub legacy_contract_version: u32,
+    pub legacy_execution_id: String,
+    pub fingerprint: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoveReplicaIncompatibilitySource {
+    LegacyPilot,
+    LegacyExplicit,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -1079,7 +1069,7 @@ mod tests {
         assert!(status.stable_snapshot.is_none());
         assert!(status.operation.is_none());
         assert!(status.durable_switchover_pilot.is_none());
-        assert!(status.durable_remove_replica_pilot.is_none());
+        assert!(status.legacy_status_fields.is_empty());
         assert!(status.remove_replica_execution.is_none());
         assert!(status.conditions.is_empty());
         assert!(
@@ -1130,42 +1120,24 @@ mod tests {
     }
 
     #[test]
-    fn remove_replica_execution_mode_defaults_to_explicit_and_round_trips_pilot() {
-        let explicit: KubericSetSpec =
-            serde_json::from_value(serde_json::json!({"image": "test:latest"})).unwrap();
-        assert_eq!(
-            explicit.remove_replica_execution_mode,
-            RemoveReplicaExecutionMode::Explicit
-        );
-
-        let pilot: KubericSetSpec = serde_json::from_value(serde_json::json!({
-            "image": "test:latest",
-            "removeReplicaExecutionMode": "durablePilot"
-        }))
-        .unwrap();
-        assert_eq!(
-            pilot.remove_replica_execution_mode,
-            RemoveReplicaExecutionMode::DurablePilot
-        );
-
+    fn framework_native_remove_schema_has_no_selector_or_pilot_status() {
         let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
         let deployment = include_str!("../deploy/deployment.yaml");
-        for required in [
-            "removeReplicaExecutionMode",
-            "durablePilot",
-            "durableRemoveReplicaPilot",
-            "checkpointName",
-            "initialOperationJson",
+        for removed in [
+            ["remove", "Replica", "Execution", "Mode"].concat(),
+            ["durable", "Remove", "Replica", "Pilot"].concat(),
         ] {
             assert!(
-                generated.contains(required),
-                "missing generated durable remove schema {required}"
+                !generated.contains(&removed),
+                "generated schema retained legacy remove surface {removed}"
             );
             assert!(
-                deployment.contains(required),
-                "missing deployed durable remove schema {required}"
+                !deployment.contains(&removed),
+                "deployed schema retained legacy remove surface {removed}"
             );
         }
+        assert!(generated.contains("removeReplicaExecution"));
+        assert!(deployment.contains("removeReplicaExecution"));
     }
 
     #[test]
@@ -1185,6 +1157,38 @@ mod tests {
                 "missing native remove schema {required}"
             );
         }
+    }
+
+    #[test]
+    fn legacy_remove_status_is_deserialized_but_never_serialized() {
+        let legacy_name = ["durable", "Remove", "Replica", "Pilot"].concat();
+        let mut value = serde_json::json!({"phase": "RemovingReplica"});
+        value.as_object_mut().unwrap().insert(
+            legacy_name.clone(),
+            serde_json::json!({
+                "version": 1,
+                "executionId": "legacy-execution",
+                "checkpointName": "legacy-checkpoint",
+                "initialOperationJson": "{}"
+            }),
+        );
+        let status: KubericSetStatus = serde_json::from_value(value).unwrap();
+        assert!(status.legacy_status_fields.contains_key(&legacy_name));
+        let serialized = serde_json::to_value(status).unwrap();
+        assert!(serialized.get(&legacy_name).is_none());
+    }
+
+    #[test]
+    fn status_schema_preserves_unknown_fields_for_one_way_legacy_conversion() {
+        let generated = serde_json::to_value(KubericSet::crd()).unwrap();
+        assert_eq!(
+            generated.pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/status/x-kubernetes-preserve-unknown-fields"
+            ),
+            Some(&serde_json::json!(true))
+        );
+        let deployment = include_str!("../deploy/deployment.yaml");
+        assert!(deployment.contains("x-kubernetes-preserve-unknown-fields: true"));
     }
 
     #[test]

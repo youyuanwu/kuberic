@@ -72,78 +72,15 @@ class ComplexityMeasurementTests(unittest.TestCase):
                 ["one", "two"], measurements, same_locations
             )
 
-    def test_frozen_shared_baseline(self) -> None:
-        self.assertEqual(measure_complexity.SHARED_BEFORE, (1208, 110))
+    def test_frozen_baseline_revision(self) -> None:
         self.assertEqual(
             measure_complexity.BASELINE_REVISION,
             "8d773ef2b32fd3073e11849a131fe2c2f5e6b97b",
         )
 
-    def test_shared_growth_is_measured_against_frozen_baseline(self) -> None:
-        self.assertEqual(
-            measure_complexity.subtract((1220, 113), measure_complexity.SHARED_BEFORE),
-            (12, 3),
-        )
-
-    def test_ratio_calculation_is_dimension_specific(self) -> None:
-        self.assertEqual(
-            measure_complexity.ratio((600, 25), (1200, 100)),
-            (0.5, 0.25),
-        )
-
-    def test_amortization_classifications(self) -> None:
-        self.assertEqual(
-            measure_complexity.classify_amortization(
-                (700, 70), (1000, 100), (100, 10), (1000, 100)
-            ),
-            "positive",
-        )
-        self.assertEqual(
-            measure_complexity.classify_amortization(
-                (1000, 70), (1000, 100), (100, 10), (1000, 100)
-            ),
-            "negative",
-        )
-        self.assertEqual(
-            measure_complexity.classify_amortization(
-                (700, 70), (1000, 100), (300, 30), (1000, 100)
-            ),
-            "inconclusive/mixed",
-        )
-
-    def test_dimension_classification_uses_spec_thresholds(self) -> None:
-        self.assertEqual(
-            measure_complexity.classify_amortization_dimension(0.99, 0.25),
-            "positive",
-        )
-        self.assertEqual(
-            measure_complexity.classify_amortization_dimension(1.0, 0.0),
-            "negative",
-        )
-        self.assertEqual(
-            measure_complexity.classify_amortization_dimension(0.75, 0.50),
-            "inconclusive/mixed",
-        )
-        self.assertEqual(
-            measure_complexity.classify_amortization_dimension(0.75, 0.500001),
-            "negative",
-        )
-
-    def test_remove_measurement_scopes_are_declared(self) -> None:
+    def test_remove_comparison_scopes_are_retired(self) -> None:
         labels = {label for label, _segments in measure_complexity.MEASUREMENTS}
-        self.assertTrue(
-            {
-                "legacy_remove",
-                "remove_module",
-                "remove_comparable_workflow_scope",
-                "remove_workflow_body_only",
-                "remove_effect_integration",
-                "remove_crd_integration",
-                "remove_routing_integration",
-                "remove_reconcile_integration",
-                "remove_status_integration",
-            }.issubset(labels)
-        )
+        self.assertFalse(any(label.startswith("remove_") for label in labels))
 
 
 if __name__ == "__main__":

@@ -1192,7 +1192,7 @@ fn replay_active_operation_history(
     reference: &RemoveReplicaExecution,
     activities: &[ActivityRecord],
 ) -> Result<(DurableOperationStatus, Vec<DurableOperationStatus>), String> {
-    let mut operation = reconstruct_initial_operation(&reference.input)?;
+    let mut operation = reconstruct_initial_operation(admission_input(reference)?)?;
     let mut accounting = RemoveReplicaActivityAccounting::default();
     let mut redeliveries = BTreeMap::new();
     let mut history = Vec::with_capacity(activities.len().saturating_add(1));
@@ -1740,13 +1740,23 @@ pub fn new_execution(
         contract_version: REMOVE_REPLICA_CONTRACT_VERSION,
         execution_id: execution_hex,
         checkpoint_name: KubernetesCheckpointStore::object_name(execution_id),
-        input,
+        input: Some(input),
+        incompatibility: None,
     };
     execution_spec(&reference)?;
     Ok(reference)
 }
 
 pub fn execution_id(reference: &RemoveReplicaExecution) -> Result<ExecutionId, String> {
+    if let Some(marker) = &reference.incompatibility {
+        return Err(format!(
+            "incompatible remove execution from {:?} contract {} identity {} fingerprint {}",
+            marker.source,
+            marker.legacy_contract_version,
+            marker.legacy_execution_id,
+            marker.fingerprint
+        ));
+    }
     if reference.contract_version != REMOVE_REPLICA_CONTRACT_VERSION {
         return Err(format!(
             "incompatible native remove contract version {}; supported {}",
@@ -1764,13 +1774,23 @@ pub fn execution_id(reference: &RemoveReplicaExecution) -> Result<ExecutionId, S
     Ok(execution_id)
 }
 
+pub fn admission_input(
+    reference: &RemoveReplicaExecution,
+) -> Result<&RemoveReplicaAdmissionInputStatus, String> {
+    reference
+        .input
+        .as_ref()
+        .ok_or_else(|| "native remove execution has no immutable admission input".to_string())
+}
+
 pub fn execution_spec(reference: &RemoveReplicaExecution) -> Result<ExecutionSpec, String> {
     let execution_id = execution_id(reference)?;
-    validate_admission(&reference.input)?;
+    let admission = admission_input(reference)?;
+    validate_admission(admission)?;
     let input = RemoveReplicaWorkflowInput {
         contract_version: reference.contract_version,
         execution_id: reference.execution_id.clone(),
-        admission: reference.input.clone(),
+        admission: admission.clone(),
     };
     let encoded = serde_json::to_vec(&input)
         .map_err(|error| format!("serialize native remove workflow input: {error}"))?;
@@ -2156,7 +2176,7 @@ pub fn validate_loaded_terminal(
     outcome: &TerminalOutcome,
     completed_activity_count: u64,
 ) -> Result<RemoveReplicaTerminal, String> {
-    let initial = reconstruct_initial_operation(&reference.input)?;
+    let initial = reconstruct_initial_operation(admission_input(reference)?)?;
     let terminal = decode_terminal(outcome)?;
     let accounting = terminal_accounting(&terminal);
     if accounting.total() != Some(completed_activity_count)
@@ -2510,7 +2530,8 @@ impl<'a> FrameworkNativeRemoveReplicaAdapter<'a> {
         execution: ExecutionSpec,
         now: i64,
     ) -> Result<Self, String> {
-        let operation = advance_to_boundary(reconstruct_initial_operation(&reference.input)?)?;
+        let operation =
+            advance_to_boundary(reconstruct_initial_operation(admission_input(reference)?)?)?;
         let empty_observations = OperationObservations::new();
         let empty_pods = OperationPodIdentities::new();
         let empty_instances = BTreeMap::new();
@@ -2648,8 +2669,10 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
                 .map_err(DurableAdapterBoundary::Isolated)?
             }
             None => {
+                let admission =
+                    admission_input(self.reference).map_err(DurableAdapterBoundary::Rejected)?;
                 let operation = advance_to_boundary(
-                    reconstruct_initial_operation(&self.reference.input)
+                    reconstruct_initial_operation(admission)
                         .map_err(DurableAdapterBoundary::Rejected)?,
                 )
                 .map_err(DurableAdapterBoundary::Isolated)?;
@@ -3191,7 +3214,7 @@ mod remove_replica_execution_tests {
     fn freeze_and_dispatch_for(
         reference: &RemoveReplicaExecution,
     ) -> (DurableOperationStatus, OperationObservations) {
-        let initial = reconstruct_initial_operation(&reference.input).unwrap();
+        let initial = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let observations = observations(&initial);
         let Decision::Persist(frozen) = decide_remove_replica(
             &initial,
@@ -3486,7 +3509,6 @@ mod remove_replica_execution_tests {
                 failover_delay: 0,
                 switchover_delay: 30,
                 switchover_execution_mode: Default::default(),
-                remove_replica_execution_mode: Default::default(),
                 port: 8080,
                 control_port: 9090,
                 data_port: 9091,
@@ -3527,7 +3549,7 @@ mod remove_replica_execution_tests {
                         data_address: "http://three:9091".to_string(),
                     },
                 ],
-                stable_snapshot: Some(reference.input.previous_snapshot.clone()),
+                stable_snapshot: Some(reference.input.as_ref().unwrap().previous_snapshot.clone()),
                 remove_replica_execution: Some(reference.clone()),
                 ..Default::default()
             }),
@@ -3757,7 +3779,7 @@ mod remove_replica_execution_tests {
     #[test]
     fn remove_replica_execution_admission_is_structured_compact_and_derives_reduced_topology() {
         let reference = reference();
-        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         assert_eq!(reference.contract_version, REMOVE_REPLICA_CONTRACT_VERSION);
         assert_eq!(operation.previous_snapshot.members.len(), 3);
         assert_eq!(operation.target_snapshot.members.len(), 2);
@@ -3768,7 +3790,7 @@ mod remove_replica_execution_tests {
                 .iter()
                 .all(|member| member.id != 3)
         );
-        let encoded = serde_json::to_vec(&reference.input).unwrap();
+        let encoded = serde_json::to_vec(reference.input.as_ref().unwrap()).unwrap();
         assert!(encoded.len() < REMOVE_REPLICA_MAX_BOUNDARY_INPUT_BYTES as usize);
         assert!(
             !String::from_utf8(encoded)
@@ -3780,10 +3802,21 @@ mod remove_replica_execution_tests {
     #[test]
     fn framework_native_remove_replica_force_mode_is_immutable_and_replays_without_target() {
         let reference = force_reference();
-        assert_eq!(reference.input.mode, DurableRemoveMode::Force);
-        assert!(reference.input.target.agent_generation.is_none());
+        assert_eq!(
+            reference.input.as_ref().unwrap().mode,
+            DurableRemoveMode::Force
+        );
+        assert!(
+            reference
+                .input
+                .as_ref()
+                .unwrap()
+                .target
+                .agent_generation
+                .is_none()
+        );
 
-        let initial = reconstruct_initial_operation(&reference.input).unwrap();
+        let initial = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         assert_eq!(initial.remove_mode, Some(DurableRemoveMode::Force));
         assert!(initial.remove_target_agent_generation.is_none());
         let mut changed_mode = initial.clone();
@@ -3827,7 +3860,7 @@ mod remove_replica_execution_tests {
     #[test]
     fn framework_native_remove_replica_force_requires_primary_target_and_topology_fences() {
         let reference = force_reference();
-        let initial = reconstruct_initial_operation(&reference.input).unwrap();
+        let initial = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let pods = pod_identities();
         let base = observations(&initial);
 
@@ -3941,7 +3974,8 @@ mod remove_replica_execution_tests {
 
     #[test]
     fn remove_replica_execution_boundaries_are_tagged_and_never_store_mutable_operation_state() {
-        let operation = reconstruct_initial_operation(&reference().input).unwrap();
+        let reference = reference();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let evidence = RemoveReplicaObservationEvidence::capture(
             &operation,
             &observations(&operation),
@@ -3957,7 +3991,7 @@ mod remove_replica_execution_tests {
         assert!(result.len() <= REMOVE_REPLICA_MAX_BOUNDARY_RESULT_BYTES as usize);
         eprintln!(
             "native remove compact sample: immutable_input={}, logical_input={}, observation_result={}",
-            execution_spec(&reference())
+            execution_spec(&reference)
                 .unwrap()
                 .workflow_input()
                 .as_slice()
@@ -3978,7 +4012,7 @@ mod remove_replica_execution_tests {
     fn remove_replica_execution_replays_evidence_deterministically() {
         let reference = reference();
         let spec = execution_spec(&reference).unwrap();
-        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let evidence = RemoveReplicaObservationEvidence::capture(
             &operation,
             &observations(&operation),
@@ -4017,8 +4051,10 @@ mod remove_replica_execution_tests {
      {
         let reference = reference();
         let execution = execution_spec(&reference).unwrap();
-        let initial =
-            advance_to_boundary(reconstruct_initial_operation(&reference.input).unwrap()).unwrap();
+        let initial = advance_to_boundary(
+            reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
         let initial_observations = observations(&initial);
         let pods = pod_identities();
         let backend = InMemoryCheckpointStore::new();
@@ -4602,7 +4638,8 @@ mod remove_replica_execution_tests {
 
     #[test]
     fn remove_replica_execution_transition_validation_is_monotonic() {
-        let initial = reconstruct_initial_operation(&reference().input).unwrap();
+        let reference = reference();
+        let initial = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let mut changed = initial.clone();
         changed.target_pod_uid = Some("replacement".to_string());
         assert!(validate_transition(&initial, &changed).is_err());
@@ -4717,7 +4754,7 @@ mod remove_replica_execution_tests {
         let reference = reference();
         let spec = execution_spec(&reference).unwrap();
         let logical = activity_spec(&logical_boundary(
-            &reconstruct_initial_operation(&reference.input).unwrap(),
+            &reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap(),
         ))
         .unwrap();
         let activities = (0..=REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
@@ -4963,7 +5000,7 @@ mod remove_replica_execution_tests {
     #[test]
     fn remove_replica_execution_persisted_shapes_deny_unknown_fields() {
         let mut reference = reference();
-        reference.input.previous_snapshot.members[0].election_metadata =
+        reference.input.as_mut().unwrap().previous_snapshot.members[0].election_metadata =
             Some(StableReplicaElectionMetadataStatus {
                 current_lsn: 10,
                 committed_lsn: 9,
@@ -4990,7 +5027,7 @@ mod remove_replica_execution_tests {
         let workflow_input = RemoveReplicaWorkflowInput {
             contract_version: reference.contract_version,
             execution_id: reference.execution_id.clone(),
-            admission: reference.input.clone(),
+            admission: reference.input.clone().unwrap(),
         };
         assert_unknown_field_rejected::<RemoveReplicaWorkflowInput>(
             &serde_json::to_value(workflow_input).unwrap(),
@@ -5135,7 +5172,7 @@ mod remove_replica_execution_tests {
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
         let execution = execution_spec(&reference).unwrap();
-        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let api = adapter_api(&operation, DispatchResult::Busy);
         let store = adapter_store(&execution, InMemoryCheckpointStore::new());
         let adapter = FrameworkNativeRemoveReplicaAdapter::new(
@@ -5181,7 +5218,7 @@ mod remove_replica_execution_tests {
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
         let execution = execution_spec(&reference).unwrap();
-        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let api = adapter_api(&operation, DispatchResult::Busy);
         let store = adapter_store(&execution, InMemoryCheckpointStore::new());
         let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
@@ -5210,7 +5247,7 @@ mod remove_replica_execution_tests {
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
         let execution = execution_spec(&reference).unwrap();
-        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let api = adapter_api(&operation, DispatchResult::Busy);
         let store = adapter_store(&execution, InMemoryCheckpointStore::new());
         let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
@@ -5241,7 +5278,7 @@ mod remove_replica_execution_tests {
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
         let execution = execution_spec(&reference).unwrap();
-        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let api = adapter_api(&operation, DispatchResult::Ambiguous);
         let backend = InMemoryCheckpointStore::new();
         let store = adapter_store(&execution, backend.clone());
@@ -5510,7 +5547,8 @@ mod remove_replica_execution_tests {
 
     #[test]
     fn framework_native_remove_replica_uid_fenced_label_and_delete_commands() {
-        let operation = reconstruct_initial_operation(&reference().input).unwrap();
+        let reference = reference();
+        let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let label = prepare_remove_label_effect_command(
             &operation,
             3,

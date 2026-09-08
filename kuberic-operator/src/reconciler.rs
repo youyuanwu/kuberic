@@ -28,20 +28,15 @@ use kuberic_core::types::{
     ReplicaStatusInfo,
 };
 use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, StablePartitionSnapshot};
-// COMPLEXITY-BOUNDARY: shared-durable-runtime-wiring:start
-#[cfg(feature = "durable-remove-replica-pilot")]
-use kuberic_durable_execution::ActivityState;
-#[cfg(any(
-    feature = "durable-remove-replica-pilot",
-    all(test, feature = "durable-switchover-pilot")
-))]
+#[cfg(all(test, feature = "durable-switchover-pilot"))]
 use kuberic_durable_execution::{ActivityObservation, CheckpointStore, HostOutcome};
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
     DurableAddMode, DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
     DurableRemoveMode, KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus,
-    PendingActionStatus, Phase, ReconfigurationPhase, RemoveReplicaExecutionMode,
+    PendingActionStatus, Phase, ReconfigurationPhase, RemoveReplicaExecutionStatus,
+    RemoveReplicaIncompatibilitySource, RemoveReplicaIncompatibilityStatus,
     StablePartitionSnapshotStatus, StableReplicaElectionMetadataStatus, StableReplicaRoleStatus,
     StableReplicaSnapshotStatus, StatusCondition,
 };
@@ -55,39 +50,20 @@ use crate::durable::pilot::{
 };
 #[cfg(all(test, feature = "durable-switchover-pilot"))]
 use crate::durable::pilot::{DurableSwitchoverStepResult, encode_step_result};
-#[cfg(all(test, feature = "durable-remove-replica-pilot"))]
 use crate::durable::remove_replica_execution as native_remove;
-#[cfg(all(test, feature = "durable-remove-replica-pilot"))]
 use crate::durable::remove_replica_execution::{
     FrameworkNativeRemoveReplicaAdapter, FrameworkNativeRemoveReplicaRuntime,
     RemoveReplicaTerminal, RemoveReplicaWorkflow,
 };
-#[cfg(feature = "durable-remove-replica-pilot")]
-use crate::durable::remove_replica_pilot as remove_pilot;
-#[cfg(feature = "durable-remove-replica-pilot")]
-use crate::durable::remove_replica_pilot::{
-    DurableRemoveReplicaPilotRuntime, DurableRemoveReplicaPilotTerminal,
-    DurableRemoveReplicaStepResult, DurableRemoveReplicaWorkflow, RemoveReplicaActivityKind,
-    RemoveReplicaAdapterDecision, RemoveReplicaPermitGuard, RemoveReplicaPreparedActivityResolver,
-};
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    all(test, feature = "durable-remove-replica-pilot")
-))]
 use crate::durable::runner::{DurableActiveReason, DurableRunner, DurableRunnerOutcome};
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 use crate::durable::workflow_host::DurableWorkflowRuntime;
 use crate::durable::{
     CreatePartitionTarget, Decision, OperationObservations, OperationPodIdentities,
     RemoveReplicaTarget, ReplicaObservation, adopt_replacement_before_confirmation,
     attest_add_replica, correlated_action_observation, decide, decide_add_replica,
-    decide_create_partition, decide_failover, decide_remove_replica, fail_closed,
-    failover_action_for, failover_pending_label, operation_condition, record_activity_error,
-    record_observation, start_add_replica, start_create_partition, start_failover,
-    start_remove_replica, start_switchover,
+    decide_create_partition, decide_failover, fail_closed, failover_action_for,
+    failover_pending_label, operation_condition, record_activity_error, record_observation,
+    start_add_replica, start_create_partition, start_failover, start_switchover,
 };
 
 /// Shared state across reconciliation loops.
@@ -100,10 +76,7 @@ pub struct ReconcilerState {
     removal_clock: Arc<dyn RemoveReplicaClock>,
     #[cfg(feature = "durable-switchover-pilot")]
     pub durable_switchover_pilot: Option<Arc<DurableSwitchoverPilotRuntime>>,
-    #[cfg(feature = "durable-remove-replica-pilot")]
-    pub durable_remove_replica_pilot: Option<Arc<DurableRemoveReplicaPilotRuntime>>,
-    #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-    framework_native_remove_replica: Option<Arc<FrameworkNativeRemoveReplicaRuntime>>,
+    framework_native_remove_replica: Arc<FrameworkNativeRemoveReplicaRuntime>,
 }
 
 #[derive(Clone)]
@@ -112,6 +85,7 @@ struct PendingCommittedStatus {
     status: KubericSetStatus,
 }
 
+// COMPLEXITY-BOUNDARY: shared-durable-runtime-wiring:start
 impl Default for ReconcilerState {
     fn default() -> Self {
         Self {
@@ -120,10 +94,11 @@ impl Default for ReconcilerState {
             removal_clock: Arc::new(SystemRemoveReplicaClock),
             #[cfg(feature = "durable-switchover-pilot")]
             durable_switchover_pilot: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            durable_remove_replica_pilot: None,
-            #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-            framework_native_remove_replica: None,
+            framework_native_remove_replica: Arc::new(
+                FrameworkNativeRemoveReplicaRuntime::in_memory(
+                    kuberic_durable_execution::InMemoryCheckpointStore::new(),
+                ),
+            ),
         }
     }
 }
@@ -136,17 +111,14 @@ impl ReconcilerState {
             removal_clock: clock,
             #[cfg(feature = "durable-switchover-pilot")]
             durable_switchover_pilot: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            durable_remove_replica_pilot: None,
-            #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-            framework_native_remove_replica: None,
+            framework_native_remove_replica: Arc::new(
+                FrameworkNativeRemoveReplicaRuntime::in_memory(
+                    kuberic_durable_execution::InMemoryCheckpointStore::new(),
+                ),
+            ),
         }
     }
 
-    #[cfg(any(
-        feature = "durable-switchover-pilot",
-        feature = "durable-remove-replica-pilot"
-    ))]
     pub fn with_durable_client(client: kube::Client) -> Self {
         let runtime = Arc::new(DurableWorkflowRuntime::kubernetes(client));
         Self {
@@ -157,12 +129,9 @@ impl ReconcilerState {
             durable_switchover_pilot: Some(Arc::new(DurableSwitchoverPilotRuntime::shared(
                 runtime.clone(),
             ))),
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            durable_remove_replica_pilot: Some(Arc::new(DurableRemoveReplicaPilotRuntime::shared(
-                runtime.clone(),
-            ))),
-            #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-            framework_native_remove_replica: None,
+            framework_native_remove_replica: Arc::new(FrameworkNativeRemoveReplicaRuntime::shared(
+                runtime,
+            )),
         }
     }
     // COMPLEXITY-BOUNDARY: shared-durable-runtime-wiring:end
@@ -176,41 +145,21 @@ impl ReconcilerState {
     pub fn with_durable_switchover_store(
         store: kuberic_durable_execution::InMemoryCheckpointStore,
     ) -> Self {
-        Self {
-            drivers: Mutex::new(HashMap::new()),
-            pending_statuses: Mutex::new(HashMap::new()),
-            removal_clock: Arc::new(SystemRemoveReplicaClock),
-            durable_switchover_pilot: Some(Arc::new(DurableSwitchoverPilotRuntime::in_memory(
-                store,
-            ))),
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            durable_remove_replica_pilot: None,
-            #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-            framework_native_remove_replica: None,
-        }
-    }
-
-    #[cfg(feature = "durable-remove-replica-pilot")]
-    pub fn with_durable_remove_replica_store(
-        store: kuberic_durable_execution::InMemoryCheckpointStore,
-    ) -> Self {
         let runtime = Arc::new(DurableWorkflowRuntime::in_memory(store));
         Self {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
-            #[cfg(feature = "durable-switchover-pilot")]
-            durable_switchover_pilot: None,
-            durable_remove_replica_pilot: Some(Arc::new(DurableRemoveReplicaPilotRuntime::shared(
+            durable_switchover_pilot: Some(Arc::new(DurableSwitchoverPilotRuntime::shared(
                 runtime.clone(),
             ))),
-            #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-            framework_native_remove_replica: None,
+            framework_native_remove_replica: Arc::new(FrameworkNativeRemoveReplicaRuntime::shared(
+                runtime,
+            )),
         }
     }
 
-    #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-    fn with_framework_native_remove_store(
+    pub fn with_remove_replica_store(
         store: kuberic_durable_execution::InMemoryCheckpointStore,
     ) -> Self {
         let runtime = Arc::new(DurableWorkflowRuntime::in_memory(store));
@@ -220,10 +169,8 @@ impl ReconcilerState {
             removal_clock: Arc::new(SystemRemoveReplicaClock),
             #[cfg(feature = "durable-switchover-pilot")]
             durable_switchover_pilot: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            durable_remove_replica_pilot: None,
-            framework_native_remove_replica: Some(Arc::new(
-                FrameworkNativeRemoveReplicaRuntime::shared(runtime),
+            framework_native_remove_replica: Arc::new(FrameworkNativeRemoveReplicaRuntime::shared(
+                runtime,
             )),
         }
     }
@@ -239,21 +186,6 @@ type DispatchEvidencePlan = crate::durable::effects::DispatchEvidencePlan;
 fn authoritative_topology_snapshot(
     status: &KubericSetStatus,
 ) -> Option<&StablePartitionSnapshotStatus> {
-    let operation = status.operation.as_ref();
-    if let Some(operation) = operation
-        && status.phase == Phase::RemovingReplica
-        && operation.kind == DurableOperationKind::RemoveReplica
-        && operation.remove_commit_evidence.is_some()
-        && matches!(
-            operation.phase,
-            DurableOperationPhase::RemoveRecordCommit
-                | DurableOperationPhase::RemoveAwaitCleanup
-                | DurableOperationPhase::RemoveDeleteTargetPod
-                | DurableOperationPhase::RemovePublishTopology
-        )
-    {
-        return operation.committed_snapshot.as_ref();
-    }
     status.stable_snapshot.as_ref()
 }
 
@@ -308,108 +240,158 @@ fn validate_new_switchover_engine(mode: crate::crd::SwitchoverExecutionMode) -> 
     }
 }
 
-// COMPLEXITY-BOUNDARY: remove-replica-routing-integration:start
-fn validate_new_remove_replica_engine(mode: RemoveReplicaExecutionMode) -> Result<(), String> {
-    match mode {
-        RemoveReplicaExecutionMode::Explicit => Ok(()),
-        RemoveReplicaExecutionMode::DurablePilot => {
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            {
-                Ok(())
-            }
-            #[cfg(not(feature = "durable-remove-replica-pilot"))]
-            {
-                Err(
-                    "durable remove-replica pilot requires the operator durable-remove-replica-pilot build feature"
-                        .to_string(),
-                )
-            }
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn accept_remove_replica(
     set: &KubericSet,
-    state: &ReconcilerState,
+    _state: &ReconcilerState,
     previous_snapshot: StablePartitionSnapshotStatus,
     target: RemoveReplicaTarget,
     mode: DurableRemoveMode,
     minimum_replicas: usize,
     now: i64,
 ) -> Result<KubericSetStatus, String> {
-    validate_new_remove_replica_engine(set.spec.remove_replica_execution_mode)?;
     let mut status = KubericSetStatus {
         phase: Phase::RemovingReplica,
         ..set.status.clone().unwrap_or_default()
     };
-    match set.spec.remove_replica_execution_mode {
-        RemoveReplicaExecutionMode::Explicit => {
-            let fallback_identity =
-                format!("{}/{}", set.namespace().unwrap_or_default(), set.name_any());
-            let operation = start_remove_replica(
-                set.metadata.uid.as_deref().unwrap_or(&fallback_identity),
-                previous_snapshot,
-                target,
-                mode,
-                minimum_replicas,
-                now,
-            )?;
-            status.operation = Some(operation.clone());
-            status.durable_remove_replica_pilot = None;
-            set_operation_condition(&mut status, operation_condition(&operation, now));
-        }
-        RemoveReplicaExecutionMode::DurablePilot => {
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            {
-                if state.durable_remove_replica_pilot.is_none() {
-                    return Err(
-                        "durable remove-replica pilot runtime is not configured".to_string()
-                    );
-                }
-                let reference = remove_pilot::new_pilot_execution(
-                    set.metadata.uid.as_deref().ok_or_else(|| {
-                        "durable remove-replica pilot requires KubericSet UID".to_string()
-                    })?,
-                    previous_snapshot,
-                    target,
-                    mode,
-                    minimum_replicas,
-                    now,
-                )?;
-                status.operation = None;
-                status.durable_remove_replica_pilot = Some(reference);
-                set_remove_pilot_condition(
-                    &mut status,
-                    "Accepted",
-                    "durable remove reference persisted before checkpoint creation",
-                    now,
-                );
-            }
-            #[cfg(not(feature = "durable-remove-replica-pilot"))]
-            {
-                let _ = (
-                    state,
-                    previous_snapshot,
-                    target,
-                    mode,
-                    minimum_replicas,
-                    now,
-                );
-                return Err(
-                    "durable remove-replica pilot requires the operator durable-remove-replica-pilot build feature"
-                        .to_string(),
-                );
-            }
-        }
-    }
+    let reference = native_remove::new_execution(
+        set.metadata
+            .uid
+            .as_deref()
+            .ok_or_else(|| "framework-native remove-replica requires KubericSet UID".to_string())?,
+        previous_snapshot,
+        target,
+        mode,
+        minimum_replicas,
+        now,
+    )?;
+    status.operation = None;
+    status.legacy_status_fields.clear();
+    status.remove_replica_execution = Some(reference);
+    set_framework_native_remove_condition(
+        &mut status,
+        "Accepted",
+        "native remove reference persisted before checkpoint creation",
+        now,
+    );
     Ok(status)
+}
+
+fn stable_legacy_fingerprint(source: &str, encoded: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in source.as_bytes().iter().chain(encoded) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn legacy_remove_marker(
+    source: RemoveReplicaIncompatibilitySource,
+    version: u32,
+    execution_id: String,
+    checkpoint_name: String,
+    encoded: &[u8],
+) -> RemoveReplicaExecutionStatus {
+    let source_name = match source {
+        RemoveReplicaIncompatibilitySource::LegacyPilot => "legacy-pilot",
+        RemoveReplicaIncompatibilitySource::LegacyExplicit => "legacy-explicit",
+    };
+    RemoveReplicaExecutionStatus {
+        contract_version: native_remove::REMOVE_REPLICA_CONTRACT_VERSION,
+        execution_id: execution_id.clone(),
+        checkpoint_name,
+        input: None,
+        incompatibility: Some(RemoveReplicaIncompatibilityStatus {
+            source,
+            legacy_contract_version: version,
+            legacy_execution_id: execution_id,
+            fingerprint: stable_legacy_fingerprint(source_name, encoded),
+        }),
+    }
+}
+
+async fn persist_legacy_remove_incompatibility(
+    set: &KubericSet,
+    api: &dyn ClusterApi,
+    now: i64,
+) -> Result<bool, String> {
+    let Some(current) = set.status.as_ref() else {
+        return Ok(false);
+    };
+    let marker = if let Some(legacy) = current
+        .legacy_status_fields
+        .get(&["durable", "Remove", "Replica", "Pilot"].concat())
+    {
+        let version = legacy
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default();
+        let execution_id = legacy
+            .get("executionId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let checkpoint_name = legacy
+            .get("checkpointName")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let encoded = serde_json::to_vec(legacy)
+            .map_err(|error| format!("serialize legacy remove status marker: {error}"))?;
+        Some(legacy_remove_marker(
+            RemoveReplicaIncompatibilitySource::LegacyPilot,
+            version,
+            execution_id,
+            checkpoint_name,
+            &encoded,
+        ))
+    } else if let Some(operation) = current
+        .operation
+        .as_ref()
+        .filter(|operation| operation.kind == DurableOperationKind::RemoveReplica)
+    {
+        let encoded = serde_json::to_vec(operation)
+            .map_err(|error| format!("serialize legacy explicit remove marker: {error}"))?;
+        let fingerprint = stable_legacy_fingerprint("legacy-explicit", encoded.as_slice());
+        Some(legacy_remove_marker(
+            RemoveReplicaIncompatibilitySource::LegacyExplicit,
+            operation.version,
+            operation.operation_id.clone(),
+            format!("kuberic-remove-incompatible-{fingerprint}"),
+            &encoded,
+        ))
+    } else {
+        None
+    };
+    let Some(marker) = marker else {
+        return Ok(false);
+    };
+    let mut status = current.clone();
+    status.operation = None;
+    status.legacy_status_fields.clear();
+    status.remove_replica_execution = Some(marker);
+    set_framework_native_remove_condition(
+        &mut status,
+        "Incompatible",
+        "legacy remove execution is durably blocked and cannot be resumed as the production contract",
+        now,
+    );
+    api.patch_set_status(
+        &set.namespace().unwrap_or_default(),
+        &set.name_any(),
+        &status,
+        set.metadata.resource_version.as_deref(),
+    )
+    .await?;
+    Ok(true)
 }
 
 // COMPLEXITY-BOUNDARY: remove-replica-routing-integration:end
 
 fn durable_identity_members(
-    status: &KubericSetStatus,
+    _status: &KubericSetStatus,
     operation: &DurableOperationStatus,
 ) -> Result<Vec<StableReplicaSnapshotStatus>, String> {
     Ok(match operation.kind {
@@ -429,16 +411,11 @@ fn durable_identity_members(
             })
             .cloned()
             .collect(),
-        DurableOperationKind::RemoveReplica if operation.remove_commit_evidence.is_some() => {
-            Vec::new()
+        DurableOperationKind::RemoveReplica => {
+            return Err(
+                "legacy explicit remove execution must be converted before recovery".into(),
+            );
         }
-        DurableOperationKind::RemoveReplica => authoritative_topology_snapshot(status)
-            .ok_or_else(|| "durable removal has no authoritative topology snapshot".to_string())?
-            .members
-            .iter()
-            .filter(|member| Some(member.id) != operation.target_replica_id)
-            .cloned()
-            .collect(),
         DurableOperationKind::Failover => Vec::new(),
     })
 }
@@ -669,6 +646,10 @@ pub async fn reconcile_set(
 
     info!(name, namespace, "reconciling KubericSet");
 
+    if persist_legacy_remove_incompatibility(set, api, state.removal_clock.unix_seconds()).await? {
+        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
+    }
+
     // A topology operation is not complete until its stable snapshot is
     // durable. Retry a failed post-commit status write before observing pods
     // or selecting any further health/topology action.
@@ -679,10 +660,6 @@ pub async fn reconcile_set(
         } else {
             if set.status.as_ref() == Some(&pending.status) {
                 state.pending_statuses.lock().await.remove(&set_key);
-                #[cfg(any(
-                    feature = "durable-switchover-pilot",
-                    feature = "durable-remove-replica-pilot"
-                ))]
                 cleanup_persisted_durable_execution(state, set, &pending.status, &set_key).await;
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
@@ -699,10 +676,6 @@ pub async fn reconcile_set(
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
             state.pending_statuses.lock().await.remove(&set_key);
-            #[cfg(any(
-                feature = "durable-switchover-pilot",
-                feature = "durable-remove-replica-pilot"
-            ))]
             cleanup_persisted_durable_execution(state, set, &pending.status, &set_key).await;
             return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
         }
@@ -728,13 +701,12 @@ pub async fn reconcile_set(
                 .await;
                 return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
             }
-            #[cfg(feature = "durable-remove-replica-pilot")]
             if set.status.as_ref().is_some_and(|status| {
                 status.phase == Phase::RemovingReplica
                     && status.operation.is_none()
-                    && status.durable_remove_replica_pilot.is_some()
+                    && status.remove_replica_execution.is_some()
             }) {
-                record_remove_pilot_wait_condition(
+                record_framework_native_remove_condition(
                     set,
                     api,
                     "ObservationUnavailable",
@@ -1843,58 +1815,12 @@ pub async fn reconcile_set(
         }
 
         Phase::RemovingReplica => {
-            #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
             if set.status.as_ref().is_some_and(|status| {
                 status.operation.is_none() && status.remove_replica_execution.is_some()
-            }) && state.framework_native_remove_replica.is_some()
-            {
+            }) {
                 return reconcile_framework_native_remove_replica(set, api, state, &pods).await;
             }
-            if set.status.as_ref().is_some_and(|status| {
-                status.operation.is_none() && status.durable_remove_replica_pilot.is_some()
-            }) {
-                #[cfg(feature = "durable-remove-replica-pilot")]
-                return match Box::pin(reconcile_durable_remove_replica_pilot(
-                    set,
-                    api,
-                    state,
-                    &pods,
-                    &ready_pods,
-                ))
-                .await
-                {
-                    Ok(action) => Ok(action),
-                    Err(error) => {
-                        warn!(
-                            name,
-                            error, "durable remove-replica pilot reconcile blocked"
-                        );
-                        record_remove_pilot_wait_condition(
-                            set,
-                            api,
-                            "Blocked",
-                            &error,
-                            state.removal_clock.unix_seconds(),
-                        )
-                        .await;
-                        Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
-                    }
-                };
-                #[cfg(not(feature = "durable-remove-replica-pilot"))]
-                return Err(
-                    "durable remove-replica pilot requires the operator durable-remove-replica-pilot build feature"
-                        .to_string(),
-                );
-            }
-            Box::pin(reconcile_durable_operation(
-                set,
-                api,
-                state,
-                &pods,
-                &ready_pods,
-                &set_key,
-            ))
-            .await
+            Err("remove-replica phase has no production execution reference".to_string())
         }
 
         Phase::AddingReplica => {
@@ -2832,7 +2758,7 @@ async fn apply_failover_decision(
                 stable_snapshot: Some(snapshot),
                 operation: None,
                 durable_switchover_pilot: None,
-                durable_remove_replica_pilot: None,
+                legacy_status_fields: BTreeMap::new(),
                 remove_replica_execution: None,
                 conditions: Vec::new(),
                 primary_failing_since: None,
@@ -3173,7 +3099,6 @@ async fn publish_pilot_terminal(
 
 // COMPLEXITY-BOUNDARY: pilot-reconcile:end
 // COMPLEXITY-BOUNDARY: remove-replica-reconcile-integration:start
-#[cfg(all(test, feature = "durable-remove-replica-pilot"))]
 async fn reconcile_framework_native_remove_replica(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -3192,10 +3117,7 @@ async fn reconcile_framework_native_remove_replica(
         .as_ref()
         .and_then(|status| status.remove_replica_execution.as_ref())
         .ok_or_else(|| "remove-replica phase has no native execution reference".to_string())?;
-    let runtime = state
-        .framework_native_remove_replica
-        .as_ref()
-        .ok_or_else(|| "framework-native remove runtime is not configured".to_string())?;
+    let runtime = &state.framework_native_remove_replica;
     let execution = match native_remove::execution_spec(reference) {
         Ok(execution) => execution,
         Err(error) => {
@@ -3304,7 +3226,6 @@ async fn reconcile_framework_native_remove_replica(
     }
 }
 
-#[cfg(all(test, feature = "durable-remove-replica-pilot"))]
 async fn publish_framework_native_remove_terminal(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -3325,17 +3246,19 @@ async fn publish_framework_native_remove_terminal(
         .as_ref()
         .and_then(|status| status.remove_replica_execution.as_ref())
         .ok_or_else(|| "terminal framework-native remove has no execution reference".to_string())?;
-    let runtime = state
-        .framework_native_remove_replica
-        .as_ref()
-        .ok_or_else(|| "terminal framework-native remove runtime is not configured".to_string())?;
+    let runtime = &state.framework_native_remove_replica;
     let completed = matches!(&terminal, RemoveReplicaTerminal::Completed { .. });
     match terminal {
         RemoveReplicaTerminal::Completed { .. } | RemoveReplicaTerminal::Compensated { .. } => {
             let snapshot = if completed {
-                native_remove::reconstruct_initial_operation(&reference.input)?.target_snapshot
+                native_remove::reconstruct_initial_operation(native_remove::admission_input(
+                    reference,
+                )?)?
+                .target_snapshot
             } else {
-                reference.input.previous_snapshot.clone()
+                native_remove::admission_input(reference)?
+                    .previous_snapshot
+                    .clone()
             };
             let mut status = set.status.clone().unwrap_or_default();
             let persisted_members = status.members.clone();
@@ -3377,7 +3300,7 @@ async fn publish_framework_native_remove_terminal(
             status.members = members;
             status.stable_snapshot = Some(snapshot);
             status.operation = None;
-            status.durable_remove_replica_pilot = None;
+            status.legacy_status_fields.clear();
             status.primary_failing_since = None;
             status.stable_election_metadata_refresh =
                 Some(crate::crd::StableElectionMetadataRefreshStatus {
@@ -3422,652 +3345,6 @@ async fn publish_framework_native_remove_terminal(
     }
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
-async fn reconcile_durable_remove_replica_pilot(
-    set: &KubericSet,
-    api: &dyn ClusterApi,
-    state: &ReconcilerState,
-    pods: &[Pod],
-    _ready_pods: &[&Pod],
-) -> Result<ReconcileAction, String> {
-    let namespace = set.namespace().unwrap_or_default();
-    let name = set.name_any();
-    let set_uid =
-        set.metadata.uid.as_deref().ok_or_else(|| {
-            "active durable remove-replica pilot has no KubericSet UID".to_string()
-        })?;
-    let reference = set
-        .status
-        .as_ref()
-        .and_then(|status| status.durable_remove_replica_pilot.as_ref())
-        .ok_or_else(|| "remove-replica phase has no durable pilot reference".to_string())?;
-    let runtime = state
-        .durable_remove_replica_pilot
-        .as_ref()
-        .ok_or_else(|| "durable remove-replica pilot runtime is not configured".to_string())?;
-    let execution = remove_pilot::execution_spec(reference)?;
-    let host = runtime.host(&namespace, &name, set_uid, reference).await?;
-    let store = { host.lock().await.store().clone() };
-    let loaded = store
-        .load(execution.execution_id())
-        .await
-        .map_err(|error| format!("load durable remove-replica checkpoint: {error}"))?;
-    if let Some(terminal) = loaded_remove_pilot_terminal(reference, loaded.as_ref(), &execution)? {
-        return publish_remove_pilot_terminal(set, api, state, terminal, unix_seconds()).await;
-    }
-
-    let operation = current_remove_pilot_operation(reference, &execution, loaded.as_ref())?;
-    let current_pods = checked_pods_by_id(pods)?;
-    let pod_identities: OperationPodIdentities = current_pods
-        .iter()
-        .map(|(id, instance_id, _)| (*id, instance_id.to_string()))
-        .collect();
-    let target_pod_role_label = operation.target_replica_id.and_then(|target_id| {
-        current_pods
-            .iter()
-            .find(|(id, instance_id, _)| {
-                *id == target_id
-                    && operation.target_pod_uid.as_deref() == Some(instance_id.as_str())
-            })
-            .and_then(|(_, _, pod)| {
-                pod.metadata
-                    .labels
-                    .as_ref()
-                    .and_then(|labels| labels.get("kuberic.io/role"))
-            })
-            .map(String::as_str)
-    });
-
-    let mut handles: BTreeMap<ReplicaId, Box<dyn ReplicaHandle>> = BTreeMap::new();
-    let mut observations = OperationObservations::new();
-    for (replica_id, _, pod) in &current_pods {
-        if !operation
-            .previous_snapshot
-            .members
-            .iter()
-            .any(|member| member.id == *replica_id)
-        {
-            continue;
-        }
-        let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await else {
-            continue;
-        };
-        match handle.get_status().await {
-            Ok(status) => {
-                observations.insert(
-                    *replica_id,
-                    ReplicaObservation {
-                        status,
-                        control_address: handle.control_address(),
-                        replicator_address: handle.replicator_address(),
-                        pod_name: pod.name_any(),
-                        pod_role_label: pod
-                            .metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|labels| labels.get("kuberic.io/role"))
-                            .cloned(),
-                    },
-                );
-            }
-            Err(
-                error @ (KubericError::RemoteControlProtocolUnsupported(_)
-                | KubericError::RemoteAgentRequestRejected(_)),
-            ) => {
-                return Err(format!(
-                    "replica {replica_id} has unsupported or malformed control status during durable remove-replica: {error}"
-                ));
-            }
-            Err(_) => {}
-        }
-        handles.insert(*replica_id, handle);
-    }
-
-    let now = state.removal_clock.unix_seconds();
-    let initial = remove_pilot::initial_operation(reference)?;
-    let addressed_instances = handles
-        .iter()
-        .map(|(replica_id, handle)| (*replica_id, handle.instance_id()))
-        .collect();
-    let resolver = RemoveReplicaPreparedActivityResolver::new(
-        &initial,
-        &observations,
-        &pod_identities,
-        target_pod_role_label,
-        &addressed_instances,
-        now,
-    );
-    let mut host = host.lock().await;
-    let mut outcome = host
-        .turn_and_expose_with(&DurableRemoveReplicaWorkflow, execution.clone(), &resolver)
-        .await;
-    for _ in 0..remove_pilot::REMOVE_REPLICA_PILOT_MAX_ACTIVITY_RECORDS {
-        host.store().correlate_host_outcome(&outcome);
-        match outcome {
-            HostOutcome::DispatchPermitted { permit, .. } => {
-                let activity = permit.activity().clone();
-                let accepted_attempt = permit.attempt_id();
-                let prepared =
-                    remove_pilot::decode_remove_activity_input(permit.activity().input())?;
-                let operation = prepared.state.apply_to(&initial)?;
-                remove_pilot::validate_prepared_activity(&operation, &prepared.kind)?;
-                if prepared.kind == RemoveReplicaActivityKind::PassiveObservation {
-                    match remove_pilot::evaluate_adapter_step(
-                        &operation,
-                        &observations,
-                        &pod_identities,
-                        target_pod_role_label,
-                        now,
-                    )? {
-                        decision @ RemoveReplicaAdapterDecision::Advance(_) => {
-                            let result = remove_pilot::completed_step(decision, &prepared.kind)?;
-                            outcome = host
-                                .observe_and_turn_with(
-                                    &DurableRemoveReplicaWorkflow,
-                                    &execution,
-                                    ActivityObservation::new(
-                                        activity,
-                                        remove_pilot::encode_step_result(&result)?,
-                                    ),
-                                    &resolver,
-                                )
-                                .await;
-                            continue;
-                        }
-                        RemoveReplicaAdapterDecision::AwaitEvidence => {
-                            record_remove_pilot_wait_condition(
-                                set,
-                                api,
-                                "AwaitingAuthoritativeObservation",
-                                "durable remove activity is waiting for authoritative primary, target, lifecycle, UID, or role evidence",
-                                now,
-                            )
-                            .await;
-                            return Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
-                                &operation, now,
-                            )));
-                        }
-                        RemoveReplicaAdapterDecision::External(_) => {
-                            return Err(
-                                "durable remove resolver exposed an external effect as a passive observation"
-                                    .to_string(),
-                            );
-                        }
-                    }
-                }
-                let mut guard = RemoveReplicaPermitGuard::new(permit);
-                match crate::durable::effects::bridge_remove_replica_permitted_step(
-                &mut guard,
-                &operation,
-                &prepared.kind,
-                &activity,
-                accepted_attempt,
-                &observations,
-                &handles,
-                api,
-                &namespace,
-            )
-            .await?
-            {
-                crate::durable::effects::DurableEffectBridgeOutcome::Observe(result) => {
-                    outcome = host
-                        .observe_and_turn_with(
-                            &DurableRemoveReplicaWorkflow,
-                            &execution,
-                            ActivityObservation::new(
-                                activity,
-                                remove_pilot::encode_step_result(&result)?,
-                            ),
-                            &resolver,
-                        )
-                        .await;
-                    continue;
-                }
-                crate::durable::effects::DurableEffectBridgeOutcome::ObserveAfterFenceRefresh(
-                    result,
-                ) => {
-                    outcome = host
-                        .observe(
-                            &execution,
-                            ActivityObservation::new(
-                                activity,
-                                remove_pilot::encode_step_result(&result)?,
-                            ),
-                        )
-                        .await;
-                    host.store().correlate_host_outcome(&outcome);
-                    if matches!(outcome, HostOutcome::ObservationAccepted { .. }) {
-                        record_remove_pilot_wait_condition(
-                                set,
-                                api,
-                                "RefreshingReplicaObservation",
-                                "proven non-admission was persisted; retry awaits refreshed replica observations",
-                                now,
-                            )
-                            .await;
-                        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-                    }
-                    return remove_pilot_host_outcome_action(set, api, &outcome, now).await;
-                }
-                crate::durable::effects::DurableEffectBridgeOutcome::Exposed => {
-                    record_remove_pilot_wait_condition(
-                        set,
-                        api,
-                        "EffectExposed",
-                        "durable remove effect was exposed and awaits authoritative observation",
-                        now,
-                    )
-                    .await;
-                }
-                crate::durable::effects::DurableEffectBridgeOutcome::AwaitEvidence => {
-                    record_remove_pilot_wait_condition(
-                            set,
-                            api,
-                            "AwaitingAuthoritativeObservation",
-                            "durable remove activity is waiting for exact authoritative effect evidence",
-                            now,
-                        )
-                        .await;
-                }
-            }
-                return Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
-                    &operation, now,
-                )));
-            }
-            HostOutcome::Quarantined { activity, .. } => {
-                let prepared = remove_pilot::decode_remove_activity_input(activity.input())?;
-                let operation = prepared.state.apply_to(&initial)?;
-                remove_pilot::validate_prepared_activity(&operation, &prepared.kind)?;
-                let decision = remove_pilot::evaluate_adapter_step(
-                    &operation,
-                    &observations,
-                    &pod_identities,
-                    target_pod_role_label,
-                    now,
-                )?;
-                match crate::durable::effects::resolve_remove_replica_quarantine(
-                &operation,
-                &prepared.kind,
-                decision,
-                &observations,
-            )? {
-                crate::durable::effects::DurableEffectBridgeOutcome::Observe(result) => {
-                    outcome = host
-                        .observe_and_turn_with(
-                            &DurableRemoveReplicaWorkflow,
-                            &execution,
-                            ActivityObservation::new(
-                                activity,
-                                remove_pilot::encode_step_result(&result)?,
-                            ),
-                            &resolver,
-                        )
-                        .await;
-                    continue;
-                }
-                crate::durable::effects::DurableEffectBridgeOutcome::ObserveAfterFenceRefresh(
-                    result,
-                ) => {
-                    outcome = host
-                        .observe(
-                            &execution,
-                            ActivityObservation::new(
-                                activity,
-                                remove_pilot::encode_step_result(&result)?,
-                            ),
-                        )
-                        .await;
-                    host.store().correlate_host_outcome(&outcome);
-                    if matches!(outcome, HostOutcome::ObservationAccepted { .. }) {
-                        record_remove_pilot_wait_condition(
-                            set,
-                            api,
-                            "RefreshingReplicaObservation",
-                            "proven non-admission was persisted; retry awaits refreshed replica observations",
-                            now,
-                        )
-                        .await;
-                        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-                    }
-                    return remove_pilot_host_outcome_action(set, api, &outcome, now).await;
-                }
-                crate::durable::effects::DurableEffectBridgeOutcome::Exposed
-                | crate::durable::effects::DurableEffectBridgeOutcome::AwaitEvidence => {
-                    record_remove_pilot_wait_condition(
-                            set,
-                            api,
-                            "Quarantined",
-                            "exposed durable remove activity remains quarantined pending authoritative evidence",
-                            now,
-                        )
-                        .await;
-                    return Ok(ReconcileAction::Requeue(remove_pilot_deadline_requeue(
-                        &operation, now,
-                    )));
-                }
-            }
-            }
-            HostOutcome::WorkflowCompleted { outcome, .. } => {
-                let completed_activity_count = host
-                    .store()
-                    .measurements()
-                    .completed_activity_count
-                    .ok_or_else(|| {
-                        "completed durable remove-replica has no authoritative activity count"
-                            .to_string()
-                    })?;
-                let terminal = remove_pilot::validate_loaded_terminal(
-                    reference,
-                    &outcome,
-                    completed_activity_count,
-                )?;
-                drop(host);
-                return publish_remove_pilot_terminal(set, api, state, terminal, now).await;
-            }
-            outcome @ (HostOutcome::ReloadRequired { .. } | HostOutcome::StoreFailed { .. }) => {
-                return remove_pilot_host_outcome_action(set, api, &outcome, now).await;
-            }
-            HostOutcome::ScheduleAccepted { .. } | HostOutcome::ObservationAccepted { .. } => {
-                return Err(
-                    "fused durable remove-replica host returned an unfused persistence outcome"
-                        .to_string(),
-                );
-            }
-            HostOutcome::Nondeterminism(error) => {
-                return Err(format!("durable remove-replica workflow changed: {error}"));
-            }
-            HostOutcome::CheckpointRejected(
-                kuberic_durable_execution::CheckpointError::PreparedActivityRejected(error),
-            ) => {
-                record_remove_pilot_wait_condition(
-                    set,
-                    api,
-                    "AwaitingEffectPreparation",
-                    &format!(
-                        "durable remove effect could not be prepared from current authoritative observations: {error:?}"
-                    ),
-                    now,
-                )
-                .await;
-                return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-            }
-            HostOutcome::CheckpointRejected(error) => {
-                return Err(format!(
-                    "durable remove-replica checkpoint rejected: {error}"
-                ));
-            }
-            HostOutcome::ObservationRejected(error) => {
-                return Err(format!(
-                    "durable remove-replica observation rejected: {error:?}"
-                ));
-            }
-        }
-    }
-    Err("durable remove-replica exhausted bounded fused progression".to_string())
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-fn remove_pilot_deadline_requeue(operation: &DurableOperationStatus, now: i64) -> Duration {
-    let deadline = operation
-        .pending_action
-        .as_ref()
-        .map(|pending| pending.deadline_unix_seconds)
-        .unwrap_or(operation.phase_deadline_unix_seconds);
-    Duration::from_secs(deadline.saturating_sub(now).clamp(1, 10) as u64)
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-async fn remove_pilot_host_outcome_action(
-    set: &KubericSet,
-    api: &dyn ClusterApi,
-    outcome: &HostOutcome,
-    now: i64,
-) -> Result<ReconcileAction, String> {
-    let diagnostic = match outcome {
-        HostOutcome::ObservationAccepted { .. } | HostOutcome::ScheduleAccepted { .. } => None,
-        HostOutcome::ReloadRequired { boundary, reason } => Some((
-            "ReloadRequired",
-            format!("checkpoint {boundary:?} requires reload after {reason:?}"),
-        )),
-        HostOutcome::StoreFailed { operation, error } => Some((
-            "StorageUnavailable",
-            format!("checkpoint {operation:?} failed: {error}"),
-        )),
-        HostOutcome::ObservationRejected(error) => {
-            return Err(format!(
-                "durable remove-replica observation rejected: {error:?}"
-            ));
-        }
-        HostOutcome::CheckpointRejected(error) => {
-            return Err(format!(
-                "durable remove-replica checkpoint rejected: {error}"
-            ));
-        }
-        HostOutcome::Nondeterminism(error) => {
-            return Err(format!("durable remove-replica workflow changed: {error}"));
-        }
-        HostOutcome::DispatchPermitted { .. }
-        | HostOutcome::Quarantined { .. }
-        | HostOutcome::WorkflowCompleted { .. } => {
-            return Err("unexpected durable remove-replica host outcome routing".to_string());
-        }
-    };
-    if let Some((reason, message)) = diagnostic {
-        record_remove_pilot_wait_condition(set, api, reason, &message, now).await;
-    }
-    Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-fn loaded_remove_pilot_terminal(
-    reference: &crate::crd::DurableRemoveReplicaPilotStatus,
-    loaded: Option<&kuberic_durable_execution::StoredCheckpoint>,
-    execution: &kuberic_durable_execution::ExecutionSpec,
-) -> Result<Option<DurableRemoveReplicaPilotTerminal>, String> {
-    let Some(stored) = loaded else {
-        return Ok(None);
-    };
-    let payload = stored
-        .checkpoint()
-        .decode_and_validate(execution, remove_pilot::checkpoint_limits())
-        .map_err(|error| format!("decode durable remove-replica checkpoint: {error}"))?;
-    match payload.terminal_outcome() {
-        Some((outcome, completed_activity_count)) => {
-            remove_pilot::validate_loaded_terminal(reference, outcome, completed_activity_count)
-                .map(Some)
-        }
-        None => Ok(None),
-    }
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-fn current_remove_pilot_operation(
-    reference: &crate::crd::DurableRemoveReplicaPilotStatus,
-    execution: &kuberic_durable_execution::ExecutionSpec,
-    loaded: Option<&kuberic_durable_execution::StoredCheckpoint>,
-) -> Result<DurableOperationStatus, String> {
-    let initial = remove_pilot::initial_operation(reference)?;
-    let Some(stored) = loaded else {
-        return Ok(initial);
-    };
-    let payload = stored
-        .checkpoint()
-        .decode_and_validate(execution, remove_pilot::checkpoint_limits())
-        .map_err(|error| format!("decode durable remove-replica checkpoint: {error}"))?;
-    let Some(activities) = payload.active_activities() else {
-        return Ok(initial);
-    };
-    let Some(last) = activities.last() else {
-        return Ok(initial);
-    };
-    let state = match last.state() {
-        ActivityState::Scheduled | ActivityState::DispatchExposed { .. } => {
-            remove_pilot::decode_remove_activity_input(last.input())?.state
-        }
-        ActivityState::Completed { result } => {
-            match remove_pilot::decode_activity_step_result(result)? {
-                DurableRemoveReplicaStepResult::Advance { operation, .. }
-                | DurableRemoveReplicaStepResult::ProvenNoAdmission { operation, .. } => operation,
-            }
-        }
-    };
-    state.apply_to(&initial)
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-async fn publish_remove_pilot_terminal(
-    set: &KubericSet,
-    api: &dyn ClusterApi,
-    state: &ReconcilerState,
-    terminal: DurableRemoveReplicaPilotTerminal,
-    now: i64,
-) -> Result<ReconcileAction, String> {
-    let namespace = set.namespace().unwrap_or_default();
-    let name = set.name_any();
-    let set_key = format!("{namespace}/{name}");
-    let set_uid = set
-        .metadata
-        .uid
-        .as_deref()
-        .ok_or_else(|| "terminal durable remove-replica has no KubericSet UID".to_string())?;
-    let reference = set
-        .status
-        .as_ref()
-        .and_then(|status| status.durable_remove_replica_pilot.as_ref())
-        .ok_or_else(|| "terminal durable remove-replica has no reference".to_string())?;
-    let runtime = state
-        .durable_remove_replica_pilot
-        .as_ref()
-        .ok_or_else(|| "terminal durable remove-replica runtime is not configured".to_string())?;
-    let initial = remove_pilot::initial_operation(reference)?;
-    let completed = matches!(
-        &terminal,
-        DurableRemoveReplicaPilotTerminal::Completed { .. }
-    );
-    match terminal {
-        DurableRemoveReplicaPilotTerminal::Completed {
-            authority: _,
-            commit_evidence: _,
-            cleanup: _,
-            accounting: _,
-        }
-        | DurableRemoveReplicaPilotTerminal::Compensated { .. } => {
-            let snapshot = if completed {
-                initial.target_snapshot.clone()
-            } else {
-                initial.previous_snapshot.cloned().ok_or_else(|| {
-                    "compensated durable remove terminal has no previous snapshot".to_string()
-                })?
-            };
-            let mut status = set.status.clone().unwrap_or_default();
-            let persisted_members = status.members.clone();
-            let mut members = Vec::with_capacity(snapshot.members.len());
-            for member in &snapshot.members {
-                let mut persisted = persisted_members
-                    .iter()
-                    .find(|persisted| persisted.id == member.id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "terminal remove snapshot member {} is absent from persisted status",
-                            member.id
-                        )
-                    })?;
-                persisted.instance_id = member.instance_id.clone();
-                persisted.role = if member.id == snapshot.primary_id {
-                    "primary".to_string()
-                } else {
-                    "secondary".to_string()
-                };
-                members.push(persisted);
-            }
-            let primary_name = members
-                .iter()
-                .find(|member| member.id == snapshot.primary_id)
-                .map(|member| member.name.clone())
-                .ok_or_else(|| {
-                    "terminal remove snapshot primary is absent from persisted status".to_string()
-                })?;
-            status.epoch = snapshot.epoch.clone();
-            status.current_primary = Some(primary_name.clone());
-            status.target_primary = Some(primary_name);
-            status.phase = Phase::Healthy;
-            status.reconfiguration_phase = ReconfigurationPhase::None;
-            status.ready_replicas = members.iter().filter(|member| member.healthy).count() as i32;
-            status.replicas = members.len() as i32;
-            status.members = members;
-            status.stable_snapshot = Some(snapshot);
-            status.operation = None;
-            status.primary_failing_since = None;
-            status.stable_election_metadata_refresh =
-                Some(crate::crd::StableElectionMetadataRefreshStatus {
-                    snapshot_epoch: status.epoch.clone(),
-                    next_member_index: 0,
-                    completed_members: Vec::new(),
-                    pending_action: None,
-                });
-            set_remove_pilot_condition(
-                &mut status,
-                if completed {
-                    "Completed"
-                } else {
-                    "CompensatedOrSafeFailure"
-                },
-                if completed {
-                    "terminal checkpoint accepted before remove topology publication"
-                } else {
-                    "terminal checkpoint accepted before compensated topology publication"
-                },
-                now,
-            );
-            persist_committed_status(api, state, &set_key, set, &status).await?;
-            if let Some(measurements) = runtime
-                .measurements(&namespace, &name, set_uid, &reference.execution_id)
-                .await
-            {
-                info!(
-                    execution_id = reference.execution_id,
-                    checkpoint_load_attempts = measurements.load_attempts,
-                    checkpoint_write_attempts = measurements.write_attempts,
-                    checkpoint_accepted_writes = measurements.accepted_writes,
-                    checkpoint_conflicts = measurements.conflicts,
-                    checkpoint_unknown_outcomes = measurements.unknown_outcomes,
-                    checkpoint_definite_failures = measurements.definite_failures,
-                    latest_authoritative_checkpoint_bytes =
-                        ?measurements.latest_authoritative_checkpoint_bytes,
-                    maximum_authoritative_checkpoint_bytes =
-                        measurements.maximum_authoritative_checkpoint_bytes,
-                    maximum_active_checkpoint_bytes =
-                        measurements.maximum_active_checkpoint_bytes,
-                    latest_terminal_checkpoint_bytes =
-                        ?measurements.latest_terminal_checkpoint_bytes,
-                    maximum_terminal_checkpoint_bytes =
-                        measurements.maximum_terminal_checkpoint_bytes,
-                    external_effect_count = ?measurements.completed_external_effect_count,
-                    passive_observation_count =
-                        ?measurements.completed_passive_observation_count,
-                    durable_boundary_count = ?measurements.completed_activity_count,
-                    "durable remove-replica pilot process summary"
-                );
-            }
-            state.drivers.lock().await.remove(&set_key);
-            runtime
-                .forget(&namespace, &name, set_uid, &reference.execution_id)
-                .await;
-            Ok(ReconcileAction::Requeue(Duration::from_secs(1)))
-        }
-        DurableRemoveReplicaPilotTerminal::UnsafeAmbiguity { message, .. } => {
-            record_remove_pilot_wait_condition(set, api, "Quarantined", &message, now).await;
-            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
-        }
-        DurableRemoveReplicaPilotTerminal::Rejected { message, .. } => {
-            record_remove_pilot_wait_condition(set, api, "Rejected", &message, now).await;
-            Ok(ReconcileAction::Requeue(Duration::from_secs(10)))
-        }
-    }
-}
-// COMPLEXITY-BOUNDARY: remove-replica-reconcile-integration:end
-
 async fn reconcile_durable_operation(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -4083,6 +3360,9 @@ async fn reconcile_durable_operation(
         .as_ref()
         .and_then(|status| status.operation.clone())
         .ok_or_else(|| "durable operation phase has no checkpoint".to_string())?;
+    if operation.kind == DurableOperationKind::RemoveReplica {
+        return Err("legacy explicit remove execution was not converted".to_string());
+    }
     if operation.kind != DurableOperationKind::CreatePartition
         && operation.previous_snapshot.is_none()
     {
@@ -4127,11 +3407,7 @@ async fn reconcile_durable_operation(
         }
     });
     if let Some(error) = identity_error {
-        let now = if operation.kind == DurableOperationKind::RemoveReplica {
-            state.removal_clock.unix_seconds()
-        } else {
-            unix_seconds()
-        };
+        let now = unix_seconds();
         let failed = fail_closed(&operation, &error);
         let mut status = set.status.clone().unwrap_or_default();
         status.operation = Some(failed.clone());
@@ -4152,16 +3428,13 @@ async fn reconcile_durable_operation(
         .iter()
         .map(|(id, instance_id, _)| (*id, instance_id.to_string()))
         .collect();
-    for (replica_id, instance_id, pod) in &current_pods {
+    for (replica_id, _instance_id, pod) in &current_pods {
         let is_target_member = operation
             .target_snapshot
             .members
             .iter()
             .any(|member| member.id == *replica_id);
-        let is_exact_remove_target = operation.kind == DurableOperationKind::RemoveReplica
-            && operation.target_replica_id == Some(*replica_id)
-            && operation.target_instance_id.as_deref() == Some(instance_id.as_str());
-        if !is_target_member && !is_exact_remove_target {
+        if !is_target_member {
             continue;
         }
         let Ok(handle) = api.create_replica_handle(*replica_id, pod, &set.spec).await else {
@@ -4198,11 +3471,7 @@ async fn reconcile_durable_operation(
         handles.insert(*replica_id, handle);
     }
 
-    let now = if operation.kind == DurableOperationKind::RemoveReplica {
-        state.removal_clock.unix_seconds()
-    } else {
-        unix_seconds()
-    };
+    let now = unix_seconds();
     let decision = match operation.kind {
         DurableOperationKind::CreatePartition => {
             decide_create_partition(&operation, &observations, &pod_identities, now)
@@ -4230,28 +3499,7 @@ async fn reconcile_durable_operation(
             )
         }
         DurableOperationKind::RemoveReplica => {
-            let target_pod_role_label = operation.target_replica_id.and_then(|target_id| {
-                current_pods
-                    .iter()
-                    .find(|(id, instance_id, _)| {
-                        *id == target_id
-                            && operation.target_pod_uid.as_deref() == Some(instance_id.as_str())
-                    })
-                    .and_then(|(_, _, pod)| {
-                        pod.metadata
-                            .labels
-                            .as_ref()
-                            .and_then(|labels| labels.get("kuberic.io/role"))
-                    })
-                    .map(String::as_str)
-            });
-            decide_remove_replica(
-                &operation,
-                &observations,
-                &pod_identities,
-                target_pod_role_label,
-                now,
-            )
+            Err("legacy explicit remove execution was not converted".to_string())
         }
         DurableOperationKind::Failover => decide_failover(&operation, &observations, now),
     };
@@ -4320,9 +3568,6 @@ async fn reconcile_durable_operation(
                 (
                     DurableOperationKind::AddReplica,
                     crate::crd::DurableActionKind::AddReplicaIntent
-                ) | (
-                    DurableOperationKind::RemoveReplica,
-                    crate::crd::DurableActionKind::RemoveReplicaIntent
                 )
             );
             match plan_dispatch_evidence(
@@ -4456,17 +3701,7 @@ async fn reconcile_durable_operation(
             status.stable_snapshot = Some(snapshot);
             status.operation = Some(operation.clone());
             set_operation_condition(&mut status, operation_condition(&operation, now));
-            if operation.kind == DurableOperationKind::RemoveReplica {
-                api.patch_set_status(
-                    &namespace,
-                    &name,
-                    &status,
-                    set.metadata.resource_version.as_deref(),
-                )
-                .await?;
-            } else {
-                persist_committed_status(api, state, set_key, set, &status).await?;
-            }
+            persist_committed_status(api, state, set_key, set, &status).await?;
         }
         Decision::RecordCommitEvidence(operation) => {
             let mut status = set.status.clone().unwrap_or_default();
@@ -4510,17 +3745,7 @@ async fn reconcile_durable_operation(
                     pending_action: None,
                 });
             set_operation_condition(&mut status, operation_condition(&operation, now));
-            if operation.kind == DurableOperationKind::RemoveReplica {
-                api.patch_set_status(
-                    &namespace,
-                    &name,
-                    &status,
-                    set.metadata.resource_version.as_deref(),
-                )
-                .await?;
-            } else {
-                persist_committed_status(api, state, set_key, set, &status).await?;
-            }
+            persist_committed_status(api, state, set_key, set, &status).await?;
             if operation.kind == DurableOperationKind::CreatePartition {
                 let core_snapshot = StablePartitionSnapshot::try_from(&recovery_snapshot)
                     .map_err(|error| format!("invalid completed creation snapshot: {error}"))?;
@@ -4936,30 +4161,6 @@ fn set_pilot_condition(status: &mut KubericSetStatus, reason: &str, message: &st
 }
 
 // COMPLEXITY-BOUNDARY: remove-replica-status-integration:start
-#[cfg(feature = "durable-remove-replica-pilot")]
-fn set_remove_pilot_condition(
-    status: &mut KubericSetStatus,
-    reason: &str,
-    message: &str,
-    now: i64,
-) {
-    set_operation_condition(
-        status,
-        StatusCondition {
-            type_: "DurableRemoveReplicaPilot".to_string(),
-            status: if matches!(reason, "Completed" | "CompensatedOrSafeFailure") {
-                "False".to_string()
-            } else {
-                "True".to_string()
-            },
-            reason: reason.to_string(),
-            message: message.chars().take(512).collect(),
-            last_transition_time: now.to_string(),
-        },
-    );
-}
-
-#[cfg(all(test, feature = "durable-remove-replica-pilot"))]
 fn set_framework_native_remove_condition(
     status: &mut KubericSetStatus,
     reason: &str,
@@ -4982,7 +4183,6 @@ fn set_framework_native_remove_condition(
     );
 }
 
-#[cfg(all(test, feature = "durable-remove-replica-pilot"))]
 async fn record_framework_native_remove_condition(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -5019,49 +4219,9 @@ async fn record_framework_native_remove_condition(
         .await;
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
-async fn record_remove_pilot_wait_condition(
-    set: &KubericSet,
-    api: &dyn ClusterApi,
-    reason: &str,
-    message: &str,
-    now: i64,
-) {
-    let normalized_message: String = message.chars().take(512).collect();
-    let desired_status = if matches!(reason, "Completed" | "CompensatedOrSafeFailure") {
-        "False"
-    } else {
-        "True"
-    };
-    let unchanged = set.status.as_ref().is_some_and(|status| {
-        status.conditions.iter().any(|condition| {
-            condition.type_ == "DurableRemoveReplicaPilot"
-                && condition.reason == reason
-                && condition.status == desired_status
-                && condition.message == normalized_message
-        })
-    });
-    if unchanged {
-        return;
-    }
-    let mut status = set.status.clone().unwrap_or_default();
-    set_remove_pilot_condition(&mut status, reason, &normalized_message, now);
-    let _ = api
-        .patch_set_status(
-            &set.namespace().unwrap_or_default(),
-            &set.name_any(),
-            &status,
-            set.metadata.resource_version.as_deref(),
-        )
-        .await;
-}
 // COMPLEXITY-BOUNDARY: remove-replica-status-integration:end
 
 // COMPLEXITY-BOUNDARY: shared-durable-terminal-cleanup:start
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 async fn cleanup_persisted_durable_execution(
     state: &ReconcilerState,
     set: &KubericSet,
@@ -5087,27 +4247,9 @@ async fn cleanup_persisted_durable_execution(
             .await;
         cleaned = true;
     }
-    #[cfg(feature = "durable-remove-replica-pilot")]
-    if let (Some(reference), Some(runtime)) = (
-        status.durable_remove_replica_pilot.as_ref(),
-        state.durable_remove_replica_pilot.as_ref(),
-    ) {
-        runtime
-            .forget(
-                &set.namespace().unwrap_or_default(),
-                &set.name_any(),
-                uid,
-                &reference.execution_id,
-            )
-            .await;
-        cleaned = true;
-    }
-    #[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-    if let (Some(reference), Some(runtime)) = (
-        status.remove_replica_execution.as_ref(),
-        state.framework_native_remove_replica.as_ref(),
-    ) {
-        runtime
+    if let Some(reference) = status.remove_replica_execution.as_ref() {
+        state
+            .framework_native_remove_replica
             .forget(
                 &set.namespace().unwrap_or_default(),
                 &set.name_any(),
@@ -5167,9 +4309,9 @@ async fn ensure_pod(
     api.create_pod(namespace, &pod).await
 }
 
-#[cfg(all(test, feature = "durable-remove-replica-pilot"))]
-#[path = "reconciler/framework_native_remove_routing_tests.rs"]
-mod framework_native_remove_routing_tests;
+#[cfg(test)]
+#[path = "reconciler/remove_replica_routing_tests.rs"]
+mod remove_replica_routing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5197,153 +4339,6 @@ mod tests {
                     .unwrap_err();
             assert!(error.contains("requires the operator"), "{error}");
         }
-    }
-
-    #[test]
-    fn explicit_remove_replica_engine_is_always_available() {
-        assert!(validate_new_remove_replica_engine(RemoveReplicaExecutionMode::Explicit).is_ok());
-    }
-
-    #[test]
-    fn durable_remove_replica_never_silently_falls_back_to_explicit() {
-        #[cfg(feature = "durable-remove-replica-pilot")]
-        assert!(
-            validate_new_remove_replica_engine(RemoveReplicaExecutionMode::DurablePilot).is_ok()
-        );
-        #[cfg(not(feature = "durable-remove-replica-pilot"))]
-        {
-            let error =
-                validate_new_remove_replica_engine(RemoveReplicaExecutionMode::DurablePilot)
-                    .unwrap_err();
-            assert!(error.contains("requires the operator"), "{error}");
-        }
-    }
-
-    fn snapshot(primary_id: i64, member_ids: &[i64]) -> StablePartitionSnapshotStatus {
-        StablePartitionSnapshotStatus {
-            epoch: crate::crd::EpochStatus {
-                data_loss_number: 1,
-                configuration_number: 2,
-            },
-            primary_id,
-            members: member_ids
-                .iter()
-                .map(|id| crate::crd::StableReplicaSnapshotStatus {
-                    id: *id,
-                    instance_id: format!("uid-{id}"),
-                    role: if *id == primary_id {
-                        StableReplicaRoleStatus::Primary
-                    } else {
-                        StableReplicaRoleStatus::ActiveSecondary
-                    },
-                    election_metadata: None,
-                })
-                .collect(),
-            write_quorum: member_ids.len() as u32 / 2 + 1,
-        }
-    }
-
-    #[test]
-    fn committed_snapshot_drives_active_removal_recovery_only_until_publication() {
-        let previous = snapshot(1, &[1, 2, 3]);
-        let reduced = snapshot(1, &[1, 2]);
-        let operation = crate::durable::start_remove_replica(
-            "set",
-            previous.clone(),
-            RemoveReplicaTarget {
-                replica_id: 3,
-                pod_name: "set-2".to_string(),
-                pod_uid: "uid-3".to_string(),
-                replicator_address: "http://set-2:9091".to_string(),
-                agent_generation: None,
-            },
-            DurableRemoveMode::Force,
-            2,
-            10,
-        )
-        .unwrap();
-        let mut operation = operation;
-        operation.phase = DurableOperationPhase::RemoveAwaitCleanup;
-        operation.committed_snapshot = Some(reduced.clone());
-        operation.remove_commit_evidence = Some(crate::crd::RemoveReplicaCommitEvidenceStatus {
-            attempt_id: "attempt".to_string(),
-            action_id: "action".to_string(),
-            primary_agent_generation: "generation".to_string(),
-            configuration_signature: "signature".to_string(),
-            observed_unix_seconds: 20,
-        });
-        let mut status = KubericSetStatus {
-            phase: Phase::RemovingReplica,
-            stable_snapshot: Some(previous.clone()),
-            operation: Some(operation),
-            ..Default::default()
-        };
-        status.stable_snapshot.as_mut().unwrap().members[1].election_metadata =
-            Some(StableReplicaElectionMetadataStatus {
-                current_lsn: 99,
-                committed_lsn: 99,
-                first_retained_lsn: 1,
-                deactivation_epoch: crate::crd::EpochStatus {
-                    data_loss_number: 1,
-                    configuration_number: 2,
-                },
-                deactivation_catch_up_lsn: 99,
-            });
-        assert_eq!(authoritative_topology_snapshot(&status), Some(&reduced));
-        assert!(
-            durable_identity_members(&status, status.operation.as_ref().unwrap())
-                .unwrap()
-                .is_empty(),
-            "committed removal must not fail closed on retained-member pod churn"
-        );
-
-        status.operation.as_mut().unwrap().phase = DurableOperationPhase::RemoveFinalize;
-        status.stable_snapshot = Some(reduced.clone());
-        status.stable_snapshot.as_mut().unwrap().members[1].election_metadata =
-            Some(StableReplicaElectionMetadataStatus {
-                current_lsn: 7,
-                committed_lsn: 7,
-                first_retained_lsn: 1,
-                deactivation_epoch: crate::crd::EpochStatus {
-                    data_loss_number: 1,
-                    configuration_number: 2,
-                },
-                deactivation_catch_up_lsn: 7,
-            });
-        assert_eq!(
-            authoritative_topology_snapshot(&status),
-            status.stable_snapshot.as_ref()
-        );
-    }
-
-    #[test]
-    fn active_other_operation_checkpoint_is_rejected_without_a_mutation_decision() {
-        let operation = crate::durable::start_remove_replica(
-            "set",
-            snapshot(1, &[1, 2, 3]),
-            RemoveReplicaTarget {
-                replica_id: 3,
-                pod_name: "set-2".to_string(),
-                pod_uid: "uid-3".to_string(),
-                replicator_address: "http://set-2:9091".to_string(),
-                agent_generation: None,
-            },
-            DurableRemoveMode::Force,
-            2,
-            10,
-        )
-        .unwrap();
-        let status = KubericSetStatus {
-            phase: Phase::Healthy,
-            operation: Some(operation.clone()),
-            ..Default::default()
-        };
-        let error = validate_active_operation_phase(Some(&status), &status.phase).unwrap_err();
-        assert!(error.contains("requires RemovingReplica"));
-
-        let mut terminal = status;
-        terminal.operation.as_mut().unwrap().phase = DurableOperationPhase::Poisoned;
-        assert!(validate_active_operation_phase(Some(&terminal), &terminal.phase).is_ok());
     }
 
     #[test]

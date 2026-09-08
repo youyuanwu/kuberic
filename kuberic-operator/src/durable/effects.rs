@@ -5,10 +5,6 @@
 //! `ReplicaHandle`; `ReplicaAgent` remains the admission, fencing, and replay
 //! owner.
 
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 use std::collections::BTreeMap;
 
 use kuberic_core::driver::ReplicaHandle;
@@ -20,10 +16,6 @@ use kuberic_core::types::{
 };
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 use crate::cluster_api::ClusterApi;
 #[cfg(feature = "durable-switchover-pilot")]
 use crate::crd::DurableOperationPhase;
@@ -33,11 +25,6 @@ use crate::crd::{DurableOperationStatus, EpochStatus, PendingActionStatus};
 use super::pilot::{
     DurableSwitchoverState, DurableSwitchoverStepResult, PilotActivityKind, PilotAdapterDecision,
     PilotPermitGuard,
-};
-#[cfg(feature = "durable-remove-replica-pilot")]
-use super::remove_replica_pilot::{
-    DurableRemoveReplicaState, DurableRemoveReplicaStepResult, RemoveReplicaActivityCompletion,
-    RemoveReplicaActivityKind, RemoveReplicaAdapterDecision, RemoveReplicaPermitGuard,
 };
 #[cfg(feature = "durable-switchover-pilot")]
 use super::workflow_host::DurablePermitGuard;
@@ -205,10 +192,6 @@ pub(crate) enum DispatchEvidencePlan {
     WaitForSupportedProtocol,
 }
 
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableEffectPreparationError {
     WaitForExactIncarnation,
@@ -219,10 +202,6 @@ pub enum DurableEffectPreparationError {
 #[cfg(feature = "durable-switchover-pilot")]
 pub type PilotEffectPreparationError = DurableEffectPreparationError;
 
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 pub fn prepare_replica_effect_command(
     pending: &PendingActionStatus,
     observed: &ReplicaStatusInfo,
@@ -238,7 +217,6 @@ pub fn prepare_replica_effect_command(
     )
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub fn prepare_lifecycle_replica_effect_command(
     pending: &PendingActionStatus,
     observed: &ReplicaStatusInfo,
@@ -254,10 +232,6 @@ pub fn prepare_lifecycle_replica_effect_command(
     )
 }
 
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 fn prepare_replica_effect_command_with_lifecycle_support(
     pending: &PendingActionStatus,
     observed: &ReplicaStatusInfo,
@@ -378,10 +352,6 @@ pub fn validate_pilot_replica_action_kind(
     ) && replica_action_matches_kind(kind, action)
 }
 
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 pub fn replica_action_matches_kind(
     kind: crate::crd::DurableActionKind,
     action: &DurableReplicaAction,
@@ -600,10 +570,6 @@ pub async fn execute_replica_command(
     .await
 }
 
-#[cfg(any(
-    feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
-))]
 pub async fn execute_label_command(
     api: &dyn ClusterApi,
     namespace: &str,
@@ -827,7 +793,6 @@ pub(crate) fn generation_change_proves_no_admission(
 // COMPLEXITY-BOUNDARY: shared-operator-effect-adapters:end
 
 // COMPLEXITY-BOUNDARY: remove-replica-effect-integration:start
-#[cfg(feature = "durable-remove-replica-pilot")]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeleteEffectCommand {
@@ -837,7 +802,6 @@ pub struct DeleteEffectCommand {
     pub identity_signature: String,
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 impl DeleteEffectCommand {
     pub fn new(target_id: ReplicaId, pod_name: String, expected_uid: String) -> Self {
         let identity_signature = format!("{target_id}@{expected_uid}:{pod_name}:delete");
@@ -858,7 +822,6 @@ impl DeleteEffectCommand {
     }
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub fn validate_remove_replica_action_kind(
     kind: crate::crd::DurableActionKind,
     action: &DurableReplicaAction,
@@ -868,7 +831,6 @@ pub fn validate_remove_replica_action_kind(
         && replica_action_matches_kind(kind, action)
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub fn validate_remove_replica_dispatch_authority(
     operation: &DurableOperationStatus,
     observed: &ReplicaStatusInfo,
@@ -898,7 +860,6 @@ pub fn validate_remove_replica_dispatch_authority(
         && action.signature() == intent.input_signature
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub fn prepare_remove_label_effect_command(
     operation: &DurableOperationStatus,
     target_id: ReplicaId,
@@ -929,7 +890,6 @@ pub fn prepare_remove_label_effect_command(
     ))
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub fn prepare_remove_delete_effect_command(
     operation: &DurableOperationStatus,
     pod_name: &str,
@@ -955,7 +915,6 @@ pub fn prepare_remove_delete_effect_command(
     ))
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub fn remove_label_postcondition_satisfied(
     command: &LabelEffectCommand,
     pod_identities: &super::OperationPodIdentities,
@@ -967,7 +926,6 @@ pub fn remove_label_postcondition_satisfied(
         || role_label == Some(command.role.as_str())
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub fn remove_delete_postcondition_satisfied(
     command: &DeleteEffectCommand,
     pod_identities: &super::OperationPodIdentities,
@@ -977,34 +935,6 @@ pub fn remove_delete_postcondition_satisfied(
         .is_none_or(|uid| uid != &command.expected_uid)
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
-pub fn resolve_quarantined_remove_label_effect<T>(
-    command: &LabelEffectCommand,
-    pod_identities: &super::OperationPodIdentities,
-    role_label: Option<&str>,
-    observed: impl FnOnce() -> T,
-) -> DurableEffectBridgeOutcome<T> {
-    if remove_label_postcondition_satisfied(command, pod_identities, role_label) {
-        DurableEffectBridgeOutcome::Observe(observed())
-    } else {
-        DurableEffectBridgeOutcome::AwaitEvidence
-    }
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-pub fn resolve_quarantined_remove_delete_effect<T>(
-    command: &DeleteEffectCommand,
-    pod_identities: &super::OperationPodIdentities,
-    observed: impl FnOnce() -> T,
-) -> DurableEffectBridgeOutcome<T> {
-    if remove_delete_postcondition_satisfied(command, pod_identities) {
-        DurableEffectBridgeOutcome::Observe(observed())
-    } else {
-        DurableEffectBridgeOutcome::AwaitEvidence
-    }
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
 pub async fn execute_delete_command(
     api: &dyn ClusterApi,
     namespace: &str,
@@ -1015,142 +945,6 @@ pub async fn execute_delete_command(
         .await;
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
-pub type RemoveReplicaEffectBridgeOutcome =
-    DurableEffectBridgeOutcome<Box<DurableRemoveReplicaStepResult>>;
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-#[allow(clippy::too_many_arguments)]
-pub async fn bridge_remove_replica_permitted_step(
-    guard: &mut RemoveReplicaPermitGuard,
-    operation: &DurableOperationStatus,
-    prepared: &RemoveReplicaActivityKind,
-    accepted_activity: &kuberic_durable_execution::LogicalActivityId,
-    accepted_attempt: kuberic_durable_execution::AttemptId,
-    observations: &OperationObservations,
-    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
-    api: &dyn ClusterApi,
-    namespace: &str,
-) -> Result<RemoveReplicaEffectBridgeOutcome, String> {
-    let _permit = guard.consume_for(operation, prepared, accepted_activity, accepted_attempt)?;
-    match prepared {
-        RemoveReplicaActivityKind::PassiveObservation => Err(
-            "passive durable remove observation unexpectedly reached the effect bridge".to_string(),
-        ),
-        RemoveReplicaActivityKind::PreparedReplica { command } => {
-            let Some(handle) = handles.get(&command.target_id) else {
-                return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
-            };
-            if handle.instance_id().as_str() != command.target_instance_id {
-                return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
-            }
-            match execute_replica_command(handle.as_ref(), command).await {
-                Ok(()) => Ok(DurableEffectBridgeOutcome::Exposed),
-                Err(error) => match classify_dispatch_failure(&error) {
-                    DispatchFailureDisposition::ProvenNoAdmission => {
-                        let next = operation_after_dispatch_error(operation, &error);
-                        let result = DurableRemoveReplicaStepResult::ProvenNoAdmission {
-                            operation: DurableRemoveReplicaState::from_operation(&next),
-                            action_id: command.action_id.clone(),
-                            redelivery: 1,
-                        };
-                        if dispatch_rejection_requires_refresh(&error) {
-                            Ok(DurableEffectBridgeOutcome::ObserveAfterFenceRefresh(
-                                Box::new(result),
-                            ))
-                        } else {
-                            Ok(DurableEffectBridgeOutcome::Observe(Box::new(result)))
-                        }
-                    }
-                    DispatchFailureDisposition::DefiniteFailure
-                        if matches!(error, KubericError::RemoteAgentConflict(_)) =>
-                    {
-                        let next =
-                            super::remove_replica::invalid_removal(operation, &error.to_string());
-                        Ok(DurableEffectBridgeOutcome::Observe(Box::new(
-                            DurableRemoveReplicaStepResult::Advance {
-                                operation: DurableRemoveReplicaState::from_operation(&next),
-                                completion: RemoveReplicaActivityCompletion::ExternalEffect,
-                            },
-                        )))
-                    }
-                    DispatchFailureDisposition::DefiniteFailure
-                    | DispatchFailureDisposition::Unknown => {
-                        Ok(DurableEffectBridgeOutcome::Exposed)
-                    }
-                },
-            }
-        }
-        RemoveReplicaActivityKind::PreparedLabel { command } => {
-            if observations
-                .get(&command.target_id)
-                .is_some_and(|observed| {
-                    observed.status.instance_id.as_str() != command.expected_uid
-                        || observed.pod_name != command.pod_name
-                })
-            {
-                return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
-            }
-            execute_label_command(api, namespace, command).await;
-            Ok(DurableEffectBridgeOutcome::Exposed)
-        }
-        RemoveReplicaActivityKind::PreparedDelete { command } => {
-            execute_delete_command(api, namespace, command).await;
-            Ok(DurableEffectBridgeOutcome::Exposed)
-        }
-    }
-}
-
-#[cfg(feature = "durable-remove-replica-pilot")]
-pub fn resolve_remove_replica_quarantine(
-    operation: &DurableOperationStatus,
-    prepared: &RemoveReplicaActivityKind,
-    decision: RemoveReplicaAdapterDecision,
-    observations: &OperationObservations,
-) -> Result<RemoveReplicaEffectBridgeOutcome, String> {
-    let decision = match decision {
-        RemoveReplicaAdapterDecision::Advance(next) => {
-            return Ok(DurableEffectBridgeOutcome::Observe(Box::new(
-                DurableRemoveReplicaStepResult::Advance {
-                    operation: *next,
-                    completion: prepared.completion_class(),
-                },
-            )));
-        }
-        RemoveReplicaAdapterDecision::AwaitEvidence => {
-            return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
-        }
-        RemoveReplicaAdapterDecision::External(decision) => decision,
-    };
-    let RemoveReplicaActivityKind::PreparedReplica { command } = prepared else {
-        return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
-    };
-    let super::Decision::Execute {
-        target_id,
-        action_id,
-        action,
-    } = *decision
-    else {
-        return Ok(DurableEffectBridgeOutcome::AwaitEvidence);
-    };
-    resolve_quarantined_replica_effect(
-        operation,
-        command,
-        QuarantinedReplicaDecision {
-            target_id,
-            action_id,
-            action,
-        },
-        observations,
-        |next, action_id| {
-            Box::new(DurableRemoveReplicaStepResult::ProvenNoAdmission {
-                operation: DurableRemoveReplicaState::from_operation(&next),
-                action_id,
-                redelivery: 1,
-            })
-        },
-    )
-}
 // COMPLEXITY-BOUNDARY: remove-replica-effect-integration:end
 
 // COMPLEXITY-BOUNDARY: switchover-effect-recovery:start

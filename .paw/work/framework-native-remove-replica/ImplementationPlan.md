@@ -171,7 +171,7 @@ pull requests. This planning activity creates no commit.
 - [x] **Phase 2: Switchover Runner Adoption** - Move switchover onto the shared runner without changing its operation-specific behavior.
 - [x] **Phase 3: Compact Native Remove Contract** - Build the versioned compact remove workflow, explicit incompatibility handling, and bounded admission.
 - [x] **Phase 4: Native Integration and Safety Traceability** - Integrate remove with the runner and establish passing replacement coverage for every deletion-gate invariant.
-- [ ] **Phase 5: Production Graduation and Legacy Removal** - Make native remove the only production path and delete explicit/pilot surfaces after the safety gate passes.
+- [x] **Phase 5: Production Graduation and Legacy Removal** - Make native remove the only production path and delete explicit/pilot surfaces after the safety gate passes.
 - [ ] **Phase 6: Measurements and Full Validation** - Lock semantic/byte measurements, update CI, and run complete local plus isolated-Kind validation.
 - [ ] **Phase 7: Documentation** - Produce the as-built record and update all project documentation for the production contract.
 

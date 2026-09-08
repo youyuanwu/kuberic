@@ -403,19 +403,7 @@ Generic activity handlers/registries, a second activity-failure lifecycle,
 passive convergence, tracing/inspection, timers, retries, parallelism, generic
 lifecycle APIs, queries, external events, child workflows, workers, queues,
 leases, and distributed runtime ownership are excluded. So are migrations,
-upgrade guarantees, broad rollout, and production diagnostics. The
-feature-gated switchover and remove-replica pilots integrate typed calls and
-operator-owned effect adapters. Both Cargo features are default-off, and both
-workflows retain their explicit implementations as the runtime default. Neither
-changes `ReplicaAgent` or the gRPC protocol.
-
-The second workflow did not demonstrate source-cost amortization. The explicit
-remove baseline is 1,611 executable lines / 213 decision points; the complete
-kernel workflow is 1,632/162; remove-specific operator integration is 1,114/81;
-and shared infrastructure grew by 374/3. The resulting marginal cost is
-3,120/246, or 1.9367 times the explicit lines and 1.1549 times the explicit
-decisions. Shared growth is 30.96%/2.73%, so both dimensions classify as
-negative. The isolated async workflow body is 138/18, but that scope is not
-representative once workflow-specific support and operator integration are
-charged. The full measured result and boundary are recorded in the
-[Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
+upgrade guarantees, broad rollout, and production diagnostics. Framework-native
+remove-replica integrates typed calls and operator-owned effect adapters by
+default, while switchover remains optional. Neither changes `ReplicaAgent` or
+the gRPC protocol.

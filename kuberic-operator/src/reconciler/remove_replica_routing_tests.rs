@@ -391,7 +391,6 @@ fn set(reference: RemoveReplicaExecution) -> KubericSet {
             failover_delay: 0,
             switchover_delay: 30,
             switchover_execution_mode: Default::default(),
-            remove_replica_execution_mode: Default::default(),
             port: 8080,
             control_port: 9090,
             data_port: 9091,
@@ -437,7 +436,7 @@ async fn store_completed_terminal(
     store: &InMemoryCheckpointStore,
     reference: &RemoveReplicaExecution,
 ) {
-    let initial = reconstruct_initial_operation(&reference.input).unwrap();
+    let initial = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
     let terminal = RemoveReplicaTerminal::Completed {
         commit_evidence: RemoveReplicaCommitEvidenceStatus {
             attempt_id: format!("{}:attempt-1", initial.operation_id),
@@ -480,11 +479,11 @@ async fn store_completed_terminal(
 }
 
 #[tokio::test]
-async fn framework_native_remove_replica_private_route_publishes_reloaded_terminal() {
+async fn framework_native_remove_replica_route_publishes_reloaded_terminal() {
     let reference = reference();
     let store = InMemoryCheckpointStore::new();
     store_completed_terminal(&store, &reference).await;
-    let state = ReconcilerState::with_framework_native_remove_store(store);
+    let state = ReconcilerState::with_remove_replica_store(store);
     let api = RoutingApi::new(vec![pod(1, "one", "primary"), pod(2, "two", "secondary")]);
 
     reconcile_set(&set(reference.clone()), &api, &state)
@@ -505,11 +504,11 @@ async fn framework_native_remove_replica_private_route_publishes_reloaded_termin
 }
 
 #[tokio::test]
-async fn framework_native_remove_replica_private_route_preserves_terminal_before_status_ordering() {
+async fn framework_native_remove_replica_route_preserves_terminal_before_status_ordering() {
     let reference = reference();
     let store = InMemoryCheckpointStore::new();
     store_completed_terminal(&store, &reference).await;
-    let state = ReconcilerState::with_framework_native_remove_store(store.clone());
+    let state = ReconcilerState::with_remove_replica_store(store.clone());
     let api = RoutingApi::new(vec![pod(1, "one", "primary"), pod(2, "two", "secondary")]);
     api.fail_next_status_patch();
 
@@ -520,7 +519,7 @@ async fn framework_native_remove_replica_private_route_preserves_terminal_before
     assert_eq!(error, "resource version conflict");
     assert!(api.last_status().is_none());
 
-    let restarted = ReconcilerState::with_framework_native_remove_store(store);
+    let restarted = ReconcilerState::with_remove_replica_store(store);
     reconcile_set(&set(reference), &api, &restarted)
         .await
         .unwrap();
@@ -528,10 +527,10 @@ async fn framework_native_remove_replica_private_route_preserves_terminal_before
 }
 
 #[tokio::test]
-async fn framework_native_remove_replica_private_route_records_incompatible_contract() {
+async fn framework_native_remove_replica_route_records_incompatible_contract() {
     let mut reference = reference();
     reference.contract_version += 1;
-    let state = ReconcilerState::with_framework_native_remove_store(InMemoryCheckpointStore::new());
+    let state = ReconcilerState::with_remove_replica_store(InMemoryCheckpointStore::new());
     let api = RoutingApi::new(vec![
         pod(1, "one", "primary"),
         pod(2, "two", "secondary"),
@@ -550,9 +549,9 @@ async fn framework_native_remove_replica_private_route_records_incompatible_cont
 }
 
 #[tokio::test]
-async fn framework_native_remove_replica_private_route_primary_gap_has_no_status_churn() {
+async fn framework_native_remove_replica_route_primary_gap_has_no_status_churn() {
     let reference = reference();
-    let state = ReconcilerState::with_framework_native_remove_store(InMemoryCheckpointStore::new());
+    let state = ReconcilerState::with_remove_replica_store(InMemoryCheckpointStore::new());
     let api = RoutingApi::new(vec![
         pod(1, "one", "primary"),
         pod(2, "two", "secondary"),
@@ -584,9 +583,9 @@ async fn framework_native_remove_replica_private_route_primary_gap_has_no_status
 }
 
 #[tokio::test]
-async fn framework_native_remove_replica_private_route_target_gap_has_no_status_churn() {
+async fn framework_native_remove_replica_route_target_gap_has_no_status_churn() {
     let reference = reference();
-    let state = ReconcilerState::with_framework_native_remove_store(InMemoryCheckpointStore::new());
+    let state = ReconcilerState::with_remove_replica_store(InMemoryCheckpointStore::new());
     let api = RoutingApi::new(vec![
         pod(1, "one", "primary"),
         pod(2, "two", "secondary"),
@@ -618,9 +617,9 @@ async fn framework_native_remove_replica_private_route_target_gap_has_no_status_
 }
 
 #[tokio::test]
-async fn framework_native_remove_replica_private_route_isolates_malformed_agent_status() {
+async fn framework_native_remove_replica_route_isolates_malformed_agent_status() {
     let reference = reference();
-    let state = ReconcilerState::with_framework_native_remove_store(InMemoryCheckpointStore::new());
+    let state = ReconcilerState::with_remove_replica_store(InMemoryCheckpointStore::new());
     let api = RoutingApi::new(vec![
         pod(1, "one", "primary"),
         pod(2, "two", "secondary"),
