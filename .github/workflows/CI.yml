@@ -14,6 +14,7 @@ jobs:
     env:
       KIND_CLUSTER_NAME: kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
       KUBECONFIG: ${{ runner.temp }}/kuberic-kind-kubeconfig
+      KUBE_CONTEXT: kind-kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       matrix:
         os: [ ubuntu-latest ]
@@ -84,9 +85,24 @@ jobs:
         cluster_name: ${{ env.KIND_CLUSTER_NAME }}
         config: deploy/kind-isolated-config.yaml
         kubeconfig: ${{ env.KUBECONFIG }}
+        registry_name: kuberic-registry-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Record isolated KinD ownership
+      run: |
+        printf '%s\n' \
+          "cluster=${KIND_CLUSTER_NAME}" \
+          "context=${KUBE_CONTEXT}" \
+          "kubeconfig=${KUBECONFIG}" \
+          | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
 
     - name: Verify isolated KinD context
       run: just verify-kind-context
+
+    - name: Resolve isolated kvstore endpoint
+      run: |
+        port="$(docker port "${KIND_CLUSTER_NAME}-control-plane" 30090/tcp | sed -n 's/.*://p')"
+        test -n "$port"
+        echo "KUBERIC_KVSTORE_ENDPOINT=http://127.0.0.1:${port}" >> "$GITHUB_ENV"
 
     - name: Build and load Docker images
       run: just images

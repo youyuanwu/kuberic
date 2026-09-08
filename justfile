@@ -2,6 +2,7 @@ cluster_name := env_var("KIND_CLUSTER_NAME")
 kubeconfig := env_var("KUBECONFIG")
 cluster_context := "kind-" + cluster_name
 kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-isolated-config.yaml")
+ownership_receipt := kubeconfig + ".kuberic-owner"
 
 # Build and load all container images into Kind.
 default: images
@@ -15,17 +16,29 @@ create-kind-cluster:
         --config "{{ kind_config }}" \
         --kubeconfig "{{ kubeconfig }}"
     kind export kubeconfig --name {{ cluster_name }} --kubeconfig "{{ kubeconfig }}"
+    printf '%s\n' \
+        "cluster={{ cluster_name }}" \
+        "context={{ cluster_context }}" \
+        "kubeconfig={{ kubeconfig }}" \
+        | install -m 600 /dev/stdin "{{ ownership_receipt }}"
     just verify-kind-context
 
+# Verify the exact cluster/kubeconfig pair was created by this workflow.
+verify-kind-ownership:
+    test -f "{{ ownership_receipt }}"
+    grep -Fx "cluster={{ cluster_name }}" "{{ ownership_receipt }}"
+    grep -Fx "context={{ cluster_context }}" "{{ ownership_receipt }}"
+    grep -Fx "kubeconfig={{ kubeconfig }}" "{{ ownership_receipt }}"
+
 # Verify every Kubernetes mutation targets the dedicated Kind checkout.
-verify-kind-context:
+verify-kind-context: verify-kind-ownership
     test "$(kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" config current-context)" = "{{ cluster_context }}"
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" cluster-info
 
 # Delete the local Kind cluster.
 delete-kind-cluster: verify-kind-context
     kind delete cluster --name {{ cluster_name }}
-    rm -f "{{ kubeconfig }}"
+    rm -f "{{ kubeconfig }}" "{{ ownership_receipt }}"
 
 # Build all workspace binaries used by the container images.
 build-rust-bins:

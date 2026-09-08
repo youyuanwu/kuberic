@@ -565,7 +565,10 @@ just delete-kind-cluster
 The exported `KUBECONFIG` points every kube client and real-API test at the
 dedicated cluster. The `just` recipes also require `KIND_CLUSTER_NAME`, verify
 the exact `kind-<name>` context before Kubernetes mutations, and delete only
-that named cluster and kubeconfig.
+that named cluster and kubeconfig after validating a workflow-created ownership
+receipt. The isolated config uses a dynamically allocated host port; the
+kvstore test resolves it from only the exact
+`<KIND_CLUSTER_NAME>-control-plane` container.
 
 The live removal test verifies selector-free admission, the owner-bound
 terminal checkpoint, exact removal of one pod, preservation of the two

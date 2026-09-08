@@ -158,16 +158,21 @@ All KinD validation must create a new workflow-specific cluster and kubeconfig.
 Set `KIND_CLUSTER_NAME` and `KUBECONFIG`; the `just` recipes reject the default
 `kind` name and default user kubeconfig, verify the exact
 `kind-${KIND_CLUSTER_NAME}` context before Kubernetes mutations, and pass the
-isolated cluster name to every image load. `KIND_CONFIG` defaults to the
-port-unmapped `deploy/kind-isolated-config.yaml`, preventing collisions with
-unrelated local clusters. Cargo real-API tests inherit only the exported
-isolated kubeconfig.
+isolated cluster name to every image load. `KIND_CONFIG` defaults to
+`deploy/kind-isolated-config.yaml`, whose kvstore host port is allocated
+dynamically; the test resolves the mapping only from the exact dedicated node
+container. An ownership receipt binds the cluster name, context, and
+kubeconfig before local cleanup is allowed. Cargo real-API tests construct
+clients from the explicit kubeconfig and context rather than inherited
+defaults.
 
-The final validation used the newly created
-`kuberic-fns-20260908-225038` cluster with its workflow-local kubeconfig. No
-existing cluster or container was inspected, reconfigured, stopped, or reused.
-After image loading, real-API testing, and the full workspace attempt, the
-exact dedicated cluster and kubeconfig were deleted.
+The final validation used the newly created `kuberic-fns-iso-20260908` cluster
+with its workflow-local kubeconfig and ownership receipt. No existing cluster
+or container was inspected, reconfigured, stopped, or reused. Image loading,
+the real-API provider test, and all five enabled KinD integration tests
+including the dynamically mapped kvstore write/read path passed. After the
+full workspace attempt, the exact dedicated cluster, kubeconfig, and receipt
+were deleted.
 
 The canonical three-member measurement is:
 

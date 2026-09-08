@@ -205,18 +205,20 @@ All are ClusterIP services (no NodePort). Port mappings:
 ### Dev/Test Access via NodePort
 
 A separate `nodeport-svc.yaml` overlay converts `kvstore-rw` to a
-NodePort service (port 30090) for dev/test access from the host.
+NodePort service (container port 30090) for dev/test access from the host.
 This is applied by the integration tests automatically. The KinD
-config includes `extraPortMappings` so NodePort 30090 is reachable
-at `localhost:30090`.
+isolated config requests a dynamic host port, which the test resolves from the
+exact dedicated control-plane container.
 
 ```bash
 # Apply NodePort overlay (done automatically by tests)
 kubectl --kubeconfig "$KUBECONFIG" --context "$KIND_CONTEXT" \
   apply -f examples/kvstore/deploy/nodeport-svc.yaml
 
-# Connect via gRPC
-grpcurl -plaintext localhost:30090 kvstore.v1.KvStore/Get
+# Resolve the dedicated dynamic host port, then connect via gRPC
+HOST_PORT="$(docker port "${KIND_CLUSTER_NAME}-control-plane" 30090/tcp \
+  | sed -n 's/.*://p')"
+grpcurl -plaintext "localhost:${HOST_PORT}" kvstore.v1.KvStore/Get
 ```
 
 > **Note**: `kubectl port-forward` is unreliable in WSL2/KinD due to
