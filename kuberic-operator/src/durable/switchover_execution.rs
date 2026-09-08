@@ -36,8 +36,6 @@ use rand::random;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-#[cfg(test)]
-use crate::crd::DurableSwitchoverPilotStatus;
 use crate::crd::{
     DurableOperationPhase, DurableOperationStatus, KubericSet, PendingActionStatus,
     StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus, SwitchoverExecutionState,
@@ -82,25 +80,6 @@ pub const SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES: usize = 16 * 1_024;
 pub const SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES: u64 = 4_096;
 pub const SWITCHOVER_MAX_ERROR_BYTES: usize = 512;
 
-#[cfg(test)]
-const PILOT_VERSION: u32 = SWITCHOVER_CONTRACT_VERSION;
-#[cfg(test)]
-const PILOT_MAX_REPLICAS: usize = SWITCHOVER_MAX_REPLICAS;
-#[cfg(test)]
-const PILOT_MAX_ACTIVITY_RECORDS: usize = SWITCHOVER_MAX_ACTIVITY_RECORDS;
-#[cfg(test)]
-const PILOT_MAX_TRANSITION_FUEL: usize = SWITCHOVER_MAX_TRANSITION_FUEL;
-#[cfg(test)]
-const PILOT_MAX_OPERATION_BYTES: usize = SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES;
-#[cfg(test)]
-const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES;
-#[cfg(test)]
-const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES;
-#[cfg(test)]
-const PILOT_MAX_TERMINAL_BYTES: u64 = SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES;
-#[cfg(test)]
-const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES;
-
 const SWITCHOVER_ACTIVITY_NAME: &str = "kuberic.switchover.native-boundary";
 const SWITCHOVER_ACTIVITY_VERSION: u32 = 2;
 pub type SwitchoverHost = DurableOperatorHost;
@@ -115,6 +94,15 @@ pub struct DurableSwitchoverRuntime {
 
 #[cfg(test)]
 type DurableSwitchoverPilotRuntime = DurableSwitchoverRuntime;
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TestSwitchoverReference {
+    pub(crate) version: u32,
+    pub(crate) execution_id: String,
+    pub(crate) checkpoint_name: String,
+    pub(crate) initial_operation_json: String,
+}
 
 impl DurableSwitchoverRuntime {
     pub fn kubernetes(client: kube::Client) -> Self {
@@ -134,14 +122,14 @@ impl DurableSwitchoverRuntime {
     }
 
     #[cfg(test)]
-    pub async fn host(
+    pub(crate) async fn host(
         &self,
         namespace: &str,
         set_name: &str,
         set_uid: &str,
-        reference: &DurableSwitchoverPilotStatus,
+        reference: &TestSwitchoverReference,
     ) -> Result<Arc<Mutex<SwitchoverHost>>, String> {
-        let execution_id = execution_id(reference)?;
+        let execution_id = test_execution_id(reference)?;
         self.inner
             .host(
                 namespace,
@@ -276,9 +264,6 @@ pub enum SwitchoverActivityKind {
     },
 }
 
-#[cfg(test)]
-pub(crate) type PilotActivityKind = SwitchoverActivityKind;
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SwitchoverActivityAccounting {
@@ -300,9 +285,6 @@ impl SwitchoverActivityAccounting {
             == Some(completed_activity_count)
     }
 }
-
-#[cfg(test)]
-pub(crate) type PilotActivityAccounting = SwitchoverActivityAccounting;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
@@ -353,9 +335,6 @@ pub enum SwitchoverTerminal {
         message: String,
     },
 }
-
-#[cfg(test)]
-type DurableSwitchoverPilotTerminal = SwitchoverTerminal;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -858,12 +837,12 @@ pub fn decode_terminal_activity_accounting(
 }
 
 #[cfg(test)]
-pub fn validate_loaded_terminal(
-    reference: &DurableSwitchoverPilotStatus,
+fn validate_test_loaded_terminal(
+    reference: &TestSwitchoverReference,
     outcome: &TerminalOutcome,
     completed_activity_count: u64,
 ) -> Result<SwitchoverTerminal, String> {
-    let initial = initial_operation(reference)?;
+    let initial = test_initial_operation(reference)?;
     validate_loaded_terminal_for_initial(&initial, outcome, completed_activity_count)
 }
 
@@ -919,9 +898,6 @@ pub enum SwitchoverAdapterDecision {
     AwaitEvidence,
     External(Box<Decision>),
 }
-
-#[cfg(test)]
-pub(crate) type PilotAdapterDecision = SwitchoverAdapterDecision;
 
 pub fn evaluate_adapter_step(
     operation: &DurableOperationStatus,
@@ -1006,9 +982,6 @@ pub struct SwitchoverPreparedActivityResolver {
     now: i64,
     deadline: Option<Arc<AtomicI64>>,
 }
-
-#[cfg(test)]
-pub(crate) type PilotPreparedActivityResolver = SwitchoverPreparedActivityResolver;
 
 impl SwitchoverPreparedActivityResolver {
     pub fn new(
@@ -1639,9 +1612,6 @@ impl SwitchoverPermitGuard {
     }
 }
 
-#[cfg(test)]
-pub(crate) type PilotPermitGuard = SwitchoverPermitGuard;
-
 fn activity_spec(input: &DurableSwitchoverActivityInput) -> Result<ActivitySpec, String> {
     Ok(ActivitySpec::new(
         ActivityName::new(SWITCHOVER_ACTIVITY_NAME, SWITCHOVER_ACTIVITY_VERSION)
@@ -1822,12 +1792,12 @@ fn encode_terminal_record(
 }
 
 #[cfg(test)]
-pub fn new_pilot_reference(
+pub(crate) fn new_test_reference(
     set_uid: &str,
     previous_snapshot: StablePartitionSnapshotStatus,
     target_primary_id: i64,
     now: i64,
-) -> Result<DurableSwitchoverPilotStatus, String> {
+) -> Result<TestSwitchoverReference, String> {
     if set_uid.is_empty() {
         return Err("durable switchover pilot requires the KubericSet UID".to_string());
     }
@@ -1844,13 +1814,13 @@ pub fn new_pilot_reference(
     let initial_operation_json = serde_json::to_string(&initial_operation)
         .map_err(|error| format!("serialize initial durable switchover operation: {error}"))?;
 
-    let reference = DurableSwitchoverPilotStatus {
-        version: PILOT_VERSION,
+    let reference = TestSwitchoverReference {
+        version: SWITCHOVER_CONTRACT_VERSION,
         execution_id: execution_hex,
         checkpoint_name: KubernetesCheckpointStore::object_name(execution_id),
         initial_operation_json,
     };
-    execution_spec(&reference)?;
+    test_execution_spec(&reference)?;
     Ok(reference)
 }
 
@@ -1987,8 +1957,10 @@ pub fn native_execution_spec(
 }
 
 #[cfg(test)]
-pub fn execution_id(reference: &DurableSwitchoverPilotStatus) -> Result<ExecutionId, String> {
-    if reference.version != PILOT_VERSION {
+pub(crate) fn test_execution_id(
+    reference: &TestSwitchoverReference,
+) -> Result<ExecutionId, String> {
+    if reference.version != SWITCHOVER_CONTRACT_VERSION {
         return Err(format!(
             "unsupported durable switchover pilot version {}",
             reference.version
@@ -2007,9 +1979,11 @@ pub fn execution_id(reference: &DurableSwitchoverPilotStatus) -> Result<Executio
 }
 
 #[cfg(test)]
-pub fn execution_spec(reference: &DurableSwitchoverPilotStatus) -> Result<ExecutionSpec, String> {
-    let execution_id = execution_id(reference)?;
-    let initial_operation = initial_operation(reference)?;
+pub(crate) fn test_execution_spec(
+    reference: &TestSwitchoverReference,
+) -> Result<ExecutionSpec, String> {
+    let execution_id = test_execution_id(reference)?;
+    let initial_operation = test_initial_operation(reference)?;
     validate_switchover_admission(&initial_operation)?;
     let input = SwitchoverWorkflowInput {
         version: reference.version,
@@ -2018,23 +1992,23 @@ pub fn execution_spec(reference: &DurableSwitchoverPilotStatus) -> Result<Execut
     };
     let input = serde_json::to_vec(&input)
         .map_err(|error| format!("serialize durable switchover pilot input: {error}"))?;
-    if input.len() > PILOT_MAX_OPERATION_BYTES {
+    if input.len() > SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES {
         return Err(format!(
             "durable switchover pilot input is {} bytes; maximum is {}",
             input.len(),
-            PILOT_MAX_OPERATION_BYTES
+            SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES
         ));
     }
     Ok(ExecutionSpec::new(
         execution_id,
         ExactBytes::new(input),
-        PILOT_MAX_TERMINAL_BYTES,
+        SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
     ))
 }
 
 #[cfg(test)]
-pub fn initial_operation(
-    reference: &DurableSwitchoverPilotStatus,
+pub(crate) fn test_initial_operation(
+    reference: &TestSwitchoverReference,
 ) -> Result<DurableOperationStatus, String> {
     serde_json::from_str(&reference.initial_operation_json)
         .map_err(|error| format!("decode initial durable switchover operation: {error}"))
@@ -2709,7 +2683,7 @@ pub fn maximum_terminal_checkpoint() -> Result<CheckpointEnvelope, String> {
 fn maximum_prepared_activity_input() -> Result<ExactBytes, String> {
     let maximum_fence = "x".repeat(512);
     let input = DurableSwitchoverActivityInput {
-        version: PILOT_VERSION,
+        version: SWITCHOVER_CONTRACT_VERSION,
         state: DurableSwitchoverState {
             phase: DurableOperationPhase::Poisoned,
             frozen_lsn: Some(i64::MAX),
@@ -2718,7 +2692,7 @@ fn maximum_prepared_activity_input() -> Result<ExactBytes, String> {
             pending_action: None,
             last_error: Some(maximum_fence.clone()),
         },
-        kind: PilotActivityKind::PreparedReplica {
+        kind: SwitchoverActivityKind::PreparedReplica {
             command: ReplicaEffectCommand {
                 action_id: maximum_fence.clone(),
                 action_signature: maximum_fence.clone(),
@@ -2744,11 +2718,11 @@ fn maximum_prepared_activity_input() -> Result<ExactBytes, String> {
     };
     let encoded = encode_activity_input::<DurableSwitchoverActivity>(&input)
         .map_err(|error| format!("encode maximum prepared pilot activity: {error}"))?;
-    if encoded.as_slice().len() > PILOT_MAX_ACTIVITY_INPUT_BYTES {
+    if encoded.as_slice().len() > SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES {
         return Err(format!(
             "maximum prepared pilot activity is {} bytes; maximum is {}",
             encoded.as_slice().len(),
-            PILOT_MAX_ACTIVITY_INPUT_BYTES
+            SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES
         ));
     }
     Ok(encoded)
@@ -2790,6 +2764,11 @@ fn decode_hex(value: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod framework_native_switchover_tests {
     use super::*;
+    use super::{
+        new_test_reference as new_pilot_reference, test_execution_id as execution_id,
+        test_execution_spec as execution_spec, test_initial_operation as initial_operation,
+        validate_test_loaded_terminal as validate_loaded_terminal,
+    };
     use crate::crd::{
         EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
         SwitchoverIncompatibilitySource,
@@ -2799,6 +2778,21 @@ mod framework_native_switchover_tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    const PILOT_VERSION: u32 = SWITCHOVER_CONTRACT_VERSION;
+    const PILOT_MAX_REPLICAS: usize = SWITCHOVER_MAX_REPLICAS;
+    const PILOT_MAX_ACTIVITY_RECORDS: usize = SWITCHOVER_MAX_ACTIVITY_RECORDS;
+    const PILOT_MAX_TRANSITION_FUEL: usize = SWITCHOVER_MAX_TRANSITION_FUEL;
+    const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES;
+    const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES;
+    const PILOT_MAX_TERMINAL_BYTES: u64 = SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES;
+    const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES;
+    type PilotActivityKind = SwitchoverActivityKind;
+    type PilotActivityAccounting = SwitchoverActivityAccounting;
+    type PilotAdapterDecision = SwitchoverAdapterDecision;
+    type PilotPreparedActivityResolver = SwitchoverPreparedActivityResolver;
+    type PilotPermitGuard = SwitchoverPermitGuard;
+    type DurableSwitchoverPilotTerminal = SwitchoverTerminal;
 
     fn snapshot(member_count: usize) -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {

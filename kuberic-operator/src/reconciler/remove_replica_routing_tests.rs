@@ -31,8 +31,8 @@ use crate::durable::remove_replica_execution::{
     checkpoint_limits, execution_spec, new_execution, reconstruct_initial_operation,
 };
 use crate::durable::switchover_execution::{
-    PilotActivityAccounting, SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES,
-    SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES, SwitchoverTerminal,
+    SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES, SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
+    SwitchoverActivityAccounting as PilotActivityAccounting, SwitchoverTerminal,
     checkpoint_limits as switchover_checkpoint_limits,
     encode_terminal as encode_switchover_terminal, native_execution_spec, native_initial_operation,
     new_switchover_execution,

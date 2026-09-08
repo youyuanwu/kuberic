@@ -61,7 +61,8 @@ use crate::durable::switchover_execution::{
 use crate::durable::switchover_execution::{DurableSwitchoverStepResult, encode_step_result};
 #[cfg(test)]
 use crate::durable::switchover_execution::{
-    PilotActivityKind, PilotAdapterDecision, PilotPermitGuard,
+    SwitchoverActivityKind as PilotActivityKind, SwitchoverAdapterDecision as PilotAdapterDecision,
+    SwitchoverPermitGuard as PilotPermitGuard,
 };
 use crate::durable::workflow_host::DurableWorkflowRuntime;
 use crate::durable::{
@@ -5586,9 +5587,10 @@ mod dispatch_planning_tests {
     async fn bridge_dispatches_one_persisted_command_from_the_fused_permit() {
         use crate::durable::checkpoint_store::MeasuredDurableCheckpointStore;
         use crate::durable::switchover_execution::{
-            DurableCheckpointStore, DurableSwitchoverWorkflow, PilotPreparedActivityResolver,
-            decode_switchover_activity_input, execution_spec, initial_operation,
-            new_pilot_reference,
+            DurableCheckpointStore, DurableSwitchoverWorkflow,
+            SwitchoverPreparedActivityResolver as PilotPreparedActivityResolver,
+            decode_switchover_activity_input, new_test_reference as new_pilot_reference,
+            test_execution_spec as execution_spec, test_initial_operation as initial_operation,
         };
         use kuberic_durable_execution::{
             DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
@@ -5722,9 +5724,10 @@ mod dispatch_planning_tests {
      {
         use crate::durable::checkpoint_store::MeasuredDurableCheckpointStore;
         use crate::durable::switchover_execution::{
-            DurableCheckpointStore, DurableSwitchoverWorkflow, PilotPreparedActivityResolver,
-            decode_switchover_activity_input, execution_spec, initial_operation,
-            new_pilot_reference,
+            DurableCheckpointStore, DurableSwitchoverWorkflow,
+            SwitchoverPreparedActivityResolver as PilotPreparedActivityResolver,
+            decode_switchover_activity_input, new_test_reference as new_pilot_reference,
+            test_execution_spec as execution_spec, test_initial_operation as initial_operation,
         };
         use kuberic_durable_execution::{
             CheckpointError, DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,
@@ -5872,9 +5875,10 @@ mod dispatch_planning_tests {
     async fn precondition_rejection_waits_for_fresh_observations_before_redelivery() {
         use crate::durable::checkpoint_store::MeasuredDurableCheckpointStore;
         use crate::durable::switchover_execution::{
-            DurableCheckpointStore, DurableSwitchoverWorkflow, PilotPreparedActivityResolver,
-            decode_switchover_activity_input, execution_spec, initial_operation,
-            new_pilot_reference,
+            DurableCheckpointStore, DurableSwitchoverWorkflow,
+            SwitchoverPreparedActivityResolver as PilotPreparedActivityResolver,
+            decode_switchover_activity_input, new_test_reference as new_pilot_reference,
+            test_execution_spec as execution_spec, test_initial_operation as initial_operation,
         };
         use kuberic_durable_execution::{
             ActivityState, DurableHost, HostEpoch, HostOutcome, InMemoryCheckpointStore,

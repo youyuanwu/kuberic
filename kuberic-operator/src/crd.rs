@@ -183,22 +183,6 @@ pub struct MemberStatus {
     pub data_address: String,
 }
 
-/// Legacy durable-pilot reference retained only for conservative compatibility
-/// parsing and test fixtures. It is not part of the current CRD status schema.
-#[cfg(test)]
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DurableSwitchoverPilotStatus {
-    pub version: u32,
-    /// Lowercase hexadecimal kernel execution identity.
-    pub execution_id: String,
-    /// Deterministic provider object name derived from `execution_id`.
-    pub checkpoint_name: String,
-    /// Exact JSON encoding of the initial operation accepted before checkpoint
-    /// creation or effect dispatch.
-    pub initial_operation_json: String,
-}
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SwitchoverExecutionStatus {
