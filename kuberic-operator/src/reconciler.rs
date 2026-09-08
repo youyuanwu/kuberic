@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "native-remove-test-harness")]
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -55,9 +57,9 @@ use crate::durable::pilot::{
 };
 #[cfg(all(test, feature = "durable-switchover-pilot"))]
 use crate::durable::pilot::{DurableSwitchoverStepResult, encode_step_result};
-#[cfg(feature = "durable-remove-replica-pilot")]
+#[cfg(feature = "native-remove-test-harness")]
 use crate::durable::remove_replica_execution as native_remove;
-#[cfg(feature = "durable-remove-replica-pilot")]
+#[cfg(feature = "native-remove-test-harness")]
 use crate::durable::remove_replica_execution::{
     FrameworkNativeRemoveReplicaAdapter, FrameworkNativeRemoveReplicaRuntime,
     RemoveReplicaTerminal, RemoveReplicaWorkflow,
@@ -72,7 +74,7 @@ use crate::durable::remove_replica_pilot::{
 };
 #[cfg(any(
     feature = "durable-switchover-pilot",
-    feature = "durable-remove-replica-pilot"
+    feature = "native-remove-test-harness"
 ))]
 use crate::durable::runner::{DurableActiveReason, DurableRunner, DurableRunnerOutcome};
 #[cfg(any(
@@ -102,9 +104,9 @@ pub struct ReconcilerState {
     pub durable_switchover_pilot: Option<Arc<DurableSwitchoverPilotRuntime>>,
     #[cfg(feature = "durable-remove-replica-pilot")]
     pub durable_remove_replica_pilot: Option<Arc<DurableRemoveReplicaPilotRuntime>>,
-    #[cfg(feature = "durable-remove-replica-pilot")]
-    pub framework_native_remove_replica: Option<Arc<FrameworkNativeRemoveReplicaRuntime>>,
-    #[cfg(feature = "durable-remove-replica-pilot")]
+    #[cfg(feature = "native-remove-test-harness")]
+    framework_native_remove_replica: Option<Arc<FrameworkNativeRemoveReplicaRuntime>>,
+    #[cfg(feature = "native-remove-test-harness")]
     framework_native_remove_replica_test_harness: bool,
 }
 
@@ -124,9 +126,9 @@ impl Default for ReconcilerState {
             durable_switchover_pilot: None,
             #[cfg(feature = "durable-remove-replica-pilot")]
             durable_remove_replica_pilot: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
             framework_native_remove_replica: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
             framework_native_remove_replica_test_harness: false,
         }
     }
@@ -142,9 +144,9 @@ impl ReconcilerState {
             durable_switchover_pilot: None,
             #[cfg(feature = "durable-remove-replica-pilot")]
             durable_remove_replica_pilot: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
             framework_native_remove_replica: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
             framework_native_remove_replica_test_harness: false,
         }
     }
@@ -167,11 +169,9 @@ impl ReconcilerState {
             durable_remove_replica_pilot: Some(Arc::new(DurableRemoveReplicaPilotRuntime::shared(
                 runtime.clone(),
             ))),
-            #[cfg(feature = "durable-remove-replica-pilot")]
-            framework_native_remove_replica: Some(Arc::new(
-                FrameworkNativeRemoveReplicaRuntime::shared(runtime),
-            )),
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
+            framework_native_remove_replica: None,
+            #[cfg(feature = "native-remove-test-harness")]
             framework_native_remove_replica_test_harness: false,
         }
     }
@@ -195,9 +195,9 @@ impl ReconcilerState {
             ))),
             #[cfg(feature = "durable-remove-replica-pilot")]
             durable_remove_replica_pilot: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
             framework_native_remove_replica: None,
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
             framework_native_remove_replica_test_harness: false,
         }
     }
@@ -216,11 +216,47 @@ impl ReconcilerState {
             durable_remove_replica_pilot: Some(Arc::new(DurableRemoveReplicaPilotRuntime::shared(
                 runtime.clone(),
             ))),
-            framework_native_remove_replica: Some(Arc::new(
-                FrameworkNativeRemoveReplicaRuntime::shared(runtime),
-            )),
-            framework_native_remove_replica_test_harness: true,
+            #[cfg(feature = "native-remove-test-harness")]
+            framework_native_remove_replica: None,
+            #[cfg(feature = "native-remove-test-harness")]
+            framework_native_remove_replica_test_harness: false,
         }
+    }
+}
+
+#[cfg(feature = "native-remove-test-harness")]
+#[doc(hidden)]
+pub struct FrameworkNativeRemoveReplicaTestHarness {
+    state: ReconcilerState,
+}
+
+#[cfg(feature = "native-remove-test-harness")]
+impl FrameworkNativeRemoveReplicaTestHarness {
+    pub fn in_memory(store: kuberic_durable_execution::InMemoryCheckpointStore) -> Self {
+        let runtime = Arc::new(DurableWorkflowRuntime::in_memory(store));
+        Self {
+            state: ReconcilerState {
+                drivers: Mutex::new(HashMap::new()),
+                pending_statuses: Mutex::new(HashMap::new()),
+                removal_clock: Arc::new(SystemRemoveReplicaClock),
+                #[cfg(feature = "durable-switchover-pilot")]
+                durable_switchover_pilot: None,
+                durable_remove_replica_pilot: None,
+                framework_native_remove_replica: Some(Arc::new(
+                    FrameworkNativeRemoveReplicaRuntime::shared(runtime),
+                )),
+                framework_native_remove_replica_test_harness: true,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "native-remove-test-harness")]
+impl Deref for FrameworkNativeRemoveReplicaTestHarness {
+    type Target = ReconcilerState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
     }
 }
 
@@ -401,42 +437,6 @@ fn accept_remove_replica(
     Ok(status)
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
-#[doc(hidden)]
-pub fn accept_framework_native_remove_replica_for_test(
-    set: &KubericSet,
-    previous_snapshot: StablePartitionSnapshotStatus,
-    target: RemoveReplicaTarget,
-    mode: DurableRemoveMode,
-    minimum_replicas: usize,
-    now: i64,
-) -> Result<KubericSetStatus, String> {
-    let set_uid = set.metadata.uid.as_deref().ok_or_else(|| {
-        "framework-native remove test acceptance requires KubericSet UID".to_string()
-    })?;
-    let reference = native_remove::new_execution(
-        set_uid,
-        previous_snapshot,
-        target,
-        mode,
-        minimum_replicas,
-        now,
-    )?;
-    let mut status = KubericSetStatus {
-        phase: Phase::RemovingReplica,
-        ..set.status.clone().unwrap_or_default()
-    };
-    status.operation = None;
-    status.durable_remove_replica_pilot = None;
-    status.remove_replica_execution = Some(reference);
-    set_framework_native_remove_condition(
-        &mut status,
-        "Accepted",
-        "framework-native remove reference persisted before checkpoint creation",
-        now,
-    );
-    Ok(status)
-}
 // COMPLEXITY-BOUNDARY: remove-replica-routing-integration:end
 
 fn durable_identity_members(
@@ -1874,7 +1874,7 @@ pub async fn reconcile_set(
         }
 
         Phase::RemovingReplica => {
-            #[cfg(feature = "durable-remove-replica-pilot")]
+            #[cfg(feature = "native-remove-test-harness")]
             if set.status.as_ref().is_some_and(|status| {
                 status.operation.is_none() && status.remove_replica_execution.is_some()
             }) && state.framework_native_remove_replica_test_harness
@@ -3204,7 +3204,7 @@ async fn publish_pilot_terminal(
 
 // COMPLEXITY-BOUNDARY: pilot-reconcile:end
 // COMPLEXITY-BOUNDARY: remove-replica-reconcile-integration:start
-#[cfg(feature = "durable-remove-replica-pilot")]
+#[cfg(feature = "native-remove-test-harness")]
 async fn reconcile_framework_native_remove_replica(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -3335,7 +3335,7 @@ async fn reconcile_framework_native_remove_replica(
     }
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
+#[cfg(feature = "native-remove-test-harness")]
 async fn publish_framework_native_remove_terminal(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -4990,7 +4990,7 @@ fn set_remove_pilot_condition(
     );
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
+#[cfg(feature = "native-remove-test-harness")]
 fn set_framework_native_remove_condition(
     status: &mut KubericSetStatus,
     reason: &str,
@@ -5013,7 +5013,7 @@ fn set_framework_native_remove_condition(
     );
 }
 
-#[cfg(feature = "durable-remove-replica-pilot")]
+#[cfg(feature = "native-remove-test-harness")]
 async fn record_framework_native_remove_condition(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -5133,7 +5133,7 @@ async fn cleanup_persisted_durable_execution(
             .await;
         cleaned = true;
     }
-    #[cfg(feature = "durable-remove-replica-pilot")]
+    #[cfg(feature = "native-remove-test-harness")]
     if let (Some(reference), Some(runtime)) = (
         status.remove_replica_execution.as_ref(),
         state.framework_native_remove_replica.as_ref(),

@@ -2973,18 +2973,32 @@ fn decode_hex(value: u8) -> Result<u8, String> {
 
 #[cfg(test)]
 mod remove_replica_execution_tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use async_trait::async_trait;
+    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
+    use kube::api::ObjectMeta;
+    use kuberic_core::driver::ReplicaHandle;
+    use kuberic_core::error::KubericError;
     use kuberic_core::replica_lifecycle::REPLICA_LIFECYCLE_PEER_PROTOCOL_VERSION;
+    use kuberic_core::types::{
+        CorrelatedControlActionAcknowledgement, CorrelatedControlActionRequest, Lsn, ReplicaId,
+    };
     use kuberic_durable_execution::{
-        ActivityCallError, CasOutcome, CheckpointError, CheckpointStore, Evaluation,
-        InMemoryCheckpointStore, encode_activity_result, evaluate,
+        ActivityCallError, CasOutcome, CheckpointError, CheckpointStore, Evaluation, HostEpoch,
+        InMemoryCheckpointStore, PreparedActivityError, encode_activity_result, evaluate,
     };
     use serde::de::DeserializeOwned;
 
     use crate::crd::{
+        KubericSetSpec, KubericSetStatus, MemberStatus, Phase, PvcRetentionPolicy,
         StableReplicaElectionMetadataStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
     };
 
     use super::super::checkpoint_store::{DurableCheckpointStore, MeasuredDurableCheckpointStore};
+    use super::super::runner::{
+        DurableActiveReason, DurableOperationAdapter, DurableRunner, DurableRunnerOutcome,
+    };
     use super::*;
 
     fn generation(id: i64) -> AgentGeneration {
@@ -3211,7 +3225,12 @@ mod remove_replica_execution_tests {
                     commit_observed_unix_seconds: Some(10),
                     connection_absent: true,
                     target_retirement: TargetRetirementObservation::Completed,
-                    retirement_expiry_unix_seconds: Some(20),
+                    retirement_expiry_unix_seconds: Some(
+                        core_intent(operation)
+                            .unwrap()
+                            .retirement_expiry(10)
+                            .unwrap(),
+                    ),
                     compensation_expiry_unix_seconds: None,
                     error: None,
                     current_install_dispatched: true,
@@ -3221,7 +3240,11 @@ mod remove_replica_execution_tests {
     }
 
     fn committed_operation() -> DurableOperationStatus {
-        let (mut operation, _) = freeze_and_dispatch();
+        committed_operation_for(&reference())
+    }
+
+    fn committed_operation_for(reference: &RemoveReplicaExecution) -> DurableOperationStatus {
+        let (mut operation, _) = freeze_and_dispatch_for(reference);
         let intent = operation.remove_intent.as_ref().unwrap();
         operation.phase = DurableOperationPhase::Completed;
         operation.pending_action = None;
@@ -3275,6 +3298,283 @@ mod remove_replica_execution_tests {
             checkpoint_limits(),
         )
         .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum DispatchResult {
+        Busy,
+        Ambiguous,
+    }
+
+    struct AdapterTestHandle {
+        replica_id: ReplicaId,
+        status: ReplicaStatusInfo,
+        requests: Arc<StdMutex<Vec<CorrelatedControlActionRequest>>>,
+        dispatch_result: DispatchResult,
+    }
+
+    #[async_trait]
+    impl ReplicaHandle for AdapterTestHandle {
+        fn id(&self) -> ReplicaId {
+            self.replica_id
+        }
+
+        fn instance_id(&self) -> ReplicaInstanceId {
+            self.status.instance_id.clone()
+        }
+
+        fn current_progress(&self) -> Lsn {
+            self.status.current_progress
+        }
+
+        fn catch_up_capability(&self) -> Lsn {
+            self.status.catch_up_capability.unwrap_or_default()
+        }
+
+        fn control_address(&self) -> String {
+            format!("http://{}:9090", self.status.instance_id)
+        }
+
+        fn replicator_address(&self) -> String {
+            format!("http://{}:9091", self.status.instance_id)
+        }
+
+        async fn get_status(&self) -> kuberic_core::Result<ReplicaStatusInfo> {
+            Ok(self.status.clone())
+        }
+
+        async fn execute_correlated_control_action(
+            &self,
+            request: CorrelatedControlActionRequest,
+        ) -> kuberic_core::Result<CorrelatedControlActionAcknowledgement> {
+            self.requests.lock().unwrap().push(request);
+            match self.dispatch_result {
+                DispatchResult::Busy => Err(KubericError::AgentBusy),
+                DispatchResult::Ambiguous => Err(KubericError::Internal(Box::new(
+                    std::io::Error::other("ambiguous test dispatch"),
+                ))),
+            }
+        }
+    }
+
+    struct AdapterTestApi {
+        statuses: Arc<StdMutex<BTreeMap<ReplicaId, ReplicaStatusInfo>>>,
+        requests: Arc<StdMutex<Vec<CorrelatedControlActionRequest>>>,
+        dispatch_result: DispatchResult,
+    }
+
+    #[async_trait]
+    impl ClusterApi for AdapterTestApi {
+        async fn list_pods(&self, _: &str, _: &str) -> Result<Vec<Pod>, String> {
+            unreachable!()
+        }
+
+        async fn create_pod(&self, _: &str, _: &Pod) -> Result<(), String> {
+            unreachable!()
+        }
+
+        async fn delete_pod(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn patch_pod_labels(
+            &self,
+            _: &str,
+            _: &str,
+            _: BTreeMap<String, String>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn patch_pod_labels_if_uid(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: BTreeMap<String, String>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn patch_set_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: &KubericSetStatus,
+            _: Option<&str>,
+        ) -> Result<(), String> {
+            unreachable!()
+        }
+
+        async fn create_replica_handle(
+            &self,
+            replica_id: ReplicaId,
+            _: &Pod,
+            _: &KubericSetSpec,
+        ) -> Result<Box<dyn ReplicaHandle>, String> {
+            Ok(Box::new(AdapterTestHandle {
+                replica_id,
+                status: self
+                    .statuses
+                    .lock()
+                    .unwrap()
+                    .get(&replica_id)
+                    .unwrap()
+                    .clone(),
+                requests: self.requests.clone(),
+                dispatch_result: self.dispatch_result,
+            }))
+        }
+
+        async fn get_pvc(&self, _: &str, _: &str) -> Result<PersistentVolumeClaim, String> {
+            unreachable!()
+        }
+
+        async fn create_pvc(&self, _: &str, _: &PersistentVolumeClaim) -> Result<(), String> {
+            unreachable!()
+        }
+
+        async fn list_pvcs(&self, _: &str, _: &str) -> Result<Vec<PersistentVolumeClaim>, String> {
+            unreachable!()
+        }
+
+        async fn delete_pvc(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+
+        async fn get_service(&self, _: &str, _: &str) -> Result<Service, String> {
+            unreachable!()
+        }
+
+        async fn create_service(&self, _: &str, _: &Service) -> Result<(), String> {
+            unreachable!()
+        }
+
+        async fn delete_service(&self, _: &str, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+    }
+
+    fn adapter_set(reference: &RemoveReplicaExecution) -> KubericSet {
+        KubericSet {
+            metadata: ObjectMeta {
+                name: Some("set".to_string()),
+                namespace: Some("default".to_string()),
+                uid: Some("set-uid".to_string()),
+                ..Default::default()
+            },
+            spec: KubericSetSpec {
+                replicas: 2,
+                min_replicas: 1,
+                image: "test:latest".to_string(),
+                failover_delay: 0,
+                switchover_delay: 30,
+                switchover_execution_mode: Default::default(),
+                remove_replica_execution_mode: Default::default(),
+                port: 8080,
+                control_port: 9090,
+                data_port: 9091,
+                storage: "256Mi".to_string(),
+                pvc_retention_policy: PvcRetentionPolicy::Delete,
+            },
+            status: Some(KubericSetStatus {
+                phase: Phase::RemovingReplica,
+                members: vec![
+                    MemberStatus {
+                        name: "set-0".to_string(),
+                        id: 1,
+                        instance_id: "one".to_string(),
+                        role: "primary".to_string(),
+                        current_progress: 10,
+                        healthy: true,
+                        control_address: "http://one:9090".to_string(),
+                        data_address: "http://one:9091".to_string(),
+                    },
+                    MemberStatus {
+                        name: "set-1".to_string(),
+                        id: 2,
+                        instance_id: "two".to_string(),
+                        role: "secondary".to_string(),
+                        current_progress: 10,
+                        healthy: true,
+                        control_address: "http://two:9090".to_string(),
+                        data_address: "http://two:9091".to_string(),
+                    },
+                    MemberStatus {
+                        name: "set-2".to_string(),
+                        id: 3,
+                        instance_id: "three".to_string(),
+                        role: "secondary".to_string(),
+                        current_progress: 10,
+                        healthy: true,
+                        control_address: "http://three:9090".to_string(),
+                        data_address: "http://three:9091".to_string(),
+                    },
+                ],
+                stable_snapshot: Some(reference.input.previous_snapshot.clone()),
+                remove_replica_execution: Some(reference.clone()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn adapter_pods() -> Vec<Pod> {
+        [
+            (1, "one", "primary"),
+            (2, "two", "secondary"),
+            (3, "three", "secondary"),
+        ]
+        .into_iter()
+        .map(|(id, uid, role)| Pod {
+            metadata: ObjectMeta {
+                name: Some(format!("set-{}", id - 1)),
+                namespace: Some("default".to_string()),
+                uid: Some(uid.to_string()),
+                labels: Some(BTreeMap::from([
+                    ("kuberic.io/pod-index".to_string(), (id - 1).to_string()),
+                    ("kuberic.io/role".to_string(), role.to_string()),
+                ])),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .collect()
+    }
+
+    fn adapter_current_pods(pods: &[Pod]) -> Vec<(i64, ReplicaInstanceId, &Pod)> {
+        pods.iter()
+            .enumerate()
+            .map(|(index, pod)| {
+                (
+                    i64::try_from(index).unwrap() + 1,
+                    ReplicaInstanceId::new(pod.metadata.uid.clone().unwrap()),
+                    pod,
+                )
+            })
+            .collect()
+    }
+
+    fn adapter_api(operation: &DurableOperationStatus, result: DispatchResult) -> AdapterTestApi {
+        AdapterTestApi {
+            statuses: Arc::new(StdMutex::new(
+                observations(operation)
+                    .into_iter()
+                    .map(|(id, observation)| (id, observation.status))
+                    .collect(),
+            )),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+            dispatch_result: result,
+        }
+    }
+
+    fn adapter_store(
+        execution: &ExecutionSpec,
+        backend: InMemoryCheckpointStore,
+    ) -> MeasuredDurableCheckpointStore {
+        MeasuredDurableCheckpointStore::with_native_remove_decoder(
+            execution.execution_id(),
+            DurableCheckpointStore::InMemory(backend),
+        )
     }
 
     #[test]
@@ -4032,163 +4332,367 @@ mod remove_replica_execution_tests {
     }
 
     #[test]
-    fn framework_native_remove_replica_fr017_outcome_matrix_is_complete() {
-        let outcomes = [
-            "active",
-            "terminal",
-            "incompatible",
-            "rejected",
-            "isolated",
-            "conflict-reload",
-            "unknown-write-reload",
-            "persistence-failure",
-            "nondeterministic",
-        ];
-        assert_eq!(outcomes.len(), 9);
-        assert_eq!(outcomes.iter().collect::<BTreeSet<_>>().len(), 9);
-    }
-
-    #[test]
-    fn framework_native_remove_replica_fr019_observation_collection() {
-        let operation = reconstruct_initial_operation(&reference().input).unwrap();
-        let observations = observations(&operation);
-        let evidence = RemoveReplicaObservationEvidence::capture(
-            &operation,
-            &observations,
-            &pod_identities(),
-            Some("secondary"),
+    fn framework_native_remove_replica_fr017_classifies_actual_checkpoint_failures() {
+        let reference = reference();
+        let set = adapter_set(&reference);
+        let pods = adapter_pods();
+        let current_pods = adapter_current_pods(&pods);
+        let execution = execution_spec(&reference).unwrap();
+        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let api = adapter_api(&operation, DispatchResult::Busy);
+        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
+        let adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            store,
+            execution.clone(),
             10,
         )
         .unwrap();
-        let (reconstructed, pods) = evidence.reconstruct(&operation).unwrap();
-        assert_eq!(reconstructed.len(), observations.len());
-        assert_eq!(pods, pod_identities());
+
+        assert_eq!(
+            adapter.checkpoint_disposition(&CheckpointError::UnsupportedFormat {
+                actual: 2,
+                supported: 3,
+            }),
+            DurableCheckpointDisposition::Incompatible
+        );
+        assert_eq!(
+            adapter.checkpoint_disposition(&CheckpointError::InvalidJson("bad".to_string())),
+            DurableCheckpointDisposition::Rejected
+        );
+        assert_eq!(
+            adapter.checkpoint_disposition(&CheckpointError::ExecutionMismatch {
+                expected: execution.execution_id(),
+                actual: ExecutionId::from_bytes([99; 16]),
+            }),
+            DurableCheckpointDisposition::Isolated
+        );
+        let wait = adapter.preparation_wait(&CheckpointError::PreparedActivityRejected(
+            PreparedActivityError::Derivation,
+        ));
+        assert_eq!(wait.reason, "AwaitingFreshAuthority");
+        assert_eq!(wait.requeue_after_seconds, Some(1));
     }
 
-    #[test]
-    fn framework_native_remove_replica_fr019_authority_and_preparation() {
+    #[tokio::test]
+    async fn framework_native_remove_replica_fr019_observation_collection() {
         let reference = reference();
-        let mut operation = reconstruct_initial_operation(&reference.input).unwrap();
-        let observations = observations(&operation);
-        operation = match decide_remove_replica(
-            &operation,
-            &observations,
-            &pod_identities(),
-            Some("secondary"),
+        let set = adapter_set(&reference);
+        let pods = adapter_pods();
+        let current_pods = adapter_current_pods(&pods);
+        let execution = execution_spec(&reference).unwrap();
+        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let api = adapter_api(&operation, DispatchResult::Busy);
+        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
+        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            store,
+            execution,
             10,
         )
-        .unwrap()
-        {
-            Decision::Persist(operation) => operation,
-            decision => panic!("unexpected preparation decision: {decision:?}"),
-        };
-        operation = match decide_remove_replica(
-            &operation,
-            &observations,
-            &pod_identities(),
-            Some("secondary"),
-            10,
-        )
-        .unwrap()
-        {
-            Decision::Persist(operation) => operation,
-            decision => panic!("unexpected preparation decision: {decision:?}"),
-        };
-        let addressed = observations
-            .iter()
-            .map(|(replica_id, observation)| (*replica_id, observation.status.instance_id.clone()))
-            .collect();
-        let resolver = RemoveReplicaPreparedActivityResolver::new(
-            &operation,
-            &observations,
-            &pod_identities(),
-            Some("secondary"),
-            &addressed,
-            10,
-        );
-        let logical = logical_boundary(&operation);
-        assert!(resolver.prepare(&logical).is_ok());
+        .unwrap();
+
+        adapter.prepare().await.unwrap();
+        let evidence = adapter.evidence().unwrap();
+        let (reconstructed, pods) = evidence.reconstruct(&adapter.operation).unwrap();
+        assert_eq!(reconstructed.len(), 3);
+        assert_eq!(pods, pod_identities());
+        assert_eq!(adapter.context().unwrap().handles.len(), 3);
     }
 
-    #[test]
-    fn framework_native_remove_replica_fr019_exact_effect_dispatch() {
-        let (operation, observations) = freeze_and_dispatch();
-        let addressed = observations
-            .iter()
-            .map(|(replica_id, observation)| (*replica_id, observation.status.instance_id.clone()))
-            .collect();
-        let resolver = RemoveReplicaPreparedActivityResolver::new(
-            &operation,
-            &observations,
-            &pod_identities(),
-            Some("secondary"),
-            &addressed,
+    #[tokio::test]
+    async fn framework_native_remove_replica_fr019_authority_and_preparation() {
+        let reference = reference();
+        let set = adapter_set(&reference);
+        let pods = adapter_pods();
+        let current_pods = adapter_current_pods(&pods);
+        let execution = execution_spec(&reference).unwrap();
+        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let api = adapter_api(&operation, DispatchResult::Busy);
+        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
+        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            store,
+            execution,
             10,
+        )
+        .unwrap();
+
+        adapter.prepare().await.unwrap();
+        let logical = activity_spec(&logical_boundary(&adapter.operation)).unwrap();
+        let prepared = adapter.resolver().resolve(&logical, None).unwrap();
+        let RemoveReplicaBoundaryInput::Observe { .. } =
+            decode_boundary_input(prepared.input()).unwrap()
+        else {
+            panic!("first prepared boundary must collect authoritative observations");
+        };
+    }
+
+    #[tokio::test]
+    async fn framework_native_remove_replica_fr019_exact_effect_dispatch_and_quarantine() {
+        let reference = reference();
+        let set = adapter_set(&reference);
+        let pods = adapter_pods();
+        let current_pods = adapter_current_pods(&pods);
+        let execution = execution_spec(&reference).unwrap();
+        let operation = reconstruct_initial_operation(&reference.input).unwrap();
+        let api = adapter_api(&operation, DispatchResult::Ambiguous);
+        let backend = InMemoryCheckpointStore::new();
+        let store = adapter_store(&execution, backend.clone());
+        let mut host = RemoveReplicaHost::new(
+            store.clone(),
+            HostEpoch::from_bytes([44; 16]),
+            checkpoint_limits(),
         );
-        let prepared = resolver.prepare(&logical_boundary(&operation)).unwrap();
+        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            store,
+            execution.clone(),
+            10,
+        )
+        .unwrap();
+
+        let outcome = DurableRunner::new(REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
+            .unwrap()
+            .run(
+                &mut host,
+                &RemoveReplicaWorkflow,
+                execution.clone(),
+                &mut adapter,
+                10,
+            )
+            .await;
         assert!(matches!(
-            prepared,
+            outcome,
+            DurableRunnerOutcome::Active {
+                reason: DurableActiveReason::Adapter,
+                ref condition_reason,
+                ..
+            } if condition_reason == "EffectExposed"
+        ));
+        assert_eq!(api.requests.lock().unwrap().len(), 1);
+        let stored = backend
+            .load(execution.execution_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(&execution, checkpoint_limits())
+            .unwrap();
+        let last = payload.active_activities().unwrap().last().unwrap();
+        assert!(matches!(
+            last.state(),
+            kuberic_durable_execution::ActivityState::DispatchExposed { .. }
+        ));
+        assert!(matches!(
+            decode_boundary_input(last.input()).unwrap(),
             RemoveReplicaBoundaryInput::ReplicaCommand { .. }
         ));
-        validate_prepared_activity(&operation, &prepared).unwrap();
+
+        let exposed_operation =
+            replay_active_operation(&reference, payload.active_activities().unwrap()).unwrap();
+        let action_id = exposed_operation
+            .remove_intent
+            .as_ref()
+            .unwrap()
+            .action_id
+            .clone();
+        api.statuses
+            .lock()
+            .unwrap()
+            .get_mut(&exposed_operation.old_primary_id)
+            .unwrap()
+            .agent
+            .current_action = Some(completed_action(&exposed_operation, action_id));
+        let reloaded_store = adapter_store(&execution, backend);
+        let mut reloaded_host = RemoveReplicaHost::new(
+            reloaded_store.clone(),
+            HostEpoch::from_bytes([45; 16]),
+            checkpoint_limits(),
+        );
+        let mut reloaded_adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            reloaded_store,
+            execution.clone(),
+            10,
+        )
+        .unwrap();
+        let recovered = DurableRunner::new(REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
+            .unwrap()
+            .run(
+                &mut reloaded_host,
+                &RemoveReplicaWorkflow,
+                execution,
+                &mut reloaded_adapter,
+                10,
+            )
+            .await;
+        assert!(
+            matches!(
+                &recovered,
+                DurableRunnerOutcome::Active {
+                    reason: DurableActiveReason::Adapter,
+                    condition_reason,
+                    ..
+                } if condition_reason == "RefreshingAuthority"
+            ),
+            "unexpected quarantine recovery outcome: {recovered:?}"
+        );
+        assert_eq!(
+            api.requests.lock().unwrap().len(),
+            1,
+            "quarantine recovery must not redispatch the exposed command"
+        );
     }
 
     #[test]
     fn framework_native_remove_replica_fr019_deadline_policy() {
-        let (operation, _) = freeze_and_dispatch();
+        let reference = reference();
+        let set = adapter_set(&reference);
+        let pods = adapter_pods();
+        let current_pods = adapter_current_pods(&pods);
+        let execution = execution_spec(&reference).unwrap();
+        let (operation, _) = freeze_and_dispatch_for(&reference);
+        let api = adapter_api(&operation, DispatchResult::Busy);
+        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
+        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            store,
+            execution,
+            10,
+        )
+        .unwrap();
+        adapter.operation = operation;
+        let wait = adapter.preparation_wait(&CheckpointError::PreparedActivityRejected(
+            PreparedActivityError::Validation,
+        ));
+        assert_eq!(wait.reason, "AwaitingFreshAuthority");
+        assert_eq!(wait.requeue_after_seconds, Some(1));
         assert_eq!(
-            operation
+            adapter.deadline_unix_seconds(),
+            adapter
+                .operation
                 .pending_action
                 .as_ref()
                 .map(|pending| pending.deadline_unix_seconds)
-                .unwrap_or(operation.phase_deadline_unix_seconds),
-            operation
-                .pending_action
-                .as_ref()
-                .unwrap()
-                .deadline_unix_seconds
+                .unwrap_or(adapter.operation.phase_deadline_unix_seconds)
         );
     }
 
     #[test]
     fn framework_native_remove_replica_fr019_terminal_validation() {
         let reference = reference();
-        let (mut operation, _) = freeze_and_dispatch_for(&reference);
-        let intent = operation.remove_intent.as_ref().unwrap().clone();
-        operation.phase = DurableOperationPhase::Completed;
-        operation.pending_action = None;
-        operation.committed_snapshot = Some(operation.target_snapshot.clone());
-        operation.remove_commit_evidence = Some(RemoveReplicaCommitEvidenceStatus {
-            attempt_id: intent.attempt_id,
-            action_id: intent.action_id,
-            primary_agent_generation: intent.primary_agent_generation,
-            configuration_signature: core_intent(&operation)
-                .unwrap()
-                .reduced_current_configuration
-                .signature(),
-            observed_unix_seconds: 10,
-        });
-        operation.remove_cleanup = Some(RemoveReplicaCleanupStatus {
-            connection_absent: true,
-            target_retirement: Some(TargetRetirementObservationStatus::Completed),
-            target_labels_fenced: true,
-            target_pod_deleted: true,
-        });
+        let set = adapter_set(&reference);
+        let pods = adapter_pods();
+        let current_pods = adapter_current_pods(&pods);
+        let execution = execution_spec(&reference).unwrap();
+        let operation = committed_operation_for(&reference);
+        let api = adapter_api(&operation, DispatchResult::Busy);
+        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
+        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            store,
+            execution,
+            10,
+        )
+        .unwrap();
         let terminal = terminal_from_operation(&operation, Default::default()).unwrap();
         let outcome = encode_terminal(terminal);
-        validate_loaded_terminal(&reference, &outcome, 0).unwrap();
+        assert!(matches!(
+            adapter.validate_terminal(outcome.clone(), 0),
+            Ok(RemoveReplicaTerminal::Completed { .. })
+        ));
+        assert!(matches!(
+            adapter.validate_terminal(outcome, 1),
+            Err(DurableAdapterBoundary::Rejected(_))
+        ));
     }
 
-    #[test]
-    fn framework_native_remove_replica_fr019_publication_handoff() {
-        let terminal = RemoveReplicaTerminal::Compensated {
-            message: "safe".to_string(),
-            accounting: Default::default(),
-        };
+    #[tokio::test]
+    async fn framework_native_remove_replica_fr019_publication_handoff() {
+        let reference = reference();
+        let set = adapter_set(&reference);
+        let pods = adapter_pods();
+        let current_pods = adapter_current_pods(&pods);
+        let execution = execution_spec(&reference).unwrap();
+        let operation = committed_operation_for(&reference);
+        let terminal = terminal_from_operation(&operation, Default::default()).unwrap();
+        let outcome = encode_terminal(terminal);
+        let checkpoint = CheckpointEnvelope::encode_with_limits(
+            &CheckpointPayload::terminal(
+                ExecutionContract::with_encoded_limits(
+                    execution.clone(),
+                    REMOVE_REPLICA_MAX_ACTIVE_ENCODED_BYTES as u64,
+                    REMOVE_REPLICA_MAX_TERMINAL_ENCODED_BYTES as u64,
+                ),
+                outcome,
+                0,
+            ),
+            checkpoint_limits(),
+        )
+        .unwrap();
+        let backend = InMemoryCheckpointStore::new();
         assert!(matches!(
-            terminal,
-            RemoveReplicaTerminal::Compensated { .. }
+            backend
+                .compare_and_swap(execution.execution_id(), None, checkpoint)
+                .await
+                .unwrap(),
+            CasOutcome::Accepted(_)
         ));
+        let store = adapter_store(&execution, backend);
+        let mut host = RemoveReplicaHost::new(
+            store.clone(),
+            HostEpoch::from_bytes([45; 16]),
+            checkpoint_limits(),
+        );
+        let api = adapter_api(&operation, DispatchResult::Busy);
+        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
+            &reference,
+            &set,
+            &current_pods,
+            &api,
+            store,
+            execution.clone(),
+            10,
+        )
+        .unwrap();
+        let published = DurableRunner::new(REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
+            .unwrap()
+            .run(
+                &mut host,
+                &RemoveReplicaWorkflow,
+                execution,
+                &mut adapter,
+                10,
+            )
+            .await;
+        assert!(matches!(
+            published,
+            DurableRunnerOutcome::Terminal(RemoveReplicaTerminal::Completed { .. })
+        ));
+        assert!(api.requests.lock().unwrap().is_empty());
     }
 
     #[test]

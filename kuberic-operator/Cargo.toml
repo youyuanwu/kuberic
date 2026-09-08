@@ -21,6 +21,7 @@ durable-remove-replica-pilot = [
     "kuberic-durable-execution/kubernetes",
     "dep:rand",
 ]
+native-remove-test-harness = ["durable-remove-replica-pilot"]
 
 [[bin]]
 name = "kuberic-operator"

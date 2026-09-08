@@ -667,6 +667,7 @@ mod checkpoint_store_tests {
         assert_eq!(measurements.completed_passive_observation_count, Some(1));
     }
 
+    #[cfg(feature = "durable-switchover-pilot")]
     async fn terminal_accounting_measurements(
         seed: u8,
         terminal_payload: &[u8],
@@ -677,11 +678,12 @@ mod checkpoint_store_tests {
             ExecutionSpec::new(execution_id, ExactBytes::new(b"workflow"), 128),
             100_000,
         );
-        let store = MeasuredDurableCheckpointStore::new(
+        let store = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
             DurableCheckpointStore::InMemory(
                 kuberic_durable_execution::InMemoryCheckpointStore::new(),
             ),
+            super::super::pilot::checkpoint_measurement_decoder(),
         );
         let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             contract,
@@ -699,6 +701,7 @@ mod checkpoint_store_tests {
         store.measurements()
     }
 
+    #[cfg(feature = "durable-switchover-pilot")]
     fn terminal_accounting_payload(
         compensated: bool,
         phase: &str,
@@ -752,6 +755,7 @@ mod checkpoint_store_tests {
         .unwrap()
     }
 
+    #[cfg(feature = "durable-switchover-pilot")]
     fn two_member_terminal_accounting_payload() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "status": "complete",
@@ -912,9 +916,15 @@ mod checkpoint_store_tests {
         let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"workflow"), 128);
         let contract = ExecutionContract::new(execution, 100_000);
         let backend = kuberic_durable_execution::InMemoryCheckpointStore::new();
-        let store = MeasuredDurableCheckpointStore::new(
+        let decoder = CheckpointMeasurementDecoder::new(
+            "fixture",
+            fixture_activity_decoder,
+            fixture_terminal_decoder,
+        );
+        let store = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
             DurableCheckpointStore::InMemory(backend.clone()),
+            decoder,
         );
         let active =
             CheckpointEnvelope::encode(&CheckpointPayload::active(contract.clone(), Vec::new()))
@@ -927,12 +937,10 @@ mod checkpoint_store_tests {
         else {
             panic!("active checkpoint was not accepted");
         };
-        let terminal_payload =
-            terminal_accounting_payload(false, "completed", Some(42), 1, None, 9, 3);
         let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             contract,
-            TerminalOutcome::succeeded(ExactBytes::new(terminal_payload)),
-            12,
+            TerminalOutcome::succeeded(ExactBytes::new(b"fixture")),
+            3,
         ))
         .unwrap();
         let terminal_bytes = terminal.encoded_len().unwrap();
@@ -954,30 +962,32 @@ mod checkpoint_store_tests {
             measurements.maximum_terminal_checkpoint_bytes,
             terminal_bytes
         );
-        assert_eq!(measurements.completed_activity_count, Some(12));
-        assert_eq!(measurements.completed_external_effect_count, Some(9));
-        assert_eq!(measurements.completed_passive_observation_count, Some(3));
+        assert_eq!(measurements.completed_activity_count, Some(3));
+        assert_eq!(measurements.completed_external_effect_count, Some(2));
+        assert_eq!(measurements.completed_passive_observation_count, Some(1));
 
-        let restarted = MeasuredDurableCheckpointStore::new(
+        let restarted = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
             DurableCheckpointStore::InMemory(backend),
+            decoder,
         );
         restarted.load(execution_id).await.unwrap();
         let reloaded = restarted.measurements();
-        assert_eq!(reloaded.completed_activity_count, Some(12));
+        assert_eq!(reloaded.completed_activity_count, Some(3));
         assert_eq!(
             reloaded.latest_terminal_checkpoint_bytes,
             Some(terminal_bytes)
         );
-        assert_eq!(reloaded.completed_external_effect_count, Some(9));
-        assert_eq!(reloaded.completed_passive_observation_count, Some(3));
+        assert_eq!(reloaded.completed_external_effect_count, Some(2));
+        assert_eq!(reloaded.completed_passive_observation_count, Some(1));
 
         let mismatched_execution_id = ExecutionId::from_bytes([11; 16]);
-        let mismatched_store = MeasuredDurableCheckpointStore::new(
+        let mismatched_store = MeasuredDurableCheckpointStore::with_decoder(
             mismatched_execution_id,
             DurableCheckpointStore::InMemory(
                 kuberic_durable_execution::InMemoryCheckpointStore::new(),
             ),
+            decoder,
         );
         let mismatched_contract = ExecutionContract::new(
             ExecutionSpec::new(mismatched_execution_id, ExactBytes::new(b"workflow"), 128),
@@ -985,16 +995,8 @@ mod checkpoint_store_tests {
         );
         let mismatched_terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             mismatched_contract,
-            TerminalOutcome::succeeded(ExactBytes::new(terminal_accounting_payload(
-                false,
-                "completed",
-                Some(42),
-                1,
-                None,
-                9,
-                3,
-            ))),
-            11,
+            TerminalOutcome::succeeded(ExactBytes::new(b"fixture")),
+            2,
         ))
         .unwrap();
         assert!(matches!(
@@ -1005,10 +1007,14 @@ mod checkpoint_store_tests {
             CasOutcome::Accepted(_)
         ));
         let mismatched = mismatched_store.measurements();
-        assert_eq!(mismatched.completed_activity_count, Some(11));
+        assert_eq!(mismatched.completed_activity_count, Some(2));
         assert_eq!(mismatched.completed_external_effect_count, None);
         assert_eq!(mismatched.completed_passive_observation_count, None);
+    }
 
+    #[cfg(feature = "durable-switchover-pilot")]
+    #[tokio::test]
+    async fn switchover_terminal_accounting_rejects_inconsistent_claims() {
         let wrong_split_payload =
             terminal_accounting_payload(false, "completed", Some(42), 1, None, 10, 2);
         let wrong_split = terminal_accounting_measurements(12, &wrong_split_payload, 12).await;

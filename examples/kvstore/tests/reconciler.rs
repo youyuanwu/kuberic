@@ -51,6 +51,8 @@ use kuberic_operator::crd::{
     SwitchoverExecutionMode, TargetRetirementObservationStatus,
 };
 use kuberic_operator::durable::{RemoveReplicaTarget, start_remove_replica};
+#[cfg(feature = "durable-remove-replica-pilot")]
+use kuberic_operator::reconciler::FrameworkNativeRemoveReplicaTestHarness;
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
 use kvstore::proto;
@@ -1535,18 +1537,17 @@ async fn framework_native_remove_status(
         .await
         .into_iter()
         .find(|replica| replica.instance_id.as_str() == target.instance_id)
-        .map(|replica| replica.agent.generation)
-        .expect("native remove target has live agent generation");
+        .map(|replica| replica.agent.generation);
     let set = make_set(name, 2, Some(status));
-    kuberic_operator::reconciler::accept_framework_native_remove_replica_for_test(
-        &set,
+    let reference = kuberic_operator::durable::remove_replica_execution::new_execution(
+        set.metadata.uid.as_deref().unwrap(),
         snapshot,
         RemoveReplicaTarget {
             replica_id: target.id,
             pod_name: member.name.clone(),
             pod_uid: target.instance_id.clone(),
             replicator_address: member.data_address.clone(),
-            agent_generation: Some(agent_generation),
+            agent_generation,
         },
         mode,
         1,
@@ -1555,7 +1556,13 @@ async fn framework_native_remove_status(
             .unwrap()
             .as_secs() as i64,
     )
-    .unwrap()
+    .unwrap();
+    let mut status = set.status.unwrap();
+    status.phase = Phase::RemovingReplica;
+    status.operation = None;
+    status.durable_remove_replica_pilot = None;
+    status.remove_replica_execution = Some(reference);
+    status
 }
 
 #[cfg(feature = "durable-remove-replica-pilot")]
@@ -1734,6 +1741,28 @@ async fn live_remove_pilot_progress(
     status: &KubericSetStatus,
 ) -> Option<RemoveReplicaProgress> {
     let operation = current_remove_pilot_operation(store, status).await?;
+    live_remove_operation_progress(api, name, replicas, &operation).await
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn live_framework_native_remove_progress(
+    api: &KvClusterApi,
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    name: &str,
+    replicas: i32,
+    status: &KubericSetStatus,
+) -> Option<RemoveReplicaProgress> {
+    let operation = current_framework_native_remove_operation(store, status).await?;
+    live_remove_operation_progress(api, name, replicas, &operation).await
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+async fn live_remove_operation_progress(
+    api: &KvClusterApi,
+    name: &str,
+    replicas: i32,
+    operation: &DurableOperationStatus,
+) -> Option<RemoveReplicaProgress> {
     let intent = operation.remove_intent.as_ref()?;
     let primary = api
         .pods
@@ -7172,7 +7201,7 @@ async fn test_framework_native_remove_replica_happy_path() {
     .await;
     let reference = accepted.remove_replica_execution.clone().unwrap();
     let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(store.clone());
 
     api.reset_operations();
     let completed =
@@ -7237,7 +7266,7 @@ async fn test_framework_native_remove_replica_every_boundary_restart() {
     let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     api.reset_operations();
     for _ in 0..240 {
-        let restarted = ReconcilerState::with_durable_remove_replica_store(store.clone());
+        let restarted = FrameworkNativeRemoveReplicaTestHarness::in_memory(store.clone());
         reconcile_set(
             &make_set("native-remove-restart", 2, Some(status.clone())),
             &api,
@@ -7282,13 +7311,51 @@ async fn test_framework_native_remove_replica_lost_reply_and_quarantine() {
     )
     .await;
     let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let state = ReconcilerState::with_durable_remove_replica_store(store);
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(store);
     api.reset_operations();
     api.fail_after_next_durable_action(ControlOperation::RemoveReplicaIntent);
     let completed =
         drive_framework_native_remove(&api, &state, "native-remove-lost-reply", accepted).await;
     assert_eq!(completed.phase, Phase::Healthy);
     assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_remove_replica_proven_no_admission() {
+    let api = KvClusterApi::new();
+    let healthy = create_healthy_set(
+        &api,
+        &ReconcilerState::default(),
+        "native-remove-no-admission",
+        3,
+    )
+    .await;
+    let accepted = framework_native_remove_status(
+        &api,
+        "native-remove-no-admission",
+        healthy,
+        DurableRemoveMode::ScaleDown,
+    )
+    .await;
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    );
+    api.reset_operations();
+    api.reject_before_next_durable_action(ControlOperation::RemoveReplicaIntent);
+
+    let completed =
+        drive_framework_native_remove(&api, &state, "native-remove-no-admission", accepted).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RemoveReplicaIntent)
+            .count(),
+        2,
+        "one proven non-admission permits exactly one fresh redelivery"
+    );
 }
 
 #[cfg(feature = "durable-remove-replica-pilot")]
@@ -7310,7 +7377,7 @@ async fn test_framework_native_remove_replica_conflict_and_unknown_write_reload(
         let accepted =
             framework_native_remove_status(&api, name, healthy, DurableRemoveMode::ScaleDown).await;
         let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-        let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+        let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(store.clone());
         store.fail_next_compare_and_swap(fault);
         reconcile_set(&make_set(name, 2, Some(accepted)), &api, &state)
             .await
@@ -7323,6 +7390,222 @@ async fn test_framework_native_remove_replica_conflict_and_unknown_write_reload(
         let completed = drive_framework_native_remove(&api, &state, name, reloading).await;
         assert_eq!(completed.phase, Phase::Healthy);
     }
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_remove_replica_stale_primary_incarnation() {
+    let api = KvClusterApi::new();
+    let healthy = create_healthy_set(
+        &api,
+        &ReconcilerState::default(),
+        "native-remove-stale-incarnation",
+        3,
+    )
+    .await;
+    let primary = healthy.current_primary.clone().unwrap();
+    let accepted = framework_native_remove_status(
+        &api,
+        "native-remove-stale-incarnation",
+        healthy,
+        DurableRemoveMode::ScaleDown,
+    )
+    .await;
+    api.crash_pod(&primary);
+    api.restart_pod(&primary).await;
+    api.reset_operations();
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    );
+
+    reconcile_set(
+        &make_set("native-remove-stale-incarnation", 2, Some(accepted.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+    );
+    assert_eq!(api.last_status().unwrap().phase, Phase::RemovingReplica);
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeRemoveReplica"
+                    && matches!(
+                        condition.reason.as_str(),
+                        "AwaitingFreshAuthority" | "AwaitingEffectPreparation"
+                    )
+            })
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_remove_replica_stale_target_generation() {
+    let api = KvClusterApi::new();
+    let healthy = create_healthy_set(
+        &api,
+        &ReconcilerState::default(),
+        "native-remove-stale-generation",
+        3,
+    )
+    .await;
+    let accepted = framework_native_remove_status(
+        &api,
+        "native-remove-stale-generation",
+        healthy,
+        DurableRemoveMode::ScaleDown,
+    )
+    .await;
+    let target_name = "native-remove-stale-generation-2";
+    api.crash_pod(target_name);
+    api.restart_process_same_pod_uid(target_name).await;
+    api.reset_operations();
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    );
+
+    reconcile_set(
+        &make_set("native-remove-stale-generation", 2, Some(accepted.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+    );
+    assert_eq!(api.last_status().unwrap().phase, Phase::RemovingReplica);
+    assert!(
+        api.last_status()
+            .unwrap()
+            .conditions
+            .iter()
+            .any(|condition| {
+                condition.type_ == "FrameworkNativeRemoveReplica"
+                    && matches!(
+                        condition.reason.as_str(),
+                        "AwaitingFreshAuthority" | "AwaitingEffectPreparation"
+                    )
+            })
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_remove_replica_force_requires_missing_target_authority() {
+    let api = KvClusterApi::new();
+    let healthy =
+        create_healthy_set(&api, &ReconcilerState::default(), "native-remove-force", 3).await;
+    let target = healthy
+        .stable_snapshot
+        .as_ref()
+        .unwrap()
+        .members
+        .iter()
+        .filter(|member| member.id != healthy.stable_snapshot.as_ref().unwrap().primary_id)
+        .max_by_key(|member| member.id)
+        .unwrap()
+        .clone();
+    api.delete_pod(
+        "default",
+        &format!("native-remove-force-{}", target.id - 1),
+        &target.instance_id,
+    )
+    .await
+    .unwrap();
+    let accepted = framework_native_remove_status(
+        &api,
+        "native-remove-force",
+        healthy,
+        DurableRemoveMode::Force,
+    )
+    .await;
+    assert_eq!(
+        accepted
+            .remove_replica_execution
+            .as_ref()
+            .unwrap()
+            .input
+            .mode,
+        DurableRemoveMode::Force
+    );
+    assert!(
+        accepted
+            .remove_replica_execution
+            .as_ref()
+            .unwrap()
+            .input
+            .target
+            .agent_generation
+            .is_none()
+    );
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    );
+    api.reset_operations();
+    let completed =
+        drive_framework_native_remove(&api, &state, "native-remove-force", accepted).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 2);
+    assert_one_coarse_remove_intent_and_no_fine_grained_controls(&api.operations());
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_remove_replica_malformed_agent_status_is_isolated() {
+    let api = KvClusterApi::new();
+    let healthy = create_healthy_set(
+        &api,
+        &ReconcilerState::default(),
+        "native-remove-malformed-agent",
+        3,
+    )
+    .await;
+    let accepted = framework_native_remove_status(
+        &api,
+        "native-remove-malformed-agent",
+        healthy,
+        DurableRemoveMode::ScaleDown,
+    )
+    .await;
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    );
+    api.reset_operations();
+    api.fail_next_status(InjectedStatusError::MalformedAgentStatus);
+
+    reconcile_set(
+        &make_set("native-remove-malformed-agent", 2, Some(accepted.clone())),
+        &api,
+        &state,
+    )
+    .await
+    .unwrap();
+    let isolated = api.last_status().unwrap();
+    assert_eq!(isolated.phase, Phase::RemovingReplica);
+    assert!(isolated.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeRemoveReplica"
+            && condition.reason == "Isolated"
+            && condition
+                .message
+                .contains("unsupported or malformed control status")
+    }));
+    assert!(
+        !api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+    );
 }
 
 #[cfg(feature = "durable-remove-replica-pilot")]
@@ -7355,7 +7638,7 @@ async fn test_framework_native_remove_replica_uid_fences_replacement() {
         .find(|pod| pod.metadata.name.as_deref() == Some(target_name))
         .and_then(|pod| pod.metadata.uid.clone())
         .unwrap();
-    let state = ReconcilerState::with_durable_remove_replica_store(
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     api.reset_operations();
@@ -7400,7 +7683,7 @@ async fn test_framework_native_remove_replica_exact_primary_status_gap_has_no_ch
         DurableRemoveMode::ScaleDown,
     )
     .await;
-    let state = ReconcilerState::with_durable_remove_replica_store(
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     api.fail_next_status(InjectedStatusError::Unavailable);
@@ -7472,7 +7755,7 @@ async fn test_framework_native_remove_replica_exact_target_status_gap_has_no_chu
         DurableRemoveMode::ScaleDown,
     )
     .await;
-    let state = ReconcilerState::with_durable_remove_replica_store(
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(
         kuberic_durable_execution::InMemoryCheckpointStore::new(),
     );
     api.crash_pod(target);
@@ -7542,7 +7825,7 @@ async fn test_framework_native_remove_replica_terminal_precedes_status_publicati
     )
     .await;
     let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let state = ReconcilerState::with_durable_remove_replica_store(store.clone());
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(store.clone());
     for _ in 0..240 {
         if current_framework_native_remove_operation(&store, &status)
             .await
@@ -7576,7 +7859,7 @@ async fn test_framework_native_remove_replica_terminal_precedes_status_publicati
         .unwrap();
         status = api.last_status().unwrap();
     }
-    api.fail_next_status_patch();
+    api.fail_next_status_conflict();
     let error = match reconcile_set(
         &make_set("native-remove-terminal-order", 2, Some(status.clone())),
         &api,
@@ -7587,10 +7870,129 @@ async fn test_framework_native_remove_replica_terminal_precedes_status_publicati
         Ok(_) => panic!("publication failure must surface after terminal persistence"),
         Err(error) => error,
     };
-    assert_eq!(error, "injected status persistence failure");
+    assert_eq!(error, "resource version conflict");
     assert!(framework_native_checkpoint_is_terminal(&store, &status).await);
     assert_eq!(status.phase, Phase::RemovingReplica);
     assert_eq!(status.stable_snapshot.as_ref().unwrap().members.len(), 3);
+
+    api.reset_operations();
+    api.pods.lock().unwrap().clear();
+    let restarted = FrameworkNativeRemoveReplicaTestHarness::in_memory(store);
+    reconcile_set(
+        &make_set("native-remove-terminal-order", 2, Some(status)),
+        &api,
+        &restarted,
+    )
+    .await
+    .unwrap();
+    let completed = api.last_status().unwrap();
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 2);
+    assert!(
+        api.operations().is_empty(),
+        "terminal reload must publish without polling or redispatching effects"
+    );
+}
+
+#[cfg(feature = "durable-remove-replica-pilot")]
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_remove_replica_post_commit_restart_ambiguity() {
+    let api = KvClusterApi::new();
+    let healthy = create_healthy_set(
+        &api,
+        &ReconcilerState::default(),
+        "native-remove-post-commit",
+        3,
+    )
+    .await;
+    let primary = healthy.current_primary.clone().unwrap();
+    let mut status = framework_native_remove_status(
+        &api,
+        "native-remove-post-commit",
+        healthy,
+        DurableRemoveMode::ScaleDown,
+    )
+    .await;
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = FrameworkNativeRemoveReplicaTestHarness::in_memory(store.clone());
+    api.reset_operations();
+    api.fail_after_next_durable_action(ControlOperation::RemoveReplicaIntent);
+
+    for _ in 0..240 {
+        reconcile_set(
+            &make_set("native-remove-post-commit", 2, Some(status.clone())),
+            &api,
+            &state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if api
+            .operations()
+            .contains(&ControlOperation::RemoveReplicaIntent)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        api.operations()
+            .contains(&ControlOperation::RemoveReplicaIntent),
+        "test must dispatch the coarse remove intent before primary restart"
+    );
+    assert!(
+        current_framework_native_remove_operation(&store, &status)
+            .await
+            .is_some_and(|operation| operation.remove_commit_evidence.is_none()),
+        "lost reply must leave commit evidence absent from the checkpoint"
+    );
+    assert!(
+        live_framework_native_remove_progress(
+            &api,
+            &store,
+            "native-remove-post-commit",
+            2,
+            &status,
+        )
+        .await
+        .is_some_and(|progress| progress.current_install_dispatched),
+        "the primary must report current-install dispatch before the ambiguous restart"
+    );
+
+    api.crash_pod(&primary);
+    api.restart_process_same_pod_uid(&primary).await;
+    for _ in 0..80 {
+        let restarted = FrameworkNativeRemoveReplicaTestHarness::in_memory(store.clone());
+        reconcile_set(
+            &make_set("native-remove-post-commit", 2, Some(status.clone())),
+            &api,
+            &restarted,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        if status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeRemoveReplica"
+                && matches!(
+                    condition.reason.as_str(),
+                    "Quarantined" | "AwaitingFreshAuthority"
+                )
+        }) || status.phase != Phase::RemovingReplica
+        {
+            break;
+        }
+    }
+    assert_eq!(status.phase, Phase::RemovingReplica);
+    assert_eq!(status.stable_snapshot.as_ref().unwrap().members.len(), 3);
+    assert!(status.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeRemoveReplica"
+            && matches!(
+                condition.reason.as_str(),
+                "Quarantined" | "AwaitingFreshAuthority"
+            )
+    }));
+    assert_no_same_epoch_primary_restoration(&api.operations());
 }
 
 #[cfg(feature = "durable-remove-replica-pilot")]

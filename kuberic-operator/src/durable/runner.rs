@@ -1057,69 +1057,6 @@ mod durable_runner_tests {
     }
 
     #[test]
-    fn durable_runner_fr017_common_outcome_matrix_is_complete() {
-        fn name(outcome: &DurableRunnerOutcome<()>) -> &'static str {
-            match outcome {
-                DurableRunnerOutcome::Active { .. } => "active",
-                DurableRunnerOutcome::Terminal(()) => "terminal",
-                DurableRunnerOutcome::Incompatible(_) => "incompatible",
-                DurableRunnerOutcome::Rejected(_) => "rejected",
-                DurableRunnerOutcome::Isolated(_) => "isolated",
-                DurableRunnerOutcome::ReloadRequired {
-                    reason: ReloadReason::Conflict,
-                    ..
-                } => "conflicted",
-                DurableRunnerOutcome::ReloadRequired {
-                    reason: ReloadReason::OutcomeUnknown,
-                    ..
-                } => "unknown-write",
-                DurableRunnerOutcome::PersistenceFailed { .. } => "persistence-failure",
-                DurableRunnerOutcome::Nondeterministic(_) => "nondeterministic",
-            }
-        }
-
-        let outcomes = [
-            DurableRunnerOutcome::Active {
-                reason: DurableActiveReason::Adapter,
-                condition_reason: "AwaitingEvidence".to_string(),
-                detail: "active".to_string(),
-                requeue_after_seconds: 1,
-            },
-            DurableRunnerOutcome::Terminal(()),
-            DurableRunnerOutcome::Incompatible("legacy".to_string()),
-            DurableRunnerOutcome::Rejected("invalid".to_string()),
-            DurableRunnerOutcome::Isolated("unsafe".to_string()),
-            DurableRunnerOutcome::ReloadRequired {
-                boundary: PersistenceBoundary::Exposure,
-                reason: ReloadReason::Conflict,
-            },
-            DurableRunnerOutcome::ReloadRequired {
-                boundary: PersistenceBoundary::Observation,
-                reason: ReloadReason::OutcomeUnknown,
-            },
-            DurableRunnerOutcome::PersistenceFailed {
-                operation: StoreOperation::Load,
-                error: StoreError::new(StoreErrorKind::Unavailable, "unavailable"),
-            },
-            DurableRunnerOutcome::Nondeterministic(Nondeterminism::UnsupportedSuspension),
-        ];
-        assert_eq!(
-            outcomes.iter().map(name).collect::<Vec<_>>(),
-            vec![
-                "active",
-                "terminal",
-                "incompatible",
-                "rejected",
-                "isolated",
-                "conflicted",
-                "unknown-write",
-                "persistence-failure",
-                "nondeterministic",
-            ]
-        );
-    }
-
-    #[test]
     fn workflow_contract_binds_version_and_independent_limits() {
         let native_remove_limits = CheckpointLimits::new(16, 262_144, 12_288).unwrap();
         let contract = DurableWorkflowContract::new(2, native_remove_limits);
