@@ -706,6 +706,23 @@ fn legacy_single_limit_contract_and_versioned_limits_fail_closed_before_polling(
         )
     ));
     assert_eq!(versioned_workflow.polls.get(), 0);
+
+    let active_limit_changed_workflow = PollCountingWorkflow {
+        polls: Cell::new(0),
+    };
+    assert!(matches!(
+        evaluate_with_spec(
+            &active_limit_changed_workflow,
+            &execution,
+            Some(&versioned),
+            CheckpointLimits::new(1, 262_145, 12_288).unwrap(),
+        ),
+        Evaluation::CheckpointRejected(CheckpointError::ConfiguredCapacityAboveAdmission {
+            configured: 262_145,
+            admitted: 262_144,
+        })
+    ));
+    assert_eq!(active_limit_changed_workflow.polls.get(), 0);
 }
 
 #[test]

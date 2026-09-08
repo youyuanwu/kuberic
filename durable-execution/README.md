@@ -77,9 +77,10 @@ mismatch is nondeterminism rather than a new dispatch.
 Format version 3 stores JSON payload bytes in a versioned
 `CheckpointEnvelope`. An immutable `ExecutionSpec` declares execution
 identity, exact workflow input, and the maximum exact-byte terminal payload.
-The persisted execution contract also records the encoded-checkpoint capacity
-under which terminal state was admitted. Every load validates that authority
-and rejects a smaller current limit before workflow polling.
+The persisted execution contract also records the active and terminal
+encoded-checkpoint capacities under which the execution was admitted. Every
+load validates that authority and rejects either changed limit before workflow
+polling.
 
 The payload has exactly one explicit lifecycle state:
 
@@ -115,9 +116,8 @@ base64/JSON length arithmetic without allocating the declared payload. The
 larger form must fit the configured terminal encoded limit. The active and
 terminal capacities are persisted as immutable admission authority. Capacity
 failure therefore precedes even the first schedule and every possible
-external-effect permit. Later hosts may use equal or larger limits, but not
-smaller ones; changing either lifecycle limit for a versioned operation
-without a contract-version change is incompatible.
+external-effect permit. Later hosts must use the same admitted limits; changing either lifecycle limit
+for a versioned operation without a contract-version change is incompatible.
 
 Before committing dispatch exposure, the host projects the completed
 checkpoint containing a result at exactly the activity's declared maximum.

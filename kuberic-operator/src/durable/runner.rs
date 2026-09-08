@@ -2,10 +2,10 @@
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityObservation, AttemptId, CheckpointError, CheckpointLimits, CheckpointStore,
-    ExecutionSpec, HostOutcome, LogicalActivityId, Nondeterminism, ObservationRejection,
-    PersistenceBoundary, PreparedActivityResolver, ReloadReason, StoreError, StoreOperation,
-    TerminalCheckpointStatus, TerminalOutcome, Workflow,
+    ActivityObservation, AttemptId, CheckpointError, CheckpointLimits, CheckpointPayload,
+    CheckpointStore, ExecutionSpec, HostOutcome, LogicalActivityId, Nondeterminism,
+    ObservationRejection, PersistenceBoundary, PreparedActivityResolver, ReloadReason, StoreError,
+    StoreOperation, TerminalCheckpointStatus, TerminalOutcome, Workflow,
 };
 use thiserror::Error;
 
@@ -110,6 +110,16 @@ pub trait DurableOperationAdapter: Send {
     /// Validate operation authority and resolve a logical request to its exact
     /// durable boundary command.
     fn resolver(&self) -> &Self::Resolver;
+
+    /// Restore operation-specific replay state from the checkpoint loaded by
+    /// the runner. The runner remains the sole owner of lifecycle loading and
+    /// error classification.
+    fn restore(
+        &mut self,
+        _checkpoint: Option<&CheckpointPayload>,
+    ) -> Result<(), DurableAdapterBoundary> {
+        Ok(())
+    }
 
     /// Collect operation-specific evidence only after the runner proves the
     /// authoritative checkpoint is not terminal.
@@ -234,7 +244,7 @@ impl DurableRunner {
                 };
             }
         };
-        if let Some(stored) = loaded {
+        let checkpoint = if let Some(stored) = loaded.as_ref() {
             let payload = match stored
                 .checkpoint()
                 .decode_and_validate(&execution, host.checkpoint_limits())
@@ -265,6 +275,14 @@ impl DurableRunner {
                         .into_result(),
                 };
             }
+            Some(payload)
+        } else {
+            None
+        };
+        if let Err(boundary) = adapter.restore(checkpoint.as_ref()) {
+            return self
+                .handle_adapter_boundary(boundary, adapter, now_unix_seconds)
+                .into_result();
         }
         if let Err(boundary) = adapter.prepare().await {
             return self

@@ -23,7 +23,7 @@ use kuberic_core::types::{
 use kuberic_durable_execution::{
     ActivityName, ActivityObservation, ActivityRecord, ActivitySequence, ActivitySpec,
     ActivityState, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload,
-    CheckpointStore, DurableActivity, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
+    DurableActivity, ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec,
     InMemoryCheckpointStore, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, LogicalActivityId,
     PreparedActivityError, PreparedActivityResolver, TerminalOutcome, Workflow, WorkflowContext,
@@ -45,7 +45,6 @@ use crate::crd::{
 
 use super::checkpoint_store::{
     CheckpointMeasurementDecoder, DurableActivityAccounting, DurableActivityClass,
-    MeasuredDurableCheckpointStore,
 };
 use super::effects::{
     DeleteEffectCommand, DispatchFailureDisposition, DurableEffectOutcome,
@@ -2540,8 +2539,6 @@ pub struct FrameworkNativeRemoveReplicaAdapter<'a> {
     current_pods: &'a [(i64, ReplicaInstanceId, &'a Pod)],
     api: &'a dyn ClusterApi,
     namespace: String,
-    store: MeasuredDurableCheckpointStore,
-    execution: ExecutionSpec,
     operation: DurableOperationStatus,
     operation_history: Vec<DurableOperationStatus>,
     resolver: RemoveReplicaPreparedActivityResolver,
@@ -2556,8 +2553,6 @@ impl<'a> FrameworkNativeRemoveReplicaAdapter<'a> {
         set: &'a KubericSet,
         current_pods: &'a [(i64, ReplicaInstanceId, &'a Pod)],
         api: &'a dyn ClusterApi,
-        store: MeasuredDurableCheckpointStore,
-        execution: ExecutionSpec,
         now: i64,
     ) -> Result<Self, String> {
         let operation =
@@ -2571,8 +2566,6 @@ impl<'a> FrameworkNativeRemoveReplicaAdapter<'a> {
             current_pods,
             api,
             namespace: set.namespace().unwrap_or_default(),
-            store,
-            execution,
             resolver: RemoveReplicaPreparedActivityResolver::new(
                 &operation,
                 &empty_observations,
@@ -2685,28 +2678,16 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
         &self.resolver
     }
 
-    async fn prepare(&mut self) -> Result<(), DurableAdapterBoundary> {
-        let loaded = self
-            .store
-            .load(self.execution.execution_id())
-            .await
-            .map_err(|error| {
-                DurableAdapterBoundary::Isolated(format!(
-                    "load native remove checkpoint for adapter preparation: {error}"
-                ))
-            })?;
-        let (operation, history) = match loaded {
-            Some(stored) => {
-                let payload = stored
-                    .checkpoint()
-                    .decode_and_validate(&self.execution, checkpoint_limits())
-                    .map_err(|error| DurableAdapterBoundary::Rejected(error.to_string()))?;
-                replay_active_operation_history(
-                    self.reference,
-                    payload.active_activities().unwrap_or_default(),
-                )
-                .map_err(DurableAdapterBoundary::Isolated)?
-            }
+    fn restore(
+        &mut self,
+        checkpoint: Option<&CheckpointPayload>,
+    ) -> Result<(), DurableAdapterBoundary> {
+        let (operation, history) = match checkpoint {
+            Some(payload) => replay_active_operation_history(
+                self.reference,
+                payload.active_activities().unwrap_or_default(),
+            )
+            .map_err(DurableAdapterBoundary::Isolated)?,
             None => {
                 let admission =
                     admission_input(self.reference).map_err(DurableAdapterBoundary::Rejected)?;
@@ -2720,6 +2701,10 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
         };
         self.operation = operation;
         self.operation_history = history;
+        Ok(())
+    }
+
+    async fn prepare(&mut self) -> Result<(), DurableAdapterBoundary> {
         let context =
             collect_runner_context(&self.operation, self.set, self.api, self.current_pods)
                 .await
@@ -2988,6 +2973,7 @@ impl DurableOperationAdapter for FrameworkNativeRemoveReplicaAdapter<'_> {
             | CheckpointError::WorkflowInputMismatch { .. }
             | CheckpointError::TerminalPayloadBoundMismatch { .. }
             | CheckpointError::ConfiguredCapacityBelowAdmission { .. }
+            | CheckpointError::ConfiguredCapacityAboveAdmission { .. }
             | CheckpointError::TerminalEncodedCheckpointCapacityMismatch { .. } => {
                 DurableCheckpointDisposition::Incompatible
             }
@@ -5221,17 +5207,9 @@ mod remove_replica_execution_tests {
         let execution = execution_spec(&reference).unwrap();
         let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let api = adapter_api(&operation, DispatchResult::Busy);
-        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
-        let adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            store,
-            execution.clone(),
-            10,
-        )
-        .unwrap();
+        let adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
 
         assert_eq!(
             adapter.checkpoint_disposition(&CheckpointError::UnsupportedFormat {
@@ -5264,20 +5242,11 @@ mod remove_replica_execution_tests {
         let set = adapter_set(&reference);
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
-        let execution = execution_spec(&reference).unwrap();
         let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let api = adapter_api(&operation, DispatchResult::Busy);
-        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
-        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            store,
-            execution,
-            10,
-        )
-        .unwrap();
+        let mut adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
 
         adapter.prepare().await.unwrap();
         let evidence = adapter.evidence().unwrap();
@@ -5293,20 +5262,11 @@ mod remove_replica_execution_tests {
         let set = adapter_set(&reference);
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
-        let execution = execution_spec(&reference).unwrap();
         let operation = reconstruct_initial_operation(reference.input.as_ref().unwrap()).unwrap();
         let api = adapter_api(&operation, DispatchResult::Busy);
-        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
-        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            store,
-            execution,
-            10,
-        )
-        .unwrap();
+        let mut adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
 
         adapter.prepare().await.unwrap();
         let logical = activity_spec(&logical_boundary(&adapter.operation)).unwrap();
@@ -5334,16 +5294,9 @@ mod remove_replica_execution_tests {
             HostEpoch::from_bytes([44; 16]),
             checkpoint_limits(),
         );
-        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            store,
-            execution.clone(),
-            10,
-        )
-        .unwrap();
+        let mut adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
 
         let outcome = DurableRunner::new(REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
             .unwrap()
@@ -5410,16 +5363,9 @@ mod remove_replica_execution_tests {
             HostEpoch::from_bytes([45; 16]),
             checkpoint_limits(),
         );
-        let mut reloaded_adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            reloaded_store,
-            execution.clone(),
-            10,
-        )
-        .unwrap();
+        let mut reloaded_adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
         let recovered = DurableRunner::new(REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
             .unwrap()
             .run(
@@ -5454,20 +5400,11 @@ mod remove_replica_execution_tests {
         let set = adapter_set(&reference);
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
-        let execution = execution_spec(&reference).unwrap();
         let (operation, _) = freeze_and_dispatch_for(&reference);
         let api = adapter_api(&operation, DispatchResult::Busy);
-        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
-        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            store,
-            execution,
-            10,
-        )
-        .unwrap();
+        let mut adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
         adapter.operation = operation;
         let wait = adapter.preparation_wait(&CheckpointError::PreparedActivityRejected(
             PreparedActivityError::Validation,
@@ -5491,20 +5428,11 @@ mod remove_replica_execution_tests {
         let set = adapter_set(&reference);
         let pods = adapter_pods();
         let current_pods = adapter_current_pods(&pods);
-        let execution = execution_spec(&reference).unwrap();
         let operation = committed_operation_for(&reference);
         let api = adapter_api(&operation, DispatchResult::Busy);
-        let store = adapter_store(&execution, InMemoryCheckpointStore::new());
-        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            store,
-            execution,
-            10,
-        )
-        .unwrap();
+        let mut adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
         let terminal = terminal_from_operation(&operation, Default::default()).unwrap();
         let outcome = encode_terminal(terminal);
         assert!(matches!(
@@ -5555,16 +5483,9 @@ mod remove_replica_execution_tests {
             checkpoint_limits(),
         );
         let api = adapter_api(&operation, DispatchResult::Busy);
-        let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
-            &reference,
-            &set,
-            &current_pods,
-            &api,
-            store,
-            execution.clone(),
-            10,
-        )
-        .unwrap();
+        let mut adapter =
+            FrameworkNativeRemoveReplicaAdapter::new(&reference, &set, &current_pods, &api, 10)
+                .unwrap();
         let published = DurableRunner::new(REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
             .unwrap()
             .run(

@@ -75,11 +75,12 @@ The as-built lifecycle compacts only completed workflows:
    discarded history.
 
 The execution contract declares one immutable terminal payload bound and
-persists the encoded-checkpoint capacity under which it was admitted. Before
-workflow evaluation can approach its first external effect, the kernel proves
-that both terminal variants at the declared maximum fit that capacity. A later
-smaller configured capacity is rejected. Exact-bound outcomes succeed;
-oversized outcomes violate the predeclared contract.
+persists the active and terminal encoded-checkpoint capacities under which it
+was admitted. Before workflow evaluation can approach its first external
+effect, the kernel proves that both terminal variants at the declared maximum
+fit that capacity. Any later configured-capacity change is rejected.
+Exact-bound outcomes succeed; oversized outcomes violate the predeclared
+contract.
 
 ### No Generic Mid-Operation Compaction
 

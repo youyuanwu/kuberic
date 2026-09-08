@@ -408,12 +408,6 @@ impl CheckpointPayload {
         let configured = u64::try_from(limits.max_active_encoded_bytes)
             .map_err(|_| CheckpointError::EncodedLengthOverflow)?;
         let admitted = self.execution.admitted_max_encoded_checkpoint_bytes;
-        if configured < admitted {
-            return Err(CheckpointError::ConfiguredCapacityBelowAdmission {
-                configured,
-                admitted,
-            });
-        }
         let configured_terminal = u64::try_from(limits.max_terminal_encoded_bytes)
             .map_err(|_| CheckpointError::EncodedLengthOverflow)?;
         let admitted_terminal = self
@@ -432,6 +426,18 @@ impl CheckpointPayload {
             return Err(CheckpointError::TerminalEncodedCheckpointCapacityMismatch {
                 configured: configured_terminal,
                 admitted: admitted_terminal,
+            });
+        }
+        if configured < admitted {
+            return Err(CheckpointError::ConfiguredCapacityBelowAdmission {
+                configured,
+                admitted,
+            });
+        }
+        if configured > admitted {
+            return Err(CheckpointError::ConfiguredCapacityAboveAdmission {
+                configured,
+                admitted,
             });
         }
 
@@ -563,6 +569,10 @@ pub enum CheckpointError {
         "configured encoded checkpoint capacity {configured} is below admitted capacity {admitted}"
     )]
     ConfiguredCapacityBelowAdmission { configured: u64, admitted: u64 },
+    #[error(
+        "configured encoded checkpoint capacity {configured} is above admitted capacity {admitted}"
+    )]
+    ConfiguredCapacityAboveAdmission { configured: u64, admitted: u64 },
     #[error(
         "configured terminal encoded checkpoint capacity {configured} differs from admitted capacity {admitted}"
     )]

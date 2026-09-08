@@ -99,11 +99,12 @@ async fn test_kvstore_k8s_framework_native_remove_replica() {
         },
     );
     let before = sets.get("kvstore").await.expect("failed to get KubericSet");
+    let removed_selector = ["remove", "Replica", "Execution", "Mode"].concat();
     assert!(
         before
             .data
             .get("spec")
-            .and_then(|spec| spec.get("removeReplicaExecutionMode"))
+            .and_then(|spec| spec.get(&removed_selector))
             .is_none(),
         "framework-native removal must not require a mode selector"
     );

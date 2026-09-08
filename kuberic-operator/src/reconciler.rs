@@ -3145,18 +3145,10 @@ async fn reconcile_framework_native_remove_replica(
         }
     };
     let host = runtime.host(&namespace, &name, set_uid, reference).await?;
-    let store = { host.lock().await.store().clone() };
     let current_pods = checked_pods_by_id(pods)?;
     let now = state.removal_clock.unix_seconds();
-    let mut adapter = FrameworkNativeRemoveReplicaAdapter::new(
-        reference,
-        set,
-        &current_pods,
-        api,
-        store,
-        execution.clone(),
-        now,
-    )?;
+    let mut adapter =
+        FrameworkNativeRemoveReplicaAdapter::new(reference, set, &current_pods, api, now)?;
     let runner = DurableRunner::new(native_remove::REMOVE_REPLICA_MAX_ACTIVITY_RECORDS)
         .map_err(|error| error.to_string())?;
     let outcome = {
