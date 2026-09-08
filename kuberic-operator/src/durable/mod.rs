@@ -20,9 +20,6 @@ mod switchover;
 pub mod switchover_execution;
 pub mod workflow_host;
 
-#[cfg(test)]
-pub use switchover_execution as pilot;
-
 pub(crate) use add_replica::final_attestation as attest_add_replica;
 pub use add_replica::{decide_add_replica, start_add_replica};
 pub use create_partition::{

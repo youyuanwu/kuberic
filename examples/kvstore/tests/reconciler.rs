@@ -5103,12 +5103,12 @@ async fn test_framework_native_switchover_unknown_checkpoint_outcomes_requeue_wi
                     kuberic_durable_execution::ActivityState::DispatchExposed { .. }
                 ));
                 assert!(matches!(
-                    kuberic_operator::durable::switchover_execution::decode_pilot_activity_input(
+                    kuberic_operator::durable::switchover_execution::decode_switchover_activity_input(
                         exposed.input(),
                     )
                         .unwrap()
                         .kind,
-                    kuberic_operator::durable::switchover_execution::PilotActivityKind::PreparedReplica { .. }
+                    kuberic_operator::durable::switchover_execution::SwitchoverActivityKind::PreparedReplica { .. }
                 ));
             }
             _ => unreachable!("test covers only unknown checkpoint outcomes"),

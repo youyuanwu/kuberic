@@ -51,9 +51,10 @@ use super::checkpoint_store::{
     MeasuredDurableCheckpointStore,
 };
 use super::effects::{
-    LabelEffectCommand, PilotEffectBridgeOutcome, PilotEffectPreparationError,
-    ReplicaEffectCommand, bridge_pilot_runner_step, exact_label_command,
-    prepare_replica_effect_command, resolve_pilot_quarantine, validate_pilot_replica_action_kind,
+    DurableEffectPreparationError, LabelEffectCommand, ReplicaEffectCommand,
+    SwitchoverEffectBridgeOutcome, bridge_switchover_runner_step, exact_label_command,
+    prepare_replica_effect_command, resolve_switchover_quarantine,
+    validate_switchover_replica_action_kind,
 };
 use super::runner::{
     DurableAdapterBoundary, DurableAdapterWait, DurableCheckpointDisposition,
@@ -81,21 +82,28 @@ pub const SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES: usize = 16 * 1_024;
 pub const SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES: u64 = 4_096;
 pub const SWITCHOVER_MAX_ERROR_BYTES: usize = 512;
 
-// Transitional aliases retained until pilot terminology is removed from the
-// reconciler and tests in later graduation phases.
-pub const PILOT_VERSION: u32 = SWITCHOVER_CONTRACT_VERSION;
-pub const PILOT_MAX_REPLICAS: usize = SWITCHOVER_MAX_REPLICAS;
-pub const PILOT_MAX_ACTIVITY_RECORDS: usize = SWITCHOVER_MAX_ACTIVITY_RECORDS;
-pub const PILOT_MAX_TRANSITION_FUEL: usize = SWITCHOVER_MAX_TRANSITION_FUEL;
-pub const PILOT_MAX_OPERATION_BYTES: usize = SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES;
-pub const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES;
-pub const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES;
-pub const PILOT_MAX_TERMINAL_BYTES: u64 = SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES;
-pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES;
+#[cfg(test)]
+const PILOT_VERSION: u32 = SWITCHOVER_CONTRACT_VERSION;
+#[cfg(test)]
+const PILOT_MAX_REPLICAS: usize = SWITCHOVER_MAX_REPLICAS;
+#[cfg(test)]
+const PILOT_MAX_ACTIVITY_RECORDS: usize = SWITCHOVER_MAX_ACTIVITY_RECORDS;
+#[cfg(test)]
+const PILOT_MAX_TRANSITION_FUEL: usize = SWITCHOVER_MAX_TRANSITION_FUEL;
+#[cfg(test)]
+const PILOT_MAX_OPERATION_BYTES: usize = SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES;
+#[cfg(test)]
+const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES;
+#[cfg(test)]
+const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES;
+#[cfg(test)]
+const PILOT_MAX_TERMINAL_BYTES: u64 = SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES;
+#[cfg(test)]
+const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES;
 
-const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.native-boundary";
-const PILOT_ACTIVITY_VERSION: u32 = 2;
-pub type PilotHost = DurableOperatorHost;
+const SWITCHOVER_ACTIVITY_NAME: &str = "kuberic.switchover.native-boundary";
+const SWITCHOVER_ACTIVITY_VERSION: u32 = 2;
+pub type SwitchoverHost = DurableOperatorHost;
 pub type SwitchoverExecution = SwitchoverExecutionStatus;
 
 /// Process-local host cache. Checkpoints, rather than this cache, remain the
@@ -132,7 +140,7 @@ impl DurableSwitchoverRuntime {
         set_name: &str,
         set_uid: &str,
         reference: &DurableSwitchoverPilotStatus,
-    ) -> Result<Arc<Mutex<PilotHost>>, String> {
+    ) -> Result<Arc<Mutex<SwitchoverHost>>, String> {
         let execution_id = execution_id(reference)?;
         self.inner
             .host(
@@ -156,7 +164,7 @@ impl DurableSwitchoverRuntime {
         set_name: &str,
         set_uid: &str,
         reference: &SwitchoverExecutionStatus,
-    ) -> Result<Arc<Mutex<PilotHost>>, String> {
+    ) -> Result<Arc<Mutex<SwitchoverHost>>, String> {
         let execution_id = native_execution_id(reference)?;
         self.inner
             .host(
@@ -252,12 +260,12 @@ pub struct DurableSwitchoverActivityInput {
     pub version: u32,
     pub state: DurableSwitchoverState,
     #[serde(default)]
-    pub kind: PilotActivityKind,
+    pub kind: SwitchoverActivityKind,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PilotActivityKind {
+pub enum SwitchoverActivityKind {
     #[default]
     PassiveObservation,
     PreparedReplica {
@@ -268,14 +276,17 @@ pub enum PilotActivityKind {
     },
 }
 
+#[cfg(test)]
+pub(crate) type PilotActivityKind = SwitchoverActivityKind;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PilotActivityAccounting {
+pub struct SwitchoverActivityAccounting {
     pub external_effect_count: u64,
     pub passive_observation_count: u64,
 }
 
-impl PilotActivityAccounting {
+impl SwitchoverActivityAccounting {
     pub const fn new(external_effect_count: u64, passive_observation_count: u64) -> Self {
         Self {
             external_effect_count,
@@ -289,6 +300,9 @@ impl PilotActivityAccounting {
             == Some(completed_activity_count)
     }
 }
+
+#[cfg(test)]
+pub(crate) type PilotActivityAccounting = SwitchoverActivityAccounting;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
@@ -306,7 +320,7 @@ pub enum DurableSwitchoverStepResult {
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        accounting: Option<PilotActivityAccounting>,
+        accounting: Option<SwitchoverActivityAccounting>,
     },
     Stopped {
         operation: DurableSwitchoverState,
@@ -320,10 +334,10 @@ impl DurableActivity for DurableSwitchoverActivity {
     type Input = DurableSwitchoverActivityInput;
     type Output = DurableSwitchoverStepResult;
 
-    const NAME: &'static str = PILOT_ACTIVITY_NAME;
-    const VERSION: u32 = PILOT_ACTIVITY_VERSION;
-    const MAX_INPUT_BYTES: u64 = PILOT_MAX_ACTIVITY_INPUT_BYTES as u64;
-    const MAX_RESULT_BYTES: u64 = PILOT_MAX_ACTIVITY_RESULT_BYTES as u64;
+    const NAME: &'static str = SWITCHOVER_ACTIVITY_NAME;
+    const VERSION: u32 = SWITCHOVER_ACTIVITY_VERSION;
+    const MAX_INPUT_BYTES: u64 = SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES as u64;
+    const MAX_RESULT_BYTES: u64 = SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES as u64;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -332,7 +346,7 @@ pub enum SwitchoverTerminal {
         operation: DurableOperationStatus,
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
-        accounting: PilotActivityAccounting,
+        accounting: SwitchoverActivityAccounting,
     },
     Stopped {
         operation: Option<DurableOperationStatus>,
@@ -351,7 +365,7 @@ enum DurableSwitchoverTerminalRecord {
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
         #[serde(default)]
-        accounting: PilotActivityAccounting,
+        accounting: SwitchoverActivityAccounting,
     },
     Stopped {
         state: Option<DurableSwitchoverState>,
@@ -368,7 +382,7 @@ enum DurableSwitchoverTerminalAccountingRecord {
         #[serde(default)]
         compensated: bool,
         #[serde(default)]
-        accounting: Option<PilotActivityAccounting>,
+        accounting: Option<SwitchoverActivityAccounting>,
     },
     Stopped {},
 }
@@ -384,7 +398,7 @@ impl Workflow for DurableSwitchoverWorkflow {
                 return terminal_failure(None, format!("decode pilot workflow input: {error}"));
             }
         };
-        if input.version != PILOT_VERSION {
+        if input.version != SWITCHOVER_CONTRACT_VERSION {
             return terminal_failure(
                 Some(input.initial_operation),
                 format!("unsupported pilot workflow version {}", input.version),
@@ -397,7 +411,7 @@ impl Workflow for DurableSwitchoverWorkflow {
             );
         }
         let initial = input.initial_operation;
-        if let Err(error) = validate_pilot_operation(&initial) {
+        if let Err(error) = validate_switchover_operation_contract(&initial) {
             return terminal_failure(Some(initial), error);
         }
         if let Err(error) = validate_switchover_operation(&initial) {
@@ -406,7 +420,7 @@ impl Workflow for DurableSwitchoverWorkflow {
         let mut state = DurableSwitchoverState::from_operation(&initial);
         let mut no_admission_redeliveries = std::collections::BTreeMap::<String, u8>::new();
 
-        for _ in 0..PILOT_MAX_TRANSITION_FUEL {
+        for _ in 0..SWITCHOVER_MAX_TRANSITION_FUEL {
             let operation = match state.apply_to(&initial) {
                 Ok(operation) => operation,
                 Err(error) => return terminal_failure(None, error),
@@ -432,9 +446,9 @@ impl Workflow for DurableSwitchoverWorkflow {
             }
             let result = match context
                 .call::<DurableSwitchoverActivity>(DurableSwitchoverActivityInput {
-                    version: PILOT_VERSION,
+                    version: SWITCHOVER_CONTRACT_VERSION,
                     state: state.clone(),
-                    kind: PilotActivityKind::PassiveObservation,
+                    kind: SwitchoverActivityKind::PassiveObservation,
                 })
                 .await
             {
@@ -574,7 +588,9 @@ impl Workflow for DurableSwitchoverWorkflow {
 
         terminal_failure(
             state.apply_to(&initial).ok(),
-            format!("durable switchover exhausted its {PILOT_MAX_TRANSITION_FUEL}-transition fuel"),
+            format!(
+                "durable switchover exhausted its {SWITCHOVER_MAX_TRANSITION_FUEL}-transition fuel"
+            ),
         )
     }
 }
@@ -625,15 +641,15 @@ pub fn encode_step_result(result: &DurableSwitchoverStepResult) -> Result<ExactB
 }
 
 pub fn decode_activity_input_state(input: &ExactBytes) -> Result<DurableSwitchoverState, String> {
-    Ok(decode_pilot_activity_input(input)?.state)
+    Ok(decode_switchover_activity_input(input)?.state)
 }
 
-pub fn decode_pilot_activity_input(
+pub fn decode_switchover_activity_input(
     input: &ExactBytes,
 ) -> Result<DurableSwitchoverActivityInput, String> {
     let input = decode_activity_input::<DurableSwitchoverActivity>(input)
         .map_err(|error| format!("decode current durable switchover activity: {error}"))?;
-    if input.version != PILOT_VERSION {
+    if input.version != SWITCHOVER_CONTRACT_VERSION {
         return Err(format!(
             "unsupported durable switchover activity version {}",
             input.version
@@ -643,12 +659,11 @@ pub fn decode_pilot_activity_input(
 }
 
 fn classify_checkpoint_activity(input: &ExactBytes) -> Option<DurableActivityClass> {
-    let input = decode_pilot_activity_input(input).ok()?;
+    let input = decode_switchover_activity_input(input).ok()?;
     Some(match input.kind {
-        PilotActivityKind::PassiveObservation => DurableActivityClass::PassiveObservation,
-        PilotActivityKind::PreparedReplica { .. } | PilotActivityKind::PreparedLabel { .. } => {
-            DurableActivityClass::ExternalEffect
-        }
+        SwitchoverActivityKind::PassiveObservation => DurableActivityClass::PassiveObservation,
+        SwitchoverActivityKind::PreparedReplica { .. }
+        | SwitchoverActivityKind::PreparedLabel { .. } => DurableActivityClass::ExternalEffect,
     })
 }
 
@@ -675,11 +690,11 @@ pub fn checkpoint_measurement_decoder() -> CheckpointMeasurementDecoder {
 
 pub fn validate_prepared_activity(
     operation: &DurableOperationStatus,
-    kind: &PilotActivityKind,
+    kind: &SwitchoverActivityKind,
 ) -> Result<(), String> {
     match kind {
-        PilotActivityKind::PassiveObservation => Ok(()),
-        PilotActivityKind::PreparedReplica { command } => {
+        SwitchoverActivityKind::PassiveObservation => Ok(()),
+        SwitchoverActivityKind::PreparedReplica { command } => {
             let pending = operation
                 .pending_action
                 .as_ref()
@@ -695,7 +710,7 @@ pub fn validate_prepared_activity(
             )
             .map_err(|error| format!("decode prepared replica activity: {error}"))?;
             let signature_matches = action.signature() == command.action_signature;
-            let kind_matches = validate_pilot_replica_action_kind(pending.kind, &action);
+            let kind_matches = validate_switchover_replica_action_kind(pending.kind, &action);
             let fixed_semantics_match =
                 action_matches_fixed_operation_semantics(operation, pending, &action);
             if !signature_matches || !kind_matches || !fixed_semantics_match {
@@ -709,7 +724,7 @@ pub fn validate_prepared_activity(
             }
             Ok(())
         }
-        PilotActivityKind::PreparedLabel { command } => {
+        SwitchoverActivityKind::PreparedLabel { command } => {
             let pending = operation
                 .pending_action
                 .as_ref()
@@ -813,7 +828,7 @@ pub fn decode_terminal(
 pub fn decode_terminal_activity_accounting(
     outcome: &TerminalOutcome,
     completed_activity_count: u64,
-) -> Result<Option<PilotActivityAccounting>, String> {
+) -> Result<Option<SwitchoverActivityAccounting>, String> {
     let record: DurableSwitchoverTerminalAccountingRecord =
         serde_json::from_slice(outcome.payload().as_slice()).map_err(|error| {
             format!("decode durable switchover terminal activity accounting: {error}")
@@ -857,7 +872,7 @@ pub fn validate_loaded_terminal_for_initial(
     outcome: &TerminalOutcome,
     completed_activity_count: u64,
 ) -> Result<SwitchoverTerminal, String> {
-    validate_pilot_admission(initial)?;
+    validate_switchover_admission(initial)?;
     let terminal = decode_terminal(outcome, initial)?;
     match (outcome, &terminal) {
         (
@@ -899,17 +914,20 @@ pub fn validate_loaded_terminal_for_initial(
     Ok(terminal)
 }
 
-pub enum PilotAdapterDecision {
+pub enum SwitchoverAdapterDecision {
     Observe(Box<DurableSwitchoverStepResult>),
     AwaitEvidence,
     External(Box<Decision>),
 }
 
+#[cfg(test)]
+pub(crate) type PilotAdapterDecision = SwitchoverAdapterDecision;
+
 pub fn evaluate_adapter_step(
     operation: &DurableOperationStatus,
     observations: &OperationObservations,
     now: i64,
-) -> Result<PilotAdapterDecision, String> {
+) -> Result<SwitchoverAdapterDecision, String> {
     Ok(match decide(operation, observations, now)? {
         Decision::Persist(operation)
             if operation.phase == crate::crd::DurableOperationPhase::Poisoned =>
@@ -918,13 +936,13 @@ pub fn evaluate_adapter_step(
                 .last_error
                 .clone()
                 .unwrap_or_else(|| "durable switchover entered poisoned state".to_string());
-            PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Stopped {
+            SwitchoverAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Stopped {
                 operation: DurableSwitchoverState::from_operation(&operation),
                 message,
             }))
         }
         Decision::Persist(operation) => {
-            PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Advance {
+            SwitchoverAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Advance {
                 operation: DurableSwitchoverState::from_operation(&operation),
             }))
         }
@@ -933,11 +951,11 @@ pub fn evaluate_adapter_step(
             snapshot,
             compensated,
         } => terminal_adapter_decision(operation, snapshot, compensated),
-        Decision::Wait => PilotAdapterDecision::AwaitEvidence,
+        Decision::Wait => SwitchoverAdapterDecision::AwaitEvidence,
         external @ (Decision::Execute { .. }
         | Decision::PatchPodRole { .. }
         | Decision::PatchPodRoleExactUid { .. }) => {
-            PilotAdapterDecision::External(Box::new(external))
+            SwitchoverAdapterDecision::External(Box::new(external))
         }
         other => {
             return Err(format!(
@@ -951,7 +969,7 @@ fn terminal_adapter_decision(
     operation: DurableOperationStatus,
     snapshot: StablePartitionSnapshotStatus,
     compensated: bool,
-) -> PilotAdapterDecision {
+) -> SwitchoverAdapterDecision {
     let terminal_state = DurableSwitchoverState::from_operation(&operation);
     if compensated
         && projected_compensation_transcripts(
@@ -967,12 +985,12 @@ fn terminal_adapter_decision(
         stopped.phase = DurableOperationPhase::Poisoned;
         stopped.pending_action = None;
         stopped.last_error = Some(message.clone());
-        PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Stopped {
+        SwitchoverAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Stopped {
             operation: DurableSwitchoverState::from_operation(&stopped),
             message,
         }))
     } else {
-        PilotAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Complete {
+        SwitchoverAdapterDecision::Observe(Box::new(DurableSwitchoverStepResult::Complete {
             operation: terminal_state,
             snapshot,
             compensated,
@@ -981,7 +999,7 @@ fn terminal_adapter_decision(
     }
 }
 
-pub struct PilotPreparedActivityResolver {
+pub struct SwitchoverPreparedActivityResolver {
     initial: DurableOperationStatus,
     observations: OperationObservations,
     addressed_instances: BTreeMap<i64, kuberic_core::types::ReplicaInstanceId>,
@@ -989,7 +1007,10 @@ pub struct PilotPreparedActivityResolver {
     deadline: Option<Arc<AtomicI64>>,
 }
 
-impl PilotPreparedActivityResolver {
+#[cfg(test)]
+pub(crate) type PilotPreparedActivityResolver = SwitchoverPreparedActivityResolver;
+
+impl SwitchoverPreparedActivityResolver {
     pub fn new(
         initial: &DurableOperationStatus,
         observations: &OperationObservations,
@@ -1034,7 +1055,8 @@ impl PilotPreparedActivityResolver {
         &self,
         logical: &DurableSwitchoverActivityInput,
     ) -> Result<DurableSwitchoverActivityInput, PreparedActivityError> {
-        if logical.version != PILOT_VERSION || logical.kind != PilotActivityKind::PassiveObservation
+        if logical.version != SWITCHOVER_CONTRACT_VERSION
+            || logical.kind != SwitchoverActivityKind::PassiveObservation
         {
             return Err(PreparedActivityError::Validation);
         }
@@ -1047,13 +1069,13 @@ impl PilotPreparedActivityResolver {
             .map_err(|_| PreparedActivityError::Derivation)?;
         let mut prepared = logical.clone();
         match decision {
-            PilotAdapterDecision::Observe(_) => {}
-            PilotAdapterDecision::AwaitEvidence => {
+            SwitchoverAdapterDecision::Observe(_) => {}
+            SwitchoverAdapterDecision::AwaitEvidence => {
                 if operation.pending_action.is_some() {
                     return Err(PreparedActivityError::Derivation);
                 }
             }
-            PilotAdapterDecision::External(decision) => match *decision {
+            SwitchoverAdapterDecision::External(decision) => match *decision {
                 Decision::Execute {
                     target_id,
                     action_id,
@@ -1084,13 +1106,13 @@ impl PilotPreparedActivityResolver {
                     let mut operation = operation;
                     operation.pending_action = Some(planned);
                     prepared.state = DurableSwitchoverState::from_operation(&operation);
-                    prepared.kind = PilotActivityKind::PreparedReplica { command };
+                    prepared.kind = SwitchoverActivityKind::PreparedReplica { command };
                 }
                 Decision::PatchPodRole { target_id, role } => {
                     let command =
                         exact_label_command(&operation, target_id, &role, &self.observations)
                             .map_err(|_| PreparedActivityError::Derivation)?;
-                    prepared.kind = PilotActivityKind::PreparedLabel { command };
+                    prepared.kind = SwitchoverActivityKind::PreparedLabel { command };
                 }
                 Decision::PatchPodRoleExactUid {
                     target_id,
@@ -1103,7 +1125,7 @@ impl PilotPreparedActivityResolver {
                     if command.expected_uid != expected_uid {
                         return Err(PreparedActivityError::Validation);
                     }
-                    prepared.kind = PilotActivityKind::PreparedLabel { command };
+                    prepared.kind = SwitchoverActivityKind::PreparedLabel { command };
                 }
                 _ => return Err(PreparedActivityError::Validation),
             },
@@ -1116,9 +1138,9 @@ impl PilotPreparedActivityResolver {
         logical: &DurableSwitchoverActivityInput,
         recorded: &DurableSwitchoverActivityInput,
     ) -> Result<(), PreparedActivityError> {
-        if logical.version != PILOT_VERSION
-            || recorded.version != PILOT_VERSION
-            || logical.kind != PilotActivityKind::PassiveObservation
+        if logical.version != SWITCHOVER_CONTRACT_VERSION
+            || recorded.version != SWITCHOVER_CONTRACT_VERSION
+            || logical.kind != SwitchoverActivityKind::PassiveObservation
         {
             return Err(PreparedActivityError::Validation);
         }
@@ -1137,7 +1159,7 @@ impl PilotPreparedActivityResolver {
             .apply_to(&self.initial)
             .map_err(|_| PreparedActivityError::Validation)?;
         self.record_deadline(&operation);
-        if matches!(recorded.kind, PilotActivityKind::PassiveObservation)
+        if matches!(recorded.kind, SwitchoverActivityKind::PassiveObservation)
             && recorded.state != logical.state
         {
             return Err(PreparedActivityError::Validation);
@@ -1147,7 +1169,7 @@ impl PilotPreparedActivityResolver {
     }
 }
 
-impl PreparedActivityResolver for PilotPreparedActivityResolver {
+impl PreparedActivityResolver for SwitchoverPreparedActivityResolver {
     fn resolve(
         &self,
         logical: &ActivitySpec,
@@ -1188,13 +1210,13 @@ impl PreparedActivityResolver for PilotPreparedActivityResolver {
     }
 }
 
-fn preparation_error(error: PilotEffectPreparationError) -> PreparedActivityError {
+fn preparation_error(error: DurableEffectPreparationError) -> PreparedActivityError {
     match error {
-        PilotEffectPreparationError::WaitForExactIncarnation
-        | PilotEffectPreparationError::WaitForSupportedProtocol => {
+        DurableEffectPreparationError::WaitForExactIncarnation
+        | DurableEffectPreparationError::WaitForSupportedProtocol => {
             PreparedActivityError::Derivation
         }
-        PilotEffectPreparationError::InvalidCommand => PreparedActivityError::Validation,
+        DurableEffectPreparationError::InvalidCommand => PreparedActivityError::Validation,
     }
 }
 
@@ -1274,7 +1296,7 @@ pub struct SwitchoverRunnerAdapter<'a> {
     initial: &'a DurableOperationStatus,
     set: &'a KubericSet,
     current_pods: &'a [(i64, kuberic_core::types::ReplicaInstanceId, &'a Pod)],
-    resolver: PilotPreparedActivityResolver,
+    resolver: SwitchoverPreparedActivityResolver,
     context: Option<SwitchoverRunnerContext>,
     api: &'a dyn ClusterApi,
     namespace: String,
@@ -1299,7 +1321,7 @@ impl<'a> SwitchoverRunnerAdapter<'a> {
             initial,
             set,
             current_pods,
-            resolver: PilotPreparedActivityResolver::with_deadline(
+            resolver: SwitchoverPreparedActivityResolver::with_deadline(
                 initial,
                 &observations,
                 &addressed_instances,
@@ -1324,8 +1346,8 @@ impl<'a> SwitchoverRunnerAdapter<'a> {
     fn decode_operation(
         &self,
         activity: &LogicalActivityId,
-    ) -> Result<(DurableOperationStatus, PilotActivityKind), String> {
-        let prepared = decode_pilot_activity_input(activity.input())?;
+    ) -> Result<(DurableOperationStatus, SwitchoverActivityKind), String> {
+        let prepared = decode_switchover_activity_input(activity.input())?;
         let operation = prepared.state.apply_to(self.initial)?;
         validate_prepared_activity(&operation, &prepared.kind)?;
         self.deadline.store(
@@ -1354,15 +1376,15 @@ impl<'a> SwitchoverRunnerAdapter<'a> {
     fn bridge_boundary(
         &self,
         activity: LogicalActivityId,
-        outcome: PilotEffectBridgeOutcome,
+        outcome: SwitchoverEffectBridgeOutcome,
         quarantine: bool,
     ) -> DurableAdapterBoundary {
         match outcome {
-            PilotEffectBridgeOutcome::Observe(result) => self
+            SwitchoverEffectBridgeOutcome::Observe(result) => self
                 .observation(activity, *result)
                 .map(DurableAdapterBoundary::Observed)
                 .unwrap_or_else(DurableAdapterBoundary::Isolated),
-            PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(result) if !quarantine => self
+            SwitchoverEffectBridgeOutcome::ObserveAfterFenceRefresh(result) if !quarantine => self
                 .observation(activity, *result)
                 .map(|observation| DurableAdapterBoundary::ObserveAndWait {
                     observation: Box::new(observation),
@@ -1371,28 +1393,28 @@ impl<'a> SwitchoverRunnerAdapter<'a> {
                     requeue_after_seconds: 1,
                 })
                 .unwrap_or_else(DurableAdapterBoundary::Isolated),
-            PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(result) => self
+            SwitchoverEffectBridgeOutcome::ObserveAfterFenceRefresh(result) => self
                 .observation(activity, *result)
                 .map(DurableAdapterBoundary::Observed)
                 .unwrap_or_else(DurableAdapterBoundary::Isolated),
-            PilotEffectBridgeOutcome::Exposed if quarantine => DurableAdapterBoundary::Wait {
+            SwitchoverEffectBridgeOutcome::Exposed if quarantine => DurableAdapterBoundary::Wait {
                 reason: "Quarantined".to_string(),
                 detail: "exposed pilot activity remains quarantined pending authoritative evidence"
                     .to_string(),
             },
-            PilotEffectBridgeOutcome::AwaitEvidence if quarantine => {
+            SwitchoverEffectBridgeOutcome::AwaitEvidence if quarantine => {
                 DurableAdapterBoundary::Wait {
                     reason: "Quarantined".to_string(),
                     detail: "exposed pilot activity remains quarantined pending authoritative evidence"
                         .to_string(),
                 }
             }
-            PilotEffectBridgeOutcome::Exposed => DurableAdapterBoundary::Wait {
+            SwitchoverEffectBridgeOutcome::Exposed => DurableAdapterBoundary::Wait {
                 reason: "EffectExposed".to_string(),
                 detail:
                     "correlated effect was exposed and awaits authoritative observation".to_string(),
             },
-            PilotEffectBridgeOutcome::AwaitEvidence => DurableAdapterBoundary::Wait {
+            SwitchoverEffectBridgeOutcome::AwaitEvidence => DurableAdapterBoundary::Wait {
                 reason: "AwaitingReplicaObservation".to_string(),
                 detail: "pilot activity is waiting for an exact replica or authoritative effect evidence"
                     .to_string(),
@@ -1403,7 +1425,7 @@ impl<'a> SwitchoverRunnerAdapter<'a> {
 
 #[async_trait]
 impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
-    type Resolver = PilotPreparedActivityResolver;
+    type Resolver = SwitchoverPreparedActivityResolver;
     type Terminal = SwitchoverTerminal;
     type Publication = SwitchoverTerminal;
 
@@ -1416,7 +1438,7 @@ impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
             collect_switchover_runner_context(self.initial, self.set, self.api, self.current_pods)
                 .await
                 .map_err(DurableAdapterBoundary::Isolated)?;
-        self.resolver = PilotPreparedActivityResolver::with_deadline(
+        self.resolver = SwitchoverPreparedActivityResolver::with_deadline(
             self.initial,
             &context.observations,
             &context.addressed_instances,
@@ -1437,7 +1459,7 @@ impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
             Ok(decoded) => decoded,
             Err(error) => return DurableAdapterBoundary::Isolated(error),
         };
-        if prepared == PilotActivityKind::PassiveObservation {
+        if prepared == SwitchoverActivityKind::PassiveObservation {
             if let Err(error) = permit.consume(activity.spec(), activity, attempt_id, "switchover")
             {
                 return DurableAdapterBoundary::Isolated(error);
@@ -1447,15 +1469,15 @@ impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
                 Err(error) => return DurableAdapterBoundary::Isolated(error),
             };
             return match evaluate_adapter_step(&operation, observations, self.now) {
-                Ok(PilotAdapterDecision::Observe(result)) => self
+                Ok(SwitchoverAdapterDecision::Observe(result)) => self
                     .observation(activity.clone(), *result)
                     .map(DurableAdapterBoundary::Observed)
                     .unwrap_or_else(DurableAdapterBoundary::Isolated),
-                Ok(PilotAdapterDecision::AwaitEvidence) => DurableAdapterBoundary::Wait {
+                Ok(SwitchoverAdapterDecision::AwaitEvidence) => DurableAdapterBoundary::Wait {
                     reason: "AwaitingReplicaObservation".to_string(),
                     detail: "pilot activity is waiting for authoritative observation".to_string(),
                 },
-                Ok(PilotAdapterDecision::External(_)) => DurableAdapterBoundary::Isolated(
+                Ok(SwitchoverAdapterDecision::External(_)) => DurableAdapterBoundary::Isolated(
                     "pilot resolver exposed an external effect as a passive observation"
                         .to_string(),
                 ),
@@ -1466,7 +1488,7 @@ impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
             Ok(context) => context,
             Err(error) => return DurableAdapterBoundary::Isolated(error),
         };
-        match bridge_pilot_runner_step(
+        match bridge_switchover_runner_step(
             permit,
             &operation,
             &prepared,
@@ -1501,7 +1523,7 @@ impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
             Ok(decision) => decision,
             Err(error) => return DurableAdapterBoundary::Isolated(error),
         };
-        match resolve_pilot_quarantine(&operation, &prepared, decision, observations) {
+        match resolve_switchover_quarantine(&operation, &prepared, decision, observations) {
             Ok(outcome) => self.bridge_boundary(activity, outcome, true),
             Err(error) => DurableAdapterBoundary::Isolated(error),
         }
@@ -1570,7 +1592,7 @@ fn enrich_runner_result(
             accounting: measurements
                 .completed_external_effect_count
                 .zip(measurements.completed_passive_observation_count)
-                .map(|(external, passive)| PilotActivityAccounting::new(external, passive))
+                .map(|(external, passive)| SwitchoverActivityAccounting::new(external, passive))
                 .or(accounting),
         },
         other => other,
@@ -1585,11 +1607,11 @@ pub fn switchover_deadline_unix_seconds(operation: &DurableOperationStatus) -> i
         .unwrap_or(operation.phase_deadline_unix_seconds)
 }
 
-pub struct PilotPermitGuard {
+pub struct SwitchoverPermitGuard {
     inner: DurablePermitGuard,
 }
 
-impl PilotPermitGuard {
+impl SwitchoverPermitGuard {
     pub fn new(permit: DispatchPermit) -> Self {
         Self {
             inner: DurablePermitGuard::new(permit),
@@ -1599,12 +1621,12 @@ impl PilotPermitGuard {
     pub fn consume_for(
         &mut self,
         operation: &DurableOperationStatus,
-        prepared: &PilotActivityKind,
+        prepared: &SwitchoverActivityKind,
         expected_activity: &LogicalActivityId,
         attempt_id: kuberic_durable_execution::AttemptId,
     ) -> Result<DispatchPermit, String> {
         let expected = activity_spec(&DurableSwitchoverActivityInput {
-            version: PILOT_VERSION,
+            version: SWITCHOVER_CONTRACT_VERSION,
             state: DurableSwitchoverState::from_operation(operation),
             kind: prepared.clone(),
         })?;
@@ -1617,22 +1639,25 @@ impl PilotPermitGuard {
     }
 }
 
+#[cfg(test)]
+pub(crate) type PilotPermitGuard = SwitchoverPermitGuard;
+
 fn activity_spec(input: &DurableSwitchoverActivityInput) -> Result<ActivitySpec, String> {
     Ok(ActivitySpec::new(
-        ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
+        ActivityName::new(SWITCHOVER_ACTIVITY_NAME, SWITCHOVER_ACTIVITY_VERSION)
             .map_err(|error| format!("construct pilot activity name: {error}"))?,
         encode_activity_input::<DurableSwitchoverActivity>(input)
             .map_err(|error| format!("serialize pilot activity input: {error}"))?,
-        PILOT_MAX_ACTIVITY_RESULT_BYTES as u64,
+        SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES as u64,
     ))
 }
 
 pub(crate) fn prepared_activity_spec(
     operation: &DurableOperationStatus,
-    prepared: &PilotActivityKind,
+    prepared: &SwitchoverActivityKind,
 ) -> Result<ActivitySpec, String> {
     activity_spec(&DurableSwitchoverActivityInput {
-        version: PILOT_VERSION,
+        version: SWITCHOVER_CONTRACT_VERSION,
         state: DurableSwitchoverState::from_operation(operation),
         kind: prepared.clone(),
     })
@@ -1652,7 +1677,7 @@ fn validate_transition(
     {
         return Err("durable switchover activity changed immutable operation identity".to_string());
     }
-    validate_pilot_operation(next)
+    validate_switchover_operation_contract(next)
 }
 
 fn validate_phase_transition(
@@ -1815,7 +1840,7 @@ pub fn new_pilot_reference(
         target_primary_id,
         now,
     )?;
-    validate_pilot_admission(&initial_operation)?;
+    validate_switchover_admission(&initial_operation)?;
     let initial_operation_json = serde_json::to_string(&initial_operation)
         .map_err(|error| format!("serialize initial durable switchover operation: {error}"))?;
 
@@ -1945,7 +1970,7 @@ pub fn native_execution_spec(
 ) -> Result<ExecutionSpec, String> {
     let execution_id = native_execution_id(reference)?;
     let initial_operation = native_initial_operation(reference)?;
-    validate_pilot_admission(&initial_operation)?;
+    validate_switchover_admission(&initial_operation)?;
     let input = SwitchoverWorkflowInput {
         version: reference.contract_version,
         execution_id: reference.execution_id.clone(),
@@ -1985,7 +2010,7 @@ pub fn execution_id(reference: &DurableSwitchoverPilotStatus) -> Result<Executio
 pub fn execution_spec(reference: &DurableSwitchoverPilotStatus) -> Result<ExecutionSpec, String> {
     let execution_id = execution_id(reference)?;
     let initial_operation = initial_operation(reference)?;
-    validate_pilot_admission(&initial_operation)?;
+    validate_switchover_admission(&initial_operation)?;
     let input = SwitchoverWorkflowInput {
         version: reference.version,
         execution_id: reference.execution_id.clone(),
@@ -2118,21 +2143,21 @@ pub fn checkpoint_store_options(
     Ok(KubernetesCheckpointStoreOptions::default().with_owner(owner))
 }
 
-pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<(), String> {
-    validate_pilot_operation(operation)?;
+pub fn validate_switchover_admission(operation: &DurableOperationStatus) -> Result<(), String> {
+    validate_switchover_operation_contract(operation)?;
     validate_variant_bounds(operation)?;
     let previous_snapshot = operation
         .previous_snapshot
         .as_ref()
-        .ok_or_else(|| "durable switchover pilot has no previous snapshot".to_string())?;
+        .ok_or_else(|| "durable switchover has no previous snapshot".to_string())?;
     let success = projected_success_transcript(previous_snapshot.members.len());
     let rollback = projected_rollback_transcript(previous_snapshot.members.len());
     let projected_steps = success
         .maximum_activity_count()
         .max(rollback.maximum_activity_count());
-    if projected_steps > PILOT_MAX_ACTIVITY_RECORDS {
+    if projected_steps > SWITCHOVER_MAX_ACTIVITY_RECORDS {
         return Err(format!(
-            "durable switchover requires {projected_steps} projected activities; maximum is {PILOT_MAX_ACTIVITY_RECORDS}"
+            "durable switchover requires {projected_steps} projected activities; maximum is {SWITCHOVER_MAX_ACTIVITY_RECORDS}"
         ));
     }
     let projected_transitions = (success.maximum_activity_count()
@@ -2148,24 +2173,26 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
     Ok(())
 }
 
-pub fn validate_pilot_operation(operation: &DurableOperationStatus) -> Result<(), String> {
+pub fn validate_switchover_operation_contract(
+    operation: &DurableOperationStatus,
+) -> Result<(), String> {
     validate_switchover_operation(operation)?;
     let previous_snapshot = operation
         .previous_snapshot
         .as_ref()
-        .ok_or_else(|| "durable switchover pilot has no previous snapshot".to_string())?;
-    if previous_snapshot.members.len() > PILOT_MAX_REPLICAS {
+        .ok_or_else(|| "durable switchover has no previous snapshot".to_string())?;
+    if previous_snapshot.members.len() > SWITCHOVER_MAX_REPLICAS {
         return Err(format!(
-            "durable switchover pilot supports at most {PILOT_MAX_REPLICAS} replicas; found {}",
+            "durable switchover supports at most {SWITCHOVER_MAX_REPLICAS} replicas; found {}",
             previous_snapshot.members.len()
         ));
     }
     let operation_bytes = serde_json::to_vec(operation)
         .map_err(|error| format!("serialize durable switchover operation: {error}"))?
         .len();
-    if operation_bytes > PILOT_MAX_OPERATION_BYTES {
+    if operation_bytes > SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES {
         return Err(format!(
-            "durable switchover operation is {operation_bytes} bytes; maximum is {PILOT_MAX_OPERATION_BYTES}"
+            "durable switchover operation is {operation_bytes} bytes; maximum is {SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES}"
         ));
     }
     if let Some(error) = operation.last_error.as_deref() {
@@ -2307,7 +2334,7 @@ impl ProjectedTranscript {
     /// Returns whether the accounting is produced by one valid base
     /// transcript plus zero or one proven-no-admission redelivery for each
     /// activity that was actually exposed as an external effect.
-    fn contains_accounting(&self, accounting: PilotActivityAccounting) -> bool {
+    fn contains_accounting(&self, accounting: SwitchoverActivityAccounting) -> bool {
         let required_external = self.required_external_effect_count();
         let required_passive = self.required_passive_observation_count();
         let flexible = self.flexible_activity_count();
@@ -2366,22 +2393,22 @@ fn projected_demote_restore_transcript() -> ProjectedTranscript {
     ])
 }
 
-fn is_full_pilot_start(initial: &DurableOperationStatus) -> bool {
+fn is_full_switchover_start(initial: &DurableOperationStatus) -> bool {
     initial.phase == DurableOperationPhase::Revoke
         && initial.pending_action.is_none()
         && initial.frozen_lsn.is_none()
         && initial.next_secondary_index == 0
-        && (2..=PILOT_MAX_REPLICAS).contains(&initial.previous_snapshot.members.len())
+        && (2..=SWITCHOVER_MAX_REPLICAS).contains(&initial.previous_snapshot.members.len())
 }
 
 fn validate_terminal_activity_accounting(
     initial: &DurableOperationStatus,
     terminal: &DurableOperationStatus,
     compensated: bool,
-    accounting: PilotActivityAccounting,
+    accounting: SwitchoverActivityAccounting,
     completed_activity_count: u64,
 ) -> Result<(), String> {
-    if !is_full_pilot_start(initial) {
+    if !is_full_switchover_start(initial) {
         return Ok(());
     }
     validate_terminal_accounting_shape(
@@ -2418,7 +2445,7 @@ fn validate_terminal_accounting_shape(
     terminal: TerminalAccountingContext,
     member_count: usize,
     compensated: bool,
-    accounting: PilotActivityAccounting,
+    accounting: SwitchoverActivityAccounting,
     completed_activity_count: u64,
 ) -> Result<(), String> {
     if !accounting.matches_completed_activity_count(completed_activity_count) {
@@ -2517,13 +2544,13 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
             operation: state.clone(),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
-            accounting: Some(PilotActivityAccounting::new(u64::MAX, u64::MAX)),
+            accounting: Some(SwitchoverActivityAccounting::new(u64::MAX, u64::MAX)),
         },
         DurableSwitchoverStepResult::Complete {
             operation: state,
             snapshot: previous.clone(),
             compensated: true,
-            accounting: Some(PilotActivityAccounting::new(u64::MAX, u64::MAX)),
+            accounting: Some(SwitchoverActivityAccounting::new(u64::MAX, u64::MAX)),
         },
         DurableSwitchoverStepResult::Stopped {
             operation: DurableSwitchoverState::from_operation(&stopped),
@@ -2538,13 +2565,13 @@ fn validate_variant_bounds(operation: &DurableOperationStatus) -> Result<(), Str
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: operation.target_snapshot.clone(),
             compensated: false,
-            accounting: PilotActivityAccounting::new(u64::MAX, u64::MAX),
+            accounting: SwitchoverActivityAccounting::new(u64::MAX, u64::MAX),
         },
         DurableSwitchoverTerminalRecord::Complete {
             state: DurableSwitchoverState::from_operation(operation),
             snapshot: previous,
             compensated: true,
-            accounting: PilotActivityAccounting::new(u64::MAX, u64::MAX),
+            accounting: SwitchoverActivityAccounting::new(u64::MAX, u64::MAX),
         },
         DurableSwitchoverTerminalRecord::Stopped {
             state: Some(DurableSwitchoverState::from_operation(&stopped)),
@@ -2598,7 +2625,7 @@ fn maximum_active_payload(
 ) -> Result<CheckpointPayload, String> {
     active_payload_with_records(
         admitted_max_encoded_checkpoint_bytes,
-        PILOT_MAX_ACTIVITY_RECORDS,
+        SWITCHOVER_MAX_ACTIVITY_RECORDS,
     )
 }
 
@@ -2609,32 +2636,32 @@ fn active_payload_with_records(
     let execution_id = ExecutionId::from_bytes([u8::MAX; 16]);
     let execution = ExecutionSpec::new(
         execution_id,
-        ExactBytes::new(vec![u8::MAX; PILOT_MAX_OPERATION_BYTES]),
-        PILOT_MAX_TERMINAL_BYTES,
+        ExactBytes::new(vec![u8::MAX; SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES]),
+        SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
     );
     let admitted = u64::try_from(admitted_max_encoded_checkpoint_bytes)
-        .map_err(|_| "pilot checkpoint limit does not fit u64".to_string())?;
+        .map_err(|_| "switchover checkpoint limit does not fit u64".to_string())?;
     let contract = ExecutionContract::with_encoded_limits(
         execution,
         admitted,
         SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
     );
-    let name = ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
-        .map_err(|error| format!("construct pilot activity name: {error}"))?;
+    let name = ActivityName::new(SWITCHOVER_ACTIVITY_NAME, SWITCHOVER_ACTIVITY_VERSION)
+        .map_err(|error| format!("construct switchover activity name: {error}"))?;
     let activities = (0..record_count)
         .map(|sequence| {
             let spec = ActivitySpec::new(
                 name.clone(),
-                ExactBytes::new(vec![u8::MAX; PILOT_MAX_ACTIVITY_INPUT_BYTES]),
-                u64::try_from(PILOT_MAX_ACTIVITY_RESULT_BYTES)
-                    .expect("pilot result bound fits u64"),
+                ExactBytes::new(vec![u8::MAX; SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES]),
+                u64::try_from(SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES)
+                    .expect("switchover result bound fits u64"),
             );
             ActivityRecord::completed(
                 ActivitySequence::new(
                     u64::try_from(sequence).expect("pilot activity count fits u64"),
                 ),
                 spec,
-                ExactBytes::new(vec![u8::MAX; PILOT_MAX_ACTIVITY_RESULT_BYTES]),
+                ExactBytes::new(vec![u8::MAX; SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES]),
             )
         })
         .collect();
@@ -2946,7 +2973,7 @@ mod framework_native_switchover_tests {
             SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
         );
         let logical = ActivitySpec::new(
-            ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION).unwrap(),
+            ActivityName::new(SWITCHOVER_ACTIVITY_NAME, SWITCHOVER_ACTIVITY_VERSION).unwrap(),
             ExactBytes::new(b"{}".to_vec()),
             SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES as u64,
         );
@@ -3069,7 +3096,9 @@ mod framework_native_switchover_tests {
             "prepared fixture must exercise large commands and fences"
         );
         assert!(matches!(
-            decode_pilot_activity_input(&prepared_input).unwrap().kind,
+            decode_switchover_activity_input(&prepared_input)
+                .unwrap()
+                .kind,
             PilotActivityKind::PreparedReplica { .. }
         ));
         let checkpoint = maximum_active_checkpoint().unwrap();
@@ -3133,7 +3162,7 @@ mod framework_native_switchover_tests {
             initial_operation(&new_pilot_reference("set-uid", snapshot(3), 2, 100).unwrap())
                 .unwrap();
         operation.previous_snapshot = Default::default();
-        assert!(validate_pilot_admission(&operation).is_err());
+        assert!(validate_switchover_admission(&operation).is_err());
     }
 
     #[tokio::test]
@@ -3191,7 +3220,7 @@ mod framework_native_switchover_tests {
     }
 
     async fn expose_next<W: Workflow>(
-        host: &mut PilotHost,
+        host: &mut SwitchoverHost,
         workflow: &W,
         execution: &ExecutionSpec,
     ) -> kuberic_durable_execution::DispatchPermit {
@@ -3410,7 +3439,7 @@ mod framework_native_switchover_tests {
             checkpoint_limits(),
         );
         let permit = expose_next(&mut host, &DurableSwitchoverWorkflow, &execution).await;
-        let prepared = decode_pilot_activity_input(permit.activity().input()).unwrap();
+        let prepared = decode_switchover_activity_input(permit.activity().input()).unwrap();
         let current = prepared.state.apply_to(&operation).unwrap();
         let activity = permit.activity().clone();
         let attempt_id = permit.attempt_id();

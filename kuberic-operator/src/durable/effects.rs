@@ -21,8 +21,8 @@ use crate::crd::DurableOperationPhase;
 use crate::crd::{DurableOperationStatus, EpochStatus, PendingActionStatus};
 
 use super::switchover_execution::{
-    DurableSwitchoverState, DurableSwitchoverStepResult, PilotActivityKind, PilotAdapterDecision,
-    PilotPermitGuard,
+    DurableSwitchoverState, DurableSwitchoverStepResult, SwitchoverActivityKind,
+    SwitchoverAdapterDecision, SwitchoverPermitGuard,
 };
 use super::workflow_host::DurablePermitGuard;
 use super::{Decision, switchover::is_switchover_postcondition_transition};
@@ -194,8 +194,6 @@ pub enum DurableEffectPreparationError {
     InvalidCommand,
 }
 
-pub type PilotEffectPreparationError = DurableEffectPreparationError;
-
 pub fn prepare_replica_effect_command(
     pending: &PendingActionStatus,
     observed: &ReplicaStatusInfo,
@@ -323,7 +321,7 @@ fn prepare_replica_effect_command_with_lifecycle_support(
     Ok((planned, command))
 }
 
-pub fn validate_pilot_replica_action_kind(
+pub fn validate_switchover_replica_action_kind(
     kind: crate::crd::DurableActionKind,
     action: &DurableReplicaAction,
 ) -> bool {
@@ -936,76 +934,79 @@ pub async fn execute_delete_command(
         .await;
 }
 
-pub type PilotEffectBridgeOutcome = DurableEffectBridgeOutcome<Box<DurableSwitchoverStepResult>>;
+pub type SwitchoverEffectBridgeOutcome =
+    DurableEffectBridgeOutcome<Box<DurableSwitchoverStepResult>>;
 
 #[allow(clippy::too_many_arguments)]
-pub async fn bridge_pilot_permitted_step(
-    guard: &mut PilotPermitGuard,
+pub async fn bridge_switchover_permitted_step(
+    guard: &mut SwitchoverPermitGuard,
     operation: &DurableOperationStatus,
-    prepared: &super::switchover_execution::PilotActivityKind,
+    prepared: &super::switchover_execution::SwitchoverActivityKind,
     accepted_activity: &kuberic_durable_execution::LogicalActivityId,
     accepted_attempt: kuberic_durable_execution::AttemptId,
     observations: &OperationObservations,
     handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
     api: &dyn ClusterApi,
     namespace: &str,
-) -> Result<PilotEffectBridgeOutcome, String> {
+) -> Result<SwitchoverEffectBridgeOutcome, String> {
     let _permit = guard.consume_for(operation, prepared, accepted_activity, accepted_attempt)?;
-    bridge_preconsumed_pilot_step(operation, prepared, observations, handles, api, namespace).await
+    bridge_preconsumed_switchover_step(operation, prepared, observations, handles, api, namespace)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn bridge_pilot_runner_step(
+pub async fn bridge_switchover_runner_step(
     guard: &mut DurablePermitGuard,
     operation: &DurableOperationStatus,
-    prepared: &super::switchover_execution::PilotActivityKind,
+    prepared: &super::switchover_execution::SwitchoverActivityKind,
     accepted_activity: &kuberic_durable_execution::LogicalActivityId,
     accepted_attempt: kuberic_durable_execution::AttemptId,
     observations: &OperationObservations,
     handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
     api: &dyn ClusterApi,
     namespace: &str,
-) -> Result<PilotEffectBridgeOutcome, String> {
+) -> Result<SwitchoverEffectBridgeOutcome, String> {
     let expected = super::switchover_execution::prepared_activity_spec(operation, prepared)?;
     let _permit = guard.consume(&expected, accepted_activity, accepted_attempt, "switchover")?;
-    bridge_preconsumed_pilot_step(operation, prepared, observations, handles, api, namespace).await
+    bridge_preconsumed_switchover_step(operation, prepared, observations, handles, api, namespace)
+        .await
 }
 
-async fn bridge_preconsumed_pilot_step(
+async fn bridge_preconsumed_switchover_step(
     operation: &DurableOperationStatus,
-    prepared: &super::switchover_execution::PilotActivityKind,
+    prepared: &super::switchover_execution::SwitchoverActivityKind,
     observations: &OperationObservations,
     handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
     api: &dyn ClusterApi,
     namespace: &str,
-) -> Result<PilotEffectBridgeOutcome, String> {
+) -> Result<SwitchoverEffectBridgeOutcome, String> {
     match prepared {
-        super::switchover_execution::PilotActivityKind::PassiveObservation => {
+        super::switchover_execution::SwitchoverActivityKind::PassiveObservation => {
             Err("passive pilot observation unexpectedly reached the effect bridge".to_string())
         }
-        super::switchover_execution::PilotActivityKind::PreparedReplica { command } => {
+        super::switchover_execution::SwitchoverActivityKind::PreparedReplica { command } => {
             let Some(handle) = handles.get(&command.target_id) else {
-                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+                return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
             };
             if handle.instance_id().as_str() != command.target_instance_id {
-                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+                return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
             }
             match execute_replica_command(handle.as_ref(), command).await {
-                Ok(()) => Ok(PilotEffectBridgeOutcome::Exposed),
-                Err(error) => match pilot_result_after_dispatch_error(
+                Ok(()) => Ok(SwitchoverEffectBridgeOutcome::Exposed),
+                Err(error) => match switchover_result_after_dispatch_error(
                     operation,
                     command.action_id.clone(),
                     &error,
                 ) {
                     Some(result) if dispatch_rejection_requires_refresh(&error) => Ok(
-                        PilotEffectBridgeOutcome::ObserveAfterFenceRefresh(Box::new(result)),
+                        SwitchoverEffectBridgeOutcome::ObserveAfterFenceRefresh(Box::new(result)),
                     ),
-                    Some(result) => Ok(PilotEffectBridgeOutcome::Observe(Box::new(result))),
-                    None => Ok(PilotEffectBridgeOutcome::Exposed),
+                    Some(result) => Ok(SwitchoverEffectBridgeOutcome::Observe(Box::new(result))),
+                    None => Ok(SwitchoverEffectBridgeOutcome::Exposed),
                 },
             }
         }
-        super::switchover_execution::PilotActivityKind::PreparedLabel { command } => {
+        super::switchover_execution::SwitchoverActivityKind::PreparedLabel { command } => {
             if observations
                 .get(&command.target_id)
                 .is_some_and(|observed| {
@@ -1013,15 +1014,15 @@ async fn bridge_preconsumed_pilot_step(
                         || observed.pod_name != command.pod_name
                 })
             {
-                return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+                return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
             }
             execute_label_command(api, namespace, command).await;
-            Ok(PilotEffectBridgeOutcome::Exposed)
+            Ok(SwitchoverEffectBridgeOutcome::Exposed)
         }
     }
 }
 
-fn pilot_result_after_dispatch_error(
+fn switchover_result_after_dispatch_error(
     operation: &DurableOperationStatus,
     action_id: String,
     error: &KubericError,
@@ -1046,17 +1047,17 @@ fn pilot_result_after_dispatch_error(
     })
 }
 
-pub fn resolve_pilot_quarantine(
+pub fn resolve_switchover_quarantine(
     operation: &DurableOperationStatus,
-    prepared: &PilotActivityKind,
-    decision: PilotAdapterDecision,
+    prepared: &SwitchoverActivityKind,
+    decision: SwitchoverAdapterDecision,
     observations: &OperationObservations,
-) -> Result<PilotEffectBridgeOutcome, String> {
+) -> Result<SwitchoverEffectBridgeOutcome, String> {
     if matches!(
         (&prepared, &decision),
         (
-            PilotActivityKind::PassiveObservation,
-            PilotAdapterDecision::AwaitEvidence
+            SwitchoverActivityKind::PassiveObservation,
+            SwitchoverAdapterDecision::AwaitEvidence
         )
     ) && operation.pending_action.is_some()
     {
@@ -1065,15 +1066,17 @@ pub fn resolve_pilot_quarantine(
                 .to_string(),
         );
     }
-    if let PilotAdapterDecision::Observe(result) = decision {
-        let authoritative = matches!(prepared, PilotActivityKind::PassiveObservation)
+    if let SwitchoverAdapterDecision::Observe(result) = decision {
+        let authoritative = matches!(prepared, SwitchoverActivityKind::PassiveObservation)
             || quarantine_result_is_authoritative(operation, &result, observations);
         return Ok(resolve_quarantined_observation(result, authoritative));
     }
-    let (PilotActivityKind::PreparedReplica { command }, PilotAdapterDecision::External(decision)) =
-        (prepared, decision)
+    let (
+        SwitchoverActivityKind::PreparedReplica { command },
+        SwitchoverAdapterDecision::External(decision),
+    ) = (prepared, decision)
     else {
-        return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+        return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
     };
     let Decision::Execute {
         target_id,
@@ -1081,7 +1084,7 @@ pub fn resolve_pilot_quarantine(
         action,
     } = *decision
     else {
-        return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
+        return Ok(SwitchoverEffectBridgeOutcome::AwaitEvidence);
     };
     resolve_quarantined_replica_effect(
         operation,
@@ -1335,7 +1338,7 @@ mod tests {
             crate::crd::DurableActionKind::CreateCompensateRemoveCandidate,
             &action,
         ));
-        assert!(!validate_pilot_replica_action_kind(
+        assert!(!validate_switchover_replica_action_kind(
             crate::crd::DurableActionKind::CreateCompensateRemoveCandidate,
             &action,
         ));
@@ -1435,7 +1438,7 @@ mod tests {
                 &ReplicaInstanceId::new("replacement-uid"),
                 &action,
             ),
-            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+            Err(DurableEffectPreparationError::WaitForExactIncarnation)
         );
 
         let mut replacement = observed_command_target();
@@ -1447,7 +1450,7 @@ mod tests {
                 &ReplicaInstanceId::new("replica-2-uid"),
                 &action,
             ),
-            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+            Err(DurableEffectPreparationError::WaitForExactIncarnation)
         );
 
         let mut unsupported = observed_command_target();
@@ -1459,7 +1462,7 @@ mod tests {
                 &ReplicaInstanceId::new("replica-2-uid"),
                 &action,
             ),
-            Err(PilotEffectPreparationError::WaitForSupportedProtocol)
+            Err(DurableEffectPreparationError::WaitForSupportedProtocol)
         );
 
         let (frozen, _) = prepare_replica_effect_command(
@@ -1479,7 +1482,7 @@ mod tests {
                 &ReplicaInstanceId::new("replica-2-uid"),
                 &action,
             ),
-            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+            Err(DurableEffectPreparationError::WaitForExactIncarnation)
         );
         let mut changed_control = observed_command_target();
         changed_control.agent.control_version = AgentControlVersion::new(12);
@@ -1490,7 +1493,7 @@ mod tests {
                 &ReplicaInstanceId::new("replica-2-uid"),
                 &action,
             ),
-            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+            Err(DurableEffectPreparationError::WaitForExactIncarnation)
         );
         let mut changed_epoch = observed_command_target();
         changed_epoch.epoch = Epoch::new(4, 9);
@@ -1501,7 +1504,7 @@ mod tests {
                 &ReplicaInstanceId::new("replica-2-uid"),
                 &action,
             ),
-            Err(PilotEffectPreparationError::WaitForExactIncarnation)
+            Err(DurableEffectPreparationError::WaitForExactIncarnation)
         );
         assert_eq!(
             prepare_replica_effect_command(
@@ -1510,7 +1513,7 @@ mod tests {
                 &ReplicaInstanceId::new("replica-2-uid"),
                 &DurableReplicaAction::Close,
             ),
-            Err(PilotEffectPreparationError::InvalidCommand)
+            Err(DurableEffectPreparationError::InvalidCommand)
         );
     }
 }
