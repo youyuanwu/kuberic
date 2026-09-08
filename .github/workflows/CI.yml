@@ -13,7 +13,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       KIND_CLUSTER_NAME: kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
-      KUBECONFIG: ${{ runner.temp }}/kuberic-kind-kubeconfig
+      KUBECONFIG: /tmp/kuberic-kind-kubeconfig-${{ github.run_id }}-${{ github.run_attempt }}
       KUBE_CONTEXT: kind-kuberic-ci-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       matrix:
