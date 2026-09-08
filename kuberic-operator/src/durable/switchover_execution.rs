@@ -1,4 +1,4 @@
-//! Immutable contract and admission gate for the durable switchover pilot.
+//! Compact versioned durable contract for framework-native switchover.
 //!
 //! The pilot deliberately reuses the explicit switchover operation as its
 //! workflow input. Per-turn workflow and reconciliation behavior is added by
@@ -38,7 +38,8 @@ use tokio::sync::Mutex;
 
 use crate::crd::{
     DurableOperationPhase, DurableOperationStatus, DurableSwitchoverPilotStatus, KubericSet,
-    PendingActionStatus, StablePartitionSnapshotStatus,
+    PendingActionStatus, StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus,
+    SwitchoverExecutionStatus, SwitchoverIncompatibilitySource, SwitchoverIncompatibilityStatus,
 };
 use crate::{cluster_api::ClusterApi, reconciler::snapshot_with_observed_metadata};
 
@@ -65,19 +66,35 @@ use super::{
     },
 };
 
-pub const PILOT_VERSION: u32 = 2;
-pub const PILOT_MAX_REPLICAS: usize = 3;
-pub const PILOT_MAX_ACTIVITY_RECORDS: usize = 32;
-pub const PILOT_MAX_TRANSITION_FUEL: usize = 64;
-pub const PILOT_MAX_OPERATION_BYTES: usize = 3_000;
-pub const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = 8_192;
-pub const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = 4_096;
-pub const PILOT_MAX_TERMINAL_BYTES: u64 = 4_096;
-pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = 752 * 1_024;
+pub const SWITCHOVER_CONTRACT_VERSION: u32 = 3;
+pub const SWITCHOVER_MAX_REPLICAS: usize = 3;
+pub const SWITCHOVER_MAX_ACTIVITY_RECORDS: usize = 32;
+pub const SWITCHOVER_MAX_TRANSITION_FUEL: usize = 64;
+pub const SWITCHOVER_MAX_RUNNER_FUEL: usize = 32;
+pub const SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES: usize = 4_096;
+pub const SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES: usize = 8_192;
+pub const SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES: usize = 4_096;
+pub const SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES: usize = 752 * 1_024;
+pub const SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES: usize = 16 * 1_024;
+pub const SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES: u64 = 4_096;
+pub const SWITCHOVER_MAX_ERROR_BYTES: usize = 512;
 
-const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.effect-boundary";
-const PILOT_ACTIVITY_VERSION: u32 = 1;
+// Transitional aliases retained until pilot terminology is removed from the
+// reconciler and tests in later graduation phases.
+pub const PILOT_VERSION: u32 = SWITCHOVER_CONTRACT_VERSION;
+pub const PILOT_MAX_REPLICAS: usize = SWITCHOVER_MAX_REPLICAS;
+pub const PILOT_MAX_ACTIVITY_RECORDS: usize = SWITCHOVER_MAX_ACTIVITY_RECORDS;
+pub const PILOT_MAX_TRANSITION_FUEL: usize = SWITCHOVER_MAX_TRANSITION_FUEL;
+pub const PILOT_MAX_OPERATION_BYTES: usize = SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES;
+pub const PILOT_MAX_ACTIVITY_INPUT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES;
+pub const PILOT_MAX_ACTIVITY_RESULT_BYTES: usize = SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES;
+pub const PILOT_MAX_TERMINAL_BYTES: u64 = SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES;
+pub const PILOT_MAX_ENCODED_CHECKPOINT_BYTES: usize = SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES;
+
+const PILOT_ACTIVITY_NAME: &str = "kuberic.switchover.native-boundary";
+const PILOT_ACTIVITY_VERSION: u32 = 2;
 pub type PilotHost = DurableOperatorHost;
+pub type SwitchoverExecution = SwitchoverExecutionStatus;
 
 /// Process-local host cache. Checkpoints, rather than this cache, remain the
 /// recovery authority; retaining hosts preserves monotonic attempt counters
@@ -85,6 +102,8 @@ pub type PilotHost = DurableOperatorHost;
 pub struct DurableSwitchoverPilotRuntime {
     inner: Arc<DurableWorkflowRuntime>,
 }
+
+pub type DurableSwitchoverRuntime = DurableSwitchoverPilotRuntime;
 
 impl DurableSwitchoverPilotRuntime {
     pub fn kubernetes(client: kube::Client) -> Self {
@@ -111,6 +130,30 @@ impl DurableSwitchoverPilotRuntime {
         reference: &DurableSwitchoverPilotStatus,
     ) -> Result<Arc<Mutex<PilotHost>>, String> {
         let execution_id = execution_id(reference)?;
+        self.inner
+            .host(
+                namespace,
+                set_name,
+                set_uid,
+                "switchover",
+                execution_id,
+                &reference.execution_id,
+                &reference.checkpoint_name,
+                checkpoint_store_options(namespace, set_name, set_uid)?,
+                checkpoint_limits(),
+                checkpoint_measurement_decoder(),
+            )
+            .await
+    }
+
+    pub async fn native_host(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        set_uid: &str,
+        reference: &SwitchoverExecutionStatus,
+    ) -> Result<Arc<Mutex<PilotHost>>, String> {
+        let execution_id = native_execution_id(reference)?;
         self.inner
             .host(
                 namespace,
@@ -1707,7 +1750,7 @@ fn encode_terminal(terminal: &DurableSwitchoverPilotTerminal) -> Result<ExactByt
 }
 
 fn terminal_failure(operation: Option<DurableOperationStatus>, message: String) -> TerminalOutcome {
-    let bounded_message: String = message.chars().take(512).collect();
+    let bounded_message: String = message.chars().take(SWITCHOVER_MAX_ERROR_BYTES).collect();
     let terminal = DurableSwitchoverTerminalRecord::Stopped {
         state: operation
             .as_ref()
@@ -1767,6 +1810,145 @@ pub fn new_pilot_reference(
     Ok(reference)
 }
 
+pub fn new_switchover_execution(
+    operation_authority: &str,
+    previous_snapshot: StablePartitionSnapshotStatus,
+    target_primary_id: i64,
+    now: i64,
+) -> Result<SwitchoverExecutionStatus, String> {
+    if operation_authority.is_empty() {
+        return Err("framework-native switchover requires operation authority".to_string());
+    }
+    let execution_id = ExecutionId::from_bytes(random());
+    let execution_hex = encode_execution_id(execution_id);
+    let reference = SwitchoverExecutionStatus {
+        contract_version: SWITCHOVER_CONTRACT_VERSION,
+        execution_id: execution_hex,
+        checkpoint_name: KubernetesCheckpointStore::object_name(execution_id),
+        input: Some(SwitchoverAdmissionInputStatus {
+            operation_authority: operation_authority.to_string(),
+            previous_snapshot,
+            target_primary_id,
+            accepted_unix_seconds: now,
+        }),
+        incompatibility: None,
+    };
+    native_execution_spec(&reference)?;
+    Ok(reference)
+}
+
+pub fn incompatible_switchover_execution(
+    source: SwitchoverIncompatibilitySource,
+    legacy_contract_version: u32,
+    legacy_execution_id: String,
+    legacy_checkpoint_name: Option<String>,
+    encoded_legacy_state: &[u8],
+) -> SwitchoverExecutionStatus {
+    let source_name = match source {
+        SwitchoverIncompatibilitySource::LegacyExplicit => "legacy-explicit",
+        SwitchoverIncompatibilitySource::LegacyPilotV1 => "legacy-pilot-v1",
+        SwitchoverIncompatibilitySource::LegacyPilotV2 => "legacy-pilot-v2",
+        SwitchoverIncompatibilitySource::UnsupportedStatus => "unsupported-status",
+    };
+    let fingerprint = stable_legacy_fingerprint(source_name, encoded_legacy_state);
+    SwitchoverExecutionStatus {
+        contract_version: SWITCHOVER_CONTRACT_VERSION,
+        execution_id: legacy_execution_id.clone(),
+        checkpoint_name: legacy_checkpoint_name
+            .clone()
+            .unwrap_or_else(|| format!("kuberic-switchover-incompatible-{fingerprint}")),
+        input: None,
+        incompatibility: Some(SwitchoverIncompatibilityStatus {
+            source,
+            legacy_contract_version,
+            legacy_execution_id,
+            legacy_checkpoint_name,
+            fingerprint,
+        }),
+    }
+}
+
+fn stable_legacy_fingerprint(source: &str, encoded: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in source.as_bytes().iter().chain(encoded) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn native_execution_id(reference: &SwitchoverExecutionStatus) -> Result<ExecutionId, String> {
+    if reference.contract_version != SWITCHOVER_CONTRACT_VERSION {
+        return Err(format!(
+            "unsupported framework-native switchover contract version {}",
+            reference.contract_version
+        ));
+    }
+    if reference.input.is_some() == reference.incompatibility.is_some() {
+        return Err(
+            "switchover execution must contain exactly one of input or incompatibility".to_string(),
+        );
+    }
+    if reference.incompatibility.is_some() {
+        return Err("incompatible switchover execution cannot be resumed".to_string());
+    }
+    let bytes = decode_execution_id(&reference.execution_id)?;
+    let execution_id = ExecutionId::from_bytes(bytes);
+    let expected_name = KubernetesCheckpointStore::object_name(execution_id);
+    if reference.checkpoint_name != expected_name {
+        return Err(format!(
+            "framework-native switchover checkpoint name mismatch: expected {expected_name}, found {}",
+            reference.checkpoint_name
+        ));
+    }
+    Ok(execution_id)
+}
+
+pub fn native_initial_operation(
+    reference: &SwitchoverExecutionStatus,
+) -> Result<DurableOperationStatus, String> {
+    let input = reference
+        .input
+        .as_ref()
+        .ok_or_else(|| "framework-native switchover has no admission input".to_string())?;
+    start_switchover(
+        &format!(
+            "{}:framework-native:{}",
+            input.operation_authority, reference.execution_id
+        ),
+        input.previous_snapshot.clone(),
+        input.target_primary_id,
+        input.accepted_unix_seconds,
+    )
+}
+
+pub fn native_execution_spec(
+    reference: &SwitchoverExecutionStatus,
+) -> Result<ExecutionSpec, String> {
+    let execution_id = native_execution_id(reference)?;
+    let initial_operation = native_initial_operation(reference)?;
+    validate_pilot_admission(&initial_operation)?;
+    let input = DurableSwitchoverPilotInput {
+        version: reference.contract_version,
+        execution_id: reference.execution_id.clone(),
+        initial_operation,
+    };
+    let input = serde_json::to_vec(&input)
+        .map_err(|error| format!("serialize framework-native switchover input: {error}"))?;
+    if input.len() > SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES {
+        return Err(format!(
+            "framework-native switchover input is {} bytes; maximum is {}",
+            input.len(),
+            SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES
+        ));
+    }
+    Ok(ExecutionSpec::new(
+        execution_id,
+        ExactBytes::new(input),
+        SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
+    ))
+}
+
 pub fn execution_id(reference: &DurableSwitchoverPilotStatus) -> Result<ExecutionId, String> {
     if reference.version != PILOT_VERSION {
         return Err(format!(
@@ -1820,11 +2002,11 @@ pub fn initial_operation(
 
 pub fn checkpoint_limits() -> CheckpointLimits {
     CheckpointLimits::new(
-        PILOT_MAX_ACTIVITY_RECORDS,
-        PILOT_MAX_ENCODED_CHECKPOINT_BYTES,
-        PILOT_MAX_ENCODED_CHECKPOINT_BYTES,
+        SWITCHOVER_MAX_ACTIVITY_RECORDS,
+        SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES,
+        SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
     )
-    .expect("durable switchover pilot limits are nonzero")
+    .expect("framework-native switchover limits are nonzero")
 }
 
 pub fn checkpoint_store_options(
@@ -1877,9 +2059,17 @@ pub fn validate_pilot_admission(operation: &DurableOperationStatus) -> Result<()
         ));
     }
     let projected_bytes = maximum_projected_checkpoint_bytes()?;
-    if projected_bytes > PILOT_MAX_ENCODED_CHECKPOINT_BYTES {
+    if projected_bytes > SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES {
         return Err(format!(
-            "durable switchover projected checkpoint is {projected_bytes} bytes; maximum is {PILOT_MAX_ENCODED_CHECKPOINT_BYTES}"
+            "durable switchover projected checkpoint is {projected_bytes} bytes; maximum is {SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES}"
+        ));
+    }
+    let projected_terminal = maximum_terminal_checkpoint()?
+        .encoded_len()
+        .map_err(|error| format!("measure maximum switchover terminal checkpoint: {error}"))?;
+    if projected_terminal > SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES {
+        return Err(format!(
+            "durable switchover projected terminal is {projected_terminal} bytes; maximum is {SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES}"
         ));
     }
     Ok(())
@@ -2315,7 +2505,7 @@ const fn projected_rollback_pure_transitions() -> usize {
 }
 
 pub fn maximum_active_checkpoint() -> Result<CheckpointEnvelope, String> {
-    let payload = maximum_active_payload(PILOT_MAX_ENCODED_CHECKPOINT_BYTES)?;
+    let payload = maximum_active_payload(SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES)?;
     CheckpointEnvelope::encode_with_limits(&payload, checkpoint_limits())
         .map_err(|error| format!("project maximum pilot checkpoint: {error}"))
 }
@@ -2331,7 +2521,11 @@ fn maximum_active_payload(
     );
     let admitted = u64::try_from(admitted_max_encoded_checkpoint_bytes)
         .map_err(|_| "pilot checkpoint limit does not fit u64".to_string())?;
-    let contract = ExecutionContract::with_encoded_limits(execution, admitted, admitted);
+    let contract = ExecutionContract::with_encoded_limits(
+        execution,
+        admitted,
+        SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
+    );
     let name = ActivityName::new(PILOT_ACTIVITY_NAME, PILOT_ACTIVITY_VERSION)
         .map_err(|error| format!("construct pilot activity name: {error}"))?;
     let activities = (0..PILOT_MAX_ACTIVITY_RECORDS)
@@ -2352,6 +2546,32 @@ fn maximum_active_payload(
         })
         .collect();
     Ok(CheckpointPayload::active(contract, activities))
+}
+
+pub fn maximum_terminal_checkpoint() -> Result<CheckpointEnvelope, String> {
+    let execution_id = ExecutionId::from_bytes([u8::MAX; 16]);
+    let execution = ExecutionSpec::new(
+        execution_id,
+        ExactBytes::new(vec![u8::MAX; SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES]),
+        SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
+    );
+    let contract = ExecutionContract::with_encoded_limits(
+        execution,
+        SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
+        SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
+    );
+    CheckpointEnvelope::encode_with_limits(
+        &CheckpointPayload::terminal(
+            contract,
+            TerminalOutcome::failed(vec![
+                u8::MAX;
+                SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES as usize
+            ]),
+            SWITCHOVER_MAX_ACTIVITY_RECORDS as u64,
+        ),
+        checkpoint_limits(),
+    )
+    .map_err(|error| format!("project maximum framework-native switchover terminal: {error}"))
 }
 
 #[cfg(test)]
@@ -2439,7 +2659,10 @@ fn decode_hex(value: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod durable_switchover_pilot_tests {
     use super::*;
-    use crate::crd::{EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus};
+    use crate::crd::{
+        EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
+        SwitchoverIncompatibilitySource, SwitchoverIncompatibilityStatus,
+    };
     use crate::durable::{Decision, decide};
     use kuberic_durable_execution::ActivityObservation;
     use std::collections::BTreeMap;
@@ -2471,6 +2694,101 @@ mod durable_switchover_pilot_tests {
 
     fn compact(operation: &DurableOperationStatus) -> DurableSwitchoverState {
         DurableSwitchoverState::from_operation(operation)
+    }
+
+    #[test]
+    fn framework_native_reference_is_immutable_and_reconstructs_admission() {
+        let previous = snapshot(3);
+        let first = new_switchover_execution("set-uid", previous.clone(), 2, 100).unwrap();
+        let second = new_switchover_execution("set-uid", previous.clone(), 2, 100).unwrap();
+        assert_eq!(first.contract_version, SWITCHOVER_CONTRACT_VERSION);
+        assert_ne!(first.execution_id, second.execution_id);
+        assert_eq!(
+            first.checkpoint_name,
+            KubernetesCheckpointStore::object_name(native_execution_id(&first).unwrap())
+        );
+        let operation = native_initial_operation(&first).unwrap();
+        assert_eq!(operation.previous_snapshot.as_ref(), Some(&previous));
+        assert_eq!(operation.target_primary_id, 2);
+        assert!(operation.operation_id.contains(&first.execution_id));
+        assert!(native_execution_spec(&first).is_ok());
+    }
+
+    #[test]
+    fn framework_native_reference_requires_exactly_one_state_variant() {
+        let mut reference = new_switchover_execution("set-uid", snapshot(3), 2, 100).unwrap();
+        reference.incompatibility = Some(SwitchoverIncompatibilityStatus {
+            source: SwitchoverIncompatibilitySource::LegacyPilotV2,
+            legacy_contract_version: 2,
+            legacy_execution_id: "legacy".to_string(),
+            legacy_checkpoint_name: Some("legacy-checkpoint".to_string()),
+            fingerprint: "fingerprint".to_string(),
+        });
+        assert!(native_execution_id(&reference).is_err());
+
+        reference.input = None;
+        assert!(native_execution_id(&reference).is_err());
+        reference.incompatibility = None;
+        assert!(native_execution_id(&reference).is_err());
+    }
+
+    #[test]
+    fn framework_native_incompatibility_marker_is_stable_and_preserves_source() {
+        let encoded = br#"{"version":2,"executionId":"legacy"}"#;
+        let first = incompatible_switchover_execution(
+            SwitchoverIncompatibilitySource::LegacyPilotV2,
+            2,
+            "legacy".to_string(),
+            Some("legacy-checkpoint".to_string()),
+            encoded,
+        );
+        let second = incompatible_switchover_execution(
+            SwitchoverIncompatibilitySource::LegacyPilotV2,
+            2,
+            "legacy".to_string(),
+            Some("legacy-checkpoint".to_string()),
+            encoded,
+        );
+        assert_eq!(first, second);
+        assert!(first.input.is_none());
+        let marker = first.incompatibility.unwrap();
+        assert_eq!(
+            marker.source,
+            SwitchoverIncompatibilitySource::LegacyPilotV2
+        );
+        assert_eq!(marker.legacy_contract_version, 2);
+        assert_eq!(marker.legacy_execution_id, "legacy");
+        assert_eq!(
+            marker.legacy_checkpoint_name.as_deref(),
+            Some("legacy-checkpoint")
+        );
+        assert_eq!(marker.fingerprint.len(), 16);
+    }
+
+    #[test]
+    fn framework_native_active_and_terminal_projections_fit_independent_bounds() {
+        let active = maximum_active_checkpoint().unwrap();
+        let terminal = maximum_terminal_checkpoint().unwrap();
+        let active_bytes = active.encoded_len().unwrap();
+        let terminal_bytes = terminal.encoded_len().unwrap();
+        assert!(active_bytes <= SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES);
+        assert!(terminal_bytes <= SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES);
+        assert_ne!(
+            SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES,
+            SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
+        );
+        eprintln!(
+            "framework-native switchover projected bounds: records={}, workflow_input={}, activity_input={}, result={}, active={}, terminal={}, terminal_payload={}, transition_fuel={}, runner_fuel={}",
+            SWITCHOVER_MAX_ACTIVITY_RECORDS,
+            SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES,
+            SWITCHOVER_MAX_ACTIVITY_INPUT_BYTES,
+            SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES,
+            active_bytes,
+            terminal_bytes,
+            SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
+            SWITCHOVER_MAX_TRANSITION_FUEL,
+            SWITCHOVER_MAX_RUNNER_FUEL
+        );
     }
 
     #[test]
@@ -2546,10 +2864,19 @@ mod durable_switchover_pilot_tests {
         );
 
         let payload = maximum_active_payload(encoded).unwrap();
-        let exact = CheckpointLimits::new(PILOT_MAX_ACTIVITY_RECORDS, encoded, encoded).unwrap();
+        let exact = CheckpointLimits::new(
+            PILOT_MAX_ACTIVITY_RECORDS,
+            encoded,
+            SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
+        )
+        .unwrap();
         assert!(CheckpointEnvelope::encode_with_limits(&payload, exact).is_ok());
-        let one_byte_short =
-            CheckpointLimits::new(PILOT_MAX_ACTIVITY_RECORDS, encoded - 1, encoded - 1).unwrap();
+        let one_byte_short = CheckpointLimits::new(
+            PILOT_MAX_ACTIVITY_RECORDS,
+            encoded - 1,
+            SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
+        )
+        .unwrap();
         assert!(CheckpointEnvelope::encode_with_limits(&payload, one_byte_short).is_err());
     }
 
@@ -3193,9 +3520,10 @@ mod durable_switchover_pilot_tests {
             .unwrap();
             assert_eq!(resolver.resolve(&logical, Some(&drifted)).unwrap(), logical);
             let payload = CheckpointPayload::active(
-                ExecutionContract::new(
+                ExecutionContract::with_encoded_limits(
                     execution.clone(),
                     u64::try_from(PILOT_MAX_ENCODED_CHECKPOINT_BYTES).unwrap(),
+                    u64::try_from(SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES).unwrap(),
                 ),
                 vec![ActivityRecord::scheduled(ActivitySequence::new(0), drifted)],
             );
@@ -3255,9 +3583,10 @@ mod durable_switchover_pilot_tests {
         for changed in [changed_name, changed_version, changed_result_bound] {
             assert_eq!(resolver.resolve(&logical, Some(&changed)).unwrap(), logical);
             let payload = CheckpointPayload::active(
-                ExecutionContract::new(
+                ExecutionContract::with_encoded_limits(
                     execution.clone(),
                     u64::try_from(PILOT_MAX_ENCODED_CHECKPOINT_BYTES).unwrap(),
+                    u64::try_from(SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES).unwrap(),
                 ),
                 vec![ActivityRecord::scheduled(ActivitySequence::new(0), changed)],
             );

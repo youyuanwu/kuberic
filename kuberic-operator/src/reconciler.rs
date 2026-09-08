@@ -2764,6 +2764,7 @@ async fn apply_failover_decision(
                 stable_snapshot: Some(snapshot),
                 operation: None,
                 durable_switchover_pilot: None,
+                switchover_execution: None,
                 legacy_status_fields: BTreeMap::new(),
                 remove_replica_execution: None,
                 conditions: Vec::new(),

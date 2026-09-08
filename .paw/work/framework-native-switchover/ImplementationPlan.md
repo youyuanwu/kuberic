@@ -146,7 +146,7 @@ obsolete tests and documentation.
 
 ## Phase Status
 
-- [ ] **Phase 1: Native Contract and Compatibility Surface** - Introduce the
+- [x] **Phase 1: Native Contract and Compatibility Surface** - Introduce the
   sole versioned switchover execution reference, incompatibility evidence, and
   independent contract bounds while preserving existing routing temporarily.
 - [ ] **Phase 2: Native Admission, Recovery, and Publication Path** - Add the

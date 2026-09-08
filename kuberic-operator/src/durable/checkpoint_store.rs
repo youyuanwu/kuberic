@@ -192,17 +192,18 @@ pub struct MeasuredDurableCheckpointStore {
 }
 
 impl MeasuredDurableCheckpointStore {
-    #[cfg(not(feature = "durable-switchover-pilot"))]
     pub fn new(execution_id: ExecutionId, inner: DurableCheckpointStore) -> Self {
         Self::with_native_remove_decoder(execution_id, inner)
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
-    pub fn new(execution_id: ExecutionId, inner: DurableCheckpointStore) -> Self {
+    pub fn with_switchover_decoder(
+        execution_id: ExecutionId,
+        inner: DurableCheckpointStore,
+    ) -> Self {
         Self::with_decoder(
             execution_id,
             inner,
-            super::pilot::checkpoint_measurement_decoder(),
+            super::switchover_execution::checkpoint_measurement_decoder(),
         )
     }
 
@@ -230,8 +231,15 @@ impl MeasuredDurableCheckpointStore {
         )
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     pub fn with_collector(
+        execution_id: ExecutionId,
+        inner: DurableCheckpointStore,
+        collector: DurableCheckpointEventCollector,
+    ) -> Self {
+        Self::with_switchover_collector(execution_id, inner, collector)
+    }
+
+    pub fn with_switchover_collector(
         execution_id: ExecutionId,
         inner: DurableCheckpointStore,
         collector: DurableCheckpointEventCollector,
@@ -240,7 +248,7 @@ impl MeasuredDurableCheckpointStore {
             execution_id,
             inner,
             collector,
-            super::pilot::checkpoint_measurement_decoder(),
+            super::switchover_execution::checkpoint_measurement_decoder(),
         )
     }
 

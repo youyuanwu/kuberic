@@ -127,6 +127,11 @@ pub struct KubericSetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durable_switchover_pilot: Option<DurableSwitchoverPilotStatus>,
 
+    /// Structured immutable authority or incompatibility marker for the
+    /// framework-native switchover execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switchover_execution: Option<SwitchoverExecutionStatus>,
+
     /// Unknown legacy status fields are accepted for one reconciliation and
     /// omitted from every replacement status.
     #[serde(flatten, default, skip_serializing)]
@@ -212,6 +217,47 @@ pub struct DurableSwitchoverPilotStatus {
     /// Exact JSON encoding of the initial operation accepted before checkpoint
     /// creation or effect dispatch.
     pub initial_operation_json: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SwitchoverExecutionStatus {
+    pub contract_version: u32,
+    pub execution_id: String,
+    pub checkpoint_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<SwitchoverAdmissionInputStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incompatibility: Option<SwitchoverIncompatibilityStatus>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SwitchoverAdmissionInputStatus {
+    pub operation_authority: String,
+    pub previous_snapshot: StablePartitionSnapshotStatus,
+    pub target_primary_id: i64,
+    pub accepted_unix_seconds: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SwitchoverIncompatibilityStatus {
+    pub source: SwitchoverIncompatibilitySource,
+    pub legacy_contract_version: u32,
+    pub legacy_execution_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_checkpoint_name: Option<String>,
+    pub fingerprint: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SwitchoverIncompatibilitySource {
+    LegacyExplicit,
+    LegacyPilotV1,
+    LegacyPilotV2,
+    UnsupportedStatus,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -1068,6 +1114,7 @@ mod tests {
         assert!(status.stable_snapshot.is_none());
         assert!(status.operation.is_none());
         assert!(status.durable_switchover_pilot.is_none());
+        assert!(status.switchover_execution.is_none());
         assert!(status.legacy_status_fields.is_empty());
         assert!(status.remove_replica_execution.is_none());
         assert!(status.conditions.is_empty());
@@ -1156,6 +1203,66 @@ mod tests {
                 "missing native remove schema {required}"
             );
         }
+    }
+
+    #[test]
+    fn framework_native_switchover_reference_has_exclusive_structured_variants() {
+        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        for required in [
+            "switchoverExecution",
+            "contractVersion",
+            "operationAuthority",
+            "previousSnapshot",
+            "targetPrimaryId",
+            "acceptedUnixSeconds",
+            "incompatibility",
+            "legacyCheckpointName",
+            "fingerprint",
+        ] {
+            assert!(
+                generated.contains(required),
+                "missing native switchover schema {required}"
+            );
+        }
+
+        let admitted = SwitchoverExecutionStatus {
+            contract_version: 3,
+            execution_id: "0123456789abcdef0123456789abcdef".to_string(),
+            checkpoint_name: "kuberic-checkpoint-0123456789abcdef0123456789abcdef".to_string(),
+            input: Some(SwitchoverAdmissionInputStatus {
+                operation_authority: "set-uid".to_string(),
+                previous_snapshot: StablePartitionSnapshotStatus {
+                    epoch: EpochStatus {
+                        data_loss_number: 1,
+                        configuration_number: 2,
+                    },
+                    primary_id: 1,
+                    members: vec![],
+                    write_quorum: 1,
+                },
+                target_primary_id: 2,
+                accepted_unix_seconds: 100,
+            }),
+            incompatibility: None,
+        };
+        let encoded = serde_json::to_value(&admitted).unwrap();
+        assert!(encoded.get("input").is_some());
+        assert!(encoded.get("incompatibility").is_none());
+
+        let incompatible = SwitchoverExecutionStatus {
+            input: None,
+            incompatibility: Some(SwitchoverIncompatibilityStatus {
+                source: SwitchoverIncompatibilitySource::LegacyPilotV2,
+                legacy_contract_version: 2,
+                legacy_execution_id: "legacy-execution".to_string(),
+                legacy_checkpoint_name: Some("legacy-checkpoint".to_string()),
+                fingerprint: "stable-fingerprint".to_string(),
+            }),
+            ..admitted
+        };
+        let encoded = serde_json::to_value(&incompatible).unwrap();
+        assert!(encoded.get("input").is_none());
+        assert!(encoded.get("incompatibility").is_some());
     }
 
     #[test]

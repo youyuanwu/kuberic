@@ -17,18 +17,14 @@ use kuberic_core::types::{
 use serde::{Deserialize, Serialize};
 
 use crate::cluster_api::ClusterApi;
-#[cfg(feature = "durable-switchover-pilot")]
 use crate::crd::DurableOperationPhase;
 use crate::crd::{DurableOperationStatus, EpochStatus, PendingActionStatus};
 
-#[cfg(feature = "durable-switchover-pilot")]
-use super::pilot::{
+use super::switchover_execution::{
     DurableSwitchoverState, DurableSwitchoverStepResult, PilotActivityKind, PilotAdapterDecision,
     PilotPermitGuard,
 };
-#[cfg(feature = "durable-switchover-pilot")]
 use super::workflow_host::DurablePermitGuard;
-#[cfg(feature = "durable-switchover-pilot")]
 use super::{Decision, switchover::is_switchover_postcondition_transition};
 use super::{
     OperationObservations, correlated_action_observation, fail_closed, record_activity_error,
@@ -198,7 +194,6 @@ pub enum DurableEffectPreparationError {
     InvalidCommand,
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub type PilotEffectPreparationError = DurableEffectPreparationError;
 
 pub fn prepare_replica_effect_command(
@@ -328,7 +323,6 @@ fn prepare_replica_effect_command_with_lifecycle_support(
     Ok((planned, command))
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub fn validate_pilot_replica_action_kind(
     kind: crate::crd::DurableActionKind,
     action: &DurableReplicaAction,
@@ -942,15 +936,13 @@ pub async fn execute_delete_command(
         .await;
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub type PilotEffectBridgeOutcome = DurableEffectBridgeOutcome<Box<DurableSwitchoverStepResult>>;
 
-#[cfg(feature = "durable-switchover-pilot")]
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_pilot_permitted_step(
     guard: &mut PilotPermitGuard,
     operation: &DurableOperationStatus,
-    prepared: &super::pilot::PilotActivityKind,
+    prepared: &super::switchover_execution::PilotActivityKind,
     accepted_activity: &kuberic_durable_execution::LogicalActivityId,
     accepted_attempt: kuberic_durable_execution::AttemptId,
     observations: &OperationObservations,
@@ -962,12 +954,11 @@ pub async fn bridge_pilot_permitted_step(
     bridge_preconsumed_pilot_step(operation, prepared, observations, handles, api, namespace).await
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_pilot_runner_step(
     guard: &mut DurablePermitGuard,
     operation: &DurableOperationStatus,
-    prepared: &super::pilot::PilotActivityKind,
+    prepared: &super::switchover_execution::PilotActivityKind,
     accepted_activity: &kuberic_durable_execution::LogicalActivityId,
     accepted_attempt: kuberic_durable_execution::AttemptId,
     observations: &OperationObservations,
@@ -975,25 +966,24 @@ pub async fn bridge_pilot_runner_step(
     api: &dyn ClusterApi,
     namespace: &str,
 ) -> Result<PilotEffectBridgeOutcome, String> {
-    let expected = super::pilot::prepared_activity_spec(operation, prepared)?;
+    let expected = super::switchover_execution::prepared_activity_spec(operation, prepared)?;
     let _permit = guard.consume(&expected, accepted_activity, accepted_attempt, "switchover")?;
     bridge_preconsumed_pilot_step(operation, prepared, observations, handles, api, namespace).await
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 async fn bridge_preconsumed_pilot_step(
     operation: &DurableOperationStatus,
-    prepared: &super::pilot::PilotActivityKind,
+    prepared: &super::switchover_execution::PilotActivityKind,
     observations: &OperationObservations,
     handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
     api: &dyn ClusterApi,
     namespace: &str,
 ) -> Result<PilotEffectBridgeOutcome, String> {
     match prepared {
-        super::pilot::PilotActivityKind::PassiveObservation => {
+        super::switchover_execution::PilotActivityKind::PassiveObservation => {
             Err("passive pilot observation unexpectedly reached the effect bridge".to_string())
         }
-        super::pilot::PilotActivityKind::PreparedReplica { command } => {
+        super::switchover_execution::PilotActivityKind::PreparedReplica { command } => {
             let Some(handle) = handles.get(&command.target_id) else {
                 return Ok(PilotEffectBridgeOutcome::AwaitEvidence);
             };
@@ -1015,7 +1005,7 @@ async fn bridge_preconsumed_pilot_step(
                 },
             }
         }
-        super::pilot::PilotActivityKind::PreparedLabel { command } => {
+        super::switchover_execution::PilotActivityKind::PreparedLabel { command } => {
             if observations
                 .get(&command.target_id)
                 .is_some_and(|observed| {
@@ -1031,7 +1021,6 @@ async fn bridge_preconsumed_pilot_step(
     }
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 fn pilot_result_after_dispatch_error(
     operation: &DurableOperationStatus,
     action_id: String,
@@ -1057,7 +1046,6 @@ fn pilot_result_after_dispatch_error(
     })
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub fn resolve_pilot_quarantine(
     operation: &DurableOperationStatus,
     prepared: &PilotActivityKind,
@@ -1114,7 +1102,6 @@ pub fn resolve_pilot_quarantine(
     )
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 fn quarantine_result_is_authoritative(
     operation: &DurableOperationStatus,
     result: &DurableSwitchoverStepResult,
@@ -1150,7 +1137,6 @@ fn quarantine_result_is_authoritative(
     }
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub(crate) fn exact_label_command(
     operation: &DurableOperationStatus,
     target_id: ReplicaId,

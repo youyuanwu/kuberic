@@ -428,7 +428,6 @@ pub fn decide(
     }
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub(crate) fn validate_switchover_operation(
     operation: &DurableOperationStatus,
 ) -> Result<(), String> {
@@ -510,7 +509,6 @@ pub(crate) fn advance_after_switchover_postcondition(
     Ok(next)
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub(crate) fn is_switchover_postcondition_transition(
     operation: &DurableOperationStatus,
     next: &DurableOperationStatus,
@@ -532,7 +530,6 @@ pub(crate) fn is_switchover_postcondition_transition(
     }
 }
 
-#[cfg(feature = "durable-switchover-pilot")]
 pub(crate) fn is_legal_switchover_phase_transition(
     current: DurableOperationPhase,
     next: DurableOperationPhase,
@@ -1684,7 +1681,6 @@ mod tests {
             } else {
                 assert_eq!(next.next_secondary_index, 7, "{kind:?}");
             }
-            #[cfg(feature = "durable-switchover-pilot")]
             assert!(
                 is_switchover_postcondition_transition(&operation, &next, &pending),
                 "{kind:?}"
