@@ -694,10 +694,6 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
                 "../../docs/features/kuberic/implemented/agent-owned-replica-remove-protocol.md"
             ),
         ),
-        (
-            "as-built documentation",
-            include_str!("../../.paw/work/framework-native-remove-replica/Docs.md"),
-        ),
     ];
 
     for (name, document) in ownership_docs {
@@ -770,10 +766,6 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
                 "../../docs/features/kuberic/implemented/agent-owned-replica-remove-protocol.md"
             ),
         ),
-        (
-            "as-built documentation",
-            include_str!("../../.paw/work/framework-native-remove-replica/Docs.md"),
-        ),
     ];
     let forbidden = [
         concat!("remove", "replicaexecutionmode"),
@@ -807,42 +799,6 @@ fn current_remove_documentation_distinguishes_status_and_checkpoint_ownership() 
     let readme = include_str!("../README.md");
     assert!(readme.contains("production-required, not opt-in"));
     assert!(readme.contains("`kuberic-operator` enables it unconditionally"));
-}
-
-#[test]
-fn historical_paw_remove_research_is_explicitly_labeled_and_exempt() {
-    let historical_docs = [
-        (
-            "code research",
-            include_str!("../../.paw/work/framework-native-remove-replica/CodeResearch.md"),
-        ),
-        (
-            "spec research",
-            include_str!("../../.paw/work/framework-native-remove-replica/SpecResearch.md"),
-        ),
-    ];
-
-    for (name, document) in historical_docs {
-        assert!(
-            document.contains("historical_snapshot: true"),
-            "{name} must explicitly declare its historical snapshot status"
-        );
-        assert!(
-            document.contains("Historical PAW research snapshot"),
-            "{name} must warn that pre-migration findings are not current documentation"
-        );
-    }
-
-    assert!(
-        historical_docs[0]
-            .1
-            .contains(concat!("durableRemoveReplica", "Pilot"))
-    );
-    assert!(
-        historical_docs[1]
-            .1
-            .contains(concat!("removeReplicaExecution", "Mode"))
-    );
 }
 
 const fn status(passed: bool) -> &'static str {

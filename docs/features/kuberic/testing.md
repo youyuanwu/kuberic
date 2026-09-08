@@ -536,10 +536,9 @@ cargo test -p kuberic-operator \
   remove_replica_execution_maximum_fault_history_and_terminal_fit_independent_bounds -- --nocapture
 ```
 
-The deletion safety inventory is retained in
-`.paw/work/framework-native-remove-replica/SafetyTraceability.md`. It maps all
-34 invariants to named native workflow, shared runner/kernel, Kubernetes
-provider, authorization, or live-cluster tests. The six operation-adapter
+The deletion safety inventory is retained by named native workflow,
+shared-runner/kernel, reconciler, Kubernetes-provider, authorization, and
+live-cluster tests in the committed source tree. The six operation-adapter
 responsibilities have dedicated `framework_native_remove_replica_fr019_*`
 tests.
 
