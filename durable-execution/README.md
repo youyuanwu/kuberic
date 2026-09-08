@@ -418,8 +418,8 @@ separate execution service is introduced.
 
 The crate intentionally stops at the durable-execution kernel.
 Completion-only compaction and an isolated Kubernetes checkpoint-provider spike
-are implemented. Production framework-native remove-replica and optional
-switchover adopt the kernel through a shared in-process operator runner without
+are implemented. Production framework-native remove-replica and switchover
+adopt the kernel through a shared in-process operator runner without
 moving effect ownership into it. Generic active-history compaction and
 continuation remain excluded. The remaining ordered deferred work is tracked in
 [Durable Execution Framework Roadmap](../docs/features/kuberic/durable-execution-roadmap.md).
@@ -449,5 +449,5 @@ lifecycle APIs, queries, external events, child workflows, workers, queues,
 leases, and distributed runtime ownership are excluded. So are migrations,
 upgrade guarantees, broad rollout of other operations, and production
 diagnostics. Framework-native remove-replica integrates typed calls and
-operator-owned effect adapters by default, while switchover remains optional.
-Neither changes `ReplicaAgent` or the gRPC protocol.
+operator-owned effect adapters by default for both remove-replica and
+switchover. Neither changes `ReplicaAgent` or the gRPC protocol.

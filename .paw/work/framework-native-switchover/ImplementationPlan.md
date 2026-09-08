@@ -545,7 +545,7 @@ obsolete tests and documentation.
 - [ ] `cargo test -p kuberic-operator remove_replica_execution`
 - [ ] `cargo test -p kvstore --test reconciler test_durable_add`
 - [ ] `cargo test -p kvstore --test reconciler test_durable_failover`
-- [ ] `cargo test -p kvstore --test reconciler test_durable_initial`
+- [ ] `cargo test -p kvstore --test reconciler test_durable_create`
 - [ ] `cargo test -p kuberic-core replica_agent`
 
 ---
