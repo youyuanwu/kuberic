@@ -1179,7 +1179,6 @@ fn make_set_with_min(
             image: "test:latest".to_string(),
             failover_delay: 0,
             switchover_delay: 3600,
-            switchover_execution_mode: Default::default(),
             port: 8080,
             control_port: 9090,
             data_port: 9091,
@@ -5104,10 +5103,12 @@ async fn test_framework_native_switchover_unknown_checkpoint_outcomes_requeue_wi
                     kuberic_durable_execution::ActivityState::DispatchExposed { .. }
                 ));
                 assert!(matches!(
-                    kuberic_operator::durable::pilot::decode_pilot_activity_input(exposed.input())
+                    kuberic_operator::durable::switchover_execution::decode_pilot_activity_input(
+                        exposed.input(),
+                    )
                         .unwrap()
                         .kind,
-                    kuberic_operator::durable::pilot::PilotActivityKind::PreparedReplica { .. }
+                    kuberic_operator::durable::switchover_execution::PilotActivityKind::PreparedReplica { .. }
                 ));
             }
             _ => unreachable!("test covers only unknown checkpoint outcomes"),

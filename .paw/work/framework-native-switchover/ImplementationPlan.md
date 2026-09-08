@@ -155,7 +155,7 @@ obsolete tests and documentation.
 - [x] **Phase 3: Replacement Safety Coverage and Cutover** - Prove the native
   path covers the complete safety matrix, then make it the sole admission and
   recovery route.
-- [ ] **Phase 4: Remove Obsolete Surfaces and Update Delivery Artifacts** -
+- [x] **Phase 4: Remove Obsolete Surfaces and Update Delivery Artifacts** -
   Delete the selector, build feature, split routing/status/conditions, stale
   test helpers, and update the checked-in schema, examples, and CI gates.
 - [ ] **Phase 5: Documentation and Full Validation** - Record the as-built

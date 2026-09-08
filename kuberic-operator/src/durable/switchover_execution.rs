@@ -36,11 +36,12 @@ use rand::random;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+use crate::crd::DurableSwitchoverPilotStatus;
 use crate::crd::{
-    DurableOperationPhase, DurableOperationStatus, DurableSwitchoverPilotStatus, KubericSet,
-    PendingActionStatus, StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus,
-    SwitchoverExecutionState, SwitchoverExecutionStatus, SwitchoverIncompatibilitySource,
-    SwitchoverIncompatibilityStatus,
+    DurableOperationPhase, DurableOperationStatus, KubericSet, PendingActionStatus,
+    StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus, SwitchoverExecutionState,
+    SwitchoverExecutionStatus, SwitchoverIncompatibilitySource, SwitchoverIncompatibilityStatus,
 };
 use crate::{cluster_api::ClusterApi, reconciler::snapshot_with_observed_metadata};
 
@@ -100,13 +101,14 @@ pub type SwitchoverExecution = SwitchoverExecutionStatus;
 /// Process-local host cache. Checkpoints, rather than this cache, remain the
 /// recovery authority; retaining hosts preserves monotonic attempt counters
 /// within one process epoch.
-pub struct DurableSwitchoverPilotRuntime {
+pub struct DurableSwitchoverRuntime {
     inner: Arc<DurableWorkflowRuntime>,
 }
 
-pub type DurableSwitchoverRuntime = DurableSwitchoverPilotRuntime;
+#[cfg(test)]
+type DurableSwitchoverPilotRuntime = DurableSwitchoverRuntime;
 
-impl DurableSwitchoverPilotRuntime {
+impl DurableSwitchoverRuntime {
     pub fn kubernetes(client: kube::Client) -> Self {
         Self {
             inner: Arc::new(DurableWorkflowRuntime::kubernetes(client)),
@@ -123,6 +125,7 @@ impl DurableSwitchoverPilotRuntime {
         Self { inner }
     }
 
+    #[cfg(test)]
     pub async fn host(
         &self,
         namespace: &str,
@@ -196,7 +199,7 @@ impl DurableSwitchoverPilotRuntime {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DurableSwitchoverPilotInput {
+pub struct SwitchoverWorkflowInput {
     pub version: u32,
     pub execution_id: String,
     pub initial_operation: DurableOperationStatus,
@@ -324,7 +327,7 @@ impl DurableActivity for DurableSwitchoverActivity {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum DurableSwitchoverPilotTerminal {
+pub enum SwitchoverTerminal {
     Complete {
         operation: DurableOperationStatus,
         snapshot: StablePartitionSnapshotStatus,
@@ -336,6 +339,9 @@ pub enum DurableSwitchoverPilotTerminal {
         message: String,
     },
 }
+
+#[cfg(test)]
+type DurableSwitchoverPilotTerminal = SwitchoverTerminal;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -372,7 +378,7 @@ pub struct DurableSwitchoverWorkflow;
 #[async_trait]
 impl Workflow for DurableSwitchoverWorkflow {
     async fn run(&self, context: &mut WorkflowContext<'_>, input: ExactBytes) -> TerminalOutcome {
-        let input: DurableSwitchoverPilotInput = match serde_json::from_slice(input.as_slice()) {
+        let input: SwitchoverWorkflowInput = match serde_json::from_slice(input.as_slice()) {
             Ok(input) => input,
             Err(error) => {
                 return terminal_failure(None, format!("decode pilot workflow input: {error}"));
@@ -537,7 +543,7 @@ impl Workflow for DurableSwitchoverWorkflow {
                     ) {
                         return terminal_failure(Some(operation), error);
                     }
-                    return terminal_success(DurableSwitchoverPilotTerminal::Complete {
+                    return terminal_success(SwitchoverTerminal::Complete {
                         operation: completed,
                         snapshot,
                         compensated,
@@ -779,7 +785,7 @@ pub fn decode_activity_step_result(
 pub fn decode_terminal(
     outcome: &TerminalOutcome,
     initial: &DurableOperationStatus,
-) -> Result<DurableSwitchoverPilotTerminal, String> {
+) -> Result<SwitchoverTerminal, String> {
     let record: DurableSwitchoverTerminalRecord =
         serde_json::from_slice(outcome.payload().as_slice())
             .map_err(|error| format!("decode durable switchover terminal outcome: {error}"))?;
@@ -789,14 +795,14 @@ pub fn decode_terminal(
             snapshot,
             compensated,
             accounting,
-        } => DurableSwitchoverPilotTerminal::Complete {
+        } => SwitchoverTerminal::Complete {
             operation: state.apply_to(initial)?,
             snapshot,
             compensated,
             accounting,
         },
         DurableSwitchoverTerminalRecord::Stopped { state, message } => {
-            DurableSwitchoverPilotTerminal::Stopped {
+            SwitchoverTerminal::Stopped {
                 operation: state.map(|state| state.apply_to(initial)).transpose()?,
                 message,
             }
@@ -836,11 +842,12 @@ pub fn decode_terminal_activity_accounting(
     })
 }
 
+#[cfg(test)]
 pub fn validate_loaded_terminal(
     reference: &DurableSwitchoverPilotStatus,
     outcome: &TerminalOutcome,
     completed_activity_count: u64,
-) -> Result<DurableSwitchoverPilotTerminal, String> {
+) -> Result<SwitchoverTerminal, String> {
     let initial = initial_operation(reference)?;
     validate_loaded_terminal_for_initial(&initial, outcome, completed_activity_count)
 }
@@ -849,13 +856,13 @@ pub fn validate_loaded_terminal_for_initial(
     initial: &DurableOperationStatus,
     outcome: &TerminalOutcome,
     completed_activity_count: u64,
-) -> Result<DurableSwitchoverPilotTerminal, String> {
+) -> Result<SwitchoverTerminal, String> {
     validate_pilot_admission(initial)?;
     let terminal = decode_terminal(outcome, initial)?;
     match (outcome, &terminal) {
         (
             TerminalOutcome::Succeeded(_),
-            DurableSwitchoverPilotTerminal::Complete {
+            SwitchoverTerminal::Complete {
                 operation,
                 snapshot,
                 compensated,
@@ -874,14 +881,14 @@ pub fn validate_loaded_terminal_for_initial(
         }
         (
             TerminalOutcome::Failed(_),
-            DurableSwitchoverPilotTerminal::Stopped {
+            SwitchoverTerminal::Stopped {
                 operation: Some(operation),
                 ..
             },
         ) => {
             validate_transition(initial, operation)?;
         }
-        (TerminalOutcome::Failed(_), DurableSwitchoverPilotTerminal::Stopped { .. }) => {}
+        (TerminalOutcome::Failed(_), SwitchoverTerminal::Stopped { .. }) => {}
         _ => {
             return Err(
                 "kernel terminal outcome kind does not match durable switchover payload"
@@ -1397,8 +1404,8 @@ impl<'a> SwitchoverRunnerAdapter<'a> {
 #[async_trait]
 impl DurableOperationAdapter for SwitchoverRunnerAdapter<'_> {
     type Resolver = PilotPreparedActivityResolver;
-    type Terminal = DurableSwitchoverPilotTerminal;
-    type Publication = DurableSwitchoverPilotTerminal;
+    type Terminal = SwitchoverTerminal;
+    type Publication = SwitchoverTerminal;
 
     fn resolver(&self) -> &Self::Resolver {
         &self.resolver
@@ -1723,18 +1730,16 @@ fn validate_completion_transition(
     }
 }
 
-fn terminal_success(terminal: DurableSwitchoverPilotTerminal) -> TerminalOutcome {
+fn terminal_success(terminal: SwitchoverTerminal) -> TerminalOutcome {
     match encode_terminal(&terminal) {
         Ok(payload) => TerminalOutcome::succeeded(payload),
         Err(error) => terminal_failure(None, error),
     }
 }
 
-pub(crate) fn encode_terminal(
-    terminal: &DurableSwitchoverPilotTerminal,
-) -> Result<ExactBytes, String> {
+pub(crate) fn encode_terminal(terminal: &SwitchoverTerminal) -> Result<ExactBytes, String> {
     let record = match terminal {
-        DurableSwitchoverPilotTerminal::Complete {
+        SwitchoverTerminal::Complete {
             operation,
             snapshot,
             compensated,
@@ -1745,7 +1750,7 @@ pub(crate) fn encode_terminal(
             compensated: *compensated,
             accounting: *accounting,
         },
-        DurableSwitchoverPilotTerminal::Stopped { operation, message } => {
+        SwitchoverTerminal::Stopped { operation, message } => {
             DurableSwitchoverTerminalRecord::Stopped {
                 state: operation
                     .as_ref()
@@ -1791,6 +1796,7 @@ fn encode_terminal_record(
     Ok(ExactBytes::new(encoded))
 }
 
+#[cfg(test)]
 pub fn new_pilot_reference(
     set_uid: &str,
     previous_snapshot: StablePartitionSnapshotStatus,
@@ -1940,7 +1946,7 @@ pub fn native_execution_spec(
     let execution_id = native_execution_id(reference)?;
     let initial_operation = native_initial_operation(reference)?;
     validate_pilot_admission(&initial_operation)?;
-    let input = DurableSwitchoverPilotInput {
+    let input = SwitchoverWorkflowInput {
         version: reference.contract_version,
         execution_id: reference.execution_id.clone(),
         initial_operation,
@@ -1955,6 +1961,7 @@ pub fn native_execution_spec(
     ))
 }
 
+#[cfg(test)]
 pub fn execution_id(reference: &DurableSwitchoverPilotStatus) -> Result<ExecutionId, String> {
     if reference.version != PILOT_VERSION {
         return Err(format!(
@@ -1974,11 +1981,12 @@ pub fn execution_id(reference: &DurableSwitchoverPilotStatus) -> Result<Executio
     Ok(execution_id)
 }
 
+#[cfg(test)]
 pub fn execution_spec(reference: &DurableSwitchoverPilotStatus) -> Result<ExecutionSpec, String> {
     let execution_id = execution_id(reference)?;
     let initial_operation = initial_operation(reference)?;
     validate_pilot_admission(&initial_operation)?;
-    let input = DurableSwitchoverPilotInput {
+    let input = SwitchoverWorkflowInput {
         version: reference.version,
         execution_id: reference.execution_id.clone(),
         initial_operation,
@@ -1999,6 +2007,7 @@ pub fn execution_spec(reference: &DurableSwitchoverPilotStatus) -> Result<Execut
     ))
 }
 
+#[cfg(test)]
 pub fn initial_operation(
     reference: &DurableSwitchoverPilotStatus,
 ) -> Result<DurableOperationStatus, String> {

@@ -47,14 +47,6 @@ pub struct KubericSetSpec {
     #[serde(default = "default_switchover_delay")]
     pub switchover_delay: i32,
 
-    /// Execution engine for newly accepted primary switchovers.
-    ///
-    /// The durable pilot also requires an operator binary built with the
-    /// matching compile-time feature. Existing and omitted values remain on
-    /// the explicit CRD-backed state machine.
-    #[serde(default)]
-    pub switchover_execution_mode: SwitchoverExecutionMode,
-
     /// Port for the application container.
     #[serde(default = "default_port")]
     pub port: i32,
@@ -121,11 +113,6 @@ pub struct KubericSetStatus {
     /// Compact durable checkpoint for the current or most recent operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<DurableOperationStatus>,
-
-    /// Immutable reference for the current or most recent durable-execution
-    /// switchover pilot. Per-phase progress lives only in its checkpoint.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub durable_switchover_pilot: Option<DurableSwitchoverPilotStatus>,
 
     /// Structured immutable authority or incompatibility marker for the
     /// framework-native switchover execution.
@@ -196,16 +183,9 @@ pub struct MemberStatus {
     pub data_address: String,
 }
 
-/// Execution engine selected when a new switchover request is accepted.
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Copy, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub enum SwitchoverExecutionMode {
-    #[default]
-    Explicit,
-    DurablePilot,
-}
-
-/// Immutable authority needed to reconstruct one durable pilot execution.
+/// Legacy durable-pilot reference retained only for conservative compatibility
+/// parsing and test fixtures. It is not part of the current CRD status schema.
+#[cfg(test)]
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DurableSwitchoverPilotStatus {
@@ -1139,7 +1119,6 @@ mod tests {
             serde_json::from_value(serde_json::json!({"phase": "Healthy"})).unwrap();
         assert!(status.stable_snapshot.is_none());
         assert!(status.operation.is_none());
-        assert!(status.durable_switchover_pilot.is_none());
         assert!(status.switchover_execution.is_none());
         assert!(status.legacy_status_fields.is_empty());
         assert!(status.remove_replica_execution.is_none());
@@ -1150,45 +1129,6 @@ mod tests {
                 .get("stableSnapshot")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn switchover_execution_mode_defaults_to_explicit_and_round_trips_pilot() {
-        let explicit: KubericSetSpec =
-            serde_json::from_value(serde_json::json!({"image": "test:latest"})).unwrap();
-        assert_eq!(
-            explicit.switchover_execution_mode,
-            SwitchoverExecutionMode::Explicit
-        );
-
-        let pilot: KubericSetSpec = serde_json::from_value(serde_json::json!({
-            "image": "test:latest",
-            "switchoverExecutionMode": "durablePilot"
-        }))
-        .unwrap();
-        assert_eq!(
-            pilot.switchover_execution_mode,
-            SwitchoverExecutionMode::DurablePilot
-        );
-
-        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
-        let deployment = include_str!("../deploy/deployment.yaml");
-        for required in [
-            "switchoverExecutionMode",
-            "durablePilot",
-            "durableSwitchoverPilot",
-            "checkpointName",
-            "initialOperationJson",
-        ] {
-            assert!(
-                generated.contains(required),
-                "missing generated pilot schema {required}"
-            );
-            assert!(
-                deployment.contains(required),
-                "missing deployed pilot schema {required}"
-            );
-        }
     }
 
     #[test]
@@ -1234,6 +1174,18 @@ mod tests {
     #[test]
     fn framework_native_switchover_reference_has_exclusive_structured_variants() {
         let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        let deployment = include_str!("../deploy/deployment.yaml");
+        for removed in ["switchoverExecutionMode", "durableSwitchoverPilot"] {
+            assert!(
+                !generated.contains(removed),
+                "generated schema retained legacy switchover surface {removed}"
+            );
+            assert!(
+                !deployment.contains(removed),
+                "deployed schema retained legacy switchover surface {removed}"
+            );
+        }
+
         for required in [
             "switchoverExecution",
             "contractVersion",
@@ -1248,6 +1200,10 @@ mod tests {
             assert!(
                 generated.contains(required),
                 "missing native switchover schema {required}"
+            );
+            assert!(
+                deployment.contains(required),
+                "missing deployed native switchover schema {required}"
             );
         }
 
@@ -1312,6 +1268,24 @@ mod tests {
         assert!(status.legacy_status_fields.contains_key(&legacy_name));
         let serialized = serde_json::to_value(status).unwrap();
         assert!(serialized.get(&legacy_name).is_none());
+    }
+
+    #[test]
+    fn legacy_switchover_status_is_deserialized_but_never_serialized() {
+        let legacy_name = "durableSwitchoverPilot";
+        let status: KubericSetStatus = serde_json::from_value(serde_json::json!({
+            "phase": "Switchover",
+            (legacy_name): {
+                "version": 2,
+                "executionId": "legacy-execution",
+                "checkpointName": "legacy-checkpoint",
+                "initialOperationJson": "{}"
+            }
+        }))
+        .unwrap();
+        assert!(status.legacy_status_fields.contains_key(legacy_name));
+        let serialized = serde_json::to_value(status).unwrap();
+        assert!(serialized.get(legacy_name).is_none());
     }
 
     #[test]

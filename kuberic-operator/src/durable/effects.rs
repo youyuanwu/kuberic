@@ -1182,19 +1182,15 @@ fn bounded(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "durable-switchover-pilot")]
     use kuberic_core::types::{
         AccessStatus, ReplicaAgentStatus, ReplicaSetConfig, ReplicaSetQuorumMode, Role,
     };
-    #[cfg(feature = "durable-switchover-pilot")]
     use std::sync::{Arc, Mutex};
 
-    #[cfg(feature = "durable-switchover-pilot")]
     struct RecordingHandle {
         requests: Arc<Mutex<Vec<CorrelatedControlActionRequest>>>,
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     #[async_trait::async_trait]
     impl ReplicaHandle for RecordingHandle {
         fn id(&self) -> ReplicaId {
@@ -1234,7 +1230,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     fn pending_command() -> PendingActionStatus {
         PendingActionStatus {
             action_id: "pilot:7:effect".to_string(),
@@ -1261,7 +1256,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     fn observed_command_target() -> ReplicaStatusInfo {
         ReplicaStatusInfo {
             instance_id: ReplicaInstanceId::new("replica-2-uid"),
@@ -1290,7 +1284,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     fn config() -> ReplicaSetConfig {
         ReplicaSetConfig {
             members: Vec::new(),
@@ -1332,7 +1325,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     #[test]
     fn workflow_neutral_action_matching_is_separate_from_switchover_allow_list() {
         let action = DurableReplicaAction::RemoveReplica {
@@ -1349,7 +1341,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     #[tokio::test]
     async fn all_seven_pilot_replica_actions_prepare_and_dispatch_exact_fenced_commands() {
         let actions = [
@@ -1433,7 +1424,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     #[test]
     fn pilot_preparation_rejects_incarnation_protocol_and_action_identity_drift() {
         let pending = pending_command();

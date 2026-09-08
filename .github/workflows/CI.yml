@@ -53,10 +53,11 @@ jobs:
       env:
         RUST_MIN_STACK: 4194304
       run: |
-        cargo test -p kuberic-operator --features durable-switchover-pilot success_and_rollback_transcripts_fit_with_redelivery_headroom
-        cargo test -p kuberic-operator --features durable-switchover-pilot maximum_projected_history_fits_both_budgets
-        cargo test -p kuberic-operator --features durable-switchover-pilot measurements_ -- --nocapture
-        cargo test -p kvstore --test reconciler test_durable_execution_switchover_pilot_happy_path -- --nocapture
+        cargo test -p kuberic-operator success_and_rollback_transcripts_fit_with_redelivery_headroom -- --nocapture
+        cargo test -p kuberic-operator maximum_projected_history_fits_both_budgets -- --nocapture
+        cargo test -p kuberic-operator framework_native_switchover_rejects_every_independent_one_over_bound
+        cargo test -p kuberic-operator measurements_ -- --nocapture
+        cargo test -p kvstore --test reconciler test_framework_native_switchover_happy_path -- --nocapture
 
     - name: Run framework-native remove-replica gates
       env:

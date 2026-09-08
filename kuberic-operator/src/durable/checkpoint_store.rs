@@ -764,7 +764,6 @@ mod checkpoint_store_tests {
         assert!(measurements.maximum_terminal_checkpoint_bytes > 0);
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     async fn terminal_accounting_measurements(
         seed: u8,
         terminal_payload: &[u8],
@@ -780,7 +779,7 @@ mod checkpoint_store_tests {
             DurableCheckpointStore::InMemory(
                 kuberic_durable_execution::InMemoryCheckpointStore::new(),
             ),
-            super::super::pilot::checkpoint_measurement_decoder(),
+            super::super::switchover_execution::checkpoint_measurement_decoder(),
         );
         let terminal = CheckpointEnvelope::encode(&CheckpointPayload::terminal(
             contract,
@@ -798,7 +797,6 @@ mod checkpoint_store_tests {
         store.measurements()
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     fn terminal_accounting_payload(
         compensated: bool,
         phase: &str,
@@ -852,7 +850,6 @@ mod checkpoint_store_tests {
         .unwrap()
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     fn two_member_terminal_accounting_payload() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "status": "complete",
@@ -1109,7 +1106,6 @@ mod checkpoint_store_tests {
         assert_eq!(mismatched.completed_passive_observation_count, None);
     }
 
-    #[cfg(feature = "durable-switchover-pilot")]
     #[tokio::test]
     async fn switchover_terminal_accounting_rejects_inconsistent_claims() {
         let wrong_split_payload =

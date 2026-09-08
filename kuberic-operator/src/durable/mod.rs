@@ -20,8 +20,7 @@ mod switchover;
 pub mod switchover_execution;
 pub mod workflow_host;
 
-// Transitional source compatibility while the public and internal pilot
-// vocabulary is removed in later graduation phases.
+#[cfg(test)]
 pub use switchover_execution as pilot;
 
 pub(crate) use add_replica::final_attestation as attest_add_replica;

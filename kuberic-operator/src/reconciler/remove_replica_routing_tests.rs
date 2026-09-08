@@ -31,8 +31,9 @@ use crate::durable::remove_replica_execution::{
     checkpoint_limits, execution_spec, new_execution, reconstruct_initial_operation,
 };
 use crate::durable::switchover_execution::{
-    DurableSwitchoverPilotTerminal, PilotActivityAccounting, SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES,
-    SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES, checkpoint_limits as switchover_checkpoint_limits,
+    PilotActivityAccounting, SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES,
+    SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES, SwitchoverTerminal,
+    checkpoint_limits as switchover_checkpoint_limits,
     encode_terminal as encode_switchover_terminal, native_execution_spec, native_initial_operation,
     new_switchover_execution,
 };
@@ -407,7 +408,6 @@ fn set(reference: RemoveReplicaExecution) -> KubericSet {
             image: "test:latest".to_string(),
             failover_delay: 0,
             switchover_delay: 30,
-            switchover_execution_mode: Default::default(),
             port: 8080,
             control_port: 9090,
             data_port: 9091,
@@ -676,7 +676,6 @@ fn switchover_set(reference: SwitchoverExecutionStatus) -> KubericSet {
             image: "test:latest".to_string(),
             failover_delay: 0,
             switchover_delay: 30,
-            switchover_execution_mode: Default::default(),
             port: 8080,
             control_port: 9090,
             data_port: 9091,
@@ -712,7 +711,7 @@ async fn store_switchover_terminal(
     let initial = native_initial_operation(reference).unwrap();
     let mut completed = initial.clone();
     completed.phase = DurableOperationPhase::Completed;
-    let terminal = DurableSwitchoverPilotTerminal::Complete {
+    let terminal = SwitchoverTerminal::Complete {
         operation: completed.clone(),
         snapshot: completed.target_snapshot.clone(),
         compensated: false,
@@ -867,12 +866,15 @@ async fn framework_native_switchover_production_conversion_covers_pilot_versions
             switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
         let status = legacy.status.as_mut().unwrap();
         status.switchover_execution = None;
-        status.durable_switchover_pilot = Some(crate::crd::DurableSwitchoverPilotStatus {
-            version,
-            execution_id: format!("{version:032x}"),
-            checkpoint_name: format!("kuberic-checkpoint-{version:032x}"),
-            initial_operation_json: "{}".to_string(),
-        });
+        status.legacy_status_fields.insert(
+            "durableSwitchoverPilot".to_string(),
+            serde_json::json!({
+                "version": version,
+                "executionId": format!("{version:032x}"),
+                "checkpointName": format!("kuberic-checkpoint-{version:032x}"),
+                "initialOperationJson": "{}"
+            }),
+        );
         let api = RoutingApi::new(Vec::new());
         reconcile_set(&legacy, &api, &ReconcilerState::default())
             .await
@@ -884,7 +886,7 @@ async fn framework_native_switchover_production_conversion_covers_pilot_versions
             panic!("pilot v{version} was not converted");
         };
         assert_eq!(incompatibility.source, expected_source);
-        assert!(converted.durable_switchover_pilot.is_none());
+        assert!(converted.legacy_status_fields.is_empty());
     }
 
     let mut malformed =
@@ -1168,7 +1170,7 @@ async fn framework_native_switchover_route_publishes_compensation_and_quarantine
     failed.phase = DurableOperationPhase::Failed;
     failed.frozen_lsn = Some(42);
     failed.next_secondary_index = 2;
-    let terminal = DurableSwitchoverPilotTerminal::Complete {
+    let terminal = SwitchoverTerminal::Complete {
         operation: failed,
         snapshot: initial.previous_snapshot.cloned().unwrap(),
         compensated: true,
@@ -1211,7 +1213,7 @@ async fn framework_native_switchover_route_publishes_compensation_and_quarantine
 
     let quarantine_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
     let initial = native_initial_operation(&quarantine_reference).unwrap();
-    let terminal = DurableSwitchoverPilotTerminal::Stopped {
+    let terminal = SwitchoverTerminal::Stopped {
         operation: Some(initial),
         message: "unknown exposed effect".to_string(),
     };
