@@ -108,7 +108,7 @@ hidden behind a coarse agent intent because it spans the old primary, target,
 retained members, and Kubernetes routing effects.
 
 `FrameworkNativeSwitchover=True` exposes active and blocked states such as
-`Accepted`, `AwaitingEffectPreparation`, `EffectExposed`, `Quarantined`,
+`Accepted`, `Blocked`, `AwaitingEffectPreparation`, `EffectExposed`, `Quarantined`,
 `ReloadRequired`, `StorageUnavailable`, `Incompatible`, `Rejected`,
 `Isolated`, `Nondeterministic`, and `FuelExhausted`. A validated terminal is
 reloaded before publication. Normal completion sets reason `Completed`;
