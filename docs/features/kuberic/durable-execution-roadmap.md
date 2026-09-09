@@ -203,12 +203,14 @@ objects, and the existing per-command fences already supply authoritative
 ambiguity recovery.
 
 The activity payloads are operation-local rather than aliases of a shared
-replica/label request. Exposed commands use a stricter recovery mode than
-undispatched requests: replica quarantine accepts only matching terminal
+replica/label request. Prepared exposed commands use a stricter recovery mode
+than undispatched requests: replica quarantine accepts only matching terminal
 ledger evidence, an exact postcondition, or generation-change non-admission;
-labels accept only their exact UID-fenced postcondition. Compact terminals
-record the completed branch and are checked against its member-count-specific
-reachable accounting pairs before publication.
+labels accept only their exact UID-fenced postcondition. Evidence-only exposed
+effects are re-evaluated without dispatch authority and wait rather than
+isolate if a command would be required. Compact terminals record the completed
+branch and are checked against member-count-specific activity classifications
+and replica-only redelivery rules before publication.
 
 The product supports 1–9 replicas. A one-member set has no distinct switchover
 target; direct switchover accepts valid stable topologies with 2–9 members.

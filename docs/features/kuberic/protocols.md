@@ -197,17 +197,20 @@ normal prefix through kuberic.switchover.promote-target@v1 failure
 → compensated stable snapshot publication
 ```
 
-Every external activity has a deterministic action ID and exact prepared
+Every dispatched activity has a deterministic action ID and exact prepared
 command persisted before dispatch. Before exposure, a matching precondition
 can dispatch and ordinary deadline policy can select a domain failure. After
-exposure, the rules are stricter: only a matching terminal agent-ledger record,
-the exact live postcondition, or generation-change proof of non-admission can
-resolve a replica command. A precondition, unavailable replica, or
-scheduled/in-progress ledger record remains quarantined even after the
-activity deadline. Replica actions receive at most one same-identity
+exposure, prepared-command rules are stricter: only a matching terminal
+agent-ledger record, the exact live postcondition, or generation-change proof
+of non-admission can resolve a replica command. A precondition, unavailable
+replica, or scheduled/in-progress ledger record remains quarantined even after
+the activity deadline. Replica actions receive at most one same-identity
 redelivery, and only after generation change proves that the previous request
 was not admitted. UID-fenced label actions are never redelivered and remain
 quarantined until the exact UID-bound label postcondition is observed.
+Evidence-only effects have no prepared command; after restart they are
+re-evaluated with dispatch disabled, accepting deterministic observations and
+waiting whenever a command would otherwise be required.
 
 The shared runner uses fused checkpoint compare-and-swap, one-use dispatch
 permits, one end-to-end 64-transition workflow budget, and authoritative

@@ -44,8 +44,8 @@ use crate::durable::remove_replica_execution::{
 use crate::durable::runner::{DurableActiveReason, DurableRunner, DurableRunnerOutcome};
 use crate::durable::switchover_execution::{
     DirectSwitchoverRunnerAdapter, DirectSwitchoverTerminalRecord, DirectSwitchoverWorkflow,
-    DurableSwitchoverRuntime, native_execution_spec, native_initial_operation,
-    new_switchover_execution, validate_native_operation_authority,
+    DurableSwitchoverRuntime, SwitchoverExposureFault, native_execution_spec,
+    native_initial_operation, new_switchover_execution, validate_native_operation_authority,
 };
 use crate::durable::workflow_host::DurableWorkflowRuntime;
 use crate::durable::{
@@ -65,6 +65,7 @@ pub struct ReconcilerState {
     /// corresponding runtime topology had already committed.
     pending_statuses: Mutex<HashMap<String, PendingCommittedStatus>>,
     removal_clock: Arc<dyn RemoveReplicaClock>,
+    switchover_exposure_fault: Option<SwitchoverExposureFault>,
     framework_native_switchover: Arc<DurableSwitchoverRuntime>,
     framework_native_remove_replica: Arc<FrameworkNativeRemoveReplicaRuntime>,
 }
@@ -81,6 +82,7 @@ impl Default for ReconcilerState {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
+            switchover_exposure_fault: None,
             framework_native_switchover: Arc::new(DurableSwitchoverRuntime::in_memory(
                 kuberic_durable_execution::InMemoryCheckpointStore::new(),
             )),
@@ -99,6 +101,7 @@ impl ReconcilerState {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: clock,
+            switchover_exposure_fault: None,
             framework_native_switchover: Arc::new(DurableSwitchoverRuntime::in_memory(
                 kuberic_durable_execution::InMemoryCheckpointStore::new(),
             )),
@@ -116,6 +119,7 @@ impl ReconcilerState {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
+            switchover_exposure_fault: None,
             framework_native_switchover: Arc::new(DurableSwitchoverRuntime::shared(
                 runtime.clone(),
             )),
@@ -133,6 +137,7 @@ impl ReconcilerState {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
+            switchover_exposure_fault: None,
             framework_native_switchover: Arc::new(DurableSwitchoverRuntime::shared(
                 runtime.clone(),
             )),
@@ -150,6 +155,7 @@ impl ReconcilerState {
             drivers: Mutex::new(HashMap::new()),
             pending_statuses: Mutex::new(HashMap::new()),
             removal_clock: Arc::new(SystemRemoveReplicaClock),
+            switchover_exposure_fault: None,
             framework_native_switchover: Arc::new(DurableSwitchoverRuntime::shared(
                 runtime.clone(),
             )),
@@ -157,6 +163,11 @@ impl ReconcilerState {
                 runtime,
             )),
         }
+    }
+
+    pub fn with_switchover_exposure_fault(mut self, fault: SwitchoverExposureFault) -> Self {
+        self.switchover_exposure_fault = Some(fault);
+        self
     }
 
     pub async fn framework_native_remove_replica_measurements(
@@ -2754,7 +2765,8 @@ async fn reconcile_framework_native_switchover_with_fuel(
     let now = unix_seconds();
     let initial = native_initial_operation(reference)?;
     let mut adapter =
-        DirectSwitchoverRunnerAdapter::new(&initial, set, &current_pods, api, store, now)?;
+        DirectSwitchoverRunnerAdapter::new(&initial, set, &current_pods, api, store, now)?
+            .with_exposure_fault(state.switchover_exposure_fault.clone());
     let mut host = host.lock().await;
     let outcome = DurableRunner::new(runner_fuel)
         .map_err(|error| format!("construct framework-native switchover runner: {error}"))?

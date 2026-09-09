@@ -111,17 +111,21 @@ Compact terminal payloads carry an immutable branch discriminator for target
 success, revoke-safe failure, previous-configuration restore, or
 post-promotion compensation. Reload rejects a terminal whose topology,
 external/passive activity split, member-count-specific base sequence, or
-redelivery count is unreachable for that branch. Terminal `reason`/`message`
-and persisted activity errors are limited to 512 UTF-8 bytes.
+redelivery count is unreachable for that branch. Replica and label slots both
+admit evidence-only classifications when their production evaluator can
+persist them, while only replica slots admit one bounded redelivery. Terminal
+`reason`/`message` and persisted activity errors are limited to 512 UTF-8
+bytes.
 
 `FrameworkNativeSwitchover=True` exposes active and blocked states such as
-`Accepted`, `Blocked`, `AwaitingEffectPreparation`, `EffectExposed`, `Quarantined`,
-`ReloadRequired`, `StorageUnavailable`, `Incompatible`, `Rejected`,
-`Isolated`, `Nondeterministic`, and `FuelExhausted`. A validated terminal is
-reloaded before publication. Normal completion sets reason `Completed`;
-verified rollback sets `CompensatedOrSafeFailure`; both set the condition to
-`False` and return the resource to `Healthy`. A stopped terminal remains
-`Quarantined` and does not publish a new stable snapshot.
+`Accepted`, `Blocked`, `AwaitingEffectPreparation`, `EffectExposed`,
+`ExposureInterrupted` when the explicit integration fault hook is armed,
+`Quarantined`, `ReloadRequired`, `StorageUnavailable`, `Incompatible`,
+`Rejected`, `Isolated`, `Nondeterministic`, and `FuelExhausted`. A validated
+terminal is reloaded before publication. Normal completion sets reason
+`Completed`; verified rollback sets `CompensatedOrSafeFailure`; both set the
+condition to `False` and return the resource to `Healthy`. A stopped terminal
+remains `Quarantined` and does not publish a new stable snapshot.
 
 ---
 

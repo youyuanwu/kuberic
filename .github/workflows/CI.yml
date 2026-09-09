@@ -67,6 +67,8 @@ jobs:
         cargo test -p kuberic-operator direct_switchover_terminal_only_reload_recovers_named_activity_accounting
         cargo test -p kuberic-operator direct_switchover_terminal_rejects_unreachable_branch_accounting
         cargo test -p kuberic-operator direct_switchover_transition_budget_is_enforced_at_execution_boundary
+        cargo test -p kuberic-operator direct_switchover_unprepared_effect_exposures_recover_without_dispatch_authority
+        cargo test -p kuberic-operator direct_switchover_deadline_effects_reach_measured_terminal_reload
         cargo test -p kuberic-operator direct_switchover_unresolved_replica_effects_remain_quarantined_past_deadline
         cargo test -p kuberic-operator direct_switchover_unresolved_labels_remain_quarantined_past_deadline
         cargo test -p kuberic-operator production_event_history_is_bounded

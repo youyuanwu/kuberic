@@ -352,8 +352,11 @@ redelivery of the same action identity. A second proof stops. Precondition,
 unavailable, scheduled, in-progress, mixed, or otherwise unknown evidence
 remains quarantined even after the activity deadline. UID-fenced label effects
 have no redelivery path and resolve only from the exact UID-bound label
-postcondition. ConfigMap conflicts and unknown writes force authoritative
-reload before another permit.
+postcondition. If the exposed effect has no prepared command, quarantine
+re-runs its deterministic evaluator without dispatch capability: an
+observation is accepted, while a result that would require dispatch remains
+waiting. Missing command state alone is never treated as isolation. ConfigMap
+conflicts and unknown writes force authoritative reload before another permit.
 
 The terminal checkpoint is accepted and then reloaded before topology/status
 publication. Terminal reload is status-only and does not poll replicas or
@@ -361,7 +364,9 @@ dispatch effects. Its immutable branch discriminator distinguishes target
 success, revoke-safe failure, previous-configuration restore, and
 post-promotion compensation. The adapter accepts only the exact topology and
 member-count-specific reachable external/passive accounting pairs for that
-branch, including only its available replica redelivery slots. `Completed` and
+branch. Every effect slot admits the passive classification that its
+production evaluator can persist; only replica slots admit one bounded
+redelivery, and labels never do. `Completed` and
 `CompensatedOrSafeFailure` clear the active
 `FrameworkNativeSwitchover` condition and return the resource to `Healthy`;
 stopped, incompatible, rejected, isolated, nondeterministic, reload, and

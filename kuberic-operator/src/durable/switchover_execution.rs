@@ -8,7 +8,13 @@
 //! use kuberic_operator::durable::start_switchover;
 //! ```
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -77,6 +83,49 @@ pub const SWITCHOVER_ACTIVITY_IDENTITIES: &[(&str, u32)] =
 
 pub type SwitchoverHost = DurableOperatorHost;
 pub type SwitchoverExecution = SwitchoverExecutionStatus;
+
+#[derive(Clone, Debug)]
+pub struct SwitchoverExposureFault {
+    activity_name: String,
+    pending: Arc<AtomicBool>,
+    triggered: Arc<AtomicBool>,
+}
+
+impl SwitchoverExposureFault {
+    pub fn once(activity_name: impl Into<String>) -> Result<Self, String> {
+        let activity_name = activity_name.into();
+        if !SWITCHOVER_ACTIVITY_IDENTITIES
+            .iter()
+            .any(|(name, _)| *name == activity_name)
+        {
+            return Err(format!(
+                "unknown direct switchover exposure fault activity {activity_name}"
+            ));
+        }
+        Ok(Self {
+            activity_name,
+            pending: Arc::new(AtomicBool::new(true)),
+            triggered: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    pub fn was_triggered(&self) -> bool {
+        self.triggered.load(Ordering::SeqCst)
+    }
+
+    fn interrupt(&self, activity_name: &str) -> bool {
+        if self.activity_name != activity_name
+            || self
+                .pending
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return false;
+        }
+        self.triggered.store(true, Ordering::SeqCst);
+        true
+    }
+}
 
 /// Process-local host cache. Checkpoints remain the recovery authority.
 pub struct DurableSwitchoverRuntime {

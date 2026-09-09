@@ -38,6 +38,7 @@ use kuberic_operator::crd::{
     DurableRemoveMode, KubericSet, KubericSetSpec, KubericSetStatus, Phase, PvcRetentionPolicy,
     RemoveReplicaIncompatibilitySource, ReplicaElectionObservationStatus, StableReplicaRoleStatus,
 };
+use kuberic_operator::durable::switchover_execution::SwitchoverExposureFault;
 use kuberic_operator::durable::{RemoveReplicaTarget, start_remove_replica};
 use kuberic_operator::reconciler::{ReconcilerState, reconcile_set};
 
@@ -1539,6 +1540,70 @@ async fn record_native_switchover_history(
     if identities.len() > longest.len() {
         *longest = identities;
     }
+}
+
+async fn exposed_native_switchover_activity(
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    status: &KubericSetStatus,
+) -> (String, bool) {
+    use kuberic_durable_execution::{ActivityState, CheckpointStore};
+    use kuberic_operator::durable::switchover_execution::{
+        checkpoint_limits, native_execution_id, native_execution_spec,
+    };
+
+    let reference = status.switchover_execution.as_ref().unwrap();
+    let execution_id = native_execution_id(reference).unwrap();
+    let stored = store.load(execution_id).await.unwrap().unwrap();
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(
+            &native_execution_spec(reference).unwrap(),
+            checkpoint_limits(),
+        )
+        .unwrap();
+    let activity = payload.active_activities().unwrap().last().unwrap();
+    assert!(matches!(
+        activity.state(),
+        ActivityState::DispatchExposed { .. }
+    ));
+    let input: serde_json::Value = serde_json::from_slice(activity.input().as_slice()).unwrap();
+    (
+        activity.name().name().to_string(),
+        input
+            .get("preparedCommand")
+            .is_some_and(|command| !command.is_null()),
+    )
+}
+
+async fn execute_external_switchover_action(
+    api: &KvClusterApi,
+    set_name: &str,
+    status: &KubericSetStatus,
+    pod_name: &str,
+    action_id: &str,
+    action: DurableReplicaAction,
+) {
+    let member = status
+        .members
+        .iter()
+        .find(|member| member.name == pod_name)
+        .unwrap();
+    let pod = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+        .unwrap()
+        .clone();
+    let set = make_native_switchover_set(set_name, status.replicas, Some(status.clone()));
+    let handle = api
+        .create_replica_handle(member.id, &pod, &set.spec)
+        .await
+        .unwrap();
+    execute_with_fresh_fences(handle.as_ref(), action_id, action)
+        .await
+        .unwrap();
 }
 
 async fn drive_native_switchover_recording_history(
@@ -5093,6 +5158,414 @@ async fn test_framework_native_switchover_observation_collection_survives_restar
                 ProductionSwitchoverScenario::PrePromotionCompensation => 1,
                 ProductionSwitchoverScenario::PostPromotionCompensation => 3,
             }
+        );
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_prepared_replica_exposure_waits_after_restart() {
+    let name = "native-exposure-prepared-replica";
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let healthy = create_healthy_set(&api, &bootstrap, name, 3).await;
+    let original_primary = healthy.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|pod_name| pod_name != &original_primary)
+        .unwrap();
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let fault = SwitchoverExposureFault::once("kuberic.switchover.revoke-writes").unwrap();
+    let faulted_state = ReconcilerState::with_switchover_store(store.clone())
+        .with_switchover_exposure_fault(fault.clone());
+    let (_, accepted) = accept_native_switchover_with_state(
+        &api,
+        name,
+        &healthy,
+        &original_primary,
+        &target,
+        faulted_state,
+    )
+    .await;
+    let reference = accepted.switchover_execution.clone().unwrap();
+    api.reset_operations();
+
+    reconcile_set(
+        &make_native_switchover_set(name, 3, Some(accepted)),
+        &api,
+        &ReconcilerState::with_switchover_store(store.clone())
+            .with_switchover_exposure_fault(fault.clone()),
+    )
+    .await
+    .unwrap();
+    let interrupted = api.last_status().unwrap();
+    assert!(fault.was_triggered());
+    assert_eq!(interrupted.phase, Phase::Switchover);
+    assert!(interrupted.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "ExposureInterrupted"
+    }));
+    assert_eq!(
+        exposed_native_switchover_activity(&store, &interrupted).await,
+        ("kuberic.switchover.revoke-writes".to_string(), true)
+    );
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+
+    let restarted = ReconcilerState::with_switchover_store(store.clone());
+    reconcile_set(
+        &make_native_switchover_set(name, 3, Some(interrupted)),
+        &api,
+        &restarted,
+    )
+    .await
+    .unwrap();
+    let quarantined = api.last_status().unwrap();
+    assert_eq!(quarantined.phase, Phase::Switchover);
+    assert!(quarantined.conditions.iter().any(|condition| {
+        condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Quarantined"
+    }));
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus),
+        "prepared unknown exposure must dispatch neither the original nor a later effect"
+    );
+    assert_eq!(*api.uid_label_patch_attempts.lock().unwrap(), 0);
+
+    let initial =
+        kuberic_operator::durable::switchover_execution::native_initial_operation(&reference)
+            .unwrap();
+    execute_external_switchover_action(
+        &api,
+        name,
+        &quarantined,
+        &original_primary,
+        &format!("{}:1", initial.execution_id),
+        DurableReplicaAction::RevokeWriteStatus,
+    )
+    .await;
+    let completed = drive_native_switchover(&api, &restarted, name, 3, quarantined).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+            .count(),
+        1,
+        "authoritative external evidence must not cause a duplicate revoke"
+    );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_unprepared_exact_replica_exposure_recovers_after_restart()
+{
+    let name = "native-exposure-passive-replica";
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let healthy = create_healthy_set(&api, &bootstrap, name, 3).await;
+    let original_primary = healthy.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|pod_name| pod_name != &original_primary)
+        .unwrap();
+    execute_external_switchover_action(
+        &api,
+        name,
+        &healthy,
+        &original_primary,
+        "preexisting:revoke",
+        DurableReplicaAction::RevokeWriteStatus,
+    )
+    .await;
+
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let fault = SwitchoverExposureFault::once("kuberic.switchover.revoke-writes").unwrap();
+    let state = ReconcilerState::with_switchover_store(store.clone())
+        .with_switchover_exposure_fault(fault.clone());
+    let (_, accepted) = accept_native_switchover_with_state(
+        &api,
+        name,
+        &healthy,
+        &original_primary,
+        &target,
+        state,
+    )
+    .await;
+    let execution_id = accepted
+        .switchover_execution
+        .as_ref()
+        .unwrap()
+        .execution_id
+        .clone();
+    api.reset_operations();
+
+    reconcile_set(
+        &make_native_switchover_set(name, 3, Some(accepted)),
+        &api,
+        &ReconcilerState::with_switchover_store(store.clone())
+            .with_switchover_exposure_fault(fault.clone()),
+    )
+    .await
+    .unwrap();
+    let interrupted = api.last_status().unwrap();
+    assert!(fault.was_triggered());
+    assert_eq!(
+        exposed_native_switchover_activity(&store, &interrupted).await,
+        ("kuberic.switchover.revoke-writes".to_string(), false)
+    );
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation == ControlOperation::GetStatus)
+    );
+
+    let restarted = ReconcilerState::with_switchover_store(store);
+    let completed = drive_native_switchover(&api, &restarted, name, 3, interrupted).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
+    assert!(
+        api.operations()
+            .iter()
+            .all(|operation| *operation != ControlOperation::RevokeWriteStatus),
+        "an evidence-only revoke exposure must never gain dispatch authority after restart"
+    );
+    let measurements = restarted
+        .framework_native_switchover_measurements("default", name, "test-uid", &execution_id)
+        .await
+        .unwrap();
+    assert_eq!(measurements.completed_activity_count, Some(12));
+    assert_eq!(measurements.completed_external_effect_count, Some(8));
+    assert_eq!(measurements.completed_passive_observation_count, Some(4));
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_passive_compensation_label_exposures_survive_restart() {
+    for (suffix, activity_name) in [
+        ("old", "kuberic.switchover.restore-old-primary-label"),
+        (
+            "target",
+            "kuberic.switchover.restore-target-secondary-label",
+        ),
+    ] {
+        let name = format!("native-exposure-passive-label-{suffix}");
+        let api = KvClusterApi::new();
+        let bootstrap = ReconcilerState::default();
+        let healthy = create_healthy_set(&api, &bootstrap, &name, 3).await;
+        let original_primary = healthy.current_primary.clone().unwrap();
+        let target = api
+            .pods
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pod| pod.metadata.name.clone().unwrap())
+            .find(|pod_name| pod_name != &original_primary)
+            .unwrap();
+        let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let fault = SwitchoverExposureFault::once(activity_name).unwrap();
+        let state = ReconcilerState::with_switchover_store(store.clone())
+            .with_switchover_exposure_fault(fault.clone());
+        let (_, mut status) = accept_native_switchover_with_state(
+            &api,
+            &name,
+            &healthy,
+            &original_primary,
+            &target,
+            state,
+        )
+        .await;
+        let execution_id = status
+            .switchover_execution
+            .as_ref()
+            .unwrap()
+            .execution_id
+            .clone();
+        api.reset_operations();
+        api.fail_terminal_durable_action_sequence(3);
+
+        for _ in 0..180 {
+            let faulted = ReconcilerState::with_switchover_store(store.clone())
+                .with_switchover_exposure_fault(fault.clone());
+            reconcile_set(
+                &make_native_switchover_set(&name, 3, Some(status.clone())),
+                &api,
+                &faulted,
+            )
+            .await
+            .unwrap();
+            status = api.last_status().unwrap();
+            if fault.was_triggered() {
+                break;
+            }
+        }
+        assert!(fault.was_triggered(), "{activity_name}");
+        assert_eq!(status.phase, Phase::Switchover);
+        assert!(status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover"
+                && condition.reason == "ExposureInterrupted"
+        }));
+        assert_eq!(
+            exposed_native_switchover_activity(&store, &status).await,
+            (activity_name.to_string(), false)
+        );
+        assert_eq!(
+            *api.uid_label_patch_attempts.lock().unwrap(),
+            0,
+            "already-exact compensation labels must remain passive"
+        );
+
+        let restarted = ReconcilerState::with_switchover_store(store.clone());
+        let completed = drive_native_switchover(&api, &restarted, &name, 3, status).await;
+        assert_eq!(completed.phase, Phase::Healthy);
+        assert_eq!(
+            completed.current_primary.as_deref(),
+            Some(original_primary.as_str())
+        );
+        assert_eq!(*api.uid_label_patch_attempts.lock().unwrap(), 0);
+        let measurements = restarted
+            .framework_native_switchover_measurements("default", &name, "test-uid", &execution_id)
+            .await
+            .unwrap();
+        assert_eq!(measurements.completed_external_effect_count, Some(9));
+        assert_eq!(measurements.completed_passive_observation_count, Some(5));
+        assert_eq!(measurements.completed_activity_count, Some(14));
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_uid_fenced_label_exposures_wait_for_exact_evidence() {
+    for (suffix, activity_name, desired_role) in [
+        (
+            "target",
+            "kuberic.switchover.publish-target-primary-label",
+            "primary",
+        ),
+        (
+            "old",
+            "kuberic.switchover.publish-old-primary-secondary-label",
+            "secondary",
+        ),
+    ] {
+        let name = format!("native-exposure-prepared-label-{suffix}");
+        let api = KvClusterApi::new();
+        let bootstrap = ReconcilerState::default();
+        let healthy = create_healthy_set(&api, &bootstrap, &name, 3).await;
+        let original_primary = healthy.current_primary.clone().unwrap();
+        let target = api
+            .pods
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pod| pod.metadata.name.clone().unwrap())
+            .find(|pod_name| pod_name != &original_primary)
+            .unwrap();
+        let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let fault = SwitchoverExposureFault::once(activity_name).unwrap();
+        let state = ReconcilerState::with_switchover_store(store.clone())
+            .with_switchover_exposure_fault(fault.clone());
+        let (_, mut status) = accept_native_switchover_with_state(
+            &api,
+            &name,
+            &healthy,
+            &original_primary,
+            &target,
+            state,
+        )
+        .await;
+        api.reset_operations();
+
+        for _ in 0..180 {
+            let faulted = ReconcilerState::with_switchover_store(store.clone())
+                .with_switchover_exposure_fault(fault.clone());
+            reconcile_set(
+                &make_native_switchover_set(&name, 3, Some(status.clone())),
+                &api,
+                &faulted,
+            )
+            .await
+            .unwrap();
+            status = api.last_status().unwrap();
+            if fault.was_triggered() {
+                break;
+            }
+        }
+        assert!(fault.was_triggered(), "{activity_name}");
+        assert_eq!(
+            exposed_native_switchover_activity(&store, &status).await,
+            (activity_name.to_string(), true)
+        );
+        let label_attempts_before_restart = *api.uid_label_patch_attempts.lock().unwrap();
+        let effects_before_restart = api
+            .operations()
+            .iter()
+            .filter(|operation| **operation != ControlOperation::GetStatus)
+            .count();
+
+        let restarted = ReconcilerState::with_switchover_store(store.clone());
+        reconcile_set(
+            &make_native_switchover_set(&name, 3, Some(status)),
+            &api,
+            &restarted,
+        )
+        .await
+        .unwrap();
+        let quarantined = api.last_status().unwrap();
+        assert_eq!(quarantined.phase, Phase::Switchover);
+        assert!(quarantined.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Quarantined"
+        }));
+        assert_eq!(
+            *api.uid_label_patch_attempts.lock().unwrap(),
+            label_attempts_before_restart,
+            "the exposed UID-fenced label must not be retried"
+        );
+        assert_eq!(
+            api.operations()
+                .iter()
+                .filter(|operation| **operation != ControlOperation::GetStatus)
+                .count(),
+            effects_before_restart,
+            "no later replica effect may run while label evidence is unresolved"
+        );
+
+        let pod_name = if suffix == "target" {
+            target.as_str()
+        } else {
+            original_primary.as_str()
+        };
+        api.pods
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|pod| pod.metadata.name.as_deref() == Some(pod_name))
+            .unwrap()
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("kuberic.io/role".to_string(), desired_role.to_string());
+
+        let completed = drive_native_switchover(&api, &restarted, &name, 3, quarantined).await;
+        assert_eq!(completed.phase, Phase::Healthy);
+        assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
+        assert_eq!(
+            *api.uid_label_patch_attempts.lock().unwrap(),
+            1,
+            "only the other normal label may require a UID-fenced patch"
         );
     }
 }

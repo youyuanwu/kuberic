@@ -44,7 +44,7 @@ use crate::{
 #[cfg(test)]
 use super::workflow::DirectSwitchoverWorkflow;
 use super::{
-    SwitchoverRunnerContext, SwitchoverWorkflowInput,
+    SwitchoverExposureFault, SwitchoverRunnerContext, SwitchoverWorkflowInput,
     activities::{
         ALL_DIRECT_ACTIVITY_IDENTITIES, AttestCompensatedTopologyActivity,
         AttestCompensatedTopologyOutput, AttestTargetTopologyActivity, AttestTargetTopologyOutput,
@@ -157,6 +157,7 @@ pub struct DirectSwitchoverRunnerAdapter<'a> {
     context: Option<SwitchoverRunnerContext>,
     now: i64,
     deadline: Arc<AtomicI64>,
+    exposure_fault: Option<SwitchoverExposureFault>,
 }
 
 impl<'a> DirectSwitchoverRunnerAdapter<'a> {
@@ -188,7 +189,16 @@ impl<'a> DirectSwitchoverRunnerAdapter<'a> {
             context: None,
             now,
             deadline,
+            exposure_fault: None,
         })
+    }
+
+    pub(crate) fn with_exposure_fault(
+        mut self,
+        exposure_fault: Option<SwitchoverExposureFault>,
+    ) -> Self {
+        self.exposure_fault = exposure_fault;
+        self
     }
 
     fn context(&self) -> Result<&SwitchoverRunnerContext, String> {
@@ -462,6 +472,24 @@ impl DurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
         }
     }
 
+    fn interrupt_after_accepted_exposure(
+        &mut self,
+        activity: &LogicalActivityId,
+        _attempt_id: kuberic_durable_execution::AttemptId,
+    ) -> Option<DurableAdapterWait> {
+        self.exposure_fault
+            .as_ref()
+            .filter(|fault| fault.interrupt(activity.spec().name().name()))
+            .map(|_| DurableAdapterWait {
+                reason: "ExposureInterrupted".to_string(),
+                detail: format!(
+                    "direct switchover exposure for {} was accepted before adapter evaluation",
+                    activity.spec().name().name()
+                ),
+                requeue_after_seconds: Some(1),
+            })
+    }
+
     fn deadline_unix_seconds(&self) -> i64 {
         self.deadline.load(Ordering::Relaxed)
     }
@@ -705,9 +733,8 @@ fn validate_direct_terminal(
 #[derive(Clone, Copy)]
 enum ProjectedActivityKind {
     ReplicaEffect,
-    ExternalEffect,
+    LabelEffect,
     PassiveObservation,
-    ExternalOrPassive,
 }
 
 struct ProjectedTranscript {
@@ -716,39 +743,28 @@ struct ProjectedTranscript {
 
 impl ProjectedTranscript {
     fn contains_accounting(&self, accounting: DirectActivityAccounting) -> bool {
-        let required_external = self
-            .activities
-            .iter()
-            .filter(|kind| {
-                matches!(
-                    kind,
-                    ProjectedActivityKind::ReplicaEffect | ProjectedActivityKind::ExternalEffect
-                )
-            })
-            .count();
-        let required_passive = self
-            .activities
-            .iter()
-            .filter(|kind| matches!(kind, ProjectedActivityKind::PassiveObservation))
-            .count();
-        let flexible = self
-            .activities
-            .iter()
-            .filter(|kind| matches!(kind, ProjectedActivityKind::ExternalOrPassive))
-            .count();
-        let redelivery_slots = self
-            .activities
-            .iter()
-            .filter(|kind| matches!(kind, ProjectedActivityKind::ReplicaEffect))
-            .count();
-        (0..=flexible).any(|external_flexible| {
-            let base_external = required_external + external_flexible;
-            let passive = required_passive + flexible - external_flexible;
-            let maximum_external = base_external + redelivery_slots;
-            usize::try_from(accounting.passive_observation_count) == Ok(passive)
-                && usize::try_from(accounting.external_effect_count)
-                    .is_ok_and(|external| (base_external..=maximum_external).contains(&external))
-        })
+        let mut reachable = vec![(0_u64, 0_u64)];
+        for kind in &self.activities {
+            let contributions: &[(u64, u64)] = match kind {
+                ProjectedActivityKind::ReplicaEffect => &[(0, 1), (1, 0), (1, 1), (2, 0)],
+                ProjectedActivityKind::LabelEffect => &[(0, 1), (1, 0)],
+                ProjectedActivityKind::PassiveObservation => &[(0, 1)],
+            };
+            let mut next = Vec::new();
+            for (external, passive) in &reachable {
+                for (additional_external, additional_passive) in contributions {
+                    let candidate = (external + additional_external, passive + additional_passive);
+                    if !next.contains(&candidate) {
+                        next.push(candidate);
+                    }
+                }
+            }
+            reachable = next;
+        }
+        reachable.contains(&(
+            accounting.external_effect_count,
+            accounting.passive_observation_count,
+        ))
     }
 }
 
@@ -785,9 +801,7 @@ fn projected_terminal_transcripts(
     branch: DirectSwitchoverTerminalBranch,
     member_count: usize,
 ) -> Vec<ProjectedTranscript> {
-    use ProjectedActivityKind::{
-        ExternalEffect, ExternalOrPassive, PassiveObservation, ReplicaEffect,
-    };
+    use ProjectedActivityKind::{LabelEffect, PassiveObservation, ReplicaEffect};
     match branch {
         DirectSwitchoverTerminalBranch::TargetSuccess => {
             let mut activities = vec![
@@ -805,8 +819,8 @@ fn projected_terminal_transcripts(
                 ReplicaEffect,
                 ReplicaEffect,
                 ReplicaEffect,
-                ExternalEffect,
-                ExternalEffect,
+                LabelEffect,
+                LabelEffect,
                 PassiveObservation,
             ]);
             vec![ProjectedTranscript { activities }]
@@ -856,8 +870,8 @@ fn projected_terminal_transcripts(
             activities.extend([
                 ReplicaEffect,
                 ReplicaEffect,
-                ExternalOrPassive,
-                ExternalOrPassive,
+                LabelEffect,
+                LabelEffect,
                 PassiveObservation,
             ]);
             vec![ProjectedTranscript { activities }]
@@ -965,9 +979,10 @@ mod tests {
         },
     };
     use kuberic_durable_execution::{
-        ActivityName, ActivityRecord, ActivitySequence, CheckpointEnvelope, CheckpointError,
-        CheckpointPayload, CheckpointStore, DurableActivity, DurableHost, HostEpoch, HostOutcome,
-        InMemoryCheckpointStore, InMemoryFault, StoreErrorKind,
+        ActivityName, ActivityObservation, ActivityRecord, ActivitySequence, CheckpointEnvelope,
+        CheckpointError, CheckpointPayload, CheckpointStore, DurableActivity, DurableHost,
+        HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault, StoreErrorKind,
+        TerminalCheckpointStatus,
     };
 
     use crate::{
@@ -988,11 +1003,11 @@ mod tests {
 
     use super::super::activities::{
         AttestCompensatedTopologyActivity, AttestTargetTopologyActivity, CaptureFrozenLsnActivity,
-        CompensateDistributeReplicaEpochActivity, CompensateDistributeReplicaEpochInput,
-        CompensatePromoteOldPrimaryActivity, CompensatePromoteOldPrimaryInput,
-        DemoteOldPrimaryActivity, DemoteOldPrimaryInput, DistributeReplicaEpochActivity,
-        DistributeReplicaEpochInput, EffectObservation,
-        InstallCompensationCatchUpConfigurationActivity,
+        CaptureFrozenLsnOutput, CompensateDistributeReplicaEpochActivity,
+        CompensateDistributeReplicaEpochInput, CompensatePromoteOldPrimaryActivity,
+        CompensatePromoteOldPrimaryInput, DemoteOldPrimaryActivity, DemoteOldPrimaryInput,
+        DemoteOldPrimaryOutput, DistributeReplicaEpochActivity, DistributeReplicaEpochInput,
+        EffectObservation, InstallCompensationCatchUpConfigurationActivity,
         InstallCompensationCatchUpConfigurationInput,
         InstallCompensationCurrentConfigurationActivity,
         InstallCompensationCurrentConfigurationInput, InstallTargetCatchUpConfigurationActivity,
@@ -1003,8 +1018,8 @@ mod tests {
         RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
         RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
         RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput,
-        RevokeWritesActivity, RevokeWritesInput, WaitTargetCaughtUpActivity,
-        WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
+        RevokeWritesActivity, RevokeWritesInput, RevokeWritesOutput, WaitTargetCaughtUpActivity,
+        WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
     };
     use super::*;
 
@@ -1013,6 +1028,53 @@ mod tests {
         Success,
         PrePromotionCompensation,
         PostPromotionCompensation,
+    }
+
+    #[derive(Clone)]
+    enum ExposureOnlyWorkflow {
+        Revoke(RevokeWritesInput),
+        Demote(DemoteOldPrimaryInput),
+        Promote(PromoteTargetInput),
+        RestoreOldLabel(RestoreOldPrimaryLabelInput),
+        RestoreTargetLabel(RestoreTargetSecondaryLabelInput),
+    }
+
+    #[async_trait]
+    impl kuberic_durable_execution::Workflow for ExposureOnlyWorkflow {
+        async fn run(
+            &self,
+            context: &mut kuberic_durable_execution::WorkflowContext<'_>,
+            _input: ExactBytes,
+        ) -> TerminalOutcome {
+            let result = match self {
+                Self::Revoke(input) => context
+                    .call::<RevokeWritesActivity>(input.clone())
+                    .await
+                    .map(|_| ()),
+                Self::Demote(input) => context
+                    .call::<DemoteOldPrimaryActivity>(input.clone())
+                    .await
+                    .map(|_| ()),
+                Self::Promote(input) => context
+                    .call::<PromoteTargetActivity>(input.clone())
+                    .await
+                    .map(|_| ()),
+                Self::RestoreOldLabel(input) => context
+                    .call::<RestoreOldPrimaryLabelActivity>(input.clone())
+                    .await
+                    .map(|_| ()),
+                Self::RestoreTargetLabel(input) => context
+                    .call::<RestoreTargetSecondaryLabelActivity>(input.clone())
+                    .await
+                    .map(|_| ()),
+            };
+            match result {
+                Ok(()) => TerminalOutcome::succeeded(ExactBytes::new(b"complete".to_vec())),
+                Err(error) => {
+                    TerminalOutcome::failed(ExactBytes::new(error.to_string().into_bytes()))
+                }
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1471,6 +1533,57 @@ mod tests {
         }
     }
 
+    fn resolver_for_world(
+        definition: &DirectSwitchoverDefinition,
+        world: &TestWorld,
+        now: i64,
+    ) -> DirectSwitchoverPreparedActivityResolver {
+        let observations = observations(world);
+        let addressed = observations
+            .iter()
+            .map(|(id, observed)| (*id, observed.status.instance_id.clone()))
+            .collect();
+        DirectSwitchoverPreparedActivityResolver::new(
+            definition,
+            &observations,
+            &addressed,
+            now,
+            Arc::new(AtomicI64::new(definition.initial_deadline_unix_seconds)),
+        )
+    }
+
+    async fn persist_direct_result<A: DurableActivity>(
+        host: &mut DurableHost<MeasuredDurableCheckpointStore>,
+        execution: &ExecutionSpec,
+        resolver: &DirectSwitchoverPreparedActivityResolver,
+        output: &A::Output,
+        expect_prepared: bool,
+    ) {
+        let HostOutcome::DispatchPermitted { permit, .. } = host
+            .turn_and_expose_with(&DirectSwitchoverWorkflow, execution.clone(), resolver)
+            .await
+        else {
+            panic!("{} was not exposed", A::NAME);
+        };
+        assert_eq!(permit.activity().spec().name().name(), A::NAME);
+        let activity = DirectActivity::decode(permit.activity().spec()).unwrap();
+        assert_eq!(
+            activity.prepared_replica_command().is_some()
+                || activity.prepared_label_command().is_some(),
+            expect_prepared,
+            "{} preparation classification",
+            A::NAME
+        );
+        let observation = ActivityObservation::new(
+            permit.activity().clone(),
+            encode_activity_result::<A>(output).unwrap(),
+        );
+        assert!(matches!(
+            host.observe(execution, observation).await,
+            HostOutcome::ObservationAccepted { .. }
+        ));
+    }
+
     async fn run_scenario(
         member_count: usize,
         scenario: Scenario,
@@ -1720,6 +1833,219 @@ mod tests {
                 DirectSwitchoverTerminalRecord::Complete { branch, .. }
                     if branch == expected_branch
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_deadline_effects_reach_measured_terminal_reload() {
+        for (seed, deadline_operation, expected_branch, expected_accounting) in [
+            (
+                121,
+                TestReplicaOperation::DemoteOldPrimary,
+                DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
+                DirectActivityAccounting::new(2, 4),
+            ),
+            (
+                124,
+                TestReplicaOperation::PromoteTarget,
+                DirectSwitchoverTerminalBranch::PostPromotionCompensated,
+                DirectActivityAccounting::new(7, 6),
+            ),
+        ] {
+            let initial =
+                direct_initial_operation(&format!("deadline-terminal-{seed}"), snapshot(3), 2, 100)
+                    .unwrap();
+            let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
+            let execution_id = ExecutionId::from_bytes([seed; 16]);
+            let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
+            let backend = InMemoryCheckpointStore::new();
+            let store = MeasuredDurableCheckpointStore::with_decoder(
+                execution_id,
+                DurableCheckpointStore::InMemory(backend.clone()),
+                direct_checkpoint_measurement_decoder(),
+            );
+            let mut host = DurableHost::new(
+                store,
+                HostEpoch::from_bytes([seed; 16]),
+                direct_checkpoint_limits(),
+            );
+            let mut world = world_for(&initial, Scenario::Success);
+
+            let resolver = resolver_for_world(&definition, &world, 100);
+            persist_direct_result::<RevokeWritesActivity>(
+                &mut host,
+                &execution,
+                &resolver,
+                &RevokeWritesOutput::Applied {
+                    observed_at_unix_seconds: 100,
+                },
+                true,
+            )
+            .await;
+            world
+                .statuses
+                .get_mut(&definition.old_primary_id)
+                .unwrap()
+                .write_status = AccessStatus::ReconfigurationPending;
+
+            let resolver = resolver_for_world(&definition, &world, 100);
+            persist_direct_result::<CaptureFrozenLsnActivity>(
+                &mut host,
+                &execution,
+                &resolver,
+                &CaptureFrozenLsnOutput::Captured {
+                    frozen_lsn: 100,
+                    observed_at_unix_seconds: 100,
+                },
+                false,
+            )
+            .await;
+
+            let resolver = resolver_for_world(&definition, &world, 100);
+            persist_direct_result::<WaitTargetCaughtUpActivity>(
+                &mut host,
+                &execution,
+                &resolver,
+                &WaitTargetCaughtUpOutput::CaughtUp {
+                    observed_at_unix_seconds: 100,
+                },
+                false,
+            )
+            .await;
+
+            if deadline_operation == TestReplicaOperation::PromoteTarget {
+                let resolver = resolver_for_world(&definition, &world, 100);
+                persist_direct_result::<DemoteOldPrimaryActivity>(
+                    &mut host,
+                    &execution,
+                    &resolver,
+                    &DemoteOldPrimaryOutput::Applied {
+                        observed_at_unix_seconds: 100,
+                    },
+                    true,
+                )
+                .await;
+                let old_primary = world.statuses.get_mut(&definition.old_primary_id).unwrap();
+                old_primary.role = Role::ActiveSecondary;
+                old_primary.epoch = Epoch::new(
+                    definition.target_snapshot.epoch.data_loss_number,
+                    definition.target_snapshot.epoch.configuration_number,
+                );
+                old_primary.write_status = AccessStatus::NotPrimary;
+            }
+
+            let deadline_resolver = resolver_for_world(&definition, &world, 111);
+            let HostOutcome::DispatchPermitted { permit, .. } = host
+                .turn_and_expose_with(
+                    &DirectSwitchoverWorkflow,
+                    execution.clone(),
+                    &deadline_resolver,
+                )
+                .await
+            else {
+                panic!("deadline effect was not exposed");
+            };
+            let exposed = DirectActivity::decode(permit.activity().spec()).unwrap();
+            assert_eq!(
+                exposed.prepared_replica_command(),
+                None,
+                "deadline outcome must remain evidence-only"
+            );
+            assert_eq!(
+                permit.activity().spec().name().name(),
+                if deadline_operation == TestReplicaOperation::DemoteOldPrimary {
+                    DemoteOldPrimaryActivity::NAME
+                } else {
+                    PromoteTargetActivity::NAME
+                }
+            );
+            drop(permit);
+
+            let world = Arc::new(StdMutex::new(world));
+            let api = TestApi {
+                world: world.clone(),
+                apply_labels: true,
+            };
+            let set = test_set(3);
+            let runner = DurableRunner::new(DIRECT_SWITCHOVER_MAX_RUNNER_FUEL).unwrap();
+            let mut restarted = DurableHost::new(
+                MeasuredDurableCheckpointStore::with_decoder(
+                    execution_id,
+                    DurableCheckpointStore::InMemory(backend.clone()),
+                    direct_checkpoint_measurement_decoder(),
+                ),
+                HostEpoch::from_bytes([seed.saturating_add(1); 16]),
+                direct_checkpoint_limits(),
+            );
+            let terminal = {
+                let mut now = 111;
+                loop {
+                    let pods = world.lock().unwrap().pods();
+                    let current_pods = pod_references(&pods);
+                    let mut adapter = DirectSwitchoverRunnerAdapter::new(
+                        &initial,
+                        &set,
+                        &current_pods,
+                        &api,
+                        restarted.store().clone(),
+                        now,
+                    )
+                    .unwrap();
+                    match runner
+                        .run(
+                            &mut restarted,
+                            &DirectSwitchoverWorkflow,
+                            execution.clone(),
+                            &mut adapter,
+                            now,
+                        )
+                        .await
+                    {
+                        DurableRunnerOutcome::Terminal(terminal) => break terminal,
+                        DurableRunnerOutcome::Active { .. }
+                        | DurableRunnerOutcome::ReloadRequired { .. } => now += 1,
+                        other => panic!("unexpected deadline terminal outcome: {other:?}"),
+                    }
+                }
+            };
+            assert!(matches!(
+                terminal,
+                DirectSwitchoverTerminalRecord::Complete { branch, .. }
+                    if branch == expected_branch
+            ));
+            let measurements = restarted.store().measurements();
+            assert_eq!(
+                measurements.completed_activity_count,
+                expected_accounting.total()
+            );
+            assert_eq!(
+                measurements.completed_external_effect_count,
+                Some(expected_accounting.external_effect_count)
+            );
+            assert_eq!(
+                measurements.completed_passive_observation_count,
+                Some(expected_accounting.passive_observation_count)
+            );
+
+            let reloaded = MeasuredDurableCheckpointStore::with_decoder(
+                execution_id,
+                DurableCheckpointStore::InMemory(backend),
+                direct_checkpoint_measurement_decoder(),
+            );
+            assert!(reloaded.load(execution_id).await.unwrap().is_some());
+            let reloaded_measurements = reloaded.measurements();
+            assert_eq!(
+                reloaded_measurements.completed_activity_count,
+                expected_accounting.total()
+            );
+            assert_eq!(
+                reloaded_measurements.completed_external_effect_count,
+                Some(expected_accounting.external_effect_count)
+            );
+            assert_eq!(
+                reloaded_measurements.completed_passive_observation_count,
+                Some(expected_accounting.passive_observation_count)
+            );
         }
     }
 
@@ -2634,6 +2960,222 @@ mod tests {
         );
     }
 
+    async fn assert_unprepared_exposure_recovers_after_restart(
+        seed: u8,
+        initial: &crate::crd::DurableOperationStatus,
+        activity: DirectActivity,
+        workflow: ExposureOnlyWorkflow,
+        mut world: TestWorld,
+        now: i64,
+        regress_to_dispatch_precondition: bool,
+    ) {
+        let definition = DirectSwitchoverDefinition::from_initial(initial).unwrap();
+        let execution_id = ExecutionId::from_bytes([seed; 16]);
+        let execution = ExecutionSpec::new(
+            execution_id,
+            ExactBytes::new(b"exposure-only".to_vec()),
+            DIRECT_SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES,
+        );
+        let backend = InMemoryCheckpointStore::new();
+        let resolver = |world: &TestWorld| {
+            let observations = observations(world);
+            let addressed = observations
+                .iter()
+                .map(|(id, observed)| (*id, observed.status.instance_id.clone()))
+                .collect();
+            DirectSwitchoverPreparedActivityResolver::new(
+                &definition,
+                &observations,
+                &addressed,
+                now,
+                Arc::new(AtomicI64::new(activity.deadline_unix_seconds())),
+            )
+        };
+        let first_resolver = resolver(&world);
+        let mut first = DurableHost::new(
+            MeasuredDurableCheckpointStore::with_decoder(
+                execution_id,
+                DurableCheckpointStore::InMemory(backend.clone()),
+                direct_checkpoint_measurement_decoder(),
+            ),
+            HostEpoch::from_bytes([seed; 16]),
+            direct_checkpoint_limits(),
+        );
+        let HostOutcome::DispatchPermitted { permit, .. } = first
+            .turn_and_expose_with(&workflow, execution.clone(), &first_resolver)
+            .await
+        else {
+            panic!("evidence-only activity was not exposed");
+        };
+        assert_eq!(
+            permit.activity().spec().name(),
+            activity.spec().unwrap().name()
+        );
+        let recorded = DirectActivity::decode(permit.activity().spec()).unwrap();
+        assert!(recorded.prepared_replica_command().is_none());
+        assert!(recorded.prepared_label_command().is_none());
+        drop(permit);
+
+        let mut restarted = DurableHost::new(
+            MeasuredDurableCheckpointStore::with_decoder(
+                execution_id,
+                DurableCheckpointStore::InMemory(backend.clone()),
+                direct_checkpoint_measurement_decoder(),
+            ),
+            HostEpoch::from_bytes([seed.saturating_add(1); 16]),
+            direct_checkpoint_limits(),
+        );
+        let HostOutcome::Quarantined {
+            activity: exposed, ..
+        } = restarted
+            .turn_and_expose_with(&workflow, execution.clone(), &first_resolver)
+            .await
+        else {
+            panic!("restarted evidence-only activity was not quarantined");
+        };
+
+        if regress_to_dispatch_precondition {
+            set_replica_precondition(
+                &mut world,
+                &definition,
+                TestReplicaOperation::RevokeWrites,
+                definition.old_primary_id,
+            );
+            let regressed = observations(&world);
+            assert!(matches!(
+                resolve_direct_quarantine(&recorded, &definition, &regressed, now).unwrap(),
+                DirectQuarantineOutcome::AwaitEvidence
+            ));
+            world
+                .statuses
+                .get_mut(&definition.old_primary_id)
+                .unwrap()
+                .write_status = AccessStatus::ReconfigurationPending;
+        }
+
+        let exact = observations(&world);
+        let DirectQuarantineOutcome::Observe(result) =
+            resolve_direct_quarantine(&recorded, &definition, &exact, now).unwrap()
+        else {
+            panic!("authoritative evidence did not resolve the unprepared exposure");
+        };
+        let final_resolver = resolver(&world);
+        assert!(matches!(
+            restarted
+                .observe_and_turn_with(
+                    &workflow,
+                    &execution,
+                    ActivityObservation::new(exposed, result),
+                    &final_resolver,
+                )
+                .await,
+            HostOutcome::WorkflowCompleted {
+                checkpoint_status: TerminalCheckpointStatus::Accepted,
+                ..
+            }
+        ));
+        let mut terminal_reload = DurableHost::new(
+            MeasuredDurableCheckpointStore::with_decoder(
+                execution_id,
+                DurableCheckpointStore::InMemory(backend),
+                direct_checkpoint_measurement_decoder(),
+            ),
+            HostEpoch::from_bytes([seed.saturating_add(2); 16]),
+            direct_checkpoint_limits(),
+        );
+        assert!(matches!(
+            terminal_reload
+                .turn_and_expose_with(&workflow, execution, &final_resolver)
+                .await,
+            HostOutcome::WorkflowCompleted {
+                checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_unprepared_effect_exposures_recover_without_dispatch_authority() {
+        let initial = direct_initial_operation("unprepared-restart", snapshot(3), 2, 100).unwrap();
+        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
+
+        let mut exact_revoke_world = world_for(&initial, Scenario::Success);
+        set_replica_precondition(
+            &mut exact_revoke_world,
+            &definition,
+            TestReplicaOperation::RevokeWrites,
+            definition.old_primary_id,
+        );
+        exact_revoke_world
+            .statuses
+            .get_mut(&definition.old_primary_id)
+            .unwrap()
+            .write_status = AccessStatus::ReconfigurationPending;
+        let (exact_revoke, _) =
+            replica_activity(&definition, TestReplicaOperation::RevokeWrites, 1, 110);
+        let DirectActivity::RevokeWrites(exact_revoke_input) = exact_revoke.clone() else {
+            unreachable!()
+        };
+        assert_unprepared_exposure_recovers_after_restart(
+            101,
+            &initial,
+            exact_revoke,
+            ExposureOnlyWorkflow::Revoke(exact_revoke_input),
+            exact_revoke_world,
+            100,
+            true,
+        )
+        .await;
+
+        for (seed, operation) in [
+            (104, TestReplicaOperation::DemoteOldPrimary),
+            (107, TestReplicaOperation::PromoteTarget),
+        ] {
+            let mut world = world_for(&initial, Scenario::Success);
+            let (activity, target_id) = replica_activity(&definition, operation, 2, 100);
+            set_replica_precondition(&mut world, &definition, operation, target_id);
+            let workflow = match activity.clone() {
+                DirectActivity::DemoteOldPrimary(input) => ExposureOnlyWorkflow::Demote(input),
+                DirectActivity::PromoteTarget(input) => ExposureOnlyWorkflow::Promote(input),
+                _ => unreachable!(),
+            };
+            assert_unprepared_exposure_recovers_after_restart(
+                seed, &initial, activity, workflow, world, 100, false,
+            )
+            .await;
+        }
+
+        for (seed, operation) in [
+            (110, TestLabelOperation::RestoreOldPrimary),
+            (113, TestLabelOperation::RestoreTargetSecondary),
+        ] {
+            let mut world = world_for(&initial, Scenario::PostPromotionCompensation);
+            let (activity, target_id) = label_activity(&definition, operation, 110);
+            set_label_precondition(&mut world, &definition, operation, target_id);
+            world.labels.insert(
+                target_id,
+                if operation == TestLabelOperation::RestoreOldPrimary {
+                    "primary".to_string()
+                } else {
+                    "secondary".to_string()
+                },
+            );
+            let workflow = match activity.clone() {
+                DirectActivity::RestoreOldPrimaryLabel(input) => {
+                    ExposureOnlyWorkflow::RestoreOldLabel(input)
+                }
+                DirectActivity::RestoreTargetSecondaryLabel(input) => {
+                    ExposureOnlyWorkflow::RestoreTargetLabel(input)
+                }
+                _ => unreachable!(),
+            };
+            assert_unprepared_exposure_recovers_after_restart(
+                seed, &initial, activity, workflow, world, 100, false,
+            )
+            .await;
+        }
+    }
+
     #[test]
     fn direct_switchover_replay_rejects_name_version_bound_input_and_command_drift() {
         let initial = direct_initial_operation("replay-drift", snapshot(2), 2, 100).unwrap();
@@ -2979,6 +3521,7 @@ mod tests {
             (DirectActivityAccounting::new(1, 0), 1),
             (DirectActivityAccounting::new(8, 3), 11),
             (DirectActivityAccounting::new(9, 2), 11),
+            (DirectActivityAccounting::new(0, 13), 13),
             (DirectActivityAccounting::new(17, 3), 20),
         ] {
             assert!(
@@ -3019,6 +3562,10 @@ mod tests {
         );
         assert!(
             validate_direct_terminal(&definition, &post(DirectActivityAccounting::new(3, 3)), 6,)
+                .is_err()
+        );
+        assert!(
+            validate_direct_terminal(&definition, &post(DirectActivityAccounting::new(0, 14)), 14,)
                 .is_err()
         );
     }

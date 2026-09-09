@@ -2260,9 +2260,14 @@ fn evaluate_quarantined_replica<A: ReplicaOperation>(
     now: i64,
 ) -> Result<DirectEvaluation, String> {
     let request = A::request(input, definition)?;
-    let command = request.prepared_command.ok_or_else(|| {
-        "quarantined direct replica activity has no persisted exact command".to_string()
-    })?;
+    let Some(command) = request.prepared_command else {
+        return match evaluate_replica::<A>(input, definition, observations, now)? {
+            observation @ DirectEvaluation::Observe(_) => Ok(observation),
+            DirectEvaluation::AwaitEvidence
+            | DirectEvaluation::DispatchReplica { .. }
+            | DirectEvaluation::DispatchLabel => Ok(DirectEvaluation::AwaitEvidence),
+        };
+    };
     let Some(observed) = observations.get(&request.target_id) else {
         return Ok(DirectEvaluation::AwaitEvidence);
     };
@@ -2435,7 +2440,12 @@ fn evaluate_quarantined_label<A: LabelOperation>(
 ) -> Result<DirectEvaluation, String> {
     let request = A::request(input, definition)?;
     if request.prepared_command.is_none() {
-        return Err("quarantined direct label activity has no persisted exact command".to_string());
+        return match evaluate_label::<A>(input, definition, observations, now)? {
+            observation @ DirectEvaluation::Observe(_) => Ok(observation),
+            DirectEvaluation::AwaitEvidence
+            | DirectEvaluation::DispatchReplica { .. }
+            | DirectEvaluation::DispatchLabel => Ok(DirectEvaluation::AwaitEvidence),
+        };
     }
     let Some(observed) = observations.get(&request.target_id) else {
         return Ok(DirectEvaluation::AwaitEvidence);

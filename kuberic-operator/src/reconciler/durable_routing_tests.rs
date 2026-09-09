@@ -1069,6 +1069,115 @@ async fn framework_native_switchover_route_rejects_unreachable_terminal_transcri
 }
 
 #[tokio::test]
+async fn framework_native_switchover_route_publishes_reachable_passive_effect_transcripts() {
+    for (label, branch, accounting, expected_primary) in [
+        (
+            "demotion-deadline",
+            DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
+            SwitchoverActivityAccounting::new(2, 4),
+            "set-0",
+        ),
+        (
+            "promotion-deadline",
+            DirectSwitchoverTerminalBranch::PostPromotionCompensated,
+            SwitchoverActivityAccounting::new(7, 6),
+            "set-0",
+        ),
+        (
+            "exact-replica-postcondition",
+            DirectSwitchoverTerminalBranch::TargetSuccess,
+            SwitchoverActivityAccounting::new(8, 4),
+            "set-1",
+        ),
+        (
+            "already-exact-labels",
+            DirectSwitchoverTerminalBranch::TargetSuccess,
+            SwitchoverActivityAccounting::new(7, 5),
+            "set-1",
+        ),
+    ] {
+        let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+        let initial = native_initial_operation(&reference).unwrap();
+        let terminal_snapshot = match branch {
+            DirectSwitchoverTerminalBranch::TargetSuccess => initial.target_snapshot.clone(),
+            DirectSwitchoverTerminalBranch::PreviousConfigurationRestored => {
+                initial.previous_snapshot.clone().0.unwrap()
+            }
+            DirectSwitchoverTerminalBranch::PostPromotionCompensated => {
+                let mut snapshot = initial.previous_snapshot.clone().0.unwrap();
+                snapshot.epoch = initial.target_snapshot.epoch.clone();
+                snapshot
+            }
+            DirectSwitchoverTerminalBranch::RevokeSafeFailure => unreachable!(),
+        };
+        let terminal = DirectSwitchoverTerminalRecord::Complete {
+            snapshot: terminal_snapshot,
+            compensated: branch != DirectSwitchoverTerminalBranch::TargetSuccess,
+            branch,
+            reason: (branch != DirectSwitchoverTerminalBranch::TargetSuccess)
+                .then(|| label.to_string()),
+            accounting: Some(accounting),
+        };
+        let store = InMemoryCheckpointStore::new();
+        store_switchover_terminal_outcome(
+            &store,
+            &reference,
+            TerminalOutcome::succeeded(encode_switchover_terminal(&terminal).unwrap()),
+            accounting.total().unwrap(),
+        )
+        .await;
+        let state = ReconcilerState::with_switchover_store(store);
+        let api = RoutingApi::new(vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ]);
+        let current_pods = api.pods.lock().unwrap().clone();
+
+        reconcile_framework_native_switchover(
+            &switchover_set(reference.clone()),
+            &api,
+            &state,
+            &current_pods,
+        )
+        .await
+        .unwrap();
+
+        let published = api.last_status().unwrap();
+        assert_eq!(published.phase, Phase::Healthy, "{label}");
+        assert_eq!(
+            published.current_primary.as_deref(),
+            Some(expected_primary),
+            "{label}"
+        );
+        let measurements = state
+            .framework_native_switchover_measurements(
+                "default",
+                "set",
+                "set-uid",
+                &reference.execution_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            measurements.completed_activity_count,
+            accounting.total(),
+            "{label}"
+        );
+        assert_eq!(
+            measurements.completed_external_effect_count,
+            Some(accounting.external_effect_count),
+            "{label}"
+        );
+        assert_eq!(
+            measurements.completed_passive_observation_count,
+            Some(accounting.passive_observation_count),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn framework_native_switchover_route_records_reload_and_persistence_failures() {
     let reload = InMemoryCheckpointStore::new();
     reload.fail_next_compare_and_swap(InMemoryFault::OutcomeUnknownWithoutApply);
