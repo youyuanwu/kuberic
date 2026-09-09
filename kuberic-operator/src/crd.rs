@@ -114,7 +114,7 @@ pub struct KubericSetStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<DurableOperationStatus>,
 
-    /// Structured immutable authority or incompatibility marker for the
+    /// Structured immutable admission and checkpoint authority for the
     /// framework-native switchover execution.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub switchover_execution: Option<SwitchoverExecutionStatus>,
@@ -1108,7 +1108,8 @@ mod tests {
 
     #[test]
     fn framework_native_switchover_reference_has_required_current_input() {
-        let generated = serde_json::to_string(&KubericSet::crd()).unwrap();
+        let generated_value = serde_json::to_value(KubericSet::crd()).unwrap();
+        let generated = serde_json::to_string(&generated_value).unwrap();
         let deployment = include_str!("../deploy/deployment.yaml");
 
         for required in [
@@ -1150,6 +1151,41 @@ mod tests {
         };
         let encoded = serde_json::to_value(&admitted).unwrap();
         assert!(encoded.get("input").is_some());
+
+        let schema = generated_value
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/switchoverExecution",
+            )
+            .unwrap();
+        assert!(schema.pointer("/properties/input").is_some());
+        assert!(schema.pointer("/properties/state").is_none());
+        assert!(schema.pointer("/properties/incompatibility").is_none());
+        let description = schema
+            .pointer("/description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            description,
+            "Structured immutable admission and checkpoint authority for the framework-native switchover execution."
+        );
+
+        let deployed = deployment
+            .split_once("              switchoverExecution:\n")
+            .unwrap()
+            .1
+            .split_once("              targetPrimary:\n")
+            .unwrap()
+            .0;
+        assert!(deployed.contains("                  input:"));
+        assert!(!deployed.contains("                  state:"));
+        assert!(!deployed.contains("                  incompatibility:"));
+        assert!(
+            deployed
+                .contains("description: Structured immutable admission and checkpoint authority")
+        );
     }
 
     #[test]

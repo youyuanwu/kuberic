@@ -2210,8 +2210,8 @@ spec:
                 - writeQuorum
                 type: object
               switchoverExecution:
-                description: Structured immutable authority for the framework-native
-                  switchover execution.
+                description: Structured immutable admission and checkpoint authority
+                  for the framework-native switchover execution.
                 nullable: true
                 properties:
                   checkpointName:
