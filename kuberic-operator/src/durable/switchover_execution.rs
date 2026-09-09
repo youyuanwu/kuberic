@@ -456,6 +456,29 @@ mod tests {
     }
 
     #[test]
+    fn direct_switchover_checkpoint_owner_is_exact_noncontrolling_and_namespaced() {
+        let options = checkpoint_store_options("default", "set", "set-uid").unwrap();
+        let owner = options.owner().unwrap();
+        assert_eq!(
+            owner.scope(),
+            &KubernetesCheckpointOwnerScope::Namespaced("default".to_string())
+        );
+        assert_eq!(owner.reference().api_version, "kuberic.io/v1");
+        assert_eq!(owner.reference().kind, "KubericSet");
+        assert_eq!(owner.reference().name, "set");
+        assert_eq!(owner.reference().uid, "set-uid");
+        assert_eq!(owner.reference().controller, Some(false));
+        assert_eq!(owner.reference().block_owner_deletion, Some(false));
+        for (namespace, name, uid) in [
+            ("", "set", "set-uid"),
+            ("default", "", "set-uid"),
+            ("default", "set", ""),
+        ] {
+            assert!(checkpoint_store_options(namespace, name, uid).is_err());
+        }
+    }
+
+    #[test]
     fn direct_switchover_production_surface_has_only_twenty_version_one_names() {
         assert_eq!(SWITCHOVER_ACTIVITY_IDENTITIES.len(), 20);
         let generic = ["kuberic.switchover.", "native", "-boundary"].concat();

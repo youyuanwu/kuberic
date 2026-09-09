@@ -761,7 +761,19 @@ mod tests {
     };
 
     use super::super::{
-        activities::{LabelOperationRequest, ReplicaOperationRequest},
+        activities::{
+            AttestCompensatedTopologyActivity, AttestTargetTopologyActivity,
+            CaptureFrozenLsnActivity, CompensateDistributeReplicaEpochActivity,
+            CompensatePromoteOldPrimaryActivity, DemoteOldPrimaryActivity,
+            DistributeReplicaEpochActivity, InstallCompensationCatchUpConfigurationActivity,
+            InstallCompensationCurrentConfigurationActivity,
+            InstallTargetCatchUpConfigurationActivity, InstallTargetCurrentConfigurationActivity,
+            LabelOperationRequest, PromoteTargetActivity, PublishOldPrimarySecondaryLabelActivity,
+            PublishTargetPrimaryLabelActivity, ReplicaOperationRequest,
+            RestoreOldPrimaryLabelActivity, RestorePreviousCurrentConfigurationActivity,
+            RestoreTargetSecondaryLabelActivity, RevokeWritesActivity, WaitTargetCaughtUpActivity,
+            WaitTargetWriteQuorumActivity,
+        },
         prepare::{DirectLabelOperation, DirectReplicaOperation},
     };
     use super::*;
@@ -771,6 +783,112 @@ mod tests {
         Success,
         PrePromotionCompensation,
         PostPromotionCompensation,
+    }
+
+    fn expected_scenario_activity_identities(
+        member_count: usize,
+        scenario: Scenario,
+        redeliver_replica_effects: bool,
+    ) -> Vec<(String, u32)> {
+        fn push_replica<A: DurableActivity>(identities: &mut Vec<(String, u32)>, redeliver: bool) {
+            identities.push((A::NAME.to_string(), A::VERSION));
+            if redeliver {
+                identities.push((A::NAME.to_string(), A::VERSION));
+            }
+        }
+
+        fn push_once<A: DurableActivity>(identities: &mut Vec<(String, u32)>) {
+            identities.push((A::NAME.to_string(), A::VERSION));
+        }
+
+        let mut identities = Vec::new();
+        push_replica::<RevokeWritesActivity>(&mut identities, redeliver_replica_effects);
+        push_once::<CaptureFrozenLsnActivity>(&mut identities);
+        push_once::<WaitTargetCaughtUpActivity>(&mut identities);
+        match scenario {
+            Scenario::PrePromotionCompensation => {
+                push_replica::<RestorePreviousCurrentConfigurationActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_once::<AttestCompensatedTopologyActivity>(&mut identities);
+            }
+            Scenario::Success => {
+                push_replica::<DemoteOldPrimaryActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_replica::<PromoteTargetActivity>(&mut identities, redeliver_replica_effects);
+                for _ in 0..member_count.saturating_sub(2) {
+                    push_replica::<DistributeReplicaEpochActivity>(
+                        &mut identities,
+                        redeliver_replica_effects,
+                    );
+                }
+                push_replica::<InstallTargetCatchUpConfigurationActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_replica::<WaitTargetWriteQuorumActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_replica::<InstallTargetCurrentConfigurationActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_once::<PublishTargetPrimaryLabelActivity>(&mut identities);
+                push_once::<PublishOldPrimarySecondaryLabelActivity>(&mut identities);
+                push_once::<AttestTargetTopologyActivity>(&mut identities);
+            }
+            Scenario::PostPromotionCompensation => {
+                push_replica::<DemoteOldPrimaryActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_replica::<PromoteTargetActivity>(&mut identities, redeliver_replica_effects);
+                push_replica::<CompensatePromoteOldPrimaryActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                for _ in 0..member_count.saturating_sub(1) {
+                    push_replica::<CompensateDistributeReplicaEpochActivity>(
+                        &mut identities,
+                        redeliver_replica_effects,
+                    );
+                }
+                push_replica::<InstallCompensationCatchUpConfigurationActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_replica::<InstallCompensationCurrentConfigurationActivity>(
+                    &mut identities,
+                    redeliver_replica_effects,
+                );
+                push_once::<RestoreOldPrimaryLabelActivity>(&mut identities);
+                push_once::<RestoreTargetSecondaryLabelActivity>(&mut identities);
+                push_once::<AttestCompensatedTopologyActivity>(&mut identities);
+            }
+        }
+        identities
+    }
+
+    fn expected_persisted_scenario_activity_prefix(
+        member_count: usize,
+        scenario: Scenario,
+        redeliver_replica_effects: bool,
+    ) -> Vec<(String, u32)> {
+        let mut identities = expected_scenario_activity_identities(
+            member_count,
+            scenario,
+            redeliver_replica_effects,
+        );
+        let terminal_fused_suffix = match scenario {
+            Scenario::Success | Scenario::PrePromotionCompensation => 1,
+            Scenario::PostPromotionCompensation => 3,
+        };
+        identities.truncate(identities.len() - terminal_fused_suffix);
+        identities
     }
 
     #[derive(Default)]
@@ -1031,6 +1149,38 @@ mod tests {
         measurements: DurableCheckpointMeasurementsSnapshot,
         requests: usize,
         label_patches: usize,
+        activity_identities: Vec<(String, u32)>,
+    }
+
+    async fn record_scenario_activity_identities(
+        backend: &InMemoryCheckpointStore,
+        execution: &ExecutionSpec,
+        longest: &mut Vec<(String, u32)>,
+    ) {
+        let Some(stored) = backend.load(execution.execution_id()).await.unwrap() else {
+            return;
+        };
+        let payload = stored
+            .checkpoint()
+            .decode_and_validate(execution, direct_checkpoint_limits())
+            .unwrap();
+        let Some(activities) = payload.active_activities() else {
+            return;
+        };
+        let identities = activities
+            .iter()
+            .map(|activity| {
+                (
+                    activity.name().name().to_string(),
+                    activity.name().version(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let shared = longest.len().min(identities.len());
+        assert_eq!(identities[..shared], longest[..shared]);
+        if identities.len() > longest.len() {
+            *longest = identities;
+        }
     }
 
     async fn run_scenario(
@@ -1057,7 +1207,7 @@ mod tests {
         let backend = InMemoryCheckpointStore::new();
         let store = MeasuredDurableCheckpointStore::with_decoder(
             execution_id,
-            DurableCheckpointStore::InMemory(backend),
+            DurableCheckpointStore::InMemory(backend.clone()),
             direct_checkpoint_measurement_decoder(),
         );
         let mut host = DurableHost::new(
@@ -1067,6 +1217,7 @@ mod tests {
         );
         let runner = DurableRunner::new(DIRECT_SWITCHOVER_MAX_RUNNER_FUEL).unwrap();
         let mut now = 100;
+        let mut activity_identities = Vec::new();
 
         for _ in 0..512 {
             let pods = world.lock().unwrap().pods();
@@ -1080,7 +1231,7 @@ mod tests {
                 now,
             )
             .unwrap();
-            match runner
+            let outcome = runner
                 .run(
                     &mut host,
                     &DirectSwitchoverWorkflow,
@@ -1088,8 +1239,10 @@ mod tests {
                     &mut adapter,
                     now,
                 )
-                .await
-            {
+                .await;
+            record_scenario_activity_identities(&backend, &execution, &mut activity_identities)
+                .await;
+            match outcome {
                 DurableRunnerOutcome::Terminal(terminal) => {
                     let world = world.lock().unwrap();
                     return ScenarioResult {
@@ -1097,6 +1250,7 @@ mod tests {
                         measurements: host.store().measurements(),
                         requests: world.requests.len(),
                         label_patches: world.label_patches.len(),
+                        activity_identities,
                     };
                 }
                 DurableRunnerOutcome::Active { .. }
@@ -1160,6 +1314,14 @@ mod tests {
                     result.measurements.completed_external_effect_count,
                     Some(expected_external as u64)
                 );
+                assert_eq!(
+                    result.activity_identities,
+                    expected_persisted_scenario_activity_prefix(member_count, scenario, false)
+                );
+                assert_eq!(
+                    result.measurements.accepted_writes,
+                    expected_activities as u64 + 1
+                );
                 assert!(result.requests > 0);
                 if scenario == Scenario::Success {
                     assert_eq!(result.label_patches, 2);
@@ -1184,6 +1346,11 @@ mod tests {
         );
         assert_eq!(result.requests, 26);
         assert_eq!(result.label_patches, 2);
+        assert_eq!(result.measurements.accepted_writes, 45);
+        assert_eq!(
+            result.activity_identities,
+            expected_persisted_scenario_activity_prefix(9, Scenario::Success, true)
+        );
     }
 
     #[tokio::test]
@@ -1211,6 +1378,19 @@ mod tests {
         );
         assert_eq!(result.requests, 28);
         assert_eq!(result.label_patches, 0);
+        assert_eq!(result.measurements.accepted_writes, 48);
+        assert_eq!(
+            result.activity_identities,
+            expected_persisted_scenario_activity_prefix(
+                9,
+                Scenario::PostPromotionCompensation,
+                true,
+            )
+        );
+        assert_eq!(
+            result.activity_identities.len(),
+            DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS - 3
+        );
         eprintln!(
             "direct switchover max-fault measurement: records={}, active={} (headroom={}), terminal={} (headroom={})",
             result.measurements.completed_activity_count.unwrap(),
@@ -1229,12 +1409,10 @@ mod tests {
         for _ in 0..100 {
             let replay = run_scenario(2, Scenario::Success, false).await;
             assert_eq!(replay.terminal, baseline.terminal);
-            assert_eq!(
-                replay.measurements.completed_activity_count,
-                baseline.measurements.completed_activity_count
-            );
+            assert_eq!(replay.measurements, baseline.measurements);
             assert_eq!(replay.requests, baseline.requests);
             assert_eq!(replay.label_patches, baseline.label_patches);
+            assert_eq!(replay.activity_identities, baseline.activity_identities);
         }
     }
 

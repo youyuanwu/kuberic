@@ -990,72 +990,78 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_workflow_spells_out_post_promotion_compensation() {
-        let (names, _targets, terminal) = run_script(
-            3,
-            &[ScriptedFailure {
-                name: PromoteTargetActivity::NAME,
-                kind: ScriptedFailureKind::Failed,
-                message: "promotion failed",
-            }],
-            None,
-        )
-        .await;
-        assert_eq!(
-            names,
-            vec![
+        for replica_count in [2, 4, 9] {
+            let (names, _targets, terminal) = run_script(
+                replica_count,
+                &[ScriptedFailure {
+                    name: PromoteTargetActivity::NAME,
+                    kind: ScriptedFailureKind::Failed,
+                    message: "promotion failed",
+                }],
+                None,
+            )
+            .await;
+            let mut expected = vec![
                 RevokeWritesActivity::NAME,
                 CaptureFrozenLsnActivity::NAME,
                 WaitTargetCaughtUpActivity::NAME,
                 DemoteOldPrimaryActivity::NAME,
                 PromoteTargetActivity::NAME,
                 CompensatePromoteOldPrimaryActivity::NAME,
+            ];
+            expected.extend(std::iter::repeat_n(
                 CompensateDistributeReplicaEpochActivity::NAME,
-                CompensateDistributeReplicaEpochActivity::NAME,
+                usize::try_from(replica_count - 1).unwrap(),
+            ));
+            expected.extend([
                 InstallCompensationCatchUpConfigurationActivity::NAME,
                 InstallCompensationCurrentConfigurationActivity::NAME,
                 RestoreOldPrimaryLabelActivity::NAME,
                 RestoreTargetSecondaryLabelActivity::NAME,
                 AttestCompensatedTopologyActivity::NAME,
-            ]
-        );
-        assert!(matches!(
-            terminal,
-            DirectSwitchoverTerminalRecord::Complete {
-                compensated: true,
-                ..
-            }
-        ));
+            ]);
+            assert_eq!(names, expected);
+            assert!(matches!(
+                terminal,
+                DirectSwitchoverTerminalRecord::Complete {
+                    compensated: true,
+                    ..
+                }
+            ));
+        }
     }
 
     #[tokio::test]
     async fn direct_switchover_workflow_spells_out_pre_promotion_compensation() {
-        let (names, _targets, terminal) = run_script(
-            3,
-            &[ScriptedFailure {
-                name: WaitTargetCaughtUpActivity::NAME,
-                kind: ScriptedFailureKind::DeadlineExceeded,
-                message: "target catch-up timed out",
-            }],
-            None,
-        )
-        .await;
-        assert_eq!(
-            names,
-            vec![
-                RevokeWritesActivity::NAME,
-                CaptureFrozenLsnActivity::NAME,
-                WaitTargetCaughtUpActivity::NAME,
-                RestorePreviousCurrentConfigurationActivity::NAME,
-                AttestCompensatedTopologyActivity::NAME,
-            ]
-        );
-        assert!(matches!(
-            terminal,
-            DirectSwitchoverTerminalRecord::Complete {
-                compensated: true,
-                ..
-            }
-        ));
+        for replica_count in [2, 4, 9] {
+            let (names, _targets, terminal) = run_script(
+                replica_count,
+                &[ScriptedFailure {
+                    name: WaitTargetCaughtUpActivity::NAME,
+                    kind: ScriptedFailureKind::DeadlineExceeded,
+                    message: "target catch-up timed out",
+                }],
+                None,
+            )
+            .await;
+            assert_eq!(
+                names,
+                vec![
+                    RevokeWritesActivity::NAME,
+                    CaptureFrozenLsnActivity::NAME,
+                    WaitTargetCaughtUpActivity::NAME,
+                    RestorePreviousCurrentConfigurationActivity::NAME,
+                    AttestCompensatedTopologyActivity::NAME,
+                ]
+            );
+            assert!(matches!(
+                terminal,
+                DirectSwitchoverTerminalRecord::Complete {
+                    compensated: true,
+                    ..
+                }
+            ));
+        }
     }
 
     #[tokio::test]

@@ -1395,6 +1395,61 @@ mod tests {
     }
 
     #[test]
+    fn direct_switchover_deployment_and_example_keep_the_single_process_status_owned_contract() {
+        let deployment = include_str!("../deploy/deployment.yaml");
+        let documents = serde_yaml_ng::Deserializer::from_str(deployment)
+            .map(|document| {
+                serde_json::Value::deserialize(document).expect("valid deployment YAML document")
+            })
+            .collect::<Vec<_>>();
+        let operator_deployments = documents
+            .iter()
+            .filter(|document| {
+                document
+                    .pointer("/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Deployment")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operator_deployments.len(),
+            1,
+            "durable switchover must not introduce a worker deployment"
+        );
+        let operator = operator_deployments[0];
+        assert_eq!(
+            operator
+                .pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str),
+            Some("kuberic-operator")
+        );
+        assert_eq!(
+            operator
+                .pointer("/spec/replicas")
+                .and_then(serde_json::Value::as_i64),
+            Some(1)
+        );
+        assert_eq!(
+            operator
+                .pointer("/spec/template/spec/containers")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let example = include_str!("../../examples/kvstore/deploy/kubericset.yaml");
+        assert!(!example.contains("switchoverExecution"));
+        assert!(!example.contains("checkpoint"));
+        assert!(!example.contains("activity"));
+        assert!(!example.contains("\nstatus:"));
+        let example_set: KubericSet =
+            serde_yaml_ng::from_str(example).expect("current kvstore example must deserialize");
+        assert_eq!(example_set.spec.replicas, 3);
+        assert!((1..=KUBERIC_MAX_REPLICAS).contains(&example_set.spec.replicas));
+        assert!(example_set.status.is_none());
+    }
+
+    #[test]
     fn persisted_snapshot_rejects_empty_incarnation() {
         let persisted = StableReplicaSnapshotStatus {
             id: 1,

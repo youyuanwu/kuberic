@@ -259,9 +259,12 @@ struct ObservedHandle {
     exposed_control_address: Option<String>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     reject_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    reject_before_durable_action_sequences: Arc<Mutex<HashSet<u32>>>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_after_durable_action_sequences: Arc<Mutex<HashSet<u32>>>,
     fail_terminal_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_terminal_durable_action_sequences: Arc<Mutex<HashSet<u32>>>,
     injected_terminal_actions: Arc<Mutex<HashMap<String, CorrelatedActionObservation>>>,
     fail_next_status: Arc<Mutex<Option<InjectedStatusError>>>,
     status_call_counts: Arc<Mutex<HashMap<String, usize>>>,
@@ -300,6 +303,10 @@ impl ObservedHandle {
                 ControlOperation::RecordElectionConfiguration
             }
         }
+    }
+
+    fn action_sequence(action_id: &str) -> Option<u32> {
+        action_id.rsplit(':').next()?.parse().ok()
     }
 }
 
@@ -375,13 +382,21 @@ impl ReplicaHandle for ObservedHandle {
         request: CorrelatedControlActionRequest,
     ) -> CoreResult<CorrelatedControlActionAcknowledgement> {
         let operation = Self::operation_for(&request.action);
+        let sequence = Self::action_sequence(&request.action_id);
         self.record(operation);
-        if self
-            .reject_before_next_durable_action
-            .lock()
-            .unwrap()
-            .as_ref()
-            == Some(&operation)
+        let reject_sequence = sequence.is_some_and(|sequence| {
+            self.reject_before_durable_action_sequences
+                .lock()
+                .unwrap()
+                .remove(&sequence)
+        });
+        if reject_sequence
+            || self
+                .reject_before_next_durable_action
+                .lock()
+                .unwrap()
+                .as_ref()
+                == Some(&operation)
         {
             self.reject_before_next_durable_action
                 .lock()
@@ -405,12 +420,19 @@ impl ReplicaHandle for ObservedHandle {
                 "injected activity failure".into(),
             ));
         }
-        if self
-            .fail_terminal_next_durable_action
-            .lock()
-            .unwrap()
-            .as_ref()
-            == Some(&operation)
+        let fail_terminal_sequence = sequence.is_some_and(|sequence| {
+            self.fail_terminal_durable_action_sequences
+                .lock()
+                .unwrap()
+                .remove(&sequence)
+        });
+        if fail_terminal_sequence
+            || self
+                .fail_terminal_next_durable_action
+                .lock()
+                .unwrap()
+                .as_ref()
+                == Some(&operation)
         {
             self.fail_terminal_next_durable_action
                 .lock()
@@ -443,7 +465,15 @@ impl ReplicaHandle for ObservedHandle {
             .inner
             .execute_correlated_control_action(request)
             .await?;
-        if self.fail_after_next_durable_action.lock().unwrap().as_ref() == Some(&operation) {
+        let fail_after_sequence = sequence.is_some_and(|sequence| {
+            self.fail_after_durable_action_sequences
+                .lock()
+                .unwrap()
+                .remove(&sequence)
+        });
+        if fail_after_sequence
+            || self.fail_after_next_durable_action.lock().unwrap().as_ref() == Some(&operation)
+        {
             self.fail_after_next_durable_action.lock().unwrap().take();
             return Err(kuberic_core::error::KubericError::Internal(
                 "injected lost activity reply".into(),
@@ -503,16 +533,20 @@ struct KvClusterApi {
     pod_list_api_calls: Mutex<u64>,
     uid_label_patch_attempts: Mutex<u64>,
     uid_label_patch_accepted: Mutex<u64>,
+    uid_label_patch_lost_replies_remaining: Mutex<usize>,
     pvcs: Mutex<HashMap<String, PersistentVolumeClaim>>,
     services: Mutex<HashMap<String, Service>>,
     operations: Arc<Mutex<Vec<ControlOperation>>>,
     reject_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    reject_before_durable_action_sequences: Arc<Mutex<HashSet<u32>>>,
     fail_next_status_patch: Mutex<bool>,
     fail_after_next_status_patch: Mutex<bool>,
     fail_next_status_conflict: Mutex<bool>,
     fail_before_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
     fail_after_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_after_durable_action_sequences: Arc<Mutex<HashSet<u32>>>,
     fail_terminal_next_durable_action: Arc<Mutex<Option<ControlOperation>>>,
+    fail_terminal_durable_action_sequences: Arc<Mutex<HashSet<u32>>>,
     injected_terminal_actions: Arc<Mutex<HashMap<String, CorrelatedActionObservation>>>,
     fail_next_status: Arc<Mutex<Option<InjectedStatusError>>>,
     status_call_counts: Arc<Mutex<HashMap<String, usize>>>,
@@ -538,16 +572,20 @@ impl KvClusterApi {
             pod_list_api_calls: Mutex::new(0),
             uid_label_patch_attempts: Mutex::new(0),
             uid_label_patch_accepted: Mutex::new(0),
+            uid_label_patch_lost_replies_remaining: Mutex::new(0),
             pvcs: Mutex::new(HashMap::new()),
             services: Mutex::new(HashMap::new()),
             operations: Arc::new(Mutex::new(Vec::new())),
             reject_before_next_durable_action: Arc::new(Mutex::new(None)),
+            reject_before_durable_action_sequences: Arc::new(Mutex::new(HashSet::new())),
             fail_next_status_patch: Mutex::new(false),
             fail_after_next_status_patch: Mutex::new(false),
             fail_next_status_conflict: Mutex::new(false),
             fail_before_next_durable_action: Arc::new(Mutex::new(None)),
             fail_after_next_durable_action: Arc::new(Mutex::new(None)),
+            fail_after_durable_action_sequences: Arc::new(Mutex::new(HashSet::new())),
             fail_terminal_next_durable_action: Arc::new(Mutex::new(None)),
+            fail_terminal_durable_action_sequences: Arc::new(Mutex::new(HashSet::new())),
             injected_terminal_actions: Arc::new(Mutex::new(HashMap::new())),
             fail_next_status: Arc::new(Mutex::new(None)),
             status_call_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -655,12 +693,37 @@ impl KvClusterApi {
         *self.reject_before_next_durable_action.lock().unwrap() = Some(operation);
     }
 
+    fn reject_before_durable_action_sequences(&self, sequences: impl IntoIterator<Item = u32>) {
+        self.reject_before_durable_action_sequences
+            .lock()
+            .unwrap()
+            .extend(sequences);
+    }
+
     fn fail_after_next_durable_action(&self, operation: ControlOperation) {
         *self.fail_after_next_durable_action.lock().unwrap() = Some(operation);
     }
 
+    fn fail_after_durable_action_sequences(&self, sequences: impl IntoIterator<Item = u32>) {
+        self.fail_after_durable_action_sequences
+            .lock()
+            .unwrap()
+            .extend(sequences);
+    }
+
     fn fail_terminal_next_durable_action(&self, operation: ControlOperation) {
         *self.fail_terminal_next_durable_action.lock().unwrap() = Some(operation);
+    }
+
+    fn fail_terminal_durable_action_sequence(&self, sequence: u32) {
+        self.fail_terminal_durable_action_sequences
+            .lock()
+            .unwrap()
+            .insert(sequence);
+    }
+
+    fn fail_after_uid_label_patches(&self, count: usize) {
+        *self.uid_label_patch_lost_replies_remaining.lock().unwrap() = count;
     }
 
     fn fail_next_status(&self, error: InjectedStatusError) {
@@ -1030,6 +1093,11 @@ impl ClusterApi for KvClusterApi {
         let current = pod.metadata.labels.get_or_insert_with(BTreeMap::new);
         current.extend(labels);
         *self.uid_label_patch_accepted.lock().unwrap() += 1;
+        let mut lost_replies = self.uid_label_patch_lost_replies_remaining.lock().unwrap();
+        if *lost_replies > 0 {
+            *lost_replies -= 1;
+            return Err("injected lost UID-fenced label reply after apply".to_string());
+        }
         Ok(())
     }
 
@@ -1093,9 +1161,16 @@ impl ClusterApi for KvClusterApi {
                 .cloned(),
             operations: self.operations.clone(),
             reject_before_next_durable_action: self.reject_before_next_durable_action.clone(),
+            reject_before_durable_action_sequences: self
+                .reject_before_durable_action_sequences
+                .clone(),
             fail_before_next_durable_action: self.fail_before_next_durable_action.clone(),
             fail_after_next_durable_action: self.fail_after_next_durable_action.clone(),
+            fail_after_durable_action_sequences: self.fail_after_durable_action_sequences.clone(),
             fail_terminal_next_durable_action: self.fail_terminal_next_durable_action.clone(),
+            fail_terminal_durable_action_sequences: self
+                .fail_terminal_durable_action_sequences
+                .clone(),
             injected_terminal_actions: self.injected_terminal_actions.clone(),
             fail_next_status: self.fail_next_status.clone(),
             status_call_counts: self.status_call_counts.clone(),
@@ -1297,7 +1372,7 @@ async fn drive_create_partition_with_min(
     min_replicas: i32,
     mut status: KubericSetStatus,
 ) -> KubericSetStatus {
-    for _ in 0..180 {
+    for _ in 0..720 {
         if status.phase == Phase::Healthy {
             return status;
         }
@@ -1380,6 +1455,17 @@ async fn accept_native_switchover(
     store: kuberic_durable_execution::InMemoryCheckpointStore,
 ) -> (ReconcilerState, KubericSetStatus) {
     let state = ReconcilerState::with_switchover_store(store);
+    accept_native_switchover_with_state(api, name, healthy, original_primary, target, state).await
+}
+
+async fn accept_native_switchover_with_state(
+    api: &KvClusterApi,
+    name: &str,
+    healthy: &KubericSetStatus,
+    original_primary: &str,
+    target: &str,
+    state: ReconcilerState,
+) -> (ReconcilerState, KubericSetStatus) {
     reconcile_set(
         &make_native_switchover_set(
             name,
@@ -1400,6 +1486,87 @@ async fn accept_native_switchover(
     assert!(accepted.operation.is_none());
     assert!(accepted.switchover_execution.is_some());
     (state, accepted)
+}
+
+async fn record_native_switchover_history(
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    status: &KubericSetStatus,
+    longest: &mut Vec<(String, u32)>,
+) {
+    use kuberic_durable_execution::CheckpointStore;
+    use kuberic_operator::durable::switchover_execution::{
+        checkpoint_limits, is_switchover_activity_identity, native_execution_id,
+        native_execution_spec,
+    };
+
+    let Some(reference) = status.switchover_execution.as_ref() else {
+        return;
+    };
+    let execution_id = native_execution_id(reference).unwrap();
+    let Some(stored) = store.load(execution_id).await.unwrap() else {
+        return;
+    };
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(
+            &native_execution_spec(reference).unwrap(),
+            checkpoint_limits(),
+        )
+        .unwrap();
+    let Some(activities) = payload.active_activities() else {
+        return;
+    };
+    let identities = activities
+        .iter()
+        .map(|activity| {
+            (
+                activity.name().name().to_string(),
+                activity.name().version(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        identities
+            .iter()
+            .all(|(name, version)| is_switchover_activity_identity(name, *version))
+    );
+    let shared = longest.len().min(identities.len());
+    assert_eq!(
+        identities[..shared],
+        longest[..shared],
+        "durable switchover history must retain exact prefix identity"
+    );
+    if identities.len() > longest.len() {
+        *longest = identities;
+    }
+}
+
+async fn drive_native_switchover_recording_history(
+    api: &KvClusterApi,
+    state: &ReconcilerState,
+    store: &kuberic_durable_execution::InMemoryCheckpointStore,
+    name: &str,
+    replicas: i32,
+    mut status: KubericSetStatus,
+    longest: &mut Vec<(String, u32)>,
+) -> KubericSetStatus {
+    record_native_switchover_history(store, &status, longest).await;
+    for _ in 0..360 {
+        reconcile_set(
+            &make_native_switchover_set(name, replicas, Some(status.clone())),
+            api,
+            state,
+        )
+        .await
+        .unwrap();
+        status = api.last_status().unwrap();
+        record_native_switchover_history(store, &status, longest).await;
+        if status.phase == Phase::Healthy {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("framework-native switchover did not reach Healthy: {status:?}");
 }
 
 async fn drive_native_switchover(
@@ -1424,6 +1591,40 @@ async fn drive_native_switchover(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("framework-native switchover did not reach Healthy: {status:?}");
+}
+
+fn assert_exact_role_labels(api: &KvClusterApi, name: &str, status: &KubericSetStatus) {
+    let snapshot = status.stable_snapshot.as_ref().unwrap();
+    let pods = api.pods.lock().unwrap();
+    for member in &snapshot.members {
+        let pod_index = member.id - 1;
+        let pod_index_label = pod_index.to_string();
+        let pod = pods
+            .iter()
+            .find(|pod| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("kuberic.io/pod-index"))
+                    == Some(&pod_index_label)
+            })
+            .unwrap();
+        let expected_role = if member.id == snapshot.primary_id {
+            "primary"
+        } else {
+            "secondary"
+        };
+        assert_eq!(
+            pod.metadata.labels.as_ref().unwrap(),
+            &BTreeMap::from([
+                ("kuberic.io/pod-index".to_string(), pod_index.to_string()),
+                ("kuberic.io/role".to_string(), expected_role.to_string()),
+                ("kuberic.io/set".to_string(), name.to_string()),
+            ]),
+            "switchover must preserve the exact role-label contract for replica {}",
+            member.id
+        );
+    }
 }
 
 async fn native_checkpoint_ready_for_terminal(
@@ -3827,6 +4028,412 @@ async fn test_framework_native_switchover_four_member_happy_path() {
     assert_stable_snapshot(&api, &completed, 4);
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionSwitchoverScenario {
+    Success,
+    PrePromotionCompensation,
+    PostPromotionCompensation,
+}
+
+fn expected_production_switchover_history(
+    member_count: usize,
+    scenario: ProductionSwitchoverScenario,
+    redeliver_replica_effects: bool,
+) -> Vec<(String, u32)> {
+    fn push(identities: &mut Vec<(String, u32)>, name: &str, redeliver_replica_effects: bool) {
+        identities.push((name.to_string(), 1));
+        if redeliver_replica_effects {
+            identities.push((name.to_string(), 1));
+        }
+    }
+
+    let mut identities = Vec::new();
+    push(
+        &mut identities,
+        "kuberic.switchover.revoke-writes",
+        redeliver_replica_effects,
+    );
+    identities.push(("kuberic.switchover.capture-frozen-lsn".to_string(), 1));
+    identities.push(("kuberic.switchover.wait-target-caught-up".to_string(), 1));
+    match scenario {
+        ProductionSwitchoverScenario::PrePromotionCompensation => {
+            push(
+                &mut identities,
+                "kuberic.switchover.demote-old-primary",
+                redeliver_replica_effects,
+            );
+            push(
+                &mut identities,
+                "kuberic.switchover.restore-previous-current-configuration",
+                redeliver_replica_effects,
+            );
+            identities.push((
+                "kuberic.switchover.attest-compensated-topology".to_string(),
+                1,
+            ));
+        }
+        ProductionSwitchoverScenario::Success => {
+            push(
+                &mut identities,
+                "kuberic.switchover.demote-old-primary",
+                redeliver_replica_effects,
+            );
+            push(
+                &mut identities,
+                "kuberic.switchover.promote-target",
+                redeliver_replica_effects,
+            );
+            for _ in 0..member_count.saturating_sub(2) {
+                push(
+                    &mut identities,
+                    "kuberic.switchover.distribute-replica-epoch",
+                    redeliver_replica_effects,
+                );
+            }
+            for name in [
+                "kuberic.switchover.install-target-catch-up-configuration",
+                "kuberic.switchover.wait-target-write-quorum",
+                "kuberic.switchover.install-target-current-configuration",
+            ] {
+                push(&mut identities, name, redeliver_replica_effects);
+            }
+            identities.extend([
+                (
+                    "kuberic.switchover.publish-target-primary-label".to_string(),
+                    1,
+                ),
+                (
+                    "kuberic.switchover.publish-old-primary-secondary-label".to_string(),
+                    1,
+                ),
+            ]);
+            identities.push(("kuberic.switchover.attest-target-topology".to_string(), 1));
+        }
+        ProductionSwitchoverScenario::PostPromotionCompensation => {
+            push(
+                &mut identities,
+                "kuberic.switchover.demote-old-primary",
+                redeliver_replica_effects,
+            );
+            push(
+                &mut identities,
+                "kuberic.switchover.promote-target",
+                redeliver_replica_effects,
+            );
+            push(
+                &mut identities,
+                "kuberic.switchover.compensate-promote-old-primary",
+                redeliver_replica_effects,
+            );
+            for index in 0..member_count.saturating_sub(1) {
+                push(
+                    &mut identities,
+                    "kuberic.switchover.compensate-distribute-replica-epoch",
+                    redeliver_replica_effects || index == 0,
+                );
+            }
+            for name in [
+                "kuberic.switchover.install-compensation-catch-up-configuration",
+                "kuberic.switchover.install-compensation-current-configuration",
+            ] {
+                push(&mut identities, name, redeliver_replica_effects);
+            }
+            identities.extend([
+                (
+                    "kuberic.switchover.restore-old-primary-label".to_string(),
+                    1,
+                ),
+                (
+                    "kuberic.switchover.restore-target-secondary-label".to_string(),
+                    1,
+                ),
+                (
+                    "kuberic.switchover.attest-compensated-topology".to_string(),
+                    1,
+                ),
+            ]);
+        }
+    }
+    identities
+}
+
+fn expected_persisted_production_switchover_history(
+    member_count: usize,
+    scenario: ProductionSwitchoverScenario,
+    redeliver_replica_effects: bool,
+) -> Vec<(String, u32)> {
+    let mut identities =
+        expected_production_switchover_history(member_count, scenario, redeliver_replica_effects);
+    let terminal_fused_suffix = match scenario {
+        ProductionSwitchoverScenario::Success
+        | ProductionSwitchoverScenario::PrePromotionCompensation => 1,
+        ProductionSwitchoverScenario::PostPromotionCompensation => 3,
+    };
+    identities.truncate(identities.len() - terminal_fused_suffix);
+    identities
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_production_topology_compensation_matrix() {
+    for member_count in [9_i32, 2, 4] {
+        for scenario in [
+            ProductionSwitchoverScenario::Success,
+            ProductionSwitchoverScenario::PrePromotionCompensation,
+            ProductionSwitchoverScenario::PostPromotionCompensation,
+        ] {
+            let suffix = match scenario {
+                ProductionSwitchoverScenario::Success => "success",
+                ProductionSwitchoverScenario::PrePromotionCompensation => "pre",
+                ProductionSwitchoverScenario::PostPromotionCompensation => "post",
+            };
+            let name = format!("native-phase4-{suffix}-{member_count}");
+            let api = KvClusterApi::new();
+            let bootstrap = ReconcilerState::default();
+            let healthy = create_healthy_set(&api, &bootstrap, &name, member_count).await;
+            let original_primary = healthy.current_primary.clone().unwrap();
+            let target = api
+                .pods
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|pod| pod.metadata.name.clone().unwrap())
+                .find(|pod_name| pod_name != &original_primary)
+                .unwrap();
+
+            let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+            let (state, status) = accept_native_switchover(
+                &api,
+                &name,
+                &healthy,
+                &original_primary,
+                &target,
+                store.clone(),
+            )
+            .await;
+            let execution_id = status
+                .switchover_execution
+                .as_ref()
+                .unwrap()
+                .execution_id
+                .clone();
+            api.reset_operations();
+            match scenario {
+                ProductionSwitchoverScenario::Success => {}
+                ProductionSwitchoverScenario::PrePromotionCompensation => {
+                    api.fail_terminal_durable_action_sequence(2);
+                }
+                ProductionSwitchoverScenario::PostPromotionCompensation => {
+                    api.fail_terminal_durable_action_sequence(3);
+                }
+            }
+
+            let mut history = Vec::new();
+            let completed = drive_native_switchover_recording_history(
+                &api,
+                &state,
+                &store,
+                &name,
+                member_count,
+                status,
+                &mut history,
+            )
+            .await;
+            let expected_history = expected_persisted_production_switchover_history(
+                member_count as usize,
+                scenario,
+                false,
+            );
+            assert_eq!(history, expected_history);
+            assert_stable_snapshot(&api, &completed, member_count as usize);
+            assert_exact_role_labels(&api, &name, &completed);
+
+            let (expected_primary, expected_activities, expected_external, expected_passive) =
+                match scenario {
+                    ProductionSwitchoverScenario::Success => (
+                        target.as_str(),
+                        member_count as u64 + 9,
+                        member_count as u64 + 6,
+                        3,
+                    ),
+                    ProductionSwitchoverScenario::PrePromotionCompensation => {
+                        (original_primary.as_str(), 6, 3, 3)
+                    }
+                    ProductionSwitchoverScenario::PostPromotionCompensation => (
+                        original_primary.as_str(),
+                        member_count as u64 + 11,
+                        member_count as u64 + 6,
+                        5,
+                    ),
+                };
+            assert_eq!(completed.current_primary.as_deref(), Some(expected_primary));
+            if scenario != ProductionSwitchoverScenario::Success {
+                assert!(completed.conditions.iter().any(|condition| {
+                    condition.type_ == "FrameworkNativeSwitchover"
+                        && condition.reason == "CompensatedOrSafeFailure"
+                }));
+            }
+            let measurements = state
+                .framework_native_switchover_measurements(
+                    "default",
+                    &name,
+                    "test-uid",
+                    &execution_id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                measurements.completed_activity_count,
+                Some(expected_activities)
+            );
+            assert_eq!(
+                measurements.completed_external_effect_count,
+                Some(expected_external)
+            );
+            assert_eq!(
+                measurements.completed_passive_observation_count,
+                Some(expected_passive)
+            );
+            assert_eq!(
+                measurements.accepted_writes,
+                expected_activities
+                    + if scenario == ProductionSwitchoverScenario::PostPromotionCompensation {
+                        2
+                    } else {
+                        1
+                    }
+            );
+            assert!(
+                measurements.maximum_active_checkpoint_bytes
+                    <= kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
+            );
+            assert!(
+                measurements.maximum_terminal_checkpoint_bytes
+                    <= kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
+            );
+            println!(
+                "KUBERIC_SWITCHOVER_PHASE4_TOPOLOGY members={member_count} scenario={suffix} activities={expected_activities} external_effects={expected_external} passive_observations={expected_passive} accepted_writes={} maximum_active_checkpoint_bytes={} maximum_terminal_checkpoint_bytes={}",
+                measurements.accepted_writes,
+                measurements.maximum_active_checkpoint_bytes,
+                measurements.maximum_terminal_checkpoint_bytes,
+            );
+        }
+    }
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_production_nine_member_maximum_fault_history() {
+    let name = "native-phase4-nine-max";
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let healthy = create_healthy_set(&api, &bootstrap, name, 9).await;
+    let original_primary = healthy.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|pod_name| pod_name != &original_primary)
+        .unwrap();
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let (state, accepted) = accept_native_switchover(
+        &api,
+        name,
+        &healthy,
+        &original_primary,
+        &target,
+        store.clone(),
+    )
+    .await;
+    let execution_id = accepted
+        .switchover_execution
+        .as_ref()
+        .unwrap()
+        .execution_id
+        .clone();
+    api.reset_operations();
+    api.reject_before_durable_action_sequences(
+        [1, 2, 3, 2000, 2001, 2002].into_iter().chain(2100..2108),
+    );
+    api.fail_terminal_durable_action_sequence(3);
+
+    let mut history = Vec::new();
+    let completed = drive_native_switchover_recording_history(
+        &api,
+        &state,
+        &store,
+        name,
+        9,
+        accepted,
+        &mut history,
+    )
+    .await;
+    let expected_history = expected_persisted_production_switchover_history(
+        9,
+        ProductionSwitchoverScenario::PostPromotionCompensation,
+        true,
+    );
+    assert_eq!(history.len(), expected_history.len(), "{history:?}");
+    for (index, (actual, expected)) in history.iter().zip(&expected_history).enumerate() {
+        assert_eq!(actual, expected, "history identity {index}");
+    }
+    assert_eq!(
+        completed.current_primary.as_deref(),
+        Some(original_primary.as_str())
+    );
+    assert_stable_snapshot(&api, &completed, 9);
+    assert_exact_role_labels(&api, name, &completed);
+    assert_eq!(
+        api.operations()
+            .iter()
+            .filter(|operation| **operation != ControlOperation::GetStatus)
+            .count(),
+        28
+    );
+    assert_eq!(*api.uid_label_patch_attempts.lock().unwrap(), 0);
+    assert!(
+        api.reject_before_durable_action_sequences
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        api.fail_terminal_durable_action_sequences
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+
+    let measurements = state
+        .framework_native_switchover_measurements("default", name, "test-uid", &execution_id)
+        .await
+        .unwrap();
+    assert_eq!(measurements.completed_activity_count, Some(33));
+    assert_eq!(measurements.completed_external_effect_count, Some(28));
+    assert_eq!(measurements.completed_passive_observation_count, Some(5));
+    assert_eq!(measurements.accepted_writes, 48);
+    assert!(
+        measurements.maximum_active_checkpoint_bytes
+            <= kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
+    );
+    assert!(
+        measurements.maximum_terminal_checkpoint_bytes
+            <= kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
+    );
+    println!(
+        "KUBERIC_SWITCHOVER_PHASE4_MAXIMUM_FAULT members=9 activities=33 external_effects=28 passive_observations=5 accepted_writes={} maximum_active_checkpoint_bytes={} active_headroom={} maximum_terminal_checkpoint_bytes={} terminal_headroom={}",
+        measurements.accepted_writes,
+        measurements.maximum_active_checkpoint_bytes,
+        kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
+            - measurements.maximum_active_checkpoint_bytes,
+        measurements.maximum_terminal_checkpoint_bytes,
+        kuberic_operator::durable::switchover_execution::SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES
+            - measurements.maximum_terminal_checkpoint_bytes,
+    );
+}
+
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_framework_native_switchover_operation_outcome_matrix() {
@@ -4413,6 +5020,7 @@ async fn test_framework_native_switchover_observation_collection_survives_restar
         .execution_id
         .clone();
     api.reset_operations();
+    let mut history = Vec::new();
 
     for _ in 0..180 {
         let restarted = ReconcilerState::with_switchover_store(checkpoint_store.clone());
@@ -4424,6 +5032,7 @@ async fn test_framework_native_switchover_observation_collection_survives_restar
         .await
         .unwrap();
         status = api.last_status().unwrap();
+        record_native_switchover_history(&checkpoint_store, &status, &mut history).await;
         if status.phase == Phase::Healthy {
             break;
         }
@@ -4435,6 +5044,15 @@ async fn test_framework_native_switchover_observation_collection_survives_restar
         status.switchover_execution.as_ref().unwrap().execution_id,
         execution_id
     );
+    assert_eq!(
+        history,
+        expected_persisted_production_switchover_history(
+            3,
+            ProductionSwitchoverScenario::Success,
+            false,
+        )
+    );
+    assert_exact_role_labels(&api, "native-restart", &status);
     let operations = api.operations();
     assert_eq!(
         operations
@@ -4632,9 +5250,8 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
         .map(|pod| pod.metadata.name.clone().unwrap())
         .find(|name| name != &original_primary)
         .unwrap();
-    let state = ReconcilerState::with_switchover_store(
-        kuberic_durable_execution::InMemoryCheckpointStore::new(),
-    );
+    let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_switchover_store(store.clone());
     reconcile_set(
         &make_native_switchover_set(
             "native-all-lost-replies",
@@ -4650,7 +5267,13 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
     )
     .await
     .unwrap();
-    let mut status = api.last_status().unwrap();
+    let status = api.last_status().unwrap();
+    let execution_id = status
+        .switchover_execution
+        .as_ref()
+        .unwrap()
+        .execution_id
+        .clone();
     api.reset_operations();
     let expected = vec![
         ControlOperation::RevokeWriteStatus,
@@ -4661,37 +5284,21 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
         ControlOperation::WaitForCatchUpQuorum,
         ControlOperation::UpdateCurrentConfiguration,
     ];
-    let mut armed_index = 0;
-    api.fail_after_next_durable_action(expected[armed_index]);
-    for _ in 0..220 {
-        reconcile_set(
-            &make_native_switchover_set("native-all-lost-replies", 3, Some(status.clone())),
-            &api,
-            &state,
-        )
-        .await
-        .unwrap();
-        status = api.last_status().unwrap();
-        let mutations: Vec<_> = api
-            .operations()
-            .into_iter()
-            .filter(|operation| *operation != ControlOperation::GetStatus)
-            .collect();
-        if mutations.len() > armed_index {
-            assert_eq!(mutations, expected[..mutations.len()]);
-            armed_index = mutations.len();
-            if armed_index < expected.len() {
-                api.fail_after_next_durable_action(expected[armed_index]);
-            }
-        }
-        if status.phase == Phase::Healthy {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(status.phase, Phase::Healthy);
-    assert_eq!(status.current_primary.as_deref(), Some(target.as_str()));
-    assert_eq!(armed_index, expected.len());
+    api.fail_after_durable_action_sequences([1, 2, 3, 100, 1000, 1001, 1002]);
+    api.fail_after_uid_label_patches(2);
+    let mut history = Vec::new();
+    let completed = drive_native_switchover_recording_history(
+        &api,
+        &state,
+        &store,
+        "native-all-lost-replies",
+        3,
+        status,
+        &mut history,
+    )
+    .await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
     assert_eq!(
         api.operations()
             .into_iter()
@@ -4699,6 +5306,39 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
             .collect::<Vec<_>>(),
         expected
     );
+    assert_eq!(
+        history,
+        expected_persisted_production_switchover_history(
+            3,
+            ProductionSwitchoverScenario::Success,
+            false,
+        )
+    );
+    assert_exact_role_labels(&api, "native-all-lost-replies", &completed);
+    assert_eq!(*api.uid_label_patch_attempts.lock().unwrap(), 2);
+    assert_eq!(*api.uid_label_patch_accepted.lock().unwrap(), 2);
+    assert_eq!(
+        *api.uid_label_patch_lost_replies_remaining.lock().unwrap(),
+        0
+    );
+    assert!(
+        api.fail_after_durable_action_sequences
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    let measurements = state
+        .framework_native_switchover_measurements(
+            "default",
+            "native-all-lost-replies",
+            "test-uid",
+            &execution_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(measurements.completed_activity_count, Some(12));
+    assert_eq!(measurements.completed_external_effect_count, Some(9));
+    assert_eq!(measurements.completed_passive_observation_count, Some(3));
 }
 
 #[test_log::test(tokio::test)]

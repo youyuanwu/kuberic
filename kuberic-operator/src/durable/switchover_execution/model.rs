@@ -433,4 +433,29 @@ mod tests {
         );
         assert!(DirectSwitchoverDefinition::from_initial(&operation).is_ok());
     }
+
+    #[test]
+    fn direct_switchover_admission_preserves_exact_product_range_and_distinct_target() {
+        for member_count in [2, crate::crd::KUBERIC_MAX_REPLICAS as i64] {
+            assert!(
+                admit_direct_switchover("set-uid", snapshot(1, member_count, 7), 2, 100).is_ok()
+            );
+        }
+        assert!(admit_direct_switchover("set-uid", snapshot(1, 1, 7), 1, 100).is_err());
+        assert!(
+            admit_direct_switchover(
+                "set-uid",
+                snapshot(1, crate::crd::KUBERIC_MAX_REPLICAS as i64 + 1, 7),
+                2,
+                100,
+            )
+            .is_err()
+        );
+        let same_primary =
+            admit_direct_switchover("set-uid", snapshot(1, 2, 7), 1, 100).unwrap_err();
+        assert!(same_primary.contains("already primary"));
+        let missing_target =
+            admit_direct_switchover("set-uid", snapshot(1, 2, 7), 3, 100).unwrap_err();
+        assert!(missing_target.contains("not in the stable snapshot"));
+    }
 }
