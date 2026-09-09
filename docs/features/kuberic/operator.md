@@ -333,6 +333,11 @@ checkpoint load/reload, bounded-fuel progression, terminal short-circuit, and
 persistence outcome classification. Neither the adapter nor runner selects
 the next switchover step.
 
+Each named activity also has its own persisted input and output shape. Fixed
+old-primary, target-primary, distribution, configuration, and label contracts
+contain only fields meaningful to that operation; production does not erase
+them into a cross-operation replica/label kind or request superset.
+
 Fused host progression persists a prepared activity directly as
 `DispatchExposed`, returning a private permit only after the exact checkpoint
 CAS is accepted. An authoritative observation can be persisted together with
@@ -341,16 +346,23 @@ generation, control version, runtime epoch, correlated action identity, and
 payload. Routing-label activities freeze the Pod UID.
 
 An exposed effect is observation-only after restart. A matching terminal
-ledger, runtime postcondition, or Pod label advances it. A new agent generation
-may prove that a replica command was never admitted, allowing one redelivery of
-the same action identity; a second proof stops. UID-fenced label effects have
-no redelivery path. In-progress, mixed, unavailable, or otherwise unknown
-evidence remains quarantined. ConfigMap conflicts and unknown writes force
-authoritative reload before another permit.
+ledger or exact runtime postcondition advances a replica effect; a new agent
+generation may instead prove that the command was never admitted, allowing one
+redelivery of the same action identity. A second proof stops. Precondition,
+unavailable, scheduled, in-progress, mixed, or otherwise unknown evidence
+remains quarantined even after the activity deadline. UID-fenced label effects
+have no redelivery path and resolve only from the exact UID-bound label
+postcondition. ConfigMap conflicts and unknown writes force authoritative
+reload before another permit.
 
 The terminal checkpoint is accepted and then reloaded before topology/status
 publication. Terminal reload is status-only and does not poll replicas or
-dispatch effects. `Completed` and `CompensatedOrSafeFailure` clear the active
+dispatch effects. Its immutable branch discriminator distinguishes target
+success, revoke-safe failure, previous-configuration restore, and
+post-promotion compensation. The adapter accepts only the exact topology and
+member-count-specific reachable external/passive accounting pairs for that
+branch, including only its available replica redelivery slots. `Completed` and
+`CompensatedOrSafeFailure` clear the active
 `FrameworkNativeSwitchover` condition and return the resource to `Healthy`;
 stopped, incompatible, rejected, isolated, nondeterministic, reload, and
 storage states stay visible without publishing an unvalidated topology.
@@ -371,10 +383,14 @@ The contract independently bounds 4,096 workflow-input bytes, 8,192 activity
 input bytes, 8,192 activity-result bytes, 33 activity records, 524,288
 active-checkpoint bytes, 16,384 terminal-checkpoint bytes, 4,096
 terminal-payload bytes, and 512 error bytes. Replay is separately bounded at
-64 workflow transitions and each reconcile at 32 runner outcomes.
+64 workflow transitions and each reconcile at 32 runner outcomes. One checked
+transition budget covers the normal path, both compensation families,
+attestation, and proof-backed redelivery. Externally sourced errors are
+UTF-8-truncated before activity persistence, while oversized replayed activity
+or terminal errors are rejected.
 The declared-maximum fixtures measure 444,601 active bytes and 15,077 terminal
-bytes. The nine-member maximum-fault production run measures 114,877 active
-bytes and 7,949 terminal bytes while consuming all 33 records. These limits
+bytes. The nine-member maximum-fault production run measures 64,061 active
+bytes and 4,921 terminal bytes while consuming all 33 records. These limits
 are switchover-specific and are not copied from remove-replica.
 
 The local mutation boundary remains individually correlated ReplicaAgent

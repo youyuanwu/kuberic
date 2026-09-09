@@ -65,6 +65,10 @@ jobs:
         cargo test -p kuberic-operator direct_switchover_nine_member_max_fault_measurement_fits_exact_limits -- --nocapture
         cargo test -p kuberic-operator direct_switchover_adapter_is_deterministic_for_one_hundred_runs -- --nocapture
         cargo test -p kuberic-operator direct_switchover_terminal_only_reload_recovers_named_activity_accounting
+        cargo test -p kuberic-operator direct_switchover_terminal_rejects_unreachable_branch_accounting
+        cargo test -p kuberic-operator direct_switchover_transition_budget_is_enforced_at_execution_boundary
+        cargo test -p kuberic-operator direct_switchover_unresolved_replica_effects_remain_quarantined_past_deadline
+        cargo test -p kuberic-operator direct_switchover_unresolved_labels_remain_quarantined_past_deadline
         cargo test -p kuberic-operator production_event_history_is_bounded
 
     - name: Run direct switchover schema, deployment, and owner gates
@@ -145,4 +149,5 @@ jobs:
         RUST_MIN_STACK: 4194304
       run: |
         cargo test -p kuberic-durable-execution --all-features -- --nocapture
+        cargo test -p kuberic-tests test_kvstore_k8s_direct_switchover_checkpoint_owner_gc -- --nocapture
         cargo test --workspace --all-features --exclude kuberic-durable-execution

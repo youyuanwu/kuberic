@@ -76,6 +76,11 @@ collects authoritative observations, prepares exact commands, dispatches only
 under a consumed one-use permit, resolves quarantine, and validates terminal
 state; it does not choose protocol progression.
 
+The durable inputs are genuinely operation-specific. Fixed old-primary,
+target-primary, distribution, configuration, and label activities expose only
+their own target and attempt fields; there is no persisted cross-operation
+kind enum or shared replica/label request superset behind the named history.
+
 The public `status.switchoverExecution` contract is version 4. This is an
 intentional clean break: previous switchover contract versions and histories
 are not migrated or resumed. The CRD exposes only the required current shape.
@@ -96,29 +101,40 @@ any effect.
 
 Fused checkpoint compare-and-swap persists an exact prepared command before a
 permit exists and combines authoritative observation with the next exposure or
-terminal state. Unknown replica effects remain observation-only quarantined.
-A new agent generation can prove non-admission and permit one redelivery of
+terminal state. Unknown replica effects remain observation-only quarantined
+past their activity deadline. Only a matching terminal ledger record, the
+exact live postcondition, or generation-change proof of non-admission resolves
+an exposed replica command. Precondition, unavailable, and scheduled/in-progress
+evidence continue waiting. A new agent generation can permit one redelivery of
 the same action identity; a second proof stops. UID-fenced label effects are
-never redelivered. Conflict or unknown checkpoint writes reload before any
-later permit.
+never redelivered and resolve only from the exact UID-bound label
+postcondition. Conflict or unknown checkpoint writes reload before any later
+permit.
 
 Terminal state is compacted, reloaded, and validated before stable
-topology/status publication. Use `status.switchoverExecution`, its referenced
-ConfigMap, and the `FrameworkNativeSwitchover` condition to inspect admission,
-named history, reloads, quarantine, incompatibility, completion, or safe
-compensation.
+topology/status publication. The compact terminal records its immutable branch
+(`target_success`, `revoke_safe_failure`,
+`previous_configuration_restored`, or
+`post_promotion_compensated`), and reload accepts only member-count-specific
+reachable external/passive accounting for that branch. Error strings are
+bounded to 512 UTF-8 bytes before activity or terminal persistence. Use
+`status.switchoverExecution`, its referenced ConfigMap, and the
+`FrameworkNativeSwitchover` condition to inspect admission, named history,
+reloads, quarantine, incompatibility, completion, or safe compensation.
 
 The canonical three-member no-fault sample records nine external effects,
 three passive observations, 12 completed boundaries, 13 accepted writes,
-27,273 maximum active-checkpoint bytes, a 3,925-byte terminal checkpoint, and
-a 900-byte terminal payload. The nine-member maximum-fault production sample
+20,857 maximum active-checkpoint bytes, a 3,961-byte terminal checkpoint, and
+a 924-byte terminal payload. The nine-member maximum-fault production sample
 records 33 boundaries, 28 external effects, five passive observations,
-48 accepted writes, 114,877 maximum active bytes, and 7,949 maximum terminal
+48 accepted writes, 64,061 maximum active bytes, and 4,921 maximum terminal
 bytes. The contract limits are 33 records, 4,096 workflow-input bytes,
 8,192 maximum activity-input/result bytes, 524,288 active bytes, 16,384
 terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64 workflow
-transitions, and 32 runner outcomes per reconcile. Measurements are validation
-snapshots, not compatibility constants.
+transitions, and 32 runner outcomes per reconcile. The single 64-transition
+budget covers normal calls, compensation, attestation, and proof-backed
+redelivery. Measurements are validation snapshots, not compatibility
+constants.
 
 The runtime topology is unchanged: one Kubernetes operator process and the
 existing Set/Pod watches schedule the in-process runner; replica mutations

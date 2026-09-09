@@ -31,9 +31,9 @@ use crate::durable::remove_replica_execution::{
     checkpoint_limits, execution_spec, new_execution, reconstruct_initial_operation,
 };
 use crate::durable::switchover_execution::{
-    DirectSwitchoverTerminalRecord, SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES,
-    SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES, SwitchoverActivityAccounting,
-    checkpoint_limits as switchover_checkpoint_limits,
+    DirectSwitchoverTerminalBranch, DirectSwitchoverTerminalRecord,
+    SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES, SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
+    SwitchoverActivityAccounting, checkpoint_limits as switchover_checkpoint_limits,
     encode_terminal as encode_switchover_terminal, is_switchover_activity_identity,
     native_execution_spec, native_initial_operation, new_switchover_execution,
 };
@@ -712,6 +712,7 @@ async fn store_switchover_terminal(
     let terminal = DirectSwitchoverTerminalRecord::Complete {
         snapshot: initial.target_snapshot,
         compensated: false,
+        branch: DirectSwitchoverTerminalBranch::TargetSuccess,
         reason: None,
         accounting: Some(SwitchoverActivityAccounting::new(9, 3)),
     };
@@ -919,24 +920,21 @@ async fn assert_native_switchover_condition_for_store(
     store: InMemoryCheckpointStore,
     expected_reason: &str,
     pods: Vec<Pod>,
-) {
+) -> KubericSetStatus {
     let state = ReconcilerState::with_switchover_store(store);
     let api = RoutingApi::new(pods);
     let current_pods = api.pods.lock().unwrap().clone();
     reconcile_framework_native_switchover(&switchover_set(reference), &api, &state, &current_pods)
         .await
         .unwrap();
+    let status = api.last_status().unwrap();
     assert!(
-        api.last_status()
-            .unwrap()
-            .conditions
-            .iter()
-            .any(|condition| {
-                condition.type_ == "FrameworkNativeSwitchover"
-                    && condition.reason == expected_reason
-            }),
+        status.conditions.iter().any(|condition| {
+            condition.type_ == "FrameworkNativeSwitchover" && condition.reason == expected_reason
+        }),
         "missing native switchover condition {expected_reason}"
     );
+    status
 }
 
 #[tokio::test]
@@ -1001,6 +999,73 @@ async fn framework_native_switchover_route_records_checkpoint_dispositions() {
         vec![pod(1, "one", "primary"), pod(2, "two", "secondary")],
     )
     .await;
+}
+
+#[tokio::test]
+async fn framework_native_switchover_route_rejects_unreachable_terminal_transcripts() {
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let initial = native_initial_operation(&reference).unwrap();
+    let store = InMemoryCheckpointStore::new();
+    let impossible_success = DirectSwitchoverTerminalRecord::Complete {
+        snapshot: initial.target_snapshot.clone(),
+        compensated: false,
+        branch: DirectSwitchoverTerminalBranch::TargetSuccess,
+        reason: None,
+        accounting: Some(SwitchoverActivityAccounting::new(1, 0)),
+    };
+    store_switchover_terminal_outcome(
+        &store,
+        &reference,
+        TerminalOutcome::succeeded(encode_switchover_terminal(&impossible_success).unwrap()),
+        1,
+    )
+    .await;
+    let rejected_status = assert_native_switchover_condition_for_store(
+        reference,
+        store,
+        "Rejected",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+    assert_eq!(rejected_status.phase, Phase::Switchover);
+    assert_eq!(rejected_status.current_primary.as_deref(), Some("set-0"));
+
+    let reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let initial = native_initial_operation(&reference).unwrap();
+    let store = InMemoryCheckpointStore::new();
+    let mut compensation_snapshot = initial.previous_snapshot.cloned().unwrap();
+    compensation_snapshot.epoch = initial.target_snapshot.epoch.clone();
+    let impossible_compensation = DirectSwitchoverTerminalRecord::Complete {
+        snapshot: compensation_snapshot,
+        compensated: true,
+        branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
+        reason: Some("unreachable compensation transcript".to_string()),
+        accounting: Some(SwitchoverActivityAccounting::new(1, 1)),
+    };
+    store_switchover_terminal_outcome(
+        &store,
+        &reference,
+        TerminalOutcome::succeeded(encode_switchover_terminal(&impossible_compensation).unwrap()),
+        2,
+    )
+    .await;
+    let rejected_status = assert_native_switchover_condition_for_store(
+        reference,
+        store,
+        "Rejected",
+        vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ],
+    )
+    .await;
+    assert_eq!(rejected_status.phase, Phase::Switchover);
+    assert_eq!(rejected_status.current_primary.as_deref(), Some("set-0"));
 }
 
 #[tokio::test]
@@ -1161,9 +1226,12 @@ async fn framework_native_switchover_route_records_nondeterminism() {
 async fn framework_native_switchover_route_publishes_compensation_and_quarantine() {
     let compensation_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
     let initial = native_initial_operation(&compensation_reference).unwrap();
+    let mut compensation_snapshot = initial.previous_snapshot.cloned().unwrap();
+    compensation_snapshot.epoch = initial.target_snapshot.epoch.clone();
     let terminal = DirectSwitchoverTerminalRecord::Complete {
-        snapshot: initial.previous_snapshot.cloned().unwrap(),
+        snapshot: compensation_snapshot,
         compensated: true,
+        branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
         reason: Some("target promotion failed and the old primary was restored".to_string()),
         accounting: Some(SwitchoverActivityAccounting::new(8, 5)),
     };

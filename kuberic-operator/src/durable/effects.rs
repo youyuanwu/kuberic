@@ -314,28 +314,6 @@ fn prepare_replica_effect_command_with_lifecycle_support(
     Ok((planned, command))
 }
 
-pub fn validate_switchover_replica_action_kind(
-    kind: crate::crd::DurableActionKind,
-    action: &DurableReplicaAction,
-) -> bool {
-    use crate::crd::DurableActionKind as Kind;
-    matches!(
-        kind,
-        Kind::RevokeWrite
-            | Kind::DemoteOldPrimary
-            | Kind::PromoteTarget
-            | Kind::CompensatePromoteOldPrimary
-            | Kind::UpdateSecondaryEpoch
-            | Kind::CompensateUpdateSecondaryEpoch
-            | Kind::UpdateCatchUpConfiguration
-            | Kind::CompensateCatchUpConfiguration
-            | Kind::WaitForCatchUpQuorum
-            | Kind::UpdateCurrentConfiguration
-            | Kind::RestorePreviousConfiguration
-            | Kind::CompensateCurrentConfiguration
-    ) && replica_action_matches_kind(kind, action)
-}
-
 pub fn replica_action_matches_kind(
     kind: crate::crd::DurableActionKind,
     action: &DurableReplicaAction,
@@ -1087,22 +1065,6 @@ mod tests {
             classify_dispatch_failure(&KubericError::Closed),
             DispatchFailureDisposition::Unknown
         );
-    }
-
-    #[test]
-    fn workflow_neutral_action_matching_is_separate_from_switchover_allow_list() {
-        let action = DurableReplicaAction::RemoveReplica {
-            replica_id: 3,
-            instance_id: ReplicaInstanceId::new("replica-3-uid"),
-        };
-        assert!(replica_action_matches_kind(
-            crate::crd::DurableActionKind::CreateCompensateRemoveCandidate,
-            &action,
-        ));
-        assert!(!validate_switchover_replica_action_kind(
-            crate::crd::DurableActionKind::CreateCompensateRemoveCandidate,
-            &action,
-        ));
     }
 
     #[tokio::test]

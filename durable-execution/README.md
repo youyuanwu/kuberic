@@ -437,6 +437,15 @@ supplies authoritative observations afterward. This demonstrates the reusable
 direct authoring pattern without adding an activity registry, generic
 compensation engine, or distributed runtime.
 
+Those activity payloads remain operation-local; the adapter does not persist a
+cross-operation kind/request union behind the typed names. Once an effect is
+exposed, its deadline is not evidence of failure: replica quarantine resolves
+only from a matching terminal ledger record, the exact live postcondition, or
+generation-change proof of non-admission, while labels resolve only from the
+exact UID-fenced label postcondition. The workflow applies one checked
+transition budget across normal calls, compensation, attestation, and
+redelivery.
+
 ## Deferred usability roadmap
 
 The crate intentionally stops at the durable-execution kernel.

@@ -198,18 +198,22 @@ normal prefix through kuberic.switchover.promote-target@v1 failure
 ```
 
 Every external activity has a deterministic action ID and exact prepared
-command persisted before dispatch. A resumed reconcile observes first: a
-matching postcondition advances, a matching precondition can dispatch, and any
-impossible observation fails closed. Replica actions receive at most one
-same-identity redelivery, and only after a new agent generation proves that the
-previous request was not admitted. UID-fenced label actions are never
-redelivered.
+command persisted before dispatch. Before exposure, a matching precondition
+can dispatch and ordinary deadline policy can select a domain failure. After
+exposure, the rules are stricter: only a matching terminal agent-ledger record,
+the exact live postcondition, or generation-change proof of non-admission can
+resolve a replica command. A precondition, unavailable replica, or
+scheduled/in-progress ledger record remains quarantined even after the
+activity deadline. Replica actions receive at most one same-identity
+redelivery, and only after generation change proves that the previous request
+was not admitted. UID-fenced label actions are never redelivered and remain
+quarantined until the exact UID-bound label postcondition is observed.
 
 The shared runner uses fused checkpoint compare-and-swap, one-use dispatch
-permits, bounded in-process fuel, and authoritative reload before any later
-effect. Unknown exposed effects remain quarantined until an exact agent-ledger,
-runtime-postcondition, or Pod-label observation resolves them. ConfigMap
-conflicts and unknown write outcomes reload before a later permit.
+permits, one end-to-end 64-transition workflow budget, and authoritative
+reload before any later effect. The budget includes normal, compensation,
+attestation, and redelivery calls. ConfigMap conflicts and unknown write
+outcomes reload before a later permit.
 
 The pod-local agent records the active action and 16 most recent terminal
 observations. These fields are the only local correlation ledger. The bounded

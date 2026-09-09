@@ -107,6 +107,13 @@ observations. The local sequence remains individually correlated rather than
 hidden behind a coarse agent intent because it spans the old primary, target,
 retained members, and Kubernetes routing effects.
 
+Compact terminal payloads carry an immutable branch discriminator for target
+success, revoke-safe failure, previous-configuration restore, or
+post-promotion compensation. Reload rejects a terminal whose topology,
+external/passive activity split, member-count-specific base sequence, or
+redelivery count is unreachable for that branch. Terminal `reason`/`message`
+and persisted activity errors are limited to 512 UTF-8 bytes.
+
 `FrameworkNativeSwitchover=True` exposes active and blocked states such as
 `Accepted`, `Blocked`, `AwaitingEffectPreparation`, `EffectExposed`, `Quarantined`,
 `ReloadRequired`, `StorageUnavailable`, `Incompatible`, `Rejected`,

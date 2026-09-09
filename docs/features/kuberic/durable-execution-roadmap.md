@@ -202,6 +202,14 @@ add and remove, the sequence spans multiple replicas and Kubernetes routing
 objects, and the existing per-command fences already supply authoritative
 ambiguity recovery.
 
+The activity payloads are operation-local rather than aliases of a shared
+replica/label request. Exposed commands use a stricter recovery mode than
+undispatched requests: replica quarantine accepts only matching terminal
+ledger evidence, an exact postcondition, or generation-change non-admission;
+labels accept only their exact UID-fenced postcondition. Compact terminals
+record the completed branch and are checked against its member-count-specific
+reachable accounting pairs before publication.
+
 The product supports 1–9 replicas. A one-member set has no distinct switchover
 target; direct switchover accepts valid stable topologies with 2–9 members.
 The upper bound is enforced by the CRD and reconciler because the nine-member
@@ -217,9 +225,13 @@ The independent limits are 33 activity records, 4,096 workflow-input bytes,
 16,384 terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64
 workflow transitions, and 32 runner outcomes per reconcile. Declared-maximum
 fixtures measure 444,601 active bytes and 15,077 terminal bytes. The measured
-three-member no-fault sample was 27,273 active bytes, 3,925 terminal bytes, and
-a 900-byte terminal payload. The nine-member maximum-fault production sample
-was 114,877 active bytes and 7,949 terminal bytes.
+three-member no-fault sample was 20,857 active bytes, 3,961 terminal bytes, and
+a 924-byte terminal payload. The nine-member maximum-fault production sample
+was 64,061 active bytes and 4,921 terminal bytes.
+
+The 64-transition limit is one workflow-wide budget consumed by normal,
+compensation, attestation, and redelivery calls. Activity and terminal error
+strings are enforced at 512 UTF-8 bytes on both write and reload paths.
 
 ### Graduated: Framework-Native Remove Replica
 

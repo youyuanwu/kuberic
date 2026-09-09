@@ -324,35 +324,6 @@ pub fn same_topology(
             })
 }
 
-pub fn is_valid_compensation_topology(
-    actual: &StablePartitionSnapshotStatus,
-    definition: &DirectSwitchoverDefinition,
-) -> bool {
-    if actual.primary_id != definition.old_primary_id
-        || actual.write_quorum != definition.previous_snapshot.write_quorum
-        || actual.members.len() != definition.previous_snapshot.members.len()
-        || (actual.epoch != definition.previous_snapshot.epoch
-            && actual.epoch != definition.target_snapshot.epoch)
-    {
-        return false;
-    }
-    definition.previous_snapshot.members.iter().all(|expected| {
-        let matches = actual
-            .members
-            .iter()
-            .filter(|member| member.id == expected.id)
-            .collect::<Vec<_>>();
-        matches.len() == 1
-            && matches[0].instance_id == expected.instance_id
-            && matches[0].role
-                == if expected.id == definition.old_primary_id {
-                    StableReplicaRoleStatus::Primary
-                } else {
-                    StableReplicaRoleStatus::ActiveSecondary
-                }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

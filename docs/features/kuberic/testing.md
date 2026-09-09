@@ -394,13 +394,18 @@ the format-3 checkpoint kernel and contract-v4 direct workflow. Persisted
 history contains only the 20 operation-specific version-1 names. The matrix
 covers normal, pre-promotion-compensation, and
 post-promotion-compensation paths at two, four, and nine members; every-turn
-operator restart; unknown outcomes with and without apply; checkpoint and
-terminal CAS conflicts; failed status publication followed by terminal reload
-without Pods; stale target incarnation; quarantine; one proof-backed
-redelivery; and lost replies for every replica mutation. It asserts the exact
-named sequence, one admitted unsafe effect per correlation identity,
-terminal-before-status recovery, and fail-closed missing-reference,
-malformed-current-contract, and previous-version state.
+operator restart across all three terminal families; unknown outcomes with and
+without apply; checkpoint and terminal CAS conflicts; failed status
+publication followed by terminal reload without Pods; stale target
+incarnation; one proof-backed redelivery; and lost replies for every normal
+and compensation replica mutation plus both label positions. Production
+adapter tests hold unknown-before-apply and matching in-progress effects past
+deadline at revoke, demote, promotion, a late replica step, and both normal
+label positions, proving zero compensation or publication until authoritative
+evidence exists. The matrix asserts the exact named sequence, one admitted
+unsafe effect per correlation identity, terminal-before-status recovery, and
+fail-closed missing-reference, malformed-current-contract, and
+previous-version state.
 
 Run the targeted matrix:
 
@@ -412,8 +417,8 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kvstore \
 The authoritative three-member happy-path gate expects exactly nine external
 effects plus three passive observations, giving 12 completed durable
 boundaries and 13 accepted checkpoint writes including terminal persistence.
-The current sample observed 27,273 maximum active-checkpoint bytes, a
-3,925-byte terminal checkpoint, and a 900-byte terminal payload. These are
+The current sample observed 20,857 maximum active-checkpoint bytes, a
+3,961-byte terminal checkpoint, and a 924-byte terminal payload. These are
 run-specific snapshots because runtime-generated values affect serialized
 length; no exact byte value is a compatibility contract.
 
@@ -430,26 +435,32 @@ The independent contract limits are 33 activity records, 4,096 workflow-input
 bytes, 8,192 maximum activity-input and activity-result bytes, 524,288 active
 encoded bytes, 16,384 terminal encoded bytes, 4,096 terminal-payload bytes,
 512 error bytes, 64 workflow transitions, and 32 runner outcomes per
-reconcile. The declared-maximum 33-record projection measures 444,601 active
-bytes and 15,077 terminal bytes. The nine-member maximum-fault production run
-uses all 33 records and measures 114,877 active bytes and 7,949 terminal bytes,
-with 28 external effects, five passive observations, and 48 accepted writes.
-Exact-bound and one-byte-over tests cover every activity declaration and each
-global limit independently.
+reconcile. The transition limit is enforced by one workflow-wide budget used
+by normal calls, compensation, attestation, and redelivery. Persisted activity
+and terminal errors enforce the 512-byte UTF-8 limit with ASCII and multibyte
+exact/one-over cases. The declared-maximum 33-record projection measures
+444,601 active bytes and 15,077 terminal bytes. The nine-member maximum-fault
+production run uses all 33 records and measures 64,061 active bytes and 4,921
+terminal bytes, with 28 external effects, five passive observations, and 48
+accepted writes. Exact-bound and one-byte-over tests cover every activity
+declaration and each global limit independently.
 
-The terminal payload carries the external-effect and passive-observation
-counts, so a fresh measurement store can recover the classification without
-prior active-checkpoint cache state. A successful `N`-member switchover
-requires exactly three passive observations and `N + 6 + r` external
+The terminal payload carries a branch discriminator plus the external-effect
+and passive-observation counts, so a fresh measurement store can recover and
+validate the classification without prior active-checkpoint cache state. A
+successful `N`-member switchover requires exactly three passive observations
+and `N + 6 + r` external
 boundaries, where `r` is the number of proven-no-admission redeliveries and is
 limited to the `N + 4` projected ReplicaAgent-effect slots; UID-fenced label
 effects have no redelivery path. For the canonical three-member path, the
 no-redelivery target remains 9/3, 12 boundaries, and 13 accepted writes, with
 at most seven redeliveries. Fault paths may consume additional boundaries and
-writes. Compensated completion is validated against the exact
-reachable pairs for its restore or failed-promotion compensation transcript,
-including only redelivery slots belonging to effects that were actually
-exposed.
+writes. Revoke-safe failure, previous-configuration restore, and
+post-promotion compensation have distinct terminal branches. Each is
+validated against its member-count-specific base sequence, passive count,
+flexible label slots where applicable, and only the replica redelivery slots
+reachable on that branch. Cross-branch, short, zero-count, wrong-split, and
+over-redelivery compact terminals are rejected before `Healthy` publication.
 `external_effects` counts ReplicaAgent commands and
 UID-fenced label patches; `passive_observations` counts evidence-only
 activities; `durable_boundaries` is their completed total.
@@ -479,6 +490,12 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
   direct_switchover_nine_member_max_fault_measurement_fits_exact_limits -- --nocapture
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
   direct_switchover_adapter_is_deterministic_for_one_hundred_runs -- --nocapture
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  direct_switchover_unresolved_replica_effects_remain_quarantined_past_deadline
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  direct_switchover_unresolved_labels_remain_quarantined_past_deadline
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test -p kuberic-operator \
+  direct_switchover_transition_budget_is_enforced_at_execution_boundary
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
   -p kvstore --test reconciler \
   test_framework_native_switchover_ -- --nocapture
@@ -488,12 +505,15 @@ The ambiguity matrix distinguishes exposure conflicts, definite storage
 failures, unknown outcomes without application, and unknown outcomes after
 application. None returns a permit on the uncertain reconcile. Reload after an
 applied unknown finds the complete prepared exposure and quarantines it;
-reload after an unapplied unknown finds the predecessor and may prepare a new
-attempt. Lost replica replies remain quarantined until authoritative
-postcondition evidence or a changed generation proves non-admission. That
-proof is persisted before the one allowed same-action redelivery; a second
-proof stops. UID-fenced label effects are never redelivered. The durable
-kernel's 45-scenario conformance matrix also covers fused schedule/exposure,
+reload after an unapplied checkpoint write finds the predecessor and may
+prepare the first attempt. Once dispatch is exposed, a precondition,
+unavailability, or scheduled/in-progress ledger record remains quarantined
+past deadline. Only matching terminal ledger evidence, the exact
+postcondition, or generation-change non-admission resolves a replica effect.
+That proof is persisted before the one allowed same-action redelivery; a
+second proof stops. UID-fenced label effects are never redelivered and require
+their exact postcondition. The durable kernel's 45-scenario conformance matrix
+also covers fused schedule/exposure,
 observation/next exposure, observation/terminal, exact permit/attempt identity,
 and capacity reservation.
 
@@ -505,15 +525,20 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 RUST_MIN_STACK=4194304 cargo test \
   -p kvstore --test reconciler test_framework_native_switchover_
 ```
 
-The all-features suite selects the real Kubernetes checkpoint test. That test
-creates an owner-bound terminal checkpoint and proves owner deletion triggers
-garbage collection. Run it only against a newly created isolated cluster whose
+The all-features suite selects both the generic Kubernetes checkpoint-provider
+test and `test_kvstore_k8s_direct_switchover_checkpoint_owner_gc`. The latter
+creates a temporary live `KubericSet`, completes a direct switchover, verifies
+the terminal checkpoint's exact non-controlling owner UID, deletes only that
+fixture, and proves Kubernetes garbage collection removes the checkpoint. Run
+these only against a newly created isolated cluster whose
 namespace/ConfigMap authorization preflight succeeds:
 
 ```console
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test \
   -p kuberic-durable-execution --features kubernetes \
   --test kubernetes_checkpoint_real -- --nocapture
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo test \
+  -p kuberic-tests test_kvstore_k8s_direct_switchover_checkpoint_owner_gc -- --nocapture
 ```
 
 Local measurement, fault, replay, and bounds gates do not substitute for this

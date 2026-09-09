@@ -45,7 +45,9 @@ mod workflow;
 
 pub use activities::DirectActivityAccounting as SwitchoverActivityAccounting;
 pub use adapter::{DirectSwitchoverPreparedActivityResolver, DirectSwitchoverRunnerAdapter};
-pub use workflow::{DirectSwitchoverTerminalRecord, DirectSwitchoverWorkflow};
+pub use workflow::{
+    DirectSwitchoverTerminalBranch, DirectSwitchoverTerminalRecord, DirectSwitchoverWorkflow,
+};
 
 pub use super::checkpoint_store::DurableCheckpointStore;
 use super::{
@@ -59,7 +61,7 @@ pub(crate) use model::admit_direct_switchover as direct_initial_operation;
 pub const SWITCHOVER_CONTRACT_VERSION: u32 = activities::DIRECT_SWITCHOVER_CONTRACT_VERSION;
 pub const SWITCHOVER_MAX_REPLICAS: usize = crate::crd::KUBERIC_MAX_REPLICAS as usize;
 pub const SWITCHOVER_MAX_ACTIVITY_RECORDS: usize = adapter::DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS;
-pub const SWITCHOVER_MAX_TRANSITION_FUEL: usize = adapter::DIRECT_SWITCHOVER_MAX_TRANSITION_FUEL;
+pub const SWITCHOVER_MAX_TRANSITION_FUEL: usize = 64;
 pub const SWITCHOVER_MAX_RUNNER_FUEL: usize = adapter::DIRECT_SWITCHOVER_MAX_RUNNER_FUEL;
 pub const SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES: usize =
     adapter::DIRECT_SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES;
@@ -69,7 +71,7 @@ pub const SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES: usize =
     adapter::DIRECT_SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES;
 pub const SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES: u64 =
     adapter::DIRECT_SWITCHOVER_MAX_TERMINAL_PAYLOAD_BYTES;
-pub const SWITCHOVER_MAX_ERROR_BYTES: usize = adapter::DIRECT_SWITCHOVER_MAX_ERROR_BYTES;
+pub const SWITCHOVER_MAX_ERROR_BYTES: usize = activities::DIRECT_ACTIVITY_ERROR_MAX_BYTES;
 pub const SWITCHOVER_ACTIVITY_IDENTITIES: &[(&str, u32)] =
     activities::ALL_DIRECT_ACTIVITY_IDENTITIES;
 

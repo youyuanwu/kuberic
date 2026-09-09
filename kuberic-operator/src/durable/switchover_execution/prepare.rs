@@ -18,7 +18,7 @@ use crate::durable::{
     OperationObservations, correlated_action_observation,
     effects::{
         DurableEffectPreparationError, LabelEffectCommand, ReplicaEffectCommand,
-        prepare_replica_effect_command,
+        command_generation_change_proves_no_admission, prepare_replica_effect_command,
     },
 };
 
@@ -28,54 +28,46 @@ use super::{
         AttestCompensatedTopologyOutput, AttestTargetTopologyActivity, AttestTargetTopologyInput,
         AttestTargetTopologyOutput, CaptureFrozenLsnActivity, CaptureFrozenLsnInput,
         CaptureFrozenLsnOutput, CompensateDistributeReplicaEpochActivity,
-        CompensatePromoteOldPrimaryActivity, DIRECT_SWITCHOVER_CONTRACT_VERSION,
-        DemoteOldPrimaryActivity, DistributeReplicaEpochActivity, EffectObservation,
+        CompensateDistributeReplicaEpochInput, CompensatePromoteOldPrimaryActivity,
+        CompensatePromoteOldPrimaryInput, DIRECT_SWITCHOVER_CONTRACT_VERSION,
+        DemoteOldPrimaryActivity, DemoteOldPrimaryInput, DistributeReplicaEpochActivity,
+        DistributeReplicaEpochInput, EffectObservation,
         InstallCompensationCatchUpConfigurationActivity,
-        InstallCompensationCurrentConfigurationActivity, InstallTargetCatchUpConfigurationActivity,
-        InstallTargetCurrentConfigurationActivity, LabelDirectActivity, LabelOperationRequest,
-        PromoteTargetActivity, PublishOldPrimarySecondaryLabelActivity,
-        PublishTargetPrimaryLabelActivity, ReplicaDirectActivity, ReplicaOperationRequest,
-        RestoreOldPrimaryLabelActivity, RestorePreviousCurrentConfigurationActivity,
-        RestoreTargetSecondaryLabelActivity, RevokeWritesActivity, WaitTargetCaughtUpActivity,
-        WaitTargetCaughtUpInput, WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity,
+        InstallCompensationCatchUpConfigurationInput,
+        InstallCompensationCurrentConfigurationActivity,
+        InstallCompensationCurrentConfigurationInput, InstallTargetCatchUpConfigurationActivity,
+        InstallTargetCatchUpConfigurationInput, InstallTargetCurrentConfigurationActivity,
+        InstallTargetCurrentConfigurationInput, LabelDirectActivity, PromoteTargetActivity,
+        PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
+        PublishOldPrimarySecondaryLabelInput, PublishTargetPrimaryLabelActivity,
+        PublishTargetPrimaryLabelInput, ReplicaDirectActivity, RestoreOldPrimaryLabelActivity,
+        RestoreOldPrimaryLabelInput, RestorePreviousCurrentConfigurationActivity,
+        RestorePreviousCurrentConfigurationInput, RestoreTargetSecondaryLabelActivity,
+        RestoreTargetSecondaryLabelInput, RevokeWritesActivity, RevokeWritesInput,
+        WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput, WaitTargetCaughtUpOutput,
+        WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
     },
     model::DirectSwitchoverDefinition,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DirectReplicaOperation {
-    RevokeWrites,
-    DemoteOldPrimary,
-    PromoteTarget,
-    DistributeReplicaEpoch,
-    InstallTargetCatchUpConfiguration,
-    WaitTargetWriteQuorum,
-    InstallTargetCurrentConfiguration,
-    RestorePreviousCurrentConfiguration,
-    CompensatePromoteOldPrimary,
-    CompensateDistributeReplicaEpoch,
-    InstallCompensationCatchUpConfiguration,
-    InstallCompensationCurrentConfiguration,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DirectLabelOperation {
-    PublishTargetPrimary,
-    PublishOldPrimarySecondary,
-    RestoreOldPrimary,
-    RestoreTargetSecondary,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum DirectActivity {
-    Replica {
-        operation: DirectReplicaOperation,
-        request: ReplicaOperationRequest,
-    },
-    Label {
-        operation: DirectLabelOperation,
-        request: LabelOperationRequest,
-    },
+    RevokeWrites(RevokeWritesInput),
+    DemoteOldPrimary(DemoteOldPrimaryInput),
+    PromoteTarget(PromoteTargetInput),
+    DistributeReplicaEpoch(DistributeReplicaEpochInput),
+    InstallTargetCatchUpConfiguration(InstallTargetCatchUpConfigurationInput),
+    WaitTargetWriteQuorum(WaitTargetWriteQuorumInput),
+    InstallTargetCurrentConfiguration(InstallTargetCurrentConfigurationInput),
+    RestorePreviousCurrentConfiguration(RestorePreviousCurrentConfigurationInput),
+    CompensatePromoteOldPrimary(CompensatePromoteOldPrimaryInput),
+    CompensateDistributeReplicaEpoch(CompensateDistributeReplicaEpochInput),
+    InstallCompensationCatchUpConfiguration(InstallCompensationCatchUpConfigurationInput),
+    InstallCompensationCurrentConfiguration(InstallCompensationCurrentConfigurationInput),
+    PublishTargetPrimaryLabel(PublishTargetPrimaryLabelInput),
+    PublishOldPrimarySecondaryLabel(PublishOldPrimarySecondaryLabelInput),
+    RestoreOldPrimaryLabel(RestoreOldPrimaryLabelInput),
+    RestoreTargetSecondaryLabel(RestoreTargetSecondaryLabelInput),
     CaptureFrozenLsn(CaptureFrozenLsnInput),
     WaitTargetCaughtUp(WaitTargetCaughtUpInput),
     AttestTargetTopology(AttestTargetTopologyInput),
@@ -96,70 +88,66 @@ impl DirectActivity {
     pub fn decode(spec: &ActivitySpec) -> Result<Self, String> {
         let name = spec.name().name();
         Ok(match name {
-            RevokeWritesActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::RevokeWrites,
-                request: decode_replica::<RevokeWritesActivity>(spec)?,
-            },
-            DemoteOldPrimaryActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::DemoteOldPrimary,
-                request: decode_replica::<DemoteOldPrimaryActivity>(spec)?,
-            },
-            PromoteTargetActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::PromoteTarget,
-                request: decode_replica::<PromoteTargetActivity>(spec)?,
-            },
-            DistributeReplicaEpochActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::DistributeReplicaEpoch,
-                request: decode_replica::<DistributeReplicaEpochActivity>(spec)?,
-            },
-            InstallTargetCatchUpConfigurationActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::InstallTargetCatchUpConfiguration,
-                request: decode_replica::<InstallTargetCatchUpConfigurationActivity>(spec)?,
-            },
-            WaitTargetWriteQuorumActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::WaitTargetWriteQuorum,
-                request: decode_replica::<WaitTargetWriteQuorumActivity>(spec)?,
-            },
-            InstallTargetCurrentConfigurationActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::InstallTargetCurrentConfiguration,
-                request: decode_replica::<InstallTargetCurrentConfigurationActivity>(spec)?,
-            },
-            RestorePreviousCurrentConfigurationActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::RestorePreviousCurrentConfiguration,
-                request: decode_replica::<RestorePreviousCurrentConfigurationActivity>(spec)?,
-            },
-            CompensatePromoteOldPrimaryActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::CompensatePromoteOldPrimary,
-                request: decode_replica::<CompensatePromoteOldPrimaryActivity>(spec)?,
-            },
-            CompensateDistributeReplicaEpochActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::CompensateDistributeReplicaEpoch,
-                request: decode_replica::<CompensateDistributeReplicaEpochActivity>(spec)?,
-            },
-            InstallCompensationCatchUpConfigurationActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::InstallCompensationCatchUpConfiguration,
-                request: decode_replica::<InstallCompensationCatchUpConfigurationActivity>(spec)?,
-            },
-            InstallCompensationCurrentConfigurationActivity::NAME => Self::Replica {
-                operation: DirectReplicaOperation::InstallCompensationCurrentConfiguration,
-                request: decode_replica::<InstallCompensationCurrentConfigurationActivity>(spec)?,
-            },
-            PublishTargetPrimaryLabelActivity::NAME => Self::Label {
-                operation: DirectLabelOperation::PublishTargetPrimary,
-                request: decode_label::<PublishTargetPrimaryLabelActivity>(spec)?,
-            },
-            PublishOldPrimarySecondaryLabelActivity::NAME => Self::Label {
-                operation: DirectLabelOperation::PublishOldPrimarySecondary,
-                request: decode_label::<PublishOldPrimarySecondaryLabelActivity>(spec)?,
-            },
-            RestoreOldPrimaryLabelActivity::NAME => Self::Label {
-                operation: DirectLabelOperation::RestoreOldPrimary,
-                request: decode_label::<RestoreOldPrimaryLabelActivity>(spec)?,
-            },
-            RestoreTargetSecondaryLabelActivity::NAME => Self::Label {
-                operation: DirectLabelOperation::RestoreTargetSecondary,
-                request: decode_label::<RestoreTargetSecondaryLabelActivity>(spec)?,
-            },
+            RevokeWritesActivity::NAME => Self::RevokeWrites(decode::<RevokeWritesActivity>(spec)?),
+            DemoteOldPrimaryActivity::NAME => {
+                Self::DemoteOldPrimary(decode::<DemoteOldPrimaryActivity>(spec)?)
+            }
+            PromoteTargetActivity::NAME => {
+                Self::PromoteTarget(decode::<PromoteTargetActivity>(spec)?)
+            }
+            DistributeReplicaEpochActivity::NAME => {
+                Self::DistributeReplicaEpoch(decode::<DistributeReplicaEpochActivity>(spec)?)
+            }
+            InstallTargetCatchUpConfigurationActivity::NAME => {
+                Self::InstallTargetCatchUpConfiguration(decode::<
+                    InstallTargetCatchUpConfigurationActivity,
+                >(spec)?)
+            }
+            WaitTargetWriteQuorumActivity::NAME => {
+                Self::WaitTargetWriteQuorum(decode::<WaitTargetWriteQuorumActivity>(spec)?)
+            }
+            InstallTargetCurrentConfigurationActivity::NAME => {
+                Self::InstallTargetCurrentConfiguration(decode::<
+                    InstallTargetCurrentConfigurationActivity,
+                >(spec)?)
+            }
+            RestorePreviousCurrentConfigurationActivity::NAME => {
+                Self::RestorePreviousCurrentConfiguration(decode::<
+                    RestorePreviousCurrentConfigurationActivity,
+                >(spec)?)
+            }
+            CompensatePromoteOldPrimaryActivity::NAME => Self::CompensatePromoteOldPrimary(
+                decode::<CompensatePromoteOldPrimaryActivity>(spec)?,
+            ),
+            CompensateDistributeReplicaEpochActivity::NAME => {
+                Self::CompensateDistributeReplicaEpoch(decode::<
+                    CompensateDistributeReplicaEpochActivity,
+                >(spec)?)
+            }
+            InstallCompensationCatchUpConfigurationActivity::NAME => {
+                Self::InstallCompensationCatchUpConfiguration(decode::<
+                    InstallCompensationCatchUpConfigurationActivity,
+                >(spec)?)
+            }
+            InstallCompensationCurrentConfigurationActivity::NAME => {
+                Self::InstallCompensationCurrentConfiguration(decode::<
+                    InstallCompensationCurrentConfigurationActivity,
+                >(spec)?)
+            }
+            PublishTargetPrimaryLabelActivity::NAME => {
+                Self::PublishTargetPrimaryLabel(decode::<PublishTargetPrimaryLabelActivity>(spec)?)
+            }
+            PublishOldPrimarySecondaryLabelActivity::NAME => {
+                Self::PublishOldPrimarySecondaryLabel(decode::<
+                    PublishOldPrimarySecondaryLabelActivity,
+                >(spec)?)
+            }
+            RestoreOldPrimaryLabelActivity::NAME => {
+                Self::RestoreOldPrimaryLabel(decode::<RestoreOldPrimaryLabelActivity>(spec)?)
+            }
+            RestoreTargetSecondaryLabelActivity::NAME => Self::RestoreTargetSecondaryLabel(
+                decode::<RestoreTargetSecondaryLabelActivity>(spec)?,
+            ),
             CaptureFrozenLsnActivity::NAME => {
                 Self::CaptureFrozenLsn(decode::<CaptureFrozenLsnActivity>(spec)?)
             }
@@ -178,8 +166,42 @@ impl DirectActivity {
 
     pub fn spec(&self) -> Result<ActivitySpec, String> {
         match self {
-            Self::Replica { operation, request } => operation.spec(request.clone()),
-            Self::Label { operation, request } => operation.spec(request.clone()),
+            Self::RevokeWrites(input) => spec::<RevokeWritesActivity>(input),
+            Self::DemoteOldPrimary(input) => spec::<DemoteOldPrimaryActivity>(input),
+            Self::PromoteTarget(input) => spec::<PromoteTargetActivity>(input),
+            Self::DistributeReplicaEpoch(input) => spec::<DistributeReplicaEpochActivity>(input),
+            Self::InstallTargetCatchUpConfiguration(input) => {
+                spec::<InstallTargetCatchUpConfigurationActivity>(input)
+            }
+            Self::WaitTargetWriteQuorum(input) => spec::<WaitTargetWriteQuorumActivity>(input),
+            Self::InstallTargetCurrentConfiguration(input) => {
+                spec::<InstallTargetCurrentConfigurationActivity>(input)
+            }
+            Self::RestorePreviousCurrentConfiguration(input) => {
+                spec::<RestorePreviousCurrentConfigurationActivity>(input)
+            }
+            Self::CompensatePromoteOldPrimary(input) => {
+                spec::<CompensatePromoteOldPrimaryActivity>(input)
+            }
+            Self::CompensateDistributeReplicaEpoch(input) => {
+                spec::<CompensateDistributeReplicaEpochActivity>(input)
+            }
+            Self::InstallCompensationCatchUpConfiguration(input) => {
+                spec::<InstallCompensationCatchUpConfigurationActivity>(input)
+            }
+            Self::InstallCompensationCurrentConfiguration(input) => {
+                spec::<InstallCompensationCurrentConfigurationActivity>(input)
+            }
+            Self::PublishTargetPrimaryLabel(input) => {
+                spec::<PublishTargetPrimaryLabelActivity>(input)
+            }
+            Self::PublishOldPrimarySecondaryLabel(input) => {
+                spec::<PublishOldPrimarySecondaryLabelActivity>(input)
+            }
+            Self::RestoreOldPrimaryLabel(input) => spec::<RestoreOldPrimaryLabelActivity>(input),
+            Self::RestoreTargetSecondaryLabel(input) => {
+                spec::<RestoreTargetSecondaryLabelActivity>(input)
+            }
             Self::CaptureFrozenLsn(input) => spec::<CaptureFrozenLsnActivity>(input),
             Self::WaitTargetCaughtUp(input) => spec::<WaitTargetCaughtUpActivity>(input),
             Self::AttestTargetTopology(input) => spec::<AttestTargetTopologyActivity>(input),
@@ -191,8 +213,22 @@ impl DirectActivity {
 
     pub fn deadline_unix_seconds(&self) -> i64 {
         match self {
-            Self::Replica { request, .. } => request.deadline_unix_seconds,
-            Self::Label { request, .. } => request.deadline_unix_seconds,
+            Self::RevokeWrites(input) => input.deadline_unix_seconds,
+            Self::DemoteOldPrimary(input) => input.deadline_unix_seconds,
+            Self::PromoteTarget(input) => input.deadline_unix_seconds,
+            Self::DistributeReplicaEpoch(input) => input.deadline_unix_seconds,
+            Self::InstallTargetCatchUpConfiguration(input) => input.deadline_unix_seconds,
+            Self::WaitTargetWriteQuorum(input) => input.deadline_unix_seconds,
+            Self::InstallTargetCurrentConfiguration(input) => input.deadline_unix_seconds,
+            Self::RestorePreviousCurrentConfiguration(input) => input.deadline_unix_seconds,
+            Self::CompensatePromoteOldPrimary(input) => input.deadline_unix_seconds,
+            Self::CompensateDistributeReplicaEpoch(input) => input.deadline_unix_seconds,
+            Self::InstallCompensationCatchUpConfiguration(input) => input.deadline_unix_seconds,
+            Self::InstallCompensationCurrentConfiguration(input) => input.deadline_unix_seconds,
+            Self::PublishTargetPrimaryLabel(input) => input.deadline_unix_seconds,
+            Self::PublishOldPrimarySecondaryLabel(input) => input.deadline_unix_seconds,
+            Self::RestoreOldPrimaryLabel(input) => input.deadline_unix_seconds,
+            Self::RestoreTargetSecondaryLabel(input) => input.deadline_unix_seconds,
             Self::CaptureFrozenLsn(input) => input.deadline_unix_seconds,
             Self::WaitTargetCaughtUp(input) => input.deadline_unix_seconds,
             Self::AttestTargetTopology(input) => input.deadline_unix_seconds,
@@ -202,21 +238,30 @@ impl DirectActivity {
 
     pub fn logical_predecessor(&self) -> Self {
         let mut predecessor = self.clone();
-        match &mut predecessor {
-            Self::Replica { request, .. } => request.prepared_command = None,
-            Self::Label { request, .. } => request.prepared_command = None,
-            Self::CaptureFrozenLsn(_)
-            | Self::WaitTargetCaughtUp(_)
-            | Self::AttestTargetTopology(_)
-            | Self::AttestCompensatedTopology(_) => {}
-        }
+        predecessor.clear_prepared_command();
         predecessor
     }
 
     pub fn is_logical(&self) -> bool {
         match self {
-            Self::Replica { request, .. } => request.prepared_command.is_none(),
-            Self::Label { request, .. } => request.prepared_command.is_none(),
+            Self::RevokeWrites(_)
+            | Self::DemoteOldPrimary(_)
+            | Self::PromoteTarget(_)
+            | Self::DistributeReplicaEpoch(_)
+            | Self::InstallTargetCatchUpConfiguration(_)
+            | Self::WaitTargetWriteQuorum(_)
+            | Self::InstallTargetCurrentConfiguration(_)
+            | Self::RestorePreviousCurrentConfiguration(_)
+            | Self::CompensatePromoteOldPrimary(_)
+            | Self::CompensateDistributeReplicaEpoch(_)
+            | Self::InstallCompensationCatchUpConfiguration(_)
+            | Self::InstallCompensationCurrentConfiguration(_) => {
+                self.prepared_replica_command().is_none()
+            }
+            Self::PublishTargetPrimaryLabel(_)
+            | Self::PublishOldPrimarySecondaryLabel(_)
+            | Self::RestoreOldPrimaryLabel(_)
+            | Self::RestoreTargetSecondaryLabel(_) => self.prepared_label_command().is_none(),
             Self::CaptureFrozenLsn(_)
             | Self::WaitTargetCaughtUp(_)
             | Self::AttestTargetTopology(_)
@@ -226,17 +271,53 @@ impl DirectActivity {
 
     pub fn validate(&self, definition: &DirectSwitchoverDefinition) -> Result<(), String> {
         match self {
-            Self::Replica { operation, request } => {
-                operation.validate_request(request, definition)?;
-                if request.prepared_command.is_some() {
-                    operation.validate_prepared(request, definition)?;
-                }
+            Self::RevokeWrites(input) => {
+                validate_replica::<RevokeWritesActivity>(input, definition)
             }
-            Self::Label { operation, request } => {
-                operation.validate_request(request, definition)?;
-                if request.prepared_command.is_some() {
-                    operation.validate_prepared(request)?;
-                }
+            Self::DemoteOldPrimary(input) => {
+                validate_replica::<DemoteOldPrimaryActivity>(input, definition)
+            }
+            Self::PromoteTarget(input) => {
+                validate_replica::<PromoteTargetActivity>(input, definition)
+            }
+            Self::DistributeReplicaEpoch(input) => {
+                validate_replica::<DistributeReplicaEpochActivity>(input, definition)
+            }
+            Self::InstallTargetCatchUpConfiguration(input) => {
+                validate_replica::<InstallTargetCatchUpConfigurationActivity>(input, definition)
+            }
+            Self::WaitTargetWriteQuorum(input) => {
+                validate_replica::<WaitTargetWriteQuorumActivity>(input, definition)
+            }
+            Self::InstallTargetCurrentConfiguration(input) => {
+                validate_replica::<InstallTargetCurrentConfigurationActivity>(input, definition)
+            }
+            Self::RestorePreviousCurrentConfiguration(input) => {
+                validate_replica::<RestorePreviousCurrentConfigurationActivity>(input, definition)
+            }
+            Self::CompensatePromoteOldPrimary(input) => {
+                validate_replica::<CompensatePromoteOldPrimaryActivity>(input, definition)
+            }
+            Self::CompensateDistributeReplicaEpoch(input) => {
+                validate_replica::<CompensateDistributeReplicaEpochActivity>(input, definition)
+            }
+            Self::InstallCompensationCatchUpConfiguration(input) => validate_replica::<
+                InstallCompensationCatchUpConfigurationActivity,
+            >(input, definition),
+            Self::InstallCompensationCurrentConfiguration(input) => validate_replica::<
+                InstallCompensationCurrentConfigurationActivity,
+            >(input, definition),
+            Self::PublishTargetPrimaryLabel(input) => {
+                validate_label::<PublishTargetPrimaryLabelActivity>(input, definition)
+            }
+            Self::PublishOldPrimarySecondaryLabel(input) => {
+                validate_label::<PublishOldPrimarySecondaryLabelActivity>(input, definition)
+            }
+            Self::RestoreOldPrimaryLabel(input) => {
+                validate_label::<RestoreOldPrimaryLabelActivity>(input, definition)
+            }
+            Self::RestoreTargetSecondaryLabel(input) => {
+                validate_label::<RestoreTargetSecondaryLabelActivity>(input, definition)
             }
             Self::CaptureFrozenLsn(input) => {
                 validate_common(
@@ -252,6 +333,7 @@ impl DirectActivity {
                 {
                     return Err("capture-frozen-lsn input conflicts with admission".to_string());
                 }
+                Ok(())
             }
             Self::WaitTargetCaughtUp(input) => {
                 validate_common(
@@ -268,6 +350,7 @@ impl DirectActivity {
                 {
                     return Err("wait-target-caught-up input conflicts with admission".to_string());
                 }
+                Ok(())
             }
             Self::AttestTargetTopology(input) => {
                 validate_common(
@@ -279,6 +362,7 @@ impl DirectActivity {
                 if input.expected_snapshot != definition.target_snapshot {
                     return Err("target attestation snapshot conflicts with admission".to_string());
                 }
+                Ok(())
             }
             Self::AttestCompensatedTopology(input) => {
                 validate_common(
@@ -295,9 +379,9 @@ impl DirectActivity {
                         "compensated attestation snapshot conflicts with admission".to_string()
                     );
                 }
+                Ok(())
             }
         }
-        Ok(())
     }
 
     pub fn evaluate(
@@ -308,12 +392,104 @@ impl DirectActivity {
     ) -> Result<DirectEvaluation, String> {
         self.validate(definition)?;
         match self {
-            Self::Replica { operation, request } => {
-                operation.evaluate(request, definition, observations, now)
+            Self::RevokeWrites(input) => {
+                evaluate_replica::<RevokeWritesActivity>(input, definition, observations, now)
             }
-            Self::Label { operation, request } => {
-                operation.evaluate(request, definition, observations, now)
+            Self::DemoteOldPrimary(input) => {
+                evaluate_replica::<DemoteOldPrimaryActivity>(input, definition, observations, now)
             }
+            Self::PromoteTarget(input) => {
+                evaluate_replica::<PromoteTargetActivity>(input, definition, observations, now)
+            }
+            Self::DistributeReplicaEpoch(input) => {
+                evaluate_replica::<DistributeReplicaEpochActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::InstallTargetCatchUpConfiguration(input) => {
+                evaluate_replica::<InstallTargetCatchUpConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::WaitTargetWriteQuorum(input) => {
+                evaluate_replica::<WaitTargetWriteQuorumActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::InstallTargetCurrentConfiguration(input) => {
+                evaluate_replica::<InstallTargetCurrentConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::RestorePreviousCurrentConfiguration(input) => {
+                evaluate_replica::<RestorePreviousCurrentConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::CompensatePromoteOldPrimary(input) => evaluate_replica::<
+                CompensatePromoteOldPrimaryActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::CompensateDistributeReplicaEpoch(input) => evaluate_replica::<
+                CompensateDistributeReplicaEpochActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::InstallCompensationCatchUpConfiguration(input) => {
+                evaluate_replica::<InstallCompensationCatchUpConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::InstallCompensationCurrentConfiguration(input) => {
+                evaluate_replica::<InstallCompensationCurrentConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::PublishTargetPrimaryLabel(input) => evaluate_label::<
+                PublishTargetPrimaryLabelActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::PublishOldPrimarySecondaryLabel(input) => evaluate_label::<
+                PublishOldPrimarySecondaryLabelActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::RestoreOldPrimaryLabel(input) => {
+                evaluate_label::<RestoreOldPrimaryLabelActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::RestoreTargetSecondaryLabel(input) => evaluate_label::<
+                RestoreTargetSecondaryLabelActivity,
+            >(
+                input, definition, observations, now
+            ),
             Self::CaptureFrozenLsn(input) => evaluate_capture(input, observations, now),
             Self::WaitTargetCaughtUp(input) => evaluate_target_catch_up(input, observations, now),
             Self::AttestTargetTopology(input) => {
@@ -361,6 +537,121 @@ impl DirectActivity {
         }
     }
 
+    pub fn evaluate_quarantine(
+        &self,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+        now: i64,
+    ) -> Result<DirectEvaluation, String> {
+        self.validate(definition)?;
+        match self {
+            Self::RevokeWrites(input) => evaluate_quarantined_replica::<RevokeWritesActivity>(
+                input,
+                definition,
+                observations,
+                now,
+            ),
+            Self::DemoteOldPrimary(input) => {
+                evaluate_quarantined_replica::<DemoteOldPrimaryActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::PromoteTarget(input) => evaluate_quarantined_replica::<PromoteTargetActivity>(
+                input,
+                definition,
+                observations,
+                now,
+            ),
+            Self::DistributeReplicaEpoch(input) => evaluate_quarantined_replica::<
+                DistributeReplicaEpochActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::InstallTargetCatchUpConfiguration(input) => {
+                evaluate_quarantined_replica::<InstallTargetCatchUpConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::WaitTargetWriteQuorum(input) => evaluate_quarantined_replica::<
+                WaitTargetWriteQuorumActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::InstallTargetCurrentConfiguration(input) => {
+                evaluate_quarantined_replica::<InstallTargetCurrentConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::RestorePreviousCurrentConfiguration(input) => {
+                evaluate_quarantined_replica::<RestorePreviousCurrentConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::CompensatePromoteOldPrimary(input) => evaluate_quarantined_replica::<
+                CompensatePromoteOldPrimaryActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::CompensateDistributeReplicaEpoch(input) => evaluate_quarantined_replica::<
+                CompensateDistributeReplicaEpochActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::InstallCompensationCatchUpConfiguration(input) => {
+                evaluate_quarantined_replica::<InstallCompensationCatchUpConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::InstallCompensationCurrentConfiguration(input) => {
+                evaluate_quarantined_replica::<InstallCompensationCurrentConfigurationActivity>(
+                    input,
+                    definition,
+                    observations,
+                    now,
+                )
+            }
+            Self::PublishTargetPrimaryLabel(input) => evaluate_quarantined_label::<
+                PublishTargetPrimaryLabelActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::PublishOldPrimarySecondaryLabel(input) => evaluate_quarantined_label::<
+                PublishOldPrimarySecondaryLabelActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::RestoreOldPrimaryLabel(input) => evaluate_quarantined_label::<
+                RestoreOldPrimaryLabelActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::RestoreTargetSecondaryLabel(input) => evaluate_quarantined_label::<
+                RestoreTargetSecondaryLabelActivity,
+            >(
+                input, definition, observations, now
+            ),
+            Self::CaptureFrozenLsn(_)
+            | Self::WaitTargetCaughtUp(_)
+            | Self::AttestTargetTopology(_)
+            | Self::AttestCompensatedTopology(_) => self.evaluate(definition, observations, now),
+        }
+    }
+
     pub fn prepare(
         &self,
         definition: &DirectSwitchoverDefinition,
@@ -376,10 +667,13 @@ impl DirectActivity {
             .map_err(|_| PreparedActivityError::Validation)?
         {
             DirectEvaluation::Observe(_) => Ok(self.clone()),
-            DirectEvaluation::AwaitEvidence => match self {
-                Self::Replica { .. } | Self::Label { .. } => Err(PreparedActivityError::Derivation),
-                _ => Ok(self.clone()),
-            },
+            DirectEvaluation::AwaitEvidence => {
+                if self.is_effect() {
+                    Err(PreparedActivityError::Derivation)
+                } else {
+                    Ok(self.clone())
+                }
+            }
             DirectEvaluation::DispatchReplica { action, pending } => {
                 let observed = observations
                     .get(&pending.target_id)
@@ -391,32 +685,34 @@ impl DirectActivity {
                     prepare_replica_effect_command(&pending, &observed.status, addressed, &action)
                         .map_err(preparation_error)?;
                 let mut prepared = self.clone();
-                let Self::Replica { request, .. } = &mut prepared else {
-                    return Err(PreparedActivityError::Validation);
-                };
-                request.prepared_command = Some(command);
+                prepared
+                    .set_prepared_replica_command(command)
+                    .map_err(|_| PreparedActivityError::Validation)?;
                 prepared
                     .validate(definition)
                     .map_err(|_| PreparedActivityError::Validation)?;
                 Ok(prepared)
             }
             DirectEvaluation::DispatchLabel => {
-                let mut prepared = self.clone();
-                let Self::Label { request, .. } = &mut prepared else {
-                    return Err(PreparedActivityError::Validation);
-                };
+                let request = self
+                    .label_request(definition)
+                    .map_err(|_| PreparedActivityError::Validation)?;
                 let observed = observations
                     .get(&request.target_id)
                     .ok_or(PreparedActivityError::Derivation)?;
                 if observed.status.instance_id.as_str() != request.target_instance_id {
                     return Err(PreparedActivityError::Validation);
                 }
-                request.prepared_command = Some(LabelEffectCommand::new(
+                let command = LabelEffectCommand::new(
                     request.target_id,
                     observed.pod_name.clone(),
-                    request.target_instance_id.clone(),
-                    request.desired_role.clone(),
-                ));
+                    request.target_instance_id.to_string(),
+                    request.desired_role.to_string(),
+                );
+                let mut prepared = self.clone();
+                prepared
+                    .set_prepared_label_command(command)
+                    .map_err(|_| PreparedActivityError::Validation)?;
                 prepared
                     .validate(definition)
                     .map_err(|_| PreparedActivityError::Validation)?;
@@ -429,819 +725,1763 @@ impl DirectActivity {
         &self,
         observation: EffectObservation,
     ) -> Result<ExactBytes, String> {
+        let observation = observation.bounded();
         match self {
-            Self::Replica { operation, .. } => operation.encode_observation(observation),
-            Self::Label { operation, .. } => operation.encode_observation(observation),
-            _ => Err("passive direct activity cannot encode an effect observation".to_string()),
+            Self::RevokeWrites(_) => {
+                encode_replica_observation::<RevokeWritesActivity>(observation)
+            }
+            Self::DemoteOldPrimary(_) => {
+                encode_replica_observation::<DemoteOldPrimaryActivity>(observation)
+            }
+            Self::PromoteTarget(_) => {
+                encode_replica_observation::<PromoteTargetActivity>(observation)
+            }
+            Self::DistributeReplicaEpoch(_) => {
+                encode_replica_observation::<DistributeReplicaEpochActivity>(observation)
+            }
+            Self::InstallTargetCatchUpConfiguration(_) => {
+                encode_replica_observation::<InstallTargetCatchUpConfigurationActivity>(observation)
+            }
+            Self::WaitTargetWriteQuorum(_) => {
+                encode_replica_observation::<WaitTargetWriteQuorumActivity>(observation)
+            }
+            Self::InstallTargetCurrentConfiguration(_) => {
+                encode_replica_observation::<InstallTargetCurrentConfigurationActivity>(observation)
+            }
+            Self::RestorePreviousCurrentConfiguration(_) => encode_replica_observation::<
+                RestorePreviousCurrentConfigurationActivity,
+            >(observation),
+            Self::CompensatePromoteOldPrimary(_) => {
+                encode_replica_observation::<CompensatePromoteOldPrimaryActivity>(observation)
+            }
+            Self::CompensateDistributeReplicaEpoch(_) => {
+                encode_replica_observation::<CompensateDistributeReplicaEpochActivity>(observation)
+            }
+            Self::InstallCompensationCatchUpConfiguration(_) => encode_replica_observation::<
+                InstallCompensationCatchUpConfigurationActivity,
+            >(observation),
+            Self::InstallCompensationCurrentConfiguration(_) => encode_replica_observation::<
+                InstallCompensationCurrentConfigurationActivity,
+            >(observation),
+            Self::PublishTargetPrimaryLabel(_) => {
+                encode_label_observation::<PublishTargetPrimaryLabelActivity>(observation)
+            }
+            Self::PublishOldPrimarySecondaryLabel(_) => {
+                encode_label_observation::<PublishOldPrimarySecondaryLabelActivity>(observation)
+            }
+            Self::RestoreOldPrimaryLabel(_) => {
+                encode_label_observation::<RestoreOldPrimaryLabelActivity>(observation)
+            }
+            Self::RestoreTargetSecondaryLabel(_) => {
+                encode_label_observation::<RestoreTargetSecondaryLabelActivity>(observation)
+            }
+            Self::CaptureFrozenLsn(_)
+            | Self::WaitTargetCaughtUp(_)
+            | Self::AttestTargetTopology(_)
+            | Self::AttestCompensatedTopology(_) => {
+                Err("passive direct activity cannot encode an effect observation".to_string())
+            }
         }
     }
 
     pub fn prepared_replica_command(&self) -> Option<&ReplicaEffectCommand> {
         match self {
-            Self::Replica { request, .. } => request.prepared_command.as_ref(),
+            Self::RevokeWrites(input) => RevokeWritesActivity::prepared_command(input),
+            Self::DemoteOldPrimary(input) => DemoteOldPrimaryActivity::prepared_command(input),
+            Self::PromoteTarget(input) => PromoteTargetActivity::prepared_command(input),
+            Self::DistributeReplicaEpoch(input) => {
+                DistributeReplicaEpochActivity::prepared_command(input)
+            }
+            Self::InstallTargetCatchUpConfiguration(input) => {
+                InstallTargetCatchUpConfigurationActivity::prepared_command(input)
+            }
+            Self::WaitTargetWriteQuorum(input) => {
+                WaitTargetWriteQuorumActivity::prepared_command(input)
+            }
+            Self::InstallTargetCurrentConfiguration(input) => {
+                InstallTargetCurrentConfigurationActivity::prepared_command(input)
+            }
+            Self::RestorePreviousCurrentConfiguration(input) => {
+                RestorePreviousCurrentConfigurationActivity::prepared_command(input)
+            }
+            Self::CompensatePromoteOldPrimary(input) => {
+                CompensatePromoteOldPrimaryActivity::prepared_command(input)
+            }
+            Self::CompensateDistributeReplicaEpoch(input) => {
+                CompensateDistributeReplicaEpochActivity::prepared_command(input)
+            }
+            Self::InstallCompensationCatchUpConfiguration(input) => {
+                InstallCompensationCatchUpConfigurationActivity::prepared_command(input)
+            }
+            Self::InstallCompensationCurrentConfiguration(input) => {
+                InstallCompensationCurrentConfigurationActivity::prepared_command(input)
+            }
             _ => None,
         }
     }
 
     pub fn prepared_label_command(&self) -> Option<&LabelEffectCommand> {
         match self {
-            Self::Label { request, .. } => request.prepared_command.as_ref(),
+            Self::PublishTargetPrimaryLabel(input) => {
+                PublishTargetPrimaryLabelActivity::prepared_command(input)
+            }
+            Self::PublishOldPrimarySecondaryLabel(input) => {
+                PublishOldPrimarySecondaryLabelActivity::prepared_command(input)
+            }
+            Self::RestoreOldPrimaryLabel(input) => {
+                RestoreOldPrimaryLabelActivity::prepared_command(input)
+            }
+            Self::RestoreTargetSecondaryLabel(input) => {
+                RestoreTargetSecondaryLabelActivity::prepared_command(input)
+            }
             _ => None,
         }
     }
-}
 
-impl DirectReplicaOperation {
-    fn spec(self, request: ReplicaOperationRequest) -> Result<ActivitySpec, String> {
+    fn is_effect(&self) -> bool {
+        !matches!(
+            self,
+            Self::CaptureFrozenLsn(_)
+                | Self::WaitTargetCaughtUp(_)
+                | Self::AttestTargetTopology(_)
+                | Self::AttestCompensatedTopology(_)
+        )
+    }
+
+    fn clear_prepared_command(&mut self) {
         match self {
-            Self::RevokeWrites => replica_spec::<RevokeWritesActivity>(request),
-            Self::DemoteOldPrimary => replica_spec::<DemoteOldPrimaryActivity>(request),
-            Self::PromoteTarget => replica_spec::<PromoteTargetActivity>(request),
-            Self::DistributeReplicaEpoch => replica_spec::<DistributeReplicaEpochActivity>(request),
-            Self::InstallTargetCatchUpConfiguration => {
-                replica_spec::<InstallTargetCatchUpConfigurationActivity>(request)
+            Self::RevokeWrites(input) => *RevokeWritesActivity::prepared_command_mut(input) = None,
+            Self::DemoteOldPrimary(input) => {
+                *DemoteOldPrimaryActivity::prepared_command_mut(input) = None
             }
-            Self::WaitTargetWriteQuorum => replica_spec::<WaitTargetWriteQuorumActivity>(request),
-            Self::InstallTargetCurrentConfiguration => {
-                replica_spec::<InstallTargetCurrentConfigurationActivity>(request)
+            Self::PromoteTarget(input) => {
+                *PromoteTargetActivity::prepared_command_mut(input) = None
             }
-            Self::RestorePreviousCurrentConfiguration => {
-                replica_spec::<RestorePreviousCurrentConfigurationActivity>(request)
+            Self::DistributeReplicaEpoch(input) => {
+                *DistributeReplicaEpochActivity::prepared_command_mut(input) = None
             }
-            Self::CompensatePromoteOldPrimary => {
-                replica_spec::<CompensatePromoteOldPrimaryActivity>(request)
+            Self::InstallTargetCatchUpConfiguration(input) => {
+                *InstallTargetCatchUpConfigurationActivity::prepared_command_mut(input) = None
             }
-            Self::CompensateDistributeReplicaEpoch => {
-                replica_spec::<CompensateDistributeReplicaEpochActivity>(request)
+            Self::WaitTargetWriteQuorum(input) => {
+                *WaitTargetWriteQuorumActivity::prepared_command_mut(input) = None
             }
-            Self::InstallCompensationCatchUpConfiguration => {
-                replica_spec::<InstallCompensationCatchUpConfigurationActivity>(request)
+            Self::InstallTargetCurrentConfiguration(input) => {
+                *InstallTargetCurrentConfigurationActivity::prepared_command_mut(input) = None
             }
-            Self::InstallCompensationCurrentConfiguration => {
-                replica_spec::<InstallCompensationCurrentConfigurationActivity>(request)
+            Self::RestorePreviousCurrentConfiguration(input) => {
+                *RestorePreviousCurrentConfigurationActivity::prepared_command_mut(input) = None
             }
+            Self::CompensatePromoteOldPrimary(input) => {
+                *CompensatePromoteOldPrimaryActivity::prepared_command_mut(input) = None
+            }
+            Self::CompensateDistributeReplicaEpoch(input) => {
+                *CompensateDistributeReplicaEpochActivity::prepared_command_mut(input) = None
+            }
+            Self::InstallCompensationCatchUpConfiguration(input) => {
+                *InstallCompensationCatchUpConfigurationActivity::prepared_command_mut(input) = None
+            }
+            Self::InstallCompensationCurrentConfiguration(input) => {
+                *InstallCompensationCurrentConfigurationActivity::prepared_command_mut(input) = None
+            }
+            Self::PublishTargetPrimaryLabel(input) => {
+                *PublishTargetPrimaryLabelActivity::prepared_command_mut(input) = None
+            }
+            Self::PublishOldPrimarySecondaryLabel(input) => {
+                *PublishOldPrimarySecondaryLabelActivity::prepared_command_mut(input) = None
+            }
+            Self::RestoreOldPrimaryLabel(input) => {
+                *RestoreOldPrimaryLabelActivity::prepared_command_mut(input) = None
+            }
+            Self::RestoreTargetSecondaryLabel(input) => {
+                *RestoreTargetSecondaryLabelActivity::prepared_command_mut(input) = None
+            }
+            Self::CaptureFrozenLsn(_)
+            | Self::WaitTargetCaughtUp(_)
+            | Self::AttestTargetTopology(_)
+            | Self::AttestCompensatedTopology(_) => {}
         }
     }
 
-    fn validate_request(
-        self,
-        request: &ReplicaOperationRequest,
-        definition: &DirectSwitchoverDefinition,
+    fn set_prepared_replica_command(
+        &mut self,
+        command: ReplicaEffectCommand,
     ) -> Result<(), String> {
-        validate_common(
-            request.contract_version,
-            &request.execution_id,
-            request.deadline_unix_seconds,
-            definition,
-        )?;
-        if request.redelivery > 1
-            || request.action_id != format!("{}:{}", definition.execution_id, request.sequence)
-        {
-            return Err(
-                "direct replica request has invalid redelivery or action identity".to_string(),
-            );
-        }
-        let (sequence, target_id, expected_epoch, desired_snapshot) =
-            self.expected_request(definition, request.sequence)?;
-        let member = definition.member(target_id)?;
-        if request.sequence != sequence
-            || request.target_id != target_id
-            || request.target_instance_id != member.instance_id
-            || request.expected_epoch != expected_epoch
-            || request.desired_snapshot != desired_snapshot
-        {
-            return Err("direct replica request conflicts with operation semantics".to_string());
+        match self {
+            Self::RevokeWrites(input) => {
+                *RevokeWritesActivity::prepared_command_mut(input) = Some(command)
+            }
+            Self::DemoteOldPrimary(input) => {
+                *DemoteOldPrimaryActivity::prepared_command_mut(input) = Some(command)
+            }
+            Self::PromoteTarget(input) => {
+                *PromoteTargetActivity::prepared_command_mut(input) = Some(command)
+            }
+            Self::DistributeReplicaEpoch(input) => {
+                *DistributeReplicaEpochActivity::prepared_command_mut(input) = Some(command)
+            }
+            Self::InstallTargetCatchUpConfiguration(input) => {
+                *InstallTargetCatchUpConfigurationActivity::prepared_command_mut(input) =
+                    Some(command)
+            }
+            Self::WaitTargetWriteQuorum(input) => {
+                *WaitTargetWriteQuorumActivity::prepared_command_mut(input) = Some(command)
+            }
+            Self::InstallTargetCurrentConfiguration(input) => {
+                *InstallTargetCurrentConfigurationActivity::prepared_command_mut(input) =
+                    Some(command)
+            }
+            Self::RestorePreviousCurrentConfiguration(input) => {
+                *RestorePreviousCurrentConfigurationActivity::prepared_command_mut(input) =
+                    Some(command)
+            }
+            Self::CompensatePromoteOldPrimary(input) => {
+                *CompensatePromoteOldPrimaryActivity::prepared_command_mut(input) = Some(command)
+            }
+            Self::CompensateDistributeReplicaEpoch(input) => {
+                *CompensateDistributeReplicaEpochActivity::prepared_command_mut(input) =
+                    Some(command)
+            }
+            Self::InstallCompensationCatchUpConfiguration(input) => {
+                *InstallCompensationCatchUpConfigurationActivity::prepared_command_mut(input) =
+                    Some(command)
+            }
+            Self::InstallCompensationCurrentConfiguration(input) => {
+                *InstallCompensationCurrentConfigurationActivity::prepared_command_mut(input) =
+                    Some(command)
+            }
+            _ => return Err("direct activity is not a replica effect".to_string()),
         }
         Ok(())
     }
 
-    fn expected_request(
-        self,
-        definition: &DirectSwitchoverDefinition,
-        actual_sequence: u32,
-    ) -> Result<(u32, i64, EpochStatus, StablePartitionSnapshotStatus), String> {
-        let previous = definition.previous_snapshot.clone();
-        let target = definition.target_snapshot.clone();
-        let compensation = definition.compensation_snapshot();
-        Ok(match self {
-            Self::RevokeWrites => (
-                1,
-                definition.old_primary_id,
-                previous.epoch.clone(),
-                previous,
-            ),
-            Self::DemoteOldPrimary => (2, definition.old_primary_id, target.epoch.clone(), target),
-            Self::PromoteTarget => (
-                3,
-                definition.target_primary_id,
-                previous.epoch.clone(),
-                target,
-            ),
-            Self::DistributeReplicaEpoch => {
-                let index = actual_sequence
-                    .checked_sub(100)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| "normal epoch sequence is invalid".to_string())?;
-                let target_id = *definition
-                    .normal_epoch_distribution_ids()
-                    .get(index)
-                    .ok_or_else(|| "normal epoch sequence is outside membership".to_string())?;
-                (actual_sequence, target_id, target.epoch.clone(), target)
-            }
-            Self::InstallTargetCatchUpConfiguration => (
-                1000,
-                definition.target_primary_id,
-                target.epoch.clone(),
-                target,
-            ),
-            Self::WaitTargetWriteQuorum => (
-                1001,
-                definition.target_primary_id,
-                target.epoch.clone(),
-                target,
-            ),
-            Self::InstallTargetCurrentConfiguration => (
-                1002,
-                definition.target_primary_id,
-                target.epoch.clone(),
-                target,
-            ),
-            Self::RestorePreviousCurrentConfiguration => (
-                1500,
-                definition.old_primary_id,
-                previous.epoch.clone(),
-                previous,
-            ),
-            Self::CompensatePromoteOldPrimary => (
-                2000,
-                definition.old_primary_id,
-                target.epoch.clone(),
-                compensation,
-            ),
-            Self::CompensateDistributeReplicaEpoch => {
-                let index = actual_sequence
-                    .checked_sub(2100)
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| "compensation epoch sequence is invalid".to_string())?;
-                let target_id = *definition
-                    .compensation_epoch_distribution_ids()
-                    .get(index)
-                    .ok_or_else(|| {
-                        "compensation epoch sequence is outside membership".to_string()
-                    })?;
-                (
-                    actual_sequence,
-                    target_id,
-                    target.epoch.clone(),
-                    compensation,
-                )
-            }
-            Self::InstallCompensationCatchUpConfiguration => (
-                2001,
-                definition.old_primary_id,
-                target.epoch.clone(),
-                compensation,
-            ),
-            Self::InstallCompensationCurrentConfiguration => (
-                2002,
-                definition.old_primary_id,
-                target.epoch.clone(),
-                compensation,
-            ),
-        })
-    }
-
-    fn action_kind(self) -> DurableActionKind {
+    fn set_prepared_label_command(&mut self, command: LabelEffectCommand) -> Result<(), String> {
         match self {
-            Self::RevokeWrites => DurableActionKind::RevokeWrite,
-            Self::DemoteOldPrimary => DurableActionKind::DemoteOldPrimary,
-            Self::PromoteTarget => DurableActionKind::PromoteTarget,
-            Self::DistributeReplicaEpoch => DurableActionKind::UpdateSecondaryEpoch,
-            Self::InstallTargetCatchUpConfiguration => {
-                DurableActionKind::UpdateCatchUpConfiguration
+            Self::PublishTargetPrimaryLabel(input) => {
+                *PublishTargetPrimaryLabelActivity::prepared_command_mut(input) = Some(command)
             }
-            Self::WaitTargetWriteQuorum => DurableActionKind::WaitForCatchUpQuorum,
-            Self::InstallTargetCurrentConfiguration => {
-                DurableActionKind::UpdateCurrentConfiguration
+            Self::PublishOldPrimarySecondaryLabel(input) => {
+                *PublishOldPrimarySecondaryLabelActivity::prepared_command_mut(input) =
+                    Some(command)
             }
-            Self::RestorePreviousCurrentConfiguration => {
-                DurableActionKind::RestorePreviousConfiguration
+            Self::RestoreOldPrimaryLabel(input) => {
+                *RestoreOldPrimaryLabelActivity::prepared_command_mut(input) = Some(command)
             }
-            Self::CompensatePromoteOldPrimary => DurableActionKind::CompensatePromoteOldPrimary,
-            Self::CompensateDistributeReplicaEpoch => {
-                DurableActionKind::CompensateUpdateSecondaryEpoch
+            Self::RestoreTargetSecondaryLabel(input) => {
+                *RestoreTargetSecondaryLabelActivity::prepared_command_mut(input) = Some(command)
             }
-            Self::InstallCompensationCatchUpConfiguration => {
-                DurableActionKind::CompensateCatchUpConfiguration
-            }
-            Self::InstallCompensationCurrentConfiguration => {
-                DurableActionKind::CompensateCurrentConfiguration
-            }
+            _ => return Err("direct activity is not a label effect".to_string()),
         }
+        Ok(())
     }
 
-    fn postcondition(self) -> DurablePostconditionStatus {
-        let (kind, role) = match self {
-            Self::RevokeWrites => (DurablePostconditionKind::WriteRevoked, None),
-            Self::DemoteOldPrimary => (
-                DurablePostconditionKind::Role,
-                Some(StableReplicaRoleStatus::ActiveSecondary),
-            ),
-            Self::PromoteTarget | Self::CompensatePromoteOldPrimary => (
-                DurablePostconditionKind::Role,
-                Some(StableReplicaRoleStatus::Primary),
-            ),
-            Self::DistributeReplicaEpoch | Self::CompensateDistributeReplicaEpoch => (
-                DurablePostconditionKind::Epoch,
-                Some(StableReplicaRoleStatus::ActiveSecondary),
-            ),
-            Self::InstallTargetCatchUpConfiguration
-            | Self::InstallCompensationCatchUpConfiguration => {
-                (DurablePostconditionKind::CatchUpConfiguration, None)
+    fn label_request<'a>(
+        &'a self,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<LabelRequest<'a>, String> {
+        match self {
+            Self::PublishTargetPrimaryLabel(input) => {
+                PublishTargetPrimaryLabelActivity::request(input, definition)
             }
-            Self::WaitTargetWriteQuorum => (DurablePostconditionKind::CatchUpQuorum, None),
-            Self::InstallTargetCurrentConfiguration
-            | Self::RestorePreviousCurrentConfiguration
-            | Self::InstallCompensationCurrentConfiguration => {
-                (DurablePostconditionKind::CurrentConfiguration, None)
+            Self::PublishOldPrimarySecondaryLabel(input) => {
+                PublishOldPrimarySecondaryLabelActivity::request(input, definition)
             }
-        };
-        DurablePostconditionStatus { kind, role }
-    }
-
-    fn pending(self, request: &ReplicaOperationRequest) -> PendingActionStatus {
-        let mut pending = PendingActionStatus {
-            action_id: request.action_id.clone(),
-            sequence: request.sequence,
-            kind: self.action_kind(),
-            target_id: request.target_id,
-            target_instance_id: request.target_instance_id.clone(),
-            expected_epoch: request.expected_epoch.clone(),
-            desired_postcondition: self.postcondition(),
-            attempts: u32::from(request.redelivery),
-            deadline_unix_seconds: request.deadline_unix_seconds,
-            last_error: None,
-            dispatch_authorized: request.prepared_command.is_some(),
-            dispatch_agent_generation: None,
-            dispatch_agent_control_version: None,
-            dispatch_observed_runtime_epoch: None,
-            dispatch_action_payload: String::new(),
-        };
-        if let Some(command) = request.prepared_command.as_ref() {
-            pending.dispatch_agent_generation = Some(command.expected_agent_generation.clone());
-            pending.dispatch_agent_control_version = Some(command.expected_control_version);
-            pending.dispatch_observed_runtime_epoch = Some(command.observed_runtime_epoch.clone());
-            pending.dispatch_action_payload = command.action_payload.clone();
+            Self::RestoreOldPrimaryLabel(input) => {
+                RestoreOldPrimaryLabelActivity::request(input, definition)
+            }
+            Self::RestoreTargetSecondaryLabel(input) => {
+                RestoreTargetSecondaryLabelActivity::request(input, definition)
+            }
+            _ => Err("direct activity is not a label effect".to_string()),
         }
-        pending
+    }
+}
+
+struct ReplicaRequest<'a> {
+    contract_version: u32,
+    execution_id: &'a str,
+    sequence: u32,
+    target_id: i64,
+    target_instance_id: &'a str,
+    expected_epoch: EpochStatus,
+    desired_snapshot: StablePartitionSnapshotStatus,
+    deadline_unix_seconds: i64,
+    redelivery: u8,
+    prepared_command: Option<&'a ReplicaEffectCommand>,
+}
+
+trait ReplicaOperation: ReplicaDirectActivity {
+    fn request<'a>(
+        input: &'a Self::Input,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String>;
+
+    fn action(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String>;
+
+    fn status_relation(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation;
+
+    fn action_kind() -> DurableActionKind;
+
+    fn postcondition() -> DurablePostconditionStatus;
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        desired_snapshot: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fixed_replica_request<'a>(
+    contract_version: u32,
+    execution_id: &'a str,
+    sequence: u32,
+    target_id: i64,
+    target_instance_id: &'a str,
+    expected_epoch: EpochStatus,
+    desired_snapshot: StablePartitionSnapshotStatus,
+    deadline_unix_seconds: i64,
+    redelivery: u8,
+    prepared_command: Option<&'a ReplicaEffectCommand>,
+) -> ReplicaRequest<'a> {
+    ReplicaRequest {
+        contract_version,
+        execution_id,
+        sequence,
+        target_id,
+        target_instance_id,
+        expected_epoch,
+        desired_snapshot,
+        deadline_unix_seconds,
+        redelivery,
+        prepared_command,
+    }
+}
+
+fn validate_target(
+    actual_id: i64,
+    actual_instance_id: &str,
+    expected_id: i64,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<(), String> {
+    let expected = definition.member(expected_id)?;
+    if actual_id != expected_id || actual_instance_id != expected.instance_id {
+        return Err("direct activity target conflicts with admission".to_string());
+    }
+    Ok(())
+}
+
+impl ReplicaOperation for RevokeWritesActivity {
+    fn request<'a>(
+        input: &'a RevokeWritesInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        validate_target(
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.old_primary_id,
+            definition,
+        )?;
+        Ok(fixed_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            1,
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.previous_snapshot.epoch.clone(),
+            definition.previous_snapshot.clone(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+        ))
     }
 
     fn action(
-        self,
-        request: &ReplicaOperationRequest,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
+        _: &ReplicaRequest<'_>,
+        _: &DirectSwitchoverDefinition,
+        _: &OperationObservations,
     ) -> Result<DurableReplicaAction, String> {
-        let target_epoch = epoch(&definition.target_snapshot.epoch);
-        Ok(match self {
-            Self::RevokeWrites => DurableReplicaAction::RevokeWriteStatus,
-            Self::DemoteOldPrimary => DurableReplicaAction::ChangeRole {
-                epoch: target_epoch,
-                role: Role::ActiveSecondary,
-            },
-            Self::PromoteTarget | Self::CompensatePromoteOldPrimary => {
-                DurableReplicaAction::ChangeRole {
-                    epoch: target_epoch,
-                    role: Role::Primary,
-                }
-            }
-            Self::DistributeReplicaEpoch | Self::CompensateDistributeReplicaEpoch => {
-                DurableReplicaAction::UpdateEpoch {
-                    epoch: target_epoch,
-                }
-            }
-            Self::InstallTargetCatchUpConfiguration => {
-                DurableReplicaAction::UpdateCatchUpConfiguration {
-                    current: config_for_snapshot(&request.desired_snapshot, observations)?,
-                    previous: config_for_snapshot(&definition.previous_snapshot, observations)?,
-                }
-            }
-            Self::WaitTargetWriteQuorum => DurableReplicaAction::WaitForCatchUpQuorum {
-                mode: ReplicaSetQuorumMode::Write,
-            },
-            Self::InstallTargetCurrentConfiguration
-            | Self::RestorePreviousCurrentConfiguration
-            | Self::InstallCompensationCurrentConfiguration => {
-                DurableReplicaAction::UpdateCurrentConfiguration {
-                    current: config_for_snapshot(&request.desired_snapshot, observations)?,
-                }
-            }
-            Self::InstallCompensationCatchUpConfiguration => {
-                DurableReplicaAction::UpdateCatchUpConfiguration {
-                    current: config_for_snapshot(&request.desired_snapshot, observations)?,
-                    previous: config_for_snapshot(&definition.previous_snapshot, observations)?,
-                }
-            }
+        Ok(DurableReplicaAction::RevokeWriteStatus)
+    }
+
+    fn status_relation(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        let previous_epoch = epoch(&definition.previous_snapshot.epoch);
+        if status.role == Role::Primary
+            && status.epoch == previous_epoch
+            && status.write_status == AccessStatus::ReconfigurationPending
+        {
+            StatusRelation::Postcondition
+        } else if status.role == Role::Primary
+            && status.epoch == previous_epoch
+            && status.write_status == AccessStatus::Granted
+        {
+            StatusRelation::Precondition
+        } else {
+            StatusRelation::conflicting("revoke-writes pre/postcondition is not exact")
+        }
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::RevokeWrite
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(DurablePostconditionKind::WriteRevoked, None)
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        _: &StablePartitionSnapshotStatus,
+        _: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(action, DurableReplicaAction::RevokeWriteStatus)
+    }
+}
+
+impl ReplicaOperation for DemoteOldPrimaryActivity {
+    fn request<'a>(
+        input: &'a DemoteOldPrimaryInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        validate_target(
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.old_primary_id,
+            definition,
+        )?;
+        Ok(fixed_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            2,
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.target_snapshot.epoch.clone(),
+            definition.target_snapshot.clone(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+        ))
+    }
+
+    fn action(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        _: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::ChangeRole {
+            epoch: epoch(&definition.target_snapshot.epoch),
+            role: Role::ActiveSecondary,
         })
     }
 
-    fn evaluate(
-        self,
-        request: &ReplicaOperationRequest,
+    fn status_relation(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        if status.role == Role::ActiveSecondary
+            && status.epoch == epoch(&definition.target_snapshot.epoch)
+        {
+            StatusRelation::Postcondition
+        } else if status.role == Role::Primary
+            && status.epoch == epoch(&definition.previous_snapshot.epoch)
+            && status.write_status == AccessStatus::ReconfigurationPending
+        {
+            StatusRelation::Precondition
+        } else {
+            StatusRelation::conflicting("demote-old-primary pre/postcondition is not exact")
+        }
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::DemoteOldPrimary
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(
+            DurablePostconditionKind::Role,
+            Some(StableReplicaRoleStatus::ActiveSecondary),
+        )
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        _: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::ChangeRole {
+                epoch: value,
+                role: Role::ActiveSecondary,
+            } if *value == epoch(&definition.target_snapshot.epoch)
+        )
+    }
+}
+
+impl ReplicaOperation for PromoteTargetActivity {
+    fn request<'a>(
+        input: &'a PromoteTargetInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        validate_target(
+            input.target_primary_id,
+            &input.target_primary_instance_id,
+            definition.target_primary_id,
+            definition,
+        )?;
+        Ok(fixed_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            3,
+            input.target_primary_id,
+            &input.target_primary_instance_id,
+            definition.previous_snapshot.epoch.clone(),
+            definition.target_snapshot.clone(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+        ))
+    }
+
+    fn action(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        _: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::ChangeRole {
+            epoch: epoch(&definition.target_snapshot.epoch),
+            role: Role::Primary,
+        })
+    }
+
+    fn status_relation(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        if status.role == Role::Primary && status.epoch == epoch(&definition.target_snapshot.epoch)
+        {
+            StatusRelation::Postcondition
+        } else if status.role == Role::ActiveSecondary
+            && status.epoch == epoch(&definition.previous_snapshot.epoch)
+        {
+            StatusRelation::Precondition
+        } else {
+            StatusRelation::conflicting("promote-target pre/postcondition is not exact")
+        }
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::PromoteTarget
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(
+            DurablePostconditionKind::Role,
+            Some(StableReplicaRoleStatus::Primary),
+        )
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        _: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::ChangeRole {
+                epoch: value,
+                role: Role::Primary,
+            } if *value == epoch(&definition.target_snapshot.epoch)
+        )
+    }
+}
+
+impl ReplicaOperation for DistributeReplicaEpochActivity {
+    fn request<'a>(
+        input: &'a DistributeReplicaEpochInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        let index = usize::from(input.distribution_index);
+        let target_id = *definition
+            .normal_epoch_distribution_ids()
+            .get(index)
+            .ok_or_else(|| "normal epoch distribution index is outside membership".to_string())?;
+        validate_target(
+            input.replica_id,
+            &input.replica_instance_id,
+            target_id,
+            definition,
+        )?;
+        Ok(fixed_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            100 + u32::from(input.distribution_index),
+            input.replica_id,
+            &input.replica_instance_id,
+            definition.target_snapshot.epoch.clone(),
+            definition.target_snapshot.clone(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+        ))
+    }
+
+    fn action(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        _: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::UpdateEpoch {
+            epoch: epoch(&definition.target_snapshot.epoch),
+        })
+    }
+
+    fn status_relation(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        epoch_distribution_relation(status, definition)
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::UpdateSecondaryEpoch
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(
+            DurablePostconditionKind::Epoch,
+            Some(StableReplicaRoleStatus::ActiveSecondary),
+        )
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        _: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::UpdateEpoch { epoch: value }
+                if *value == epoch(&definition.target_snapshot.epoch)
+        )
+    }
+}
+
+impl ReplicaOperation for InstallTargetCatchUpConfigurationActivity {
+    fn request<'a>(
+        input: &'a InstallTargetCatchUpConfigurationInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        target_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            1000,
+            input.target_primary_id,
+            &input.target_primary_instance_id,
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+            definition,
+        )
+    }
+
+    fn action(
+        request: &ReplicaRequest<'_>,
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
-        now: i64,
-    ) -> Result<DirectEvaluation, String> {
-        let Some(observed) = observations.get(&request.target_id) else {
-            return deadline_or_wait(request.deadline_unix_seconds, now, || {
-                self.encode_observation(EffectObservation::UnavailableAtDeadline {
-                    observed_at_unix_seconds: now,
-                    message: format!(
-                        "direct switchover replica {} is unavailable at deadline",
-                        request.target_id
-                    ),
-                })
-            });
-        };
-        if observed.status.instance_id.as_str() != request.target_instance_id {
-            return self
-                .encode_observation(EffectObservation::Conflicting {
-                    observed_at_unix_seconds: now,
-                    message: format!(
-                        "direct switchover replica {} incarnation changed",
-                        request.target_id
-                    ),
-                })
-                .map(DirectEvaluation::Observe);
-        }
-        if let Some(recorded) = correlated_action_observation(&observed.status, &request.action_id)
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::UpdateCatchUpConfiguration {
+            current: config_for_snapshot(&request.desired_snapshot, observations)?,
+            previous: config_for_snapshot(&definition.previous_snapshot, observations)?,
+        })
+    }
+
+    fn status_relation(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        configuration_relation(
+            status,
+            &configuration_status(ReplicaConfigurationMode::CatchUp, &request.desired_snapshot),
+            None,
+            true,
+            epoch(&definition.target_snapshot.epoch),
+        )
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::UpdateCatchUpConfiguration
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(DurablePostconditionKind::CatchUpConfiguration, None)
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        desired_snapshot: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::UpdateCatchUpConfiguration { current, previous }
+                if config_matches_snapshot(current, desired_snapshot)
+                    && config_matches_snapshot(previous, &definition.previous_snapshot)
+        )
+    }
+}
+
+impl ReplicaOperation for WaitTargetWriteQuorumActivity {
+    fn request<'a>(
+        input: &'a WaitTargetWriteQuorumInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        target_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            1001,
+            input.target_primary_id,
+            &input.target_primary_instance_id,
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+            definition,
+        )
+    }
+
+    fn action(
+        _: &ReplicaRequest<'_>,
+        _: &DirectSwitchoverDefinition,
+        _: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::WaitForCatchUpQuorum {
+            mode: ReplicaSetQuorumMode::Write,
+        })
+    }
+
+    fn status_relation(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        if status.role == Role::Primary && status.epoch == epoch(&definition.target_snapshot.epoch)
         {
-            let action = match self.action(request, definition, observations) {
-                Ok(action) => action,
-                Err(error) => {
-                    return deadline_or_wait(request.deadline_unix_seconds, now, || {
-                        self.encode_observation(EffectObservation::DeadlineExceeded {
-                            observed_at_unix_seconds: now,
-                            message: error,
-                        })
-                    });
-                }
-            };
-            if recorded.signature != action.signature() {
-                return self
-                    .encode_observation(EffectObservation::Conflicting {
+            StatusRelation::Precondition
+        } else {
+            StatusRelation::conflicting("write-quorum wait target is not exact primary")
+        }
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::WaitForCatchUpQuorum
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(DurablePostconditionKind::CatchUpQuorum, None)
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        _: &StablePartitionSnapshotStatus,
+        _: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::WaitForCatchUpQuorum {
+                mode: ReplicaSetQuorumMode::Write,
+            }
+        )
+    }
+}
+
+impl ReplicaOperation for InstallTargetCurrentConfigurationActivity {
+    fn request<'a>(
+        input: &'a InstallTargetCurrentConfigurationInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        target_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            1002,
+            input.target_primary_id,
+            &input.target_primary_instance_id,
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+            definition,
+        )
+    }
+
+    fn action(
+        request: &ReplicaRequest<'_>,
+        _: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::UpdateCurrentConfiguration {
+            current: config_for_snapshot(&request.desired_snapshot, observations)?,
+        })
+    }
+
+    fn status_relation(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        let catch_up =
+            configuration_status(ReplicaConfigurationMode::CatchUp, &request.desired_snapshot);
+        configuration_relation(
+            status,
+            &configuration_status(ReplicaConfigurationMode::Current, &request.desired_snapshot),
+            Some(&catch_up),
+            false,
+            epoch(&definition.target_snapshot.epoch),
+        )
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::UpdateCurrentConfiguration
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(DurablePostconditionKind::CurrentConfiguration, None)
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        desired_snapshot: &StablePartitionSnapshotStatus,
+        _: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::UpdateCurrentConfiguration { current }
+                if config_matches_snapshot(current, desired_snapshot)
+        )
+    }
+}
+
+impl ReplicaOperation for RestorePreviousCurrentConfigurationActivity {
+    fn request<'a>(
+        input: &'a RestorePreviousCurrentConfigurationInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        old_primary_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            1500,
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.previous_snapshot.epoch.clone(),
+            definition.previous_snapshot.clone(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+            definition,
+        )
+    }
+
+    fn action(
+        request: &ReplicaRequest<'_>,
+        _: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::UpdateCurrentConfiguration {
+            current: config_for_snapshot(&request.desired_snapshot, observations)?,
+        })
+    }
+
+    fn status_relation(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        let desired_current =
+            configuration_status(ReplicaConfigurationMode::Current, &request.desired_snapshot);
+        if status.role != Role::Primary
+            || status.epoch != epoch(&definition.previous_snapshot.epoch)
+        {
+            StatusRelation::conflicting(
+                "previous-configuration restore target is not exact primary",
+            )
+        } else if status.configuration.as_ref() == Some(&desired_current)
+            && status.write_status == AccessStatus::Granted
+        {
+            StatusRelation::Postcondition
+        } else if status.configuration.as_ref() == Some(&desired_current)
+            && status.write_status == AccessStatus::ReconfigurationPending
+        {
+            StatusRelation::Precondition
+        } else {
+            StatusRelation::conflicting(
+                "previous-configuration restore pre/postcondition is not exact",
+            )
+        }
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::RestorePreviousConfiguration
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(DurablePostconditionKind::CurrentConfiguration, None)
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        desired_snapshot: &StablePartitionSnapshotStatus,
+        _: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::UpdateCurrentConfiguration { current }
+                if config_matches_snapshot(current, desired_snapshot)
+        )
+    }
+}
+
+impl ReplicaOperation for CompensatePromoteOldPrimaryActivity {
+    fn request<'a>(
+        input: &'a CompensatePromoteOldPrimaryInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        old_primary_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            2000,
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.target_snapshot.epoch.clone(),
+            definition.compensation_snapshot(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+            definition,
+        )
+    }
+
+    fn action(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        _: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::ChangeRole {
+            epoch: epoch(&definition.target_snapshot.epoch),
+            role: Role::Primary,
+        })
+    }
+
+    fn status_relation(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        if status.role == Role::Primary && status.epoch == epoch(&definition.target_snapshot.epoch)
+        {
+            StatusRelation::Postcondition
+        } else if status.role == Role::ActiveSecondary
+            && status.epoch == epoch(&definition.target_snapshot.epoch)
+        {
+            StatusRelation::Precondition
+        } else {
+            StatusRelation::conflicting("compensating promotion pre/postcondition is not exact")
+        }
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::CompensatePromoteOldPrimary
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(
+            DurablePostconditionKind::Role,
+            Some(StableReplicaRoleStatus::Primary),
+        )
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        _: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::ChangeRole {
+                epoch: value,
+                role: Role::Primary,
+            } if *value == epoch(&definition.target_snapshot.epoch)
+        )
+    }
+}
+
+impl ReplicaOperation for CompensateDistributeReplicaEpochActivity {
+    fn request<'a>(
+        input: &'a CompensateDistributeReplicaEpochInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        let index = usize::from(input.distribution_index);
+        let target_id = *definition
+            .compensation_epoch_distribution_ids()
+            .get(index)
+            .ok_or_else(|| {
+                "compensation epoch distribution index is outside membership".to_string()
+            })?;
+        validate_target(
+            input.replica_id,
+            &input.replica_instance_id,
+            target_id,
+            definition,
+        )?;
+        Ok(fixed_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            2100 + u32::from(input.distribution_index),
+            input.replica_id,
+            &input.replica_instance_id,
+            definition.target_snapshot.epoch.clone(),
+            definition.compensation_snapshot(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+        ))
+    }
+
+    fn action(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        _: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::UpdateEpoch {
+            epoch: epoch(&definition.target_snapshot.epoch),
+        })
+    }
+
+    fn status_relation(
+        _: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        epoch_distribution_relation(status, definition)
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::CompensateUpdateSecondaryEpoch
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(
+            DurablePostconditionKind::Epoch,
+            Some(StableReplicaRoleStatus::ActiveSecondary),
+        )
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        _: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::UpdateEpoch { epoch: value }
+                if *value == epoch(&definition.target_snapshot.epoch)
+        )
+    }
+}
+
+impl ReplicaOperation for InstallCompensationCatchUpConfigurationActivity {
+    fn request<'a>(
+        input: &'a InstallCompensationCatchUpConfigurationInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        old_primary_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            2001,
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.target_snapshot.epoch.clone(),
+            definition.compensation_snapshot(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+            definition,
+        )
+    }
+
+    fn action(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::UpdateCatchUpConfiguration {
+            current: config_for_snapshot(&request.desired_snapshot, observations)?,
+            previous: config_for_snapshot(&definition.previous_snapshot, observations)?,
+        })
+    }
+
+    fn status_relation(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        let previous_current = configuration_status(
+            ReplicaConfigurationMode::Current,
+            &definition.previous_snapshot,
+        );
+        configuration_relation(
+            status,
+            &configuration_status(ReplicaConfigurationMode::CatchUp, &request.desired_snapshot),
+            Some(&previous_current),
+            false,
+            epoch(&definition.target_snapshot.epoch),
+        )
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::CompensateCatchUpConfiguration
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(DurablePostconditionKind::CatchUpConfiguration, None)
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        desired_snapshot: &StablePartitionSnapshotStatus,
+        definition: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::UpdateCatchUpConfiguration { current, previous }
+                if config_matches_snapshot(current, desired_snapshot)
+                    && config_matches_snapshot(previous, &definition.previous_snapshot)
+        )
+    }
+}
+
+impl ReplicaOperation for InstallCompensationCurrentConfigurationActivity {
+    fn request<'a>(
+        input: &'a InstallCompensationCurrentConfigurationInput,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<ReplicaRequest<'a>, String> {
+        old_primary_replica_request(
+            input.contract_version,
+            &input.execution_id,
+            2002,
+            input.old_primary_id,
+            &input.old_primary_instance_id,
+            definition.target_snapshot.epoch.clone(),
+            definition.compensation_snapshot(),
+            input.deadline_unix_seconds,
+            input.redelivery,
+            input.prepared_command.as_ref(),
+            definition,
+        )
+    }
+
+    fn action(
+        request: &ReplicaRequest<'_>,
+        _: &DirectSwitchoverDefinition,
+        observations: &OperationObservations,
+    ) -> Result<DurableReplicaAction, String> {
+        Ok(DurableReplicaAction::UpdateCurrentConfiguration {
+            current: config_for_snapshot(&request.desired_snapshot, observations)?,
+        })
+    }
+
+    fn status_relation(
+        request: &ReplicaRequest<'_>,
+        definition: &DirectSwitchoverDefinition,
+        status: &kuberic_core::types::ReplicaStatusInfo,
+    ) -> StatusRelation {
+        let catch_up =
+            configuration_status(ReplicaConfigurationMode::CatchUp, &request.desired_snapshot);
+        configuration_relation(
+            status,
+            &configuration_status(ReplicaConfigurationMode::Current, &request.desired_snapshot),
+            Some(&catch_up),
+            false,
+            epoch(&definition.target_snapshot.epoch),
+        )
+    }
+
+    fn action_kind() -> DurableActionKind {
+        DurableActionKind::CompensateCurrentConfiguration
+    }
+
+    fn postcondition() -> DurablePostconditionStatus {
+        postcondition(DurablePostconditionKind::CurrentConfiguration, None)
+    }
+
+    fn action_has_fixed_semantics(
+        action: &DurableReplicaAction,
+        desired_snapshot: &StablePartitionSnapshotStatus,
+        _: &DirectSwitchoverDefinition,
+    ) -> bool {
+        matches!(
+            action,
+            DurableReplicaAction::UpdateCurrentConfiguration { current }
+                if config_matches_snapshot(current, desired_snapshot)
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn target_replica_request<'a>(
+    contract_version: u32,
+    execution_id: &'a str,
+    sequence: u32,
+    target_primary_id: i64,
+    target_primary_instance_id: &'a str,
+    deadline_unix_seconds: i64,
+    redelivery: u8,
+    prepared_command: Option<&'a ReplicaEffectCommand>,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<ReplicaRequest<'a>, String> {
+    validate_target(
+        target_primary_id,
+        target_primary_instance_id,
+        definition.target_primary_id,
+        definition,
+    )?;
+    Ok(fixed_replica_request(
+        contract_version,
+        execution_id,
+        sequence,
+        target_primary_id,
+        target_primary_instance_id,
+        definition.target_snapshot.epoch.clone(),
+        definition.target_snapshot.clone(),
+        deadline_unix_seconds,
+        redelivery,
+        prepared_command,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn old_primary_replica_request<'a>(
+    contract_version: u32,
+    execution_id: &'a str,
+    sequence: u32,
+    old_primary_id: i64,
+    old_primary_instance_id: &'a str,
+    expected_epoch: EpochStatus,
+    desired_snapshot: StablePartitionSnapshotStatus,
+    deadline_unix_seconds: i64,
+    redelivery: u8,
+    prepared_command: Option<&'a ReplicaEffectCommand>,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<ReplicaRequest<'a>, String> {
+    validate_target(
+        old_primary_id,
+        old_primary_instance_id,
+        definition.old_primary_id,
+        definition,
+    )?;
+    Ok(fixed_replica_request(
+        contract_version,
+        execution_id,
+        sequence,
+        old_primary_id,
+        old_primary_instance_id,
+        expected_epoch,
+        desired_snapshot,
+        deadline_unix_seconds,
+        redelivery,
+        prepared_command,
+    ))
+}
+
+struct LabelRequest<'a> {
+    contract_version: u32,
+    execution_id: &'a str,
+    sequence: u32,
+    target_id: i64,
+    target_instance_id: &'a str,
+    desired_role: &'static str,
+    deadline_unix_seconds: i64,
+    prepared_command: Option<&'a LabelEffectCommand>,
+}
+
+trait LabelOperation: LabelDirectActivity {
+    fn request<'a>(
+        input: &'a Self::Input,
+        definition: &DirectSwitchoverDefinition,
+    ) -> Result<LabelRequest<'a>, String>;
+}
+
+macro_rules! impl_label_operation {
+    (
+        $activity:ty,
+        $input:ty,
+        $id_field:ident,
+        $instance_field:ident,
+        $expected_id:expr,
+        $sequence:expr,
+        $role:literal
+    ) => {
+        impl LabelOperation for $activity {
+            fn request<'a>(
+                input: &'a $input,
+                definition: &DirectSwitchoverDefinition,
+            ) -> Result<LabelRequest<'a>, String> {
+                let expected_id = $expected_id(definition);
+                validate_target(
+                    input.$id_field,
+                    &input.$instance_field,
+                    expected_id,
+                    definition,
+                )?;
+                Ok(LabelRequest {
+                    contract_version: input.contract_version,
+                    execution_id: &input.execution_id,
+                    sequence: $sequence,
+                    target_id: input.$id_field,
+                    target_instance_id: &input.$instance_field,
+                    desired_role: $role,
+                    deadline_unix_seconds: input.deadline_unix_seconds,
+                    prepared_command: input.prepared_command.as_ref(),
+                })
+            }
+        }
+    };
+}
+
+impl_label_operation!(
+    PublishTargetPrimaryLabelActivity,
+    PublishTargetPrimaryLabelInput,
+    target_primary_id,
+    target_primary_instance_id,
+    |definition: &DirectSwitchoverDefinition| definition.target_primary_id,
+    1003,
+    "primary"
+);
+impl_label_operation!(
+    PublishOldPrimarySecondaryLabelActivity,
+    PublishOldPrimarySecondaryLabelInput,
+    old_primary_id,
+    old_primary_instance_id,
+    |definition: &DirectSwitchoverDefinition| definition.old_primary_id,
+    1004,
+    "secondary"
+);
+impl_label_operation!(
+    RestoreOldPrimaryLabelActivity,
+    RestoreOldPrimaryLabelInput,
+    old_primary_id,
+    old_primary_instance_id,
+    |definition: &DirectSwitchoverDefinition| definition.old_primary_id,
+    2003,
+    "primary"
+);
+impl_label_operation!(
+    RestoreTargetSecondaryLabelActivity,
+    RestoreTargetSecondaryLabelInput,
+    target_primary_id,
+    target_primary_instance_id,
+    |definition: &DirectSwitchoverDefinition| definition.target_primary_id,
+    2004,
+    "secondary"
+);
+
+fn validate_replica<A: ReplicaOperation>(
+    input: &A::Input,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<(), String> {
+    let request = A::request(input, definition)?;
+    validate_common(
+        request.contract_version,
+        request.execution_id,
+        request.deadline_unix_seconds,
+        definition,
+    )?;
+    if request.redelivery > 1 {
+        return Err("direct replica request has invalid redelivery".to_string());
+    }
+    let Some(command) = request.prepared_command else {
+        return Ok(());
+    };
+    let pending = pending::<A>(&request);
+    if ReplicaEffectCommand::from_pending(&pending)? != *command
+        || command.action_id != action_id(definition, request.sequence)
+        || command.target_id != request.target_id
+        || command.target_instance_id != request.target_instance_id
+        || command.expected_epoch != request.expected_epoch
+        || command.desired_postcondition != A::postcondition()
+        || command.expected_agent_generation.is_empty()
+        || command.expected_control_version == 0
+        || command.action_payload.is_empty()
+    {
+        return Err("prepared direct replica command has invalid exact identity".to_string());
+    }
+    let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
+        &command.action_payload,
+    )
+    .map_err(|error| format!("decode direct prepared action: {error}"))?;
+    if action.signature() != command.action_signature
+        || !A::action_has_fixed_semantics(&action, &request.desired_snapshot, definition)
+    {
+        return Err("prepared direct replica command changed fixed semantics".to_string());
+    }
+    Ok(())
+}
+
+fn evaluate_replica<A: ReplicaOperation>(
+    input: &A::Input,
+    definition: &DirectSwitchoverDefinition,
+    observations: &OperationObservations,
+    now: i64,
+) -> Result<DirectEvaluation, String> {
+    let request = A::request(input, definition)?;
+    let Some(observed) = observations.get(&request.target_id) else {
+        return deadline_or_wait(request.deadline_unix_seconds, now, || {
+            encode_replica_observation::<A>(EffectObservation::UnavailableAtDeadline {
+                observed_at_unix_seconds: now,
+                message: format!(
+                    "direct switchover replica {} is unavailable at deadline",
+                    request.target_id
+                ),
+            })
+        });
+    };
+    if observed.status.instance_id.as_str() != request.target_instance_id {
+        return encode_replica_observation::<A>(EffectObservation::Conflicting {
+            observed_at_unix_seconds: now,
+            message: format!(
+                "direct switchover replica {} incarnation changed",
+                request.target_id
+            ),
+        })
+        .map(DirectEvaluation::Observe);
+    }
+    if let Some(recorded) =
+        correlated_action_observation(&observed.status, &action_id(definition, request.sequence))
+    {
+        let action = match A::action(&request, definition, observations) {
+            Ok(action) => action,
+            Err(error) => {
+                return deadline_or_wait(request.deadline_unix_seconds, now, || {
+                    encode_replica_observation::<A>(EffectObservation::DeadlineExceeded {
                         observed_at_unix_seconds: now,
-                        message: "correlated action signature conflicts with direct request"
+                        message: error,
+                    })
+                });
+            }
+        };
+        if recorded.signature != action.signature() {
+            return encode_replica_observation::<A>(EffectObservation::Conflicting {
+                observed_at_unix_seconds: now,
+                message: "correlated action signature conflicts with direct request".to_string(),
+            })
+            .map(DirectEvaluation::Observe);
+        }
+        return match recorded.state {
+            DurableActionState::Completed => {
+                encode_replica_observation::<A>(EffectObservation::Applied {
+                    observed_at_unix_seconds: now,
+                })
+                .map(DirectEvaluation::Observe)
+            }
+            DurableActionState::Failed => {
+                encode_replica_observation::<A>(EffectObservation::Failed {
+                    observed_at_unix_seconds: now,
+                    message: recorded.error.clone().unwrap_or_else(|| {
+                        "correlated direct switchover action failed".to_string()
+                    }),
+                })
+                .map(DirectEvaluation::Observe)
+            }
+            DurableActionState::Scheduled | DurableActionState::InProgress => {
+                deadline_or_wait(request.deadline_unix_seconds, now, || {
+                    encode_replica_observation::<A>(EffectObservation::DeadlineExceeded {
+                        observed_at_unix_seconds: now,
+                        message: "correlated direct switchover action reached its deadline"
                             .to_string(),
                     })
-                    .map(DirectEvaluation::Observe);
+                })
             }
-            return match recorded.state {
-                DurableActionState::Completed => self
-                    .encode_observation(EffectObservation::Applied {
+        };
+    }
+    match A::status_relation(&request, definition, &observed.status) {
+        StatusRelation::Postcondition => {
+            encode_replica_observation::<A>(EffectObservation::Applied {
+                observed_at_unix_seconds: now,
+            })
+            .map(DirectEvaluation::Observe)
+        }
+        StatusRelation::Precondition if now >= request.deadline_unix_seconds => {
+            encode_replica_observation::<A>(EffectObservation::DeadlineExceeded {
+                observed_at_unix_seconds: now,
+                message: format!(
+                    "direct switchover action {:?} reached its deadline",
+                    A::action_kind()
+                ),
+            })
+            .map(DirectEvaluation::Observe)
+        }
+        StatusRelation::Precondition => {
+            let action = match A::action(&request, definition, observations) {
+                Ok(action) => action,
+                Err(_) => return Ok(DirectEvaluation::AwaitEvidence),
+            };
+            Ok(DirectEvaluation::DispatchReplica {
+                action,
+                pending: Box::new(pending::<A>(&request)),
+            })
+        }
+        StatusRelation::Conflicting(message) => {
+            encode_replica_observation::<A>(EffectObservation::Conflicting {
+                observed_at_unix_seconds: now,
+                message,
+            })
+            .map(DirectEvaluation::Observe)
+        }
+    }
+}
+
+fn evaluate_quarantined_replica<A: ReplicaOperation>(
+    input: &A::Input,
+    definition: &DirectSwitchoverDefinition,
+    observations: &OperationObservations,
+    now: i64,
+) -> Result<DirectEvaluation, String> {
+    let request = A::request(input, definition)?;
+    let command = request.prepared_command.ok_or_else(|| {
+        "quarantined direct replica activity has no persisted exact command".to_string()
+    })?;
+    let Some(observed) = observations.get(&request.target_id) else {
+        return Ok(DirectEvaluation::AwaitEvidence);
+    };
+    if observed.status.instance_id.as_str() != request.target_instance_id {
+        return Ok(DirectEvaluation::AwaitEvidence);
+    }
+    if let Some(recorded) = correlated_action_observation(&observed.status, &command.action_id) {
+        if recorded.signature == command.action_signature {
+            match recorded.state {
+                DurableActionState::Completed => {
+                    return encode_replica_observation::<A>(EffectObservation::Applied {
                         observed_at_unix_seconds: now,
                     })
-                    .map(DirectEvaluation::Observe),
-                DurableActionState::Failed => self
-                    .encode_observation(EffectObservation::Failed {
+                    .map(DirectEvaluation::Observe);
+                }
+                DurableActionState::Failed => {
+                    return encode_replica_observation::<A>(EffectObservation::Failed {
                         observed_at_unix_seconds: now,
                         message: recorded.error.clone().unwrap_or_else(|| {
                             "correlated direct switchover action failed".to_string()
                         }),
                     })
-                    .map(DirectEvaluation::Observe),
-                DurableActionState::Scheduled | DurableActionState::InProgress => {
-                    deadline_or_wait(request.deadline_unix_seconds, now, || {
-                        self.encode_observation(EffectObservation::DeadlineExceeded {
-                            observed_at_unix_seconds: now,
-                            message: "correlated direct switchover action reached its deadline"
-                                .to_string(),
-                        })
-                    })
+                    .map(DirectEvaluation::Observe);
                 }
-            };
-        }
-        match self.status_relation(request, definition, &observed.status)? {
-            StatusRelation::Postcondition => self
-                .encode_observation(EffectObservation::Applied {
-                    observed_at_unix_seconds: now,
-                })
-                .map(DirectEvaluation::Observe),
-            StatusRelation::Precondition if now >= request.deadline_unix_seconds => self
-                .encode_observation(EffectObservation::DeadlineExceeded {
-                    observed_at_unix_seconds: now,
-                    message: format!(
-                        "direct switchover action {:?} reached its deadline",
-                        self.action_kind()
-                    ),
-                })
-                .map(DirectEvaluation::Observe),
-            StatusRelation::Precondition => {
-                let action = match self.action(request, definition, observations) {
-                    Ok(action) => action,
-                    Err(_) => return Ok(DirectEvaluation::AwaitEvidence),
-                };
-                Ok(DirectEvaluation::DispatchReplica {
-                    action,
-                    pending: Box::new(self.pending(request)),
-                })
+                DurableActionState::Scheduled | DurableActionState::InProgress => {}
             }
-            StatusRelation::Conflicting(message) => self
-                .encode_observation(EffectObservation::Conflicting {
-                    observed_at_unix_seconds: now,
-                    message,
-                })
-                .map(DirectEvaluation::Observe),
         }
     }
+    if matches!(
+        A::status_relation(&request, definition, &observed.status),
+        StatusRelation::Postcondition
+    ) {
+        return encode_replica_observation::<A>(EffectObservation::Applied {
+            observed_at_unix_seconds: now,
+        })
+        .map(DirectEvaluation::Observe);
+    }
+    if command_generation_change_proves_no_admission(
+        &command.expected_agent_generation,
+        &command.action_id,
+        &observed.status,
+    ) {
+        return encode_replica_observation::<A>(EffectObservation::ProvenNoAdmission {
+            observed_at_unix_seconds: now,
+        })
+        .map(DirectEvaluation::Observe);
+    }
+    Ok(DirectEvaluation::AwaitEvidence)
+}
 
-    fn status_relation(
-        self,
-        request: &ReplicaOperationRequest,
-        definition: &DirectSwitchoverDefinition,
-        status: &kuberic_core::types::ReplicaStatusInfo,
-    ) -> Result<StatusRelation, String> {
-        let previous_epoch = epoch(&definition.previous_snapshot.epoch);
-        let target_epoch = epoch(&definition.target_snapshot.epoch);
-        let desired_current =
-            configuration_status(ReplicaConfigurationMode::Current, &request.desired_snapshot);
-        let desired_catch_up =
-            configuration_status(ReplicaConfigurationMode::CatchUp, &request.desired_snapshot);
-        Ok(match self {
-            Self::RevokeWrites => {
-                if status.role == Role::Primary
-                    && status.epoch == previous_epoch
-                    && status.write_status == AccessStatus::ReconfigurationPending
-                {
-                    StatusRelation::Postcondition
-                } else if status.role == Role::Primary
-                    && status.epoch == previous_epoch
-                    && status.write_status == AccessStatus::Granted
-                {
-                    StatusRelation::Precondition
-                } else {
-                    StatusRelation::conflicting("revoke-writes pre/postcondition is not exact")
-                }
-            }
-            Self::DemoteOldPrimary => {
-                if status.role == Role::ActiveSecondary && status.epoch == target_epoch {
-                    StatusRelation::Postcondition
-                } else if status.role == Role::Primary
-                    && status.epoch == previous_epoch
-                    && status.write_status == AccessStatus::ReconfigurationPending
-                {
-                    StatusRelation::Precondition
-                } else {
-                    StatusRelation::conflicting("demote-old-primary pre/postcondition is not exact")
-                }
-            }
-            Self::PromoteTarget => {
-                if status.role == Role::Primary && status.epoch == target_epoch {
-                    StatusRelation::Postcondition
-                } else if status.role == Role::ActiveSecondary && status.epoch == previous_epoch {
-                    StatusRelation::Precondition
-                } else {
-                    StatusRelation::conflicting("promote-target pre/postcondition is not exact")
-                }
-            }
-            Self::DistributeReplicaEpoch | Self::CompensateDistributeReplicaEpoch => {
-                if status.role == Role::ActiveSecondary && status.epoch == target_epoch {
-                    StatusRelation::Postcondition
-                } else if status.role == Role::ActiveSecondary && status.epoch == previous_epoch {
-                    StatusRelation::Precondition
-                } else {
-                    StatusRelation::conflicting(
-                        "replica-epoch distribution pre/postcondition is not exact",
-                    )
-                }
-            }
-            Self::InstallTargetCatchUpConfiguration => {
-                configuration_relation(status, &desired_catch_up, None, true, target_epoch)
-            }
-            Self::WaitTargetWriteQuorum => {
-                if status.role == Role::Primary && status.epoch == target_epoch {
-                    StatusRelation::Precondition
-                } else {
-                    StatusRelation::conflicting("write-quorum wait target is not exact primary")
-                }
-            }
-            Self::InstallTargetCurrentConfiguration => configuration_relation(
-                status,
-                &desired_current,
-                Some(&desired_catch_up),
-                false,
-                target_epoch,
-            ),
-            Self::RestorePreviousCurrentConfiguration => {
-                if status.role != Role::Primary || status.epoch != previous_epoch {
-                    StatusRelation::conflicting(
-                        "previous-configuration restore target is not exact primary",
-                    )
-                } else if status.configuration.as_ref() == Some(&desired_current)
-                    && status.write_status == AccessStatus::Granted
-                {
-                    StatusRelation::Postcondition
-                } else if status.configuration.as_ref() == Some(&desired_current)
-                    && status.write_status == AccessStatus::ReconfigurationPending
-                {
-                    StatusRelation::Precondition
-                } else {
-                    StatusRelation::conflicting(
-                        "previous-configuration restore pre/postcondition is not exact",
-                    )
-                }
-            }
-            Self::CompensatePromoteOldPrimary => {
-                if status.role == Role::Primary && status.epoch == target_epoch {
-                    StatusRelation::Postcondition
-                } else if status.role == Role::ActiveSecondary && status.epoch == target_epoch {
-                    StatusRelation::Precondition
-                } else {
-                    StatusRelation::conflicting(
-                        "compensating promotion pre/postcondition is not exact",
-                    )
-                }
-            }
-            Self::InstallCompensationCatchUpConfiguration => {
-                let previous_current = configuration_status(
-                    ReplicaConfigurationMode::Current,
-                    &definition.previous_snapshot,
-                );
-                configuration_relation(
-                    status,
-                    &desired_catch_up,
-                    Some(&previous_current),
-                    false,
-                    target_epoch,
-                )
-            }
-            Self::InstallCompensationCurrentConfiguration => configuration_relation(
-                status,
-                &desired_current,
-                Some(&desired_catch_up),
-                false,
-                target_epoch,
+fn pending<A: ReplicaOperation>(request: &ReplicaRequest<'_>) -> PendingActionStatus {
+    let mut pending = PendingActionStatus {
+        action_id: request_action_id(request),
+        sequence: request.sequence,
+        kind: A::action_kind(),
+        target_id: request.target_id,
+        target_instance_id: request.target_instance_id.to_string(),
+        expected_epoch: request.expected_epoch.clone(),
+        desired_postcondition: A::postcondition(),
+        attempts: u32::from(request.redelivery),
+        deadline_unix_seconds: request.deadline_unix_seconds,
+        last_error: None,
+        dispatch_authorized: request.prepared_command.is_some(),
+        dispatch_agent_generation: None,
+        dispatch_agent_control_version: None,
+        dispatch_observed_runtime_epoch: None,
+        dispatch_action_payload: String::new(),
+    };
+    if let Some(command) = request.prepared_command {
+        pending.dispatch_agent_generation = Some(command.expected_agent_generation.clone());
+        pending.dispatch_agent_control_version = Some(command.expected_control_version);
+        pending.dispatch_observed_runtime_epoch = Some(command.observed_runtime_epoch.clone());
+        pending.dispatch_action_payload = command.action_payload.clone();
+    }
+    pending
+}
+
+fn request_action_id(request: &ReplicaRequest<'_>) -> String {
+    format!("{}:{}", request.execution_id, request.sequence)
+}
+
+fn action_id(definition: &DirectSwitchoverDefinition, sequence: u32) -> String {
+    format!("{}:{sequence}", definition.execution_id)
+}
+
+fn validate_label<A: LabelOperation>(
+    input: &A::Input,
+    definition: &DirectSwitchoverDefinition,
+) -> Result<(), String> {
+    let request = A::request(input, definition)?;
+    validate_common(
+        request.contract_version,
+        request.execution_id,
+        request.deadline_unix_seconds,
+        definition,
+    )?;
+    let Some(command) = request.prepared_command else {
+        return Ok(());
+    };
+    if command.target_id != request.target_id
+        || command.expected_uid != request.target_instance_id
+        || command.role != request.desired_role
+        || command.pod_name.is_empty()
+        || !command.has_valid_identity_signature()
+    {
+        return Err("prepared direct label command has invalid exact identity".to_string());
+    }
+    Ok(())
+}
+
+fn evaluate_label<A: LabelOperation>(
+    input: &A::Input,
+    definition: &DirectSwitchoverDefinition,
+    observations: &OperationObservations,
+    now: i64,
+) -> Result<DirectEvaluation, String> {
+    let request = A::request(input, definition)?;
+    let Some(observed) = observations.get(&request.target_id) else {
+        return deadline_or_wait(request.deadline_unix_seconds, now, || {
+            encode_label_observation::<A>(EffectObservation::UnavailableAtDeadline {
+                observed_at_unix_seconds: now,
+                message: format!(
+                    "direct switchover label target {} is unavailable at deadline",
+                    request.target_id
+                ),
+            })
+        });
+    };
+    if observed.status.instance_id.as_str() != request.target_instance_id {
+        return encode_label_observation::<A>(EffectObservation::Conflicting {
+            observed_at_unix_seconds: now,
+            message: "direct switchover label target incarnation changed".to_string(),
+        })
+        .map(DirectEvaluation::Observe);
+    }
+    let expected_role = label_role(request.desired_role);
+    if observed.status.epoch != epoch(&definition.target_snapshot.epoch)
+        || observed.status.role != expected_role
+    {
+        return encode_label_observation::<A>(EffectObservation::Conflicting {
+            observed_at_unix_seconds: now,
+            message: "direct switchover label target runtime role is not exact".to_string(),
+        })
+        .map(DirectEvaluation::Observe);
+    }
+    if observed.pod_role_label.as_deref() == Some(request.desired_role) {
+        encode_label_observation::<A>(EffectObservation::Applied {
+            observed_at_unix_seconds: now,
+        })
+        .map(DirectEvaluation::Observe)
+    } else if now >= request.deadline_unix_seconds {
+        encode_label_observation::<A>(EffectObservation::DeadlineExceeded {
+            observed_at_unix_seconds: now,
+            message: format!(
+                "direct switchover label action {} reached its deadline",
+                request.sequence
             ),
         })
-    }
-
-    fn validate_prepared(
-        self,
-        request: &ReplicaOperationRequest,
-        definition: &DirectSwitchoverDefinition,
-    ) -> Result<(), String> {
-        let command = request
-            .prepared_command
-            .as_ref()
-            .ok_or_else(|| "direct replica activity is not prepared".to_string())?;
-        let pending = self.pending(request);
-        if ReplicaEffectCommand::from_pending(&pending)? != *command
-            || command.action_id != request.action_id
-            || command.target_id != request.target_id
-            || command.target_instance_id != request.target_instance_id
-            || command.expected_epoch != request.expected_epoch
-            || command.desired_postcondition != self.postcondition()
-            || command.expected_agent_generation.is_empty()
-            || command.expected_control_version == 0
-            || command.action_payload.is_empty()
-        {
-            return Err("prepared direct replica command has invalid exact identity".to_string());
-        }
-        let action = kuberic_core::grpc::convert::decode_direct_correlated_action_payload(
-            &command.action_payload,
-        )
-        .map_err(|error| format!("decode direct prepared action: {error}"))?;
-        if action.signature() != command.action_signature
-            || !self.action_has_fixed_semantics(&action, &request.desired_snapshot, definition)
-        {
-            return Err("prepared direct replica command changed fixed semantics".to_string());
-        }
-        Ok(())
-    }
-
-    fn action_has_fixed_semantics(
-        self,
-        action: &DurableReplicaAction,
-        desired_snapshot: &StablePartitionSnapshotStatus,
-        definition: &DirectSwitchoverDefinition,
-    ) -> bool {
-        let target_epoch = epoch(&definition.target_snapshot.epoch);
-        match (self, action) {
-            (Self::RevokeWrites, DurableReplicaAction::RevokeWriteStatus) => true,
-            (
-                Self::DemoteOldPrimary,
-                DurableReplicaAction::ChangeRole {
-                    epoch,
-                    role: Role::ActiveSecondary,
-                },
-            )
-            | (
-                Self::PromoteTarget | Self::CompensatePromoteOldPrimary,
-                DurableReplicaAction::ChangeRole {
-                    epoch,
-                    role: Role::Primary,
-                },
-            )
-            | (
-                Self::DistributeReplicaEpoch | Self::CompensateDistributeReplicaEpoch,
-                DurableReplicaAction::UpdateEpoch { epoch },
-            ) => *epoch == target_epoch,
-            (
-                Self::InstallTargetCatchUpConfiguration
-                | Self::InstallCompensationCatchUpConfiguration,
-                DurableReplicaAction::UpdateCatchUpConfiguration { current, previous },
-            ) => {
-                config_matches_snapshot(current, desired_snapshot)
-                    && config_matches_snapshot(previous, &definition.previous_snapshot)
-            }
-            (
-                Self::WaitTargetWriteQuorum,
-                DurableReplicaAction::WaitForCatchUpQuorum {
-                    mode: ReplicaSetQuorumMode::Write,
-                },
-            ) => true,
-            (
-                Self::InstallTargetCurrentConfiguration
-                | Self::RestorePreviousCurrentConfiguration
-                | Self::InstallCompensationCurrentConfiguration,
-                DurableReplicaAction::UpdateCurrentConfiguration { current },
-            ) => config_matches_snapshot(current, desired_snapshot),
-            _ => false,
-        }
-    }
-
-    fn encode_observation(self, observation: EffectObservation) -> Result<ExactBytes, String> {
-        match self {
-            Self::RevokeWrites => encode_replica_observation::<RevokeWritesActivity>(observation),
-            Self::DemoteOldPrimary => {
-                encode_replica_observation::<DemoteOldPrimaryActivity>(observation)
-            }
-            Self::PromoteTarget => encode_replica_observation::<PromoteTargetActivity>(observation),
-            Self::DistributeReplicaEpoch => {
-                encode_replica_observation::<DistributeReplicaEpochActivity>(observation)
-            }
-            Self::InstallTargetCatchUpConfiguration => {
-                encode_replica_observation::<InstallTargetCatchUpConfigurationActivity>(observation)
-            }
-            Self::WaitTargetWriteQuorum => {
-                encode_replica_observation::<WaitTargetWriteQuorumActivity>(observation)
-            }
-            Self::InstallTargetCurrentConfiguration => {
-                encode_replica_observation::<InstallTargetCurrentConfigurationActivity>(observation)
-            }
-            Self::RestorePreviousCurrentConfiguration => encode_replica_observation::<
-                RestorePreviousCurrentConfigurationActivity,
-            >(observation),
-            Self::CompensatePromoteOldPrimary => {
-                encode_replica_observation::<CompensatePromoteOldPrimaryActivity>(observation)
-            }
-            Self::CompensateDistributeReplicaEpoch => {
-                encode_replica_observation::<CompensateDistributeReplicaEpochActivity>(observation)
-            }
-            Self::InstallCompensationCatchUpConfiguration => encode_replica_observation::<
-                InstallCompensationCatchUpConfigurationActivity,
-            >(observation),
-            Self::InstallCompensationCurrentConfiguration => encode_replica_observation::<
-                InstallCompensationCurrentConfigurationActivity,
-            >(observation),
-        }
+        .map(DirectEvaluation::Observe)
+    } else {
+        Ok(DirectEvaluation::DispatchLabel)
     }
 }
 
-impl DirectLabelOperation {
-    fn spec(self, request: LabelOperationRequest) -> Result<ActivitySpec, String> {
-        match self {
-            Self::PublishTargetPrimary => label_spec::<PublishTargetPrimaryLabelActivity>(request),
-            Self::PublishOldPrimarySecondary => {
-                label_spec::<PublishOldPrimarySecondaryLabelActivity>(request)
-            }
-            Self::RestoreOldPrimary => label_spec::<RestoreOldPrimaryLabelActivity>(request),
-            Self::RestoreTargetSecondary => {
-                label_spec::<RestoreTargetSecondaryLabelActivity>(request)
-            }
-        }
+fn evaluate_quarantined_label<A: LabelOperation>(
+    input: &A::Input,
+    definition: &DirectSwitchoverDefinition,
+    observations: &OperationObservations,
+    now: i64,
+) -> Result<DirectEvaluation, String> {
+    let request = A::request(input, definition)?;
+    if request.prepared_command.is_none() {
+        return Err("quarantined direct label activity has no persisted exact command".to_string());
     }
-
-    fn validate_request(
-        self,
-        request: &LabelOperationRequest,
-        definition: &DirectSwitchoverDefinition,
-    ) -> Result<(), String> {
-        validate_common(
-            request.contract_version,
-            &request.execution_id,
-            request.deadline_unix_seconds,
-            definition,
-        )?;
-        let (sequence, target_id, role) = match self {
-            Self::PublishTargetPrimary => (1003, definition.target_primary_id, "primary"),
-            Self::PublishOldPrimarySecondary => (1004, definition.old_primary_id, "secondary"),
-            Self::RestoreOldPrimary => (2003, definition.old_primary_id, "primary"),
-            Self::RestoreTargetSecondary => (2004, definition.target_primary_id, "secondary"),
-        };
-        let member = definition.member(target_id)?;
-        if request.sequence != sequence
-            || request.action_id != format!("{}:{sequence}", definition.execution_id)
-            || request.target_id != target_id
-            || request.target_instance_id != member.instance_id
-            || request.desired_role != role
-        {
-            return Err("direct label request conflicts with operation semantics".to_string());
-        }
-        Ok(())
+    let Some(observed) = observations.get(&request.target_id) else {
+        return Ok(DirectEvaluation::AwaitEvidence);
+    };
+    if observed.status.instance_id.as_str() == request.target_instance_id
+        && observed.status.epoch == epoch(&definition.target_snapshot.epoch)
+        && observed.status.role == label_role(request.desired_role)
+        && observed.pod_role_label.as_deref() == Some(request.desired_role)
+    {
+        return encode_label_observation::<A>(EffectObservation::Applied {
+            observed_at_unix_seconds: now,
+        })
+        .map(DirectEvaluation::Observe);
     }
+    Ok(DirectEvaluation::AwaitEvidence)
+}
 
-    fn validate_prepared(self, request: &LabelOperationRequest) -> Result<(), String> {
-        let command = request
-            .prepared_command
-            .as_ref()
-            .ok_or_else(|| "direct label activity is not prepared".to_string())?;
-        if command.target_id != request.target_id
-            || command.expected_uid != request.target_instance_id
-            || command.role != request.desired_role
-            || command.pod_name.is_empty()
-            || !command.has_valid_identity_signature()
-        {
-            return Err("prepared direct label command has invalid exact identity".to_string());
-        }
-        Ok(())
+fn label_role(role: &str) -> Role {
+    if role == "primary" {
+        Role::Primary
+    } else {
+        Role::ActiveSecondary
     }
+}
 
-    fn evaluate(
-        self,
-        request: &LabelOperationRequest,
-        definition: &DirectSwitchoverDefinition,
-        observations: &OperationObservations,
-        now: i64,
-    ) -> Result<DirectEvaluation, String> {
-        let Some(observed) = observations.get(&request.target_id) else {
-            return deadline_or_wait(request.deadline_unix_seconds, now, || {
-                self.encode_observation(EffectObservation::UnavailableAtDeadline {
-                    observed_at_unix_seconds: now,
-                    message: format!(
-                        "direct switchover label target {} is unavailable at deadline",
-                        request.target_id
-                    ),
-                })
-            });
-        };
-        if observed.status.instance_id.as_str() != request.target_instance_id {
-            return self
-                .encode_observation(EffectObservation::Conflicting {
-                    observed_at_unix_seconds: now,
-                    message: "direct switchover label target incarnation changed".to_string(),
-                })
-                .map(DirectEvaluation::Observe);
-        }
-        let expected_role = if request.desired_role == "primary" {
-            Role::Primary
-        } else {
-            Role::ActiveSecondary
-        };
-        if observed.status.epoch != epoch(&definition.target_snapshot.epoch)
-            || observed.status.role != expected_role
-        {
-            return self
-                .encode_observation(EffectObservation::Conflicting {
-                    observed_at_unix_seconds: now,
-                    message: "direct switchover label target runtime role is not exact".to_string(),
-                })
-                .map(DirectEvaluation::Observe);
-        }
-        if observed.pod_role_label.as_deref() == Some(request.desired_role.as_str()) {
-            self.encode_observation(EffectObservation::Applied {
-                observed_at_unix_seconds: now,
-            })
-            .map(DirectEvaluation::Observe)
-        } else if now >= request.deadline_unix_seconds {
-            self.encode_observation(EffectObservation::DeadlineExceeded {
-                observed_at_unix_seconds: now,
-                message: format!(
-                    "direct switchover label action {:?} reached its deadline",
-                    self
-                ),
-            })
-            .map(DirectEvaluation::Observe)
-        } else {
-            Ok(DirectEvaluation::DispatchLabel)
-        }
-    }
+fn postcondition(
+    kind: DurablePostconditionKind,
+    role: Option<StableReplicaRoleStatus>,
+) -> DurablePostconditionStatus {
+    DurablePostconditionStatus { kind, role }
+}
 
-    fn encode_observation(self, observation: EffectObservation) -> Result<ExactBytes, String> {
-        match self {
-            Self::PublishTargetPrimary => {
-                encode_label_observation::<PublishTargetPrimaryLabelActivity>(observation)
-            }
-            Self::PublishOldPrimarySecondary => {
-                encode_label_observation::<PublishOldPrimarySecondaryLabelActivity>(observation)
-            }
-            Self::RestoreOldPrimary => {
-                encode_label_observation::<RestoreOldPrimaryLabelActivity>(observation)
-            }
-            Self::RestoreTargetSecondary => {
-                encode_label_observation::<RestoreTargetSecondaryLabelActivity>(observation)
-            }
-        }
+fn epoch_distribution_relation(
+    status: &kuberic_core::types::ReplicaStatusInfo,
+    definition: &DirectSwitchoverDefinition,
+) -> StatusRelation {
+    if status.role == Role::ActiveSecondary
+        && status.epoch == epoch(&definition.target_snapshot.epoch)
+    {
+        StatusRelation::Postcondition
+    } else if status.role == Role::ActiveSecondary
+        && status.epoch == epoch(&definition.previous_snapshot.epoch)
+    {
+        StatusRelation::Precondition
+    } else {
+        StatusRelation::conflicting("replica-epoch distribution pre/postcondition is not exact")
     }
 }
 
@@ -1278,18 +2518,6 @@ fn decode<A: DurableActivity>(spec: &ActivitySpec) -> Result<A::Input, String> {
         .map_err(|error| format!("decode {} activity input: {error}", A::NAME))
 }
 
-fn decode_replica<A: ReplicaDirectActivity>(
-    spec: &ActivitySpec,
-) -> Result<ReplicaOperationRequest, String> {
-    decode::<A>(spec).map(A::request)
-}
-
-fn decode_label<A: LabelDirectActivity>(
-    spec: &ActivitySpec,
-) -> Result<LabelOperationRequest, String> {
-    decode::<A>(spec).map(A::request)
-}
-
 fn validate_spec_identity<A: DurableActivity>(spec: &ActivitySpec) -> Result<(), String> {
     if spec.name().name() != A::NAME
         || spec.name().version() != A::VERSION
@@ -1313,22 +2541,10 @@ fn spec<A: DurableActivity>(input: &A::Input) -> Result<ActivitySpec, String> {
     ))
 }
 
-fn replica_spec<A: ReplicaDirectActivity>(
-    request: ReplicaOperationRequest,
-) -> Result<ActivitySpec, String> {
-    spec::<A>(&A::input(request))
-}
-
-fn label_spec<A: LabelDirectActivity>(
-    request: LabelOperationRequest,
-) -> Result<ActivitySpec, String> {
-    spec::<A>(&A::input(request))
-}
-
 fn encode_replica_observation<A: ReplicaDirectActivity>(
     observation: EffectObservation,
 ) -> Result<ExactBytes, String> {
-    let output = A::output(observation)?;
+    let output = A::output(observation.bounded())?;
     encode_activity_result::<A>(&output)
         .map_err(|error| format!("encode {} result: {error}", A::NAME))
 }
@@ -1336,7 +2552,7 @@ fn encode_replica_observation<A: ReplicaDirectActivity>(
 fn encode_label_observation<A: LabelDirectActivity>(
     observation: EffectObservation,
 ) -> Result<ExactBytes, String> {
-    let output = A::output(observation)?;
+    let output = A::output(observation.bounded())?;
     encode_activity_result::<A>(&output)
         .map_err(|error| format!("encode {} result: {error}", A::NAME))
 }

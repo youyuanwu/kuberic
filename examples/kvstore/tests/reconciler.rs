@@ -4983,91 +4983,118 @@ async fn test_framework_native_switchover_deadline_policy_preserves_fresh_fence_
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_framework_native_switchover_observation_collection_survives_restart_every_turn() {
-    let api = KvClusterApi::new();
-    let bootstrap = ReconcilerState::default();
-    let status = create_healthy_set(&api, &bootstrap, "native-restart", 3).await;
-    let original_primary = status.current_primary.clone().unwrap();
-    let target = api
-        .pods
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|pod| pod.metadata.name.clone().unwrap())
-        .find(|name| name != &original_primary)
-        .unwrap();
-    let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
-    let initial_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
-    reconcile_set(
-        &make_native_switchover_set(
-            "native-restart",
-            3,
-            Some(KubericSetStatus {
-                current_primary: Some(original_primary),
-                target_primary: Some(target.clone()),
-                ..status
-            }),
-        ),
-        &api,
-        &initial_state,
-    )
-    .await
-    .unwrap();
-    let mut status = api.last_status().unwrap();
-    let execution_id = status
-        .switchover_execution
-        .as_ref()
-        .unwrap()
-        .execution_id
-        .clone();
-    api.reset_operations();
-    let mut history = Vec::new();
-
-    for _ in 0..180 {
-        let restarted = ReconcilerState::with_switchover_store(checkpoint_store.clone());
+    for scenario in [
+        ProductionSwitchoverScenario::Success,
+        ProductionSwitchoverScenario::PrePromotionCompensation,
+        ProductionSwitchoverScenario::PostPromotionCompensation,
+    ] {
+        let suffix = match scenario {
+            ProductionSwitchoverScenario::Success => "success",
+            ProductionSwitchoverScenario::PrePromotionCompensation => "pre",
+            ProductionSwitchoverScenario::PostPromotionCompensation => "post",
+        };
+        let name = format!("native-restart-{suffix}");
+        let api = KvClusterApi::new();
+        let bootstrap = ReconcilerState::default();
+        let status = create_healthy_set(&api, &bootstrap, &name, 3).await;
+        let original_primary = status.current_primary.clone().unwrap();
+        let target = api
+            .pods
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pod| pod.metadata.name.clone().unwrap())
+            .find(|pod_name| pod_name != &original_primary)
+            .unwrap();
+        let checkpoint_store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let initial_state = ReconcilerState::with_switchover_store(checkpoint_store.clone());
         reconcile_set(
-            &make_native_switchover_set("native-restart", 3, Some(status.clone())),
+            &make_native_switchover_set(
+                &name,
+                3,
+                Some(KubericSetStatus {
+                    current_primary: Some(original_primary.clone()),
+                    target_primary: Some(target.clone()),
+                    ..status
+                }),
+            ),
             &api,
-            &restarted,
+            &initial_state,
         )
         .await
         .unwrap();
-        status = api.last_status().unwrap();
-        record_native_switchover_history(&checkpoint_store, &status, &mut history).await;
-        if status.phase == Phase::Healthy {
-            break;
+        let mut status = api.last_status().unwrap();
+        let execution_id = status
+            .switchover_execution
+            .as_ref()
+            .unwrap()
+            .execution_id
+            .clone();
+        api.reset_operations();
+        match scenario {
+            ProductionSwitchoverScenario::Success => {}
+            ProductionSwitchoverScenario::PrePromotionCompensation => {
+                api.fail_terminal_durable_action_sequence(2);
+            }
+            ProductionSwitchoverScenario::PostPromotionCompensation => {
+                api.fail_terminal_durable_action_sequence(3);
+            }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut history = Vec::new();
+
+        for _ in 0..220 {
+            let restarted = ReconcilerState::with_switchover_store(checkpoint_store.clone());
+            reconcile_set(
+                &make_native_switchover_set(&name, 3, Some(status.clone())),
+                &api,
+                &restarted,
+            )
+            .await
+            .unwrap();
+            status = api.last_status().unwrap();
+            record_native_switchover_history(&checkpoint_store, &status, &mut history).await;
+            if status.phase == Phase::Healthy {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status.phase, Phase::Healthy);
+        assert_eq!(
+            status.current_primary.as_deref(),
+            Some(if scenario == ProductionSwitchoverScenario::Success {
+                target.as_str()
+            } else {
+                original_primary.as_str()
+            })
+        );
+        assert_eq!(
+            status.switchover_execution.as_ref().unwrap().execution_id,
+            execution_id
+        );
+        assert_eq!(
+            history,
+            expected_persisted_production_switchover_history(3, scenario, false)
+        );
+        assert_exact_role_labels(&api, &name, &status);
+        assert_eq!(
+            api.operations()
+                .iter()
+                .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
+                .count(),
+            1
+        );
+        assert_eq!(
+            api.operations()
+                .iter()
+                .filter(|operation| **operation == ControlOperation::ChangeRole)
+                .count(),
+            match scenario {
+                ProductionSwitchoverScenario::Success => 2,
+                ProductionSwitchoverScenario::PrePromotionCompensation => 1,
+                ProductionSwitchoverScenario::PostPromotionCompensation => 3,
+            }
+        );
     }
-    assert_eq!(status.phase, Phase::Healthy);
-    assert_eq!(status.current_primary.as_deref(), Some(target.as_str()));
-    assert_eq!(
-        status.switchover_execution.as_ref().unwrap().execution_id,
-        execution_id
-    );
-    assert_eq!(
-        history,
-        expected_persisted_production_switchover_history(
-            3,
-            ProductionSwitchoverScenario::Success,
-            false,
-        )
-    );
-    assert_exact_role_labels(&api, "native-restart", &status);
-    let operations = api.operations();
-    assert_eq!(
-        operations
-            .iter()
-            .filter(|operation| **operation == ControlOperation::RevokeWriteStatus)
-            .count(),
-        1
-    );
-    assert_eq!(
-        operations
-            .iter()
-            .filter(|operation| **operation == ControlOperation::ChangeRole)
-            .count(),
-        2
-    );
 }
 
 #[test_log::test(tokio::test)]
@@ -5339,6 +5366,116 @@ async fn test_framework_native_switchover_exact_effect_dispatch_observes_every_l
     assert_eq!(measurements.completed_activity_count, Some(12));
     assert_eq!(measurements.completed_external_effect_count, Some(9));
     assert_eq!(measurements.completed_passive_observation_count, Some(3));
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_compensation_observes_every_lost_reply_once() {
+    for scenario in [
+        ProductionSwitchoverScenario::PrePromotionCompensation,
+        ProductionSwitchoverScenario::PostPromotionCompensation,
+    ] {
+        let suffix = match scenario {
+            ProductionSwitchoverScenario::PrePromotionCompensation => "pre",
+            ProductionSwitchoverScenario::PostPromotionCompensation => "post",
+            ProductionSwitchoverScenario::Success => unreachable!(),
+        };
+        let name = format!("native-compensation-lost-replies-{suffix}");
+        let api = KvClusterApi::new();
+        let bootstrap = ReconcilerState::default();
+        let healthy = create_healthy_set(&api, &bootstrap, &name, 3).await;
+        let original_primary = healthy.current_primary.clone().unwrap();
+        let target = api
+            .pods
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pod| pod.metadata.name.clone().unwrap())
+            .find(|pod_name| pod_name != &original_primary)
+            .unwrap();
+        let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
+        let (state, accepted) =
+            accept_native_switchover(&api, &name, &healthy, &original_primary, &target, store)
+                .await;
+        api.reset_operations();
+        match scenario {
+            ProductionSwitchoverScenario::PrePromotionCompensation => {
+                api.fail_terminal_durable_action_sequence(2);
+                api.fail_after_durable_action_sequences([1500]);
+            }
+            ProductionSwitchoverScenario::PostPromotionCompensation => {
+                api.fail_terminal_durable_action_sequence(3);
+                api.fail_after_durable_action_sequences([2000, 2100, 2101, 2001, 2002]);
+                {
+                    let mut pods = api.pods.lock().unwrap();
+                    pods.iter_mut()
+                        .find(|pod| pod.metadata.name.as_deref() == Some(original_primary.as_str()))
+                        .unwrap()
+                        .metadata
+                        .labels
+                        .as_mut()
+                        .unwrap()
+                        .insert("kuberic.io/role".to_string(), "secondary".to_string());
+                    pods.iter_mut()
+                        .find(|pod| pod.metadata.name.as_deref() == Some(target.as_str()))
+                        .unwrap()
+                        .metadata
+                        .labels
+                        .as_mut()
+                        .unwrap()
+                        .insert("kuberic.io/role".to_string(), "primary".to_string());
+                }
+                api.fail_after_uid_label_patches(2);
+            }
+            ProductionSwitchoverScenario::Success => unreachable!(),
+        }
+
+        let completed = drive_native_switchover(&api, &state, &name, 3, accepted).await;
+        assert_eq!(completed.phase, Phase::Healthy);
+        assert_eq!(
+            completed.current_primary.as_deref(),
+            Some(original_primary.as_str())
+        );
+        let action_ids = api
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|operation| *operation != ControlOperation::GetStatus)
+            .collect::<Vec<_>>();
+        match scenario {
+            ProductionSwitchoverScenario::PrePromotionCompensation => {
+                assert_eq!(
+                    action_ids
+                        .iter()
+                        .filter(
+                            |operation| **operation == ControlOperation::UpdateCurrentConfiguration
+                        )
+                        .count(),
+                    1,
+                    "lost restore reply must not duplicate the compensation effect"
+                );
+            }
+            ProductionSwitchoverScenario::PostPromotionCompensation => {
+                assert!(
+                    api.fail_after_durable_action_sequences
+                        .lock()
+                        .unwrap()
+                        .is_empty(),
+                    "every compensation replica lost-reply injection must be exercised"
+                );
+                assert_eq!(*api.uid_label_patch_attempts.lock().unwrap(), 2);
+                assert_eq!(*api.uid_label_patch_accepted.lock().unwrap(), 2);
+                assert_eq!(
+                    *api.uid_label_patch_lost_replies_remaining.lock().unwrap(),
+                    0
+                );
+            }
+            ProductionSwitchoverScenario::Success => unreachable!(),
+        }
+        assert_exact_role_labels(&api, &name, &completed);
+    }
 }
 
 #[test_log::test(tokio::test)]

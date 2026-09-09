@@ -1,8 +1,10 @@
 use async_trait::async_trait;
-use kuberic_durable_execution::{ExactBytes, TerminalOutcome, Workflow, WorkflowContext};
+use kuberic_durable_execution::{
+    DurableActivity, ExactBytes, TerminalOutcome, Workflow, WorkflowContext,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::crd::{EpochStatus, StablePartitionSnapshotStatus};
+use crate::crd::StablePartitionSnapshotStatus;
 
 use super::SwitchoverWorkflowInput;
 use super::activities::{
@@ -10,20 +12,33 @@ use super::activities::{
     AttestCompensatedTopologyOutput, AttestTargetTopologyActivity, AttestTargetTopologyInput,
     AttestTargetTopologyOutput, CaptureFrozenLsnActivity, CaptureFrozenLsnInput,
     CaptureFrozenLsnOutput, CompensateDistributeReplicaEpochActivity,
-    CompensatePromoteOldPrimaryActivity, DIRECT_SWITCHOVER_CONTRACT_VERSION,
-    DemoteOldPrimaryActivity, DirectActivityAccounting, DistributeReplicaEpochActivity,
-    EffectObservation, InstallCompensationCatchUpConfigurationActivity,
-    InstallCompensationCurrentConfigurationActivity, InstallTargetCatchUpConfigurationActivity,
-    InstallTargetCurrentConfigurationActivity, LabelDirectActivity, LabelOperationRequest,
-    PromoteTargetActivity, PublishOldPrimarySecondaryLabelActivity,
-    PublishTargetPrimaryLabelActivity, ReplicaDirectActivity, ReplicaOperationRequest,
-    RestoreOldPrimaryLabelActivity, RestorePreviousCurrentConfigurationActivity,
-    RestoreTargetSecondaryLabelActivity, RevokeWritesActivity, WaitTargetCaughtUpActivity,
-    WaitTargetCaughtUpInput, WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity,
+    CompensateDistributeReplicaEpochInput, CompensatePromoteOldPrimaryActivity,
+    CompensatePromoteOldPrimaryInput, DIRECT_SWITCHOVER_CONTRACT_VERSION, DemoteOldPrimaryActivity,
+    DemoteOldPrimaryInput, DirectActivityAccounting, DistributeReplicaEpochActivity,
+    DistributeReplicaEpochInput, EffectObservation,
+    InstallCompensationCatchUpConfigurationActivity, InstallCompensationCatchUpConfigurationInput,
+    InstallCompensationCurrentConfigurationActivity, InstallCompensationCurrentConfigurationInput,
+    InstallTargetCatchUpConfigurationActivity, InstallTargetCatchUpConfigurationInput,
+    InstallTargetCurrentConfigurationActivity, InstallTargetCurrentConfigurationInput,
+    LabelDirectActivity, PromoteTargetActivity, PromoteTargetInput,
+    PublishOldPrimarySecondaryLabelActivity, PublishOldPrimarySecondaryLabelInput,
+    PublishTargetPrimaryLabelActivity, PublishTargetPrimaryLabelInput, ReplicaDirectActivity,
+    RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
+    RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
+    RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput, RevokeWritesActivity,
+    RevokeWritesInput, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
+    WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
 };
 use super::model::{DirectSwitchoverDefinition, next_deadline};
 
-const DIRECT_WORKFLOW_TRANSITION_FUEL: usize = 64;
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectSwitchoverTerminalBranch {
+    TargetSuccess,
+    RevokeSafeFailure,
+    PreviousConfigurationRestored,
+    PostPromotionCompensated,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -31,14 +46,37 @@ pub enum DirectSwitchoverTerminalRecord {
     Complete {
         snapshot: StablePartitionSnapshotStatus,
         compensated: bool,
+        branch: DirectSwitchoverTerminalBranch,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(with = "super::activities::bounded_optional_error")]
         reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         accounting: Option<DirectActivityAccounting>,
     },
     Stopped {
+        #[serde(with = "super::activities::bounded_error")]
         message: String,
     },
+}
+
+struct TransitionBudget {
+    consumed: usize,
+}
+
+impl TransitionBudget {
+    const fn new() -> Self {
+        Self { consumed: 0 }
+    }
+
+    fn consume(&mut self, activity_name: &str) -> Result<(), String> {
+        if self.consumed >= super::SWITCHOVER_MAX_TRANSITION_FUEL {
+            return Err(format!(
+                "direct switchover exhausted transition fuel before {activity_name}"
+            ));
+        }
+        self.consumed += 1;
+        Ok(())
+    }
 }
 
 pub struct DirectSwitchoverWorkflow;
@@ -63,26 +101,31 @@ impl Workflow for DirectSwitchoverWorkflow {
             Ok(definition) => definition,
             Err(error) => return stopped(error),
         };
-        let mut transition_count = 0usize;
+        let mut budget = TransitionBudget::new();
         let mut deadline = definition.initial_deadline_unix_seconds;
+        let old_primary = match definition.member(definition.old_primary_id) {
+            Ok(member) => member,
+            Err(error) => return stopped(error),
+        };
 
         let revoke = match call_replica::<RevokeWritesActivity>(
             context,
-            replica_request(
-                &definition,
-                1,
-                definition.old_primary_id,
-                definition.previous_snapshot.epoch.clone(),
-                definition.previous_snapshot.clone(),
-                deadline,
-            ),
+            &mut budget,
+            RevokeWritesInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                old_primary_id: definition.old_primary_id,
+                old_primary_instance_id: old_primary.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                redelivery: 0,
+                prepared_command: None,
+            },
         )
         .await
         {
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        transition_count += 1;
         deadline = match effect_applied(revoke) {
             Ok(observed_at) => match next_deadline(observed_at) {
                 Ok(deadline) => deadline,
@@ -94,35 +137,35 @@ impl Workflow for DirectSwitchoverWorkflow {
             }) => {
                 return attest_compensated(
                     context,
+                    &mut budget,
                     &definition,
                     definition.previous_snapshot.clone(),
                     observed_at,
                     message,
+                    DirectSwitchoverTerminalBranch::RevokeSafeFailure,
                 )
                 .await;
             }
             Err(EffectBranch::Stopped(message)) => return stopped(message),
         };
 
-        let old_primary = match definition.member(definition.old_primary_id) {
-            Ok(member) => member,
-            Err(error) => return stopped(error),
-        };
-        let captured = match context
-            .call::<CaptureFrozenLsnActivity>(CaptureFrozenLsnInput {
+        let captured = match call_activity::<CaptureFrozenLsnActivity>(
+            context,
+            &mut budget,
+            CaptureFrozenLsnInput {
                 contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
                 execution_id: definition.execution_id.clone(),
                 old_primary_id: definition.old_primary_id,
                 old_primary_instance_id: old_primary.instance_id.clone(),
                 expected_epoch: definition.previous_snapshot.epoch.clone(),
                 deadline_unix_seconds: deadline,
-            })
-            .await
+            },
+        )
+        .await
         {
             Ok(result) => result,
             Err(error) => return stopped(format!("capture frozen LSN activity failed: {error}")),
         };
-        transition_count += 1;
         let (frozen_lsn, observed_at) = match captured {
             CaptureFrozenLsnOutput::Captured {
                 frozen_lsn,
@@ -140,8 +183,10 @@ impl Workflow for DirectSwitchoverWorkflow {
             Ok(member) => member,
             Err(error) => return stopped(error),
         };
-        let caught_up = match context
-            .call::<WaitTargetCaughtUpActivity>(WaitTargetCaughtUpInput {
+        let caught_up = match call_activity::<WaitTargetCaughtUpActivity>(
+            context,
+            &mut budget,
+            WaitTargetCaughtUpInput {
                 contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
                 execution_id: definition.execution_id.clone(),
                 target_id: definition.target_primary_id,
@@ -149,13 +194,13 @@ impl Workflow for DirectSwitchoverWorkflow {
                 expected_epoch: definition.previous_snapshot.epoch.clone(),
                 frozen_lsn,
                 deadline_unix_seconds: deadline,
-            })
-            .await
+            },
+        )
+        .await
         {
             Ok(result) => result,
             Err(error) => return stopped(format!("target catch-up activity failed: {error}")),
         };
-        transition_count += 1;
         deadline = match caught_up {
             WaitTargetCaughtUpOutput::CaughtUp {
                 observed_at_unix_seconds,
@@ -169,6 +214,7 @@ impl Workflow for DirectSwitchoverWorkflow {
             } => {
                 return restore_previous_configuration(
                     context,
+                    &mut budget,
                     &definition,
                     observed_at_unix_seconds,
                     message,
@@ -180,21 +226,22 @@ impl Workflow for DirectSwitchoverWorkflow {
 
         let demote = match call_replica::<DemoteOldPrimaryActivity>(
             context,
-            replica_request(
-                &definition,
-                2,
-                definition.old_primary_id,
-                definition.target_snapshot.epoch.clone(),
-                definition.target_snapshot.clone(),
-                deadline,
-            ),
+            &mut budget,
+            DemoteOldPrimaryInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                old_primary_id: definition.old_primary_id,
+                old_primary_instance_id: old_primary.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                redelivery: 0,
+                prepared_command: None,
+            },
         )
         .await
         {
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        transition_count += 1;
         deadline = match effect_applied(demote) {
             Ok(observed_at) => match next_deadline(observed_at) {
                 Ok(deadline) => deadline,
@@ -204,29 +251,36 @@ impl Workflow for DirectSwitchoverWorkflow {
                 observed_at,
                 message,
             }) => {
-                return restore_previous_configuration(context, &definition, observed_at, message)
-                    .await;
+                return restore_previous_configuration(
+                    context,
+                    &mut budget,
+                    &definition,
+                    observed_at,
+                    message,
+                )
+                .await;
             }
             Err(EffectBranch::Stopped(message)) => return stopped(message),
         };
 
         let promote = match call_replica::<PromoteTargetActivity>(
             context,
-            replica_request(
-                &definition,
-                3,
-                definition.target_primary_id,
-                definition.previous_snapshot.epoch.clone(),
-                definition.target_snapshot.clone(),
-                deadline,
-            ),
+            &mut budget,
+            PromoteTargetInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                target_primary_id: definition.target_primary_id,
+                target_primary_instance_id: target.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                redelivery: 0,
+                prepared_command: None,
+            },
         )
         .await
         {
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        transition_count += 1;
         deadline = match effect_applied(promote) {
             Ok(observed_at) => match next_deadline(observed_at) {
                 Ok(deadline) => deadline,
@@ -238,6 +292,7 @@ impl Workflow for DirectSwitchoverWorkflow {
             }) => {
                 return compensate_after_promotion_failure(
                     context,
+                    &mut budget,
                     &definition,
                     observed_at,
                     message,
@@ -252,27 +307,33 @@ impl Workflow for DirectSwitchoverWorkflow {
             .into_iter()
             .enumerate()
         {
-            let sequence = match u32::try_from(index) {
-                Ok(index) => 100 + index,
+            let distribution_index = match u8::try_from(index) {
+                Ok(index) => index,
                 Err(_) => return stopped("normal epoch distribution index overflow".to_string()),
+            };
+            let replica = match definition.member(replica_id) {
+                Ok(member) => member,
+                Err(error) => return stopped(error),
             };
             let result = match call_replica::<DistributeReplicaEpochActivity>(
                 context,
-                replica_request(
-                    &definition,
-                    sequence,
+                &mut budget,
+                DistributeReplicaEpochInput {
+                    contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                    execution_id: definition.execution_id.clone(),
+                    distribution_index,
                     replica_id,
-                    definition.target_snapshot.epoch.clone(),
-                    definition.target_snapshot.clone(),
-                    deadline,
-                ),
+                    replica_instance_id: replica.instance_id.clone(),
+                    deadline_unix_seconds: deadline,
+                    redelivery: 0,
+                    prepared_command: None,
+                },
             )
             .await
             {
                 Ok(result) => result,
                 Err(error) => return stopped(error),
             };
-            transition_count += 1;
             deadline = match late_effect_deadline(result) {
                 Ok(deadline) => deadline,
                 Err(message) => return stopped(message),
@@ -280,24 +341,11 @@ impl Workflow for DirectSwitchoverWorkflow {
         }
 
         macro_rules! run_target_replica_step {
-            ($activity:ty, $sequence:expr) => {{
-                let result = match call_replica::<$activity>(
-                    context,
-                    replica_request(
-                        &definition,
-                        $sequence,
-                        definition.target_primary_id,
-                        definition.target_snapshot.epoch.clone(),
-                        definition.target_snapshot.clone(),
-                        deadline,
-                    ),
-                )
-                .await
-                {
+            ($activity:ty, $input:expr) => {{
+                let result = match call_replica::<$activity>(context, &mut budget, $input).await {
                     Ok(result) => result,
                     Err(error) => return stopped(error),
                 };
-                transition_count += 1;
                 deadline = match late_effect_deadline(result) {
                     Ok(deadline) => deadline,
                     Err(message) => return stopped(message),
@@ -305,26 +353,60 @@ impl Workflow for DirectSwitchoverWorkflow {
             }};
         }
 
-        run_target_replica_step!(InstallTargetCatchUpConfigurationActivity, 1000);
-        run_target_replica_step!(WaitTargetWriteQuorumActivity, 1001);
-        run_target_replica_step!(InstallTargetCurrentConfigurationActivity, 1002);
+        run_target_replica_step!(
+            InstallTargetCatchUpConfigurationActivity,
+            InstallTargetCatchUpConfigurationInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                target_primary_id: definition.target_primary_id,
+                target_primary_instance_id: target.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                redelivery: 0,
+                prepared_command: None,
+            }
+        );
+        run_target_replica_step!(
+            WaitTargetWriteQuorumActivity,
+            WaitTargetWriteQuorumInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                target_primary_id: definition.target_primary_id,
+                target_primary_instance_id: target.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                redelivery: 0,
+                prepared_command: None,
+            }
+        );
+        run_target_replica_step!(
+            InstallTargetCurrentConfigurationActivity,
+            InstallTargetCurrentConfigurationInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                target_primary_id: definition.target_primary_id,
+                target_primary_instance_id: target.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                redelivery: 0,
+                prepared_command: None,
+            }
+        );
 
         let target_label = match call_label::<PublishTargetPrimaryLabelActivity>(
             context,
-            label_request(
-                &definition,
-                1003,
-                definition.target_primary_id,
-                "primary",
-                deadline,
-            ),
+            &mut budget,
+            PublishTargetPrimaryLabelInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                target_primary_id: definition.target_primary_id,
+                target_primary_instance_id: target.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                prepared_command: None,
+            },
         )
         .await
         {
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        transition_count += 1;
         deadline = match late_effect_deadline(target_label) {
             Ok(deadline) => deadline,
             Err(message) => return stopped(message),
@@ -332,42 +414,49 @@ impl Workflow for DirectSwitchoverWorkflow {
 
         let old_label = match call_label::<PublishOldPrimarySecondaryLabelActivity>(
             context,
-            label_request(
-                &definition,
-                1004,
-                definition.old_primary_id,
-                "secondary",
-                deadline,
-            ),
+            &mut budget,
+            PublishOldPrimarySecondaryLabelInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                old_primary_id: definition.old_primary_id,
+                old_primary_instance_id: old_primary.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                prepared_command: None,
+            },
         )
         .await
         {
             Ok(result) => result,
             Err(error) => return stopped(error),
         };
-        transition_count += 1;
         deadline = match late_effect_deadline(old_label) {
             Ok(deadline) => deadline,
             Err(message) => return stopped(message),
         };
 
-        if transition_count >= DIRECT_WORKFLOW_TRANSITION_FUEL {
-            return stopped("direct switchover exhausted transition fuel".to_string());
-        }
-        match context
-            .call::<AttestTargetTopologyActivity>(AttestTargetTopologyInput {
+        match call_activity::<AttestTargetTopologyActivity>(
+            context,
+            &mut budget,
+            AttestTargetTopologyInput {
                 contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
                 execution_id: definition.execution_id.clone(),
                 expected_snapshot: definition.target_snapshot.clone(),
                 deadline_unix_seconds: deadline,
-            })
-            .await
+            },
+        )
+        .await
         {
             Ok(AttestTargetTopologyOutput::Attested {
                 snapshot,
                 accounting,
                 ..
-            }) => complete(snapshot, false, None, accounting),
+            }) => complete(
+                snapshot,
+                false,
+                DirectSwitchoverTerminalBranch::TargetSuccess,
+                None,
+                accounting,
+            ),
             Ok(AttestTargetTopologyOutput::DeadlineExceeded { message, .. })
             | Ok(AttestTargetTopologyOutput::Conflicting { message, .. }) => stopped(message),
             Err(error) => stopped(format!("target topology attestation failed: {error}")),
@@ -377,6 +466,7 @@ impl Workflow for DirectSwitchoverWorkflow {
 
 async fn restore_previous_configuration(
     context: &mut WorkflowContext<'_>,
+    budget: &mut TransitionBudget,
     definition: &DirectSwitchoverDefinition,
     observed_at_unix_seconds: i64,
     reason: String,
@@ -385,16 +475,22 @@ async fn restore_previous_configuration(
         Ok(deadline) => deadline,
         Err(error) => return stopped(error),
     };
+    let old_primary = match definition.member(definition.old_primary_id) {
+        Ok(member) => member,
+        Err(error) => return stopped(error),
+    };
     let restore = match call_replica::<RestorePreviousCurrentConfigurationActivity>(
         context,
-        replica_request(
-            definition,
-            1500,
-            definition.old_primary_id,
-            definition.previous_snapshot.epoch.clone(),
-            definition.previous_snapshot.clone(),
-            deadline,
-        ),
+        budget,
+        RestorePreviousCurrentConfigurationInput {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: definition.execution_id.clone(),
+            old_primary_id: definition.old_primary_id,
+            old_primary_instance_id: old_primary.instance_id.clone(),
+            deadline_unix_seconds: deadline,
+            redelivery: 0,
+            prepared_command: None,
+        },
     )
     .await
     {
@@ -409,16 +505,19 @@ async fn restore_previous_configuration(
     };
     attest_compensated(
         context,
+        budget,
         definition,
         definition.previous_snapshot.clone(),
         observed_at,
         reason,
+        DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
     )
     .await
 }
 
 async fn compensate_after_promotion_failure(
     context: &mut WorkflowContext<'_>,
+    budget: &mut TransitionBudget,
     definition: &DirectSwitchoverDefinition,
     observed_at_unix_seconds: i64,
     reason: String,
@@ -428,17 +527,23 @@ async fn compensate_after_promotion_failure(
         Ok(deadline) => deadline,
         Err(error) => return stopped(error),
     };
+    let old_primary = match definition.member(definition.old_primary_id) {
+        Ok(member) => member,
+        Err(error) => return stopped(error),
+    };
 
     let promote_old = match call_replica::<CompensatePromoteOldPrimaryActivity>(
         context,
-        replica_request(
-            definition,
-            2000,
-            definition.old_primary_id,
-            definition.target_snapshot.epoch.clone(),
-            snapshot.clone(),
-            deadline,
-        ),
+        budget,
+        CompensatePromoteOldPrimaryInput {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: definition.execution_id.clone(),
+            old_primary_id: definition.old_primary_id,
+            old_primary_instance_id: old_primary.instance_id.clone(),
+            deadline_unix_seconds: deadline,
+            redelivery: 0,
+            prepared_command: None,
+        },
     )
     .await
     {
@@ -455,20 +560,27 @@ async fn compensate_after_promotion_failure(
         .into_iter()
         .enumerate()
     {
-        let sequence = match u32::try_from(index) {
-            Ok(index) => 2100 + index,
+        let distribution_index = match u8::try_from(index) {
+            Ok(index) => index,
             Err(_) => return stopped("compensation epoch distribution index overflow".to_string()),
+        };
+        let replica = match definition.member(replica_id) {
+            Ok(member) => member,
+            Err(error) => return stopped(error),
         };
         let result = match call_replica::<CompensateDistributeReplicaEpochActivity>(
             context,
-            replica_request(
-                definition,
-                sequence,
+            budget,
+            CompensateDistributeReplicaEpochInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: definition.execution_id.clone(),
+                distribution_index,
                 replica_id,
-                definition.target_snapshot.epoch.clone(),
-                snapshot.clone(),
-                deadline,
-            ),
+                replica_instance_id: replica.instance_id.clone(),
+                deadline_unix_seconds: deadline,
+                redelivery: 0,
+                prepared_command: None,
+            },
         )
         .await
         {
@@ -481,36 +593,40 @@ async fn compensate_after_promotion_failure(
         };
     }
 
-    for (sequence, step) in [
-        (2001, CompensationStep::CatchUpConfiguration),
-        (2002, CompensationStep::CurrentConfiguration),
+    for step in [
+        CompensationStep::CatchUpConfiguration,
+        CompensationStep::CurrentConfiguration,
     ] {
         let result = match step {
             CompensationStep::CatchUpConfiguration => {
                 call_replica::<InstallCompensationCatchUpConfigurationActivity>(
                     context,
-                    replica_request(
-                        definition,
-                        sequence,
-                        definition.old_primary_id,
-                        definition.target_snapshot.epoch.clone(),
-                        snapshot.clone(),
-                        deadline,
-                    ),
+                    budget,
+                    InstallCompensationCatchUpConfigurationInput {
+                        contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                        execution_id: definition.execution_id.clone(),
+                        old_primary_id: definition.old_primary_id,
+                        old_primary_instance_id: old_primary.instance_id.clone(),
+                        deadline_unix_seconds: deadline,
+                        redelivery: 0,
+                        prepared_command: None,
+                    },
                 )
                 .await
             }
             CompensationStep::CurrentConfiguration => {
                 call_replica::<InstallCompensationCurrentConfigurationActivity>(
                     context,
-                    replica_request(
-                        definition,
-                        sequence,
-                        definition.old_primary_id,
-                        definition.target_snapshot.epoch.clone(),
-                        snapshot.clone(),
-                        deadline,
-                    ),
+                    budget,
+                    InstallCompensationCurrentConfigurationInput {
+                        contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                        execution_id: definition.execution_id.clone(),
+                        old_primary_id: definition.old_primary_id,
+                        old_primary_instance_id: old_primary.instance_id.clone(),
+                        deadline_unix_seconds: deadline,
+                        redelivery: 0,
+                        prepared_command: None,
+                    },
                 )
                 .await
             }
@@ -527,13 +643,15 @@ async fn compensate_after_promotion_failure(
 
     let restore_old_label = match call_label::<RestoreOldPrimaryLabelActivity>(
         context,
-        label_request(
-            definition,
-            2003,
-            definition.old_primary_id,
-            "primary",
-            deadline,
-        ),
+        budget,
+        RestoreOldPrimaryLabelInput {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: definition.execution_id.clone(),
+            old_primary_id: definition.old_primary_id,
+            old_primary_instance_id: old_primary.instance_id.clone(),
+            deadline_unix_seconds: deadline,
+            prepared_command: None,
+        },
     )
     .await
     {
@@ -547,13 +665,18 @@ async fn compensate_after_promotion_failure(
 
     let restore_target_label = match call_label::<RestoreTargetSecondaryLabelActivity>(
         context,
-        label_request(
-            definition,
-            2004,
-            definition.target_primary_id,
-            "secondary",
-            deadline,
-        ),
+        budget,
+        RestoreTargetSecondaryLabelInput {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: definition.execution_id.clone(),
+            target_primary_id: definition.target_primary_id,
+            target_primary_instance_id: definition
+                .member(definition.target_primary_id)
+                .map(|member| member.instance_id.clone())
+                .unwrap_or_default(),
+            deadline_unix_seconds: deadline,
+            prepared_command: None,
+        },
     )
     .await
     {
@@ -567,55 +690,72 @@ async fn compensate_after_promotion_failure(
         }
     };
 
-    attest_compensated(context, definition, snapshot, observed_at, reason).await
+    attest_compensated(
+        context,
+        budget,
+        definition,
+        snapshot,
+        observed_at,
+        reason,
+        DirectSwitchoverTerminalBranch::PostPromotionCompensated,
+    )
+    .await
 }
 
 async fn attest_compensated(
     context: &mut WorkflowContext<'_>,
+    budget: &mut TransitionBudget,
     definition: &DirectSwitchoverDefinition,
     snapshot: StablePartitionSnapshotStatus,
     observed_at_unix_seconds: i64,
     reason: String,
+    branch: DirectSwitchoverTerminalBranch,
 ) -> TerminalOutcome {
     let deadline = match next_deadline(observed_at_unix_seconds) {
         Ok(deadline) => deadline,
         Err(error) => return stopped(error),
     };
-    match context
-        .call::<AttestCompensatedTopologyActivity>(AttestCompensatedTopologyInput {
+    match call_activity::<AttestCompensatedTopologyActivity>(
+        context,
+        budget,
+        AttestCompensatedTopologyInput {
             contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
             execution_id: definition.execution_id.clone(),
             expected_snapshot: snapshot.clone(),
             deadline_unix_seconds: deadline,
-        })
-        .await
+        },
+    )
+    .await
     {
         Ok(AttestCompensatedTopologyOutput::Attested {
             snapshot,
             accounting,
             ..
-        }) => complete(snapshot, true, Some(reason), accounting),
+        }) => complete(snapshot, true, branch, Some(reason), accounting),
         Ok(AttestCompensatedTopologyOutput::DeadlineExceeded { message, .. })
         | Ok(AttestCompensatedTopologyOutput::Conflicting { message, .. }) => stopped(message),
         Err(error) => stopped(format!("compensated topology attestation failed: {error}")),
     }
 }
 
-async fn call_replica<A: ReplicaDirectActivity>(
+async fn call_replica<A>(
     context: &mut WorkflowContext<'_>,
-    mut request: ReplicaOperationRequest,
-) -> Result<EffectObservation, String> {
-    let first = context
-        .call::<A>(A::input(request.clone()))
+    budget: &mut TransitionBudget,
+    mut input: A::Input,
+) -> Result<EffectObservation, String>
+where
+    A: ReplicaDirectActivity,
+    A::Input: Clone,
+{
+    let first = call_activity::<A>(context, budget, input.clone())
         .await
         .map(A::observation)
         .map_err(|error| format!("{} activity failed: {error}", A::NAME))?;
     if !matches!(first, EffectObservation::ProvenNoAdmission { .. }) {
         return Ok(first);
     }
-    request.redelivery = 1;
-    let second = context
-        .call::<A>(A::input(request))
+    A::set_redelivery(&mut input, 1);
+    let second = call_activity::<A>(context, budget, input)
         .await
         .map(A::observation)
         .map_err(|error| format!("{} redelivery failed: {error}", A::NAME))?;
@@ -630,64 +770,25 @@ async fn call_replica<A: ReplicaDirectActivity>(
 
 async fn call_label<A: LabelDirectActivity>(
     context: &mut WorkflowContext<'_>,
-    request: LabelOperationRequest,
+    budget: &mut TransitionBudget,
+    input: A::Input,
 ) -> Result<EffectObservation, String> {
-    context
-        .call::<A>(A::input(request))
+    call_activity::<A>(context, budget, input)
         .await
         .map(A::observation)
         .map_err(|error| format!("{} activity failed: {error}", A::NAME))
 }
 
-fn replica_request(
-    definition: &DirectSwitchoverDefinition,
-    sequence: u32,
-    target_id: i64,
-    expected_epoch: EpochStatus,
-    desired_snapshot: StablePartitionSnapshotStatus,
-    deadline_unix_seconds: i64,
-) -> ReplicaOperationRequest {
-    let target_instance_id = definition
-        .member(target_id)
-        .map(|member| member.instance_id.clone())
-        .unwrap_or_default();
-    ReplicaOperationRequest {
-        contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-        execution_id: definition.execution_id.clone(),
-        action_id: format!("{}:{sequence}", definition.execution_id),
-        sequence,
-        target_id,
-        target_instance_id,
-        expected_epoch,
-        desired_snapshot,
-        deadline_unix_seconds,
-        redelivery: 0,
-        prepared_command: None,
-    }
-}
-
-fn label_request(
-    definition: &DirectSwitchoverDefinition,
-    sequence: u32,
-    target_id: i64,
-    desired_role: &str,
-    deadline_unix_seconds: i64,
-) -> LabelOperationRequest {
-    let target_instance_id = definition
-        .member(target_id)
-        .map(|member| member.instance_id.clone())
-        .unwrap_or_default();
-    LabelOperationRequest {
-        contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
-        execution_id: definition.execution_id.clone(),
-        action_id: format!("{}:{sequence}", definition.execution_id),
-        sequence,
-        target_id,
-        target_instance_id,
-        desired_role: desired_role.to_string(),
-        deadline_unix_seconds,
-        prepared_command: None,
-    }
+async fn call_activity<A: DurableActivity>(
+    context: &mut WorkflowContext<'_>,
+    budget: &mut TransitionBudget,
+    input: A::Input,
+) -> Result<A::Output, String> {
+    budget.consume(A::NAME)?;
+    context
+        .call::<A>(input)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 enum EffectBranch {
@@ -700,11 +801,7 @@ fn effect_applied(observation: EffectObservation) -> Result<i64, EffectBranch> {
         EffectObservation::Applied {
             observed_at_unix_seconds,
         } => Ok(observed_at_unix_seconds),
-        EffectObservation::Rejected {
-            observed_at_unix_seconds,
-            message,
-        }
-        | EffectObservation::Failed {
+        EffectObservation::Failed {
             observed_at_unix_seconds,
             message,
         }
@@ -727,8 +824,7 @@ fn late_effect_deadline(observation: EffectObservation) -> Result<i64, String> {
     let observed_at = observation.observed_at_unix_seconds();
     match observation {
         EffectObservation::Applied { .. } => next_deadline(observed_at),
-        EffectObservation::Rejected { message, .. }
-        | EffectObservation::Failed { message, .. }
+        EffectObservation::Failed { message, .. }
         | EffectObservation::DeadlineExceeded { message, .. }
         | EffectObservation::UnavailableAtDeadline { message, .. }
         | EffectObservation::Conflicting { message, .. } => Err(message),
@@ -746,12 +842,14 @@ enum CompensationStep {
 fn complete(
     snapshot: StablePartitionSnapshotStatus,
     compensated: bool,
+    branch: DirectSwitchoverTerminalBranch,
     reason: Option<String>,
     accounting: Option<DirectActivityAccounting>,
 ) -> TerminalOutcome {
     terminal(DirectSwitchoverTerminalRecord::Complete {
         snapshot,
         compensated,
+        branch,
         reason: reason
             .map(|reason| super::bounded_utf8(&reason, super::SWITCHOVER_MAX_ERROR_BYTES)),
         accounting,
@@ -982,6 +1080,7 @@ mod tests {
                 terminal,
                 DirectSwitchoverTerminalRecord::Complete {
                     compensated: false,
+                    branch: DirectSwitchoverTerminalBranch::TargetSuccess,
                     ..
                 }
             ));
@@ -1025,6 +1124,7 @@ mod tests {
                 terminal,
                 DirectSwitchoverTerminalRecord::Complete {
                     compensated: true,
+                    branch: DirectSwitchoverTerminalBranch::PostPromotionCompensated,
                     ..
                 }
             ));
@@ -1058,6 +1158,7 @@ mod tests {
                 terminal,
                 DirectSwitchoverTerminalRecord::Complete {
                     compensated: true,
+                    branch: DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
                     ..
                 }
             ));
@@ -1126,7 +1227,16 @@ mod tests {
                 terminal,
                 DirectSwitchoverTerminalRecord::Complete {
                     compensated: true,
+                    branch,
                     ..
+                } if branch == match activity_name {
+                    RevokeWritesActivity::NAME =>
+                        DirectSwitchoverTerminalBranch::RevokeSafeFailure,
+                    DemoteOldPrimaryActivity::NAME =>
+                        DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
+                    PromoteTargetActivity::NAME =>
+                        DirectSwitchoverTerminalBranch::PostPromotionCompensated,
+                    _ => unreachable!(),
                 }
             ));
             assert!(
@@ -1264,5 +1374,169 @@ mod tests {
         };
         assert!(message.len() <= super::super::SWITCHOVER_MAX_ERROR_BYTES);
         assert!(message.is_char_boundary(message.len()));
+
+        for exact in ["x".repeat(512), "é".repeat(256)] {
+            assert!(
+                serde_json::to_vec(&DirectSwitchoverTerminalRecord::Stopped { message: exact })
+                    .is_ok()
+            );
+        }
+        for one_over in ["x".repeat(513), "é".repeat(257)] {
+            assert!(
+                serde_json::to_vec(&DirectSwitchoverTerminalRecord::Stopped {
+                    message: one_over.clone()
+                })
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<DirectSwitchoverTerminalRecord>(serde_json::json!({
+                    "status": "stopped",
+                    "message": one_over,
+                }))
+                .is_err()
+            );
+        }
+        let snapshot = snapshot(2);
+        for exact in ["x".repeat(512), "é".repeat(256)] {
+            assert!(
+                serde_json::to_vec(&DirectSwitchoverTerminalRecord::Complete {
+                    snapshot: snapshot.clone(),
+                    compensated: true,
+                    branch: DirectSwitchoverTerminalBranch::RevokeSafeFailure,
+                    reason: Some(exact),
+                    accounting: Some(DirectActivityAccounting::new(1, 1)),
+                })
+                .is_ok()
+            );
+        }
+        for one_over in ["x".repeat(513), "é".repeat(257)] {
+            assert!(
+                serde_json::to_vec(&DirectSwitchoverTerminalRecord::Complete {
+                    snapshot: snapshot.clone(),
+                    compensated: true,
+                    branch: DirectSwitchoverTerminalBranch::RevokeSafeFailure,
+                    reason: Some(one_over.clone()),
+                    accounting: Some(DirectActivityAccounting::new(1, 1)),
+                })
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<DirectSwitchoverTerminalRecord>(serde_json::json!({
+                    "status": "complete",
+                    "snapshot": snapshot.clone(),
+                    "compensated": true,
+                    "branch": "revoke_safe_failure",
+                    "reason": one_over,
+                    "accounting": {
+                        "externalEffectCount": 1,
+                        "passiveObservationCount": 1,
+                    },
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct BudgetProbeInput {
+        index: usize,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct BudgetProbeOutput;
+
+    struct BudgetProbeActivity;
+
+    impl DurableActivity for BudgetProbeActivity {
+        type Input = BudgetProbeInput;
+        type Output = BudgetProbeOutput;
+
+        const NAME: &'static str = "kuberic.switchover.test-transition-budget";
+        const VERSION: u32 = 1;
+        const MAX_INPUT_BYTES: u64 = 128;
+        const MAX_RESULT_BYTES: u64 = 128;
+    }
+
+    struct BudgetProbeWorkflow {
+        calls: usize,
+    }
+
+    #[async_trait]
+    impl Workflow for BudgetProbeWorkflow {
+        async fn run(
+            &self,
+            context: &mut WorkflowContext<'_>,
+            _input: ExactBytes,
+        ) -> TerminalOutcome {
+            let mut budget = TransitionBudget::new();
+            for index in 0..self.calls {
+                if let Err(error) = call_activity::<BudgetProbeActivity>(
+                    context,
+                    &mut budget,
+                    BudgetProbeInput { index },
+                )
+                .await
+                {
+                    return stopped(error);
+                }
+            }
+            TerminalOutcome::succeeded(ExactBytes::new(b"{}".to_vec()))
+        }
+    }
+
+    async fn run_budget_probe(calls: usize) -> (TerminalOutcome, u64) {
+        let execution_id = ExecutionId::from_bytes([93; 16]);
+        let execution = ExecutionSpec::new(execution_id, ExactBytes::new(b"{}".to_vec()), 4_096);
+        let mut host = DurableHost::new(
+            InMemoryCheckpointStore::new(),
+            HostEpoch::from_bytes([94; 16]),
+            CheckpointLimits::new(65, 1024 * 1024, 16 * 1024).unwrap(),
+        );
+        let workflow = BudgetProbeWorkflow { calls };
+        loop {
+            match host.turn(&workflow, execution.clone()).await {
+                HostOutcome::ScheduleAccepted { .. } => {}
+                HostOutcome::DispatchPermitted { permit, .. } => {
+                    let outcome = host
+                        .observe(
+                            &execution,
+                            ActivityObservation::new(
+                                permit.activity().clone(),
+                                kuberic_durable_execution::encode_activity_result::<
+                                    BudgetProbeActivity,
+                                >(&BudgetProbeOutput)
+                                .unwrap(),
+                            ),
+                        )
+                        .await;
+                    assert!(matches!(outcome, HostOutcome::ObservationAccepted { .. }));
+                }
+                HostOutcome::WorkflowCompleted {
+                    outcome,
+                    completed_activity_count,
+                    ..
+                } => return (outcome, completed_activity_count),
+                other => panic!("unexpected budget probe outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_transition_budget_is_enforced_at_execution_boundary() {
+        let (exact, exact_count) =
+            run_budget_probe(super::super::SWITCHOVER_MAX_TRANSITION_FUEL).await;
+        assert!(matches!(exact, TerminalOutcome::Succeeded(_)));
+        assert_eq!(
+            exact_count,
+            super::super::SWITCHOVER_MAX_TRANSITION_FUEL as u64
+        );
+
+        let (one_over, one_over_count) =
+            run_budget_probe(super::super::SWITCHOVER_MAX_TRANSITION_FUEL + 1).await;
+        assert!(matches!(one_over, TerminalOutcome::Failed(_)));
+        assert_eq!(
+            one_over_count,
+            super::super::SWITCHOVER_MAX_TRANSITION_FUEL as u64
+        );
     }
 }
