@@ -8,11 +8,13 @@ use crate::crd::{EpochStatus, StablePartitionSnapshotStatus};
 
 use super::SwitchoverWorkflowInput;
 use super::activities::{
-    AttestCompensatedTopologyActivity, AttestTargetTopologyActivity, AttestTopologyInput,
-    AttestTopologyOutput, CaptureFrozenLsnActivity, CaptureFrozenLsnInput, CaptureFrozenLsnOutput,
-    CompensateDistributeReplicaEpochActivity, CompensatePromoteOldPrimaryActivity,
-    DIRECT_SWITCHOVER_CONTRACT_VERSION, DemoteOldPrimaryActivity, DistributeReplicaEpochActivity,
-    EffectObservation, InstallCompensationCatchUpConfigurationActivity,
+    AttestCompensatedTopologyActivity, AttestCompensatedTopologyInput,
+    AttestCompensatedTopologyOutput, AttestTargetTopologyActivity, AttestTargetTopologyInput,
+    AttestTargetTopologyOutput, CaptureFrozenLsnActivity, CaptureFrozenLsnInput,
+    CaptureFrozenLsnOutput, CompensateDistributeReplicaEpochActivity,
+    CompensatePromoteOldPrimaryActivity, DIRECT_SWITCHOVER_CONTRACT_VERSION,
+    DemoteOldPrimaryActivity, DistributeReplicaEpochActivity, EffectObservation,
+    InstallCompensationCatchUpConfigurationActivity,
     InstallCompensationCurrentConfigurationActivity, InstallTargetCatchUpConfigurationActivity,
     InstallTargetCurrentConfigurationActivity, LabelDirectActivity, LabelOperationRequest,
     PromoteTargetActivity, PublishOldPrimarySecondaryLabelActivity,
@@ -353,7 +355,7 @@ impl Workflow for DirectSwitchoverWorkflow {
             return stopped("direct switchover exhausted transition fuel".to_string());
         }
         match context
-            .call::<AttestTargetTopologyActivity>(AttestTopologyInput {
+            .call::<AttestTargetTopologyActivity>(AttestTargetTopologyInput {
                 contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
                 execution_id: definition.execution_id.clone(),
                 expected_snapshot: definition.target_snapshot.clone(),
@@ -361,11 +363,11 @@ impl Workflow for DirectSwitchoverWorkflow {
             })
             .await
         {
-            Ok(AttestTopologyOutput::Attested { .. }) => {
+            Ok(AttestTargetTopologyOutput::Attested { .. }) => {
                 complete(definition.target_snapshot, false, None)
             }
-            Ok(AttestTopologyOutput::DeadlineExceeded { message, .. })
-            | Ok(AttestTopologyOutput::Conflicting { message, .. }) => stopped(message),
+            Ok(AttestTargetTopologyOutput::DeadlineExceeded { message, .. })
+            | Ok(AttestTargetTopologyOutput::Conflicting { message, .. }) => stopped(message),
             Err(error) => stopped(format!("target topology attestation failed: {error}")),
         }
     }
@@ -578,7 +580,7 @@ async fn attest_compensated(
         Err(error) => return stopped(error),
     };
     match context
-        .call::<AttestCompensatedTopologyActivity>(AttestTopologyInput {
+        .call::<AttestCompensatedTopologyActivity>(AttestCompensatedTopologyInput {
             contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
             execution_id: definition.execution_id.clone(),
             expected_snapshot: snapshot.clone(),
@@ -586,9 +588,11 @@ async fn attest_compensated(
         })
         .await
     {
-        Ok(AttestTopologyOutput::Attested { .. }) => complete(snapshot, true, Some(reason)),
-        Ok(AttestTopologyOutput::DeadlineExceeded { message, .. })
-        | Ok(AttestTopologyOutput::Conflicting { message, .. }) => stopped(message),
+        Ok(AttestCompensatedTopologyOutput::Attested { .. }) => {
+            complete(snapshot, true, Some(reason))
+        }
+        Ok(AttestCompensatedTopologyOutput::DeadlineExceeded { message, .. })
+        | Ok(AttestCompensatedTopologyOutput::Conflicting { message, .. }) => stopped(message),
         Err(error) => stopped(format!("compensated topology attestation failed: {error}")),
     }
 }
@@ -774,6 +778,7 @@ mod tests {
             },
             primary_id: 1,
             members: (1..=count)
+                .rev()
                 .map(|id| StableReplicaSnapshotStatus {
                     id,
                     instance_id: format!("instance-{id}"),
@@ -793,7 +798,11 @@ mod tests {
         replica_count: i64,
         failure: Option<(&str, &str)>,
         proven_no_admission: Option<&str>,
-    ) -> (Vec<String>, DirectSwitchoverTerminalRecord) {
+    ) -> (
+        Vec<String>,
+        Vec<Option<i64>>,
+        DirectSwitchoverTerminalRecord,
+    ) {
         let execution_id = ExecutionId::from_bytes([41; 16]);
         let operation = start_switchover("set-uid", snapshot(replica_count), 2, 100).unwrap();
         let input = SwitchoverWorkflowInput {
@@ -814,6 +823,7 @@ mod tests {
         );
         let workflow = DirectSwitchoverWorkflow;
         let mut names = Vec::new();
+        let mut targets = Vec::new();
         let mut observed_at = 101i64;
         let mut occurrences = std::collections::BTreeMap::<String, usize>::new();
 
@@ -823,6 +833,12 @@ mod tests {
                 HostOutcome::DispatchPermitted { permit, .. } => {
                     let name = permit.activity().name().name().to_string();
                     names.push(name.clone());
+                    let target_id = serde_json::from_slice::<serde_json::Value>(
+                        permit.activity().input().as_slice(),
+                    )
+                    .ok()
+                    .and_then(|value| value.get("targetId").and_then(serde_json::Value::as_i64));
+                    targets.push(target_id);
                     let occurrence = occurrences.entry(name.clone()).or_default();
                     let result = scripted_result(
                         &name,
@@ -845,7 +861,7 @@ mod tests {
                         outcome.payload().as_slice(),
                     )
                     .unwrap();
-                    return (names, record);
+                    return (names, targets, record);
                 }
                 other => panic!("unexpected direct workflow host outcome: {other:?}"),
             }
@@ -907,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_workflow_spells_out_successful_protocol() {
         for replica_count in [2, 4, 9] {
-            let (names, terminal) = run_script(replica_count, None, None).await;
+            let (names, _targets, terminal) = run_script(replica_count, None, None).await;
             let mut expected = vec![
                 RevokeWritesActivity::NAME,
                 CaptureFrozenLsnActivity::NAME,
@@ -940,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_workflow_spells_out_post_promotion_compensation() {
-        let (names, terminal) = run_script(
+        let (names, _targets, terminal) = run_script(
             3,
             Some((PromoteTargetActivity::NAME, "promotion failed")),
             None,
@@ -975,7 +991,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_workflow_spells_out_pre_promotion_compensation() {
-        let (names, terminal) = run_script(
+        let (names, _targets, terminal) = run_script(
             3,
             Some((
                 WaitTargetCaughtUpActivity::NAME,
@@ -1005,7 +1021,8 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_records_one_same_operation_redelivery() {
-        let (names, terminal) = run_script(3, None, Some(DemoteOldPrimaryActivity::NAME)).await;
+        let (names, _targets, terminal) =
+            run_script(3, None, Some(DemoteOldPrimaryActivity::NAME)).await;
         assert_eq!(
             names
                 .iter()
@@ -1024,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_late_failure_stops_without_compensation() {
-        let (names, terminal) = run_script(
+        let (names, _targets, terminal) = run_script(
             3,
             Some((
                 InstallTargetCurrentConfigurationActivity::NAME,
@@ -1050,79 +1067,100 @@ mod tests {
         }
     }
 
-    #[test]
-    fn direct_switchover_activity_fixture_matches_reducer_action_order() {
-        use crate::crd::DurableActionKind;
+    #[tokio::test]
+    async fn direct_switchover_matches_reducer_oracle_actions_targets_and_terminals() {
+        use crate::crd::{DurableActionKind, DurableOperationPhase};
+        use crate::durable::switchover::{
+            TestSwitchoverOracleScenario, test_switchover_oracle_trace,
+        };
 
-        let fixture = [
-            (DurableActionKind::RevokeWrite, RevokeWritesActivity::NAME),
-            (
-                DurableActionKind::DemoteOldPrimary,
-                DemoteOldPrimaryActivity::NAME,
-            ),
-            (
-                DurableActionKind::PromoteTarget,
-                PromoteTargetActivity::NAME,
-            ),
-            (
-                DurableActionKind::UpdateSecondaryEpoch,
-                DistributeReplicaEpochActivity::NAME,
-            ),
-            (
-                DurableActionKind::UpdateCatchUpConfiguration,
-                InstallTargetCatchUpConfigurationActivity::NAME,
-            ),
-            (
-                DurableActionKind::WaitForCatchUpQuorum,
-                WaitTargetWriteQuorumActivity::NAME,
-            ),
-            (
-                DurableActionKind::UpdateCurrentConfiguration,
-                InstallTargetCurrentConfigurationActivity::NAME,
-            ),
-            (
-                DurableActionKind::LabelTargetPrimary,
-                PublishTargetPrimaryLabelActivity::NAME,
-            ),
-            (
-                DurableActionKind::LabelOldSecondary,
-                PublishOldPrimarySecondaryLabelActivity::NAME,
-            ),
-            (
-                DurableActionKind::RestorePreviousConfiguration,
-                RestorePreviousCurrentConfigurationActivity::NAME,
-            ),
-            (
-                DurableActionKind::CompensatePromoteOldPrimary,
-                CompensatePromoteOldPrimaryActivity::NAME,
-            ),
-            (
-                DurableActionKind::CompensateUpdateSecondaryEpoch,
-                CompensateDistributeReplicaEpochActivity::NAME,
-            ),
-            (
-                DurableActionKind::CompensateCatchUpConfiguration,
-                InstallCompensationCatchUpConfigurationActivity::NAME,
-            ),
-            (
-                DurableActionKind::CompensateCurrentConfiguration,
-                InstallCompensationCurrentConfigurationActivity::NAME,
-            ),
-            (
-                DurableActionKind::CompensateLabelOldPrimary,
-                RestoreOldPrimaryLabelActivity::NAME,
-            ),
-            (
-                DurableActionKind::CompensateLabelTargetSecondary,
-                RestoreTargetSecondaryLabelActivity::NAME,
-            ),
-        ];
-        assert_eq!(fixture.len(), 16);
-        assert!(fixture.iter().all(|(_, name)| {
-            super::super::activities::ALL_DIRECT_ACTIVITY_IDENTITIES
-                .iter()
-                .any(|(direct_name, version)| direct_name == name && *version == 1)
-        }));
+        for replica_count in [2, 4, 9] {
+            for scenario in [
+                TestSwitchoverOracleScenario::Success,
+                TestSwitchoverOracleScenario::PrePromotionCompensation,
+                TestSwitchoverOracleScenario::PostPromotionCompensation,
+                TestSwitchoverOracleScenario::LateFailure,
+            ] {
+                let failure = match scenario {
+                    TestSwitchoverOracleScenario::Success => None,
+                    TestSwitchoverOracleScenario::PrePromotionCompensation => Some((
+                        WaitTargetCaughtUpActivity::NAME,
+                        "target catch-up timed out",
+                    )),
+                    TestSwitchoverOracleScenario::PostPromotionCompensation => {
+                        Some((PromoteTargetActivity::NAME, "promotion failed"))
+                    }
+                    TestSwitchoverOracleScenario::LateFailure => Some((
+                        InstallTargetCurrentConfigurationActivity::NAME,
+                        "current configuration failed",
+                    )),
+                };
+                let initial = start_switchover("set-uid", snapshot(replica_count), 2, 100).unwrap();
+                let oracle = test_switchover_oracle_trace(&initial, scenario).unwrap();
+                let (names, targets, terminal) = run_script(replica_count, failure, None).await;
+                let direct_actions = names
+                    .iter()
+                    .zip(targets)
+                    .filter_map(|(name, target)| {
+                        direct_action_kind(name).map(|kind| {
+                            (
+                                kind,
+                                target.expect("effect activity input must carry targetId"),
+                            )
+                        })
+                    })
+                    .collect::<Vec<(DurableActionKind, i64)>>();
+                assert_eq!(direct_actions, oracle.actions, "{scenario:?}");
+                let direct_terminal = match terminal {
+                    DirectSwitchoverTerminalRecord::Complete {
+                        compensated: false, ..
+                    } => DurableOperationPhase::Completed,
+                    DirectSwitchoverTerminalRecord::Complete {
+                        compensated: true, ..
+                    } => DurableOperationPhase::Failed,
+                    DirectSwitchoverTerminalRecord::Stopped { .. } => {
+                        DurableOperationPhase::Poisoned
+                    }
+                };
+                assert_eq!(direct_terminal, oracle.terminal_phase, "{scenario:?}");
+            }
+        }
+    }
+
+    fn direct_action_kind(name: &str) -> Option<crate::crd::DurableActionKind> {
+        use crate::crd::DurableActionKind as Action;
+
+        Some(match name {
+            RevokeWritesActivity::NAME => Action::RevokeWrite,
+            DemoteOldPrimaryActivity::NAME => Action::DemoteOldPrimary,
+            PromoteTargetActivity::NAME => Action::PromoteTarget,
+            DistributeReplicaEpochActivity::NAME => Action::UpdateSecondaryEpoch,
+            InstallTargetCatchUpConfigurationActivity::NAME => Action::UpdateCatchUpConfiguration,
+            WaitTargetWriteQuorumActivity::NAME => Action::WaitForCatchUpQuorum,
+            InstallTargetCurrentConfigurationActivity::NAME => Action::UpdateCurrentConfiguration,
+            PublishTargetPrimaryLabelActivity::NAME => Action::LabelTargetPrimary,
+            PublishOldPrimarySecondaryLabelActivity::NAME => Action::LabelOldSecondary,
+            RestorePreviousCurrentConfigurationActivity::NAME => {
+                Action::RestorePreviousConfiguration
+            }
+            CompensatePromoteOldPrimaryActivity::NAME => Action::CompensatePromoteOldPrimary,
+            CompensateDistributeReplicaEpochActivity::NAME => {
+                Action::CompensateUpdateSecondaryEpoch
+            }
+            InstallCompensationCatchUpConfigurationActivity::NAME => {
+                Action::CompensateCatchUpConfiguration
+            }
+            InstallCompensationCurrentConfigurationActivity::NAME => {
+                Action::CompensateCurrentConfiguration
+            }
+            RestoreOldPrimaryLabelActivity::NAME => Action::CompensateLabelOldPrimary,
+            RestoreTargetSecondaryLabelActivity::NAME => Action::CompensateLabelTargetSecondary,
+            CaptureFrozenLsnActivity::NAME
+            | WaitTargetCaughtUpActivity::NAME
+            | AttestTargetTopologyActivity::NAME
+            | AttestCompensatedTopologyActivity::NAME => return None,
+            _ => return None,
+        })
     }
 
     #[test]

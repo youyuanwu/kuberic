@@ -505,54 +505,62 @@ impl DurableActivity for WaitTargetCaughtUpActivity {
     const MAX_RESULT_BYTES: u64 = 1_024;
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AttestTopologyInput {
-    pub contract_version: u32,
-    pub execution_id: String,
-    pub expected_snapshot: StablePartitionSnapshotStatus,
-    pub deadline_unix_seconds: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AttestTopologyOutput {
-    Attested {
-        observed_at_unix_seconds: i64,
-    },
-    DeadlineExceeded {
-        observed_at_unix_seconds: i64,
-        message: String,
-    },
-    Conflicting {
-        observed_at_unix_seconds: i64,
-        message: String,
-    },
-}
-
 macro_rules! define_attestation_activity {
-    ($activity:ident, $name:literal) => {
+    ($activity:ident, $input:ident, $output:ident, $name:literal, $max_input:literal, $max_result:literal) => {
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct $input {
+            pub contract_version: u32,
+            pub execution_id: String,
+            pub expected_snapshot: StablePartitionSnapshotStatus,
+            pub deadline_unix_seconds: i64,
+        }
+
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+        pub enum $output {
+            Attested {
+                observed_at_unix_seconds: i64,
+            },
+            DeadlineExceeded {
+                observed_at_unix_seconds: i64,
+                message: String,
+            },
+            Conflicting {
+                observed_at_unix_seconds: i64,
+                message: String,
+            },
+        }
+
         pub struct $activity;
 
         impl DurableActivity for $activity {
-            type Input = AttestTopologyInput;
-            type Output = AttestTopologyOutput;
+            type Input = $input;
+            type Output = $output;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-            const MAX_INPUT_BYTES: u64 = 8_192;
-            const MAX_RESULT_BYTES: u64 = 1_024;
+            const MAX_INPUT_BYTES: u64 = $max_input;
+            const MAX_RESULT_BYTES: u64 = $max_result;
         }
     };
 }
 
 define_attestation_activity!(
     AttestTargetTopologyActivity,
-    "kuberic.switchover.attest-target-topology"
+    AttestTargetTopologyInput,
+    AttestTargetTopologyOutput,
+    "kuberic.switchover.attest-target-topology",
+    8_192,
+    1_024
 );
 define_attestation_activity!(
     AttestCompensatedTopologyActivity,
-    "kuberic.switchover.attest-compensated-topology"
+    AttestCompensatedTopologyInput,
+    AttestCompensatedTopologyOutput,
+    "kuberic.switchover.attest-compensated-topology",
+    8_192,
+    1_024
 );
 
 pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[

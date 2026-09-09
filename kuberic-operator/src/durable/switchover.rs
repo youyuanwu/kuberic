@@ -1530,6 +1530,110 @@ fn switchover_label_uid(
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TestSwitchoverOracleScenario {
+    Success,
+    PrePromotionCompensation,
+    PostPromotionCompensation,
+    LateFailure,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TestSwitchoverOracleTrace {
+    pub(crate) actions: Vec<(DurableActionKind, i64)>,
+    pub(crate) terminal_phase: DurableOperationPhase,
+}
+
+#[cfg(test)]
+pub(crate) fn test_switchover_oracle_trace(
+    initial: &DurableOperationStatus,
+    scenario: TestSwitchoverOracleScenario,
+) -> Result<TestSwitchoverOracleTrace, String> {
+    let mut operation = initial.clone();
+    let mut actions = Vec::new();
+
+    for _ in 0..64 {
+        match operation.phase {
+            DurableOperationPhase::Completed
+            | DurableOperationPhase::Failed
+            | DurableOperationPhase::Poisoned => {
+                return Ok(TestSwitchoverOracleTrace {
+                    actions,
+                    terminal_phase: operation.phase,
+                });
+            }
+            DurableOperationPhase::CaptureLsn => {
+                operation.frozen_lsn = Some(0);
+                operation.phase = DurableOperationPhase::PreCatchUp;
+                operation.phase_deadline_unix_seconds =
+                    action_deadline(operation.phase_deadline_unix_seconds)?;
+                continue;
+            }
+            DurableOperationPhase::PreCatchUp => {
+                if scenario == TestSwitchoverOracleScenario::PrePromotionCompensation {
+                    operation = match decide(
+                        &operation,
+                        &OperationObservations::new(),
+                        operation.phase_deadline_unix_seconds,
+                    )? {
+                        Decision::Persist(next) => next,
+                        other => {
+                            return Err(format!(
+                                "pre-promotion oracle produced unexpected decision: {other:?}"
+                            ));
+                        }
+                    };
+                } else {
+                    operation.phase = DurableOperationPhase::DemoteOldPrimary;
+                    operation.phase_deadline_unix_seconds =
+                        action_deadline(operation.phase_deadline_unix_seconds)?;
+                }
+                continue;
+            }
+            DurableOperationPhase::Finalize => {
+                operation.phase = DurableOperationPhase::Completed;
+                continue;
+            }
+            DurableOperationPhase::CompensateFinalize => {
+                operation.phase = DurableOperationPhase::Failed;
+                continue;
+            }
+            _ => {}
+        }
+
+        let now = operation
+            .phase_deadline_unix_seconds
+            .saturating_sub(ACTION_DEADLINE_SECONDS);
+        let next = match decide(&operation, &OperationObservations::new(), now)? {
+            Decision::Persist(next) => next,
+            other => {
+                return Err(format!(
+                    "switchover oracle produced unexpected decision in {:?}: {other:?}",
+                    operation.phase
+                ));
+            }
+        };
+        let Some(pending) = next.pending_action.clone() else {
+            operation = next;
+            continue;
+        };
+        actions.push((pending.kind, pending.target_id));
+        let inject_failure = (scenario == TestSwitchoverOracleScenario::PostPromotionCompensation
+            && pending.kind == DurableActionKind::PromoteTarget)
+            || (scenario == TestSwitchoverOracleScenario::LateFailure
+                && pending.kind == DurableActionKind::UpdateCurrentConfiguration);
+        operation = if inject_failure {
+            timeout_transition(&next, &pending, now)?
+        } else {
+            advance_after_switchover_postcondition(&next, &pending, now)?
+        };
+    }
+
+    Err("switchover oracle exhausted transition fuel".to_string())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::crd::{StableReplicaRoleStatus, StableReplicaSnapshotStatus};
