@@ -826,6 +826,47 @@ async fn framework_native_switchover_route_records_invalid_reference_condition()
 }
 
 #[tokio::test]
+async fn framework_native_switchover_route_blocks_invalid_admission_authority_without_dispatch() {
+    let valid = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
+    let mut invalid_references = Vec::new();
+    let mut foreign_authority = valid.clone();
+    foreign_authority.input.operation_authority = "other-uid".to_string();
+    invalid_references.push(foreign_authority);
+    let mut invalid_time = valid;
+    invalid_time.input.accepted_unix_seconds = i64::MAX;
+    invalid_references.push(invalid_time);
+
+    for reference in invalid_references {
+        let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+        let api = RoutingApi::new(vec![
+            pod(1, "one", "primary"),
+            pod(2, "two", "secondary"),
+            pod(3, "three", "secondary"),
+        ]);
+        let current_pods = api.pods.lock().unwrap().clone();
+
+        reconcile_framework_native_switchover(
+            &switchover_set(reference),
+            &api,
+            &state,
+            &current_pods,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            api.last_status()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| {
+                    condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Blocked"
+                })
+        );
+    }
+}
+
+#[tokio::test]
 async fn switchover_phase_without_native_reference_fails_closed_without_dispatch() {
     let mut set = switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
     let status = set.status.as_mut().unwrap();

@@ -19,6 +19,11 @@ use super::{
     record_activity_error,
 };
 
+fn action_deadline(now: i64) -> Result<i64, String> {
+    now.checked_add(ACTION_DEADLINE_SECONDS)
+        .ok_or_else(|| "switchover action deadline overflows unix time".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionObservation {
     Precondition,
@@ -91,7 +96,7 @@ pub fn start_switchover(
         minimum_committed_replicas: None,
         frozen_lsn: None,
         next_secondary_index: 0,
-        phase_deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
+        phase_deadline_unix_seconds: action_deadline(now)?,
         pending_action: None,
         last_error: None,
         failover: None,
@@ -185,7 +190,7 @@ pub fn decide(
             let mut next = operation.clone();
             next.frozen_lsn = Some(old.status.current_progress);
             next.phase = DurableOperationPhase::PreCatchUp;
-            next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+            next.phase_deadline_unix_seconds = action_deadline(now)?;
             Ok(Decision::Persist(next))
         }
         DurableOperationPhase::PreCatchUp => {
@@ -193,7 +198,7 @@ pub fn decide(
                 if now >= operation.phase_deadline_unix_seconds {
                     let mut next = operation.clone();
                     next.phase = DurableOperationPhase::RestorePreviousConfiguration;
-                    next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+                    next.phase_deadline_unix_seconds = action_deadline(now)?;
                     next.last_error =
                         Some("switchover target was unavailable during pre-catch-up".to_string());
                     return Ok(Decision::Persist(next));
@@ -226,12 +231,12 @@ pub fn decide(
             if target.status.current_progress >= frozen {
                 let mut next = operation.clone();
                 next.phase = DurableOperationPhase::DemoteOldPrimary;
-                next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+                next.phase_deadline_unix_seconds = action_deadline(now)?;
                 Ok(Decision::Persist(next))
             } else if now >= operation.phase_deadline_unix_seconds {
                 let mut next = operation.clone();
                 next.phase = DurableOperationPhase::RestorePreviousConfiguration;
-                next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+                next.phase_deadline_unix_seconds = action_deadline(now)?;
                 next.last_error =
                     Some("switchover target did not reach the frozen primary LSN".to_string());
                 Ok(Decision::Persist(next))
@@ -253,7 +258,7 @@ pub fn decide(
             if index >= secondaries.len() {
                 let mut next = operation.clone();
                 next.phase = DurableOperationPhase::UpdateCatchUpConfiguration;
-                next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+                next.phase_deadline_unix_seconds = action_deadline(now)?;
                 return Ok(Decision::Persist(next));
             }
             Ok(Decision::Persist(with_pending(
@@ -363,7 +368,7 @@ pub fn decide(
             if index >= secondaries.len() {
                 let mut next = operation.clone();
                 next.phase = DurableOperationPhase::CompensateCatchUpConfiguration;
-                next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+                next.phase_deadline_unix_seconds = action_deadline(now)?;
                 return Ok(Decision::Persist(next));
             }
             Ok(Decision::Persist(with_pending(
@@ -495,7 +500,7 @@ pub(crate) fn advance_after_switchover_postcondition(
     let mut next = operation.clone();
     next.pending_action = None;
     next.last_error = None;
-    next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+    next.phase_deadline_unix_seconds = action_deadline(now)?;
     match advance {
         PostconditionAdvance::Phase(phase) => next.phase = phase,
         PostconditionAdvance::PhaseAndResetIndex(phase) => {
@@ -607,7 +612,7 @@ fn decide_pending(
             if now >= pending.deadline_unix_seconds {
                 return Ok(Decision::Persist(timeout_transition(
                     operation, pending, now,
-                )));
+                )?));
             }
             if let Some(role) = pod_role_action(pending.kind) {
                 Ok(Decision::PatchPodRoleExactUid {
@@ -628,14 +633,14 @@ fn decide_pending(
             if now >= pending.deadline_unix_seconds {
                 Ok(Decision::Persist(timeout_transition(
                     operation, pending, now,
-                )))
+                )?))
             } else {
                 Ok(Decision::Wait)
             }
         }
         ActionObservation::Failed(error) => {
             let recorded = record_activity_error(operation, &error);
-            let mut next = timeout_transition(&recorded, pending, now);
+            let mut next = timeout_transition(&recorded, pending, now)?;
             next.last_error = Some(error);
             Ok(Decision::Persist(next))
         }
@@ -981,11 +986,17 @@ fn pending_action(
         DurableActionKind::LabelOldSecondary | DurableActionKind::CompensateLabelOldPrimary => {
             operation.old_primary_id
         }
-        DurableActionKind::UpdateSecondaryEpoch => {
-            epoch_distribution_ids(operation)[operation.next_secondary_index as usize]
-        }
+        DurableActionKind::UpdateSecondaryEpoch => *epoch_distribution_ids(operation)
+            .get(operation.next_secondary_index as usize)
+            .ok_or_else(|| {
+                "switchover secondary epoch cursor is outside the retained-member set".to_string()
+            })?,
         DurableActionKind::CompensateUpdateSecondaryEpoch => {
-            compensation_epoch_distribution_ids(operation)[operation.next_secondary_index as usize]
+            *compensation_epoch_distribution_ids(operation)
+                .get(operation.next_secondary_index as usize)
+                .ok_or_else(|| {
+                    "switchover compensation cursor is outside the secondary-member set".to_string()
+                })?
         }
         _ => return Err("non-switchover action cannot be scheduled".to_string()),
     };
@@ -1057,7 +1068,7 @@ fn pending_action(
         expected_epoch,
         desired_postcondition: postcondition,
         attempts: 0,
-        deadline_unix_seconds: now + ACTION_DEADLINE_SECONDS,
+        deadline_unix_seconds: action_deadline(now)?,
         last_error: None,
         dispatch_authorized: false,
         dispatch_agent_generation: None,
@@ -1084,10 +1095,10 @@ fn timeout_transition(
     operation: &DurableOperationStatus,
     pending: &PendingActionStatus,
     now: i64,
-) -> DurableOperationStatus {
+) -> Result<DurableOperationStatus, String> {
     let mut next = operation.clone();
     next.pending_action = None;
-    next.phase_deadline_unix_seconds = now + ACTION_DEADLINE_SECONDS;
+    next.phase_deadline_unix_seconds = action_deadline(now)?;
     next.last_error = Some(format!(
         "durable action {:?} reached its deadline",
         pending.kind
@@ -1112,7 +1123,7 @@ fn timeout_transition(
         | DurableActionKind::CompensateLabelTargetSecondary => DurableOperationPhase::Poisoned,
         _ => DurableOperationPhase::Poisoned,
     };
-    next
+    Ok(next)
 }
 
 fn exact_observation<'a>(

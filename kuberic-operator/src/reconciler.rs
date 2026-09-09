@@ -54,7 +54,7 @@ use crate::durable::switchover_execution::{
     DurableSwitchoverRuntime, DurableSwitchoverWorkflow as NativeSwitchoverWorkflow,
     SwitchoverRunnerAdapter as NativeSwitchoverRunnerAdapter,
     SwitchoverTerminal as NativeSwitchoverTerminal, native_execution_spec,
-    native_initial_operation, new_switchover_execution,
+    native_initial_operation, new_switchover_execution, validate_native_operation_authority,
 };
 #[cfg(test)]
 use crate::durable::switchover_execution::{DurableSwitchoverStepResult, encode_step_result};
@@ -2845,6 +2845,7 @@ async fn reconcile_framework_native_switchover_with_fuel(
         .ok_or_else(|| {
             "switchover phase has no framework-native execution reference".to_string()
         })?;
+    validate_native_operation_authority(reference, set_uid)?;
     let execution = native_execution_spec(reference)?;
     let host = state
         .framework_native_switchover

@@ -406,7 +406,7 @@ length; no exact byte value is a compatibility contract.
 
 The product-wide replica range is 1–9 and is enforced by both the CRD schema
 and reconciliation. A four-member end-to-end switchover test covers the former
-pilot regression, while schema and admission tests cover exactly nine and
+three-replica ceiling, while schema and admission tests cover exactly nine and
 reject ten. Generated-schema tests assert the exact current native property
 set and required fields. A dedicated isolated KinD API-server check with
 strict field validation accepts the valid native shape and rejects missing
@@ -424,13 +424,14 @@ nine-member product maximum, the corresponding projections are 31 records /
 
 The terminal payload carries the external-effect and passive-observation
 counts, so a fresh measurement store can recover the classification without
-prior active-checkpoint cache state. A successful full switchover requires exactly
-three passive observations and `9 + r` external boundaries, where `r` is the
-number of proven-no-admission redeliveries and is limited to the seven
-projected ReplicaAgent-effect slots; UID-fenced label effects have no
-redelivery path. The no-redelivery target remains 9/3, 12
-boundaries, and 13 accepted writes; fault paths may consume additional
-boundaries and writes. Compensated completion is validated against the exact
+prior active-checkpoint cache state. A successful `N`-member switchover
+requires exactly three passive observations and `N + 6 + r` external
+boundaries, where `r` is the number of proven-no-admission redeliveries and is
+limited to the `N + 4` projected ReplicaAgent-effect slots; UID-fenced label
+effects have no redelivery path. For the canonical three-member path, the
+no-redelivery target remains 9/3, 12 boundaries, and 13 accepted writes, with
+at most seven redeliveries. Fault paths may consume additional boundaries and
+writes. Compensated completion is validated against the exact
 reachable pairs for its restore or failed-promotion compensation transcript,
 including only redelivery slots belonging to effects that were actually
 exposed.

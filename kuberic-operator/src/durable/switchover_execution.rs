@@ -37,8 +37,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::crd::{
-    DurableOperationPhase, DurableOperationStatus, KubericSet, PendingActionStatus,
-    StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus, SwitchoverExecutionStatus,
+    DurableActionKind, DurableOperationPhase, DurableOperationStatus, KubericSet,
+    PendingActionStatus, StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus,
+    SwitchoverExecutionStatus,
 };
 use crate::{cluster_api::ClusterApi, reconciler::snapshot_with_observed_metadata};
 
@@ -402,6 +403,9 @@ impl Workflow for DurableSwitchoverWorkflow {
                     if let Err(error) = validate_phase_transition(&operation, &next) {
                         return terminal_failure(Some(operation), error);
                     }
+                    if let Err(error) = validate_cursor_transition(&operation, &next) {
+                        return terminal_failure(Some(operation), error);
+                    }
                     if next.phase == DurableOperationPhase::Poisoned {
                         return terminal_failure(
                             Some(next.clone()),
@@ -447,6 +451,9 @@ impl Workflow for DurableSwitchoverWorkflow {
                         Err(error) => return terminal_failure(Some(operation), error),
                     };
                     if let Err(error) = validate_phase_transition(&operation, &next) {
+                        return terminal_failure(Some(operation), error);
+                    }
+                    if let Err(error) = validate_cursor_transition(&operation, &next) {
                         return terminal_failure(Some(operation), error);
                     }
                     state = next_state;
@@ -1658,6 +1665,103 @@ fn validate_phase_transition(
     }
 }
 
+fn validate_cursor_transition(
+    current: &DurableOperationStatus,
+    next: &DurableOperationStatus,
+) -> Result<(), String> {
+    if current.phase != next.phase {
+        let member_count = current
+            .previous_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.members.len());
+        let completed_distribution = match (current.phase, next.phase) {
+            (
+                DurableOperationPhase::DistributeEpoch,
+                DurableOperationPhase::UpdateCatchUpConfiguration,
+            ) => Some(member_count.saturating_sub(2)),
+            (
+                DurableOperationPhase::CompensateDistributeEpoch,
+                DurableOperationPhase::CompensateCatchUpConfiguration,
+            ) => Some(member_count.saturating_sub(1)),
+            _ => None,
+        };
+        if let Some(expected) = completed_distribution {
+            let current_cursor = usize::try_from(current.next_secondary_index).ok();
+            let next_cursor = usize::try_from(next.next_secondary_index).ok();
+            return if current_cursor == Some(expected) && next_cursor == Some(expected) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "durable switchover advanced from {:?} before completing {expected} \
+                     secondary epoch updates",
+                    current.phase
+                ))
+            };
+        }
+        if matches!(
+            (current.phase, next.phase),
+            (
+                DurableOperationPhase::PromoteTarget,
+                DurableOperationPhase::DistributeEpoch
+            ) | (
+                DurableOperationPhase::CompensatePromoteOldPrimary,
+                DurableOperationPhase::CompensateDistributeEpoch
+            )
+        ) {
+            return if next.next_secondary_index == 0 {
+                Ok(())
+            } else {
+                Err("durable switchover did not reset the secondary cursor".to_string())
+            };
+        }
+        return if next.next_secondary_index == current.next_secondary_index {
+            Ok(())
+        } else {
+            Err(format!(
+                "invalid durable switchover secondary cursor transition {} -> {}",
+                current.next_secondary_index, next.next_secondary_index
+            ))
+        };
+    }
+    if next.next_secondary_index == current.next_secondary_index {
+        return Ok(());
+    }
+    let permitted = match current.pending_action.as_ref().map(|pending| pending.kind) {
+        Some(DurableActionKind::UpdateSecondaryEpoch) => {
+            current.phase == DurableOperationPhase::DistributeEpoch
+                && next.phase == DurableOperationPhase::DistributeEpoch
+                && current
+                    .next_secondary_index
+                    .checked_add(1)
+                    .is_some_and(|expected| next.next_secondary_index == expected)
+        }
+        Some(DurableActionKind::CompensateUpdateSecondaryEpoch) => {
+            current.phase == DurableOperationPhase::CompensateDistributeEpoch
+                && next.phase == DurableOperationPhase::CompensateDistributeEpoch
+                && current
+                    .next_secondary_index
+                    .checked_add(1)
+                    .is_some_and(|expected| next.next_secondary_index == expected)
+        }
+        Some(DurableActionKind::PromoteTarget) => {
+            next.phase == DurableOperationPhase::DistributeEpoch && next.next_secondary_index == 0
+        }
+        Some(DurableActionKind::CompensatePromoteOldPrimary) => {
+            next.phase == DurableOperationPhase::CompensateDistributeEpoch
+                && next.next_secondary_index == 0
+        }
+        _ => false,
+    };
+    if permitted {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid durable switchover secondary cursor transition {} -> {}",
+            current.next_secondary_index, next.next_secondary_index
+        ))
+    }
+}
+
 fn validate_no_admission_transition(
     current: &DurableOperationStatus,
     next: &DurableOperationStatus,
@@ -1867,6 +1971,15 @@ pub fn native_initial_operation(
     reference: &SwitchoverExecutionStatus,
 ) -> Result<DurableOperationStatus, String> {
     let input = &reference.input;
+    if input.operation_authority.is_empty()
+        || input.accepted_unix_seconds <= 0
+        || input
+            .accepted_unix_seconds
+            .checked_add(super::ACTION_DEADLINE_SECONDS)
+            .is_none()
+    {
+        return Err("framework-native switchover immutable admission input is invalid".to_string());
+    }
     start_switchover(
         &format!(
             "{}:framework-native:{}",
@@ -1876,6 +1989,19 @@ pub fn native_initial_operation(
         input.target_primary_id,
         input.accepted_unix_seconds,
     )
+}
+
+pub fn validate_native_operation_authority(
+    reference: &SwitchoverExecutionStatus,
+    expected_set_uid: &str,
+) -> Result<(), String> {
+    if expected_set_uid.is_empty() || reference.input.operation_authority != expected_set_uid {
+        return Err(
+            "framework-native switchover operation authority does not match KubericSet UID"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub fn native_execution_spec(
@@ -2104,6 +2230,29 @@ pub fn validate_switchover_operation_contract(
             previous_snapshot.members.len()
         ));
     }
+    let cursor = usize::try_from(operation.next_secondary_index)
+        .map_err(|_| "durable switchover secondary cursor is not representable".to_string())?;
+    let maximum_cursor = previous_snapshot.members.len().saturating_sub(1);
+    if cursor > maximum_cursor {
+        return Err(format!(
+            "durable switchover secondary cursor {cursor} exceeds maximum {maximum_cursor}"
+        ));
+    }
+    if let Some(pending) = operation.pending_action.as_ref() {
+        let available = match pending.kind {
+            DurableActionKind::UpdateSecondaryEpoch => {
+                previous_snapshot.members.len().saturating_sub(2)
+            }
+            DurableActionKind::CompensateUpdateSecondaryEpoch => maximum_cursor,
+            _ => maximum_cursor.saturating_add(1),
+        };
+        if cursor >= available {
+            return Err(format!(
+                "durable switchover pending {:?} has out-of-range secondary cursor {cursor}",
+                pending.kind
+            ));
+        }
+    }
     let operation_bytes = serde_json::to_vec(operation)
         .map_err(|error| format!("serialize durable switchover operation: {error}"))?
         .len();
@@ -2191,7 +2340,7 @@ impl ProjectedTranscript {
     }
 
     #[cfg(test)]
-    fn maximum_external_effect_count(&self) -> usize {
+    fn external_effect_slot_count(&self) -> usize {
         self.activities
             .iter()
             .filter(|activity| {
@@ -2375,14 +2524,17 @@ fn validate_terminal_accounting_shape(
 
     if !compensated {
         let projection = projected_success_transcript(member_count);
+        let minimum_external = projection.required_external_effect_count();
+        let maximum_external =
+            projection.required_external_effect_count() + projection.redelivery_slot_count();
         if terminal.phase != DurableOperationPhase::Completed
             || terminal.has_pending_action
             || !projection.contains_accounting(accounting)
         {
             return Err(format!(
-                "successful full switchover requires exactly three passive observations and 9..=16 \
-                 external effects (the base nine plus at most one projected redelivery per \
-                 ReplicaAgent effect), got {}/{}",
+                "successful {member_count}-member switchover requires exactly three passive \
+                 observations and {minimum_external}..={maximum_external} external effects \
+                 (at most one projected redelivery per ReplicaAgent effect), got {}/{}",
                 accounting.external_effect_count, accounting.passive_observation_count,
             ));
         }
@@ -3928,6 +4080,54 @@ mod framework_native_switchover_tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_distribution_cursor_cannot_skip_epoch_updates() {
+        let mut reference = test_reference("set-uid", snapshot(4), 2, 100).unwrap();
+        let mut initial = initial_operation(&reference).unwrap();
+        initial.phase = DurableOperationPhase::DistributeEpoch;
+        reference.initial_operation_json = serde_json::to_string(&initial).unwrap();
+        let execution = execution_spec(&reference).unwrap();
+        let mut host = DurableHost::new(
+            MeasuredDurableCheckpointStore::new(
+                execution.execution_id(),
+                DurableCheckpointStore::InMemory(InMemoryCheckpointStore::new()),
+            ),
+            HostEpoch::from_bytes([29; 16]),
+            checkpoint_limits(),
+        );
+        let workflow = DurableSwitchoverWorkflow;
+        let permit = expose_next(&mut host, &workflow, &execution).await;
+        let mut skipped = decode_activity_input_state(permit.activity().input()).unwrap();
+        assert_eq!(skipped.phase, DurableOperationPhase::DistributeEpoch);
+        assert_eq!(skipped.next_secondary_index, 0);
+        skipped.phase = DurableOperationPhase::UpdateCatchUpConfiguration;
+        skipped.pending_action = None;
+        assert!(matches!(
+            host.observe(
+                &execution,
+                ActivityObservation::new(
+                    permit.activity().clone(),
+                    encode_step_result(&DurableSwitchoverStepResult::Advance {
+                        operation: skipped,
+                    })
+                    .unwrap(),
+                ),
+            )
+            .await,
+            kuberic_durable_execution::HostOutcome::ObservationAccepted { .. }
+        ));
+        let kuberic_durable_execution::HostOutcome::WorkflowCompleted { outcome, .. } =
+            host.turn(&workflow, execution).await
+        else {
+            panic!("malformed cursor replay must fail terminally");
+        };
+        assert!(matches!(outcome, TerminalOutcome::Failed(_)));
+        assert!(
+            String::from_utf8_lossy(outcome.payload().as_slice())
+                .contains("before completing 2 secondary epoch updates")
+        );
+    }
+
     #[test]
     fn structurally_invalid_initial_operation_fails_before_activity_schedule() {
         let mut reference = test_reference("set-uid", snapshot(3), 2, 100).unwrap();
@@ -3939,6 +4139,88 @@ mod framework_native_switchover_tests {
             error.contains("unsupported durable operation version"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn native_reference_rejects_invalid_authority_and_acceptance_time() {
+        let reference = new_switchover_execution("set-uid", snapshot(3), 2, 100).unwrap();
+        assert!(validate_native_operation_authority(&reference, "set-uid").is_ok());
+        assert!(validate_native_operation_authority(&reference, "other-uid").is_err());
+
+        let mut malformed = reference.clone();
+        malformed.input.operation_authority.clear();
+        assert!(native_execution_spec(&malformed).is_err());
+
+        for accepted_unix_seconds in [0, -1, i64::MAX] {
+            let mut malformed = reference.clone();
+            malformed.input.accepted_unix_seconds = accepted_unix_seconds;
+            assert!(
+                native_execution_spec(&malformed).is_err(),
+                "accepted invalid timestamp {accepted_unix_seconds}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_secondary_cursors_fail_before_effects() {
+        let reference = new_switchover_execution("set-uid", snapshot(3), 2, 100).unwrap();
+        let initial = native_initial_operation(&reference).unwrap();
+
+        let mut jumped = initial.clone();
+        jumped.next_secondary_index = 1;
+        assert!(validate_cursor_transition(&initial, &jumped).is_err());
+
+        let mut skipped_distribution = initial.clone();
+        skipped_distribution.phase = DurableOperationPhase::DistributeEpoch;
+        let mut skipped_to_configuration = skipped_distribution.clone();
+        skipped_to_configuration.phase = DurableOperationPhase::UpdateCatchUpConfiguration;
+        assert!(
+            validate_cursor_transition(&skipped_distribution, &skipped_to_configuration).is_err()
+        );
+
+        let mut unrepresentable = initial.clone();
+        unrepresentable.next_secondary_index = u32::MAX;
+        assert!(validate_switchover_operation_contract(&unrepresentable).is_err());
+
+        let mut distributing = initial.clone();
+        distributing.phase = DurableOperationPhase::DistributeEpoch;
+        let Decision::Persist(mut pending_distribution) =
+            decide(&distributing, &OperationObservations::default(), 100).unwrap()
+        else {
+            panic!("distribution must prepare a retained-member epoch action");
+        };
+        pending_distribution.next_secondary_index = 1;
+        assert!(validate_switchover_operation_contract(&pending_distribution).is_err());
+
+        let mut compensating = initial;
+        compensating.phase = DurableOperationPhase::CompensateDistributeEpoch;
+        let Decision::Persist(mut pending_compensation) =
+            decide(&compensating, &OperationObservations::default(), 100).unwrap()
+        else {
+            panic!("compensation must prepare a secondary epoch action");
+        };
+        pending_compensation.next_secondary_index = 2;
+        assert!(validate_switchover_operation_contract(&pending_compensation).is_err());
+    }
+
+    #[test]
+    fn accounting_diagnostic_uses_member_specific_redelivery_range() {
+        let terminal = TerminalAccountingContext {
+            phase: DurableOperationPhase::Completed,
+            frozen_lsn: Some(10),
+            next_secondary_index: 2,
+            has_pending_action: false,
+            has_last_error: false,
+        };
+        let error = validate_terminal_accounting_shape(
+            terminal,
+            4,
+            false,
+            SwitchoverActivityAccounting::new(20, 3),
+            23,
+        )
+        .unwrap_err();
+        assert!(error.contains("10..=18 external effects"), "{error}");
     }
 
     #[test]
@@ -4956,8 +5238,8 @@ mod framework_native_switchover_tests {
         let canonical_rollback = projected_rollback_transcript(3);
         assert_eq!(canonical_success.maximum_activity_count(), 19);
         assert_eq!(canonical_rollback.maximum_activity_count(), 21);
-        assert_eq!(canonical_success.maximum_external_effect_count(), 9);
-        assert_eq!(canonical_rollback.maximum_external_effect_count(), 10);
+        assert_eq!(canonical_success.external_effect_slot_count(), 9);
+        assert_eq!(canonical_rollback.external_effect_slot_count(), 10);
         assert_eq!(canonical_success.redelivery_slot_count(), 7);
         assert_eq!(canonical_rollback.redelivery_slot_count(), 8);
 
@@ -4972,11 +5254,11 @@ mod framework_native_switchover_tests {
             2 * SWITCHOVER_MAX_REPLICAS + 15
         );
         assert_eq!(
-            success.maximum_external_effect_count(),
+            success.external_effect_slot_count(),
             SWITCHOVER_MAX_REPLICAS + 6
         );
         assert_eq!(
-            rollback.maximum_external_effect_count(),
+            rollback.external_effect_slot_count(),
             SWITCHOVER_MAX_REPLICAS + 7
         );
         assert_eq!(success.redelivery_slot_count(), SWITCHOVER_MAX_REPLICAS + 4);
@@ -4987,7 +5269,7 @@ mod framework_native_switchover_tests {
         let success_label_effects = projected_label_effect_count(&success);
         assert_eq!(success_label_effects, 2);
         assert_eq!(
-            success.maximum_external_effect_count() - success_label_effects,
+            success.external_effect_slot_count() - success_label_effects,
             SWITCHOVER_MAX_REPLICAS + 4
         );
         assert_eq!(success.required_passive_observation_count(), 3);
