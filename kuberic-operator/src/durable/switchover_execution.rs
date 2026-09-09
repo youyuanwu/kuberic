@@ -5,6 +5,13 @@
 //! later phases; this module owns only identity, bounds, and Kubernetes
 //! lifecycle policy.
 
+#[cfg(test)]
+pub(crate) mod activities;
+#[cfg(test)]
+pub(crate) mod model;
+#[cfg(test)]
+pub(crate) mod workflow;
+
 use std::{
     collections::BTreeMap,
     sync::{
