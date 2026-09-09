@@ -1,8 +1,8 @@
 //! Direct, operation-specific durable switchover execution.
 //!
 //! Production history is restricted to the version-1 activity identities in
-//! [`SWITCHOVER_ACTIVITY_IDENTITIES`]. The former reducer entry point is not
-//! available from a non-test build:
+//! [`SWITCHOVER_ACTIVITY_IDENTITIES`]. Only the direct execution entry points
+//! are available from a non-test build:
 //!
 //! ```compile_fail
 //! use kuberic_operator::durable::start_switchover;
