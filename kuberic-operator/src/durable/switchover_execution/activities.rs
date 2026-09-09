@@ -8,12 +8,6 @@ use crate::durable::effects::{LabelEffectCommand, ReplicaEffectCommand};
 
 pub const DIRECT_SWITCHOVER_CONTRACT_VERSION: u32 = 4;
 pub const DIRECT_ACTIVITY_VERSION: u32 = 1;
-pub const DIRECT_REPLICA_INPUT_BYTES: u64 = 8_192;
-pub const DIRECT_LABEL_INPUT_BYTES: u64 = 4_096;
-pub const DIRECT_OBSERVATION_INPUT_BYTES: u64 = 4_096;
-pub const DIRECT_ATTESTATION_INPUT_BYTES: u64 = 8_192;
-pub const DIRECT_EFFECT_RESULT_BYTES: u64 = 1_024;
-pub const DIRECT_OBSERVATION_RESULT_BYTES: u64 = 2_048;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -105,10 +99,23 @@ pub trait LabelDirectActivity: DurableActivity {
 }
 
 macro_rules! define_replica_activity {
-    ($activity:ident, $input:ident, $output:ident, $name:literal) => {
+    ($activity:ident, $input:ident, $output:ident, $name:literal, $max_input:literal, $max_result:literal) => {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $input(pub ReplicaOperationRequest);
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct $input {
+            pub contract_version: u32,
+            pub execution_id: String,
+            pub action_id: String,
+            pub sequence: u32,
+            pub target_id: i64,
+            pub target_instance_id: String,
+            pub expected_epoch: EpochStatus,
+            pub desired_snapshot: StablePartitionSnapshotStatus,
+            pub deadline_unix_seconds: i64,
+            pub redelivery: u8,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub prepared_command: Option<ReplicaEffectCommand>,
+        }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
@@ -141,13 +148,25 @@ macro_rules! define_replica_activity {
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-            const MAX_INPUT_BYTES: u64 = DIRECT_REPLICA_INPUT_BYTES;
-            const MAX_RESULT_BYTES: u64 = DIRECT_EFFECT_RESULT_BYTES;
+            const MAX_INPUT_BYTES: u64 = $max_input;
+            const MAX_RESULT_BYTES: u64 = $max_result;
         }
 
         impl ReplicaDirectActivity for $activity {
             fn input(request: ReplicaOperationRequest) -> Self::Input {
-                $input(request)
+                $input {
+                    contract_version: request.contract_version,
+                    execution_id: request.execution_id,
+                    action_id: request.action_id,
+                    sequence: request.sequence,
+                    target_id: request.target_id,
+                    target_instance_id: request.target_instance_id,
+                    expected_epoch: request.expected_epoch,
+                    desired_snapshot: request.desired_snapshot,
+                    deadline_unix_seconds: request.deadline_unix_seconds,
+                    redelivery: request.redelivery,
+                    prepared_command: request.prepared_command,
+                }
             }
 
             fn observation(output: Self::Output) -> EffectObservation {
@@ -190,10 +209,21 @@ macro_rules! define_replica_activity {
 }
 
 macro_rules! define_label_activity {
-    ($activity:ident, $input:ident, $output:ident, $name:literal) => {
+    ($activity:ident, $input:ident, $output:ident, $name:literal, $max_input:literal, $max_result:literal) => {
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $input(pub LabelOperationRequest);
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        pub struct $input {
+            pub contract_version: u32,
+            pub execution_id: String,
+            pub action_id: String,
+            pub sequence: u32,
+            pub target_id: i64,
+            pub target_instance_id: String,
+            pub desired_role: String,
+            pub deadline_unix_seconds: i64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub prepared_command: Option<LabelEffectCommand>,
+        }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
         #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
@@ -219,13 +249,23 @@ macro_rules! define_label_activity {
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-            const MAX_INPUT_BYTES: u64 = DIRECT_LABEL_INPUT_BYTES;
-            const MAX_RESULT_BYTES: u64 = DIRECT_EFFECT_RESULT_BYTES;
+            const MAX_INPUT_BYTES: u64 = $max_input;
+            const MAX_RESULT_BYTES: u64 = $max_result;
         }
 
         impl LabelDirectActivity for $activity {
             fn input(request: LabelOperationRequest) -> Self::Input {
-                $input(request)
+                $input {
+                    contract_version: request.contract_version,
+                    execution_id: request.execution_id,
+                    action_id: request.action_id,
+                    sequence: request.sequence,
+                    target_id: request.target_id,
+                    target_instance_id: request.target_instance_id,
+                    desired_role: request.desired_role,
+                    deadline_unix_seconds: request.deadline_unix_seconds,
+                    prepared_command: request.prepared_command,
+                }
             }
 
             fn observation(output: Self::Output) -> EffectObservation {
@@ -259,98 +299,130 @@ define_replica_activity!(
     RevokeWritesActivity,
     RevokeWritesInput,
     RevokeWritesOutput,
-    "kuberic.switchover.revoke-writes"
+    "kuberic.switchover.revoke-writes",
+    6_144,
+    1_024
 );
 define_replica_activity!(
     DemoteOldPrimaryActivity,
     DemoteOldPrimaryInput,
     DemoteOldPrimaryOutput,
-    "kuberic.switchover.demote-old-primary"
+    "kuberic.switchover.demote-old-primary",
+    6_144,
+    1_024
 );
 define_replica_activity!(
     PromoteTargetActivity,
     PromoteTargetInput,
     PromoteTargetOutput,
-    "kuberic.switchover.promote-target"
+    "kuberic.switchover.promote-target",
+    6_144,
+    1_024
 );
 define_replica_activity!(
     DistributeReplicaEpochActivity,
     DistributeReplicaEpochInput,
     DistributeReplicaEpochOutput,
-    "kuberic.switchover.distribute-replica-epoch"
+    "kuberic.switchover.distribute-replica-epoch",
+    6_144,
+    1_024
 );
 define_replica_activity!(
     InstallTargetCatchUpConfigurationActivity,
     InstallTargetCatchUpConfigurationInput,
     InstallTargetCatchUpConfigurationOutput,
-    "kuberic.switchover.install-target-catch-up-configuration"
+    "kuberic.switchover.install-target-catch-up-configuration",
+    8_192,
+    1_024
 );
 define_replica_activity!(
     WaitTargetWriteQuorumActivity,
     WaitTargetWriteQuorumInput,
     WaitTargetWriteQuorumOutput,
-    "kuberic.switchover.wait-target-write-quorum"
+    "kuberic.switchover.wait-target-write-quorum",
+    6_144,
+    1_024
 );
 define_replica_activity!(
     InstallTargetCurrentConfigurationActivity,
     InstallTargetCurrentConfigurationInput,
     InstallTargetCurrentConfigurationOutput,
-    "kuberic.switchover.install-target-current-configuration"
+    "kuberic.switchover.install-target-current-configuration",
+    8_192,
+    1_024
 );
 define_replica_activity!(
     RestorePreviousCurrentConfigurationActivity,
     RestorePreviousCurrentConfigurationInput,
     RestorePreviousCurrentConfigurationOutput,
-    "kuberic.switchover.restore-previous-current-configuration"
+    "kuberic.switchover.restore-previous-current-configuration",
+    8_192,
+    1_024
 );
 define_replica_activity!(
     CompensatePromoteOldPrimaryActivity,
     CompensatePromoteOldPrimaryInput,
     CompensatePromoteOldPrimaryOutput,
-    "kuberic.switchover.compensate-promote-old-primary"
+    "kuberic.switchover.compensate-promote-old-primary",
+    6_144,
+    1_024
 );
 define_replica_activity!(
     CompensateDistributeReplicaEpochActivity,
     CompensateDistributeReplicaEpochInput,
     CompensateDistributeReplicaEpochOutput,
-    "kuberic.switchover.compensate-distribute-replica-epoch"
+    "kuberic.switchover.compensate-distribute-replica-epoch",
+    6_144,
+    1_024
 );
 define_replica_activity!(
     InstallCompensationCatchUpConfigurationActivity,
     InstallCompensationCatchUpConfigurationInput,
     InstallCompensationCatchUpConfigurationOutput,
-    "kuberic.switchover.install-compensation-catch-up-configuration"
+    "kuberic.switchover.install-compensation-catch-up-configuration",
+    8_192,
+    1_024
 );
 define_replica_activity!(
     InstallCompensationCurrentConfigurationActivity,
     InstallCompensationCurrentConfigurationInput,
     InstallCompensationCurrentConfigurationOutput,
-    "kuberic.switchover.install-compensation-current-configuration"
+    "kuberic.switchover.install-compensation-current-configuration",
+    8_192,
+    1_024
 );
 
 define_label_activity!(
     PublishTargetPrimaryLabelActivity,
     PublishTargetPrimaryLabelInput,
     PublishTargetPrimaryLabelOutput,
-    "kuberic.switchover.publish-target-primary-label"
+    "kuberic.switchover.publish-target-primary-label",
+    4_096,
+    768
 );
 define_label_activity!(
     PublishOldPrimarySecondaryLabelActivity,
     PublishOldPrimarySecondaryLabelInput,
     PublishOldPrimarySecondaryLabelOutput,
-    "kuberic.switchover.publish-old-primary-secondary-label"
+    "kuberic.switchover.publish-old-primary-secondary-label",
+    4_096,
+    768
 );
 define_label_activity!(
     RestoreOldPrimaryLabelActivity,
     RestoreOldPrimaryLabelInput,
     RestoreOldPrimaryLabelOutput,
-    "kuberic.switchover.restore-old-primary-label"
+    "kuberic.switchover.restore-old-primary-label",
+    4_096,
+    768
 );
 define_label_activity!(
     RestoreTargetSecondaryLabelActivity,
     RestoreTargetSecondaryLabelInput,
     RestoreTargetSecondaryLabelOutput,
-    "kuberic.switchover.restore-target-secondary-label"
+    "kuberic.switchover.restore-target-secondary-label",
+    4_096,
+    768
 );
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -389,8 +461,8 @@ impl DurableActivity for CaptureFrozenLsnActivity {
 
     const NAME: &'static str = "kuberic.switchover.capture-frozen-lsn";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-    const MAX_INPUT_BYTES: u64 = DIRECT_OBSERVATION_INPUT_BYTES;
-    const MAX_RESULT_BYTES: u64 = DIRECT_OBSERVATION_RESULT_BYTES;
+    const MAX_INPUT_BYTES: u64 = 2_048;
+    const MAX_RESULT_BYTES: u64 = 1_024;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -429,8 +501,8 @@ impl DurableActivity for WaitTargetCaughtUpActivity {
 
     const NAME: &'static str = "kuberic.switchover.wait-target-caught-up";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-    const MAX_INPUT_BYTES: u64 = DIRECT_OBSERVATION_INPUT_BYTES;
-    const MAX_RESULT_BYTES: u64 = DIRECT_OBSERVATION_RESULT_BYTES;
+    const MAX_INPUT_BYTES: u64 = 2_048;
+    const MAX_RESULT_BYTES: u64 = 1_024;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -468,8 +540,8 @@ macro_rules! define_attestation_activity {
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
-            const MAX_INPUT_BYTES: u64 = DIRECT_ATTESTATION_INPUT_BYTES;
-            const MAX_RESULT_BYTES: u64 = DIRECT_OBSERVATION_RESULT_BYTES;
+            const MAX_INPUT_BYTES: u64 = 8_192;
+            const MAX_RESULT_BYTES: u64 = 1_024;
         }
     };
 }
@@ -563,9 +635,51 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::{StableReplicaRoleStatus, StableReplicaSnapshotStatus};
+
+    fn snapshot() -> StablePartitionSnapshotStatus {
+        StablePartitionSnapshotStatus {
+            epoch: EpochStatus {
+                data_loss_number: 1,
+                configuration_number: 2,
+            },
+            primary_id: 1,
+            members: vec![
+                StableReplicaSnapshotStatus {
+                    id: 1,
+                    instance_id: "instance-1".to_string(),
+                    role: StableReplicaRoleStatus::Primary,
+                    election_metadata: None,
+                },
+                StableReplicaSnapshotStatus {
+                    id: 2,
+                    instance_id: "instance-2".to_string(),
+                    role: StableReplicaRoleStatus::ActiveSecondary,
+                    election_metadata: None,
+                },
+            ],
+            write_quorum: 2,
+        }
+    }
+
+    fn replica_request() -> ReplicaOperationRequest {
+        ReplicaOperationRequest {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: "execution".to_string(),
+            action_id: "execution:1".to_string(),
+            sequence: 1,
+            target_id: 1,
+            target_instance_id: "instance-1".to_string(),
+            expected_epoch: snapshot().epoch,
+            desired_snapshot: snapshot(),
+            deadline_unix_seconds: 10,
+            redelivery: 0,
+            prepared_command: None,
+        }
+    }
 
     #[test]
-    fn direct_activity_identities_are_unique_positive_and_operation_specific() {
+    fn direct_switchover_activity_identities_are_unique_positive_and_operation_specific() {
         let identities = ALL_DIRECT_ACTIVITY_IDENTITIES
             .iter()
             .copied()
@@ -580,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn every_direct_activity_declares_independent_nonzero_bounds() {
+    fn every_direct_switchover_activity_declares_independent_nonzero_bounds() {
         macro_rules! assert_bounds {
             ($($activity:ty),+ $(,)?) => {
                 $(
@@ -611,5 +725,60 @@ mod tests {
             RestoreTargetSecondaryLabelActivity,
             AttestCompensatedTopologyActivity,
         );
+        assert_ne!(
+            RevokeWritesActivity::MAX_INPUT_BYTES,
+            InstallTargetCurrentConfigurationActivity::MAX_INPUT_BYTES
+        );
+        assert_ne!(
+            PublishTargetPrimaryLabelActivity::MAX_RESULT_BYTES,
+            RevokeWritesActivity::MAX_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn direct_switchover_contracts_reject_unknown_fields() {
+        let mut value =
+            serde_json::to_value(RevokeWritesActivity::input(replica_request())).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".to_string(), serde_json::Value::Bool(true));
+        assert!(serde_json::from_value::<RevokeWritesInput>(value).is_err());
+
+        let malformed = serde_json::json!({
+            "result": "applied",
+            "observed_at_unix_seconds": 1,
+            "unknown": true,
+        });
+        assert!(serde_json::from_value::<RevokeWritesOutput>(malformed).is_err());
+    }
+
+    #[test]
+    fn direct_switchover_effect_outputs_preserve_domain_outcomes() {
+        let outcomes = [
+            RevokeWritesOutput::Applied {
+                observed_at_unix_seconds: 1,
+            },
+            RevokeWritesOutput::ProvenNoAdmission {
+                observed_at_unix_seconds: 2,
+            },
+            RevokeWritesOutput::Rejected {
+                observed_at_unix_seconds: 3,
+                message: "rejected".to_string(),
+            },
+            RevokeWritesOutput::Failed {
+                observed_at_unix_seconds: 4,
+                message: "failed".to_string(),
+            },
+            RevokeWritesOutput::Conflicting {
+                observed_at_unix_seconds: 5,
+                message: "conflicting".to_string(),
+            },
+        ];
+        for outcome in outcomes {
+            let encoded = serde_json::to_vec(&outcome).unwrap();
+            let decoded = serde_json::from_slice::<RevokeWritesOutput>(&encoded).unwrap();
+            assert_eq!(decoded, outcome);
+        }
     }
 }

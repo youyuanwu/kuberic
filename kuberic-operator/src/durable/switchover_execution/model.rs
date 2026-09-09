@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use crate::crd::{
-    DurableOperationKind, DurableOperationPhase, DurableOperationStatus, EpochStatus,
-    StablePartitionSnapshotStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
+    DURABLE_OPERATION_VERSION, DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
+    EpochStatus, StablePartitionSnapshotStatus, StableReplicaRoleStatus,
+    StableReplicaSnapshotStatus,
 };
 use crate::durable::ACTION_DEADLINE_SECONDS;
 
@@ -19,6 +20,12 @@ pub struct DirectSwitchoverDefinition {
 
 impl DirectSwitchoverDefinition {
     pub fn from_initial(operation: &DurableOperationStatus) -> Result<Self, String> {
+        if operation.version != DURABLE_OPERATION_VERSION {
+            return Err(format!(
+                "unsupported direct switchover operation version {}",
+                operation.version
+            ));
+        }
         if operation.kind != DurableOperationKind::Switchover {
             return Err("direct switchover input is not a switchover operation".to_string());
         }
@@ -222,5 +229,13 @@ mod tests {
         let compensated = definition.compensation_snapshot();
         assert_eq!(compensated.primary_id, 1);
         assert_eq!(compensated.epoch.configuration_number, 8);
+    }
+
+    #[test]
+    fn direct_switchover_rejects_old_operation_versions() {
+        let mut operation =
+            crate::durable::start_switchover("set-uid", snapshot(1, 2, 7), 2, 100).unwrap();
+        operation.version = DURABLE_OPERATION_VERSION + 1;
+        assert!(DirectSwitchoverDefinition::from_initial(&operation).is_err());
     }
 }

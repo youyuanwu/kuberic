@@ -736,11 +736,13 @@ fn complete(
     terminal(DirectSwitchoverTerminalRecord::Complete {
         snapshot,
         compensated,
-        reason,
+        reason: reason
+            .map(|reason| super::bounded_utf8(&reason, super::SWITCHOVER_MAX_ERROR_BYTES)),
     })
 }
 
 fn stopped(message: String) -> TerminalOutcome {
+    let message = super::bounded_utf8(&message, super::SWITCHOVER_MAX_ERROR_BYTES);
     let payload = serde_json::to_vec(&DirectSwitchoverTerminalRecord::Stopped { message })
         .unwrap_or_else(|_| br#"{"status":"stopped","message":"encode failure"}"#.to_vec());
     TerminalOutcome::failed(ExactBytes::new(payload))
@@ -790,6 +792,7 @@ mod tests {
     async fn run_script(
         replica_count: i64,
         failure: Option<(&str, &str)>,
+        proven_no_admission: Option<&str>,
     ) -> (Vec<String>, DirectSwitchoverTerminalRecord) {
         let execution_id = ExecutionId::from_bytes([41; 16]);
         let operation = start_switchover("set-uid", snapshot(replica_count), 2, 100).unwrap();
@@ -812,6 +815,7 @@ mod tests {
         let workflow = DirectSwitchoverWorkflow;
         let mut names = Vec::new();
         let mut observed_at = 101i64;
+        let mut occurrences = std::collections::BTreeMap::<String, usize>::new();
 
         loop {
             match host.turn(&workflow, execution.clone()).await {
@@ -819,11 +823,14 @@ mod tests {
                 HostOutcome::DispatchPermitted { permit, .. } => {
                     let name = permit.activity().name().name().to_string();
                     names.push(name.clone());
+                    let occurrence = occurrences.entry(name.clone()).or_default();
                     let result = scripted_result(
                         &name,
                         observed_at,
                         failure.filter(|(failed_name, _)| *failed_name == name),
+                        proven_no_admission == Some(name.as_str()) && *occurrence == 0,
                     );
+                    *occurrence += 1;
                     observed_at += 1;
                     let outcome = host
                         .observe(
@@ -845,8 +852,18 @@ mod tests {
         }
     }
 
-    fn scripted_result(name: &str, observed_at: i64, failure: Option<(&str, &str)>) -> ExactBytes {
-        let value = if let Some((_, message)) = failure {
+    fn scripted_result(
+        name: &str,
+        observed_at: i64,
+        failure: Option<(&str, &str)>,
+        proven_no_admission: bool,
+    ) -> ExactBytes {
+        let value = if proven_no_admission {
+            serde_json::json!({
+                "result": "proven_no_admission",
+                "observed_at_unix_seconds": observed_at,
+            })
+        } else if let Some((_, message)) = failure {
             if name == WaitTargetCaughtUpActivity::NAME {
                 serde_json::json!({
                     "result": "deadline_exceeded",
@@ -888,9 +905,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_workflow_spells_out_successful_protocol() {
+    async fn direct_switchover_workflow_spells_out_successful_protocol() {
         for replica_count in [2, 4, 9] {
-            let (names, terminal) = run_script(replica_count, None).await;
+            let (names, terminal) = run_script(replica_count, None, None).await;
             let mut expected = vec![
                 RevokeWritesActivity::NAME,
                 CaptureFrozenLsnActivity::NAME,
@@ -922,9 +939,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_workflow_spells_out_post_promotion_compensation() {
-        let (names, terminal) =
-            run_script(3, Some((PromoteTargetActivity::NAME, "promotion failed"))).await;
+    async fn direct_switchover_workflow_spells_out_post_promotion_compensation() {
+        let (names, terminal) = run_script(
+            3,
+            Some((PromoteTargetActivity::NAME, "promotion failed")),
+            None,
+        )
+        .await;
         assert_eq!(
             names,
             vec![
@@ -953,13 +974,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_workflow_spells_out_pre_promotion_compensation() {
+    async fn direct_switchover_workflow_spells_out_pre_promotion_compensation() {
         let (names, terminal) = run_script(
             3,
             Some((
                 WaitTargetCaughtUpActivity::NAME,
                 "target catch-up timed out",
             )),
+            None,
         )
         .await;
         assert_eq!(
@@ -979,5 +1001,141 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_records_one_same_operation_redelivery() {
+        let (names, terminal) = run_script(3, None, Some(DemoteOldPrimaryActivity::NAME)).await;
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| name.as_str() == DemoteOldPrimaryActivity::NAME)
+                .count(),
+            2
+        );
+        assert!(matches!(
+            terminal,
+            DirectSwitchoverTerminalRecord::Complete {
+                compensated: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_late_failure_stops_without_compensation() {
+        let (names, terminal) = run_script(
+            3,
+            Some((
+                InstallTargetCurrentConfigurationActivity::NAME,
+                "current configuration failed",
+            )),
+            None,
+        )
+        .await;
+        assert!(names.contains(&InstallTargetCurrentConfigurationActivity::NAME.to_string()));
+        assert!(!names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string()));
+        assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+        assert!(matches!(
+            terminal,
+            DirectSwitchoverTerminalRecord::Stopped { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_replay_is_identical_one_hundred_times() {
+        let baseline = run_script(2, None, None).await;
+        for _ in 0..100 {
+            assert_eq!(run_script(2, None, None).await, baseline);
+        }
+    }
+
+    #[test]
+    fn direct_switchover_activity_fixture_matches_reducer_action_order() {
+        use crate::crd::DurableActionKind;
+
+        let fixture = [
+            (DurableActionKind::RevokeWrite, RevokeWritesActivity::NAME),
+            (
+                DurableActionKind::DemoteOldPrimary,
+                DemoteOldPrimaryActivity::NAME,
+            ),
+            (
+                DurableActionKind::PromoteTarget,
+                PromoteTargetActivity::NAME,
+            ),
+            (
+                DurableActionKind::UpdateSecondaryEpoch,
+                DistributeReplicaEpochActivity::NAME,
+            ),
+            (
+                DurableActionKind::UpdateCatchUpConfiguration,
+                InstallTargetCatchUpConfigurationActivity::NAME,
+            ),
+            (
+                DurableActionKind::WaitForCatchUpQuorum,
+                WaitTargetWriteQuorumActivity::NAME,
+            ),
+            (
+                DurableActionKind::UpdateCurrentConfiguration,
+                InstallTargetCurrentConfigurationActivity::NAME,
+            ),
+            (
+                DurableActionKind::LabelTargetPrimary,
+                PublishTargetPrimaryLabelActivity::NAME,
+            ),
+            (
+                DurableActionKind::LabelOldSecondary,
+                PublishOldPrimarySecondaryLabelActivity::NAME,
+            ),
+            (
+                DurableActionKind::RestorePreviousConfiguration,
+                RestorePreviousCurrentConfigurationActivity::NAME,
+            ),
+            (
+                DurableActionKind::CompensatePromoteOldPrimary,
+                CompensatePromoteOldPrimaryActivity::NAME,
+            ),
+            (
+                DurableActionKind::CompensateUpdateSecondaryEpoch,
+                CompensateDistributeReplicaEpochActivity::NAME,
+            ),
+            (
+                DurableActionKind::CompensateCatchUpConfiguration,
+                InstallCompensationCatchUpConfigurationActivity::NAME,
+            ),
+            (
+                DurableActionKind::CompensateCurrentConfiguration,
+                InstallCompensationCurrentConfigurationActivity::NAME,
+            ),
+            (
+                DurableActionKind::CompensateLabelOldPrimary,
+                RestoreOldPrimaryLabelActivity::NAME,
+            ),
+            (
+                DurableActionKind::CompensateLabelTargetSecondary,
+                RestoreTargetSecondaryLabelActivity::NAME,
+            ),
+        ];
+        assert_eq!(fixture.len(), 16);
+        assert!(fixture.iter().all(|(_, name)| {
+            super::super::activities::ALL_DIRECT_ACTIVITY_IDENTITIES
+                .iter()
+                .any(|(direct_name, version)| direct_name == name && *version == 1)
+        }));
+    }
+
+    #[test]
+    fn direct_switchover_terminal_messages_are_utf8_bounded() {
+        let TerminalOutcome::Failed(payload) = stopped("é".repeat(1_000)) else {
+            panic!("stopped terminal must fail");
+        };
+        let terminal =
+            serde_json::from_slice::<DirectSwitchoverTerminalRecord>(payload.as_slice()).unwrap();
+        let DirectSwitchoverTerminalRecord::Stopped { message } = terminal else {
+            panic!("expected stopped terminal");
+        };
+        assert!(message.len() <= super::super::SWITCHOVER_MAX_ERROR_BYTES);
+        assert!(message.is_char_boundary(message.len()));
     }
 }
