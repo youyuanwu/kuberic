@@ -150,6 +150,10 @@ Single failure → NoWriteQuorum. Failover is safe (survivor has all data).
 **Minimum recommended:** `replicas >= 3`. Pod anti-affinity across nodes
 (ensures failure independence for quorum model).
 
+**Maximum supported:** `replicas <= 9`. The CRD and reconciler enforce this
+product-wide bound. It keeps the largest framework-native switchover
+compensation history within the admitted ConfigMap checkpoint budget.
+
 ---
 
 ## Open Questions

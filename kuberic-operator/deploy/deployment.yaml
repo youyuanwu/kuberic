@@ -69,6 +69,8 @@ spec:
                 description: Minimum replica set size. Operator won't reduce below
                   this.
                 format: int32
+                maximum: 9.0
+                minimum: 1.0
                 type: integer
               port:
                 default: 8080
@@ -87,6 +89,8 @@ spec:
                 default: 3
                 description: Total number of replicas (1 primary + N-1 secondaries).
                 format: int32
+                maximum: 9.0
+                minimum: 1.0
                 type: integer
               storage:
                 default: 256Mi

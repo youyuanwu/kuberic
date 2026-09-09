@@ -67,8 +67,8 @@ use super::{
 };
 
 pub const SWITCHOVER_CONTRACT_VERSION: u32 = 3;
-pub const SWITCHOVER_MAX_REPLICAS: usize = 3;
-pub const SWITCHOVER_MAX_ACTIVITY_RECORDS: usize = 32;
+pub const SWITCHOVER_MAX_REPLICAS: usize = crate::crd::KUBERIC_MAX_REPLICAS as usize;
+pub const SWITCHOVER_MAX_ACTIVITY_RECORDS: usize = 2 * SWITCHOVER_MAX_REPLICAS + 15;
 pub const SWITCHOVER_MAX_TRANSITION_FUEL: usize = 64;
 pub const SWITCHOVER_MAX_RUNNER_FUEL: usize = 32;
 pub const SWITCHOVER_MAX_WORKFLOW_INPUT_BYTES: usize = 4_096;
@@ -2596,6 +2596,24 @@ fn projected_active_checkpoint_bytes(record_count: usize) -> Result<usize, Strin
     .map_err(|error| format!("measure projected switchover checkpoint: {error}"))
 }
 
+#[cfg(test)]
+fn projected_unadmitted_active_checkpoint_bytes(record_count: usize) -> Result<usize, String> {
+    let projection_capacity = SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES * 2;
+    let measurement_limits = CheckpointLimits::new(
+        record_count,
+        projection_capacity,
+        SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
+    )
+    .map_err(|error| format!("construct projection-only checkpoint limits: {error}"))?;
+    CheckpointEnvelope::encode_with_limits(
+        &active_payload_with_records(projection_capacity, record_count)?,
+        measurement_limits,
+    )
+    .map_err(|error| format!("encode projection-only switchover checkpoint: {error}"))?
+    .encoded_len()
+    .map_err(|error| format!("measure projection-only switchover checkpoint: {error}"))
+}
+
 pub fn maximum_terminal_checkpoint() -> Result<CheckpointEnvelope, String> {
     let execution_id = ExecutionId::from_bytes([u8::MAX; 16]);
     let execution = ExecutionSpec::new(
@@ -2965,9 +2983,18 @@ mod framework_native_switchover_tests {
     }
 
     #[test]
-    fn admission_rejects_more_than_three_members() {
-        let reference = test_reference("set-uid", snapshot(4), 2, 100).unwrap_err();
-        assert!(reference.contains("at most 3 replicas"), "{reference}");
+    fn admission_accepts_four_and_product_max_members_and_rejects_one_over() {
+        assert!(new_switchover_execution("set-uid", snapshot(4), 2, 100).is_ok());
+        assert!(
+            new_switchover_execution("set-uid", snapshot(SWITCHOVER_MAX_REPLICAS), 2, 100).is_ok()
+        );
+        let error =
+            new_switchover_execution("set-uid", snapshot(SWITCHOVER_MAX_REPLICAS + 1), 2, 100)
+                .unwrap_err();
+        assert!(
+            error.contains(&format!("at most {SWITCHOVER_MAX_REPLICAS} replicas")),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4135,7 +4162,7 @@ mod framework_native_switchover_tests {
         failed.phase = crate::crd::DurableOperationPhase::Failed;
         failed.frozen_lsn = Some(42);
         failed.next_secondary_index =
-            u32::try_from(SWITCHOVER_MAX_REPLICAS.saturating_sub(1)).unwrap();
+            u32::try_from(failed.previous_snapshot.members.len().saturating_sub(1)).unwrap();
         failed.last_error = None;
         let compensated = failed.previous_snapshot.cloned().unwrap();
         let valid_compensation = TestTerminal::Complete {
@@ -4244,7 +4271,7 @@ mod framework_native_switchover_tests {
             has_last_error: false,
         };
         let fully_compensated = TerminalAccountingContext {
-            next_secondary_index: u32::try_from(SWITCHOVER_MAX_REPLICAS - 1).unwrap(),
+            next_secondary_index: 2,
             ..restored
         };
         let incomplete_compensation = TerminalAccountingContext {
@@ -4389,7 +4416,7 @@ mod framework_native_switchover_tests {
             assert_eq!(
                 validate_terminal_accounting_shape(
                     terminal,
-                    SWITCHOVER_MAX_REPLICAS,
+                    3,
                     compensated,
                     accounting,
                     external + passive,
@@ -4925,19 +4952,43 @@ mod framework_native_switchover_tests {
 
     #[test]
     fn success_and_rollback_transcripts_fit_with_redelivery_headroom() {
+        let canonical_success = projected_success_transcript(3);
+        let canonical_rollback = projected_rollback_transcript(3);
+        assert_eq!(canonical_success.maximum_activity_count(), 19);
+        assert_eq!(canonical_rollback.maximum_activity_count(), 21);
+        assert_eq!(canonical_success.maximum_external_effect_count(), 9);
+        assert_eq!(canonical_rollback.maximum_external_effect_count(), 10);
+        assert_eq!(canonical_success.redelivery_slot_count(), 7);
+        assert_eq!(canonical_rollback.redelivery_slot_count(), 8);
+
         let success = projected_success_transcript(SWITCHOVER_MAX_REPLICAS);
         let rollback = projected_rollback_transcript(SWITCHOVER_MAX_REPLICAS);
-        assert_eq!(success.maximum_activity_count(), 19);
-        assert_eq!(rollback.maximum_activity_count(), 21);
-        assert_eq!(success.maximum_external_effect_count(), 9);
-        assert_eq!(rollback.maximum_external_effect_count(), 10);
-        assert_eq!(success.redelivery_slot_count(), 7);
-        assert_eq!(rollback.redelivery_slot_count(), 8);
+        assert_eq!(
+            success.maximum_activity_count(),
+            2 * SWITCHOVER_MAX_REPLICAS + 13
+        );
+        assert_eq!(
+            rollback.maximum_activity_count(),
+            2 * SWITCHOVER_MAX_REPLICAS + 15
+        );
+        assert_eq!(
+            success.maximum_external_effect_count(),
+            SWITCHOVER_MAX_REPLICAS + 6
+        );
+        assert_eq!(
+            rollback.maximum_external_effect_count(),
+            SWITCHOVER_MAX_REPLICAS + 7
+        );
+        assert_eq!(success.redelivery_slot_count(), SWITCHOVER_MAX_REPLICAS + 4);
+        assert_eq!(
+            rollback.redelivery_slot_count(),
+            SWITCHOVER_MAX_REPLICAS + 5
+        );
         let success_label_effects = projected_label_effect_count(&success);
         assert_eq!(success_label_effects, 2);
         assert_eq!(
             success.maximum_external_effect_count() - success_label_effects,
-            7
+            SWITCHOVER_MAX_REPLICAS + 4
         );
         assert_eq!(success.required_passive_observation_count(), 3);
         assert_eq!(success.flexible_activity_count(), 0);
@@ -4959,6 +5010,19 @@ mod framework_native_switchover_tests {
             projected_active_checkpoint_bytes(rollback.maximum_activity_count()).unwrap();
         assert!(success_bytes <= SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES);
         assert!(rollback_bytes <= SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES);
+        let one_over_rollback =
+            projected_rollback_transcript(SWITCHOVER_MAX_REPLICAS.saturating_add(1));
+        assert_eq!(
+            one_over_rollback.maximum_activity_count(),
+            SWITCHOVER_MAX_ACTIVITY_RECORDS + 2
+        );
+        assert!(
+            projected_unadmitted_active_checkpoint_bytes(
+                one_over_rollback.maximum_activity_count()
+            )
+            .unwrap()
+                > SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES
+        );
         eprintln!(
             "framework-native switchover history projections: success_records={} success_bytes={} rollback_records={} rollback_bytes={}",
             success.maximum_activity_count(),

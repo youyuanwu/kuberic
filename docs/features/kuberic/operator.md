@@ -315,13 +315,19 @@ Switchover has one production path. Acceptance first persists
 ID, deterministic checkpoint name, exact previous topology, target primary,
 and acceptance time. No checkpoint or effect exists before that status write.
 The admitted input is required and rejects unknown fields.
+The structural CRD contains only the current native reference and requires
+every top-level and nested input field. Kubernetes strict field validation
+rejects removed or misspelled fields before persistence; missing fields are
+rejected by schema admission.
 
 The workflow uses typed ordinary-async calls over the format-3 linear replay
 kernel and the same pure switchover calculation/terminal validation as the
 previous implementation. Workflow input stores immutable operation authority once;
 ordinary activity records contain a compact mutable projection. Deterministic
-persist transitions run in memory. The three-member admission permits at most 32 activity records and separately
-bounds replay at 64 transitions and each reconcile at 32 runner outcomes.
+persist transitions run in memory. The product supports 1–9 replicas; the CRD
+and reconciler enforce that range. The nine-member maximum-fault projection
+uses the 33-record activity limit. Replay is separately bounded at 64
+transitions and each reconcile at 32 runner outcomes.
 
 Fused host progression persists a new activity directly as exposed, returning
 a private permit only after the exact checkpoint CAS is accepted. An
@@ -348,9 +354,10 @@ reference to the exact `KubericSet`. The operator has ConfigMap `get`,
 owner and rely on Kubernetes garbage collection after owner deletion.
 
 The contract independently bounds 4,096 workflow-input bytes, 8,192 activity
-input bytes, 4,096 result bytes, 770,048 active-checkpoint bytes, 16,384
-terminal-checkpoint bytes, 4,096 terminal-payload bytes, and 512 error bytes.
-The maximum encoded fixtures measure 714,105 active bytes and 15,093 terminal
+input bytes, 4,096 result bytes, 33 activity records, 770,048
+active-checkpoint bytes, 16,384 terminal-checkpoint bytes, 4,096
+terminal-payload bytes, and 512 error bytes.
+The maximum encoded fixtures measure 736,181 active bytes and 15,093 terminal
 bytes. These limits are switchover-specific and are not copied from
 remove-replica.
 

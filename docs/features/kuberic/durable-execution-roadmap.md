@@ -196,11 +196,19 @@ intent was not introduced: unlike add and remove, the sequence spans multiple
 replicas and Kubernetes routing objects, and the existing per-command fences
 already supply authoritative ambiguity recovery.
 
-The independent limits are 32 activity records, 4,096 workflow-input bytes,
+The product supports 1–9 replicas. The upper bound is enforced by the CRD and
+reconciler because the nine-member maximum-fault rollback consumes all 33
+admitted activity records while remaining within the ConfigMap budget.
+The status schema has one native execution-reference shape with required
+immutable input; no switchover incompatibility variant remains. Missing fields
+fail schema admission, while strict Kubernetes field validation rejects
+removed or unknown fields before persistence.
+
+The independent limits are 33 activity records, 4,096 workflow-input bytes,
 8,192 activity-input bytes, 4,096 result bytes, 770,048 active bytes, 16,384
 terminal bytes, 4,096 terminal-payload bytes, 512 error bytes, 64 workflow
 transitions, and 32 runner outcomes per reconcile. Maximum fixtures measure
-714,105 active bytes and 15,093 terminal bytes. The measured no-fault sample
+736,181 active bytes and 15,093 terminal bytes. The measured no-fault sample
 was 31,785 active bytes, 4,169 terminal bytes, and a 1,041-byte terminal
 payload.
 

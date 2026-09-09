@@ -404,13 +404,23 @@ terminal-checkpoint bytes, and a 1,041-byte terminal payload. These are
 run-specific snapshots because runtime-generated values affect serialized
 length; no exact byte value is a compatibility contract.
 
-The independent contract limits are 32 activity records, 4,096 workflow-input
+The product-wide replica range is 1–9 and is enforced by both the CRD schema
+and reconciliation. A four-member end-to-end switchover test covers the former
+pilot regression, while schema and admission tests cover exactly nine and
+reject ten. Generated-schema tests assert the exact current native property
+set and required fields. A dedicated isolated KinD API-server check with
+strict field validation accepts the valid native shape and rejects missing
+input, removed variants, and unknown top-level or nested input fields.
+
+The independent contract limits are 33 activity records, 4,096 workflow-input
 bytes, 8,192 activity-input bytes, 4,096 result bytes, 770,048 active encoded
 bytes, 16,384 terminal encoded bytes, 4,096 terminal-payload bytes, 512 error
 bytes, 64 workflow transitions, and 32 runner outcomes per reconcile. Maximum
-fixtures measure 714,105 active bytes and 15,093 terminal bytes. The
+fixtures measure 736,181 active bytes and 15,093 terminal bytes. The
 19-record success-with-redelivery projection is 427,133 bytes; the 21-record
-rollback-with-redelivery projection is 471,285 bytes.
+rollback-with-redelivery projection is 471,285 bytes for three members. At the
+nine-member product maximum, the corresponding projections are 31 records /
+692,029 bytes and 33 records / 736,181 bytes.
 
 The terminal payload carries the external-effect and passive-observation
 counts, so a fresh measurement store can recover the classification without

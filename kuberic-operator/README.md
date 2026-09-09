@@ -63,6 +63,10 @@ collected with that owner. The operator needs ConfigMap `get`, `create`, and
 remains the scheduler and all replica mutations continue through
 `ReplicaAgent`.
 
+Kuberic supports 1–9 replicas. The CRD and reconciler enforce the same product
+range; framework-native switchover admits four-member through nine-member
+stable snapshots and rejects a tenth member before any effect.
+
 The workflow uses typed activity calls and compact effect/observation
 records. Deterministic switchover transitions replay in memory; fused
 checkpoint CAS operations durably expose an exact command before returning a
@@ -74,6 +78,9 @@ bounded deadline requeues as a fallback.
 Use `status.switchoverExecution` and the `FrameworkNativeSwitchover` condition
 to inspect immutable admission, checkpoint identity, current-contract
 validation, storage reloads, exposed/quarantined work, and completion.
+The CRD defines only the required current native reference. API requests using
+strict Kubernetes field validation reject removed or unknown fields, and
+missing required fields fail schema admission.
 Resources in the `Switchover` phase without a current native reference fail
 closed and are not restarted automatically.
 Creation, add/build, removal, and failover retain their existing execution

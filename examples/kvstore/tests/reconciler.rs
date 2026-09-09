@@ -1383,7 +1383,7 @@ async fn accept_native_switchover(
     reconcile_set(
         &make_native_switchover_set(
             name,
-            3,
+            healthy.replicas,
             Some(KubericSetStatus {
                 current_primary: Some(original_primary.to_string()),
                 target_primary: Some(target.to_string()),
@@ -3798,6 +3798,38 @@ async fn test_framework_native_switchover_happy_path() {
         next_status.switchover_execution.is_some(),
         "a retained terminal reference must not hijack a later native switchover"
     );
+}
+
+#[test_log::test(tokio::test)]
+#[serial]
+async fn test_framework_native_switchover_four_member_happy_path() {
+    let api = KvClusterApi::new();
+    let bootstrap = ReconcilerState::default();
+    let healthy = create_healthy_set(&api, &bootstrap, "native-four-member", 4).await;
+    let original_primary = healthy.current_primary.clone().unwrap();
+    let target = api
+        .pods
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|pod| pod.metadata.name.clone().unwrap())
+        .find(|name| name != &original_primary)
+        .unwrap();
+    let (state, accepted) = accept_native_switchover(
+        &api,
+        "native-four-member",
+        &healthy,
+        &original_primary,
+        &target,
+        kuberic_durable_execution::InMemoryCheckpointStore::new(),
+    )
+    .await;
+
+    let completed = drive_native_switchover(&api, &state, "native-four-member", 4, accepted).await;
+    assert_eq!(completed.phase, Phase::Healthy);
+    assert_eq!(completed.current_primary.as_deref(), Some(target.as_str()));
+    assert_eq!(completed.stable_snapshot.as_ref().unwrap().members.len(), 4);
+    assert_stable_snapshot(&api, &completed, 4);
 }
 
 #[test_log::test(tokio::test)]

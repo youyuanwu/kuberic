@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Deref;
 
+pub const KUBERIC_MAX_REPLICAS: i32 = 9;
+
 /// KubericSet is the primary CRD for managing a stateful replica set.
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
 #[kube(
@@ -29,10 +31,12 @@ use std::ops::Deref;
 pub struct KubericSetSpec {
     /// Total number of replicas (1 primary + N-1 secondaries).
     #[serde(default = "default_replicas")]
+    #[schemars(range(min = 1, max = 9))]
     pub replicas: i32,
 
     /// Minimum replica set size. Operator won't reduce below this.
     #[serde(default = "default_min_replicas")]
+    #[schemars(range(min = 1, max = 9))]
     pub min_replicas: i32,
 
     /// Container image for the application pods.
@@ -1006,7 +1010,6 @@ impl TryFrom<&StableReplicaSnapshot> for StableReplicaSnapshotStatus {
 mod tests {
     use super::*;
     use kube::CustomResourceExt;
-
     #[test]
     fn stable_snapshot_round_trips_without_changing_incarnations() {
         let core = StablePartitionSnapshot {
@@ -1107,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn framework_native_switchover_reference_has_required_current_input() {
+    fn framework_native_switchover_schema_defines_only_the_current_native_shape() {
         let generated_value = serde_json::to_value(KubericSet::crd()).unwrap();
         let generated = serde_json::to_string(&generated_value).unwrap();
         let deployment = include_str!("../deploy/deployment.yaml");
@@ -1160,6 +1163,67 @@ mod tests {
         assert!(schema.pointer("/properties/input").is_some());
         assert!(schema.pointer("/properties/state").is_none());
         assert!(schema.pointer("/properties/incompatibility").is_none());
+        let mut top_level_properties = schema
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        top_level_properties.sort_unstable();
+        assert_eq!(
+            top_level_properties,
+            ["checkpointName", "contractVersion", "executionId", "input"]
+        );
+        let input_schema = schema.pointer("/properties/input").unwrap();
+        let mut input_properties = input_schema
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        input_properties.sort_unstable();
+        assert_eq!(
+            input_properties,
+            [
+                "acceptedUnixSeconds",
+                "operationAuthority",
+                "previousSnapshot",
+                "targetPrimaryId"
+            ]
+        );
+        assert_eq!(
+            schema.pointer("/x-kubernetes-preserve-unknown-fields"),
+            None
+        );
+        assert_eq!(
+            schema.pointer("/properties/input/x-kubernetes-preserve-unknown-fields"),
+            None
+        );
+        assert_eq!(schema.pointer("/additionalProperties"), None);
+        assert_eq!(
+            schema.pointer("/properties/input/additionalProperties"),
+            None
+        );
+        assert_eq!(
+            schema.pointer("/required"),
+            Some(&serde_json::json!([
+                "checkpointName",
+                "contractVersion",
+                "executionId",
+                "input"
+            ]))
+        );
+        assert_eq!(
+            input_schema.pointer("/required"),
+            Some(&serde_json::json!([
+                "acceptedUnixSeconds",
+                "operationAuthority",
+                "previousSnapshot",
+                "targetPrimaryId"
+            ]))
+        );
         let description = schema
             .pointer("/description")
             .and_then(serde_json::Value::as_str)
@@ -1182,10 +1246,57 @@ mod tests {
         assert!(deployed.contains("                  input:"));
         assert!(!deployed.contains("                  state:"));
         assert!(!deployed.contains("                  incompatibility:"));
+        assert!(!deployed.contains("switchoverExecution contains an unsupported field"));
+        assert!(!deployed.contains("x-kubernetes-preserve-unknown-fields"));
         assert!(
             deployed
                 .contains("description: Structured immutable admission and checkpoint authority")
         );
+
+        let mut missing_input = encoded.clone();
+        missing_input.as_object_mut().unwrap().remove("input");
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(missing_input).is_err());
+
+        let mut extra_top_level = encoded.clone();
+        extra_top_level
+            .as_object_mut()
+            .unwrap()
+            .insert("state".to_string(), serde_json::json!({}));
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(extra_top_level).is_err());
+
+        let mut missing_target = encoded.clone();
+        missing_target["input"]
+            .as_object_mut()
+            .unwrap()
+            .remove("targetPrimaryId");
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(missing_target).is_err());
+
+        let mut extra_input = encoded;
+        extra_input["input"]
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".to_string(), serde_json::json!(true));
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(extra_input).is_err());
+    }
+
+    #[test]
+    fn crd_enforces_product_replica_bounds() {
+        let generated = serde_json::to_value(KubericSet::crd()).unwrap();
+        for property in ["replicas", "minReplicas"] {
+            let schema = generated
+                .pointer(&format!(
+                    "/spec/versions/0/schema/openAPIV3Schema/properties/spec/properties/{property}"
+                ))
+                .unwrap();
+            assert_eq!(schema.pointer("/minimum"), Some(&serde_json::json!(1.0)));
+            assert_eq!(
+                schema.pointer("/maximum"),
+                Some(&serde_json::json!(KUBERIC_MAX_REPLICAS as f64))
+            );
+        }
+        let deployment = include_str!("../deploy/deployment.yaml");
+        assert!(deployment.contains("                maximum: 9.0"));
+        assert!(deployment.contains("                minimum: 1.0"));
     }
 
     #[test]

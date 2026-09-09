@@ -34,8 +34,8 @@ use kuberic_durable_execution::{ActivityObservation, CheckpointStore, HostOutcom
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
     DurableAddMode, DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
-    DurableRemoveMode, KubericSet, KubericSetSpec, KubericSetStatus, MemberStatus,
-    PendingActionStatus, Phase, ReconfigurationPhase, RemoveReplicaExecutionStatus,
+    DurableRemoveMode, KUBERIC_MAX_REPLICAS, KubericSet, KubericSetSpec, KubericSetStatus,
+    MemberStatus, PendingActionStatus, Phase, ReconfigurationPhase, RemoveReplicaExecutionStatus,
     RemoveReplicaIncompatibilitySource, RemoveReplicaIncompatibilityStatus,
     StablePartitionSnapshotStatus, StableReplicaElectionMetadataStatus, StableReplicaRoleStatus,
     StableReplicaSnapshotStatus, StatusCondition,
@@ -209,6 +209,22 @@ pub enum ReconcileAction {
 }
 
 type DispatchEvidencePlan = crate::durable::effects::DispatchEvidencePlan;
+
+fn validate_replica_spec_bounds(spec: &KubericSetSpec) -> Result<(), String> {
+    if !(1..=KUBERIC_MAX_REPLICAS).contains(&spec.replicas) {
+        return Err(format!(
+            "replicas must be between 1 and {KUBERIC_MAX_REPLICAS}; found {}",
+            spec.replicas
+        ));
+    }
+    if spec.min_replicas < 1 || spec.min_replicas > spec.replicas {
+        return Err(format!(
+            "minReplicas must be between 1 and desired replicas ({})",
+            spec.replicas
+        ));
+    }
+    Ok(())
+}
 
 fn authoritative_topology_snapshot(
     status: &KubericSetStatus,
@@ -686,6 +702,7 @@ pub async fn reconcile_set(
     let set_key = format!("{}/{}", namespace, name);
 
     info!(name, namespace, "reconciling KubericSet");
+    validate_replica_spec_bounds(&set.spec)?;
 
     if persist_legacy_remove_incompatibility(set, api, state.removal_clock.unix_seconds()).await? {
         return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
@@ -4394,6 +4411,29 @@ mod tests {
         let non_member =
             accept_framework_native_switchover(&set, switchover_snapshot(), 3, 100).unwrap_err();
         assert!(non_member.contains("not in the stable snapshot"));
+    }
+
+    #[test]
+    fn product_replica_bounds_are_enforced_before_reconciliation() {
+        let mut set = switchover_set();
+        set.spec.replicas = KUBERIC_MAX_REPLICAS;
+        set.spec.min_replicas = KUBERIC_MAX_REPLICAS;
+        assert!(validate_replica_spec_bounds(&set.spec).is_ok());
+
+        set.spec.replicas = KUBERIC_MAX_REPLICAS + 1;
+        assert!(
+            validate_replica_spec_bounds(&set.spec)
+                .unwrap_err()
+                .contains("replicas must be between")
+        );
+
+        set.spec.replicas = 4;
+        set.spec.min_replicas = 5;
+        assert!(
+            validate_replica_spec_bounds(&set.spec)
+                .unwrap_err()
+                .contains("minReplicas")
+        );
     }
 
     #[test]
