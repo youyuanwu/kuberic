@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use kuberic_durable_execution::ExactBytes;
 
 use crate::durable::{

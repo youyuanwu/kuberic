@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::{
     collections::BTreeMap,
     sync::{
@@ -14,10 +12,12 @@ use kuberic_core::{
     error::KubericError,
     types::{ReplicaId, ReplicaInstanceId},
 };
+#[cfg(test)]
+use kuberic_durable_execution::ExecutionContract;
 use kuberic_durable_execution::{
-    ActivityObservation, ActivitySpec, CheckpointError, CheckpointLimits, ExactBytes,
-    ExecutionContract, ExecutionId, ExecutionSpec, LogicalActivityId, PreparedActivityError,
-    PreparedActivityResolver, TerminalOutcome, decode_activity_result, encode_activity_result,
+    ActivityObservation, ActivitySpec, CheckpointError, CheckpointLimits, ExactBytes, ExecutionId,
+    ExecutionSpec, LogicalActivityId, PreparedActivityError, PreparedActivityResolver,
+    TerminalOutcome, decode_activity_result, encode_activity_result,
 };
 
 use crate::{
@@ -41,6 +41,8 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+use super::workflow::DirectSwitchoverWorkflow;
 use super::{
     SwitchoverRunnerContext, SwitchoverWorkflowInput,
     activities::{
@@ -49,10 +51,10 @@ use super::{
         DIRECT_SWITCHOVER_CONTRACT_VERSION, DirectActivityAccounting,
     },
     collect_switchover_runner_context, encode_execution_id,
-    model::DirectSwitchoverDefinition,
+    model::{DirectSwitchoverDefinition, is_valid_compensation_topology, same_topology},
     prepare::{DirectActivity, DirectEvaluation},
     quarantine::{DirectQuarantineOutcome, resolve_direct_quarantine},
-    workflow::{DirectSwitchoverTerminalRecord, DirectSwitchoverWorkflow},
+    workflow::DirectSwitchoverTerminalRecord,
 };
 
 pub const DIRECT_SWITCHOVER_MAX_ACTIVITY_RECORDS: usize =
@@ -74,7 +76,7 @@ pub struct DirectSwitchoverPreparedActivityResolver {
 }
 
 impl DirectSwitchoverPreparedActivityResolver {
-    pub fn new(
+    pub(crate) fn new(
         definition: &DirectSwitchoverDefinition,
         observations: &OperationObservations,
         addressed_instances: &BTreeMap<ReplicaId, ReplicaInstanceId>,
@@ -430,9 +432,7 @@ impl DurableOperationAdapter for DirectSwitchoverRunnerAdapter<'_> {
             Ok(expected) => expected,
             Err(error) => return DurableAdapterBoundary::Isolated(error),
         };
-        if let Err(error) =
-            permit.consume(&expected, activity_id, attempt_id, "switchover-direct-test")
-        {
+        if let Err(error) = permit.consume(&expected, activity_id, attempt_id, "switchover") {
             return DurableAdapterBoundary::Isolated(error);
         }
         self.evaluate_or_dispatch(activity_id.clone(), &activity)
@@ -533,7 +533,7 @@ pub fn direct_checkpoint_limits() -> CheckpointLimits {
 
 pub fn direct_checkpoint_measurement_decoder() -> CheckpointMeasurementDecoder {
     CheckpointMeasurementDecoder::new(
-        "switchover-direct-test",
+        "switchover",
         classify_direct_checkpoint_activity,
         decode_direct_terminal_accounting,
     )
@@ -617,7 +617,7 @@ fn validate_direct_terminal(
                 reason: None,
                 accounting: Some(accounting),
             },
-        ) if snapshot == &definition.target_snapshot
+        ) if same_topology(snapshot, &definition.target_snapshot)
             && accounting.total() == Some(completed_activity_count) => {}
         (
             TerminalOutcome::Succeeded(_),
@@ -627,8 +627,7 @@ fn validate_direct_terminal(
                 reason: Some(_),
                 accounting: Some(accounting),
             },
-        ) if (snapshot == &definition.previous_snapshot
-            || snapshot == &definition.compensation_snapshot())
+        ) if is_valid_compensation_topology(snapshot, definition)
             && accounting.total() == Some(completed_activity_count) => {}
         (TerminalOutcome::Failed(_), DirectSwitchoverTerminalRecord::Stopped { .. }) => {}
         _ => {
@@ -648,6 +647,7 @@ pub fn validate_direct_workflow_input_bytes(actual: usize) -> Result<(), String>
     )
 }
 
+#[cfg(test)]
 pub fn validate_direct_active_checkpoint_bytes(actual: usize) -> Result<(), String> {
     validate_maximum(
         "active checkpoint",
@@ -656,6 +656,7 @@ pub fn validate_direct_active_checkpoint_bytes(actual: usize) -> Result<(), Stri
     )
 }
 
+#[cfg(test)]
 pub fn validate_direct_terminal_checkpoint_bytes(actual: usize) -> Result<(), String> {
     validate_maximum(
         "terminal checkpoint",
@@ -664,6 +665,7 @@ pub fn validate_direct_terminal_checkpoint_bytes(actual: usize) -> Result<(), St
     )
 }
 
+#[cfg(test)]
 pub fn validate_direct_terminal_payload_bytes(actual: usize) -> Result<(), String> {
     validate_maximum(
         "terminal payload",
@@ -672,6 +674,7 @@ pub fn validate_direct_terminal_payload_bytes(actual: usize) -> Result<(), Strin
     )
 }
 
+#[cfg(test)]
 pub fn validate_direct_transition_fuel(actual: usize) -> Result<(), String> {
     validate_maximum(
         "transition fuel",
@@ -687,6 +690,7 @@ pub fn validate_direct_runner_fuel(actual: usize) -> Result<(), String> {
     validate_maximum("runner fuel", actual, DIRECT_SWITCHOVER_MAX_RUNNER_FUEL)
 }
 
+#[cfg(test)]
 pub fn validate_direct_error_bytes(actual: usize) -> Result<(), String> {
     validate_maximum("error", actual, DIRECT_SWITCHOVER_MAX_ERROR_BYTES)
 }
@@ -701,16 +705,13 @@ fn validate_maximum(label: &str, actual: usize, maximum: usize) -> Result<(), St
     }
 }
 
+#[cfg(test)]
 pub fn direct_execution_contract(execution: ExecutionSpec) -> ExecutionContract {
     ExecutionContract::with_encoded_limits(
         execution,
         DIRECT_SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES as u64,
         DIRECT_SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES as u64,
     )
-}
-
-pub fn direct_workflow() -> DirectSwitchoverWorkflow {
-    DirectSwitchoverWorkflow
 }
 
 #[cfg(test)]
@@ -755,7 +756,7 @@ mod tests {
                 MeasuredDurableCheckpointStore,
             },
             runner::{DurableRunner, DurableRunnerOutcome},
-            start_switchover,
+            switchover_execution::direct_initial_operation,
         },
     };
 
@@ -1033,7 +1034,7 @@ mod tests {
         scenario: Scenario,
         busy_first_for_every_action: bool,
     ) -> ScenarioResult {
-        let initial = start_switchover(
+        let initial = direct_initial_operation(
             &format!("set-{member_count}-{scenario:?}"),
             snapshot(member_count),
             2,
@@ -1235,7 +1236,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_lost_reply_resolves_without_duplicate_effect() {
-        let initial = start_switchover("lost-reply", snapshot(2), 2, 100).unwrap();
+        let initial = direct_initial_operation("lost-reply", snapshot(2), 2, 100).unwrap();
         let execution_id = ExecutionId::from_bytes([61; 16]);
         let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
         let mut world_value = world_for(&initial, Scenario::Success);
@@ -1298,7 +1299,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_unknown_completion_write_reloads_without_duplicate_effect() {
-        let initial = start_switchover("unknown-completion", snapshot(2), 2, 100).unwrap();
+        let initial = direct_initial_operation("unknown-completion", snapshot(2), 2, 100).unwrap();
         let execution_id = ExecutionId::from_bytes([71; 16]);
         let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
         let world = Arc::new(StdMutex::new(world_for(&initial, Scenario::Success)));
@@ -1415,7 +1416,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_generation_change_allows_only_one_same_action_redelivery() {
-        let initial = start_switchover("generation-change", snapshot(2), 2, 100).unwrap();
+        let initial = direct_initial_operation("generation-change", snapshot(2), 2, 100).unwrap();
         let execution_id = ExecutionId::from_bytes([63; 16]);
         let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
         let mut world_value = world_for(&initial, Scenario::Success);
@@ -1504,7 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_second_proven_non_admission_stops_without_third_dispatch() {
-        let initial = start_switchover("bounded-redelivery", snapshot(2), 2, 100).unwrap();
+        let initial = direct_initial_operation("bounded-redelivery", snapshot(2), 2, 100).unwrap();
         let execution_id = ExecutionId::from_bytes([74; 16]);
         let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
         let mut world_value = world_for(&initial, Scenario::Success);
@@ -1572,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_label_quarantine_never_redelivers() {
-        let initial = start_switchover("label-quarantine", snapshot(2), 2, 100).unwrap();
+        let initial = direct_initial_operation("label-quarantine", snapshot(2), 2, 100).unwrap();
         let execution_id = ExecutionId::from_bytes([65; 16]);
         let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
         let world = Arc::new(StdMutex::new(world_for(&initial, Scenario::Success)));
@@ -1663,7 +1664,7 @@ mod tests {
             InMemoryFault::OutcomeUnknownAfterApply,
             InMemoryFault::FailBeforeRequest(StoreErrorKind::Unavailable),
         ] {
-            let initial = start_switchover("exposure-fault", snapshot(2), 2, 100).unwrap();
+            let initial = direct_initial_operation("exposure-fault", snapshot(2), 2, 100).unwrap();
             let execution_id = ExecutionId::from_bytes([67; 16]);
             let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
             let world = Arc::new(StdMutex::new(world_for(&initial, Scenario::Success)));
@@ -1702,7 +1703,8 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_prepared_command_is_persisted_before_permit() {
-        let initial = start_switchover("prepared-before-permit", snapshot(2), 2, 100).unwrap();
+        let initial =
+            direct_initial_operation("prepared-before-permit", snapshot(2), 2, 100).unwrap();
         let execution_id = ExecutionId::from_bytes([69; 16]);
         let execution = direct_execution_spec(execution_id, initial.clone()).unwrap();
         let world = Arc::new(StdMutex::new(world_for(&initial, Scenario::Success)));
@@ -1756,7 +1758,7 @@ mod tests {
 
     #[test]
     fn direct_switchover_replay_rejects_name_version_bound_input_and_command_drift() {
-        let initial = start_switchover("replay-drift", snapshot(2), 2, 100).unwrap();
+        let initial = direct_initial_operation("replay-drift", snapshot(2), 2, 100).unwrap();
         let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
         let world = world_for(&initial, Scenario::Success);
         let observations = observations(&world);
@@ -2055,12 +2057,12 @@ mod tests {
     }
 
     #[test]
-    fn direct_switchover_phase_two_keeps_production_on_the_existing_native_route() {
+    fn direct_switchover_phase_three_routes_production_to_the_direct_engine() {
         let reconciler = include_str!("../../reconciler.rs");
         assert!(reconciler.contains("let execution = native_execution_spec(reference)?;"));
-        assert!(reconciler.contains("&NativeSwitchoverWorkflow"));
-        assert!(!reconciler.contains("direct_execution_spec(reference)"));
-        assert!(!reconciler.contains("&DirectSwitchoverWorkflow"));
+        assert!(reconciler.contains("DirectSwitchoverRunnerAdapter::new"));
+        assert!(reconciler.contains("&DirectSwitchoverWorkflow"));
+        assert!(!reconciler.contains("NativeSwitchoverWorkflow"));
     }
 
     fn snapshot(member_count: usize) -> StablePartitionSnapshotStatus {

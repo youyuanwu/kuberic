@@ -1134,7 +1134,7 @@ mod tests {
         }
 
         let admitted = SwitchoverExecutionStatus {
-            contract_version: 3,
+            contract_version: crate::durable::switchover_execution::SWITCHOVER_CONTRACT_VERSION,
             execution_id: "0123456789abcdef0123456789abcdef".to_string(),
             checkpoint_name: "kuberic-checkpoint-0123456789abcdef0123456789abcdef".to_string(),
             input: SwitchoverAdmissionInputStatus {
@@ -1318,7 +1318,8 @@ mod tests {
         assert!(serde_json::from_value::<SwitchoverExecutionStatus>(extra_input).is_err());
 
         let mut previous_version = admitted;
-        previous_version.contract_version = 2;
+        previous_version.contract_version =
+            crate::durable::switchover_execution::SWITCHOVER_CONTRACT_VERSION - 1;
         assert!(
             crate::durable::switchover_execution::native_execution_id(&previous_version).is_err()
         );

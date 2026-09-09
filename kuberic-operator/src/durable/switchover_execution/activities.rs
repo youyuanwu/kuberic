@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use kuberic_durable_execution::DurableActivity;
 use serde::{Deserialize, Serialize};
 
@@ -642,6 +640,7 @@ macro_rules! define_attestation_activity {
         pub enum $output {
             Attested {
                 observed_at_unix_seconds: i64,
+                snapshot: StablePartitionSnapshotStatus,
                 #[serde(default, skip_serializing_if = "Option::is_none")]
                 accounting: Option<DirectActivityAccounting>,
             },
@@ -675,7 +674,7 @@ define_attestation_activity!(
     AttestTargetTopologyOutput,
     "kuberic.switchover.attest-target-topology",
     8_192,
-    1_024
+    8_192
 );
 define_attestation_activity!(
     AttestCompensatedTopologyActivity,
@@ -683,7 +682,7 @@ define_attestation_activity!(
     AttestCompensatedTopologyOutput,
     "kuberic.switchover.attest-compensated-topology",
     8_192,
-    1_024
+    8_192
 );
 
 pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[

@@ -31,11 +31,11 @@ use crate::durable::remove_replica_execution::{
     checkpoint_limits, execution_spec, new_execution, reconstruct_initial_operation,
 };
 use crate::durable::switchover_execution::{
-    SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES, SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES,
-    SwitchoverActivityAccounting, SwitchoverTerminal,
+    DirectSwitchoverTerminalRecord, SWITCHOVER_MAX_ACTIVE_ENCODED_BYTES,
+    SWITCHOVER_MAX_TERMINAL_ENCODED_BYTES, SwitchoverActivityAccounting,
     checkpoint_limits as switchover_checkpoint_limits,
-    encode_terminal as encode_switchover_terminal, native_execution_spec, native_initial_operation,
-    new_switchover_execution,
+    encode_terminal as encode_switchover_terminal, is_switchover_activity_identity,
+    native_execution_spec, native_initial_operation, new_switchover_execution,
 };
 
 #[derive(Default)]
@@ -709,13 +709,11 @@ async fn store_switchover_terminal(
     reference: &SwitchoverExecutionStatus,
 ) {
     let initial = native_initial_operation(reference).unwrap();
-    let mut completed = initial.clone();
-    completed.phase = DurableOperationPhase::Completed;
-    let terminal = SwitchoverTerminal::Complete {
-        operation: completed.clone(),
-        snapshot: completed.target_snapshot.clone(),
+    let terminal = DirectSwitchoverTerminalRecord::Complete {
+        snapshot: initial.target_snapshot,
         compensated: false,
-        accounting: SwitchoverActivityAccounting::new(9, 3),
+        reason: None,
+        accounting: Some(SwitchoverActivityAccounting::new(9, 3)),
     };
     store_switchover_terminal_outcome(
         store,
@@ -1063,7 +1061,8 @@ async fn framework_native_switchover_route_records_adapter_wait_and_fuel_exhaust
     );
 
     let reference = new_switchover_execution("set-uid", snapshot(), 2, unix_seconds()).unwrap();
-    let state = ReconcilerState::with_switchover_store(InMemoryCheckpointStore::new());
+    let store = InMemoryCheckpointStore::new();
+    let state = ReconcilerState::with_switchover_store(store.clone());
     let api = RoutingApi::new(vec![
         pod(1, "one", "primary"),
         pod(2, "two", "secondary"),
@@ -1072,7 +1071,7 @@ async fn framework_native_switchover_route_records_adapter_wait_and_fuel_exhaust
     api.reject_dispatch_as_busy();
     let current_pods = api.pods.lock().unwrap().clone();
     reconcile_framework_native_switchover_with_fuel(
-        &switchover_set(reference),
+        &switchover_set(reference.clone()),
         &api,
         &state,
         &current_pods,
@@ -1090,6 +1089,30 @@ async fn framework_native_switchover_route_records_adapter_wait_and_fuel_exhaust
                     && condition.reason == "FuelExhausted"
             })
     );
+
+    let execution = native_execution_spec(&reference).unwrap();
+    let stored = store
+        .load(execution.execution_id())
+        .await
+        .unwrap()
+        .expect("production switchover must persist an active checkpoint");
+    let payload = stored
+        .checkpoint()
+        .decode_and_validate(&execution, switchover_checkpoint_limits())
+        .unwrap();
+    let activities = payload.active_activities().unwrap();
+    assert!(!activities.is_empty());
+    for activity in activities {
+        assert!(is_switchover_activity_identity(
+            activity.name().name(),
+            activity.name().version()
+        ));
+        assert_eq!(activity.name().version(), 1);
+        assert_ne!(
+            activity.name().name(),
+            ["kuberic.switchover.", "native", "-boundary"].concat()
+        );
+    }
 }
 
 #[tokio::test]
@@ -1138,15 +1161,11 @@ async fn framework_native_switchover_route_records_nondeterminism() {
 async fn framework_native_switchover_route_publishes_compensation_and_quarantine() {
     let compensation_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
     let initial = native_initial_operation(&compensation_reference).unwrap();
-    let mut failed = initial.clone();
-    failed.phase = DurableOperationPhase::Failed;
-    failed.frozen_lsn = Some(42);
-    failed.next_secondary_index = 2;
-    let terminal = SwitchoverTerminal::Complete {
-        operation: failed,
+    let terminal = DirectSwitchoverTerminalRecord::Complete {
         snapshot: initial.previous_snapshot.cloned().unwrap(),
         compensated: true,
-        accounting: SwitchoverActivityAccounting::new(8, 5),
+        reason: Some("target promotion failed and the old primary was restored".to_string()),
+        accounting: Some(SwitchoverActivityAccounting::new(8, 5)),
     };
     let store = InMemoryCheckpointStore::new();
     store_switchover_terminal_outcome(
@@ -1184,9 +1203,7 @@ async fn framework_native_switchover_route_publishes_compensation_and_quarantine
     );
 
     let quarantine_reference = new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap();
-    let initial = native_initial_operation(&quarantine_reference).unwrap();
-    let terminal = SwitchoverTerminal::Stopped {
-        operation: Some(initial),
+    let terminal = DirectSwitchoverTerminalRecord::Stopped {
         message: "unknown exposed effect".to_string(),
     };
     let store = InMemoryCheckpointStore::new();
@@ -1194,7 +1211,7 @@ async fn framework_native_switchover_route_publishes_compensation_and_quarantine
         &store,
         &quarantine_reference,
         TerminalOutcome::failed(encode_switchover_terminal(&terminal).unwrap()),
-        0,
+        1,
     )
     .await;
     let state = ReconcilerState::with_switchover_store(store);

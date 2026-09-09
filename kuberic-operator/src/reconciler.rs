@@ -17,8 +17,6 @@ use kuberic_core::driver::{PartitionDriver, ReplicaHandle};
 use kuberic_core::error::KubericError;
 use kuberic_core::remove_replica::{RemoveReplicaClock, SystemRemoveReplicaClock};
 #[cfg(test)]
-use kuberic_core::types::CorrelatedControlActionRequest;
-#[cfg(test)]
 use kuberic_core::types::DurableActionState;
 #[cfg(test)]
 use kuberic_core::types::{AgentControlVersion, CorrelatedControlActionAcknowledgement};
@@ -28,8 +26,6 @@ use kuberic_core::types::{
     ReplicaStatusInfo,
 };
 use kuberic_core::types::{Epoch, ReplicaId, ReplicaInstanceId, StablePartitionSnapshot};
-#[cfg(test)]
-use kuberic_durable_execution::{ActivityObservation, CheckpointStore, HostOutcome};
 
 use crate::cluster_api::ClusterApi;
 use crate::crd::{
@@ -40,27 +36,16 @@ use crate::crd::{
     StablePartitionSnapshotStatus, StableReplicaElectionMetadataStatus, StableReplicaRoleStatus,
     StableReplicaSnapshotStatus, StatusCondition,
 };
-#[cfg(test)]
-use crate::durable::decide;
 use crate::durable::remove_replica_execution as native_remove;
 use crate::durable::remove_replica_execution::{
     FrameworkNativeRemoveReplicaAdapter, FrameworkNativeRemoveReplicaRuntime,
     RemoveReplicaTerminal, RemoveReplicaWorkflow,
 };
 use crate::durable::runner::{DurableActiveReason, DurableRunner, DurableRunnerOutcome};
-#[cfg(test)]
-use crate::durable::start_switchover;
 use crate::durable::switchover_execution::{
-    DurableSwitchoverRuntime, DurableSwitchoverWorkflow as NativeSwitchoverWorkflow,
-    SwitchoverRunnerAdapter as NativeSwitchoverRunnerAdapter,
-    SwitchoverTerminal as NativeSwitchoverTerminal, native_execution_spec,
-    native_initial_operation, new_switchover_execution, validate_native_operation_authority,
-};
-#[cfg(test)]
-use crate::durable::switchover_execution::{DurableSwitchoverStepResult, encode_step_result};
-#[cfg(test)]
-use crate::durable::switchover_execution::{
-    SwitchoverActivityKind, SwitchoverAdapterDecision, SwitchoverPermitGuard,
+    DirectSwitchoverRunnerAdapter, DirectSwitchoverTerminalRecord, DirectSwitchoverWorkflow,
+    DurableSwitchoverRuntime, native_execution_spec, native_initial_operation,
+    new_switchover_execution, validate_native_operation_authority,
 };
 use crate::durable::workflow_host::DurableWorkflowRuntime;
 use crate::durable::{
@@ -601,93 +586,6 @@ fn operation_after_dispatch_error(
     error: &KubericError,
 ) -> DurableOperationStatus {
     crate::durable::effects::operation_after_dispatch_error(operation, error)
-}
-
-/// Result of handling one dispatch-permitted durable switchover activity.
-#[cfg(test)]
-pub type SwitchoverEffectBridgeOutcome = crate::durable::effects::SwitchoverEffectBridgeOutcome;
-
-/// Consume one permit and either persist adapter evidence, issue one existing
-/// correlated effect, or leave the activity exposed for observation.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub async fn bridge_switchover_permitted_step(
-    guard: &mut SwitchoverPermitGuard,
-    operation: &DurableOperationStatus,
-    prepared: &SwitchoverActivityKind,
-    accepted_activity: &kuberic_durable_execution::LogicalActivityId,
-    accepted_attempt: kuberic_durable_execution::AttemptId,
-    observations: &OperationObservations,
-    handles: &BTreeMap<ReplicaId, Box<dyn ReplicaHandle>>,
-    api: &dyn ClusterApi,
-    namespace: &str,
-) -> Result<SwitchoverEffectBridgeOutcome, String> {
-    crate::durable::effects::bridge_switchover_permitted_step(
-        guard,
-        operation,
-        prepared,
-        accepted_activity,
-        accepted_attempt,
-        observations,
-        handles,
-        api,
-        namespace,
-    )
-    .await
-}
-
-#[cfg(test)]
-fn switchover_result_after_dispatch_error(
-    operation: &DurableOperationStatus,
-    action_id: String,
-    error: &KubericError,
-) -> Option<DurableSwitchoverStepResult> {
-    if crate::durable::effects::classify_dispatch_failure(error)
-        == crate::durable::effects::DispatchFailureDisposition::ProvenNoAdmission
-    {
-        return Some(DurableSwitchoverStepResult::ProvenNoAdmission {
-            operation: crate::durable::switchover_execution::DurableSwitchoverState::from_operation(
-                &operation_after_dispatch_error(operation, error),
-            ),
-            action_id,
-            redelivery: 1,
-        });
-    }
-    matches!(error, KubericError::RemoteAgentConflict(_)).then(|| {
-        DurableSwitchoverStepResult::Stopped {
-            operation: crate::durable::switchover_execution::DurableSwitchoverState::from_operation(
-                &fail_closed(operation, &error.to_string()),
-            ),
-            message: error.to_string(),
-        }
-    })
-}
-
-/// Resolve an exposed activity only from authoritative replica observations.
-#[cfg(test)]
-pub fn resolve_switchover_quarantine(
-    operation: &DurableOperationStatus,
-    prepared: &SwitchoverActivityKind,
-    decision: SwitchoverAdapterDecision,
-    observations: &OperationObservations,
-) -> Result<SwitchoverEffectBridgeOutcome, String> {
-    crate::durable::effects::resolve_switchover_quarantine(
-        operation,
-        prepared,
-        decision,
-        observations,
-    )
-}
-
-#[cfg(test)]
-fn exact_switchover_label_target(
-    operation: &DurableOperationStatus,
-    target_id: ReplicaId,
-    observations: &OperationObservations,
-) -> Result<(String, String), String> {
-    let command =
-        crate::durable::effects::exact_label_command(operation, target_id, "", observations)?;
-    Ok((command.pod_name, command.expected_uid))
 }
 
 /// Main reconciliation logic, decoupled from kube-runtime.
@@ -2856,13 +2754,13 @@ async fn reconcile_framework_native_switchover_with_fuel(
     let now = unix_seconds();
     let initial = native_initial_operation(reference)?;
     let mut adapter =
-        NativeSwitchoverRunnerAdapter::new(&initial, set, &current_pods, api, store, now);
+        DirectSwitchoverRunnerAdapter::new(&initial, set, &current_pods, api, store, now)?;
     let mut host = host.lock().await;
     let outcome = DurableRunner::new(runner_fuel)
         .map_err(|error| format!("construct framework-native switchover runner: {error}"))?
         .run(
             &mut host,
-            &NativeSwitchoverWorkflow,
+            &DirectSwitchoverWorkflow,
             execution,
             &mut adapter,
             now,
@@ -2973,7 +2871,7 @@ async fn publish_framework_native_switchover_terminal(
     set: &KubericSet,
     api: &dyn ClusterApi,
     state: &ReconcilerState,
-    terminal: NativeSwitchoverTerminal,
+    terminal: DirectSwitchoverTerminalRecord,
     now: i64,
 ) -> Result<ReconcileAction, String> {
     let namespace = set.namespace().unwrap_or_default();
@@ -2989,14 +2887,14 @@ async fn publish_framework_native_switchover_terminal(
         .and_then(|status| status.switchover_execution.as_ref())
         .ok_or_else(|| "terminal framework-native switchover has no reference".to_string())?;
     match terminal {
-        NativeSwitchoverTerminal::Stopped { message, .. } => {
+        DirectSwitchoverTerminalRecord::Stopped { message } => {
             record_framework_native_switchover_condition(set, api, "Quarantined", &message, now)
                 .await;
         }
-        NativeSwitchoverTerminal::Complete {
-            operation,
+        DirectSwitchoverTerminalRecord::Complete {
             snapshot,
             compensated,
+            reason,
             ..
         } => {
             let primary_name = set
@@ -3060,8 +2958,7 @@ async fn publish_framework_native_switchover_terminal(
             let (reason, message) = if compensated {
                 (
                     "CompensatedOrSafeFailure",
-                    operation
-                        .last_error
+                    reason
                         .as_deref()
                         .unwrap_or("target promotion failed and the old primary was restored"),
                 )
@@ -4703,14 +4600,9 @@ fn build_service(
 #[cfg(test)]
 mod dispatch_planning_tests {
     use super::*;
-    use crate::durable::effects::{LabelEffectCommand, ReplicaEffectCommand};
     use kuberic_core::types::{
         AccessStatus, AgentControlVersion, AgentGeneration, CorrelatedActionObservation,
         DurableActionErrorClass, DurableActionObservation, ReplicaAgentStatus,
-    };
-    use std::sync::{
-        Arc as StdArc, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
     };
 
     fn pending() -> PendingActionStatus {
@@ -4770,6 +4662,13 @@ mod dispatch_planning_tests {
     fn action() -> DurableReplicaAction {
         DurableReplicaAction::RevokeWriteStatus
     }
+
+    // Kept unreachable only as historical test context while the direct
+    // operation tests below and in switchover_execution own current coverage.
+    #[rustfmt::skip]
+    #[cfg(any())]
+    mod obsolete_generic_switchover_tests {
+        use super::*;
 
     fn switchover_snapshot() -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {
@@ -6066,6 +5965,37 @@ mod dispatch_planning_tests {
         }
     }
 
+    }
+
+    fn configuration_action(progress: i64) -> DurableReplicaAction {
+        DurableReplicaAction::UpdateCurrentConfiguration {
+            current: kuberic_core::types::ReplicaSetConfig {
+                members: vec![kuberic_core::types::ReplicaInfo {
+                    id: 2,
+                    instance_id: ReplicaInstanceId::new("secondary"),
+                    role: kuberic_core::types::Role::ActiveSecondary,
+                    status: kuberic_core::types::ReplicaStatus::Up,
+                    replicator_address: "http://secondary".to_string(),
+                    current_progress: progress,
+                    catch_up_capability: progress,
+                    must_catch_up: true,
+                }],
+                write_quorum: 2,
+            },
+        }
+    }
+
+    fn persisted(plan: DispatchEvidencePlan) -> PendingActionStatus {
+        match plan {
+            DispatchEvidencePlan::Persist(pending) => *pending,
+            DispatchEvidencePlan::Ready
+            | DispatchEvidencePlan::WaitForExactIncarnation
+            | DispatchEvidencePlan::WaitForSupportedProtocol => {
+                panic!("expected dispatch evidence persistence")
+            }
+        }
+    }
+
     #[test]
     fn versioned_dispatch_evidence_is_persisted_without_changing_attempt_budget() {
         let original = pending();
@@ -6332,7 +6262,10 @@ mod dispatch_planning_tests {
             ],
             write_quorum: 2,
         };
-        let mut operation = start_switchover("set-uid", snapshot, 2, 0).unwrap();
+        let mut operation = crate::durable::switchover_execution::direct_initial_operation(
+            "set-uid", snapshot, 2, 0,
+        )
+        .unwrap();
         operation.pending_action = Some(pending());
         let original_attempts = operation.pending_action.as_ref().unwrap().attempts;
         operation
@@ -6377,7 +6310,10 @@ mod dispatch_planning_tests {
             ],
             write_quorum: 2,
         };
-        let mut operation = start_switchover("set-uid", snapshot, 2, 0).unwrap();
+        let mut operation = crate::durable::switchover_execution::direct_initial_operation(
+            "set-uid", snapshot, 2, 0,
+        )
+        .unwrap();
         let mut pending = pending();
         pending.dispatch_agent_generation = Some("0123456789abcdef0123456789abcdef".to_string());
         let attempts = pending.attempts;

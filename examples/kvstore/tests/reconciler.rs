@@ -1432,8 +1432,7 @@ async fn native_checkpoint_ready_for_terminal(
 ) -> bool {
     use kuberic_durable_execution::{ActivityState, CheckpointStore};
     use kuberic_operator::durable::switchover_execution::{
-        DurableSwitchoverStepResult, checkpoint_limits, decode_activity_input_state,
-        decode_activity_step_result, native_execution_id, native_execution_spec,
+        checkpoint_limits, native_execution_id, native_execution_spec,
     };
 
     let Some(reference) = status.switchover_execution.as_ref() else {
@@ -1456,19 +1455,15 @@ async fn native_checkpoint_ready_for_terminal(
         return false;
     };
     match last.state() {
-        ActivityState::DispatchExposed { .. } => decode_activity_input_state(last.input())
-            .is_ok_and(|state| {
-                state.pending_action.as_ref().is_some_and(|pending| {
-                    matches!(
-                        pending.kind,
-                        DurableActionKind::LabelOldSecondary
-                            | DurableActionKind::CompensateLabelTargetSecondary
-                    )
-                })
-            }),
-        ActivityState::Completed { result } => matches!(
-            decode_activity_step_result(result),
-            Ok(DurableSwitchoverStepResult::Complete { .. })
+        ActivityState::DispatchExposed { .. } => matches!(
+            last.name().name(),
+            "kuberic.switchover.publish-old-primary-secondary-label"
+                | "kuberic.switchover.restore-target-secondary-label"
+        ),
+        ActivityState::Completed { .. } => matches!(
+            last.name().name(),
+            "kuberic.switchover.attest-target-topology"
+                | "kuberic.switchover.attest-compensated-topology"
         ),
         ActivityState::Scheduled => false,
     }
@@ -4542,9 +4537,9 @@ async fn test_framework_native_switchover_publication_compensates_failed_promoti
         )
         .await
         .expect("completed compensation measurements must remain available");
-    assert_eq!(measurements.completed_external_effect_count, Some(8));
+    assert_eq!(measurements.completed_external_effect_count, Some(9));
     assert_eq!(measurements.completed_passive_observation_count, Some(5));
-    assert_eq!(measurements.completed_activity_count, Some(13));
+    assert_eq!(measurements.completed_activity_count, Some(14));
     assert_eq!(
         api.operations()
             .iter()
@@ -4749,13 +4744,11 @@ async fn test_framework_native_switchover_terminal_validation_reloads_before_pub
         .await
         .unwrap();
         status = api.last_status().unwrap();
-        if api
-            .operations()
-            .contains(&ControlOperation::UpdateCurrentConfiguration)
-        {
+        if native_checkpoint_ready_for_terminal(&store, &status).await {
             break;
         }
     }
+    assert!(native_checkpoint_ready_for_terminal(&store, &status).await);
     api.fail_next_status_patch();
     for _ in 0..60 {
         reconcile_set(
@@ -5071,14 +5064,20 @@ async fn test_framework_native_switchover_unknown_checkpoint_outcomes_requeue_wi
                     exposed.state(),
                     kuberic_durable_execution::ActivityState::DispatchExposed { .. }
                 ));
-                assert!(matches!(
-                    kuberic_operator::durable::switchover_execution::decode_switchover_activity_input(
-                        exposed.input(),
+                assert!(
+                    kuberic_operator::durable::switchover_execution::is_switchover_activity_identity(
+                        exposed.name().name(),
+                        exposed.name().version(),
                     )
-                        .unwrap()
-                        .kind,
-                    kuberic_operator::durable::switchover_execution::SwitchoverActivityKind::PreparedReplica { .. }
-                ));
+                );
+                assert_eq!(exposed.name().version(), 1);
+                let input: serde_json::Value =
+                    serde_json::from_slice(exposed.input().as_slice()).unwrap();
+                assert!(
+                    input
+                        .get("preparedCommand")
+                        .is_some_and(|value| !value.is_null())
+                );
             }
             _ => unreachable!("test covers only unknown checkpoint outcomes"),
         }

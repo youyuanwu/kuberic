@@ -1,11 +1,87 @@
-#![allow(dead_code)]
-
 use crate::crd::{
     DURABLE_OPERATION_VERSION, DurableOperationKind, DurableOperationPhase, DurableOperationStatus,
-    EpochStatus, StablePartitionSnapshotStatus, StableReplicaRoleStatus,
-    StableReplicaSnapshotStatus,
+    StablePartitionSnapshotStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
 };
 use crate::durable::ACTION_DEADLINE_SECONDS;
+
+pub fn admit_direct_switchover(
+    operation_authority: &str,
+    previous_snapshot: StablePartitionSnapshotStatus,
+    target_primary_id: i64,
+    accepted_unix_seconds: i64,
+) -> Result<DurableOperationStatus, String> {
+    if operation_authority.is_empty() {
+        return Err("direct switchover operation authority is empty".to_string());
+    }
+    validate_snapshot(&previous_snapshot)?;
+    if previous_snapshot.primary_id == target_primary_id {
+        return Err("switchover target is already primary".to_string());
+    }
+    if !previous_snapshot
+        .members
+        .iter()
+        .any(|member| member.id == target_primary_id)
+    {
+        return Err(format!(
+            "switchover target replica {target_primary_id} is not in the stable snapshot"
+        ));
+    }
+
+    let mut target_snapshot = previous_snapshot.clone();
+    target_snapshot.epoch.configuration_number = target_snapshot
+        .epoch
+        .configuration_number
+        .checked_add(1)
+        .ok_or_else(|| "switchover epoch overflow".to_string())?;
+    target_snapshot.primary_id = target_primary_id;
+    for member in &mut target_snapshot.members {
+        member.role = if member.id == target_primary_id {
+            StableReplicaRoleStatus::Primary
+        } else {
+            StableReplicaRoleStatus::ActiveSecondary
+        };
+    }
+
+    let operation_id = format!(
+        "{operation_authority}:switchover:v{DURABLE_OPERATION_VERSION}:{}-{}:{target_primary_id}",
+        previous_snapshot.epoch.data_loss_number, previous_snapshot.epoch.configuration_number,
+    );
+    let operation = DurableOperationStatus {
+        execution_id: format!("{operation_id}:execution-1"),
+        operation_id,
+        version: DURABLE_OPERATION_VERSION,
+        kind: DurableOperationKind::Switchover,
+        phase: DurableOperationPhase::Revoke,
+        old_primary_id: previous_snapshot.primary_id,
+        target_primary_id,
+        add_mode: None,
+        remove_mode: None,
+        target_replica_id: None,
+        target_instance_id: None,
+        target_pod_name: None,
+        target_pod_uid: None,
+        remove_target_replicator_address: None,
+        remove_target_agent_generation: None,
+        retired_instance_id: None,
+        previous_snapshot: previous_snapshot.into(),
+        target_snapshot,
+        committed_snapshot: None,
+        minimum_committed_replicas: None,
+        frozen_lsn: None,
+        next_secondary_index: 0,
+        phase_deadline_unix_seconds: next_deadline(accepted_unix_seconds)?,
+        pending_action: None,
+        last_error: None,
+        failover: None,
+        add_intent: None,
+        remove_intent: None,
+        remove_commit_evidence: None,
+        remove_cleanup: None,
+        removal_disposition: None,
+    };
+    DirectSwitchoverDefinition::from_initial(&operation)?;
+    Ok(operation)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DirectSwitchoverDefinition {
@@ -36,6 +112,32 @@ impl DirectSwitchoverDefinition {
         {
             return Err("direct switchover input is not immutable admission state".to_string());
         }
+        if operation.operation_id.is_empty()
+            || operation.execution_id != format!("{}:execution-1", operation.operation_id)
+        {
+            return Err("direct switchover operation identity is invalid".to_string());
+        }
+        if operation.committed_snapshot.is_some()
+            || operation.minimum_committed_replicas.is_some()
+            || operation.add_mode.is_some()
+            || operation.remove_mode.is_some()
+            || operation.target_replica_id.is_some()
+            || operation.target_instance_id.is_some()
+            || operation.target_pod_name.is_some()
+            || operation.target_pod_uid.is_some()
+            || operation.remove_target_replicator_address.is_some()
+            || operation.remove_target_agent_generation.is_some()
+            || operation.retired_instance_id.is_some()
+            || operation.last_error.is_some()
+            || operation.failover.is_some()
+            || operation.add_intent.is_some()
+            || operation.remove_intent.is_some()
+            || operation.remove_commit_evidence.is_some()
+            || operation.remove_cleanup.is_some()
+            || operation.removal_disposition.is_some()
+        {
+            return Err("direct switchover admission contains unrelated mutable state".to_string());
+        }
         let previous_snapshot = operation
             .previous_snapshot
             .cloned()
@@ -56,12 +158,38 @@ impl DirectSwitchoverDefinition {
         if previous_snapshot.members.len() != operation.target_snapshot.members.len() {
             return Err("direct switchover membership changed at admission".to_string());
         }
-        for previous in &previous_snapshot.members {
-            let target = member(&operation.target_snapshot, previous.id)?;
-            if target.instance_id != previous.instance_id {
+        let expected_configuration_number = previous_snapshot
+            .epoch
+            .configuration_number
+            .checked_add(1)
+            .ok_or_else(|| "direct switchover admission epoch overflows".to_string())?;
+        if operation.target_snapshot.epoch.data_loss_number
+            != previous_snapshot.epoch.data_loss_number
+            || operation.target_snapshot.epoch.configuration_number != expected_configuration_number
+            || operation.target_snapshot.write_quorum != previous_snapshot.write_quorum
+        {
+            return Err("direct switchover target epoch or quorum is invalid".to_string());
+        }
+        for (previous, target) in previous_snapshot
+            .members
+            .iter()
+            .zip(&operation.target_snapshot.members)
+        {
+            if target.id != previous.id || target.instance_id != previous.instance_id {
                 return Err(format!(
                     "direct switchover replica {} incarnation changed at admission",
                     previous.id
+                ));
+            }
+            let expected_role = if target.id == operation.target_primary_id {
+                StableReplicaRoleStatus::Primary
+            } else {
+                StableReplicaRoleStatus::ActiveSecondary
+            };
+            if target.role != expected_role {
+                return Err(format!(
+                    "direct switchover replica {} target role is invalid",
+                    target.id
                 ));
             }
         }
@@ -113,10 +241,6 @@ pub fn next_deadline(observed_at_unix_seconds: i64) -> Result<i64, String> {
         .ok_or_else(|| "direct switchover action deadline overflows unix time".to_string())
 }
 
-pub fn expected_epoch_for_previous(snapshot: &StablePartitionSnapshotStatus) -> EpochStatus {
-    snapshot.epoch.clone()
-}
-
 fn member(
     snapshot: &StablePartitionSnapshotStatus,
     id: i64,
@@ -139,8 +263,12 @@ fn sorted_ids_excluding(snapshot: &StablePartitionSnapshotStatus, excluded: &[i6
 }
 
 fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), String> {
-    if snapshot.members.is_empty() {
-        return Err("direct switchover snapshot has no members".to_string());
+    if !(2..=crate::crd::KUBERIC_MAX_REPLICAS as usize).contains(&snapshot.members.len()) {
+        return Err(format!(
+            "direct switchover snapshot member count {} is outside 2..={}",
+            snapshot.members.len(),
+            crate::crd::KUBERIC_MAX_REPLICAS
+        ));
     }
     let expected_quorum = u32::try_from(snapshot.members.len() / 2 + 1)
         .map_err(|_| "direct switchover snapshot quorum overflows u32".to_string())?;
@@ -177,9 +305,58 @@ fn validate_snapshot(snapshot: &StablePartitionSnapshotStatus) -> Result<(), Str
     Ok(())
 }
 
+pub fn same_topology(
+    actual: &StablePartitionSnapshotStatus,
+    expected: &StablePartitionSnapshotStatus,
+) -> bool {
+    actual.epoch == expected.epoch
+        && actual.primary_id == expected.primary_id
+        && actual.write_quorum == expected.write_quorum
+        && actual.members.len() == expected.members.len()
+        && actual
+            .members
+            .iter()
+            .zip(&expected.members)
+            .all(|(actual, expected)| {
+                actual.id == expected.id
+                    && actual.instance_id == expected.instance_id
+                    && actual.role == expected.role
+            })
+}
+
+pub fn is_valid_compensation_topology(
+    actual: &StablePartitionSnapshotStatus,
+    definition: &DirectSwitchoverDefinition,
+) -> bool {
+    if actual.primary_id != definition.old_primary_id
+        || actual.write_quorum != definition.previous_snapshot.write_quorum
+        || actual.members.len() != definition.previous_snapshot.members.len()
+        || (actual.epoch != definition.previous_snapshot.epoch
+            && actual.epoch != definition.target_snapshot.epoch)
+    {
+        return false;
+    }
+    definition.previous_snapshot.members.iter().all(|expected| {
+        let matches = actual
+            .members
+            .iter()
+            .filter(|member| member.id == expected.id)
+            .collect::<Vec<_>>();
+        matches.len() == 1
+            && matches[0].instance_id == expected.instance_id
+            && matches[0].role
+                == if expected.id == definition.old_primary_id {
+                    StableReplicaRoleStatus::Primary
+                } else {
+                    StableReplicaRoleStatus::ActiveSecondary
+                }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::EpochStatus;
 
     fn snapshot(
         primary_id: i64,
@@ -233,9 +410,27 @@ mod tests {
 
     #[test]
     fn direct_switchover_rejects_old_operation_versions() {
-        let mut operation =
-            crate::durable::start_switchover("set-uid", snapshot(1, 2, 7), 2, 100).unwrap();
+        let mut operation = admit_direct_switchover("set-uid", snapshot(1, 2, 7), 2, 100).unwrap();
         operation.version = DURABLE_OPERATION_VERSION + 1;
         assert!(DirectSwitchoverDefinition::from_initial(&operation).is_err());
+    }
+
+    #[test]
+    fn direct_admission_constructs_the_exact_target_epoch_and_roles() {
+        let operation = admit_direct_switchover("set-uid", snapshot(1, 4, 7), 3, 100).unwrap();
+        assert_eq!(operation.old_primary_id, 1);
+        assert_eq!(operation.target_primary_id, 3);
+        assert_eq!(operation.target_snapshot.epoch.configuration_number, 8);
+        assert_eq!(
+            operation
+                .target_snapshot
+                .members
+                .iter()
+                .find(|member| member.id == 3)
+                .unwrap()
+                .role,
+            StableReplicaRoleStatus::Primary
+        );
+        assert!(DirectSwitchoverDefinition::from_initial(&operation).is_ok());
     }
 }

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use kuberic_core::types::{
@@ -324,8 +322,9 @@ impl DirectActivity {
                     input.deadline_unix_seconds,
                     observations,
                     now,
-                    |observed_at| AttestTargetTopologyOutput::Attested {
+                    |observed_at, snapshot| AttestTargetTopologyOutput::Attested {
                         observed_at_unix_seconds: observed_at,
+                        snapshot,
                         accounting: None,
                     },
                     |observed_at, message| AttestTargetTopologyOutput::DeadlineExceeded {
@@ -344,8 +343,9 @@ impl DirectActivity {
                     input.deadline_unix_seconds,
                     observations,
                     now,
-                    |observed_at| AttestCompensatedTopologyOutput::Attested {
+                    |observed_at, snapshot| AttestCompensatedTopologyOutput::Attested {
                         observed_at_unix_seconds: observed_at,
+                        snapshot,
                         accounting: None,
                     },
                     |observed_at, message| AttestCompensatedTopologyOutput::DeadlineExceeded {
@@ -1410,12 +1410,15 @@ fn evaluate_attestation<A, FAttested, FDeadline, FConflicting>(
 ) -> Result<DirectEvaluation, String>
 where
     A: DurableActivity,
-    FAttested: FnOnce(i64) -> A::Output,
+    FAttested: FnOnce(i64, StablePartitionSnapshotStatus) -> A::Output,
     FDeadline: FnOnce(i64, String) -> A::Output,
     FConflicting: FnOnce(i64, String) -> A::Output,
 {
     let result = match attestation_error(snapshot, observations) {
-        Ok(()) => attested(now),
+        Ok(()) => attested(
+            now,
+            crate::reconciler::snapshot_with_observed_metadata(snapshot.clone(), observations),
+        ),
         Err(AttestationError::Unavailable(_)) if now < deadline_unix_seconds => {
             return Ok(DirectEvaluation::AwaitEvidence);
         }
