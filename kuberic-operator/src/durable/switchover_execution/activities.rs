@@ -9,6 +9,27 @@ use crate::durable::effects::{LabelEffectCommand, ReplicaEffectCommand};
 pub const DIRECT_SWITCHOVER_CONTRACT_VERSION: u32 = 4;
 pub const DIRECT_ACTIVITY_VERSION: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DirectActivityAccounting {
+    pub external_effect_count: u64,
+    pub passive_observation_count: u64,
+}
+
+impl DirectActivityAccounting {
+    pub const fn new(external_effect_count: u64, passive_observation_count: u64) -> Self {
+        Self {
+            external_effect_count,
+            passive_observation_count,
+        }
+    }
+
+    pub fn total(self) -> Option<u64> {
+        self.external_effect_count
+            .checked_add(self.passive_observation_count)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicaOperationRequest {
@@ -90,12 +111,16 @@ impl EffectObservation {
 
 pub trait ReplicaDirectActivity: DurableActivity {
     fn input(request: ReplicaOperationRequest) -> Self::Input;
+    fn request(input: Self::Input) -> ReplicaOperationRequest;
     fn observation(output: Self::Output) -> EffectObservation;
+    fn output(observation: EffectObservation) -> Result<Self::Output, String>;
 }
 
 pub trait LabelDirectActivity: DurableActivity {
     fn input(request: LabelOperationRequest) -> Self::Input;
+    fn request(input: Self::Input) -> LabelOperationRequest;
     fn observation(output: Self::Output) -> EffectObservation;
+    fn output(observation: EffectObservation) -> Result<Self::Output, String>;
 }
 
 macro_rules! define_replica_activity {
@@ -169,6 +194,22 @@ macro_rules! define_replica_activity {
                 }
             }
 
+            fn request(input: Self::Input) -> ReplicaOperationRequest {
+                ReplicaOperationRequest {
+                    contract_version: input.contract_version,
+                    execution_id: input.execution_id,
+                    action_id: input.action_id,
+                    sequence: input.sequence,
+                    target_id: input.target_id,
+                    target_instance_id: input.target_instance_id,
+                    expected_epoch: input.expected_epoch,
+                    desired_snapshot: input.desired_snapshot,
+                    deadline_unix_seconds: input.deadline_unix_seconds,
+                    redelivery: input.redelivery,
+                    prepared_command: input.prepared_command,
+                }
+            }
+
             fn observation(output: Self::Output) -> EffectObservation {
                 match output {
                     $output::Applied {
@@ -203,6 +244,42 @@ macro_rules! define_replica_activity {
                         message,
                     },
                 }
+            }
+
+            fn output(observation: EffectObservation) -> Result<Self::Output, String> {
+                Ok(match observation {
+                    EffectObservation::Applied {
+                        observed_at_unix_seconds,
+                    } => $output::Applied {
+                        observed_at_unix_seconds,
+                    },
+                    EffectObservation::ProvenNoAdmission {
+                        observed_at_unix_seconds,
+                    } => $output::ProvenNoAdmission {
+                        observed_at_unix_seconds,
+                    },
+                    EffectObservation::Rejected {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::Rejected {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::Failed {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::Failed {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::Conflicting {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::Conflicting {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                })
             }
         }
     };
@@ -268,6 +345,20 @@ macro_rules! define_label_activity {
                 }
             }
 
+            fn request(input: Self::Input) -> LabelOperationRequest {
+                LabelOperationRequest {
+                    contract_version: input.contract_version,
+                    execution_id: input.execution_id,
+                    action_id: input.action_id,
+                    sequence: input.sequence,
+                    target_id: input.target_id,
+                    target_instance_id: input.target_instance_id,
+                    desired_role: input.desired_role,
+                    deadline_unix_seconds: input.deadline_unix_seconds,
+                    prepared_command: input.prepared_command,
+                }
+            }
+
             fn observation(output: Self::Output) -> EffectObservation {
                 match output {
                     $output::Applied {
@@ -290,6 +381,36 @@ macro_rules! define_label_activity {
                         message,
                     },
                 }
+            }
+
+            fn output(observation: EffectObservation) -> Result<Self::Output, String> {
+                Ok(match observation {
+                    EffectObservation::Applied {
+                        observed_at_unix_seconds,
+                    } => $output::Applied {
+                        observed_at_unix_seconds,
+                    },
+                    EffectObservation::Failed {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::Failed {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::Conflicting {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::Conflicting {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::ProvenNoAdmission { .. }
+                    | EffectObservation::Rejected { .. } => {
+                        return Err(
+                            "label activities cannot report replica-only outcomes".to_string()
+                        );
+                    }
+                })
             }
         }
     };
@@ -521,6 +642,8 @@ macro_rules! define_attestation_activity {
         pub enum $output {
             Attested {
                 observed_at_unix_seconds: i64,
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                accounting: Option<DirectActivityAccounting>,
             },
             DeadlineExceeded {
                 observed_at_unix_seconds: i64,
@@ -644,6 +767,10 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
 mod tests {
     use super::*;
     use crate::crd::{StableReplicaRoleStatus, StableReplicaSnapshotStatus};
+    use kuberic_durable_execution::{
+        ActivityCallError, decode_activity_input, decode_activity_result, encode_activity_input,
+        encode_activity_result,
+    };
 
     fn snapshot() -> StablePartitionSnapshotStatus {
         StablePartitionSnapshotStatus {
@@ -684,6 +811,100 @@ mod tests {
             redelivery: 0,
             prepared_command: None,
         }
+    }
+
+    fn label_request() -> LabelOperationRequest {
+        LabelOperationRequest {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: "execution".to_string(),
+            action_id: "execution:1003".to_string(),
+            sequence: 1003,
+            target_id: 2,
+            target_instance_id: "instance-2".to_string(),
+            desired_role: "primary".to_string(),
+            deadline_unix_seconds: 10,
+            prepared_command: None,
+        }
+    }
+
+    fn assert_exact_input_bound<A, F>(make: F)
+    where
+        A: DurableActivity,
+        F: Fn(usize) -> A::Input,
+    {
+        let base = encode_activity_input::<A>(&make(0)).unwrap();
+        let maximum = usize::try_from(A::MAX_INPUT_BYTES).unwrap();
+        assert!(base.as_slice().len() <= maximum, "{}", A::NAME);
+        let padding = maximum - base.as_slice().len();
+        let exact = encode_activity_input::<A>(&make(padding)).unwrap();
+        assert_eq!(exact.as_slice().len(), maximum, "{}", A::NAME);
+        assert!(decode_activity_input::<A>(&exact).is_ok(), "{}", A::NAME);
+        assert!(
+            matches!(
+                encode_activity_input::<A>(&make(padding + 1)),
+                Err(ActivityCallError::InputTooLarge {
+                    actual_bytes,
+                    max_bytes,
+                }) if actual_bytes == max_bytes + 1 && max_bytes == A::MAX_INPUT_BYTES
+            ),
+            "{}",
+            A::NAME
+        );
+    }
+
+    fn assert_exact_result_bound<A, F>(make: F)
+    where
+        A: DurableActivity,
+        F: Fn(usize) -> A::Output,
+    {
+        let base = encode_activity_result::<A>(&make(0)).unwrap();
+        let maximum = usize::try_from(A::MAX_RESULT_BYTES).unwrap();
+        assert!(base.as_slice().len() <= maximum, "{}", A::NAME);
+        let padding = maximum - base.as_slice().len();
+        let exact = encode_activity_result::<A>(&make(padding)).unwrap();
+        assert_eq!(exact.as_slice().len(), maximum, "{}", A::NAME);
+        assert!(decode_activity_result::<A>(&exact).is_ok(), "{}", A::NAME);
+        assert!(
+            matches!(
+                encode_activity_result::<A>(&make(padding + 1)),
+                Err(ActivityCallError::ResultTooLarge {
+                    actual_bytes,
+                    max_bytes,
+                }) if actual_bytes == max_bytes + 1 && max_bytes == A::MAX_RESULT_BYTES
+            ),
+            "{}",
+            A::NAME
+        );
+    }
+
+    fn assert_replica_activity_exact_bounds<A: ReplicaDirectActivity>() {
+        assert_exact_input_bound::<A, _>(|padding| {
+            let mut request = replica_request();
+            request.execution_id = "x".repeat(padding);
+            A::input(request)
+        });
+        assert_exact_result_bound::<A, _>(|padding| {
+            A::output(EffectObservation::Failed {
+                observed_at_unix_seconds: 1,
+                message: "x".repeat(padding),
+            })
+            .unwrap()
+        });
+    }
+
+    fn assert_label_activity_exact_bounds<A: LabelDirectActivity>() {
+        assert_exact_input_bound::<A, _>(|padding| {
+            let mut request = label_request();
+            request.execution_id = "x".repeat(padding);
+            A::input(request)
+        });
+        assert_exact_result_bound::<A, _>(|padding| {
+            A::output(EffectObservation::Failed {
+                observed_at_unix_seconds: 1,
+                message: "x".repeat(padding),
+            })
+            .unwrap()
+        });
     }
 
     #[test]
@@ -788,5 +1009,89 @@ mod tests {
             let decoded = serde_json::from_slice::<RevokeWritesOutput>(&encoded).unwrap();
             assert_eq!(decoded, outcome);
         }
+    }
+
+    #[test]
+    fn direct_switchover_every_activity_accepts_exact_bounds_and_rejects_one_over() {
+        assert_replica_activity_exact_bounds::<RevokeWritesActivity>();
+        assert_replica_activity_exact_bounds::<DemoteOldPrimaryActivity>();
+        assert_replica_activity_exact_bounds::<PromoteTargetActivity>();
+        assert_replica_activity_exact_bounds::<DistributeReplicaEpochActivity>();
+        assert_replica_activity_exact_bounds::<InstallTargetCatchUpConfigurationActivity>();
+        assert_replica_activity_exact_bounds::<WaitTargetWriteQuorumActivity>();
+        assert_replica_activity_exact_bounds::<InstallTargetCurrentConfigurationActivity>();
+        assert_replica_activity_exact_bounds::<RestorePreviousCurrentConfigurationActivity>();
+        assert_replica_activity_exact_bounds::<CompensatePromoteOldPrimaryActivity>();
+        assert_replica_activity_exact_bounds::<CompensateDistributeReplicaEpochActivity>();
+        assert_replica_activity_exact_bounds::<InstallCompensationCatchUpConfigurationActivity>();
+        assert_replica_activity_exact_bounds::<InstallCompensationCurrentConfigurationActivity>();
+
+        assert_label_activity_exact_bounds::<PublishTargetPrimaryLabelActivity>();
+        assert_label_activity_exact_bounds::<PublishOldPrimarySecondaryLabelActivity>();
+        assert_label_activity_exact_bounds::<RestoreOldPrimaryLabelActivity>();
+        assert_label_activity_exact_bounds::<RestoreTargetSecondaryLabelActivity>();
+
+        assert_exact_input_bound::<CaptureFrozenLsnActivity, _>(|padding| CaptureFrozenLsnInput {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: "x".repeat(padding),
+            old_primary_id: 1,
+            old_primary_instance_id: "instance-1".to_string(),
+            expected_epoch: snapshot().epoch,
+            deadline_unix_seconds: 10,
+        });
+        assert_exact_result_bound::<CaptureFrozenLsnActivity, _>(|padding| {
+            CaptureFrozenLsnOutput::Conflicting {
+                observed_at_unix_seconds: 1,
+                message: "x".repeat(padding),
+            }
+        });
+
+        assert_exact_input_bound::<WaitTargetCaughtUpActivity, _>(|padding| {
+            WaitTargetCaughtUpInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: "x".repeat(padding),
+                target_id: 2,
+                target_instance_id: "instance-2".to_string(),
+                expected_epoch: snapshot().epoch,
+                frozen_lsn: 10,
+                deadline_unix_seconds: 10,
+            }
+        });
+        assert_exact_result_bound::<WaitTargetCaughtUpActivity, _>(|padding| {
+            WaitTargetCaughtUpOutput::Conflicting {
+                observed_at_unix_seconds: 1,
+                message: "x".repeat(padding),
+            }
+        });
+
+        assert_exact_input_bound::<AttestTargetTopologyActivity, _>(|padding| {
+            AttestTargetTopologyInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: "x".repeat(padding),
+                expected_snapshot: snapshot(),
+                deadline_unix_seconds: 10,
+            }
+        });
+        assert_exact_result_bound::<AttestTargetTopologyActivity, _>(|padding| {
+            AttestTargetTopologyOutput::Conflicting {
+                observed_at_unix_seconds: 1,
+                message: "x".repeat(padding),
+            }
+        });
+
+        assert_exact_input_bound::<AttestCompensatedTopologyActivity, _>(|padding| {
+            AttestCompensatedTopologyInput {
+                contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+                execution_id: "x".repeat(padding),
+                expected_snapshot: snapshot(),
+                deadline_unix_seconds: 10,
+            }
+        });
+        assert_exact_result_bound::<AttestCompensatedTopologyActivity, _>(|padding| {
+            AttestCompensatedTopologyOutput::Conflicting {
+                observed_at_unix_seconds: 1,
+                message: "x".repeat(padding),
+            }
+        });
     }
 }

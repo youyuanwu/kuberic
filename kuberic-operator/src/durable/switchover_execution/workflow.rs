@@ -13,8 +13,8 @@ use super::activities::{
     AttestTargetTopologyOutput, CaptureFrozenLsnActivity, CaptureFrozenLsnInput,
     CaptureFrozenLsnOutput, CompensateDistributeReplicaEpochActivity,
     CompensatePromoteOldPrimaryActivity, DIRECT_SWITCHOVER_CONTRACT_VERSION,
-    DemoteOldPrimaryActivity, DistributeReplicaEpochActivity, EffectObservation,
-    InstallCompensationCatchUpConfigurationActivity,
+    DemoteOldPrimaryActivity, DirectActivityAccounting, DistributeReplicaEpochActivity,
+    EffectObservation, InstallCompensationCatchUpConfigurationActivity,
     InstallCompensationCurrentConfigurationActivity, InstallTargetCatchUpConfigurationActivity,
     InstallTargetCurrentConfigurationActivity, LabelDirectActivity, LabelOperationRequest,
     PromoteTargetActivity, PublishOldPrimarySecondaryLabelActivity,
@@ -35,6 +35,8 @@ pub enum DirectSwitchoverTerminalRecord {
         compensated: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounting: Option<DirectActivityAccounting>,
     },
     Stopped {
         message: String,
@@ -363,8 +365,8 @@ impl Workflow for DirectSwitchoverWorkflow {
             })
             .await
         {
-            Ok(AttestTargetTopologyOutput::Attested { .. }) => {
-                complete(definition.target_snapshot, false, None)
+            Ok(AttestTargetTopologyOutput::Attested { accounting, .. }) => {
+                complete(definition.target_snapshot, false, None, accounting)
             }
             Ok(AttestTargetTopologyOutput::DeadlineExceeded { message, .. })
             | Ok(AttestTargetTopologyOutput::Conflicting { message, .. }) => stopped(message),
@@ -588,8 +590,8 @@ async fn attest_compensated(
         })
         .await
     {
-        Ok(AttestCompensatedTopologyOutput::Attested { .. }) => {
-            complete(snapshot, true, Some(reason))
+        Ok(AttestCompensatedTopologyOutput::Attested { accounting, .. }) => {
+            complete(snapshot, true, Some(reason), accounting)
         }
         Ok(AttestCompensatedTopologyOutput::DeadlineExceeded { message, .. })
         | Ok(AttestCompensatedTopologyOutput::Conflicting { message, .. }) => stopped(message),
@@ -736,12 +738,14 @@ fn complete(
     snapshot: StablePartitionSnapshotStatus,
     compensated: bool,
     reason: Option<String>,
+    accounting: Option<DirectActivityAccounting>,
 ) -> TerminalOutcome {
     terminal(DirectSwitchoverTerminalRecord::Complete {
         snapshot,
         compensated,
         reason: reason
             .map(|reason| super::bounded_utf8(&reason, super::SWITCHOVER_MAX_ERROR_BYTES)),
+        accounting,
     })
 }
 

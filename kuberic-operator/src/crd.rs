@@ -1145,8 +1145,21 @@ mod tests {
                         configuration_number: 2,
                     },
                     primary_id: 1,
-                    members: vec![],
-                    write_quorum: 1,
+                    members: vec![
+                        StableReplicaSnapshotStatus {
+                            id: 1,
+                            instance_id: "pod-1-uid".to_string(),
+                            role: StableReplicaRoleStatus::Primary,
+                            election_metadata: None,
+                        },
+                        StableReplicaSnapshotStatus {
+                            id: 2,
+                            instance_id: "pod-2-uid".to_string(),
+                            role: StableReplicaRoleStatus::ActiveSecondary,
+                            election_metadata: None,
+                        },
+                    ],
+                    write_quorum: 2,
                 },
                 target_primary_id: 2,
                 accepted_unix_seconds: 100,
@@ -1154,6 +1167,7 @@ mod tests {
         };
         let encoded = serde_json::to_value(&admitted).unwrap();
         assert!(encoded.get("input").is_some());
+        assert!(crate::durable::switchover_execution::native_execution_spec(&admitted).is_ok());
 
         let schema = generated_value
             .pointer(
@@ -1248,9 +1262,34 @@ mod tests {
         assert!(!deployed.contains("                  incompatibility:"));
         assert!(!deployed.contains("switchoverExecution contains an unsupported field"));
         assert!(!deployed.contains("x-kubernetes-preserve-unknown-fields"));
-        assert!(
-            deployed
-                .contains("description: Structured immutable admission and checkpoint authority")
+        assert!(deployed.contains("Structured immutable admission and checkpoint authority"));
+
+        let deployed_documents = serde_yaml_ng::Deserializer::from_str(deployment)
+            .map(|document| {
+                serde_json::Value::deserialize(document).expect("valid deployment YAML document")
+            })
+            .collect::<Vec<_>>();
+        let deployed_crd = deployed_documents
+            .iter()
+            .find(|document| {
+                document
+                    .pointer("/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("CustomResourceDefinition")
+                    && document
+                        .pointer("/metadata/name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("kubericsets.kuberic.io")
+            })
+            .expect("deployment contains the KubericSet CRD");
+        let deployed_schema = deployed_crd
+            .pointer(
+                "/spec/versions/0/schema/openAPIV3Schema/properties/status/properties/switchoverExecution",
+            )
+            .expect("deployed CRD contains the switchover execution schema");
+        assert_eq!(
+            deployed_schema, schema,
+            "generated and deployed switchover execution schemas must be exactly equal"
         );
 
         let mut missing_input = encoded.clone();
@@ -1277,6 +1316,12 @@ mod tests {
             .unwrap()
             .insert("unknown".to_string(), serde_json::json!(true));
         assert!(serde_json::from_value::<SwitchoverExecutionStatus>(extra_input).is_err());
+
+        let mut previous_version = admitted;
+        previous_version.contract_version = 2;
+        assert!(
+            crate::durable::switchover_execution::native_execution_id(&previous_version).is_err()
+        );
     }
 
     #[test]

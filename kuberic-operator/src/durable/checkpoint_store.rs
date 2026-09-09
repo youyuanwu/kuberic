@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointState, CheckpointStore,
-    ExactBytes, ExecutionId, HostOutcome, InMemoryCheckpointStore, KubernetesCheckpointStore,
+    ActivitySpec, CasOutcome, CheckpointEnvelope, CheckpointPayload, CheckpointState,
+    CheckpointStore, ExecutionId, HostOutcome, InMemoryCheckpointStore, KubernetesCheckpointStore,
     PersistenceBoundary, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
     TerminalOutcome,
 };
@@ -71,14 +71,14 @@ pub struct DurableActivityAccounting {
 #[derive(Clone, Copy)]
 pub struct CheckpointMeasurementDecoder {
     workflow_name: &'static str,
-    activity: fn(&ExactBytes) -> Option<DurableActivityClass>,
+    activity: fn(&ActivitySpec) -> Option<DurableActivityClass>,
     terminal: fn(&TerminalOutcome, u64) -> Option<DurableActivityAccounting>,
 }
 
 impl CheckpointMeasurementDecoder {
     pub const fn new(
         workflow_name: &'static str,
-        activity: fn(&ExactBytes) -> Option<DurableActivityClass>,
+        activity: fn(&ActivitySpec) -> Option<DurableActivityClass>,
         terminal: fn(&TerminalOutcome, u64) -> Option<DurableActivityAccounting>,
     ) -> Self {
         Self {
@@ -92,8 +92,8 @@ impl CheckpointMeasurementDecoder {
         self.workflow_name
     }
 
-    fn activity(self, input: &ExactBytes) -> Option<DurableActivityClass> {
-        (self.activity)(input)
+    fn activity(self, activity: &ActivitySpec) -> Option<DurableActivityClass> {
+        (self.activity)(activity)
     }
 
     fn terminal(
@@ -349,7 +349,7 @@ impl MeasuredDurableCheckpointStore {
                 let mut external_effects = 0_u64;
                 let mut passive_observations = 0_u64;
                 for activity in activities {
-                    match self.decoder.activity(activity.input()) {
+                    match self.decoder.activity(activity.spec()) {
                         Some(DurableActivityClass::PassiveObservation) => {
                             passive_observations = passive_observations.saturating_add(1);
                         }
@@ -552,8 +552,8 @@ mod checkpoint_store_tests {
         CheckpointEnvelope::new(3, ExactBytes::new(value))
     }
 
-    fn fixture_activity_decoder(input: &ExactBytes) -> Option<DurableActivityClass> {
-        match input.as_slice() {
+    fn fixture_activity_decoder(activity: &ActivitySpec) -> Option<DurableActivityClass> {
+        match activity.input().as_slice() {
             b"effect" => Some(DurableActivityClass::ExternalEffect),
             b"observation" => Some(DurableActivityClass::PassiveObservation),
             _ => None,
@@ -579,15 +579,22 @@ mod checkpoint_store_tests {
             fixture_activity_decoder,
             fixture_terminal_decoder,
         );
+        let spec = |input: &'static [u8]| {
+            ActivitySpec::new(
+                ActivityName::new("fixture.activity", 1).unwrap(),
+                ExactBytes::new(input),
+                32,
+            )
+        };
         assert_eq!(
-            decoder.activity(&ExactBytes::new(b"effect")),
+            decoder.activity(&spec(b"effect")),
             Some(DurableActivityClass::ExternalEffect)
         );
         assert_eq!(
-            decoder.activity(&ExactBytes::new(b"observation")),
+            decoder.activity(&spec(b"observation")),
             Some(DurableActivityClass::PassiveObservation)
         );
-        assert_eq!(decoder.activity(&ExactBytes::new(b"unknown")), None);
+        assert_eq!(decoder.activity(&spec(b"unknown")), None);
         assert_eq!(
             decoder.terminal(&TerminalOutcome::succeeded(ExactBytes::new(b"fixture")), 3),
             Some(DurableActivityAccounting {

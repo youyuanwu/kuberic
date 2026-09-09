@@ -8,7 +8,13 @@
 #[cfg(test)]
 pub(crate) mod activities;
 #[cfg(test)]
+pub(crate) mod adapter;
+#[cfg(test)]
 pub(crate) mod model;
+#[cfg(test)]
+pub(crate) mod prepare;
+#[cfg(test)]
+pub(crate) mod quarantine;
 #[cfg(test)]
 pub(crate) mod workflow;
 
@@ -644,8 +650,14 @@ pub fn decode_switchover_activity_input(
     Ok(input)
 }
 
-fn classify_checkpoint_activity(input: &ExactBytes) -> Option<DurableActivityClass> {
-    let input = decode_switchover_activity_input(input).ok()?;
+fn classify_checkpoint_activity(activity: &ActivitySpec) -> Option<DurableActivityClass> {
+    if activity.name().name() != SWITCHOVER_ACTIVITY_NAME
+        || activity.name().version() != SWITCHOVER_ACTIVITY_VERSION
+        || activity.max_result_bytes() != SWITCHOVER_MAX_ACTIVITY_RESULT_BYTES as u64
+    {
+        return None;
+    }
+    let input = decode_switchover_activity_input(activity.input()).ok()?;
     Some(match input.kind {
         SwitchoverActivityKind::PassiveObservation => DurableActivityClass::PassiveObservation,
         SwitchoverActivityKind::PreparedReplica { .. }

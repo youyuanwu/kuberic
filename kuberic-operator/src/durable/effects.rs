@@ -778,8 +778,20 @@ pub(crate) fn generation_change_proves_no_admission(
     let Some(observed) = observations.get(&target_id) else {
         return false;
     };
-    observed.status.agent.generation.as_str() != dispatched_generation
-        && correlated_action_observation(&observed.status, &pending.action_id).is_none()
+    command_generation_change_proves_no_admission(
+        dispatched_generation,
+        &pending.action_id,
+        &observed.status,
+    )
+}
+
+pub(crate) fn command_generation_change_proves_no_admission(
+    dispatched_generation: &str,
+    action_id: &str,
+    observed: &ReplicaStatusInfo,
+) -> bool {
+    observed.agent.generation.as_str() != dispatched_generation
+        && correlated_action_observation(observed, action_id).is_none()
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
