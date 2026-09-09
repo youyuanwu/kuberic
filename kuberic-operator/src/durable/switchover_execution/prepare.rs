@@ -754,7 +754,7 @@ impl DirectReplicaOperation {
     ) -> Result<DirectEvaluation, String> {
         let Some(observed) = observations.get(&request.target_id) else {
             return deadline_or_wait(request.deadline_unix_seconds, now, || {
-                self.encode_observation(EffectObservation::Failed {
+                self.encode_observation(EffectObservation::UnavailableAtDeadline {
                     observed_at_unix_seconds: now,
                     message: format!(
                         "direct switchover replica {} is unavailable at deadline",
@@ -774,19 +774,19 @@ impl DirectReplicaOperation {
                 })
                 .map(DirectEvaluation::Observe);
         }
-        let action = match self.action(request, definition, observations) {
-            Ok(action) => action,
-            Err(error) => {
-                return deadline_or_wait(request.deadline_unix_seconds, now, || {
-                    self.encode_observation(EffectObservation::Failed {
-                        observed_at_unix_seconds: now,
-                        message: error,
-                    })
-                });
-            }
-        };
         if let Some(recorded) = correlated_action_observation(&observed.status, &request.action_id)
         {
+            let action = match self.action(request, definition, observations) {
+                Ok(action) => action,
+                Err(error) => {
+                    return deadline_or_wait(request.deadline_unix_seconds, now, || {
+                        self.encode_observation(EffectObservation::DeadlineExceeded {
+                            observed_at_unix_seconds: now,
+                            message: error,
+                        })
+                    });
+                }
+            };
             if recorded.signature != action.signature() {
                 return self
                     .encode_observation(EffectObservation::Conflicting {
@@ -812,7 +812,7 @@ impl DirectReplicaOperation {
                     .map(DirectEvaluation::Observe),
                 DurableActionState::Scheduled | DurableActionState::InProgress => {
                     deadline_or_wait(request.deadline_unix_seconds, now, || {
-                        self.encode_observation(EffectObservation::Failed {
+                        self.encode_observation(EffectObservation::DeadlineExceeded {
                             observed_at_unix_seconds: now,
                             message: "correlated direct switchover action reached its deadline"
                                 .to_string(),
@@ -827,10 +827,25 @@ impl DirectReplicaOperation {
                     observed_at_unix_seconds: now,
                 })
                 .map(DirectEvaluation::Observe),
-            StatusRelation::Precondition => Ok(DirectEvaluation::DispatchReplica {
-                action,
-                pending: Box::new(self.pending(request)),
-            }),
+            StatusRelation::Precondition if now >= request.deadline_unix_seconds => self
+                .encode_observation(EffectObservation::DeadlineExceeded {
+                    observed_at_unix_seconds: now,
+                    message: format!(
+                        "direct switchover action {:?} reached its deadline",
+                        self.action_kind()
+                    ),
+                })
+                .map(DirectEvaluation::Observe),
+            StatusRelation::Precondition => {
+                let action = match self.action(request, definition, observations) {
+                    Ok(action) => action,
+                    Err(_) => return Ok(DirectEvaluation::AwaitEvidence),
+                };
+                Ok(DirectEvaluation::DispatchReplica {
+                    action,
+                    pending: Box::new(self.pending(request)),
+                })
+            }
             StatusRelation::Conflicting(message) => self
                 .encode_observation(EffectObservation::Conflicting {
                     observed_at_unix_seconds: now,
@@ -1161,7 +1176,7 @@ impl DirectLabelOperation {
     ) -> Result<DirectEvaluation, String> {
         let Some(observed) = observations.get(&request.target_id) else {
             return deadline_or_wait(request.deadline_unix_seconds, now, || {
-                self.encode_observation(EffectObservation::Failed {
+                self.encode_observation(EffectObservation::UnavailableAtDeadline {
                     observed_at_unix_seconds: now,
                     message: format!(
                         "direct switchover label target {} is unavailable at deadline",
@@ -1196,6 +1211,15 @@ impl DirectLabelOperation {
         if observed.pod_role_label.as_deref() == Some(request.desired_role.as_str()) {
             self.encode_observation(EffectObservation::Applied {
                 observed_at_unix_seconds: now,
+            })
+            .map(DirectEvaluation::Observe)
+        } else if now >= request.deadline_unix_seconds {
+            self.encode_observation(EffectObservation::DeadlineExceeded {
+                observed_at_unix_seconds: now,
+                message: format!(
+                    "direct switchover label action {:?} reached its deadline",
+                    self
+                ),
             })
             .map(DirectEvaluation::Observe)
         } else {

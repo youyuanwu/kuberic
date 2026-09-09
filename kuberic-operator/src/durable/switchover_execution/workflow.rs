@@ -707,11 +707,16 @@ fn effect_applied(observation: EffectObservation) -> Result<i64, EffectBranch> {
         | EffectObservation::Failed {
             observed_at_unix_seconds,
             message,
+        }
+        | EffectObservation::DeadlineExceeded {
+            observed_at_unix_seconds,
+            message,
         } => Err(EffectBranch::DomainFailure {
             observed_at: observed_at_unix_seconds,
             message,
         }),
-        EffectObservation::Conflicting { message, .. } => Err(EffectBranch::Stopped(message)),
+        EffectObservation::UnavailableAtDeadline { message, .. }
+        | EffectObservation::Conflicting { message, .. } => Err(EffectBranch::Stopped(message)),
         EffectObservation::ProvenNoAdmission { .. } => Err(EffectBranch::Stopped(
             "unresolved proven-no-admission result".to_string(),
         )),
@@ -724,6 +729,8 @@ fn late_effect_deadline(observation: EffectObservation) -> Result<i64, String> {
         EffectObservation::Applied { .. } => next_deadline(observed_at),
         EffectObservation::Rejected { message, .. }
         | EffectObservation::Failed { message, .. }
+        | EffectObservation::DeadlineExceeded { message, .. }
+        | EffectObservation::UnavailableAtDeadline { message, .. }
         | EffectObservation::Conflicting { message, .. } => Err(message),
         EffectObservation::ProvenNoAdmission { .. } => {
             Err("unresolved proven-no-admission result".to_string())
@@ -800,9 +807,23 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ScriptedFailureKind {
+        Failed,
+        DeadlineExceeded,
+        UnavailableAtDeadline,
+    }
+
+    #[derive(Clone, Copy)]
+    struct ScriptedFailure {
+        name: &'static str,
+        kind: ScriptedFailureKind,
+        message: &'static str,
+    }
+
     async fn run_script(
         replica_count: i64,
-        failure: Option<(&str, &str)>,
+        failures: &[ScriptedFailure],
         proven_no_admission: Option<&str>,
     ) -> (
         Vec<String>,
@@ -849,10 +870,14 @@ mod tests {
                         .and_then(serde_json::Value::as_i64);
                     targets.push(target_id);
                     let occurrence = occurrences.entry(name.clone()).or_default();
+                    let failure = failures
+                        .iter()
+                        .copied()
+                        .find(|failure| failure.name == name);
                     let result = scripted_result(
                         &name,
                         observed_at,
-                        failure.filter(|(failed_name, _)| *failed_name == name),
+                        failure,
                         proven_no_admission == Some(name.as_str()) && *occurrence == 0,
                         &activity_input,
                     );
@@ -881,7 +906,7 @@ mod tests {
     fn scripted_result(
         name: &str,
         observed_at: i64,
-        failure: Option<(&str, &str)>,
+        failure: Option<ScriptedFailure>,
         proven_no_admission: bool,
         activity_input: &serde_json::Value,
     ) -> ExactBytes {
@@ -890,20 +915,17 @@ mod tests {
                 "result": "proven_no_admission",
                 "observed_at_unix_seconds": observed_at,
             })
-        } else if let Some((_, message)) = failure {
-            if name == WaitTargetCaughtUpActivity::NAME {
-                serde_json::json!({
-                    "result": "deadline_exceeded",
-                    "observed_at_unix_seconds": observed_at,
-                    "message": message,
-                })
-            } else {
-                serde_json::json!({
-                    "result": "failed",
-                    "observed_at_unix_seconds": observed_at,
-                    "message": message,
-                })
-            }
+        } else if let Some(failure) = failure {
+            let result = match failure.kind {
+                ScriptedFailureKind::Failed => "failed",
+                ScriptedFailureKind::DeadlineExceeded => "deadline_exceeded",
+                ScriptedFailureKind::UnavailableAtDeadline => "unavailable_at_deadline",
+            };
+            serde_json::json!({
+                "result": result,
+                "observed_at_unix_seconds": observed_at,
+                "message": failure.message,
+            })
         } else if name == CaptureFrozenLsnActivity::NAME {
             serde_json::json!({
                 "result": "captured",
@@ -935,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_workflow_spells_out_successful_protocol() {
         for replica_count in [2, 4, 9] {
-            let (names, _targets, terminal) = run_script(replica_count, None, None).await;
+            let (names, _targets, terminal) = run_script(replica_count, &[], None).await;
             let mut expected = vec![
                 RevokeWritesActivity::NAME,
                 CaptureFrozenLsnActivity::NAME,
@@ -970,7 +992,11 @@ mod tests {
     async fn direct_switchover_workflow_spells_out_post_promotion_compensation() {
         let (names, _targets, terminal) = run_script(
             3,
-            Some((PromoteTargetActivity::NAME, "promotion failed")),
+            &[ScriptedFailure {
+                name: PromoteTargetActivity::NAME,
+                kind: ScriptedFailureKind::Failed,
+                message: "promotion failed",
+            }],
             None,
         )
         .await;
@@ -1005,10 +1031,11 @@ mod tests {
     async fn direct_switchover_workflow_spells_out_pre_promotion_compensation() {
         let (names, _targets, terminal) = run_script(
             3,
-            Some((
-                WaitTargetCaughtUpActivity::NAME,
-                "target catch-up timed out",
-            )),
+            &[ScriptedFailure {
+                name: WaitTargetCaughtUpActivity::NAME,
+                kind: ScriptedFailureKind::DeadlineExceeded,
+                message: "target catch-up timed out",
+            }],
             None,
         )
         .await;
@@ -1034,7 +1061,7 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_records_one_same_operation_redelivery() {
         let (names, _targets, terminal) =
-            run_script(3, None, Some(DemoteOldPrimaryActivity::NAME)).await;
+            run_script(3, &[], Some(DemoteOldPrimaryActivity::NAME)).await;
         assert_eq!(
             names
                 .iter()
@@ -1055,10 +1082,11 @@ mod tests {
     async fn direct_switchover_late_failure_stops_without_compensation() {
         let (names, _targets, terminal) = run_script(
             3,
-            Some((
-                InstallTargetCurrentConfigurationActivity::NAME,
-                "current configuration failed",
-            )),
+            &[ScriptedFailure {
+                name: InstallTargetCurrentConfigurationActivity::NAME,
+                kind: ScriptedFailureKind::Failed,
+                message: "current configuration failed",
+            }],
             None,
         )
         .await;
@@ -1072,10 +1100,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_switchover_expired_actions_preserve_prior_compensation_boundaries() {
+        for activity_name in [
+            RevokeWritesActivity::NAME,
+            DemoteOldPrimaryActivity::NAME,
+            PromoteTargetActivity::NAME,
+        ] {
+            let (names, _targets, terminal) = run_script(
+                3,
+                &[ScriptedFailure {
+                    name: activity_name,
+                    kind: ScriptedFailureKind::DeadlineExceeded,
+                    message: "action reached its exact deadline",
+                }],
+                None,
+            )
+            .await;
+            assert!(matches!(
+                terminal,
+                DirectSwitchoverTerminalRecord::Complete {
+                    compensated: true,
+                    ..
+                }
+            ));
+            assert!(
+                names.contains(&AttestCompensatedTopologyActivity::NAME.to_string()),
+                "{activity_name}"
+            );
+            match activity_name {
+                RevokeWritesActivity::NAME => {
+                    assert!(
+                        !names.contains(
+                            &RestorePreviousCurrentConfigurationActivity::NAME.to_string()
+                        )
+                    );
+                    assert!(
+                        !names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string())
+                    );
+                }
+                DemoteOldPrimaryActivity::NAME => {
+                    assert!(
+                        names.contains(
+                            &RestorePreviousCurrentConfigurationActivity::NAME.to_string()
+                        )
+                    );
+                    assert!(
+                        !names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string())
+                    );
+                }
+                PromoteTargetActivity::NAME => {
+                    assert!(names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_unavailable_at_action_deadline_stops_without_compensation() {
+        for activity_name in [
+            RevokeWritesActivity::NAME,
+            DemoteOldPrimaryActivity::NAME,
+            PromoteTargetActivity::NAME,
+        ] {
+            let (names, _targets, terminal) = run_script(
+                3,
+                &[ScriptedFailure {
+                    name: activity_name,
+                    kind: ScriptedFailureKind::UnavailableAtDeadline,
+                    message: "action target unavailable at its exact deadline",
+                }],
+                None,
+            )
+            .await;
+            assert!(matches!(
+                terminal,
+                DirectSwitchoverTerminalRecord::Stopped { .. }
+            ));
+            assert!(
+                !names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string())
+            );
+            assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+            assert!(!names.contains(&AttestCompensatedTopologyActivity::NAME.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_switchover_late_and_compensation_deadlines_stop() {
+        for activity_name in [
+            DistributeReplicaEpochActivity::NAME,
+            InstallTargetCatchUpConfigurationActivity::NAME,
+            PublishTargetPrimaryLabelActivity::NAME,
+        ] {
+            let (names, _targets, terminal) = run_script(
+                3,
+                &[ScriptedFailure {
+                    name: activity_name,
+                    kind: ScriptedFailureKind::DeadlineExceeded,
+                    message: "late action reached its exact deadline",
+                }],
+                None,
+            )
+            .await;
+            assert!(matches!(
+                terminal,
+                DirectSwitchoverTerminalRecord::Stopped { .. }
+            ));
+            assert!(
+                !names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string())
+            );
+            assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+        }
+
+        let (names, _targets, terminal) = run_script(
+            3,
+            &[
+                ScriptedFailure {
+                    name: PromoteTargetActivity::NAME,
+                    kind: ScriptedFailureKind::Failed,
+                    message: "promotion failed",
+                },
+                ScriptedFailure {
+                    name: CompensatePromoteOldPrimaryActivity::NAME,
+                    kind: ScriptedFailureKind::DeadlineExceeded,
+                    message: "compensation action reached its exact deadline",
+                },
+            ],
+            None,
+        )
+        .await;
+        assert!(matches!(
+            terminal,
+            DirectSwitchoverTerminalRecord::Stopped { .. }
+        ));
+        assert!(names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+        assert!(!names.contains(&CompensateDistributeReplicaEpochActivity::NAME.to_string()));
+        assert!(!names.contains(&AttestCompensatedTopologyActivity::NAME.to_string()));
+    }
+
+    #[tokio::test]
     async fn direct_switchover_replay_is_identical_one_hundred_times() {
-        let baseline = run_script(2, None, None).await;
+        let baseline = run_script(2, &[], None).await;
         for _ in 0..100 {
-            assert_eq!(run_script(2, None, None).await, baseline);
+            assert_eq!(run_script(2, &[], None).await, baseline);
         }
     }
 

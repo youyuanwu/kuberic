@@ -760,6 +760,10 @@ mod tests {
         },
     };
 
+    use super::super::{
+        activities::{LabelOperationRequest, ReplicaOperationRequest},
+        prepare::{DirectLabelOperation, DirectReplicaOperation},
+    };
     use super::*;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2063,6 +2067,359 @@ mod tests {
         assert!(reconciler.contains("DirectSwitchoverRunnerAdapter::new"));
         assert!(reconciler.contains("&DirectSwitchoverWorkflow"));
         assert!(!reconciler.contains("NativeSwitchoverWorkflow"));
+    }
+
+    #[test]
+    fn direct_switchover_expired_replica_preconditions_never_dispatch() {
+        let initial = direct_initial_operation("set-deadline", snapshot(3), 2, 100).unwrap();
+        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
+        let deadline = definition.initial_deadline_unix_seconds;
+        for (operation, sequence) in replica_operation_cases() {
+            let (activity, target_id) =
+                replica_activity(&definition, operation, sequence, deadline);
+            let mut world = world_for(&initial, Scenario::Success);
+            set_replica_precondition(&mut world, &definition, operation, target_id);
+            let available = observations(&world);
+            assert!(
+                matches!(
+                    activity.evaluate(&definition, &available, deadline - 1),
+                    Ok(DirectEvaluation::DispatchReplica { .. })
+                ),
+                "{operation:?}"
+            );
+            assert_eq!(
+                observed_result_tag(activity.evaluate(&definition, &available, deadline)),
+                "deadline_exceeded",
+                "{operation:?}"
+            );
+
+            let mut unavailable = available;
+            unavailable.remove(&target_id);
+            assert!(
+                matches!(
+                    activity.evaluate(&definition, &unavailable, deadline - 1),
+                    Ok(DirectEvaluation::AwaitEvidence)
+                ),
+                "{operation:?}"
+            );
+            assert_eq!(
+                observed_result_tag(activity.evaluate(&definition, &unavailable, deadline)),
+                "unavailable_at_deadline",
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_switchover_expired_label_preconditions_never_dispatch() {
+        let initial = direct_initial_operation("set-label-deadline", snapshot(3), 2, 100).unwrap();
+        let definition = DirectSwitchoverDefinition::from_initial(&initial).unwrap();
+        let deadline = definition.initial_deadline_unix_seconds;
+        for operation in [
+            DirectLabelOperation::PublishTargetPrimary,
+            DirectLabelOperation::PublishOldPrimarySecondary,
+            DirectLabelOperation::RestoreOldPrimary,
+            DirectLabelOperation::RestoreTargetSecondary,
+        ] {
+            let (activity, target_id) = label_activity(&definition, operation, deadline);
+            let mut world = world_for(&initial, Scenario::Success);
+            set_label_precondition(&mut world, &definition, operation, target_id);
+            let available = observations(&world);
+            assert!(
+                matches!(
+                    activity.evaluate(&definition, &available, deadline - 1),
+                    Ok(DirectEvaluation::DispatchLabel)
+                ),
+                "{operation:?}"
+            );
+            assert_eq!(
+                observed_result_tag(activity.evaluate(&definition, &available, deadline)),
+                "deadline_exceeded",
+                "{operation:?}"
+            );
+
+            let mut unavailable = available;
+            unavailable.remove(&target_id);
+            assert!(
+                matches!(
+                    activity.evaluate(&definition, &unavailable, deadline - 1),
+                    Ok(DirectEvaluation::AwaitEvidence)
+                ),
+                "{operation:?}"
+            );
+            assert_eq!(
+                observed_result_tag(activity.evaluate(&definition, &unavailable, deadline)),
+                "unavailable_at_deadline",
+                "{operation:?}"
+            );
+        }
+    }
+
+    fn replica_operation_cases() -> [(DirectReplicaOperation, u32); 12] {
+        [
+            (DirectReplicaOperation::RevokeWrites, 1),
+            (DirectReplicaOperation::DemoteOldPrimary, 2),
+            (DirectReplicaOperation::PromoteTarget, 3),
+            (DirectReplicaOperation::DistributeReplicaEpoch, 100),
+            (
+                DirectReplicaOperation::InstallTargetCatchUpConfiguration,
+                1000,
+            ),
+            (DirectReplicaOperation::WaitTargetWriteQuorum, 1001),
+            (
+                DirectReplicaOperation::InstallTargetCurrentConfiguration,
+                1002,
+            ),
+            (
+                DirectReplicaOperation::RestorePreviousCurrentConfiguration,
+                1500,
+            ),
+            (DirectReplicaOperation::CompensatePromoteOldPrimary, 2000),
+            (
+                DirectReplicaOperation::CompensateDistributeReplicaEpoch,
+                2100,
+            ),
+            (
+                DirectReplicaOperation::InstallCompensationCatchUpConfiguration,
+                2001,
+            ),
+            (
+                DirectReplicaOperation::InstallCompensationCurrentConfiguration,
+                2002,
+            ),
+        ]
+    }
+
+    fn replica_activity(
+        definition: &DirectSwitchoverDefinition,
+        operation: DirectReplicaOperation,
+        sequence: u32,
+        deadline: i64,
+    ) -> (DirectActivity, ReplicaId) {
+        let previous = definition.previous_snapshot.clone();
+        let target = definition.target_snapshot.clone();
+        let compensation = definition.compensation_snapshot();
+        let (target_id, expected_epoch, desired_snapshot) = match operation {
+            DirectReplicaOperation::RevokeWrites => {
+                (definition.old_primary_id, previous.epoch.clone(), previous)
+            }
+            DirectReplicaOperation::DemoteOldPrimary => {
+                (definition.old_primary_id, target.epoch.clone(), target)
+            }
+            DirectReplicaOperation::PromoteTarget => {
+                (definition.target_primary_id, previous.epoch.clone(), target)
+            }
+            DirectReplicaOperation::DistributeReplicaEpoch => {
+                let index = usize::try_from(sequence - 100).unwrap();
+                (
+                    definition.normal_epoch_distribution_ids()[index],
+                    target.epoch.clone(),
+                    target,
+                )
+            }
+            DirectReplicaOperation::InstallTargetCatchUpConfiguration
+            | DirectReplicaOperation::WaitTargetWriteQuorum
+            | DirectReplicaOperation::InstallTargetCurrentConfiguration => {
+                (definition.target_primary_id, target.epoch.clone(), target)
+            }
+            DirectReplicaOperation::RestorePreviousCurrentConfiguration => {
+                (definition.old_primary_id, previous.epoch.clone(), previous)
+            }
+            DirectReplicaOperation::CompensatePromoteOldPrimary
+            | DirectReplicaOperation::InstallCompensationCatchUpConfiguration
+            | DirectReplicaOperation::InstallCompensationCurrentConfiguration => (
+                definition.old_primary_id,
+                target.epoch.clone(),
+                compensation,
+            ),
+            DirectReplicaOperation::CompensateDistributeReplicaEpoch => {
+                let index = usize::try_from(sequence - 2100).unwrap();
+                (
+                    definition.compensation_epoch_distribution_ids()[index],
+                    target.epoch.clone(),
+                    compensation,
+                )
+            }
+        };
+        let request = ReplicaOperationRequest {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: definition.execution_id.clone(),
+            action_id: format!("{}:{sequence}", definition.execution_id),
+            sequence,
+            target_id,
+            target_instance_id: definition.member(target_id).unwrap().instance_id.clone(),
+            expected_epoch,
+            desired_snapshot,
+            deadline_unix_seconds: deadline,
+            redelivery: 0,
+            prepared_command: None,
+        };
+        (DirectActivity::Replica { operation, request }, target_id)
+    }
+
+    fn label_activity(
+        definition: &DirectSwitchoverDefinition,
+        operation: DirectLabelOperation,
+        deadline: i64,
+    ) -> (DirectActivity, ReplicaId) {
+        let (sequence, target_id, desired_role) = match operation {
+            DirectLabelOperation::PublishTargetPrimary => {
+                (1003, definition.target_primary_id, "primary")
+            }
+            DirectLabelOperation::PublishOldPrimarySecondary => {
+                (1004, definition.old_primary_id, "secondary")
+            }
+            DirectLabelOperation::RestoreOldPrimary => (2003, definition.old_primary_id, "primary"),
+            DirectLabelOperation::RestoreTargetSecondary => {
+                (2004, definition.target_primary_id, "secondary")
+            }
+        };
+        let request = LabelOperationRequest {
+            contract_version: DIRECT_SWITCHOVER_CONTRACT_VERSION,
+            execution_id: definition.execution_id.clone(),
+            action_id: format!("{}:{sequence}", definition.execution_id),
+            sequence,
+            target_id,
+            target_instance_id: definition.member(target_id).unwrap().instance_id.clone(),
+            desired_role: desired_role.to_string(),
+            deadline_unix_seconds: deadline,
+            prepared_command: None,
+        };
+        (DirectActivity::Label { operation, request }, target_id)
+    }
+
+    fn set_replica_precondition(
+        world: &mut TestWorld,
+        definition: &DirectSwitchoverDefinition,
+        operation: DirectReplicaOperation,
+        target_id: ReplicaId,
+    ) {
+        let previous_epoch = Epoch::new(
+            definition.previous_snapshot.epoch.data_loss_number,
+            definition.previous_snapshot.epoch.configuration_number,
+        );
+        let target_epoch = Epoch::new(
+            definition.target_snapshot.epoch.data_loss_number,
+            definition.target_snapshot.epoch.configuration_number,
+        );
+        let previous_current = configuration_status(
+            ReplicaConfigurationMode::Current,
+            &definition.previous_snapshot,
+        );
+        let target_catch_up = configuration_status(
+            ReplicaConfigurationMode::CatchUp,
+            &definition.target_snapshot,
+        );
+        let compensation_catch_up = configuration_status(
+            ReplicaConfigurationMode::CatchUp,
+            &definition.compensation_snapshot(),
+        );
+        let status = world.statuses.get_mut(&target_id).unwrap();
+        status.agent.current_action = None;
+        status.agent.retained_terminal_actions.clear();
+        match operation {
+            DirectReplicaOperation::RevokeWrites => {
+                status.role = Role::Primary;
+                status.epoch = previous_epoch;
+                status.write_status = AccessStatus::Granted;
+                status.configuration = Some(previous_current);
+            }
+            DirectReplicaOperation::DemoteOldPrimary => {
+                status.role = Role::Primary;
+                status.epoch = previous_epoch;
+                status.write_status = AccessStatus::ReconfigurationPending;
+                status.configuration = Some(previous_current);
+            }
+            DirectReplicaOperation::PromoteTarget
+            | DirectReplicaOperation::DistributeReplicaEpoch
+            | DirectReplicaOperation::CompensateDistributeReplicaEpoch => {
+                status.role = Role::ActiveSecondary;
+                status.epoch = previous_epoch;
+                status.write_status = AccessStatus::NotPrimary;
+                status.configuration = None;
+            }
+            DirectReplicaOperation::InstallTargetCatchUpConfiguration => {
+                status.role = Role::Primary;
+                status.epoch = target_epoch;
+                status.write_status = AccessStatus::Granted;
+                status.configuration = None;
+            }
+            DirectReplicaOperation::WaitTargetWriteQuorum
+            | DirectReplicaOperation::InstallTargetCurrentConfiguration => {
+                status.role = Role::Primary;
+                status.epoch = target_epoch;
+                status.write_status = AccessStatus::Granted;
+                status.configuration = Some(target_catch_up);
+            }
+            DirectReplicaOperation::RestorePreviousCurrentConfiguration => {
+                status.role = Role::Primary;
+                status.epoch = previous_epoch;
+                status.write_status = AccessStatus::ReconfigurationPending;
+                status.configuration = Some(previous_current);
+            }
+            DirectReplicaOperation::CompensatePromoteOldPrimary => {
+                status.role = Role::ActiveSecondary;
+                status.epoch = target_epoch;
+                status.write_status = AccessStatus::NotPrimary;
+                status.configuration = None;
+            }
+            DirectReplicaOperation::InstallCompensationCatchUpConfiguration => {
+                status.role = Role::Primary;
+                status.epoch = target_epoch;
+                status.write_status = AccessStatus::Granted;
+                status.configuration = Some(previous_current);
+            }
+            DirectReplicaOperation::InstallCompensationCurrentConfiguration => {
+                status.role = Role::Primary;
+                status.epoch = target_epoch;
+                status.write_status = AccessStatus::Granted;
+                status.configuration = Some(compensation_catch_up);
+            }
+        }
+    }
+
+    fn set_label_precondition(
+        world: &mut TestWorld,
+        definition: &DirectSwitchoverDefinition,
+        operation: DirectLabelOperation,
+        target_id: ReplicaId,
+    ) {
+        let target_epoch = Epoch::new(
+            definition.target_snapshot.epoch.data_loss_number,
+            definition.target_snapshot.epoch.configuration_number,
+        );
+        let status = world.statuses.get_mut(&target_id).unwrap();
+        status.epoch = target_epoch;
+        match operation {
+            DirectLabelOperation::PublishTargetPrimary => {
+                status.role = Role::Primary;
+                world.labels.insert(target_id, "secondary".to_string());
+            }
+            DirectLabelOperation::PublishOldPrimarySecondary => {
+                status.role = Role::ActiveSecondary;
+                world.labels.insert(target_id, "primary".to_string());
+            }
+            DirectLabelOperation::RestoreOldPrimary => {
+                status.role = Role::Primary;
+                world.labels.insert(target_id, "secondary".to_string());
+            }
+            DirectLabelOperation::RestoreTargetSecondary => {
+                status.role = Role::ActiveSecondary;
+                world.labels.insert(target_id, "primary".to_string());
+            }
+        }
+    }
+
+    fn observed_result_tag(result: Result<DirectEvaluation, String>) -> String {
+        let DirectEvaluation::Observe(result) = result.unwrap() else {
+            panic!("expired activity must return an observation without dispatch");
+        };
+        serde_json::from_slice::<serde_json::Value>(result.as_slice())
+            .unwrap()
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string()
     }
 
     fn snapshot(member_count: usize) -> StablePartitionSnapshotStatus {

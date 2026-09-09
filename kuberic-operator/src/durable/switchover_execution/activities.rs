@@ -76,6 +76,14 @@ pub enum EffectObservation {
         observed_at_unix_seconds: i64,
         message: String,
     },
+    DeadlineExceeded {
+        observed_at_unix_seconds: i64,
+        message: String,
+    },
+    UnavailableAtDeadline {
+        observed_at_unix_seconds: i64,
+        message: String,
+    },
     Conflicting {
         observed_at_unix_seconds: i64,
         message: String,
@@ -96,6 +104,14 @@ impl EffectObservation {
                 ..
             }
             | Self::Failed {
+                observed_at_unix_seconds,
+                ..
+            }
+            | Self::DeadlineExceeded {
+                observed_at_unix_seconds,
+                ..
+            }
+            | Self::UnavailableAtDeadline {
                 observed_at_unix_seconds,
                 ..
             }
@@ -154,6 +170,14 @@ macro_rules! define_replica_activity {
                 message: String,
             },
             Failed {
+                observed_at_unix_seconds: i64,
+                message: String,
+            },
+            DeadlineExceeded {
+                observed_at_unix_seconds: i64,
+                message: String,
+            },
+            UnavailableAtDeadline {
                 observed_at_unix_seconds: i64,
                 message: String,
             },
@@ -234,6 +258,20 @@ macro_rules! define_replica_activity {
                         observed_at_unix_seconds,
                         message,
                     },
+                    $output::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    } => EffectObservation::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    $output::UnavailableAtDeadline {
+                        observed_at_unix_seconds,
+                        message,
+                    } => EffectObservation::UnavailableAtDeadline {
+                        observed_at_unix_seconds,
+                        message,
+                    },
                     $output::Conflicting {
                         observed_at_unix_seconds,
                         message,
@@ -267,6 +305,20 @@ macro_rules! define_replica_activity {
                         observed_at_unix_seconds,
                         message,
                     } => $output::Failed {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::UnavailableAtDeadline {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::UnavailableAtDeadline {
                         observed_at_unix_seconds,
                         message,
                     },
@@ -307,6 +359,14 @@ macro_rules! define_label_activity {
                 observed_at_unix_seconds: i64,
             },
             Failed {
+                observed_at_unix_seconds: i64,
+                message: String,
+            },
+            DeadlineExceeded {
+                observed_at_unix_seconds: i64,
+                message: String,
+            },
+            UnavailableAtDeadline {
                 observed_at_unix_seconds: i64,
                 message: String,
             },
@@ -371,6 +431,20 @@ macro_rules! define_label_activity {
                         observed_at_unix_seconds,
                         message,
                     },
+                    $output::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    } => EffectObservation::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    $output::UnavailableAtDeadline {
+                        observed_at_unix_seconds,
+                        message,
+                    } => EffectObservation::UnavailableAtDeadline {
+                        observed_at_unix_seconds,
+                        message,
+                    },
                     $output::Conflicting {
                         observed_at_unix_seconds,
                         message,
@@ -392,6 +466,20 @@ macro_rules! define_label_activity {
                         observed_at_unix_seconds,
                         message,
                     } => $output::Failed {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::DeadlineExceeded {
+                        observed_at_unix_seconds,
+                        message,
+                    },
+                    EffectObservation::UnavailableAtDeadline {
+                        observed_at_unix_seconds,
+                        message,
+                    } => $output::UnavailableAtDeadline {
                         observed_at_unix_seconds,
                         message,
                     },
@@ -883,7 +971,7 @@ mod tests {
             A::input(request)
         });
         assert_exact_result_bound::<A, _>(|padding| {
-            A::output(EffectObservation::Failed {
+            A::output(EffectObservation::UnavailableAtDeadline {
                 observed_at_unix_seconds: 1,
                 message: "x".repeat(padding),
             })
@@ -898,7 +986,7 @@ mod tests {
             A::input(request)
         });
         assert_exact_result_bound::<A, _>(|padding| {
-            A::output(EffectObservation::Failed {
+            A::output(EffectObservation::UnavailableAtDeadline {
                 observed_at_unix_seconds: 1,
                 message: "x".repeat(padding),
             })
@@ -998,8 +1086,16 @@ mod tests {
                 observed_at_unix_seconds: 4,
                 message: "failed".to_string(),
             },
-            RevokeWritesOutput::Conflicting {
+            RevokeWritesOutput::DeadlineExceeded {
                 observed_at_unix_seconds: 5,
+                message: "deadline exceeded".to_string(),
+            },
+            RevokeWritesOutput::UnavailableAtDeadline {
+                observed_at_unix_seconds: 6,
+                message: "unavailable at deadline".to_string(),
+            },
+            RevokeWritesOutput::Conflicting {
+                observed_at_unix_seconds: 7,
                 message: "conflicting".to_string(),
             },
         ];
