@@ -2210,8 +2210,8 @@ spec:
                 - writeQuorum
                 type: object
               switchoverExecution:
-                description: Structured immutable authority or incompatibility marker
-                  for the framework-native switchover execution.
+                description: Structured immutable authority for the framework-native
+                  switchover execution.
                 nullable: true
                 properties:
                   checkpointName:
@@ -2222,149 +2222,111 @@ spec:
                     type: integer
                   executionId:
                     type: string
-                  state:
+                  input:
                     properties:
-                      incompatibility:
-                        nullable: true
+                      acceptedUnixSeconds:
+                        format: int64
+                        type: integer
+                      operationAuthority:
+                        type: string
+                      previousSnapshot:
+                        description: Schema-safe persisted form of the core stable
+                          partition snapshot.
                         properties:
-                          fingerprint:
-                            type: string
-                          legacyCheckpointName:
-                            nullable: true
-                            type: string
-                          legacyContractVersion:
-                            format: uint32
-                            minimum: 0.0
-                            type: integer
-                          legacyExecutionId:
-                            type: string
-                          source:
-                            enum:
-                            - legacyExplicit
-                            - legacyPilotV1
-                            - legacyPilotV2
-                            - unsupportedStatus
-                            type: string
-                        required:
-                        - fingerprint
-                        - legacyContractVersion
-                        - legacyExecutionId
-                        - source
-                        type: object
-                      input:
-                        nullable: true
-                        properties:
-                          acceptedUnixSeconds:
-                            format: int64
-                            type: integer
-                          operationAuthority:
-                            type: string
-                          previousSnapshot:
-                            description: Schema-safe persisted form of the core stable
-                              partition snapshot.
+                          epoch:
                             properties:
-                              epoch:
-                                properties:
-                                  configurationNumber:
-                                    format: int64
-                                    type: integer
-                                  dataLossNumber:
-                                    format: int64
-                                    type: integer
-                                required:
-                                - configurationNumber
-                                - dataLossNumber
-                                type: object
-                              members:
-                                items:
-                                  description: Schema-safe persisted identity and stable
-                                    role of one replica.
+                              configurationNumber:
+                                format: int64
+                                type: integer
+                              dataLossNumber:
+                                format: int64
+                                type: integer
+                            required:
+                            - configurationNumber
+                            - dataLossNumber
+                            type: object
+                          members:
+                            items:
+                              description: Schema-safe persisted identity and stable
+                                role of one replica.
+                              properties:
+                                electionMetadata:
+                                  nullable: true
                                   properties:
-                                    electionMetadata:
-                                      nullable: true
+                                    committedLsn:
+                                      format: int64
+                                      type: integer
+                                    currentLsn:
+                                      format: int64
+                                      type: integer
+                                    deactivationCatchUpLsn:
+                                      format: int64
+                                      type: integer
+                                    deactivationEpoch:
                                       properties:
-                                        committedLsn:
+                                        configurationNumber:
                                           format: int64
                                           type: integer
-                                        currentLsn:
-                                          format: int64
-                                          type: integer
-                                        deactivationCatchUpLsn:
-                                          format: int64
-                                          type: integer
-                                        deactivationEpoch:
-                                          properties:
-                                            configurationNumber:
-                                              format: int64
-                                              type: integer
-                                            dataLossNumber:
-                                              format: int64
-                                              type: integer
-                                          required:
-                                          - configurationNumber
-                                          - dataLossNumber
-                                          type: object
-                                        firstRetainedLsn:
+                                        dataLossNumber:
                                           format: int64
                                           type: integer
                                       required:
-                                      - committedLsn
-                                      - currentLsn
-                                      - deactivationCatchUpLsn
-                                      - deactivationEpoch
-                                      - firstRetainedLsn
+                                      - configurationNumber
+                                      - dataLossNumber
                                       type: object
-                                    id:
+                                    firstRetainedLsn:
                                       format: int64
                                       type: integer
-                                    instanceId:
-                                      type: string
-                                    role:
-                                      enum:
-                                      - primary
-                                      - activeSecondary
-                                      type: string
                                   required:
-                                  - id
-                                  - instanceId
-                                  - role
+                                  - committedLsn
+                                  - currentLsn
+                                  - deactivationCatchUpLsn
+                                  - deactivationEpoch
+                                  - firstRetainedLsn
                                   type: object
-                                type: array
-                              primaryId:
-                                format: int64
-                                type: integer
-                              writeQuorum:
-                                format: uint32
-                                minimum: 0.0
-                                type: integer
-                            required:
-                            - epoch
-                            - members
-                            - primaryId
-                            - writeQuorum
-                            type: object
-                          targetPrimaryId:
+                                id:
+                                  format: int64
+                                  type: integer
+                                instanceId:
+                                  type: string
+                                role:
+                                  enum:
+                                  - primary
+                                  - activeSecondary
+                                  type: string
+                              required:
+                              - id
+                              - instanceId
+                              - role
+                              type: object
+                            type: array
+                          primaryId:
                             format: int64
                             type: integer
+                          writeQuorum:
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
                         required:
-                        - acceptedUnixSeconds
-                        - operationAuthority
-                        - previousSnapshot
-                        - targetPrimaryId
+                        - epoch
+                        - members
+                        - primaryId
+                        - writeQuorum
                         type: object
-                      kind:
-                        enum:
-                        - admitted
-                        - incompatible
-                        type: string
+                      targetPrimaryId:
+                        format: int64
+                        type: integer
                     required:
-                    - kind
+                    - acceptedUnixSeconds
+                    - operationAuthority
+                    - previousSnapshot
+                    - targetPrimaryId
                     type: object
                 required:
                 - checkpointName
                 - contractVersion
                 - executionId
-                - state
+                - input
                 type: object
               targetPrimary:
                 description: Pod name that should be primary. "pending" during failover.

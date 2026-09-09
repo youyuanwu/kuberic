@@ -28,8 +28,8 @@ switchover, and scaling through Kubernetes-backed durable workflows.
 - optional compact versioned `operation` checkpoint for durable creation,
   replica add/rebuild, and failover
 - optional `switchoverExecution` reference with immutable switchover admission
-  or incompatibility evidence; compact history and terminal evidence live in
-  the referenced same-namespace ConfigMap
+  and checkpoint identity; compact history and terminal evidence live in the
+  referenced same-namespace ConfigMap
 - structured add-replica attempt with frozen primary/target generations,
   endpoints, configuration descriptors, semantic build key, deadlines, and
   commit observation
@@ -214,9 +214,9 @@ non-primary incarnation changes are handled by topology reconciliation or the
 phase-specific failover fence. Durable `Creating`, `AddingReplica`, and
 `FailingOver` resume from `status.operation`.
 `Switchover` resumes from `status.switchoverExecution` and its ConfigMap
-checkpoint. Legacy explicit or pilot switchover status is converted to an
-incompatibility marker before pod observation and never enters the ordinary
-operation reconciler. `RemovingReplica` resumes from the production
+checkpoint. A `Switchover` phase without that current native reference fails
+closed and never enters the ordinary operation reconciler. `RemovingReplica`
+resumes from the production
 `status.removeReplicaExecution` reference and its ConfigMap checkpoint.
 Completed topology snapshots are refreshed with exact election metadata before
 they are used as unavailable-candidate comparison evidence. See
@@ -314,8 +314,7 @@ Switchover has one production path. Acceptance first persists
 `status.switchoverExecution`, including the contract version, random execution
 ID, deterministic checkpoint name, exact previous topology, target primary,
 and acceptance time. No checkpoint or effect exists before that status write.
-The status state is either admitted input or typed incompatibility evidence;
-it cannot be both.
+The admitted input is required and rejects unknown fields.
 
 The workflow uses typed ordinary-async calls over the format-3 linear replay
 kernel and the same pure switchover calculation/terminal validation as the

@@ -91,9 +91,10 @@ third records evidence erased by a complete same-Pod primary process restart.
 They are durable ConfigMap terminal decisions, unlike the volatile coordinator
 ledger.
 
-During switchover, `status.switchoverExecution` stores immutable admission or
-typed incompatibility evidence. Its ConfigMap checkpoint stores exact prepared
-commands, observations, bounded redelivery evidence, and terminal outcome.
+During switchover, `status.switchoverExecution` stores immutable admission and
+checkpoint identity. Its ConfigMap checkpoint stores exact prepared commands,
+observations, bounded redelivery evidence, and terminal outcome. A
+`Switchover` phase without the current native reference fails closed.
 The local sequence remains individually correlated rather than hidden behind
 a coarse agent intent because it spans the old primary, target, retained
 members, and Kubernetes routing effects.

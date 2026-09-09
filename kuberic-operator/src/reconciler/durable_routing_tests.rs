@@ -23,7 +23,7 @@ use super::*;
 use crate::crd::{
     EpochStatus, MemberStatus, PvcRetentionPolicy, RemoveReplicaCleanupStatus,
     RemoveReplicaCommitEvidenceStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
-    TargetRetirementObservationStatus,
+    SwitchoverExecutionStatus, TargetRetirementObservationStatus,
 };
 use crate::durable::remove_replica_execution::{
     REMOVE_REPLICA_MAX_ACTIVE_ENCODED_BYTES, REMOVE_REPLICA_MAX_TERMINAL_ENCODED_BYTES,
@@ -826,98 +826,29 @@ async fn framework_native_switchover_route_records_invalid_reference_condition()
 }
 
 #[tokio::test]
-async fn framework_native_switchover_conversion_is_atomic_and_fail_closed() {
-    let mut legacy =
-        switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
-    let status = legacy.status.as_mut().unwrap();
-    status.switchover_execution = None;
-    status.operation = Some(start_switchover("legacy", snapshot(), 2, 10).unwrap());
-    let api = RoutingApi::new(Vec::new());
-
-    assert!(
-        persist_legacy_switchover_incompatibility(&legacy, &api, 100)
-            .await
-            .unwrap()
-    );
-    let converted = api.last_status().unwrap();
-    assert!(converted.operation.is_none());
-    let SwitchoverExecutionState::Incompatible { incompatibility } =
-        &converted.switchover_execution.as_ref().unwrap().state
-    else {
-        panic!("legacy switchover did not become incompatible");
-    };
-    assert_eq!(
-        incompatibility.source,
-        SwitchoverIncompatibilitySource::LegacyExplicit
-    );
-    assert!(converted.conditions.iter().any(|condition| {
-        condition.type_ == "FrameworkNativeSwitchover" && condition.reason == "Incompatible"
-    }));
-}
-
-#[tokio::test]
-async fn framework_native_switchover_production_conversion_covers_pilot_versions_and_malformed_status()
- {
-    for (version, expected_source) in [
-        (1, SwitchoverIncompatibilitySource::LegacyPilotV1),
-        (2, SwitchoverIncompatibilitySource::LegacyPilotV2),
-    ] {
-        let mut legacy =
-            switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
-        let status = legacy.status.as_mut().unwrap();
-        status.switchover_execution = None;
-        status.legacy_status_fields.insert(
-            "durableSwitchoverPilot".to_string(),
-            serde_json::json!({
-                "version": version,
-                "executionId": format!("{version:032x}"),
-                "checkpointName": format!("kuberic-checkpoint-{version:032x}"),
-                "initialOperationJson": "{}"
-            }),
-        );
-        let api = RoutingApi::new(Vec::new());
-        reconcile_set(&legacy, &api, &ReconcilerState::default())
-            .await
-            .unwrap();
-        let converted = api.last_status().unwrap();
-        let SwitchoverExecutionState::Incompatible { incompatibility } =
-            &converted.switchover_execution.as_ref().unwrap().state
-        else {
-            panic!("pilot v{version} was not converted");
-        };
-        assert_eq!(incompatibility.source, expected_source);
-        assert!(converted.legacy_status_fields.is_empty());
-    }
-
-    let mut malformed =
-        switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
-    let status = malformed.status.as_mut().unwrap();
+async fn switchover_phase_without_native_reference_fails_closed_without_dispatch() {
+    let mut set = switchover_set(new_switchover_execution("set-uid", snapshot(), 2, 10).unwrap());
+    let status = set.status.as_mut().unwrap();
     status.switchover_execution = None;
     status.legacy_status_fields.insert(
-        "durableSwitchoverPilot".to_string(),
-        serde_json::json!({
-            "version": "unsupported",
-            "executionId": 7,
-            "checkpointName": null,
-            "unexpected": true
-        }),
+        "removedSwitchoverField".to_string(),
+        serde_json::json!({"ignored": true}),
     );
-    let api = RoutingApi::new(Vec::new());
-    reconcile_set(&malformed, &api, &ReconcilerState::default())
-        .await
-        .unwrap();
-    let converted = api.last_status().unwrap();
-    let SwitchoverExecutionState::Incompatible { incompatibility } =
-        &converted.switchover_execution.as_ref().unwrap().state
-    else {
-        panic!("malformed legacy status was not converted");
+    let api = RoutingApi::new(vec![
+        pod(1, "one", "primary"),
+        pod(2, "two", "secondary"),
+        pod(3, "three", "secondary"),
+    ]);
+
+    let error = match reconcile_set(&set, &api, &ReconcilerState::default()).await {
+        Ok(_) => panic!("missing native switchover reference unexpectedly reconciled"),
+        Err(error) => error,
     };
     assert_eq!(
-        incompatibility.source,
-        SwitchoverIncompatibilitySource::UnsupportedStatus
+        error,
+        "switchover phase has no production execution reference"
     );
-    assert_eq!(incompatibility.legacy_execution_id, "unknown");
-    assert!(converted.legacy_status_fields.is_empty());
+    assert!(api.statuses.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

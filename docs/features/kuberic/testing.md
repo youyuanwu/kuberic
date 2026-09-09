@@ -386,7 +386,7 @@ conflict, failed status publication followed by terminal reload without Pods,
 stale target incarnation, target-promotion compensation, and lost replies for
 every replica mutation. It asserts the ordered mutation sequence, one admitted
 unsafe effect per correlation identity, terminal-before-status recovery, and
-fail-closed legacy/unsupported state.
+fail-closed missing-reference and unsupported current-native state.
 
 Run the targeted matrix:
 

@@ -38,8 +38,7 @@ use crate::crd::{
     PendingActionStatus, Phase, ReconfigurationPhase, RemoveReplicaExecutionStatus,
     RemoveReplicaIncompatibilitySource, RemoveReplicaIncompatibilityStatus,
     StablePartitionSnapshotStatus, StableReplicaElectionMetadataStatus, StableReplicaRoleStatus,
-    StableReplicaSnapshotStatus, StatusCondition, SwitchoverExecutionState,
-    SwitchoverExecutionStatus, SwitchoverIncompatibilitySource,
+    StableReplicaSnapshotStatus, StatusCondition,
 };
 #[cfg(test)]
 use crate::durable::decide;
@@ -54,8 +53,8 @@ use crate::durable::start_switchover;
 use crate::durable::switchover_execution::{
     DurableSwitchoverRuntime, DurableSwitchoverWorkflow as NativeSwitchoverWorkflow,
     SwitchoverRunnerAdapter as NativeSwitchoverRunnerAdapter,
-    SwitchoverTerminal as NativeSwitchoverTerminal, incompatible_switchover_execution,
-    native_execution_spec, native_initial_operation, new_switchover_execution,
+    SwitchoverTerminal as NativeSwitchoverTerminal, native_execution_spec,
+    native_initial_operation, new_switchover_execution,
 };
 #[cfg(test)]
 use crate::durable::switchover_execution::{DurableSwitchoverStepResult, encode_step_result};
@@ -349,90 +348,6 @@ fn legacy_remove_marker(
     }
 }
 
-#[allow(dead_code)]
-fn legacy_switchover_marker(
-    current: &KubericSetStatus,
-) -> Result<Option<SwitchoverExecutionStatus>, String> {
-    if let Some(operation) = current
-        .operation
-        .as_ref()
-        .filter(|operation| operation.kind == DurableOperationKind::Switchover)
-    {
-        let encoded = serde_json::to_vec(operation)
-            .map_err(|error| format!("serialize legacy explicit switchover marker: {error}"))?;
-        return Ok(Some(incompatible_switchover_execution(
-            SwitchoverIncompatibilitySource::LegacyExplicit,
-            operation.version,
-            operation.operation_id.clone(),
-            None,
-            &encoded,
-        )));
-    }
-    if let Some(legacy) = current.legacy_status_fields.get("durableSwitchoverPilot") {
-        let encoded = serde_json::to_vec(legacy)
-            .map_err(|error| format!("serialize unsupported switchover status marker: {error}"))?;
-        let version = legacy
-            .get("version")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or_default();
-        let execution_id = legacy
-            .get("executionId")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let checkpoint_name = legacy
-            .get("checkpointName")
-            .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string);
-        let source = match version {
-            1 => SwitchoverIncompatibilitySource::LegacyPilotV1,
-            2 => SwitchoverIncompatibilitySource::LegacyPilotV2,
-            _ => SwitchoverIncompatibilitySource::UnsupportedStatus,
-        };
-        return Ok(Some(incompatible_switchover_execution(
-            source,
-            version,
-            execution_id,
-            checkpoint_name,
-            &encoded,
-        )));
-    }
-    Ok(None)
-}
-
-#[allow(dead_code)]
-async fn persist_legacy_switchover_incompatibility(
-    set: &KubericSet,
-    api: &dyn ClusterApi,
-    now: i64,
-) -> Result<bool, String> {
-    let Some(current) = set.status.as_ref() else {
-        return Ok(false);
-    };
-    let Some(marker) = legacy_switchover_marker(current)? else {
-        return Ok(false);
-    };
-    let mut status = current.clone();
-    status.operation = None;
-    status.legacy_status_fields.clear();
-    status.switchover_execution = Some(marker);
-    set_framework_native_switchover_condition(
-        &mut status,
-        "Incompatible",
-        "legacy switchover execution is durably blocked and cannot be resumed as the production contract",
-        now,
-    );
-    api.patch_set_status(
-        &set.namespace().unwrap_or_default(),
-        &set.name_any(),
-        &status,
-        set.metadata.resource_version.as_deref(),
-    )
-    .await?;
-    Ok(true)
-}
-
 async fn persist_legacy_remove_incompatibility(
     set: &KubericSet,
     api: &dyn ClusterApi,
@@ -514,18 +429,17 @@ fn durable_identity_members(
     _status: &KubericSetStatus,
     operation: &DurableOperationStatus,
 ) -> Result<Vec<StableReplicaSnapshotStatus>, String> {
-    if operation.kind == DurableOperationKind::Switchover {
-        return Err(
-            "legacy explicit switchover cannot supply production execution identity".to_string(),
-        );
-    }
     Ok(match operation.kind {
         DurableOperationKind::CreatePartition => operation
             .committed_snapshot
             .as_ref()
             .map(|snapshot| snapshot.members.clone())
             .unwrap_or_default(),
-        DurableOperationKind::Switchover => unreachable!("handled above"),
+        DurableOperationKind::Switchover => {
+            return Err(
+                "switchover requires status.switchoverExecution for execution identity".to_string(),
+            );
+        }
         DurableOperationKind::AddReplica => operation
             .target_snapshot
             .members
@@ -772,10 +686,6 @@ pub async fn reconcile_set(
     let set_key = format!("{}/{}", namespace, name);
 
     info!(name, namespace, "reconciling KubericSet");
-
-    if persist_legacy_switchover_incompatibility(set, api, unix_seconds()).await? {
-        return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
-    }
 
     if persist_legacy_remove_incompatibility(set, api, state.removal_clock.unix_seconds()).await? {
         return Ok(ReconcileAction::Requeue(Duration::from_secs(1)));
@@ -2918,12 +2828,6 @@ async fn reconcile_framework_native_switchover_with_fuel(
         .ok_or_else(|| {
             "switchover phase has no framework-native execution reference".to_string()
         })?;
-    if matches!(
-        reference.state,
-        SwitchoverExecutionState::Incompatible { .. }
-    ) {
-        return Err("incompatible switchover execution cannot be resumed".to_string());
-    }
     let execution = native_execution_spec(reference)?;
     let host = state
         .framework_native_switchover
@@ -3547,7 +3451,7 @@ async fn reconcile_durable_operation(
             decide_create_partition(&operation, &observations, &pod_identities, now)
         }
         DurableOperationKind::Switchover => {
-            Err("legacy explicit switchover cannot enter the production reconciler".to_string())
+            Err("switchover cannot execute from status.operation".to_string())
         }
         DurableOperationKind::AddReplica => {
             let target_pod_role_label = operation.target_replica_id.and_then(|target_id| {
@@ -4414,8 +4318,8 @@ async fn ensure_pod(
 }
 
 #[cfg(test)]
-#[path = "reconciler/remove_replica_routing_tests.rs"]
-mod remove_replica_routing_tests;
+#[path = "reconciler/durable_routing_tests.rs"]
+mod durable_routing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4475,9 +4379,7 @@ mod tests {
         assert_eq!(status.phase, Phase::Switchover);
         assert!(status.operation.is_none());
         let reference = status.switchover_execution.as_ref().unwrap();
-        let SwitchoverExecutionState::Admitted { input } = &reference.state else {
-            panic!("native admission did not persist admitted state");
-        };
+        let input = &reference.input;
         assert_eq!(input.operation_authority, "set-uid");
         assert_eq!(input.target_primary_id, 2);
         assert_eq!(input.previous_snapshot, switchover_snapshot());
@@ -4492,61 +4394,6 @@ mod tests {
         let non_member =
             accept_framework_native_switchover(&set, switchover_snapshot(), 3, 100).unwrap_err();
         assert!(non_member.contains("not in the stable snapshot"));
-    }
-
-    #[test]
-    fn framework_native_switchover_legacy_markers_preserve_source_identity() {
-        let mut explicit = switchover_set().status.unwrap();
-        explicit.phase = Phase::Switchover;
-        explicit.operation =
-            Some(start_switchover("legacy-set", switchover_snapshot(), 2, 100).unwrap());
-        let marker = legacy_switchover_marker(&explicit).unwrap().unwrap();
-        let SwitchoverExecutionState::Incompatible { incompatibility } = marker.state else {
-            panic!("legacy explicit switchover was not incompatible");
-        };
-        assert_eq!(
-            incompatibility.source,
-            SwitchoverIncompatibilitySource::LegacyExplicit
-        );
-        assert_eq!(incompatibility.legacy_contract_version, 1);
-        assert!(incompatibility.legacy_checkpoint_name.is_none());
-        assert_eq!(incompatibility.fingerprint.len(), 16);
-
-        let mut pilot = KubericSetStatus {
-            phase: Phase::Switchover,
-            ..Default::default()
-        };
-        pilot.legacy_status_fields.insert(
-            "durableSwitchoverPilot".to_string(),
-            serde_json::json!({
-                "version": 2,
-                "executionId": "0123456789abcdef0123456789abcdef",
-                "checkpointName": "kuberic-checkpoint-0123456789abcdef0123456789abcdef",
-                "initialOperationJson": "{}"
-            }),
-        );
-        let marker = legacy_switchover_marker(&pilot).unwrap().unwrap();
-        let SwitchoverExecutionState::Incompatible { incompatibility } = marker.state else {
-            panic!("legacy pilot switchover was not incompatible");
-        };
-        assert_eq!(
-            incompatibility.source,
-            SwitchoverIncompatibilitySource::LegacyPilotV2
-        );
-        assert!(incompatibility.legacy_checkpoint_name.is_some());
-
-        pilot
-            .legacy_status_fields
-            .get_mut("durableSwitchoverPilot")
-            .unwrap()["version"] = serde_json::json!(1);
-        let marker = legacy_switchover_marker(&pilot).unwrap().unwrap();
-        let SwitchoverExecutionState::Incompatible { incompatibility } = marker.state else {
-            panic!("legacy pilot v1 switchover was not incompatible");
-        };
-        assert_eq!(
-            incompatibility.source,
-            SwitchoverIncompatibilitySource::LegacyPilotV1
-        );
     }
 
     #[test]

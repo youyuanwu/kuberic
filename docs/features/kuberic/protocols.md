@@ -170,9 +170,9 @@ allows one bounded redelivery of the same action identity. All other exposed
 ambiguity remains quarantined. ConfigMap conflicts and unknown write outcomes
 reload before any later permit.
 
-Legacy explicit version-1 and pilot version-1/version-2 status are converted
-to typed incompatibility evidence before pod observation. They are never
-resumed, cleared as absent, or used to authorize a replacement execution.
+A resource already in the `Switchover` phase must contain the current native
+execution reference. If it does not, reconciliation fails closed and does not
+authorize a replacement execution.
 
 Switchover deliberately retains individually correlated local mutations. A
 coarse primary-agent intent would require a new coordinator across multiple

@@ -72,9 +72,10 @@ not automatically retried. Set/Pod watches provide normal wakeups, with
 bounded deadline requeues as a fallback.
 
 Use `status.switchoverExecution` and the `FrameworkNativeSwitchover` condition
-to inspect immutable admission, checkpoint identity, compatibility blocking,
-storage reloads, exposed/quarantined work, and completion. Legacy explicit and
-pilot executions are retained as incompatibility evidence and are not resumed.
+to inspect immutable admission, checkpoint identity, current-contract
+validation, storage reloads, exposed/quarantined work, and completion.
+Resources in the `Switchover` phase without a current native reference fail
+closed and are not restarted automatically.
 Creation, add/build, removal, and failover retain their existing execution
 models.
 

@@ -38,8 +38,7 @@ use tokio::sync::Mutex;
 
 use crate::crd::{
     DurableOperationPhase, DurableOperationStatus, KubericSet, PendingActionStatus,
-    StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus, SwitchoverExecutionState,
-    SwitchoverExecutionStatus, SwitchoverIncompatibilitySource, SwitchoverIncompatibilityStatus,
+    StablePartitionSnapshotStatus, SwitchoverAdmissionInputStatus, SwitchoverExecutionStatus,
 };
 use crate::{cluster_api::ClusterApi, reconciler::snapshot_with_observed_metadata};
 
@@ -244,21 +243,15 @@ impl DurableSwitchoverState {
 pub struct DurableSwitchoverActivityInput {
     pub version: u32,
     pub state: DurableSwitchoverState,
-    #[serde(default)]
     pub kind: SwitchoverActivityKind,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SwitchoverActivityKind {
-    #[default]
     PassiveObservation,
-    PreparedReplica {
-        command: ReplicaEffectCommand,
-    },
-    PreparedLabel {
-        command: LabelEffectCommand,
-    },
+    PreparedReplica { command: ReplicaEffectCommand },
+    PreparedLabel { command: LabelEffectCommand },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1840,58 +1833,15 @@ pub fn new_switchover_execution(
         contract_version: SWITCHOVER_CONTRACT_VERSION,
         execution_id: execution_hex,
         checkpoint_name: KubernetesCheckpointStore::object_name(execution_id),
-        state: SwitchoverExecutionState::Admitted {
-            input: SwitchoverAdmissionInputStatus {
-                operation_authority: operation_authority.to_string(),
-                previous_snapshot,
-                target_primary_id,
-                accepted_unix_seconds: now,
-            },
+        input: SwitchoverAdmissionInputStatus {
+            operation_authority: operation_authority.to_string(),
+            previous_snapshot,
+            target_primary_id,
+            accepted_unix_seconds: now,
         },
     };
     native_execution_spec(&reference)?;
     Ok(reference)
-}
-
-pub fn incompatible_switchover_execution(
-    source: SwitchoverIncompatibilitySource,
-    legacy_contract_version: u32,
-    legacy_execution_id: String,
-    legacy_checkpoint_name: Option<String>,
-    encoded_legacy_state: &[u8],
-) -> SwitchoverExecutionStatus {
-    let source_name = match source {
-        SwitchoverIncompatibilitySource::LegacyExplicit => "legacy-explicit",
-        SwitchoverIncompatibilitySource::LegacyPilotV1 => "legacy-pilot-v1",
-        SwitchoverIncompatibilitySource::LegacyPilotV2 => "legacy-pilot-v2",
-        SwitchoverIncompatibilitySource::UnsupportedStatus => "unsupported-status",
-    };
-    let fingerprint = stable_legacy_fingerprint(source_name, encoded_legacy_state);
-    SwitchoverExecutionStatus {
-        contract_version: SWITCHOVER_CONTRACT_VERSION,
-        execution_id: legacy_execution_id.clone(),
-        checkpoint_name: legacy_checkpoint_name
-            .clone()
-            .unwrap_or_else(|| format!("kuberic-switchover-incompatible-{fingerprint}")),
-        state: SwitchoverExecutionState::Incompatible {
-            incompatibility: SwitchoverIncompatibilityStatus {
-                source,
-                legacy_contract_version,
-                legacy_execution_id,
-                legacy_checkpoint_name,
-                fingerprint,
-            },
-        },
-    }
-}
-
-fn stable_legacy_fingerprint(source: &str, encoded: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in source.as_bytes().iter().chain(encoded) {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
 }
 
 pub fn native_execution_id(reference: &SwitchoverExecutionStatus) -> Result<ExecutionId, String> {
@@ -1900,12 +1850,6 @@ pub fn native_execution_id(reference: &SwitchoverExecutionStatus) -> Result<Exec
             "unsupported framework-native switchover contract version {}",
             reference.contract_version
         ));
-    }
-    if matches!(
-        reference.state,
-        SwitchoverExecutionState::Incompatible { .. }
-    ) {
-        return Err("incompatible switchover execution cannot be resumed".to_string());
     }
     let bytes = decode_execution_id(&reference.execution_id)?;
     let execution_id = ExecutionId::from_bytes(bytes);
@@ -1922,9 +1866,7 @@ pub fn native_execution_id(reference: &SwitchoverExecutionStatus) -> Result<Exec
 pub fn native_initial_operation(
     reference: &SwitchoverExecutionStatus,
 ) -> Result<DurableOperationStatus, String> {
-    let SwitchoverExecutionState::Admitted { input } = &reference.state else {
-        return Err("incompatible switchover execution cannot be reconstructed".to_string());
-    };
+    let input = &reference.input;
     start_switchover(
         &format!(
             "{}:framework-native:{}",
@@ -2770,10 +2712,7 @@ mod framework_native_switchover_tests {
         test_execution_spec as execution_spec, test_initial_operation as initial_operation,
         validate_test_loaded_terminal as validate_loaded_terminal,
     };
-    use crate::crd::{
-        EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus,
-        SwitchoverIncompatibilitySource,
-    };
+    use crate::crd::{EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus};
     use crate::durable::{Decision, decide};
     use kuberic_durable_execution::ActivityObservation;
     use std::collections::BTreeMap;
@@ -2833,62 +2772,18 @@ mod framework_native_switchover_tests {
     }
 
     #[test]
-    fn framework_native_reference_schema_requires_exactly_one_state_variant() {
+    fn framework_native_reference_schema_requires_current_admission_input() {
         let reference = new_switchover_execution("set-uid", snapshot(3), 2, 100).unwrap();
-        let mut both = serde_json::to_value(&reference).unwrap();
-        both["state"]["incompatibility"] = serde_json::json!({
-            "source": "legacyPilotV2",
-            "legacyContractVersion": 2,
-            "legacyExecutionId": "legacy",
-            "legacyCheckpointName": "legacy-checkpoint",
-            "fingerprint": "fingerprint"
-        });
-        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(both).is_err());
+        let mut missing = serde_json::to_value(&reference).unwrap();
+        missing.as_object_mut().unwrap().remove("input");
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(missing).is_err());
 
-        let neither = serde_json::json!({
-            "contractVersion": SWITCHOVER_CONTRACT_VERSION,
-            "executionId": reference.execution_id,
-            "checkpointName": reference.checkpoint_name,
-            "state": {"kind": "admitted"}
-        });
-        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(neither).is_err());
-    }
-
-    #[test]
-    fn framework_native_incompatibility_marker_is_stable_and_preserves_source() {
-        let encoded = br#"{"version":2,"executionId":"legacy"}"#;
-        let first = incompatible_switchover_execution(
-            SwitchoverIncompatibilitySource::LegacyPilotV2,
-            2,
-            "legacy".to_string(),
-            Some("legacy-checkpoint".to_string()),
-            encoded,
-        );
-        let second = incompatible_switchover_execution(
-            SwitchoverIncompatibilitySource::LegacyPilotV2,
-            2,
-            "legacy".to_string(),
-            Some("legacy-checkpoint".to_string()),
-            encoded,
-        );
-        assert_eq!(first, second);
-        let SwitchoverExecutionState::Incompatible {
-            incompatibility: marker,
-        } = first.state
-        else {
-            panic!("expected incompatible marker");
-        };
-        assert_eq!(
-            marker.source,
-            SwitchoverIncompatibilitySource::LegacyPilotV2
-        );
-        assert_eq!(marker.legacy_contract_version, 2);
-        assert_eq!(marker.legacy_execution_id, "legacy");
-        assert_eq!(
-            marker.legacy_checkpoint_name.as_deref(),
-            Some("legacy-checkpoint")
-        );
-        assert_eq!(marker.fingerprint.len(), 16);
+        let mut unknown = serde_json::to_value(&reference).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unknownState".to_string(), serde_json::json!({}));
+        assert!(serde_json::from_value::<SwitchoverExecutionStatus>(unknown).is_err());
     }
 
     #[test]
@@ -3826,30 +3721,6 @@ mod framework_native_switchover_tests {
                 )
             ));
         }
-    }
-
-    #[test]
-    fn legacy_activity_v1_without_kind_replays_with_exact_recorded_bytes() {
-        let reference = test_reference("set-uid", snapshot(3), 2, 100).unwrap();
-        let initial = initial_operation(&reference).unwrap();
-        let logical = activity_spec(&DurableSwitchoverActivityInput {
-            version: SWITCHOVER_CONTRACT_VERSION,
-            state: compact(&initial),
-            kind: TestActivityKind::PassiveObservation,
-        })
-        .unwrap();
-        let mut legacy_json: serde_json::Value =
-            serde_json::from_slice(logical.input().as_slice()).unwrap();
-        legacy_json.as_object_mut().unwrap().remove("kind");
-        let legacy = ActivitySpec::new(
-            logical.name().clone(),
-            ExactBytes::new(serde_json::to_vec(&legacy_json).unwrap()),
-            logical.max_result_bytes(),
-        );
-        let observations = OperationObservations::new();
-        let addressed = BTreeMap::new();
-        let resolver = TestPreparedActivityResolver::new(&initial, &observations, &addressed, 100);
-        assert_eq!(resolver.resolve(&logical, Some(&legacy)).unwrap(), legacy);
     }
 
     #[test]

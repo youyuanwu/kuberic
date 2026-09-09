@@ -185,10 +185,9 @@ operation-specific.
 
 ### Graduated: Framework-Native Switchover
 
-`status.switchoverExecution` owns immutable admission, checkpoint identity, or
-typed incompatibility evidence. Legacy explicit version-1 and pilot
-version-1/version-2 status are converted before pod observation and are never
-resumed or treated as absence.
+`status.switchoverExecution` owns immutable admission and checkpoint identity.
+A resource in the `Switchover` phase without a current native reference fails
+closed; removed historical formats are neither migrated nor converted.
 
 The operation reuses the shared runner and ConfigMap provider while retaining
 the existing deterministic switchover reducer and individually correlated
