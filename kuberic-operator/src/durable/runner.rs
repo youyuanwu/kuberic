@@ -443,6 +443,7 @@ impl DurableRunner {
                     revision: _,
                     boundary: _,
                     checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                    ..
                 } => {
                     return match adapter.validate_terminal(outcome, completed_activity_count) {
                         Ok(terminal) => {

@@ -901,6 +901,7 @@ mod checkpoint_store_tests {
         store.correlate_host_outcome(&HostOutcome::WorkflowCompleted {
             outcome: TerminalOutcome::succeeded(ExactBytes::new(b"terminal")),
             completed_activity_count: 0,
+            completion_metadata: None,
             revision: revision.clone(),
             boundary: PersistenceBoundary::Completion,
             checkpoint_status: kuberic_durable_execution::TerminalCheckpointStatus::Accepted,

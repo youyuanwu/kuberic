@@ -1,8 +1,10 @@
 use crate::{
     ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError,
-    CheckpointLimits, CheckpointPayload, CheckpointStore, Evaluation, ExactBytes, ExecutionId,
-    ExecutionSpec, HostEpoch, LogicalActivityId, Nondeterminism, PreparedActivityResolver,
-    StorageRevision, StoreError, TerminalOutcome, Workflow, evaluate, evaluate_prepared,
+    CheckpointLimits, CheckpointPayload, CheckpointStore, CompletionMetadata,
+    EffectObservationDisposition, Evaluation, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
+    LogicalActivityId, Nondeterminism, PreparedActivityResolver, PreparedCommand,
+    PreparedEffectResolver, StorageRevision, StoreError, TerminalOutcome, Workflow, evaluate,
+    evaluate_effects, evaluate_prepared,
 };
 
 /// The persistence boundary that must be reloaded after an uncertain CAS result.
@@ -73,6 +75,31 @@ impl ActivityObservation {
     }
 }
 
+/// An authoritative typed-effect observation for one exact persisted attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectObservation {
+    activity: LogicalActivityId,
+    attempt_id: AttemptId,
+    result: ExactBytes,
+    disposition: EffectObservationDisposition,
+}
+
+impl EffectObservation {
+    pub fn new(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        result: ExactBytes,
+        disposition: EffectObservationDisposition,
+    ) -> Self {
+        Self {
+            activity,
+            attempt_id,
+            result,
+            disposition,
+        }
+    }
+}
+
 /// Unforgeable evidence that the dispatch-exposed checkpoint was accepted.
 ///
 /// External callers can inspect a permit but cannot construct one:
@@ -96,19 +123,26 @@ impl ActivityObservation {
 /// let forged = DispatchPermit {
 ///     activity,
 ///     attempt_id,
+///     prepared_command: None,
 /// };
 /// ```
 #[derive(Debug, Eq, PartialEq)]
 pub struct DispatchPermit {
     activity: LogicalActivityId,
     attempt_id: AttemptId,
+    prepared_command: Option<PreparedCommand>,
 }
 
 impl DispatchPermit {
-    fn new(activity: LogicalActivityId, attempt_id: AttemptId) -> Self {
+    fn new(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        prepared_command: Option<PreparedCommand>,
+    ) -> Self {
         Self {
             activity,
             attempt_id,
+            prepared_command,
         }
     }
 
@@ -118,6 +152,10 @@ impl DispatchPermit {
 
     pub const fn attempt_id(&self) -> AttemptId {
         self.attempt_id
+    }
+
+    pub const fn prepared_command(&self) -> Option<&PreparedCommand> {
+        self.prepared_command.as_ref()
     }
 }
 
@@ -151,6 +189,7 @@ define_host_outcomes! {
     WorkflowCompleted {
         outcome: TerminalOutcome,
         completed_activity_count: u64,
+        completion_metadata: Option<CompletionMetadata>,
         revision: StorageRevision,
         boundary: PersistenceBoundary,
         checkpoint_status: TerminalCheckpointStatus,
@@ -224,13 +263,14 @@ impl<S: CheckpointStore> DurableHost<S> {
                 Err(error) => return HostOutcome::CheckpointRejected(error),
             };
             if let Some((outcome, completed_activity_count)) = payload.terminal_outcome() {
-                return HostOutcome::WorkflowCompleted {
-                    outcome: outcome.clone(),
+                return terminal_host_outcome(
+                    outcome.clone(),
                     completed_activity_count,
-                    revision: stored.revision().clone(),
-                    boundary: PersistenceBoundary::Completion,
-                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
-                };
+                    payload.terminal_completion_metadata(),
+                    stored.revision().clone(),
+                    PersistenceBoundary::Completion,
+                    TerminalCheckpointStatus::Reloaded,
+                );
             }
             if let Some(record) = payload
                 .active_activities()
@@ -309,6 +349,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 HostOutcome::WorkflowCompleted {
                     outcome,
                     completed_activity_count,
+                    completion_metadata: None,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
                     checkpoint_status: TerminalCheckpointStatus::Reloaded,
@@ -348,6 +389,28 @@ impl<S: CheckpointStore> DurableHost<S> {
         execution: ExecutionSpec,
         resolver: &dyn PreparedActivityResolver,
     ) -> HostOutcome {
+        self.turn_and_expose_resolved(workflow, execution, ExposureResolver::Activity(resolver))
+            .await
+    }
+
+    /// Evaluate and atomically expose a typed effect whose exact command is
+    /// prepared separately from its logical request.
+    pub async fn turn_and_expose_effects<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: ExecutionSpec,
+        resolver: &dyn PreparedEffectResolver,
+    ) -> HostOutcome {
+        self.turn_and_expose_resolved(workflow, execution, ExposureResolver::Effect(resolver))
+            .await
+    }
+
+    async fn turn_and_expose_resolved<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: ExecutionSpec,
+        resolver: ExposureResolver<'_>,
+    ) -> HostOutcome {
         let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
             Ok(loaded) => loaded,
@@ -368,13 +431,14 @@ impl<S: CheckpointStore> DurableHost<S> {
                 Err(error) => return HostOutcome::CheckpointRejected(error),
             };
             if let Some((outcome, completed_activity_count)) = payload.terminal_outcome() {
-                return HostOutcome::WorkflowCompleted {
-                    outcome: outcome.clone(),
+                return terminal_host_outcome(
+                    outcome.clone(),
                     completed_activity_count,
-                    revision: stored.revision().clone(),
-                    boundary: PersistenceBoundary::Completion,
-                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
-                };
+                    payload.terminal_completion_metadata(),
+                    stored.revision().clone(),
+                    PersistenceBoundary::Completion,
+                    TerminalCheckpointStatus::Reloaded,
+                );
             }
             if let Some(record) = payload
                 .active_activities()
@@ -387,13 +451,16 @@ impl<S: CheckpointStore> DurableHost<S> {
                 };
             }
         }
-        match evaluate_prepared(
-            workflow,
-            &execution,
-            loaded.as_ref().map(|stored| stored.checkpoint()),
-            self.limits,
-            resolver,
-        ) {
+        let checkpoint = loaded.as_ref().map(|stored| stored.checkpoint());
+        let evaluation = match resolver {
+            ExposureResolver::Activity(resolver) => {
+                evaluate_prepared(workflow, &execution, checkpoint, self.limits, resolver)
+            }
+            ExposureResolver::Effect(resolver) => {
+                evaluate_effects(workflow, &execution, checkpoint, self.limits, resolver)
+            }
+        };
+        match evaluation {
             Evaluation::Scheduled {
                 activity,
                 checkpoint,
@@ -457,6 +524,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 HostOutcome::WorkflowCompleted {
                     outcome,
                     completed_activity_count,
+                    completion_metadata: None,
                     revision: stored.revision().clone(),
                     boundary: PersistenceBoundary::Completion,
                     checkpoint_status: TerminalCheckpointStatus::Reloaded,
@@ -541,8 +609,98 @@ impl<S: CheckpointStore> DurableHost<S> {
         let activity = expected_activity;
         replace_final_record(
             &mut payload,
-            ActivityRecord::completed(record.sequence(), record.spec().clone(), observation.result),
+            record.with_state(ActivityState::Completed {
+                result: observation.result,
+            }),
         );
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(revision)) => {
+                HostOutcome::ObservationAccepted { activity, revision }
+            }
+            Ok(other) => reload_outcome(PersistenceBoundary::Observation, other),
+            Err(error) => store_failed(PersistenceBoundary::Observation, error),
+        }
+    }
+
+    /// Persist an authoritative effect observation for the exact exposed
+    /// attempt. Proven non-admission reopens the same logical activity once;
+    /// all other observations complete it.
+    pub async fn observe_effect(
+        &self,
+        execution: &ExecutionSpec,
+        observation: EffectObservation,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected_activity = record.logical_id(execution_id);
+        if expected_activity != observation.activity {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected: expected_activity,
+                    observed: observation.activity,
+                },
+            );
+        }
+        if !matches!(
+            record.state(),
+            ActivityState::DispatchExposed { attempt_id }
+                if *attempt_id == observation.attempt_id
+        ) {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        }
+        let actual_result_bytes =
+            u64::try_from(observation.result.as_slice().len()).unwrap_or(u64::MAX);
+        if actual_result_bytes > record.max_result_bytes() {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::ResultExceedsDeclaredBound {
+                    actual: actual_result_bytes,
+                    maximum: record.max_result_bytes(),
+                },
+            );
+        }
+        let activity = expected_activity;
+        let replacement = match record.observe_effect_attempt(
+            observation.attempt_id,
+            observation.disposition,
+            observation.result,
+        ) {
+            Ok(record) => record,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        replace_final_record(&mut payload, replacement);
         let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
             Ok(checkpoint) => checkpoint,
             Err(error) => return HostOutcome::CheckpointRejected(error),
@@ -642,7 +800,9 @@ impl<S: CheckpointStore> DurableHost<S> {
 
         replace_final_record(
             &mut payload,
-            ActivityRecord::completed(record.sequence(), record.spec().clone(), observation.result),
+            record.with_state(ActivityState::Completed {
+                result: observation.result,
+            }),
         );
         let completed_checkpoint =
             match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
@@ -698,6 +858,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             } => HostOutcome::WorkflowCompleted {
                 outcome,
                 completed_activity_count,
+                completion_metadata: None,
                 revision: stored.revision().clone(),
                 boundary: PersistenceBoundary::Completion,
                 checkpoint_status: TerminalCheckpointStatus::Reloaded,
@@ -754,16 +915,15 @@ impl<S: CheckpointStore> DurableHost<S> {
             });
         }
         let attempt_id = self.next_attempt();
-        replace_final_record(
-            &mut payload,
-            ActivityRecord::dispatch_exposed(record.sequence(), record.spec().clone(), attempt_id),
-        );
+        let prepared_command = record.prepared_command().cloned();
+        replace_final_record(&mut payload, record.expose_attempt(attempt_id)?);
         Ok(PreparedExposure {
             execution_id: execution.execution_id(),
             expected_revision,
             checkpoint: CheckpointEnvelope::encode_with_limits(&payload, self.limits)?,
             activity,
             attempt_id,
+            prepared_command,
         })
     }
 
@@ -782,7 +942,11 @@ impl<S: CheckpointStore> DurableHost<S> {
             .await
         {
             Ok(CasOutcome::Accepted(revision)) => HostOutcome::DispatchPermitted {
-                permit: DispatchPermit::new(proposal.activity, proposal.attempt_id),
+                permit: DispatchPermit::new(
+                    proposal.activity,
+                    proposal.attempt_id,
+                    proposal.prepared_command,
+                ),
                 revision,
                 boundary,
             },
@@ -828,6 +992,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             Ok(terminal) => terminal,
             Err(error) => return HostOutcome::CheckpointRejected(error),
         };
+        let completion_metadata = terminal.terminal_completion_metadata();
         let checkpoint = match CheckpointEnvelope::encode_with_limits(&terminal, self.limits) {
             Ok(checkpoint) => checkpoint,
             Err(error) => return HostOutcome::CheckpointRejected(error),
@@ -837,13 +1002,14 @@ impl<S: CheckpointStore> DurableHost<S> {
             .compare_and_swap(execution_id, expected_revision, checkpoint)
             .await
         {
-            Ok(CasOutcome::Accepted(revision)) => HostOutcome::WorkflowCompleted {
+            Ok(CasOutcome::Accepted(revision)) => terminal_host_outcome(
                 outcome,
                 completed_activity_count,
+                completion_metadata,
                 revision,
                 boundary,
-                checkpoint_status: TerminalCheckpointStatus::Accepted,
-            },
+                TerminalCheckpointStatus::Accepted,
+            ),
             Ok(other) => reload_outcome(boundary, other),
             Err(error) => store_failed(boundary, error),
         }
@@ -865,6 +1031,12 @@ struct PreparedExposure {
     checkpoint: CheckpointEnvelope,
     activity: LogicalActivityId,
     attempt_id: AttemptId,
+    prepared_command: Option<PreparedCommand>,
+}
+
+enum ExposureResolver<'a> {
+    Activity(&'a dyn PreparedActivityResolver),
+    Effect(&'a dyn PreparedEffectResolver),
 }
 
 fn replace_final_record(payload: &mut CheckpointPayload, replacement: ActivityRecord) {
@@ -873,6 +1045,24 @@ fn replace_final_record(payload: &mut CheckpointPayload, replacement: ActivityRe
         .expect("replacement requires active state")
         .last_mut()
         .expect("replacement requires a final activity") = replacement;
+}
+
+fn terminal_host_outcome(
+    outcome: TerminalOutcome,
+    completed_activity_count: u64,
+    completion_metadata: Option<CompletionMetadata>,
+    revision: StorageRevision,
+    boundary: PersistenceBoundary,
+    checkpoint_status: TerminalCheckpointStatus,
+) -> HostOutcome {
+    HostOutcome::WorkflowCompleted {
+        outcome,
+        completed_activity_count,
+        completion_metadata,
+        revision,
+        boundary,
+        checkpoint_status,
+    }
 }
 
 fn reload_outcome(boundary: PersistenceBoundary, result: CasOutcome) -> HostOutcome {
@@ -898,12 +1088,102 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActivityName, ActivitySequence, ActivitySpec, CheckpointLimits, InMemoryCheckpointStore,
-        InMemoryFault, PreparedActivityError, PreparedActivityResolver, StoreErrorKind,
-        WorkflowContext,
+        ActivityName, ActivitySequence, ActivitySpec, CheckpointLimits, CompletionClass,
+        DurableEffect, EffectActivity, EffectMetadata, EffectOutcome, InMemoryCheckpointStore,
+        InMemoryFault, PreparedActivityError, PreparedActivityResolver, PreparedCommand,
+        PreparedEffectResolver, StoreErrorKind, WorkflowContext, encode_activity_result,
     };
+    use serde::{Deserialize, Serialize};
 
     struct OneActivity;
+
+    #[derive(Deserialize, Serialize)]
+    struct UnitRequest;
+
+    #[derive(Deserialize, Serialize)]
+    struct UnitCommand {
+        exact: u8,
+    }
+
+    struct OneEffect;
+
+    impl DurableEffect for OneEffect {
+        type Request = UnitRequest;
+        type Command = UnitCommand;
+        type Output = String;
+
+        const NAME: &'static str = "unit.effect";
+        const VERSION: u32 = 1;
+        const MAX_REQUEST_BYTES: u64 = 16;
+        const MAX_COMMAND_BYTES: u64 = 32;
+        const MAX_RESULT_BYTES: u64 = 256;
+        const MAX_ERROR_MESSAGE_BYTES: u64 = 64;
+        const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
+    }
+
+    struct OneEffectWorkflow;
+
+    #[async_trait]
+    impl Workflow for OneEffectWorkflow {
+        async fn run(
+            &self,
+            context: &mut WorkflowContext<'_>,
+            _input: ExactBytes,
+        ) -> TerminalOutcome {
+            match context.call_effect::<OneEffect>(UnitRequest).await {
+                Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+                Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
+            }
+        }
+    }
+
+    struct UnitEffectResolver {
+        mismatch_recorded: bool,
+    }
+
+    impl PreparedEffectResolver for UnitEffectResolver {
+        fn resolve(
+            &self,
+            _execution_id: ExecutionId,
+            _logical: &ActivitySpec,
+            metadata: EffectMetadata,
+            recorded: Option<&PreparedCommand>,
+        ) -> Result<PreparedCommand, PreparedActivityError> {
+            if let Some(recorded) = recorded
+                && !self.mismatch_recorded
+            {
+                return Ok(recorded.clone());
+            }
+            let exact = if recorded.is_some() { 2 } else { 1 };
+            crate::encode_effect_command::<OneEffect>(&UnitCommand { exact })
+                .and_then(|command| {
+                    if command.max_bytes() == metadata.max_command_bytes() {
+                        Ok(command)
+                    } else {
+                        Err(crate::EffectContractError::CommandTooLarge {
+                            actual_bytes: command.max_bytes(),
+                            max_bytes: metadata.max_command_bytes(),
+                        })
+                    }
+                })
+                .map_err(|_| PreparedActivityError::Encoding)
+        }
+    }
+
+    struct WrongCommandBoundResolver;
+
+    impl PreparedEffectResolver for WrongCommandBoundResolver {
+        fn resolve(
+            &self,
+            _execution_id: ExecutionId,
+            _logical: &ActivitySpec,
+            _metadata: EffectMetadata,
+            _recorded: Option<&PreparedCommand>,
+        ) -> Result<PreparedCommand, PreparedActivityError> {
+            PreparedCommand::new(ExactBytes::new(b"{}"), 999)
+                .map_err(|_| PreparedActivityError::Encoding)
+        }
+    }
 
     #[async_trait]
     impl Workflow for OneActivity {
@@ -993,6 +1273,183 @@ mod tests {
         });
     }
 
+    #[test]
+    fn typed_effect_persists_command_redelivers_once_and_authenticates_completion() {
+        block_on(async {
+            let store = InMemoryCheckpointStore::new();
+            let execution = ExecutionSpec::new(
+                ExecutionId::from_bytes([22; 16]),
+                ExactBytes::new(b"workflow"),
+                1024,
+            );
+            let mut host = DurableHost::new(
+                store,
+                HostEpoch::from_bytes([23; 16]),
+                CheckpointLimits::new(4, 100_000, 100_000).unwrap(),
+            );
+            let resolver = UnitEffectResolver {
+                mismatch_recorded: false,
+            };
+
+            let HostOutcome::DispatchPermitted { permit: first, .. } = host
+                .turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
+                .await
+            else {
+                panic!("first effect attempt was not exposed");
+            };
+            assert!(first.prepared_command().is_some());
+            let logical = first.activity().clone();
+            let first_attempt = first.attempt_id();
+            let proven = encode_activity_result::<EffectActivity<OneEffect>>(
+                &EffectOutcome::<String>::ProvenNoAdmission,
+            )
+            .unwrap();
+            assert!(matches!(
+                host.observe_effect(
+                    &execution,
+                    EffectObservation::new(
+                        logical.clone(),
+                        first_attempt,
+                        proven.clone(),
+                        EffectObservationDisposition::ProvenNoAdmission,
+                    ),
+                )
+                .await,
+                HostOutcome::ObservationAccepted { .. }
+            ));
+
+            let HostOutcome::DispatchPermitted { permit: second, .. } = host
+                .turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
+                .await
+            else {
+                panic!("second effect attempt was not exposed");
+            };
+            assert_eq!(second.activity(), &logical);
+            assert_ne!(second.attempt_id(), first_attempt);
+            assert_eq!(second.prepared_command(), first.prepared_command());
+            assert!(matches!(
+                host.observe_effect(
+                    &execution,
+                    EffectObservation::new(
+                        logical,
+                        second.attempt_id(),
+                        proven,
+                        EffectObservationDisposition::ProvenNoAdmission,
+                    ),
+                )
+                .await,
+                HostOutcome::ObservationAccepted { .. }
+            ));
+
+            let HostOutcome::WorkflowCompleted {
+                completion_metadata: Some(metadata),
+                checkpoint_status: TerminalCheckpointStatus::Accepted,
+                ..
+            } = host
+                .turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
+                .await
+            else {
+                panic!("effect workflow did not complete with authenticated metadata");
+            };
+            assert_eq!(metadata.completed_activity_count(), 1);
+            assert_eq!(metadata.external_effect_count(), 1);
+            assert_eq!(metadata.passive_observation_count(), 0);
+
+            assert!(matches!(
+                host.turn_and_expose_effects(&OneEffectWorkflow, execution, &resolver)
+                    .await,
+                HostOutcome::WorkflowCompleted {
+                    completion_metadata: Some(_),
+                    checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                    ..
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn typed_effect_unknown_outcome_quarantines_and_recorded_command_mismatch_is_nondeterminism() {
+        block_on(async {
+            let store = InMemoryCheckpointStore::new();
+            let execution = ExecutionSpec::new(
+                ExecutionId::from_bytes([24; 16]),
+                ExactBytes::new(b"workflow"),
+                1024,
+            );
+            let mut host = DurableHost::new(
+                store.clone(),
+                HostEpoch::from_bytes([25; 16]),
+                CheckpointLimits::new(4, 100_000, 100_000).unwrap(),
+            );
+            let resolver = UnitEffectResolver {
+                mismatch_recorded: false,
+            };
+            assert!(matches!(
+                host.turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
+                    .await,
+                HostOutcome::DispatchPermitted { .. }
+            ));
+            assert!(matches!(
+                host.turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
+                    .await,
+                HostOutcome::Quarantined { .. }
+            ));
+
+            let mismatching = UnitEffectResolver {
+                mismatch_recorded: true,
+            };
+            let stored = store.load(execution.execution_id()).await.unwrap().unwrap();
+            assert!(matches!(
+                evaluate_effects(
+                    &OneEffectWorkflow,
+                    &execution,
+                    Some(stored.checkpoint()),
+                    host.checkpoint_limits(),
+                    &mismatching,
+                ),
+                Evaluation::Nondeterminism(Nondeterminism::PreparedCommandMismatch { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn typed_effect_rejects_resolver_command_bound_mismatch_before_persistence() {
+        block_on(async {
+            let store = InMemoryCheckpointStore::new();
+            let execution = ExecutionSpec::new(
+                ExecutionId::from_bytes([26; 16]),
+                ExactBytes::new(b"workflow"),
+                1024,
+            );
+            let mut host = DurableHost::new(
+                store.clone(),
+                HostEpoch::from_bytes([27; 16]),
+                CheckpointLimits::new(4, 100_000, 100_000).unwrap(),
+            );
+            assert!(matches!(
+                host.turn_and_expose_effects(
+                    &OneEffectWorkflow,
+                    execution.clone(),
+                    &WrongCommandBoundResolver,
+                )
+                .await,
+                HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(
+                    PreparedActivityError::CommandBoundMismatch {
+                        actual_bytes: 999,
+                        max_bytes: 32,
+                    }
+                ))
+            ));
+            assert!(
+                store
+                    .load(execution.execution_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
     #[derive(Clone)]
     struct PreparedResolver(Result<ActivitySpec, PreparedActivityError>);
 
@@ -1018,6 +1475,14 @@ mod tests {
                     max_bytes: 1,
                 },
                 PreparedActivityError::ResultBoundTooLarge {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                PreparedActivityError::CommandTooLarge {
+                    actual_bytes: 2,
+                    max_bytes: 1,
+                },
+                PreparedActivityError::CommandBoundMismatch {
                     actual_bytes: 2,
                     max_bytes: 1,
                 },

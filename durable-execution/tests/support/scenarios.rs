@@ -1134,6 +1134,7 @@ async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
                             revision: first_revision,
                             boundary: first_boundary,
                             checkpoint_status: TerminalCheckpointStatus::Accepted,
+                            ..
                         },
                         HostOutcome::WorkflowCompleted {
                             outcome: second_outcome,
@@ -1141,6 +1142,7 @@ async fn completed_replay(id: ScenarioId) -> ScenarioEvidence {
                             revision: second_revision,
                             boundary: second_boundary,
                             checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                            ..
                         },
                     ) if first_outcome == second_outcome
                         && first_count == second_count
@@ -2258,6 +2260,7 @@ async fn active_to_terminal_compaction(id: ScenarioId) -> ScenarioEvidence {
                     Some(CheckpointState::Terminal {
                         outcome: TerminalOutcome::Succeeded(result),
                         completed_activity_count: 1,
+                        ..
                     }) if result == &bytes(b"compacted")
                 ) && !terminal_json.contains("activities")
                     && !terminal_json.contains("history")
@@ -2312,6 +2315,7 @@ async fn terminal_reload_without_poll(id: ScenarioId) -> ScenarioEvidence {
                             revision: accepted_revision,
                             boundary: accepted_boundary,
                             checkpoint_status: TerminalCheckpointStatus::Accepted,
+                            ..
                         },
                         HostOutcome::WorkflowCompleted {
                             outcome: reloaded_outcome,
@@ -2319,6 +2323,7 @@ async fn terminal_reload_without_poll(id: ScenarioId) -> ScenarioEvidence {
                             revision: reloaded_revision,
                             boundary: reloaded_boundary,
                             checkpoint_status: TerminalCheckpointStatus::Reloaded,
+                            ..
                         },
                     ) if accepted_outcome == reloaded_outcome
                         && accepted_count == reloaded_count
