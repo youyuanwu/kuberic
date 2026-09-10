@@ -88,6 +88,10 @@ impl DurablePermitGuard {
     pub fn attempt_id(&self) -> Option<AttemptId> {
         self.permit.as_ref().map(DispatchPermit::attempt_id)
     }
+
+    pub fn attempt_ordinal(&self) -> Option<u32> {
+        self.permit.as_ref().map(DispatchPermit::attempt_ordinal)
+    }
 }
 
 #[derive(Clone)]

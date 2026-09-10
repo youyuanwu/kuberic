@@ -610,6 +610,17 @@ impl ActivityRecord {
         Self::new(sequence, spec, ActivityState::Scheduled)
     }
 
+    pub(crate) fn classified(
+        sequence: ActivitySequence,
+        spec: ActivitySpec,
+        completion_class: CompletionClass,
+        state: ActivityState,
+    ) -> Self {
+        let mut record = Self::new(sequence, spec, state);
+        record.completion_class = Some(completion_class);
+        record
+    }
+
     pub const fn completed(
         sequence: ActivitySequence,
         spec: ActivitySpec,
@@ -1002,7 +1013,7 @@ fn validate_active_history(activities: &[ActivityRecord]) -> Result<(), Checkpoi
                     .map_err(|error| CheckpointError::EffectContract(error.to_string()))?;
                 validate_effect_record_state(record)?;
             }
-            (None, None) if record.attempts.is_empty() => {}
+            (None, _) if record.attempts.is_empty() => {}
             (None, Some(_)) => {
                 return Err(CheckpointError::MissingPreparedCommand {
                     sequence: record.sequence,

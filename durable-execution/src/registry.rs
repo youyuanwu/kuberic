@@ -11,6 +11,21 @@ use crate::{
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send>>;
 type ErasedHandler = dyn Fn(ActivityContext, ExactBytes) -> HandlerFuture + Send + Sync;
 
+/// Embedding-runtime timer used to cancel an in-flight activity invocation.
+///
+/// The durable kernel owns timeout semantics but does not embed a concrete
+/// async runtime. Tokio, async-std, or another host runtime supplies this
+/// small adapter.
+pub trait ActivityTimeoutRuntime: Send + Sync {
+    fn invoke<'a>(
+        &'a self,
+        timeout_millis: u64,
+        invocation: Pin<
+            Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send + 'a>,
+        >,
+    ) -> Pin<Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send + 'a>>;
+}
+
 struct RegistryEntry {
     handler: Option<Arc<ErasedHandler>>,
     max_input_bytes: u64,
@@ -367,11 +382,21 @@ fn validate_registered_contract(
 pub struct ActivityRunner<S> {
     host: DurableHost<S>,
     registry: ActivityRegistry,
+    timeout_runtime: Option<Arc<dyn ActivityTimeoutRuntime>>,
 }
 
 impl<S: CheckpointStore> ActivityRunner<S> {
     pub fn new(host: DurableHost<S>, registry: ActivityRegistry) -> Self {
-        Self { host, registry }
+        Self {
+            host,
+            registry,
+            timeout_runtime: None,
+        }
+    }
+
+    pub fn with_timeout_runtime(mut self, runtime: impl ActivityTimeoutRuntime + 'static) -> Self {
+        self.timeout_runtime = Some(Arc::new(runtime));
+        self
     }
 
     pub const fn host(&self) -> &DurableHost<S> {
@@ -471,7 +496,6 @@ impl<S: CheckpointStore> ActivityRunner<S> {
                 )
                 .await;
         }
-        let invocation = self.registry.invoke_classified(context, input);
         let action_timeout = activity
             .options()
             .action_deadline_unix_millis()
@@ -485,26 +509,30 @@ impl<S: CheckpointStore> ActivityRunner<S> {
             (None, Some(attempt)) => (Some(attempt), false),
             (None, None) => (None, false),
         };
+        let invocation = Box::pin(self.registry.invoke_classified(context, input));
         let handler_result = match effective_timeout {
-            Some(timeout_millis) => match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_millis),
-                invocation,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) if action_deadline_wins => {
-                    return self
-                        .host
-                        .observe_failure(
-                            &execution,
-                            &activity,
-                            ActivityFailure::ActionDeadlineExceeded,
-                        )
-                        .await;
+            Some(timeout_millis) => {
+                let Some(runtime) = &self.timeout_runtime else {
+                    return HostOutcome::CheckpointRejected(
+                        CheckpointError::PreparedActivityRejected(
+                            crate::PreparedActivityError::Validation,
+                        ),
+                    );
+                };
+                match runtime.invoke(timeout_millis, invocation).await {
+                    Err(ActivityHandlerError::TimedOut) if action_deadline_wins => {
+                        return self
+                            .host
+                            .observe_failure(
+                                &execution,
+                                &activity,
+                                ActivityFailure::ActionDeadlineExceeded,
+                            )
+                            .await;
+                    }
+                    result => result,
                 }
-                Err(_) => Err(ActivityHandlerError::TimedOut),
-            },
+            }
             None => invocation.await,
         };
         match handler_result {

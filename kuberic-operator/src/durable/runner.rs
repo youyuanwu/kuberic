@@ -1,5 +1,7 @@
 //! Shared bounded lifecycle runner for operator-hosted durable workflows.
 
+use std::future::Future;
+
 use async_trait::async_trait;
 use kuberic_durable_execution::{
     ActivityObservation, AttemptId, CheckpointError, CheckpointLimits, CheckpointPayload,
@@ -14,6 +16,20 @@ use super::workflow_host::{DurableOperatorHost, DurablePermitGuard};
 
 const MIN_REQUEUE_SECONDS: u64 = 1;
 const MAX_REQUEUE_SECONDS: u64 = 10;
+
+async fn await_adapter_deadline<F: Future>(
+    future: F,
+    now_unix_seconds: i64,
+    deadline_unix_seconds: i64,
+) -> Result<F::Output, ()> {
+    // Observation remains necessary after the action deadline (especially for
+    // strict quarantine), but each reconciler call is still bounded.
+    let remaining = deadline_unix_seconds
+        .saturating_sub(now_unix_seconds)
+        .max(1);
+    let timeout = std::time::Duration::from_secs(u64::try_from(remaining).unwrap_or_default());
+    tokio::time::timeout(timeout, future).await.map_err(|_| ())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableWorkflowContract {
@@ -170,6 +186,7 @@ pub(crate) trait ReconcilerActivityAdapter: Send {
         &mut self,
         _activity: &LogicalActivityId,
         _attempt_id: AttemptId,
+        _attempt_ordinal: u32,
         _permit: &mut DurablePermitGuard,
     ) -> DurableAdapterBoundary {
         DurableAdapterBoundary::Isolated(
@@ -503,6 +520,36 @@ impl DurableRunner {
                                     retry_not_before_unix_millis,
                                 ),
                             },
+                            HostOutcome::CheckpointRejected(
+                                CheckpointError::ActivityAttemptLimitExceeded { .. },
+                            ) => {
+                                let failed = host
+                                    .observe_failure(
+                                        &execution,
+                                        &activity,
+                                        kuberic_durable_execution::ActivityFailure::Application(
+                                            kuberic_durable_execution::ExactBytes::new(
+                                                b"lost_result_retry_exhausted",
+                                            ),
+                                        ),
+                                    )
+                                    .await;
+                                host.store().correlate_host_outcome(&failed);
+                                match failed {
+                                    HostOutcome::ObservationAccepted { .. } => {
+                                        DurableRunnerOutcome::Active {
+                                            reason: DurableActiveReason::Adapter,
+                                            condition_reason: "ActivityRetryExhausted".to_string(),
+                                            detail: format!(
+                                                "ordinary activity {} exhausted its bounded attempts",
+                                                activity.spec().name().name()
+                                            ),
+                                            requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                                        }
+                                    }
+                                    other => host_outcome_failure(other),
+                                }
+                            }
                             other => host_outcome_failure(other),
                         };
                     }
@@ -792,9 +839,35 @@ impl DurableRunner {
                     let ordinary = permit.prepared_command().is_none();
                     let mut guard = DurablePermitGuard::new(permit);
                     if ordinary {
-                        let boundary = adapter
-                            .observe_or_dispatch_activity(&activity, attempt_id, &mut guard)
-                            .await;
+                        let attempt_ordinal = guard
+                            .attempt_ordinal()
+                            .expect("newly constructed permit guard contains its permit");
+                        let adapter_deadline = adapter.deadline_unix_seconds();
+                        let boundary = match await_adapter_deadline(
+                            adapter.observe_or_dispatch_activity(
+                                &activity,
+                                attempt_id,
+                                attempt_ordinal,
+                                &mut guard,
+                            ),
+                            now_unix_seconds,
+                            adapter_deadline,
+                        )
+                        .await
+                        {
+                            Ok(boundary) => boundary,
+                            Err(()) => {
+                                return DurableRunnerOutcome::Active {
+                                    reason: DurableActiveReason::Adapter,
+                                    condition_reason: "ActivityInvocationTimedOut".to_string(),
+                                    detail: format!(
+                                        "ordinary activity {} exceeded its persisted action deadline",
+                                        activity.spec().name().name()
+                                    ),
+                                    requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                                };
+                            }
+                        };
                         if guard.activity().is_some() {
                             return DurableRunnerOutcome::Isolated(
                                 "activity adapter did not consume the durable dispatch permit"
@@ -823,6 +896,37 @@ impl DurableRunner {
                                         retry_not_before_unix_millis,
                                     ),
                                 },
+                                HostOutcome::CheckpointRejected(
+                                    CheckpointError::ActivityAttemptLimitExceeded { .. },
+                                ) => {
+                                    let failed = host
+                                        .observe_failure(
+                                            &execution,
+                                            &activity,
+                                            kuberic_durable_execution::ActivityFailure::Application(
+                                                kuberic_durable_execution::ExactBytes::new(
+                                                    b"lost_result_retry_exhausted",
+                                                ),
+                                            ),
+                                        )
+                                        .await;
+                                    host.store().correlate_host_outcome(&failed);
+                                    match failed {
+                                        HostOutcome::ObservationAccepted { .. } => {
+                                            DurableRunnerOutcome::Active {
+                                                reason: DurableActiveReason::Adapter,
+                                                condition_reason: "ActivityRetryExhausted"
+                                                    .to_string(),
+                                                detail: format!(
+                                                    "ordinary activity {} exhausted its bounded attempts",
+                                                    activity.spec().name().name()
+                                                ),
+                                                requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                                            }
+                                        }
+                                        other => host_outcome_failure(other),
+                                    }
+                                }
                                 other => host_outcome_failure(other),
                             };
                         }
@@ -885,9 +989,27 @@ impl DurableRunner {
                             AdapterHandling::Return(result) => return result,
                         }
                     } else {
-                        let boundary = adapter
-                            .observe_or_dispatch(&activity, attempt_id, &mut guard)
-                            .await;
+                        let adapter_deadline = adapter.deadline_unix_seconds();
+                        let boundary = match await_adapter_deadline(
+                            adapter.observe_or_dispatch(&activity, attempt_id, &mut guard),
+                            now_unix_seconds,
+                            adapter_deadline,
+                        )
+                        .await
+                        {
+                            Ok(boundary) => boundary,
+                            Err(()) => {
+                                return DurableRunnerOutcome::Active {
+                                    reason: DurableActiveReason::Adapter,
+                                    condition_reason: "StrictEffectInvocationTimedOut".to_string(),
+                                    detail: format!(
+                                        "strict activity {} exceeded its persisted action deadline and remains quarantined",
+                                        activity.spec().name().name()
+                                    ),
+                                    requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                                };
+                            }
+                        };
                         if guard.activity().is_some() {
                             return DurableRunnerOutcome::Isolated(
                                 "typed operation adapter did not consume the durable dispatch permit"
@@ -943,9 +1065,27 @@ impl DurableRunner {
                     completion_class,
                 } => {
                     let Some(prepared_command) = prepared_command else {
-                        let boundary = adapter
-                            .resolve_activity_quarantine(&activity, attempt_id)
-                            .await;
+                        let adapter_deadline = adapter.deadline_unix_seconds();
+                        let boundary = match await_adapter_deadline(
+                            adapter.resolve_activity_quarantine(&activity, attempt_id),
+                            now_unix_seconds,
+                            adapter_deadline,
+                        )
+                        .await
+                        {
+                            Ok(boundary) => boundary,
+                            Err(()) => {
+                                return DurableRunnerOutcome::Active {
+                                    reason: DurableActiveReason::Adapter,
+                                    condition_reason: "ActivityObservationTimedOut".to_string(),
+                                    detail: format!(
+                                        "activity {} observation exceeded its persisted deadline",
+                                        activity.spec().name().name()
+                                    ),
+                                    requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                                };
+                            }
+                        };
                         if let DurableAdapterBoundary::Retry { reason, detail } = &boundary {
                             let retried = host
                                 .schedule_retry(
@@ -968,6 +1108,37 @@ impl DurableRunner {
                                         retry_not_before_unix_millis,
                                     ),
                                 },
+                                HostOutcome::CheckpointRejected(
+                                    CheckpointError::ActivityAttemptLimitExceeded { .. },
+                                ) => {
+                                    let failed = host
+                                        .observe_failure(
+                                            &execution,
+                                            &activity,
+                                            kuberic_durable_execution::ActivityFailure::Application(
+                                                kuberic_durable_execution::ExactBytes::new(
+                                                    b"lost_result_retry_exhausted",
+                                                ),
+                                            ),
+                                        )
+                                        .await;
+                                    host.store().correlate_host_outcome(&failed);
+                                    match failed {
+                                        HostOutcome::ObservationAccepted { .. } => {
+                                            DurableRunnerOutcome::Active {
+                                                reason: DurableActiveReason::Adapter,
+                                                condition_reason: "ActivityRetryExhausted"
+                                                    .to_string(),
+                                                detail: format!(
+                                                    "ordinary activity {} exhausted its bounded attempts",
+                                                    activity.spec().name().name()
+                                                ),
+                                                requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                                            }
+                                        }
+                                        other => host_outcome_failure(other),
+                                    }
+                                }
                                 other => host_outcome_failure(other),
                             };
                         }
@@ -1030,13 +1201,31 @@ impl DurableRunner {
                                 .to_string(),
                         );
                     }
-                    let boundary = adapter
-                        .resolve_quarantine(DurableEffectQuarantine {
+                    let adapter_deadline = adapter.deadline_unix_seconds();
+                    let activity_name = activity.spec().name().name().to_string();
+                    let boundary = match await_adapter_deadline(
+                        adapter.resolve_quarantine(DurableEffectQuarantine {
                             activity,
                             attempt_id,
                             prepared_command,
-                        })
-                        .await;
+                        }),
+                        now_unix_seconds,
+                        adapter_deadline,
+                    )
+                    .await
+                    {
+                        Ok(boundary) => boundary,
+                        Err(()) => {
+                            return DurableRunnerOutcome::Active {
+                                reason: DurableActiveReason::Adapter,
+                                condition_reason: "StrictEffectObservationTimedOut".to_string(),
+                                detail: format!(
+                                    "strict activity {activity_name} observation timed out and remains quarantined"
+                                ),
+                                requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                            };
+                        }
+                    };
                     match typed_boundary_result(
                         boundary,
                         adapter.deadline_unix_seconds(),

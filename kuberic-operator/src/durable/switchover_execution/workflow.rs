@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityCallError, ActivityOptions, DurableEffect, EffectCallError, EffectErrorKind,
-    ExactBytes, TerminalOutcome, Workflow, WorkflowContext,
+    ActivityOptions, BoundedEffectError, EffectErrorKind, ExactBytes, TerminalOutcome, Workflow,
+    WorkflowContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,8 +26,9 @@ use super::activities::{
     RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
     RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
     RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput, RevokeWritesActivity,
-    RevokeWritesInput, SwitchoverActivityInput, WaitTargetCaughtUpActivity,
-    WaitTargetCaughtUpInput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
+    RevokeWritesInput, SwitchoverActivityContract, SwitchoverActivityInput,
+    WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput, WaitTargetWriteQuorumActivity,
+    WaitTargetWriteQuorumInput,
 };
 use super::model::{DirectSwitchoverDefinition, next_deadline};
 
@@ -631,7 +632,7 @@ async fn attest_compensated(
     }
 }
 
-async fn call_activity<A: DurableEffect>(
+async fn call_activity<A: SwitchoverActivityContract>(
     context: &mut WorkflowContext<'_>,
     budget: &mut TransitionBudget,
     action_deadline_unix_seconds: i64,
@@ -654,7 +655,7 @@ async fn call_activity<A: DurableEffect>(
         .map_err(|error| error.to_string())
 }
 
-async fn call_activity_branch<A: DurableEffect>(
+async fn call_activity_branch<A: SwitchoverActivityContract>(
     context: &mut WorkflowContext<'_>,
     budget: &mut TransitionBudget,
     action_deadline_unix_seconds: i64,
@@ -672,29 +673,20 @@ async fn call_activity_branch<A: DurableEffect>(
     context
         .schedule_activity_typed::<OrdinarySwitchoverActivity<A>>(A::NAME, &input, options)
         .await
-        .map_err(|error| {
-            effect_call_branch(EffectCallError::Activity(ActivityCallError::Handler(
-                error.to_string(),
-            )))
-        })?
+        .map_err(|error| EffectBranch::Stopped(error.to_string()))?
         .into_workflow_result(A::MAX_ERROR_MESSAGE_BYTES)
         .map_err(effect_call_branch)
 }
 
-fn effect_call_branch(error: EffectCallError) -> EffectBranch {
-    match error {
-        EffectCallError::Effect(error)
-            if matches!(
-                error.kind(),
-                EffectErrorKind::DomainFailure | EffectErrorKind::DeadlineExceeded
-            ) =>
-        {
+fn effect_call_branch(error: BoundedEffectError) -> EffectBranch {
+    match error.kind() {
+        EffectErrorKind::DomainFailure | EffectErrorKind::DeadlineExceeded => {
             EffectBranch::DomainFailure {
                 observed_at: error.observed_at_unix_seconds().unwrap_or_default(),
                 message: error.message().to_string(),
             }
         }
-        other => EffectBranch::Stopped(other.to_string()),
+        _ => EffectBranch::Stopped(error.to_string()),
     }
 }
 
@@ -880,35 +872,36 @@ mod tests {
                     );
                     *occurrence += 1;
                     observed_at += 1;
-                    let outcome =
-                        if matches!(
-                    super::super::activities::activity_class(&name),
-                    Some(super::super::activities::SwitchoverActivityClass::StrictEffectRequired)
+                    let outcome = if matches!(
+                        super::super::activities::activity_class(&name),
+                        Some(
+                            super::super::activities::SwitchoverActivityClass::StrictEffectRequired
+                        )
                     ) {
-                            macro_rules! decode {
+                        macro_rules! decode {
                                 () => {
-                                    if name == RevokeWritesActivity::NAME {
+                                    if name == <RevokeWritesActivity as SwitchoverActivityContract>::NAME {
                                         decode_effect_observation::<RevokeWritesActivity>(
                                             permit.activity().clone(),
                                             permit.attempt_id(),
                                             &result,
                                         )
                                         .unwrap()
-                                    } else if name == DemoteOldPrimaryActivity::NAME {
+                                    } else if name == <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME {
                                         decode_effect_observation::<DemoteOldPrimaryActivity>(
                                             permit.activity().clone(),
                                             permit.attempt_id(),
                                             &result,
                                         )
                                         .unwrap()
-                                    } else if name == PromoteTargetActivity::NAME {
+                                    } else if name == <PromoteTargetActivity as SwitchoverActivityContract>::NAME {
                                         decode_effect_observation::<PromoteTargetActivity>(
                                             permit.activity().clone(),
                                             permit.attempt_id(),
                                             &result,
                                         )
                                         .unwrap()
-                                    } else if name == CompensatePromoteOldPrimaryActivity::NAME {
+                                    } else if name == <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME {
                                         decode_effect_observation::<
                                             CompensatePromoteOldPrimaryActivity,
                                         >(
@@ -920,15 +913,15 @@ mod tests {
                                     }
                                 };
                             }
-                            let observation = decode!();
-                            host.observe_effect(&execution, observation).await
-                        } else {
-                            host.observe(
-                                &execution,
-                                ActivityObservation::new(permit.activity().clone(), result),
-                            )
-                            .await
-                        };
+                        let observation = decode!();
+                        host.observe_effect(&execution, observation).await
+                    } else {
+                        host.observe(
+                            &execution,
+                            ActivityObservation::new(permit.activity().clone(), result),
+                        )
+                        .await
+                    };
                     assert!(matches!(outcome, HostOutcome::ObservationAccepted { .. }));
                 }
                 HostOutcome::WorkflowCompleted { outcome, .. } => {
@@ -1011,11 +1004,11 @@ mod tests {
         for replica_count in [2, 4, 9] {
             let (names, _targets, terminal) = run_script(replica_count, &[], None).await;
             let mut expected = vec![
-                RevokeWritesActivity::NAME,
+                <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
                 CaptureFrozenLsnActivity::NAME,
                 WaitTargetCaughtUpActivity::NAME,
-                DemoteOldPrimaryActivity::NAME,
-                PromoteTargetActivity::NAME,
+                <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+                <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
             ];
             expected.extend(std::iter::repeat_n(
                 DistributeReplicaEpochActivity::NAME,
@@ -1047,7 +1040,7 @@ mod tests {
             let (names, _targets, terminal) = run_script(
                 replica_count,
                 &[ScriptedFailure {
-                    name: PromoteTargetActivity::NAME,
+                    name: <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
                     kind: ScriptedFailureKind::Failed,
                     message: "promotion failed",
                 }],
@@ -1055,12 +1048,12 @@ mod tests {
             )
             .await;
             let mut expected = vec![
-                RevokeWritesActivity::NAME,
+                <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
                 CaptureFrozenLsnActivity::NAME,
                 WaitTargetCaughtUpActivity::NAME,
-                DemoteOldPrimaryActivity::NAME,
-                PromoteTargetActivity::NAME,
-                CompensatePromoteOldPrimaryActivity::NAME,
+                <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+                <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
+                <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
             ];
             expected.extend(std::iter::repeat_n(
                 CompensateDistributeReplicaEpochActivity::NAME,
@@ -1101,7 +1094,7 @@ mod tests {
             assert_eq!(
                 names,
                 vec![
-                    RevokeWritesActivity::NAME,
+                    <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
                     CaptureFrozenLsnActivity::NAME,
                     WaitTargetCaughtUpActivity::NAME,
                     RestorePreviousCurrentConfigurationActivity::NAME,
@@ -1121,12 +1114,17 @@ mod tests {
 
     #[tokio::test]
     async fn direct_switchover_records_one_same_operation_redelivery() {
-        let (names, _targets, terminal) =
-            run_script(3, &[], Some(DemoteOldPrimaryActivity::NAME)).await;
+        let (names, _targets, terminal) = run_script(
+            3,
+            &[],
+            Some(<DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME),
+        )
+        .await;
         assert_eq!(
             names
                 .iter()
-                .filter(|name| name.as_str() == DemoteOldPrimaryActivity::NAME)
+                .filter(|name| name.as_str()
+                    == <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME)
                 .count(),
             2
         );
@@ -1153,7 +1151,9 @@ mod tests {
         .await;
         assert!(names.contains(&InstallTargetCurrentConfigurationActivity::NAME.to_string()));
         assert!(!names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string()));
-        assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+        assert!(!names.contains(
+            &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string()
+        ));
         assert!(matches!(
             terminal,
             DirectSwitchoverTerminalRecord::Stopped { .. }
@@ -1163,9 +1163,9 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_expired_actions_preserve_prior_compensation_boundaries() {
         for activity_name in [
-            RevokeWritesActivity::NAME,
-            DemoteOldPrimaryActivity::NAME,
-            PromoteTargetActivity::NAME,
+            <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+            <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+            <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
         ] {
             let (names, _targets, terminal) = run_script(
                 3,
@@ -1184,11 +1184,11 @@ mod tests {
                     branch,
                     ..
                 } if branch == match activity_name {
-                    RevokeWritesActivity::NAME =>
+                    <RevokeWritesActivity as SwitchoverActivityContract>::NAME =>
                         DirectSwitchoverTerminalBranch::RevokeSafeFailure,
-                    DemoteOldPrimaryActivity::NAME =>
+                    <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME =>
                         DirectSwitchoverTerminalBranch::PreviousConfigurationRestored,
-                    PromoteTargetActivity::NAME =>
+                    <PromoteTargetActivity as SwitchoverActivityContract>::NAME =>
                         DirectSwitchoverTerminalBranch::PostPromotionCompensated,
                     _ => unreachable!(),
                 }
@@ -1198,28 +1198,28 @@ mod tests {
                 "{activity_name}"
             );
             match activity_name {
-                RevokeWritesActivity::NAME => {
+                <RevokeWritesActivity as SwitchoverActivityContract>::NAME => {
                     assert!(
                         !names.contains(
                             &RestorePreviousCurrentConfigurationActivity::NAME.to_string()
                         )
                     );
                     assert!(
-                        !names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string())
+                        !names.contains(&<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string())
                     );
                 }
-                DemoteOldPrimaryActivity::NAME => {
+                <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME => {
                     assert!(
                         names.contains(
                             &RestorePreviousCurrentConfigurationActivity::NAME.to_string()
                         )
                     );
                     assert!(
-                        !names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string())
+                        !names.contains(&<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string())
                     );
                 }
-                PromoteTargetActivity::NAME => {
-                    assert!(names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+                <PromoteTargetActivity as SwitchoverActivityContract>::NAME => {
+                    assert!(names.contains(&<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string()));
                 }
                 _ => unreachable!(),
             }
@@ -1229,9 +1229,9 @@ mod tests {
     #[tokio::test]
     async fn direct_switchover_unavailable_at_action_deadline_stops_without_compensation() {
         for activity_name in [
-            RevokeWritesActivity::NAME,
-            DemoteOldPrimaryActivity::NAME,
-            PromoteTargetActivity::NAME,
+            <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+            <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+            <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
         ] {
             let (names, _targets, terminal) = run_script(
                 3,
@@ -1250,7 +1250,12 @@ mod tests {
             assert!(
                 !names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string())
             );
-            assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+            assert!(
+                !names.contains(
+                    &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME
+                        .to_string()
+                )
+            );
             assert!(!names.contains(&AttestCompensatedTopologyActivity::NAME.to_string()));
         }
     }
@@ -1279,19 +1284,24 @@ mod tests {
             assert!(
                 !names.contains(&RestorePreviousCurrentConfigurationActivity::NAME.to_string())
             );
-            assert!(!names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+            assert!(
+                !names.contains(
+                    &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME
+                        .to_string()
+                )
+            );
         }
 
         let (names, _targets, terminal) = run_script(
             3,
             &[
                 ScriptedFailure {
-                    name: PromoteTargetActivity::NAME,
+                    name: <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
                     kind: ScriptedFailureKind::Failed,
                     message: "promotion failed",
                 },
                 ScriptedFailure {
-                    name: CompensatePromoteOldPrimaryActivity::NAME,
+                    name: <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
                     kind: ScriptedFailureKind::DeadlineExceeded,
                     message: "compensation action reached its exact deadline",
                 },
@@ -1303,7 +1313,9 @@ mod tests {
             terminal,
             DirectSwitchoverTerminalRecord::Stopped { .. }
         ));
-        assert!(names.contains(&CompensatePromoteOldPrimaryActivity::NAME.to_string()));
+        assert!(names.contains(
+            &<CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME.to_string()
+        ));
         assert!(!names.contains(&CompensateDistributeReplicaEpochActivity::NAME.to_string()));
         assert!(!names.contains(&AttestCompensatedTopologyActivity::NAME.to_string()));
     }

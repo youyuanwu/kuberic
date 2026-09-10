@@ -66,6 +66,9 @@ ordinary results may consume an attempt. Codec, registration, nondeterminism,
 storage, and timeout failures do not silently become retries. `ActivityOptions`
 also carries action deadlines and attempt timeouts; all options participate in
 replay identity and supply requeue wakeups to an embedding reconciler.
+`ActivityRunner::with_timeout_runtime` accepts the embedding async runtime's
+timer/cancellation adapter, so elapsed in-flight deadlines become durable
+timeout failures without adding Tokio or another executor to the kernel.
 
 Handlers must expect a crash after changing external state but before result
 persistence. Read-only handlers reread evidence, naturally idempotent handlers

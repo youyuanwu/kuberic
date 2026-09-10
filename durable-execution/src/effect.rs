@@ -545,6 +545,13 @@ pub fn decode_effect_observation<E: DurableEffect>(
 }
 
 impl EffectMetadata {
+    pub const fn new(max_command_bytes: u64, completion_class: CompletionClass) -> Self {
+        Self {
+            max_command_bytes,
+            completion_class,
+        }
+    }
+
     pub const fn of<E: DurableEffect>() -> Self {
         Self {
             max_command_bytes: E::MAX_COMMAND_BYTES,

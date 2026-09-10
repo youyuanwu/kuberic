@@ -6,8 +6,8 @@ use kuberic_core::types::{
     ReplicaInfo, ReplicaInstanceId, ReplicaSetConfig, ReplicaSetQuorumMode, ReplicaStatus, Role,
 };
 use kuberic_durable_execution::{
-    BoundedEffectError, DurableEffect, EffectActivity, EffectErrorKind, EffectOutcome, ExactBytes,
-    PreparedActivityError, decode_activity_result, encode_activity_result,
+    BoundedEffectError, EffectErrorKind, EffectOutcome, ExactBytes, PreparedActivityError,
+    decode_activity_result, encode_activity_result,
 };
 
 use crate::crd::{
@@ -37,14 +37,15 @@ use super::{
         InstallCompensationCurrentConfigurationActivity,
         InstallCompensationCurrentConfigurationInput, InstallTargetCatchUpConfigurationActivity,
         InstallTargetCatchUpConfigurationInput, InstallTargetCurrentConfigurationActivity,
-        InstallTargetCurrentConfigurationInput, LabelEffectFamily, PassiveEffectFamily,
-        PromoteTargetActivity, PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
-        PublishOldPrimarySecondaryLabelInput, PublishTargetPrimaryLabelActivity,
-        PublishTargetPrimaryLabelInput, ReplicaEffectFamily, RestoreOldPrimaryLabelActivity,
-        RestoreOldPrimaryLabelInput, RestorePreviousCurrentConfigurationActivity,
-        RestorePreviousCurrentConfigurationInput, RestoreTargetSecondaryLabelActivity,
-        RestoreTargetSecondaryLabelInput, RevokeWritesActivity, RevokeWritesInput,
-        SwitchoverEffect, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
+        InstallTargetCurrentConfigurationInput, LabelEffectFamily, OrdinarySwitchoverActivity,
+        PassiveEffectFamily, PromoteTargetActivity, PromoteTargetInput,
+        PublishOldPrimarySecondaryLabelActivity, PublishOldPrimarySecondaryLabelInput,
+        PublishTargetPrimaryLabelActivity, PublishTargetPrimaryLabelInput, ReplicaEffectFamily,
+        RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
+        RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
+        RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput,
+        RevokeWritesActivity, RevokeWritesInput, SwitchoverActivityContract,
+        SwitchoverActivityHandlerContract, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
         WaitTargetCaughtUpOutput, WaitTargetWriteQuorumActivity, WaitTargetWriteQuorumInput,
     },
     model::DirectSwitchoverDefinition,
@@ -66,7 +67,7 @@ pub(crate) enum SwitchoverDispatch<'a> {
     ObservationOnly,
 }
 
-pub(crate) trait SwitchoverEffectFamily<E: DurableEffect> {
+pub(crate) trait SwitchoverEffectFamily<E: SwitchoverActivityHandlerContract> {
     fn bind_activity_identity(
         _command: &mut E::Command,
         _activity: &kuberic_durable_execution::LogicalActivityId,
@@ -107,6 +108,13 @@ pub(crate) trait SwitchoverEffectFamily<E: DurableEffect> {
         deadline_unix_seconds: i64,
     ) -> Result<Option<EffectOutcome<E::Output>>, String>;
 
+    fn has_authoritative_pending_evidence(
+        _command: &E::Command,
+        _observations: &OperationObservations,
+    ) -> bool {
+        false
+    }
+
     fn dispatch(command: &E::Command) -> SwitchoverDispatch<'_>;
 }
 
@@ -122,7 +130,10 @@ struct ReplicaRequest<'a> {
 }
 
 trait ReplicaOperation:
-    DurableEffect<Command = Option<ReplicaEffectCommand>, Output = EffectApplied>
+    SwitchoverActivityHandlerContract<
+        Command = Option<ReplicaEffectCommand>,
+        Family = ReplicaEffectFamily,
+    > + SwitchoverActivityContract<Output = EffectApplied>
 {
     fn request<'a>(
         input: &'a Self::Request,
@@ -1107,7 +1118,10 @@ struct LabelRequest<'a> {
 }
 
 trait LabelOperation:
-    DurableEffect<Command = Option<LabelEffectCommand>, Output = EffectApplied>
+    SwitchoverActivityHandlerContract<
+        Command = Option<LabelEffectCommand>,
+        Family = LabelEffectFamily,
+    > + SwitchoverActivityContract<Output = EffectApplied>
 {
     fn request<'a>(
         input: &'a Self::Request,
@@ -1661,15 +1675,19 @@ fn validate_common(
 
 fn encode_effect_outcome<A>(outcome: EffectOutcome<A::Output>) -> Result<ExactBytes, String>
 where
-    A: DurableEffect,
+    A: SwitchoverActivityContract,
 {
-    encode_activity_result::<EffectActivity<A>>(&outcome)
-        .map_err(|error| format!("encode {} result: {error}", <A as DurableEffect>::NAME))
+    encode_activity_result::<OrdinarySwitchoverActivity<A>>(&outcome.into()).map_err(|error| {
+        format!(
+            "encode {} result: {error}",
+            <A as SwitchoverActivityContract>::NAME
+        )
+    })
 }
 
 fn encode_effect_applied<A>(observed_at_unix_seconds: i64) -> Result<ExactBytes, String>
 where
-    A: DurableEffect<Output = EffectApplied>,
+    A: SwitchoverActivityContract<Output = EffectApplied>,
 {
     encode_effect_outcome::<A>(EffectOutcome::Applied(EffectApplied {
         observed_at_unix_seconds,
@@ -1682,7 +1700,7 @@ fn encode_effect_error<A>(
     message: String,
 ) -> Result<ExactBytes, String>
 where
-    A: DurableEffect<Output = EffectApplied>,
+    A: SwitchoverActivityContract<Output = EffectApplied>,
 {
     let error = effect_error::<A>(kind, observed_at_unix_seconds, message)?;
     let outcome = match kind {
@@ -1695,7 +1713,7 @@ where
     encode_effect_outcome::<A>(outcome)
 }
 
-fn effect_error<A: DurableEffect>(
+fn effect_error<A: SwitchoverActivityContract>(
     kind: EffectErrorKind,
     observed_at_unix_seconds: i64,
     message: String,
@@ -1704,21 +1722,28 @@ fn effect_error<A: DurableEffect>(
         kind,
         super::bounded_utf8(&message, super::SWITCHOVER_MAX_ERROR_BYTES),
         observed_at_unix_seconds,
-        A::MAX_ERROR_MESSAGE_BYTES,
+        <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
     )
-    .map_err(|error| format!("bound {} effect error: {error}", A::NAME))
+    .map_err(|error| {
+        format!(
+            "bound {} activity error: {error}",
+            <A as SwitchoverActivityContract>::NAME
+        )
+    })
 }
 
 fn decode_evaluation<A>(
     evaluation: DirectEvaluation,
 ) -> Result<Option<EffectOutcome<A::Output>>, String>
 where
-    A: DurableEffect,
+    A: SwitchoverActivityContract,
 {
     match evaluation {
-        DirectEvaluation::Observe(result) => decode_activity_result::<EffectActivity<A>>(&result)
-            .map(Some)
-            .map_err(|error| format!("decode {} observation: {error}", A::NAME)),
+        DirectEvaluation::Observe(result) => {
+            decode_activity_result::<OrdinarySwitchoverActivity<A>>(&result)
+                .map(|outcome| Some(outcome.into()))
+                .map_err(|error| format!("decode {} observation: {error}", A::NAME))
+        }
         DirectEvaluation::AwaitEvidence
         | DirectEvaluation::DispatchReplica { .. }
         | DirectEvaluation::DispatchLabel => Ok(None),
@@ -1836,6 +1861,27 @@ where
             now,
             deadline_unix_seconds,
         )?)
+    }
+
+    fn has_authoritative_pending_evidence(
+        command: &A::Command,
+        observations: &OperationObservations,
+    ) -> bool {
+        let Some(command) = command else {
+            return false;
+        };
+        let Some(observed) = observations.get(&command.target_id) else {
+            return false;
+        };
+        correlated_action_observation(&observed.status, &command.action_id).is_some_and(
+            |recorded| {
+                recorded.signature == command.action_signature
+                    && matches!(
+                        recorded.state,
+                        DurableActionState::Scheduled | DurableActionState::InProgress
+                    )
+            },
+        )
     }
 
     fn dispatch(command: &A::Command) -> SwitchoverDispatch<'_> {
@@ -1992,7 +2038,7 @@ fn evaluate_capture(
             observed_at_unix_seconds: now,
         }),
     };
-    encode_activity_result::<EffectActivity<CaptureFrozenLsnActivity>>(&outcome)
+    encode_activity_result::<OrdinarySwitchoverActivity<CaptureFrozenLsnActivity>>(&outcome.into())
         .map(DirectEvaluation::Observe)
         .map_err(|error| format!("encode capture-frozen-lsn result: {error}"))
 }
@@ -2035,9 +2081,11 @@ fn evaluate_target_catch_up(
             "target did not reach the frozen LSN before deadline".to_string(),
         )?),
     };
-    encode_activity_result::<EffectActivity<WaitTargetCaughtUpActivity>>(&outcome)
-        .map(DirectEvaluation::Observe)
-        .map_err(|error| format!("encode wait-target-caught-up result: {error}"))
+    encode_activity_result::<OrdinarySwitchoverActivity<WaitTargetCaughtUpActivity>>(
+        &outcome.into(),
+    )
+    .map(DirectEvaluation::Observe)
+    .map_err(|error| format!("encode wait-target-caught-up result: {error}"))
 }
 
 fn evaluate_attestation<A, FAttested>(
@@ -2048,7 +2096,7 @@ fn evaluate_attestation<A, FAttested>(
     attested: FAttested,
 ) -> Result<DirectEvaluation, String>
 where
-    A: DurableEffect,
+    A: SwitchoverActivityContract,
     FAttested: FnOnce(i64, StablePartitionSnapshotStatus) -> A::Output,
 {
     let outcome = match attestation_error(snapshot, observations) {
@@ -2066,13 +2114,18 @@ where
             effect_error::<A>(EffectErrorKind::ConflictingEvidence, now, message)?,
         ),
     };
-    encode_activity_result::<EffectActivity<A>>(&outcome)
+    encode_activity_result::<OrdinarySwitchoverActivity<A>>(&outcome.into())
         .map(DirectEvaluation::Observe)
-        .map_err(|error| format!("encode {} result: {error}", <A as DurableEffect>::NAME))
+        .map_err(|error| {
+            format!(
+                "encode {} result: {error}",
+                <A as SwitchoverActivityContract>::NAME
+            )
+        })
 }
 
 trait PassiveOperation:
-    DurableEffect<Command = ()> + SwitchoverEffect<Family = PassiveEffectFamily>
+    SwitchoverActivityHandlerContract<Command = (), Family = PassiveEffectFamily>
 {
     fn validate_request(
         request: &Self::Request,

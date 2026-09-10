@@ -5519,12 +5519,25 @@ async fn test_framework_native_switchover_uid_fenced_label_exposures_wait_for_ex
         assert_eq!(quarantined.phase, Phase::Switchover);
         assert!(quarantined.conditions.iter().any(|condition| {
             condition.type_ == "FrameworkNativeSwitchover"
-                && condition.reason == "AwaitingActivityObservation"
+                && condition.reason == "LostActivityResultRetryScheduled"
         }));
         assert_eq!(
             *api.uid_label_patch_attempts.lock().unwrap(),
+            label_attempts_before_restart,
+            "lost-result recovery must persist the bounded retry before reinvocation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        reconcile_set(
+            &make_native_switchover_set(&name, 3, Some(quarantined.clone())),
+            &api,
+            &restarted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *api.uid_label_patch_attempts.lock().unwrap(),
             label_attempts_before_restart + 1,
-            "the exposed exact-UID label is safe to invoke at least once after restart"
+            "the persisted retry may reinvoke the exact-UID idempotent label"
         );
         assert_eq!(
             api.operations()

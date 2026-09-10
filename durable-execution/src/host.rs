@@ -87,6 +87,22 @@ pub struct EffectObservation {
 }
 
 impl EffectObservation {
+    /// Construct an authoritative completed observation from a result encoded
+    /// for the activity contract. The host still validates activity identity,
+    /// attempt identity, and result bounds against the persisted record.
+    pub fn completed(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        result: ExactBytes,
+    ) -> Self {
+        Self {
+            activity,
+            attempt_id,
+            result,
+            disposition: EffectObservationDisposition::Completed,
+        }
+    }
+
     pub fn from_outcome<E: crate::DurableEffect>(
         activity: LogicalActivityId,
         attempt_id: AttemptId,
@@ -152,6 +168,7 @@ impl EffectObservation {
 pub struct DispatchPermit {
     activity: LogicalActivityId,
     attempt_id: AttemptId,
+    attempt_ordinal: u32,
     prepared_command: Option<PreparedCommand>,
 }
 
@@ -159,11 +176,13 @@ impl DispatchPermit {
     fn new(
         activity: LogicalActivityId,
         attempt_id: AttemptId,
+        attempt_ordinal: u32,
         prepared_command: Option<PreparedCommand>,
     ) -> Self {
         Self {
             activity,
             attempt_id,
+            attempt_ordinal,
             prepared_command,
         }
     }
@@ -174,6 +193,10 @@ impl DispatchPermit {
 
     pub const fn attempt_id(&self) -> AttemptId {
         self.attempt_id
+    }
+
+    pub const fn attempt_ordinal(&self) -> u32 {
+        self.attempt_ordinal
     }
 
     pub const fn prepared_command(&self) -> Option<&PreparedCommand> {
@@ -1299,6 +1322,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             });
         }
         let attempt_id = self.next_attempt();
+        let attempt_ordinal = record.attempt().ordinal();
         let prepared_command = record.prepared_command().cloned();
         replace_final_record(&mut payload, record.expose_attempt(attempt_id)?);
         Ok(PreparedExposure {
@@ -1307,6 +1331,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             checkpoint: CheckpointEnvelope::encode_with_limits(&payload, self.limits)?,
             activity,
             attempt_id,
+            attempt_ordinal,
             prepared_command,
         })
     }
@@ -1329,6 +1354,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                 permit: DispatchPermit::new(
                     proposal.activity,
                     proposal.attempt_id,
+                    proposal.attempt_ordinal,
                     proposal.prepared_command,
                 ),
                 revision,
@@ -1415,6 +1441,7 @@ struct PreparedExposure {
     checkpoint: CheckpointEnvelope,
     activity: LogicalActivityId,
     attempt_id: AttemptId,
+    attempt_ordinal: u32,
     prepared_command: Option<PreparedCommand>,
 }
 

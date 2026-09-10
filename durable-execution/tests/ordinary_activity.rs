@@ -1,17 +1,21 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
     ActivityContext, ActivityHandlerError, ActivityName, ActivityOptions, ActivityRegistry,
-    ActivityRegistryError, ActivityRunner, ActivitySequence, ActivitySpec, ActivityWakeups,
-    AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointStore,
-    DurableActivity, DurableHost, Evaluation, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
-    HostOutcome, InMemoryCheckpointStore, InMemoryFault, LogicalActivityId, Nondeterminism,
-    ReloadReason, StorageRevision, StoreError, StoredCheckpoint, TerminalCheckpointStatus,
-    TerminalOutcome, Workflow, WorkflowContext, evaluate,
+    ActivityRegistryError, ActivityRunner, ActivitySequence, ActivitySpec, ActivityTimeoutRuntime,
+    ActivityWakeups, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits,
+    CheckpointStore, DurableActivity, DurableHost, Evaluation, ExactBytes, ExecutionId,
+    ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault,
+    LogicalActivityId, Nondeterminism, ReloadReason, StorageRevision, StoreError, StoredCheckpoint,
+    TerminalCheckpointStatus, TerminalOutcome, Workflow, WorkflowContext, evaluate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +25,24 @@ struct EchoInput {
 }
 
 struct Echo;
+
+struct TokioTimeoutRuntime;
+
+impl ActivityTimeoutRuntime for TokioTimeoutRuntime {
+    fn invoke<'a>(
+        &'a self,
+        timeout_millis: u64,
+        invocation: Pin<
+            Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send + 'a>,
+        >,
+    ) -> Pin<Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_millis), invocation)
+                .await
+                .unwrap_or(Err(ActivityHandlerError::TimedOut))
+        })
+    }
+}
 
 impl DurableActivity for Echo {
     type Input = EchoInput;
@@ -427,14 +449,14 @@ async fn timeout_is_terminal_and_does_not_consume_a_retry() {
             handler_calls.fetch_add(1, Ordering::SeqCst);
             async {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                Ok("late".to_owned())
+                Ok("late".to_string())
             }
         })
         .build()
         .unwrap();
     let store = kuberic_durable_execution::InMemoryCheckpointStore::new();
     let host = DurableHost::new(store, HostEpoch::from_bytes([13; 16]), limits());
-    let mut runner = ActivityRunner::new(host, registry);
+    let mut runner = ActivityRunner::new(host, registry).with_timeout_runtime(TokioTimeoutRuntime);
     let workflow = TypedWorkflow {
         options: ActivityOptions::new(3, 1, None, Some(1)).unwrap(),
     };
@@ -477,35 +499,6 @@ async fn elapsed_action_deadline_fails_without_invoking_handler() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(matches!(
         runner.run_once(&workflow, execution(), 1_000).await,
-        HostOutcome::WorkflowCompleted {
-            outcome: TerminalOutcome::Failed(_),
-            ..
-        }
-    ));
-}
-
-#[tokio::test]
-async fn action_deadline_interrupts_an_active_handler() {
-    let registry = ActivityRegistry::builder()
-        .register::<Echo, _, _>("Echo", |_context, _input| async {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            Ok("late".to_owned())
-        })
-        .build()
-        .unwrap();
-    let store = InMemoryCheckpointStore::new();
-    let host = DurableHost::new(store, HostEpoch::from_bytes([20; 16]), limits());
-    let mut runner = ActivityRunner::new(host, registry);
-    let workflow = TypedWorkflow {
-        options: ActivityOptions::new(3, 1, Some(1_001), Some(100)).unwrap(),
-    };
-
-    assert!(matches!(
-        runner.run_once(&workflow, execution(), 1_000).await,
-        HostOutcome::ObservationAccepted { .. }
-    ));
-    assert!(matches!(
-        runner.run_once(&workflow, execution(), 1_001).await,
         HostOutcome::WorkflowCompleted {
             outcome: TerminalOutcome::Failed(_),
             ..

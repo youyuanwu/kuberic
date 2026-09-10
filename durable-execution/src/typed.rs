@@ -140,6 +140,11 @@ pub trait DurableActivity {
     const MAX_RESULT_BYTES: u64;
 
     #[doc(hidden)]
+    fn completion_class() -> Option<crate::CompletionClass> {
+        None
+    }
+
+    #[doc(hidden)]
     fn strict_effect_metadata() -> Option<crate::EffectMetadata> {
         None
     }

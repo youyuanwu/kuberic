@@ -14,7 +14,99 @@ pub struct EffectApplied {
     pub observed_at_unix_seconds: i64,
 }
 
-pub(crate) trait SwitchoverEffect: DurableEffect {
+/// Reconciler-native result of an ordinary switchover activity.
+///
+/// The workflow contract is independent from the optional strict-effect
+/// implementation used behind four activity handlers.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum SwitchoverActivityOutcome<T> {
+    Applied(T),
+    ProvenNoAdmission,
+    DomainFailure(kuberic_durable_execution::BoundedEffectError),
+    DeadlineExceeded(kuberic_durable_execution::BoundedEffectError),
+    UnavailableAtDeadline(kuberic_durable_execution::BoundedEffectError),
+    ConflictingEvidence(kuberic_durable_execution::BoundedEffectError),
+}
+
+impl<T> SwitchoverActivityOutcome<T> {
+    pub fn into_workflow_result(
+        self,
+        max_message_bytes: u64,
+    ) -> Result<T, kuberic_durable_execution::BoundedEffectError> {
+        use kuberic_durable_execution::{BoundedEffectError, EffectErrorKind};
+        match self {
+            Self::Applied(output) => Ok(output),
+            Self::ProvenNoAdmission => Err(BoundedEffectError::new(
+                EffectErrorKind::ProvenNoAdmission,
+                "dispatch was proven not admitted",
+                max_message_bytes,
+            )
+            .expect("fixed activity error fits the switchover error bound")),
+            Self::DomainFailure(error)
+            | Self::DeadlineExceeded(error)
+            | Self::UnavailableAtDeadline(error)
+            | Self::ConflictingEvidence(error) => {
+                error
+                    .validate(max_message_bytes)
+                    .expect("decoded activity result already satisfies its declared bound");
+                Err(error)
+            }
+        }
+    }
+}
+
+impl<T> From<kuberic_durable_execution::EffectOutcome<T>> for SwitchoverActivityOutcome<T> {
+    fn from(outcome: kuberic_durable_execution::EffectOutcome<T>) -> Self {
+        match outcome {
+            kuberic_durable_execution::EffectOutcome::Applied(value) => Self::Applied(value),
+            kuberic_durable_execution::EffectOutcome::ProvenNoAdmission => Self::ProvenNoAdmission,
+            kuberic_durable_execution::EffectOutcome::DomainFailure(error) => {
+                Self::DomainFailure(error)
+            }
+            kuberic_durable_execution::EffectOutcome::DeadlineExceeded(error) => {
+                Self::DeadlineExceeded(error)
+            }
+            kuberic_durable_execution::EffectOutcome::UnavailableAtDeadline(error) => {
+                Self::UnavailableAtDeadline(error)
+            }
+            kuberic_durable_execution::EffectOutcome::ConflictingEvidence(error) => {
+                Self::ConflictingEvidence(error)
+            }
+        }
+    }
+}
+
+impl<T> From<SwitchoverActivityOutcome<T>> for kuberic_durable_execution::EffectOutcome<T> {
+    fn from(outcome: SwitchoverActivityOutcome<T>) -> Self {
+        match outcome {
+            SwitchoverActivityOutcome::Applied(value) => Self::Applied(value),
+            SwitchoverActivityOutcome::ProvenNoAdmission => Self::ProvenNoAdmission,
+            SwitchoverActivityOutcome::DomainFailure(error) => Self::DomainFailure(error),
+            SwitchoverActivityOutcome::DeadlineExceeded(error) => Self::DeadlineExceeded(error),
+            SwitchoverActivityOutcome::UnavailableAtDeadline(error) => {
+                Self::UnavailableAtDeadline(error)
+            }
+            SwitchoverActivityOutcome::ConflictingEvidence(error) => {
+                Self::ConflictingEvidence(error)
+            }
+        }
+    }
+}
+
+pub trait SwitchoverActivityContract {
+    type Request: Serialize + serde::de::DeserializeOwned;
+    type Output: Serialize + serde::de::DeserializeOwned;
+    const NAME: &'static str;
+    const VERSION: u32;
+    const MAX_REQUEST_BYTES: u64;
+    const MAX_RESULT_BYTES: u64;
+    const MAX_ERROR_MESSAGE_BYTES: u64;
+    const COMPLETION_CLASS: CompletionClass;
+}
+
+pub(crate) trait SwitchoverActivityHandlerContract: SwitchoverActivityContract {
+    type Command;
     type Family;
 }
 
@@ -43,21 +135,20 @@ macro_rules! define_replica_activity {
     ($activity:ident, $input:ty, $name:literal, $max_input:literal, $max_result:literal) => {
         pub struct $activity;
 
-        impl DurableEffect for $activity {
+        impl SwitchoverActivityContract for $activity {
             type Request = $input;
-            type Command = Option<ReplicaEffectCommand>;
             type Output = EffectApplied;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
             const MAX_REQUEST_BYTES: u64 = $max_input;
-            const MAX_COMMAND_BYTES: u64 = 8_192;
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
         }
 
-        impl SwitchoverEffect for $activity {
+        impl SwitchoverActivityHandlerContract for $activity {
+            type Command = Option<ReplicaEffectCommand>;
             type Family = ReplicaEffectFamily;
         }
     };
@@ -67,21 +158,20 @@ macro_rules! define_label_activity {
     ($activity:ident, $input:ty, $name:literal, $max_input:literal, $max_result:literal) => {
         pub struct $activity;
 
-        impl DurableEffect for $activity {
+        impl SwitchoverActivityContract for $activity {
             type Request = $input;
-            type Command = Option<LabelEffectCommand>;
             type Output = EffectApplied;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
             const MAX_REQUEST_BYTES: u64 = $max_input;
-            const MAX_COMMAND_BYTES: u64 = 4_096;
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
         }
 
-        impl SwitchoverEffect for $activity {
+        impl SwitchoverActivityHandlerContract for $activity {
+            type Command = Option<LabelEffectCommand>;
             type Family = LabelEffectFamily;
         }
     };
@@ -287,6 +377,31 @@ define_label_activity!(
     4_096,
     768
 );
+
+macro_rules! implement_strict_effect {
+    ($activity:ty) => {
+        impl DurableEffect for $activity {
+            type Request = <Self as SwitchoverActivityContract>::Request;
+            type Command = Option<ReplicaEffectCommand>;
+            type Output = <Self as SwitchoverActivityContract>::Output;
+
+            const NAME: &'static str = <Self as SwitchoverActivityContract>::NAME;
+            const VERSION: u32 = <Self as SwitchoverActivityContract>::VERSION;
+            const MAX_REQUEST_BYTES: u64 = <Self as SwitchoverActivityContract>::MAX_REQUEST_BYTES;
+            const MAX_COMMAND_BYTES: u64 = 8_192;
+            const MAX_RESULT_BYTES: u64 = <Self as SwitchoverActivityContract>::MAX_RESULT_BYTES;
+            const MAX_ERROR_MESSAGE_BYTES: u64 =
+                <Self as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES;
+            const COMPLETION_CLASS: CompletionClass =
+                <Self as SwitchoverActivityContract>::COMPLETION_CLASS;
+        }
+    };
+}
+
+implement_strict_effect!(RevokeWritesActivity);
+implement_strict_effect!(DemoteOldPrimaryActivity);
+implement_strict_effect!(PromoteTargetActivity);
+implement_strict_effect!(CompensatePromoteOldPrimaryActivity);
 define_label_activity!(
     PublishOldPrimarySecondaryLabelActivity,
     PublishOldPrimarySecondaryLabelInput,
@@ -390,21 +505,20 @@ pub struct CaptureFrozenLsnOutput {
 
 pub struct CaptureFrozenLsnActivity;
 
-impl DurableEffect for CaptureFrozenLsnActivity {
+impl SwitchoverActivityContract for CaptureFrozenLsnActivity {
     type Request = CaptureFrozenLsnInput;
-    type Command = ();
     type Output = CaptureFrozenLsnOutput;
 
     const NAME: &'static str = "kuberic.switchover.capture-frozen-lsn";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
     const MAX_REQUEST_BYTES: u64 = 2_048;
-    const MAX_COMMAND_BYTES: u64 = 4;
     const MAX_RESULT_BYTES: u64 = 1_024;
     const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
     const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
 }
 
-impl SwitchoverEffect for CaptureFrozenLsnActivity {
+impl SwitchoverActivityHandlerContract for CaptureFrozenLsnActivity {
+    type Command = ();
     type Family = PassiveEffectFamily;
 }
 
@@ -421,21 +535,20 @@ pub type WaitTargetCaughtUpOutput = EffectApplied;
 
 pub struct WaitTargetCaughtUpActivity;
 
-impl DurableEffect for WaitTargetCaughtUpActivity {
+impl SwitchoverActivityContract for WaitTargetCaughtUpActivity {
     type Request = WaitTargetCaughtUpInput;
-    type Command = ();
     type Output = WaitTargetCaughtUpOutput;
 
     const NAME: &'static str = "kuberic.switchover.wait-target-caught-up";
     const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
     const MAX_REQUEST_BYTES: u64 = 2_048;
-    const MAX_COMMAND_BYTES: u64 = 4;
     const MAX_RESULT_BYTES: u64 = 1_024;
     const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
     const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
 }
 
-impl SwitchoverEffect for WaitTargetCaughtUpActivity {
+impl SwitchoverActivityHandlerContract for WaitTargetCaughtUpActivity {
+    type Command = ();
     type Family = PassiveEffectFamily;
 }
 
@@ -456,21 +569,20 @@ macro_rules! define_attestation_activity {
 
         pub struct $activity;
 
-        impl DurableEffect for $activity {
+        impl SwitchoverActivityContract for $activity {
             type Request = $input;
-            type Command = ();
             type Output = $output;
 
             const NAME: &'static str = $name;
             const VERSION: u32 = DIRECT_ACTIVITY_VERSION;
             const MAX_REQUEST_BYTES: u64 = $max_input;
-            const MAX_COMMAND_BYTES: u64 = 4;
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
         }
 
-        impl SwitchoverEffect for $activity {
+        impl SwitchoverActivityHandlerContract for $activity {
+            type Command = ();
             type Family = PassiveEffectFamily;
         }
     };
@@ -495,7 +607,10 @@ define_attestation_activity!(
 );
 
 pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
-    (RevokeWritesActivity::NAME, RevokeWritesActivity::VERSION),
+    (
+        <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
+        <RevokeWritesActivity as SwitchoverActivityContract>::VERSION,
+    ),
     (
         CaptureFrozenLsnActivity::NAME,
         CaptureFrozenLsnActivity::VERSION,
@@ -505,10 +620,13 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
         WaitTargetCaughtUpActivity::VERSION,
     ),
     (
-        DemoteOldPrimaryActivity::NAME,
-        DemoteOldPrimaryActivity::VERSION,
+        <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+        <DemoteOldPrimaryActivity as SwitchoverActivityContract>::VERSION,
     ),
-    (PromoteTargetActivity::NAME, PromoteTargetActivity::VERSION),
+    (
+        <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
+        <PromoteTargetActivity as SwitchoverActivityContract>::VERSION,
+    ),
     (
         DistributeReplicaEpochActivity::NAME,
         DistributeReplicaEpochActivity::VERSION,
@@ -542,8 +660,8 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
         RestorePreviousCurrentConfigurationActivity::VERSION,
     ),
     (
-        CompensatePromoteOldPrimaryActivity::NAME,
-        CompensatePromoteOldPrimaryActivity::VERSION,
+        <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
+        <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::VERSION,
     ),
     (
         CompensateDistributeReplicaEpochActivity::NAME,
@@ -573,12 +691,12 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
 
 pub(crate) struct OrdinarySwitchoverActivity<E>(std::marker::PhantomData<E>);
 
-pub(crate) struct SwitchoverActivityInput<E: DurableEffect> {
+pub(crate) struct SwitchoverActivityInput<E: SwitchoverActivityContract> {
     request: E::Request,
     action_deadline_unix_seconds: i64,
 }
 
-impl<E: DurableEffect> SwitchoverActivityInput<E> {
+impl<E: SwitchoverActivityContract> SwitchoverActivityInput<E> {
     pub fn new(request: E::Request, action_deadline_unix_seconds: i64) -> Self {
         Self {
             request,
@@ -595,7 +713,7 @@ impl<E: DurableEffect> SwitchoverActivityInput<E> {
     }
 }
 
-impl<E: DurableEffect> Serialize for SwitchoverActivityInput<E> {
+impl<E: SwitchoverActivityContract> Serialize for SwitchoverActivityInput<E> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -604,7 +722,7 @@ impl<E: DurableEffect> Serialize for SwitchoverActivityInput<E> {
     }
 }
 
-impl<'de, E: DurableEffect> Deserialize<'de> for SwitchoverActivityInput<E> {
+impl<'de, E: SwitchoverActivityContract> Deserialize<'de> for SwitchoverActivityInput<E> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -616,21 +734,25 @@ impl<'de, E: DurableEffect> Deserialize<'de> for SwitchoverActivityInput<E> {
     }
 }
 
-impl<E: DurableEffect> DurableActivity for OrdinarySwitchoverActivity<E> {
+impl<E: SwitchoverActivityContract> DurableActivity for OrdinarySwitchoverActivity<E> {
     type Input = SwitchoverActivityInput<E>;
-    type Output = kuberic_durable_execution::EffectOutcome<E::Output>;
+    type Output = SwitchoverActivityOutcome<E::Output>;
 
     const NAME: &'static str = E::NAME;
     const VERSION: u32 = E::VERSION;
     const MAX_INPUT_BYTES: u64 = E::MAX_REQUEST_BYTES;
     const MAX_RESULT_BYTES: u64 = E::MAX_RESULT_BYTES;
 
+    fn completion_class() -> Option<CompletionClass> {
+        Some(E::COMPLETION_CLASS)
+    }
+
     fn strict_effect_metadata() -> Option<kuberic_durable_execution::EffectMetadata> {
         matches!(
             activity_class(E::NAME),
             Some(SwitchoverActivityClass::StrictEffectRequired)
         )
-        .then(kuberic_durable_execution::EffectMetadata::of::<E>)
+        .then(|| kuberic_durable_execution::EffectMetadata::new(8_192, E::COMPLETION_CLASS))
     }
 }
 
@@ -708,19 +830,19 @@ pub const SWITCHOVER_ACTIVITY_CLASSIFICATION: &[(&str, SwitchoverActivityClass)]
         SwitchoverActivityClass::IdentityFencedIdempotent,
     ),
     (
-        RevokeWritesActivity::NAME,
+        <RevokeWritesActivity as SwitchoverActivityContract>::NAME,
         SwitchoverActivityClass::StrictEffectRequired,
     ),
     (
-        DemoteOldPrimaryActivity::NAME,
+        <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
         SwitchoverActivityClass::StrictEffectRequired,
     ),
     (
-        PromoteTargetActivity::NAME,
+        <PromoteTargetActivity as SwitchoverActivityContract>::NAME,
         SwitchoverActivityClass::StrictEffectRequired,
     ),
     (
-        CompensatePromoteOldPrimaryActivity::NAME,
+        <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME,
         SwitchoverActivityClass::StrictEffectRequired,
     ),
 ];
@@ -736,9 +858,9 @@ mod tests {
     use super::*;
     use crate::crd::{StableReplicaRoleStatus, StableReplicaSnapshotStatus};
     use kuberic_durable_execution::{
-        ActivityCallError, BoundedEffectError, EffectActivity, EffectContractError,
-        EffectErrorKind, EffectOutcome, decode_activity_result, decode_effect_request,
-        encode_activity_result, encode_effect_request,
+        ActivityCallError, BoundedEffectError, EffectContractError, EffectErrorKind, EffectOutcome,
+        decode_activity_input, decode_activity_result, encode_activity_input,
+        encode_activity_result,
     };
 
     fn snapshot() -> StablePartitionSnapshotStatus {
@@ -782,50 +904,66 @@ mod tests {
 
     fn assert_exact_input_bound<A, F>(make: F)
     where
-        A: DurableEffect,
+        A: SwitchoverActivityContract,
         F: Fn(usize) -> A::Request,
     {
-        let base = encode_effect_request::<A>(&make(0)).unwrap();
-        let maximum = usize::try_from(A::MAX_REQUEST_BYTES).unwrap();
-        assert!(base.as_slice().len() <= maximum, "{}", A::NAME);
+        let input = |request| SwitchoverActivityInput::<A>::new(request, 0);
+        let base = encode_activity_input::<OrdinarySwitchoverActivity<A>>(&input(make(0))).unwrap();
+        let maximum =
+            usize::try_from(<A as SwitchoverActivityContract>::MAX_REQUEST_BYTES).unwrap();
+        assert!(
+            base.as_slice().len() <= maximum,
+            "{}",
+            <A as SwitchoverActivityContract>::NAME
+        );
         let padding = maximum - base.as_slice().len();
-        let exact = encode_effect_request::<A>(&make(padding)).unwrap();
-        assert_eq!(exact.as_slice().len(), maximum, "{}", A::NAME);
-        assert!(decode_effect_request::<A>(&exact).is_ok(), "{}", A::NAME);
+        let exact =
+            encode_activity_input::<OrdinarySwitchoverActivity<A>>(&input(make(padding))).unwrap();
+        assert_eq!(
+            exact.as_slice().len(),
+            maximum,
+            "{}",
+            <A as SwitchoverActivityContract>::NAME
+        );
+        assert!(
+            decode_activity_input::<OrdinarySwitchoverActivity<A>>(&exact).is_ok(),
+            "{}",
+            <A as SwitchoverActivityContract>::NAME
+        );
         assert!(
             matches!(
-                encode_effect_request::<A>(&make(padding + 1)),
-                Err(EffectContractError::Activity(ActivityCallError::InputTooLarge {
+                encode_activity_input::<OrdinarySwitchoverActivity<A>>(&input(make(padding + 1))),
+                Err(ActivityCallError::InputTooLarge {
                     actual_bytes,
                     max_bytes,
-                })) if actual_bytes == max_bytes + 1 && max_bytes == A::MAX_REQUEST_BYTES
+                }) if actual_bytes == max_bytes + 1
+                    && max_bytes == <A as SwitchoverActivityContract>::MAX_REQUEST_BYTES
             ),
             "{}",
-            A::NAME
+            <A as SwitchoverActivityContract>::NAME
         );
     }
 
     fn assert_replica_result_error_bound<A>()
     where
-        A: DurableEffect<Output = EffectApplied>,
+        A: SwitchoverActivityContract<Output = EffectApplied>,
     {
         for message in ["x".repeat(512), "é".repeat(256)] {
             let error = BoundedEffectError::observed_at(
                 EffectErrorKind::UnavailableAtDeadline,
                 message,
                 1,
-                A::MAX_ERROR_MESSAGE_BYTES,
+                <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
             )
             .unwrap();
-            let encoded =
-                encode_activity_result::<EffectActivity<A>>(
-                    &EffectOutcome::<EffectApplied>::UnavailableAtDeadline(error),
-                )
-                .unwrap();
+            let encoded = encode_activity_result::<OrdinarySwitchoverActivity<A>>(
+                &SwitchoverActivityOutcome::<EffectApplied>::UnavailableAtDeadline(error),
+            )
+            .unwrap();
             assert!(
-                decode_activity_result::<EffectActivity<A>>(&encoded).is_ok(),
+                decode_activity_result::<OrdinarySwitchoverActivity<A>>(&encoded).is_ok(),
                 "{}",
-                A::NAME
+                <A as SwitchoverActivityContract>::NAME
             );
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
@@ -835,20 +973,20 @@ mod tests {
                         EffectErrorKind::UnavailableAtDeadline,
                         message,
                         1,
-                        A::MAX_ERROR_MESSAGE_BYTES,
+                        <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
                     ),
                     Err(EffectContractError::ErrorMessageTooLarge { .. })
                 ),
                 "{}",
-                A::NAME
+                <A as SwitchoverActivityContract>::NAME
             );
         }
         assert!(matches!(
-            decode_activity_result::<EffectActivity<A>>(
+            decode_activity_result::<OrdinarySwitchoverActivity<A>>(
                 &kuberic_durable_execution::ExactBytes::new(vec![
                     b'x';
                     usize::try_from(
-                        A::MAX_RESULT_BYTES
+                        <A as SwitchoverActivityContract>::MAX_RESULT_BYTES
                     )
                     .unwrap()
                         + 1
@@ -860,43 +998,57 @@ mod tests {
 
     fn assert_label_result_error_bound<A>()
     where
-        A: DurableEffect<Output = EffectApplied>,
+        A: SwitchoverActivityContract<Output = EffectApplied>,
     {
         assert_replica_result_error_bound::<A>();
     }
 
     macro_rules! assert_replica_activity_bounds {
         ($activity:ty, $input:expr) => {{
-            let encoded = encode_effect_request::<$activity>(&$input).unwrap();
-            assert!(encoded.as_slice().len() <= <$activity>::MAX_REQUEST_BYTES as usize);
-            assert!(decode_effect_request::<$activity>(&encoded).is_ok());
+            let input = SwitchoverActivityInput::<$activity>::new($input, 0);
+            let encoded =
+                encode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&input).unwrap();
+            assert!(
+                encoded.as_slice().len()
+                    <= <$activity as SwitchoverActivityContract>::MAX_REQUEST_BYTES as usize
+            );
+            assert!(
+                decode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&encoded).is_ok()
+            );
             assert_replica_result_error_bound::<$activity>();
         }};
     }
 
     macro_rules! assert_label_activity_bounds {
         ($activity:ty, $input:expr) => {{
-            let encoded = encode_effect_request::<$activity>(&$input).unwrap();
-            assert!(encoded.as_slice().len() <= <$activity>::MAX_REQUEST_BYTES as usize);
-            assert!(decode_effect_request::<$activity>(&encoded).is_ok());
+            let input = SwitchoverActivityInput::<$activity>::new($input, 0);
+            let encoded =
+                encode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&input).unwrap();
+            assert!(
+                encoded.as_slice().len()
+                    <= <$activity as SwitchoverActivityContract>::MAX_REQUEST_BYTES as usize
+            );
+            assert!(
+                decode_activity_input::<OrdinarySwitchoverActivity<$activity>>(&encoded).is_ok()
+            );
             assert_label_result_error_bound::<$activity>();
         }};
     }
 
-    fn assert_bounded_message_result<A: DurableEffect>() {
+    fn assert_bounded_message_result<A: SwitchoverActivityContract>() {
         for message in ["x".repeat(512), "é".repeat(256)] {
             let error = BoundedEffectError::observed_at(
                 EffectErrorKind::ConflictingEvidence,
                 message,
                 1,
-                A::MAX_ERROR_MESSAGE_BYTES,
+                <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
             )
             .unwrap();
-            let encoded = encode_activity_result::<EffectActivity<A>>(
-                &EffectOutcome::<A::Output>::ConflictingEvidence(error),
+            let encoded = encode_activity_result::<OrdinarySwitchoverActivity<A>>(
+                &SwitchoverActivityOutcome::<A::Output>::ConflictingEvidence(error),
             )
             .unwrap();
-            assert!(decode_activity_result::<EffectActivity<A>>(&encoded).is_ok());
+            assert!(decode_activity_result::<OrdinarySwitchoverActivity<A>>(&encoded).is_ok());
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
             assert!(matches!(
@@ -904,17 +1056,17 @@ mod tests {
                     EffectErrorKind::ConflictingEvidence,
                     message,
                     1,
-                    A::MAX_ERROR_MESSAGE_BYTES,
+                    <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
                 ),
                 Err(EffectContractError::ErrorMessageTooLarge { .. })
             ));
         }
         assert!(matches!(
-            decode_activity_result::<EffectActivity<A>>(
+            decode_activity_result::<OrdinarySwitchoverActivity<A>>(
                 &kuberic_durable_execution::ExactBytes::new(vec![
                     b'x';
                     usize::try_from(
-                        A::MAX_RESULT_BYTES
+                        <A as SwitchoverActivityContract>::MAX_RESULT_BYTES
                     )
                     .unwrap()
                         + 1
@@ -944,9 +1096,8 @@ mod tests {
         macro_rules! assert_bounds {
             ($($activity:ty),+ $(,)?) => {
                 $(
-                    assert!(<$activity>::MAX_REQUEST_BYTES > 0);
-                    assert!(<$activity>::MAX_COMMAND_BYTES > 0);
-                    assert!(<$activity>::MAX_RESULT_BYTES > 0);
+                    assert!(<$activity as SwitchoverActivityContract>::MAX_REQUEST_BYTES > 0);
+                    assert!(<$activity as SwitchoverActivityContract>::MAX_RESULT_BYTES > 0);
                 )+
             };
         }
@@ -973,12 +1124,12 @@ mod tests {
             AttestCompensatedTopologyActivity,
         );
         assert_ne!(
-            RevokeWritesActivity::MAX_REQUEST_BYTES,
-            InstallTargetCurrentConfigurationActivity::MAX_REQUEST_BYTES
+            <RevokeWritesActivity as SwitchoverActivityContract>::MAX_REQUEST_BYTES,
+            <InstallTargetCurrentConfigurationActivity as SwitchoverActivityContract>::MAX_REQUEST_BYTES
         );
         assert_ne!(
-            PublishTargetPrimaryLabelActivity::MAX_RESULT_BYTES,
-            RevokeWritesActivity::MAX_RESULT_BYTES
+            <PublishTargetPrimaryLabelActivity as SwitchoverActivityContract>::MAX_RESULT_BYTES,
+            <RevokeWritesActivity as SwitchoverActivityContract>::MAX_RESULT_BYTES
         );
     }
 
@@ -1232,14 +1383,17 @@ mod tests {
     #[test]
     fn ordinary_contract_preserves_the_typed_name_and_bounds() {
         type Contract = OrdinarySwitchoverActivity<PromoteTargetActivity>;
-        assert_eq!(Contract::NAME, PromoteTargetActivity::NAME);
+        assert_eq!(
+            Contract::NAME,
+            <PromoteTargetActivity as SwitchoverActivityContract>::NAME
+        );
         assert_eq!(
             Contract::MAX_INPUT_BYTES,
-            PromoteTargetActivity::MAX_REQUEST_BYTES
+            <PromoteTargetActivity as SwitchoverActivityContract>::MAX_REQUEST_BYTES
         );
         assert_eq!(
             Contract::MAX_RESULT_BYTES,
-            PromoteTargetActivity::MAX_RESULT_BYTES
+            <PromoteTargetActivity as SwitchoverActivityContract>::MAX_RESULT_BYTES
         );
     }
 }

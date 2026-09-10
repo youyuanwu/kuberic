@@ -67,7 +67,7 @@ pub use kubernetes::{
 };
 pub use registry::{
     ActivityContext, ActivityHandlerError, ActivityRegistry, ActivityRegistryBuilder,
-    ActivityRegistryError, ActivityRunner, ActivityWakeups,
+    ActivityRegistryError, ActivityRunner, ActivityTimeoutRuntime, ActivityWakeups,
 };
 pub use replay::{Evaluation, Nondeterminism, evaluate, evaluate_effects, evaluate_prepared};
 pub use store::{

@@ -92,7 +92,7 @@ impl<'history> WorkflowContext<'history> {
     }
 
     pub async fn activity(&mut self, spec: ActivitySpec) -> ExactBytes {
-        match poll_fn(|_| self.poll_activity(&spec)).await {
+        match poll_fn(|_| self.poll_activity(&spec, None)).await {
             Ok(result) => result,
             Err(failure) => failure
                 .payload()
@@ -122,7 +122,7 @@ impl<'history> WorkflowContext<'history> {
         let result = if let Some(metadata) = A::strict_effect_metadata() {
             poll_fn(|_| self.poll_effect(&spec, metadata)).await
         } else {
-            poll_fn(|_| self.poll_activity(&spec))
+            poll_fn(|_| self.poll_activity(&spec, A::completion_class()))
                 .await
                 .map_err(|failure| match failure {
                     ActivityFailure::Application(error) => {
@@ -146,7 +146,11 @@ impl<'history> WorkflowContext<'history> {
         self.execution_id
     }
 
-    fn poll_activity(&mut self, spec: &ActivitySpec) -> Poll<Result<ExactBytes, ActivityFailure>> {
+    fn poll_activity(
+        &mut self,
+        spec: &ActivitySpec,
+        completion_class: Option<CompletionClass>,
+    ) -> Poll<Result<ExactBytes, ActivityFailure>> {
         if self.decision.is_some() {
             return Poll::Pending;
         }
@@ -172,6 +176,7 @@ impl<'history> WorkflowContext<'history> {
                 sequence,
                 spec: prepared,
                 logical_id: requested_id,
+                completion_class,
             });
             return Poll::Pending;
         };
@@ -182,6 +187,16 @@ impl<'history> WorkflowContext<'history> {
                     sequence,
                     recorded: record.spec().clone(),
                     requested: prepared,
+                },
+            ));
+            return Poll::Pending;
+        }
+        if record.completion_class() != completion_class {
+            self.decision = Some(ContextDecision::Nondeterminism(
+                Nondeterminism::CompletionClassMismatch {
+                    sequence,
+                    recorded: record.completion_class(),
+                    requested: completion_class.unwrap_or(CompletionClass::ExternalEffect),
                 },
             ));
             return Poll::Pending;
@@ -315,6 +330,7 @@ pub(crate) enum ContextDecision {
         sequence: ActivitySequence,
         spec: ActivitySpec,
         logical_id: LogicalActivityId,
+        completion_class: Option<CompletionClass>,
     },
     ScheduleEffect {
         sequence: ActivitySequence,
