@@ -341,24 +341,27 @@ revoke-writes, demote-old-primary, promote-target, and
 compensate-promote-old-primary have an exact prepared command and strict
 effect family.
 
-The host persists the logical request separately from its exact prepared
-command and marks it `DispatchExposed`, returning a private permit only after
-the exact checkpoint CAS is accepted. An authoritative observation can advance
-the same logical record. Replica dispatch freezes exact agent
-generation, control version, runtime epoch, correlated action identity, and
-payload. Routing-label activities freeze the Pod UID.
+The host persists every logical request and marks its attempt
+`DispatchExposed`, returning invocation authority only after the exact
+checkpoint CAS is accepted. Strict activities additionally persist their exact
+prepared command and receive a private one-use permit. An authoritative
+observation can advance the same logical record. Strict replica dispatch
+freezes exact agent generation, control version, runtime epoch, correlated
+action identity, and payload. Ordinary routing-label handlers use the exact
+Pod UID from their typed request.
 
 An exposed effect is observation-only after restart. A matching terminal
 ledger or exact runtime postcondition advances a replica effect; a new agent
 generation may instead prove that the command was never admitted, allowing one
 redelivery of the same action identity. A second proof stops. Precondition,
 unavailable, scheduled, in-progress, mixed, or otherwise unknown evidence
-remains quarantined even after the activity deadline. Ordinary ReplicaAgent and UID-fenced label activities resolve through their
-registered handlers. Recovery first invokes the same handler without dispatch
-authority; absent authoritative evidence produces a bounded persisted retry
-before the same logical action or exact-UID patch is reinvoked. Missing strict
-command state alone is never treated as isolation. ConfigMap conflicts and
-unknown writes force authoritative reload before another permit.
+remains quarantined even after the activity deadline. Ordinary ReplicaAgent
+and UID-fenced label activities resolve through their registered handlers.
+Recovery first invokes the same handler without dispatch authority; absent
+authoritative evidence produces a bounded persisted retry before the same
+logical action or exact-UID patch is reinvoked. Missing strict command state
+alone is never treated as isolation. ConfigMap conflicts and unknown writes
+force authoritative reload before another permit.
 
 The terminal checkpoint is accepted and then reloaded before topology/status
 publication. Terminal reload is status-only and does not poll replicas or
