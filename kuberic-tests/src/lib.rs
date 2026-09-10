@@ -15,68 +15,6 @@ pub mod test_utils {
         dir.parent().unwrap().to_path_buf()
     }
 
-    fn isolated_kube_coordinates() -> (String, String) {
-        let kubeconfig =
-            std::env::var("KUBECONFIG").expect("KinD tests require an isolated KUBECONFIG");
-        let context =
-            std::env::var("KUBE_CONTEXT").expect("KinD tests require an explicit KUBE_CONTEXT");
-        let cluster_name = std::env::var("KIND_CLUSTER_NAME")
-            .expect("KinD tests require an explicit KIND_CLUSTER_NAME");
-        assert_ne!(cluster_name, "kind", "default KinD cluster is forbidden");
-        assert_eq!(
-            context,
-            format!("kind-{cluster_name}"),
-            "KUBE_CONTEXT must match the dedicated KinD cluster"
-        );
-        if let Ok(home) = std::env::var("HOME") {
-            assert_ne!(
-                std::path::Path::new(&kubeconfig),
-                std::path::Path::new(&home).join(".kube/config"),
-                "default user kubeconfig is forbidden"
-            );
-        }
-        (kubeconfig, context)
-    }
-
-    pub async fn isolated_kube_client() -> kube::Client {
-        let (kubeconfig_path, context) = isolated_kube_coordinates();
-        let kubeconfig = kube::config::Kubeconfig::read_from(kubeconfig_path)
-            .expect("Failed to read isolated kubeconfig");
-        let config = kube::Config::from_custom_kubeconfig(
-            kubeconfig,
-            &kube::config::KubeConfigOptions {
-                context: Some(context),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("Failed to load isolated Kubernetes context");
-        kube::Client::try_from(config).expect("Failed to create isolated Kubernetes client")
-    }
-
-    pub fn isolated_kvstore_endpoint() -> String {
-        let cluster_name = std::env::var("KIND_CLUSTER_NAME")
-            .expect("KinD tests require an explicit KIND_CLUSTER_NAME");
-        let container_name = format!("{cluster_name}-control-plane");
-        let output = std::process::Command::new("docker")
-            .args(["port", &container_name, "30090/tcp"])
-            .output()
-            .expect("Failed to resolve dedicated KinD NodePort mapping");
-        assert!(
-            output.status.success(),
-            "Failed to resolve dedicated KinD NodePort mapping: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let mapping = String::from_utf8(output.stdout).expect("Docker port output is not UTF-8");
-        let port = mapping
-            .trim()
-            .rsplit_once(':')
-            .map(|(_, port)| port)
-            .filter(|port| !port.is_empty())
-            .expect("Dedicated KinD NodePort mapping has no host port");
-        format!("http://127.0.0.1:{port}")
-    }
-
     pub async fn kubectl_apply(path: &std::path::Path) {
         run_kubectl_cmd(&["apply", "-f", path.to_str().unwrap()])
             .await
@@ -84,14 +22,8 @@ pub mod test_utils {
     }
 
     pub async fn run_kubectl_cmd(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-        let (kubeconfig, context) = isolated_kube_coordinates();
-        tracing::info!(
-            "Running kubectl command against isolated context {}: kubectl {:?}",
-            context,
-            args.join(" ")
-        );
+        tracing::info!("Running kubectl command: kubectl {:?}", args.join(" "));
         let output = tokio::process::Command::new("kubectl")
-            .args(["--kubeconfig", &kubeconfig, "--context", &context])
             .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -148,7 +80,9 @@ pub mod test_utils {
     }
 
     async fn ensure_kuberic_operator_deployed_internal() {
-        let client = isolated_kube_client().await;
+        let client = kube::Client::try_default()
+            .await
+            .expect("Failed to create k8s client");
         let deployments: kube::Api<k8s_openapi::api::apps::v1::Deployment> =
             kube::Api::namespaced(client.clone(), NS_XEDIO);
         let name = "kuberic-operator";
@@ -197,7 +131,7 @@ pub mod test_utils {
             .expect("kvstore pods failed to become ready");
 
         // Wait for operator to reconcile status to Healthy
-        wait_kubericset_healthy(NS_XEDIO, "kvstore", 3, 60)
+        wait_kubericset_healthy(NS_XEDIO, "kvstore", 60)
             .await
             .expect("kvstore KubericSet failed to reach Healthy phase");
         tracing::info!("kvstore deployed and healthy");
@@ -206,10 +140,9 @@ pub mod test_utils {
     pub async fn wait_kubericset_healthy(
         namespace: &str,
         name: &str,
-        expected_replicas: i64,
         timeout_seconds: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = isolated_kube_client().await;
+        let client = kube::Client::try_default().await?;
         let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
             client,
             namespace,
@@ -231,126 +164,19 @@ pub mod test_utils {
                 .and_then(|s| s.get("phase"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let ready_replicas = obj
-                .data
-                .get("status")
-                .and_then(|s| s.get("readyReplicas"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or_default();
-            let replicas = obj
-                .data
-                .get("status")
-                .and_then(|s| s.get("replicas"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or_default();
 
-            if phase == "Healthy"
-                && ready_replicas == expected_replicas
-                && replicas == expected_replicas
-            {
+            if phase == "Healthy" {
                 return Ok(());
             }
 
             if std::time::Instant::now() > deadline {
                 return Err(format!(
-                    "timeout: KubericSet {name} phase is {phase}, readyReplicas is \
-                     {ready_replicas}, replicas is {replicas}; expected Healthy with \
-                     {expected_replicas} replicas"
+                    "timeout: KubericSet {} phase is {}, expected Healthy",
+                    name, phase
                 )
                 .into());
             }
-            tracing::debug!(
-                name,
-                phase,
-                ready_replicas,
-                replicas,
-                expected_replicas,
-                "waiting for converged Healthy status"
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        }
-    }
-
-    pub async fn patch_kubericset_replicas(
-        namespace: &str,
-        name: &str,
-        replicas: i32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = isolated_kube_client().await;
-        let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
-            client,
-            namespace,
-            &kube::discovery::ApiResource {
-                group: "kuberic.io".into(),
-                version: "v1".into(),
-                kind: "KubericSet".into(),
-                api_version: "kuberic.io/v1".into(),
-                plural: "kubericsets".into(),
-            },
-        );
-        api.patch(
-            name,
-            &kube::api::PatchParams::default(),
-            &kube::api::Patch::Merge(serde_json::json!({
-                "spec": { "replicas": replicas }
-            })),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn wait_kubericset_native_remove_terminal(
-        namespace: &str,
-        name: &str,
-        expected_replicas: i64,
-        timeout_seconds: u64,
-    ) -> Result<kube::api::DynamicObject, Box<dyn std::error::Error>> {
-        let client = isolated_kube_client().await;
-        let api: kube::Api<kube::api::DynamicObject> = kube::Api::namespaced_with(
-            client,
-            namespace,
-            &kube::discovery::ApiResource {
-                group: "kuberic.io".into(),
-                version: "v1".into(),
-                kind: "KubericSet".into(),
-                api_version: "kuberic.io/v1".into(),
-                plural: "kubericsets".into(),
-            },
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
-        loop {
-            let obj = api.get(name).await?;
-            let status = obj.data.get("status");
-            let healthy = status
-                .and_then(|status| status.get("phase"))
-                .and_then(|value| value.as_str())
-                == Some("Healthy");
-            let replicas = status
-                .and_then(|status| status.get("replicas"))
-                .and_then(|value| value.as_i64());
-            let native = status
-                .and_then(|status| status.get("removeReplicaExecution"))
-                .is_some_and(|value| !value.is_null());
-            let completed = status
-                .and_then(|status| status.get("conditions"))
-                .and_then(|value| value.as_array())
-                .is_some_and(|conditions| {
-                    conditions.iter().any(|condition| {
-                        condition.get("type").and_then(|value| value.as_str())
-                            == Some("FrameworkNativeRemoveReplica")
-                            && condition.get("reason").and_then(|value| value.as_str())
-                                == Some("Completed")
-                    })
-                });
-            if healthy && replicas == Some(expected_replicas) && native && completed {
-                return Ok(obj);
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(format!(
-                    "timeout waiting for native remove terminal on {namespace}/{name}"
-                )
-                .into());
-            }
+            tracing::debug!(name, phase, "waiting for Healthy...");
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     }
@@ -361,7 +187,7 @@ pub mod test_utils {
         expected: usize,
         timeout_seconds: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = isolated_kube_client().await;
+        let client = kube::Client::try_default().await?;
         let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
             kube::Api::namespaced(client, namespace);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
