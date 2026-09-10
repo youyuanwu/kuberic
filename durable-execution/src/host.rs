@@ -85,18 +85,29 @@ pub struct EffectObservation {
 }
 
 impl EffectObservation {
-    pub fn new(
+    pub fn from_outcome<E: crate::DurableEffect>(
         activity: LogicalActivityId,
         attempt_id: AttemptId,
-        result: ExactBytes,
-        disposition: EffectObservationDisposition,
-    ) -> Self {
-        Self {
+        outcome: &crate::EffectOutcome<E::Output>,
+    ) -> Result<Self, crate::ActivityCallError> {
+        let disposition = match outcome {
+            crate::EffectOutcome::ProvenNoAdmission => {
+                EffectObservationDisposition::ProvenNoAdmission
+            }
+            crate::EffectOutcome::Applied(_)
+            | crate::EffectOutcome::DomainFailure(_)
+            | crate::EffectOutcome::DeadlineExceeded(_)
+            | crate::EffectOutcome::UnavailableAtDeadline(_)
+            | crate::EffectOutcome::ConflictingEvidence(_) => {
+                EffectObservationDisposition::Completed
+            }
+        };
+        Ok(Self {
             activity,
             attempt_id,
-            result,
+            result: crate::encode_activity_result::<crate::EffectActivity<E>>(outcome)?,
             disposition,
-        }
+        })
     }
 }
 
@@ -197,6 +208,8 @@ define_host_outcomes! {
     Quarantined {
         activity: LogicalActivityId,
         attempt_id: AttemptId,
+        prepared_command: Option<PreparedCommand>,
+        completion_class: Option<crate::CompletionClass>,
     },
     Nondeterminism(Nondeterminism),
     CheckpointRejected(CheckpointError),
@@ -280,6 +293,8 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::Quarantined {
                     activity: record.logical_id(execution_id),
                     attempt_id: *attempt_id,
+                    prepared_command: record.prepared_command().cloned(),
+                    completion_class: record.completion_class(),
                 };
             }
         }
@@ -322,6 +337,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             } => HostOutcome::Quarantined {
                 activity,
                 attempt_id,
+                prepared_command: None,
+                completion_class: None,
             },
             Evaluation::Pending {
                 state: ActivityState::Completed { .. },
@@ -448,6 +465,8 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::Quarantined {
                     activity: record.logical_id(execution_id),
                     attempt_id: *attempt_id,
+                    prepared_command: record.prepared_command().cloned(),
+                    completion_class: record.completion_class(),
                 };
             }
         }
@@ -495,6 +514,35 @@ impl<S: CheckpointStore> DurableHost<S> {
                 activity,
                 state: ActivityState::DispatchExposed { attempt_id },
             } => HostOutcome::Quarantined {
+                prepared_command: loaded
+                    .as_ref()
+                    .and_then(|stored| {
+                        stored
+                            .checkpoint()
+                            .decode_and_validate(&execution, self.limits)
+                            .ok()
+                    })
+                    .and_then(|payload| {
+                        payload
+                            .active_activities()
+                            .and_then(|activities| activities.last())
+                            .and_then(ActivityRecord::prepared_command)
+                            .cloned()
+                    }),
+                completion_class: loaded
+                    .as_ref()
+                    .and_then(|stored| {
+                        stored
+                            .checkpoint()
+                            .decode_and_validate(&execution, self.limits)
+                            .ok()
+                    })
+                    .and_then(|payload| {
+                        payload
+                            .active_activities()
+                            .and_then(|activities| activities.last())
+                            .and_then(ActivityRecord::completion_class)
+                    }),
                 activity,
                 attempt_id,
             },
@@ -638,6 +686,31 @@ impl<S: CheckpointStore> DurableHost<S> {
         execution: &ExecutionSpec,
         observation: EffectObservation,
     ) -> HostOutcome {
+        self.observe_effect_with_redelivery(execution, observation, true)
+            .await
+    }
+
+    /// Resolve a quarantined attempt from observation only. Even proven
+    /// non-admission completes the logical call because dispatch uncertainty
+    /// permanently removes redelivery authority.
+    pub async fn observe_quarantined_effect(
+        &self,
+        execution: &ExecutionSpec,
+        observation: EffectObservation,
+    ) -> HostOutcome {
+        self.observe_effect_with_redelivery(execution, observation, false)
+            .await
+    }
+
+    async fn observe_effect_with_redelivery(
+        &self,
+        execution: &ExecutionSpec,
+        mut observation: EffectObservation,
+        allow_redelivery: bool,
+    ) -> HostOutcome {
+        if !allow_redelivery {
+            observation.disposition = EffectObservationDisposition::Completed;
+        }
         let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
             Ok(loaded) => loaded,
@@ -848,6 +921,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             } => HostOutcome::Quarantined {
                 activity,
                 attempt_id,
+                prepared_command: None,
+                completion_class: None,
             },
             Evaluation::Pending { .. } => {
                 HostOutcome::Nondeterminism(Nondeterminism::UnsupportedSuspension)
@@ -1089,9 +1164,9 @@ mod tests {
     use super::*;
     use crate::{
         ActivityName, ActivitySequence, ActivitySpec, CheckpointLimits, CompletionClass,
-        DurableEffect, EffectActivity, EffectMetadata, EffectOutcome, InMemoryCheckpointStore,
-        InMemoryFault, PreparedActivityError, PreparedActivityResolver, PreparedCommand,
-        PreparedEffectResolver, StoreErrorKind, WorkflowContext, encode_activity_result,
+        DurableEffect, EffectMetadata, EffectOutcome, InMemoryCheckpointStore, InMemoryFault,
+        PreparedActivityError, PreparedActivityResolver, PreparedCommand, PreparedEffectResolver,
+        StoreErrorKind, WorkflowContext,
     };
     use serde::{Deserialize, Serialize};
 
@@ -1300,19 +1375,15 @@ mod tests {
             assert!(first.prepared_command().is_some());
             let logical = first.activity().clone();
             let first_attempt = first.attempt_id();
-            let proven = encode_activity_result::<EffectActivity<OneEffect>>(
-                &EffectOutcome::<String>::ProvenNoAdmission,
-            )
-            .unwrap();
             assert!(matches!(
                 host.observe_effect(
                     &execution,
-                    EffectObservation::new(
+                    EffectObservation::from_outcome::<OneEffect>(
                         logical.clone(),
                         first_attempt,
-                        proven.clone(),
-                        EffectObservationDisposition::ProvenNoAdmission,
-                    ),
+                        &EffectOutcome::<String>::ProvenNoAdmission,
+                    )
+                    .unwrap(),
                 )
                 .await,
                 HostOutcome::ObservationAccepted { .. }
@@ -1330,12 +1401,12 @@ mod tests {
             assert!(matches!(
                 host.observe_effect(
                     &execution,
-                    EffectObservation::new(
+                    EffectObservation::from_outcome::<OneEffect>(
                         logical,
                         second.attempt_id(),
-                        proven,
-                        EffectObservationDisposition::ProvenNoAdmission,
-                    ),
+                        &EffectOutcome::<String>::ProvenNoAdmission,
+                    )
+                    .unwrap(),
                 )
                 .await,
                 HostOutcome::ObservationAccepted { .. }
@@ -1389,12 +1460,21 @@ mod tests {
                     .await,
                 HostOutcome::DispatchPermitted { .. }
             ));
-            assert!(matches!(
-                host.turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
-                    .await,
-                HostOutcome::Quarantined { .. }
-            ));
-
+            let HostOutcome::Quarantined {
+                activity: quarantined_activity,
+                attempt_id: quarantined_attempt,
+                prepared_command: Some(quarantined_command),
+                ..
+            } = host
+                .turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
+                .await
+            else {
+                panic!("typed effect did not retain its prepared command in quarantine");
+            };
+            assert_eq!(
+                quarantined_command,
+                crate::encode_effect_command::<OneEffect>(&UnitCommand { exact: 1 }).unwrap()
+            );
             let mismatching = UnitEffectResolver {
                 mismatch_recorded: true,
             };
@@ -1408,6 +1488,25 @@ mod tests {
                     &mismatching,
                 ),
                 Evaluation::Nondeterminism(Nondeterminism::PreparedCommandMismatch { .. })
+            ));
+
+            assert!(matches!(
+                host.observe_quarantined_effect(
+                    &execution,
+                    EffectObservation::from_outcome::<OneEffect>(
+                        quarantined_activity,
+                        quarantined_attempt,
+                        &EffectOutcome::<String>::ProvenNoAdmission,
+                    )
+                    .unwrap(),
+                )
+                .await,
+                HostOutcome::ObservationAccepted { .. }
+            ));
+            assert!(matches!(
+                host.turn_and_expose_effects(&OneEffectWorkflow, execution.clone(), &resolver)
+                    .await,
+                HostOutcome::WorkflowCompleted { .. }
             ));
         });
     }

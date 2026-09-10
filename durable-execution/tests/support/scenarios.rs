@@ -750,7 +750,8 @@ async fn lost_reply_then_observation(id: ScenarioId) -> ScenarioEvidence {
                     quarantined,
                     HostOutcome::Quarantined {
                         activity,
-                        attempt_id
+                        attempt_id,
+                        ..
                     } if activity == logical && attempt_id == expected_attempt
                 ),
             ),
@@ -1473,7 +1474,8 @@ async fn quarantine_resolution(id: ScenarioId) -> ScenarioEvidence {
                     quarantined,
                     HostOutcome::Quarantined {
                         activity,
-                        attempt_id
+                        attempt_id,
+                        ..
                     } if activity == logical && attempt_id == permit.attempt_id()
                 ),
             ),

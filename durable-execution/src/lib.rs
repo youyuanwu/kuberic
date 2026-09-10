@@ -32,11 +32,14 @@ pub use checkpoint::{
     CheckpointLimits, CheckpointPayload, CheckpointState, ExecutionContract,
 };
 pub use effect::{
-    BoundedEffectError, CompletionClass, CompletionMetadata, DurableEffect, EffectActivity,
-    EffectAttempt, EffectAttemptState, EffectCallError, EffectContractError, EffectErrorKind,
-    EffectMetadata, EffectObservationDisposition, EffectOutcome, PrepareEffect, PreparedCommand,
-    PreparedEffectResolver, decode_effect_command, decode_effect_request, encode_effect_command,
-    encode_effect_request, validate_effect_attempts,
+    BoundedEffectError, CompletionClass, CompletionMetadata, DispatchEffect, DurableEffect,
+    DurableEffectSet, EffectActivity, EffectAttempt, EffectAttemptState, EffectCallError,
+    EffectContractError, EffectErrorKind, EffectHostStep, EffectMetadata,
+    EffectObservationDisposition, EffectOutcome, EffectQuarantineContext, EffectRegistration,
+    EffectRoutingError, HostedEffectSet, ObserveEffect, ObserveQuarantinedEffect, PrepareEffect,
+    PreparedCommand, PreparedEffectResolver, RegisteredEffectResolver, decode_effect_command,
+    decode_effect_request, encode_effect_command, encode_effect_request, validate_effect_attempts,
+    validate_effect_registrations,
 };
 pub use host::{
     ActivityObservation, DispatchPermit, DurableHost, EffectObservation, HOST_OUTCOME_VARIANTS,
