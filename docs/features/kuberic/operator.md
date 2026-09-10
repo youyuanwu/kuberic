@@ -331,7 +331,10 @@ observations, validates immutable admission, and provides operation-specific
 domain services, but it does not route activity names or select protocol
 progression. The shared runner owns checkpoint load/reload, bounded-fuel
 progression, ordinary retry/error handling, terminal short-circuit, and
-persistence outcome classification.
+persistence outcome classification. Its ordinary path delegates invocation,
+action-deadline and attempt-timeout selection, retry exhaustion, waits, and
+failure classification to the same `ActivityInvocationRuntime` used by the
+standalone durable activity runner.
 
 Each named activity has its own logical request and typed output shape. Fixed
 old-primary, target-primary, distribution, configuration, and label contracts

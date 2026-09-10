@@ -92,6 +92,12 @@ impl DurablePermitGuard {
     pub fn attempt_ordinal(&self) -> Option<u32> {
         self.permit.as_ref().map(DispatchPermit::attempt_ordinal)
     }
+
+    pub fn retry_not_before_unix_millis(&self) -> Option<i64> {
+        self.permit
+            .as_ref()
+            .and_then(DispatchPermit::retry_not_before_unix_millis)
+    }
 }
 
 #[derive(Clone)]

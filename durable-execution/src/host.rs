@@ -200,6 +200,7 @@ pub struct DispatchPermit {
     activity: LogicalActivityId,
     attempt_id: AttemptId,
     attempt_ordinal: u32,
+    retry_not_before_unix_millis: Option<i64>,
     prepared_command: Option<PreparedCommand>,
 }
 
@@ -208,12 +209,14 @@ impl DispatchPermit {
         activity: LogicalActivityId,
         attempt_id: AttemptId,
         attempt_ordinal: u32,
+        retry_not_before_unix_millis: Option<i64>,
         prepared_command: Option<PreparedCommand>,
     ) -> Self {
         Self {
             activity,
             attempt_id,
             attempt_ordinal,
+            retry_not_before_unix_millis,
             prepared_command,
         }
     }
@@ -228,6 +231,10 @@ impl DispatchPermit {
 
     pub const fn attempt_ordinal(&self) -> u32 {
         self.attempt_ordinal
+    }
+
+    pub const fn retry_not_before_unix_millis(&self) -> Option<i64> {
+        self.retry_not_before_unix_millis
     }
 
     pub const fn prepared_command(&self) -> Option<&PreparedCommand> {
@@ -282,6 +289,8 @@ define_host_outcomes! {
     Quarantined {
         activity: LogicalActivityId,
         attempt_id: AttemptId,
+        attempt_ordinal: u32,
+        retry_not_before_unix_millis: Option<i64>,
         prepared_command: Option<PreparedCommand>,
         completion_class: Option<crate::CompletionClass>,
     },
@@ -367,6 +376,8 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::Quarantined {
                     activity: record.logical_id(execution_id),
                     attempt_id: *attempt_id,
+                    attempt_ordinal: record.attempt().ordinal(),
+                    retry_not_before_unix_millis: record.attempt().retry_not_before_unix_millis(),
                     prepared_command: record.prepared_command().cloned(),
                     completion_class: record.completion_class(),
                 };
@@ -408,12 +419,36 @@ impl<S: CheckpointStore> DurableHost<S> {
             Evaluation::Pending {
                 activity,
                 state: ActivityState::DispatchExposed { attempt_id },
-            } => HostOutcome::Quarantined {
-                activity,
-                attempt_id,
-                prepared_command: None,
-                completion_class: None,
-            },
+            } => {
+                let (attempt_ordinal, retry_not_before_unix_millis) = loaded
+                    .as_ref()
+                    .and_then(|stored| {
+                        stored
+                            .checkpoint()
+                            .decode_and_validate(&execution, self.limits)
+                            .ok()
+                    })
+                    .and_then(|payload| {
+                        payload
+                            .active_activities()
+                            .and_then(|activities| activities.last())
+                            .map(|record| {
+                                (
+                                    record.attempt().ordinal(),
+                                    record.attempt().retry_not_before_unix_millis(),
+                                )
+                            })
+                    })
+                    .expect("pending exposed evaluation requires persisted attempt metadata");
+                HostOutcome::Quarantined {
+                    activity,
+                    attempt_id,
+                    attempt_ordinal,
+                    retry_not_before_unix_millis,
+                    prepared_command: None,
+                    completion_class: None,
+                }
+            }
             Evaluation::Pending {
                 state: ActivityState::Completed { .. },
                 ..
@@ -568,6 +603,8 @@ impl<S: CheckpointStore> DurableHost<S> {
                 return HostOutcome::Quarantined {
                     activity: record.logical_id(execution_id),
                     attempt_id: *attempt_id,
+                    attempt_ordinal: record.attempt().ordinal(),
+                    retry_not_before_unix_millis: record.attempt().retry_not_before_unix_millis(),
                     prepared_command: record.prepared_command().cloned(),
                     completion_class: record.completion_class(),
                 };
@@ -646,8 +683,13 @@ impl<S: CheckpointStore> DurableHost<S> {
             Evaluation::Pending {
                 activity,
                 state: ActivityState::DispatchExposed { attempt_id },
-            } => HostOutcome::Quarantined {
-                prepared_command: loaded
+            } => {
+                let (
+                    attempt_ordinal,
+                    retry_not_before_unix_millis,
+                    prepared_command,
+                    completion_class,
+                ) = loaded
                     .as_ref()
                     .and_then(|stored| {
                         stored
@@ -659,26 +701,25 @@ impl<S: CheckpointStore> DurableHost<S> {
                         payload
                             .active_activities()
                             .and_then(|activities| activities.last())
-                            .and_then(ActivityRecord::prepared_command)
-                            .cloned()
-                    }),
-                completion_class: loaded
-                    .as_ref()
-                    .and_then(|stored| {
-                        stored
-                            .checkpoint()
-                            .decode_and_validate(&execution, self.limits)
-                            .ok()
+                            .map(|record| {
+                                (
+                                    record.attempt().ordinal(),
+                                    record.attempt().retry_not_before_unix_millis(),
+                                    record.prepared_command().cloned(),
+                                    record.completion_class(),
+                                )
+                            })
                     })
-                    .and_then(|payload| {
-                        payload
-                            .active_activities()
-                            .and_then(|activities| activities.last())
-                            .and_then(ActivityRecord::completion_class)
-                    }),
-                activity,
-                attempt_id,
-            },
+                    .expect("pending exposed evaluation requires persisted activity metadata");
+                HostOutcome::Quarantined {
+                    activity,
+                    attempt_id,
+                    attempt_ordinal,
+                    retry_not_before_unix_millis,
+                    prepared_command,
+                    completion_class,
+                }
+            }
             Evaluation::Pending {
                 state: ActivityState::Completed { .. },
                 ..
@@ -1243,6 +1284,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             );
         }
 
+        let attempt_ordinal = record.attempt().ordinal();
+        let retry_not_before_unix_millis = record.attempt().retry_not_before_unix_millis();
         replace_final_record(
             &mut payload,
             record.with_state(ActivityState::Completed {
@@ -1293,6 +1336,8 @@ impl<S: CheckpointStore> DurableHost<S> {
             } => HostOutcome::Quarantined {
                 activity,
                 attempt_id,
+                attempt_ordinal,
+                retry_not_before_unix_millis,
                 prepared_command: None,
                 completion_class: None,
             },
@@ -1363,6 +1408,7 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
         let attempt_id = self.next_attempt();
         let attempt_ordinal = record.attempt().ordinal();
+        let retry_not_before_unix_millis = record.attempt().retry_not_before_unix_millis();
         let prepared_command = record.prepared_command().cloned();
         replace_final_record(&mut payload, record.expose_attempt(attempt_id)?);
         Ok(PreparedExposure {
@@ -1372,6 +1418,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             activity,
             attempt_id,
             attempt_ordinal,
+            retry_not_before_unix_millis,
             prepared_command,
         })
     }
@@ -1395,6 +1442,7 @@ impl<S: CheckpointStore> DurableHost<S> {
                     proposal.activity,
                     proposal.attempt_id,
                     proposal.attempt_ordinal,
+                    proposal.retry_not_before_unix_millis,
                     proposal.prepared_command,
                 ),
                 revision,
@@ -1482,6 +1530,7 @@ struct PreparedExposure {
     activity: LogicalActivityId,
     attempt_id: AttemptId,
     attempt_ordinal: u32,
+    retry_not_before_unix_millis: Option<i64>,
     prepared_command: Option<PreparedCommand>,
 }
 

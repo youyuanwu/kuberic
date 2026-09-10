@@ -60,6 +60,9 @@ bounds, and typed input before invoking an owned handler.
 letting a handler borrow mutable embedding state, such as one reconciliation
 snapshot, for the duration of an invocation. Identity, codec validation, and
 handler selection remain framework-owned.
+`ActivityInvocationRuntime` applies the same action-deadline, attempt-timeout,
+retry-exhaustion, wait, result, and failure classification for both standalone
+`ActivityRunner` users and reconciler-hosted scoped handlers.
 
 Ordinary activities have practical at-least-once semantics. One logical record
 contains bounded physical attempts; the default policy permits three attempts

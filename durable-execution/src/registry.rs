@@ -119,12 +119,13 @@ impl ActivityContext {
         logical_id: LogicalActivityId,
         attempt_id: AttemptId,
         attempt_ordinal: u32,
+        retry_not_before_unix_millis: Option<i64>,
     ) -> Self {
         Self {
             logical_id,
             attempt_id,
             attempt_ordinal,
-            retry_not_before_unix_millis: None,
+            retry_not_before_unix_millis,
             dispatch_authorized: false,
         }
     }
@@ -175,6 +176,108 @@ pub enum ActivityHandlerError {
     WaitUntil(i64),
     #[error("activity codec failed: {0}")]
     Codec(ActivityCallError),
+}
+
+/// Framework-owned result of invoking one ordinary activity handler.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivityInvocationOutcome {
+    Completed(ExactBytes),
+    Retryable(ExactBytes),
+    Failed(ActivityFailure),
+    WaitUntil(i64),
+    Rejected(ActivityCallError),
+}
+
+/// Shared ordinary-handler invocation semantics for embedded runtimes.
+#[derive(Clone, Default)]
+pub struct ActivityInvocationRuntime {
+    timeout_runtime: Option<Arc<dyn ActivityTimeoutRuntime>>,
+}
+
+impl ActivityInvocationRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_timeout_runtime(mut self, runtime: impl ActivityTimeoutRuntime + 'static) -> Self {
+        self.timeout_runtime = Some(Arc::new(runtime));
+        self
+    }
+
+    pub async fn invoke<'a>(
+        &self,
+        context: ActivityContext,
+        now_unix_millis: i64,
+        invocation: ScopedHandlerFuture<'a>,
+    ) -> ActivityInvocationOutcome {
+        let action_deadline = context.action_deadline_unix_millis();
+        if context.dispatch_authorized()
+            && action_deadline.is_some_and(|deadline| now_unix_millis >= deadline)
+        {
+            return ActivityInvocationOutcome::Failed(ActivityFailure::ActionDeadlineExceeded);
+        }
+        let action_timeout = context
+            .dispatch_authorized()
+            .then_some(action_deadline)
+            .flatten()
+            .and_then(|deadline| deadline.checked_sub(now_unix_millis))
+            .and_then(|remaining| u64::try_from(remaining).ok());
+        let attempt_timeout = context.attempt_timeout_millis();
+        let (effective_timeout, action_deadline_wins) = match (action_timeout, attempt_timeout) {
+            (Some(action), Some(attempt)) if action <= attempt => (Some(action), true),
+            (Some(_), Some(attempt)) => (Some(attempt), false),
+            (Some(action), None) => (Some(action), true),
+            (None, Some(attempt)) => (Some(attempt), false),
+            (None, None) => (None, false),
+        };
+        let result = match effective_timeout {
+            Some(timeout_millis) => {
+                let Some(runtime) = &self.timeout_runtime else {
+                    return ActivityInvocationOutcome::Rejected(ActivityCallError::Handler(
+                        "activity timeout requires an embedding timeout runtime".to_string(),
+                    ));
+                };
+                match runtime.invoke(timeout_millis, invocation).await {
+                    Err(ActivityHandlerError::TimedOut) if action_deadline_wins => {
+                        return ActivityInvocationOutcome::Failed(
+                            ActivityFailure::ActionDeadlineExceeded,
+                        );
+                    }
+                    result => result,
+                }
+            }
+            None => invocation.await,
+        };
+        match result {
+            Ok(result) => ActivityInvocationOutcome::Completed(result),
+            Err(ActivityHandlerError::Retryable(failure))
+                if context.attempt_ordinal() < context.options().max_attempts() =>
+            {
+                ActivityInvocationOutcome::Retryable(failure)
+            }
+            Err(ActivityHandlerError::Retryable(failure))
+            | Err(ActivityHandlerError::Terminal(failure)) => {
+                ActivityInvocationOutcome::Failed(ActivityFailure::Application(failure))
+            }
+            Err(ActivityHandlerError::TimedOut) => {
+                ActivityInvocationOutcome::Failed(ActivityFailure::TimedOut)
+            }
+            Err(ActivityHandlerError::WaitUntil(wake_at_unix_millis)) => {
+                let wake_at_unix_millis = ActivityWakeups {
+                    action_deadline_unix_millis: context
+                        .dispatch_authorized()
+                        .then_some(action_deadline)
+                        .flatten(),
+                    handler_wait_unix_millis: Some(wake_at_unix_millis),
+                    ..ActivityWakeups::default()
+                }
+                .earliest()
+                .expect("handler wait is present");
+                ActivityInvocationOutcome::WaitUntil(wake_at_unix_millis)
+            }
+            Err(ActivityHandlerError::Codec(error)) => ActivityInvocationOutcome::Rejected(error),
+        }
+    }
 }
 
 /// Absolute wakeup candidates returned to the reconciler-hosted runner.
@@ -542,7 +645,7 @@ fn validate_contract_bounds(
 pub struct ActivityRunner<S> {
     host: DurableHost<S>,
     registry: ActivityRegistry,
-    timeout_runtime: Option<Arc<dyn ActivityTimeoutRuntime>>,
+    invocation_runtime: ActivityInvocationRuntime,
 }
 
 impl<S: CheckpointStore> ActivityRunner<S> {
@@ -550,12 +653,12 @@ impl<S: CheckpointStore> ActivityRunner<S> {
         Self {
             host,
             registry,
-            timeout_runtime: None,
+            invocation_runtime: ActivityInvocationRuntime::new(),
         }
     }
 
     pub fn with_timeout_runtime(mut self, runtime: impl ActivityTimeoutRuntime + 'static) -> Self {
-        self.timeout_runtime = Some(Arc::new(runtime));
+        self.invocation_runtime = self.invocation_runtime.with_timeout_runtime(runtime);
         self
     }
 
@@ -642,103 +745,33 @@ impl<S: CheckpointStore> ActivityRunner<S> {
             attempt.retry_not_before_unix_millis(),
         );
         let input = activity.input().clone();
-        if activity
-            .options()
-            .action_deadline_unix_millis()
-            .is_some_and(|deadline| now_unix_millis >= deadline)
+        let invocation = Box::pin(self.registry.invoke_classified(context.clone(), input));
+        match self
+            .invocation_runtime
+            .invoke(context, now_unix_millis, invocation)
+            .await
         {
-            return self
-                .host
-                .observe_failure(
-                    &execution,
-                    &activity,
-                    ActivityFailure::ActionDeadlineExceeded,
-                )
-                .await;
-        }
-        let action_timeout = activity
-            .options()
-            .action_deadline_unix_millis()
-            .and_then(|deadline| deadline.checked_sub(now_unix_millis))
-            .and_then(|remaining| u64::try_from(remaining).ok());
-        let attempt_timeout = activity.options().attempt_timeout_millis();
-        let (effective_timeout, action_deadline_wins) = match (action_timeout, attempt_timeout) {
-            (Some(action), Some(attempt)) if action <= attempt => (Some(action), true),
-            (Some(_), Some(attempt)) => (Some(attempt), false),
-            (Some(action), None) => (Some(action), true),
-            (None, Some(attempt)) => (Some(attempt), false),
-            (None, None) => (None, false),
-        };
-        let invocation = Box::pin(self.registry.invoke_classified(context, input));
-        let handler_result = match effective_timeout {
-            Some(timeout_millis) => {
-                let Some(runtime) = &self.timeout_runtime else {
-                    return HostOutcome::CheckpointRejected(
-                        CheckpointError::PreparedActivityRejected(
-                            crate::PreparedActivityError::Validation,
-                        ),
-                    );
-                };
-                match runtime.invoke(timeout_millis, invocation).await {
-                    Err(ActivityHandlerError::TimedOut) if action_deadline_wins => {
-                        return self
-                            .host
-                            .observe_failure(
-                                &execution,
-                                &activity,
-                                ActivityFailure::ActionDeadlineExceeded,
-                            )
-                            .await;
-                    }
-                    result => result,
-                }
-            }
-            None => invocation.await,
-        };
-        match handler_result {
-            Ok(result) => {
+            ActivityInvocationOutcome::Completed(result) => {
                 self.host
                     .observe(&execution, ActivityObservation::new(activity, result))
                     .await
             }
-            Err(ActivityHandlerError::Retryable(failure)) => {
-                if attempt.ordinal() < activity.options().max_attempts() {
-                    self.host
-                        .schedule_retry(&execution, &activity, now_unix_millis)
-                        .await
-                } else {
-                    self.host
-                        .observe_failure(
-                            &execution,
-                            &activity,
-                            ActivityFailure::Application(failure),
-                        )
-                        .await
-                }
-            }
-            Err(ActivityHandlerError::Terminal(failure)) => {
+            ActivityInvocationOutcome::Retryable(_) => {
                 self.host
-                    .observe_failure(&execution, &activity, ActivityFailure::Application(failure))
+                    .schedule_retry(&execution, &activity, now_unix_millis)
                     .await
             }
-            Err(ActivityHandlerError::TimedOut) => {
+            ActivityInvocationOutcome::Failed(failure) => {
                 self.host
-                    .observe_failure(&execution, &activity, ActivityFailure::TimedOut)
+                    .observe_failure(&execution, &activity, failure)
                     .await
             }
-            Err(ActivityHandlerError::WaitUntil(wake_at_unix_millis)) => {
-                let wake_at_unix_millis = ActivityWakeups {
-                    action_deadline_unix_millis: activity.options().action_deadline_unix_millis(),
-                    handler_wait_unix_millis: Some(wake_at_unix_millis),
-                    ..ActivityWakeups::default()
-                }
-                .earliest()
-                .expect("handler wait is present");
+            ActivityInvocationOutcome::WaitUntil(wake_at_unix_millis) => {
                 self.host
                     .defer_wait(&execution, &activity, wake_at_unix_millis)
                     .await
             }
-            Err(ActivityHandlerError::Codec(_)) => HostOutcome::CheckpointRejected(
+            ActivityInvocationOutcome::Rejected(_) => HostOutcome::CheckpointRejected(
                 CheckpointError::PreparedActivityRejected(crate::PreparedActivityError::Validation),
             ),
         }

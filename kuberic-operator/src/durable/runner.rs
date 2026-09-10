@@ -1,15 +1,15 @@
 //! Shared bounded lifecycle runner for operator-hosted durable workflows.
 
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityContext, ActivityFailure, ActivityHandlerError, ActivityObservation, AttemptId,
-    CheckpointError, CheckpointLimits, CheckpointPayload, CheckpointStore, CompletionMetadata,
-    EffectObservation, ExactBytes, ExecutionSpec, HostOutcome, LogicalActivityId, Nondeterminism,
-    ObservationRejection, PersistenceBoundary, PreparedActivityResolver, PreparedCommand,
-    PreparedEffectResolver, ReloadReason, StoreError, StoreOperation, TerminalCheckpointStatus,
-    TerminalOutcome, Workflow,
+    ActivityContext, ActivityHandlerError, ActivityInvocationOutcome, ActivityInvocationRuntime,
+    ActivityObservation, ActivityTimeoutRuntime, AttemptId, CheckpointError, CheckpointLimits,
+    CheckpointPayload, CheckpointStore, CompletionMetadata, EffectObservation, ExactBytes,
+    ExecutionSpec, HostOutcome, LogicalActivityId, Nondeterminism, ObservationRejection,
+    PersistenceBoundary, PreparedActivityResolver, PreparedCommand, PreparedEffectResolver,
+    ReloadReason, StoreError, StoreOperation, TerminalCheckpointStatus, TerminalOutcome, Workflow,
 };
 use thiserror::Error;
 
@@ -30,6 +30,25 @@ async fn await_adapter_deadline<F: Future>(
         .max(1);
     let timeout = std::time::Duration::from_secs(u64::try_from(remaining).unwrap_or_default());
     tokio::time::timeout(timeout, future).await.map_err(|_| ())
+}
+
+#[derive(Clone, Copy)]
+struct TokioActivityTimeoutRuntime;
+
+impl ActivityTimeoutRuntime for TokioActivityTimeoutRuntime {
+    fn invoke<'a>(
+        &'a self,
+        timeout_millis: u64,
+        invocation: Pin<
+            Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send + 'a>,
+        >,
+    ) -> Pin<Box<dyn Future<Output = Result<ExactBytes, ActivityHandlerError>> + Send + 'a>> {
+        Box::pin(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(timeout_millis), invocation)
+                .await
+                .unwrap_or(Err(ActivityHandlerError::TimedOut))
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,6 +826,8 @@ impl DurableRunner {
             .into_result();
         }
 
+        let invocation_runtime =
+            ActivityInvocationRuntime::new().with_timeout_runtime(TokioActivityTimeoutRuntime);
         let mut outcome = turn_registered_effects(host, workflow, execution.clone(), adapter).await;
         for _ in 0..self.max_host_outcomes {
             host.store().correlate_host_outcome(&outcome);
@@ -837,40 +858,27 @@ impl DurableRunner {
                         let attempt_ordinal = guard
                             .attempt_ordinal()
                             .expect("newly constructed permit guard contains its permit");
+                        let retry_not_before_unix_millis = guard.retry_not_before_unix_millis();
                         if let Err(error) =
                             guard.consume(activity.spec(), &activity, attempt_id, "activity")
                         {
                             return DurableRunnerOutcome::Isolated(error);
                         }
-                        let adapter_deadline = adapter.deadline_unix_seconds();
                         let context = ActivityContext::new(
                             activity.clone(),
                             attempt_id,
                             attempt_ordinal,
-                            None,
+                            retry_not_before_unix_millis,
                         );
-                        let invocation = match await_adapter_deadline(
-                            adapter.invoke_activity(context, activity.spec().input().clone()),
-                            now_unix_seconds,
-                            adapter_deadline,
-                        )
-                        .await
-                        {
-                            Ok(boundary) => boundary,
-                            Err(()) => {
-                                return DurableRunnerOutcome::Active {
-                                    reason: DurableActiveReason::Adapter,
-                                    condition_reason: "ActivityInvocationTimedOut".to_string(),
-                                    detail: format!(
-                                        "ordinary activity {} exceeded its persisted action deadline",
-                                        activity.spec().name().name()
-                                    ),
-                                    requeue_after_seconds: MIN_REQUEUE_SECONDS,
-                                };
-                            }
-                        };
+                        let handler = Box::pin(
+                            adapter
+                                .invoke_activity(context.clone(), activity.spec().input().clone()),
+                        );
+                        let invocation = invocation_runtime
+                            .invoke(context, now_unix_seconds.saturating_mul(1_000), handler)
+                            .await;
                         match invocation {
-                            Ok(result) => {
+                            ActivityInvocationOutcome::Completed(result) => {
                                 let observed = host
                                     .observe(
                                         &execution,
@@ -903,7 +911,7 @@ impl DurableRunner {
                                     other => other,
                                 }
                             }
-                            Err(ActivityHandlerError::Retryable(failure)) => {
+                            ActivityInvocationOutcome::Retryable(_) => {
                                 let retried = host
                                     .schedule_retry(
                                         &execution,
@@ -932,38 +940,15 @@ impl DurableRunner {
                                     }
                                     HostOutcome::CheckpointRejected(
                                         CheckpointError::ActivityAttemptLimitExceeded { .. },
-                                    ) => {
-                                        let observed = host
-                                            .observe_failure(
-                                                &execution,
-                                                &activity,
-                                                ActivityFailure::Application(failure),
-                                            )
-                                            .await;
-                                        match observed {
-                                            HostOutcome::ObservationAccepted { .. } => {
-                                                turn_registered_effects(
-                                                    host,
-                                                    workflow,
-                                                    execution.clone(),
-                                                    adapter,
-                                                )
-                                                .await
-                                            }
-                                            other => other,
-                                        }
-                                    }
+                                    ) => return DurableRunnerOutcome::Isolated(
+                                        "activity invocation runtime authorized a retry beyond the persisted attempt limit".to_string(),
+                                    ),
                                     other => other,
                                 }
                             }
-                            Err(ActivityHandlerError::Terminal(failure)) => {
-                                let observed = host
-                                    .observe_failure(
-                                        &execution,
-                                        &activity,
-                                        ActivityFailure::Application(failure),
-                                    )
-                                    .await;
+                            ActivityInvocationOutcome::Failed(failure) => {
+                                let observed =
+                                    host.observe_failure(&execution, &activity, failure).await;
                                 match observed {
                                     HostOutcome::ObservationAccepted { .. } => {
                                         turn_registered_effects(
@@ -977,28 +962,7 @@ impl DurableRunner {
                                     other => other,
                                 }
                             }
-                            Err(ActivityHandlerError::TimedOut) => {
-                                let observed = host
-                                    .observe_failure(
-                                        &execution,
-                                        &activity,
-                                        ActivityFailure::TimedOut,
-                                    )
-                                    .await;
-                                match observed {
-                                    HostOutcome::ObservationAccepted { .. } => {
-                                        turn_registered_effects(
-                                            host,
-                                            workflow,
-                                            execution.clone(),
-                                            adapter,
-                                        )
-                                        .await
-                                    }
-                                    other => other,
-                                }
-                            }
-                            Err(ActivityHandlerError::WaitUntil(wake_at_unix_millis)) => {
+                            ActivityInvocationOutcome::WaitUntil(wake_at_unix_millis) => {
                                 return DurableRunnerOutcome::Active {
                                     reason: DurableActiveReason::Adapter,
                                     condition_reason: "AwaitingActivityObservation".to_string(),
@@ -1012,7 +976,7 @@ impl DurableRunner {
                                     ),
                                 };
                             }
-                            Err(ActivityHandlerError::Codec(error)) => {
+                            ActivityInvocationOutcome::Rejected(error) => {
                                 return DurableRunnerOutcome::Rejected(error.to_string());
                             }
                         }
@@ -1089,34 +1053,27 @@ impl DurableRunner {
                 HostOutcome::Quarantined {
                     activity,
                     attempt_id,
+                    attempt_ordinal,
+                    retry_not_before_unix_millis,
                     prepared_command,
                     completion_class,
                 } => {
                     let Some(prepared_command) = prepared_command else {
-                        let adapter_deadline = adapter.deadline_unix_seconds();
-                        let context = ActivityContext::recovery(activity.clone(), attempt_id, 1);
-                        let invocation = match await_adapter_deadline(
-                            adapter.invoke_activity(context, activity.spec().input().clone()),
-                            now_unix_seconds,
-                            adapter_deadline,
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(()) => {
-                                return DurableRunnerOutcome::Active {
-                                    reason: DurableActiveReason::Adapter,
-                                    condition_reason: "ActivityObservationTimedOut".to_string(),
-                                    detail: format!(
-                                        "activity {} observation exceeded its persisted deadline",
-                                        activity.spec().name().name()
-                                    ),
-                                    requeue_after_seconds: MIN_REQUEUE_SECONDS,
-                                };
-                            }
-                        };
+                        let context = ActivityContext::recovery(
+                            activity.clone(),
+                            attempt_id,
+                            attempt_ordinal,
+                            retry_not_before_unix_millis,
+                        );
+                        let handler = Box::pin(
+                            adapter
+                                .invoke_activity(context.clone(), activity.spec().input().clone()),
+                        );
+                        let invocation = invocation_runtime
+                            .invoke(context, now_unix_seconds.saturating_mul(1_000), handler)
+                            .await;
                         return match invocation {
-                            Ok(result) => {
+                            ActivityInvocationOutcome::Completed(result) => {
                                 let observed = host
                                     .observe(
                                         &execution,
@@ -1139,7 +1096,7 @@ impl DurableRunner {
                                     other => host_outcome_failure(other),
                                 }
                             }
-                            Err(ActivityHandlerError::Retryable(failure)) => {
+                            ActivityInvocationOutcome::Retryable(_) => {
                                 let retried = host
                                     .schedule_retry(
                                         &execution,
@@ -1167,42 +1124,15 @@ impl DurableRunner {
                                     },
                                     HostOutcome::CheckpointRejected(
                                         CheckpointError::ActivityAttemptLimitExceeded { .. },
-                                    ) => {
-                                        let failed = host
-                                            .observe_failure(
-                                                &execution,
-                                                &activity,
-                                                ActivityFailure::Application(failure),
-                                            )
-                                            .await;
-                                        host.store().correlate_host_outcome(&failed);
-                                        match failed {
-                                            HostOutcome::ObservationAccepted { .. } => {
-                                                DurableRunnerOutcome::Active {
-                                                    reason: DurableActiveReason::Adapter,
-                                                    condition_reason: "ActivityRetryExhausted"
-                                                        .to_string(),
-                                                    detail: format!(
-                                                        "ordinary activity {} exhausted its bounded attempts",
-                                                        activity.spec().name().name()
-                                                    ),
-                                                    requeue_after_seconds: MIN_REQUEUE_SECONDS,
-                                                }
-                                            }
-                                            other => host_outcome_failure(other),
-                                        }
-                                    }
+                                    ) => DurableRunnerOutcome::Isolated(
+                                        "activity invocation runtime authorized a recovery retry beyond the persisted attempt limit".to_string(),
+                                    ),
                                     other => host_outcome_failure(other),
                                 }
                             }
-                            Err(ActivityHandlerError::Terminal(failure)) => {
-                                let failed = host
-                                    .observe_failure(
-                                        &execution,
-                                        &activity,
-                                        ActivityFailure::Application(failure),
-                                    )
-                                    .await;
+                            ActivityInvocationOutcome::Failed(failure) => {
+                                let failed =
+                                    host.observe_failure(&execution, &activity, failure).await;
                                 host.store().correlate_host_outcome(&failed);
                                 match failed {
                                     HostOutcome::ObservationAccepted { .. } => {
@@ -1219,16 +1149,7 @@ impl DurableRunner {
                                     other => host_outcome_failure(other),
                                 }
                             }
-                            Err(ActivityHandlerError::TimedOut) => DurableRunnerOutcome::Active {
-                                reason: DurableActiveReason::Adapter,
-                                condition_reason: "ActivityObservationTimedOut".to_string(),
-                                detail: format!(
-                                    "activity {} observation timed out",
-                                    activity.spec().name().name()
-                                ),
-                                requeue_after_seconds: MIN_REQUEUE_SECONDS,
-                            },
-                            Err(ActivityHandlerError::WaitUntil(wake_at_unix_millis)) => {
+                            ActivityInvocationOutcome::WaitUntil(wake_at_unix_millis) => {
                                 DurableRunnerOutcome::Active {
                                     reason: DurableActiveReason::Adapter,
                                     condition_reason: "AwaitingActivityObservation".to_string(),
@@ -1242,7 +1163,7 @@ impl DurableRunner {
                                     ),
                                 }
                             }
-                            Err(ActivityHandlerError::Codec(error)) => {
+                            ActivityInvocationOutcome::Rejected(error) => {
                                 DurableRunnerOutcome::Rejected(error.to_string())
                             }
                         };

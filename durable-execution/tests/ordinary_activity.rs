@@ -9,7 +9,8 @@ use std::{
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityContext, ActivityHandlerError, ActivityName, ActivityOptions, ActivityRegistry,
+    ActivityContext, ActivityFailure, ActivityHandlerError, ActivityInvocationOutcome,
+    ActivityInvocationRuntime, ActivityName, ActivityOptions, ActivityRegistry,
     ActivityRegistryError, ActivityRunner, ActivitySequence, ActivitySpec, ActivityTimeoutRuntime,
     ActivityWakeups, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits,
     CheckpointStore, DurableActivity, DurableHost, Evaluation, ExactBytes, ExecutionId,
@@ -186,6 +187,86 @@ async fn scoped_registry_owns_handlers_that_borrow_embedding_state() {
     assert_eq!(
         serde_json::from_slice::<String>(result.as_slice()).unwrap(),
         "hello-scoped-1"
+    );
+}
+
+#[tokio::test]
+async fn shared_invocation_runtime_classifies_scoped_retry_exhaustion() {
+    let registry = ScopedActivityRegistry::<Vec<(u32, Option<i64>)>>::builder()
+        .register::<Echo, _>("Echo", |state, context, _| {
+            Box::pin(async move {
+                state.push((
+                    context.attempt_ordinal(),
+                    context.retry_not_before_unix_millis(),
+                ));
+                Err(ActivityHandlerError::Retryable(ExactBytes::new(
+                    b"retry exhausted",
+                )))
+            })
+        })
+        .build()
+        .unwrap();
+    let options = ActivityOptions::new(2, 1_000, None, None).unwrap();
+    let context = ActivityContext::new(
+        logical(options),
+        AttemptId::new(HostEpoch::from_bytes([29; 16]), 2).unwrap(),
+        2,
+        Some(2_000),
+    );
+    let mut calls = Vec::new();
+    let handler = Box::pin(registry.invoke_classified(
+        &mut calls,
+        context.clone(),
+        ExactBytes::new(br#"{"value":"hello"}"#),
+    ));
+
+    let outcome = ActivityInvocationRuntime::new()
+        .invoke(context, 2_000, handler)
+        .await;
+
+    assert_eq!(calls, vec![(2, Some(2_000))]);
+    assert_eq!(
+        outcome,
+        ActivityInvocationOutcome::Failed(ActivityFailure::Application(ExactBytes::new(
+            b"retry exhausted"
+        )))
+    );
+}
+
+#[tokio::test]
+async fn shared_invocation_runtime_allows_observation_only_recovery_after_deadline() {
+    let registry = ScopedActivityRegistry::<usize>::builder()
+        .register::<Echo, _>("Echo", |calls, context, input| {
+            Box::pin(async move {
+                assert!(!context.dispatch_authorized());
+                *calls += 1;
+                Ok(input.value)
+            })
+        })
+        .build()
+        .unwrap();
+    let options = ActivityOptions::new(3, 1_000, Some(1_000), None).unwrap();
+    let context = ActivityContext::recovery(
+        logical(options),
+        AttemptId::new(HostEpoch::from_bytes([30; 16]), 2).unwrap(),
+        2,
+        Some(900),
+    );
+    let mut calls = 0;
+    let handler = Box::pin(registry.invoke_classified(
+        &mut calls,
+        context.clone(),
+        ExactBytes::new(br#"{"value":"observed"}"#),
+    ));
+
+    let outcome = ActivityInvocationRuntime::new()
+        .invoke(context, 2_000, handler)
+        .await;
+
+    assert_eq!(calls, 1);
+    assert_eq!(
+        outcome,
+        ActivityInvocationOutcome::Completed(ExactBytes::new(br#""observed""#))
     );
 }
 
