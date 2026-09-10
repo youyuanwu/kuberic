@@ -5,12 +5,13 @@ use futures::future::poll_fn;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivityRecord, ActivitySequence, ActivitySpec, ActivityState, CompletionClass, DurableEffect,
-    EffectActivity, EffectCallError, EffectMetadata, ExactBytes, ExecutionId, LogicalActivityId,
-    Nondeterminism, PreparedCommand, PreparedEffectResolver,
+    ActivityFailure, ActivityOptions, ActivityRecord, ActivitySequence, ActivitySpec,
+    ActivityState, CompletionClass, DurableEffect, EffectActivity, EffectCallError, EffectMetadata,
+    ExactBytes, ExecutionId, LogicalActivityId, Nondeterminism, PreparedCommand,
+    PreparedEffectResolver,
     typed::{
-        ActivityCallError, DurableActivity, PreparedActivityError, PreparedActivityResolver,
-        activity_spec, decode_activity_result,
+        ActivityCallError, ActivityInvocationError, DurableActivity, PreparedActivityError,
+        PreparedActivityResolver, activity_spec, activity_spec_named, decode_activity_result,
     },
 };
 
@@ -92,7 +93,13 @@ impl<'history> WorkflowContext<'history> {
     }
 
     pub async fn activity(&mut self, spec: ActivitySpec) -> ExactBytes {
-        poll_fn(|_| self.poll_activity(&spec)).await
+        match poll_fn(|_| self.poll_activity(&spec)).await {
+            Ok(result) => result,
+            Err(failure) => failure
+                .payload()
+                .cloned()
+                .unwrap_or_else(ExactBytes::default),
+        }
     }
 
     /// Invoke a versioned activity with typed, bounded input and output.
@@ -103,6 +110,29 @@ impl<'history> WorkflowContext<'history> {
         let spec = activity_spec::<A>(&input)?;
         let result = self.activity(spec).await;
         decode_activity_result::<A>(&result)
+    }
+
+    /// Schedule an ordinary named typed activity with replay-matched options.
+    pub async fn schedule_activity_typed<A: DurableActivity>(
+        &mut self,
+        name: &str,
+        input: &A::Input,
+        options: ActivityOptions,
+    ) -> Result<A::Output, ActivityInvocationError> {
+        let spec = activity_spec_named::<A>(name, input, options)?;
+        let result =
+            poll_fn(|_| self.poll_activity(&spec))
+                .await
+                .map_err(|failure| match failure {
+                    ActivityFailure::Application(error) => {
+                        ActivityInvocationError::Application(error)
+                    }
+                    ActivityFailure::TimedOut => ActivityInvocationError::TimedOut,
+                    ActivityFailure::ActionDeadlineExceeded => {
+                        ActivityInvocationError::ActionDeadlineExceeded
+                    }
+                })?;
+        decode_activity_result::<A>(&result).map_err(ActivityInvocationError::Call)
     }
 
     /// Invoke a durable effect and expose only its typed applied value or
@@ -126,7 +156,7 @@ impl<'history> WorkflowContext<'history> {
         self.execution_id
     }
 
-    fn poll_activity(&mut self, spec: &ActivitySpec) -> Poll<ExactBytes> {
+    fn poll_activity(&mut self, spec: &ActivitySpec) -> Poll<Result<ExactBytes, ActivityFailure>> {
         if self.decision.is_some() {
             return Poll::Pending;
         }
@@ -170,7 +200,10 @@ impl<'history> WorkflowContext<'history> {
         match record.state() {
             ActivityState::Completed { result } => {
                 self.cursor += 1;
-                Poll::Ready(result.clone())
+                Poll::Ready(match record.failure() {
+                    Some(failure) => Err(failure.clone()),
+                    None => Ok(result.clone()),
+                })
             }
             state @ (ActivityState::Scheduled | ActivityState::DispatchExposed { .. }) => {
                 self.decision = Some(ContextDecision::ExistingPending {

@@ -624,6 +624,11 @@ impl DurableRunner {
                         Nondeterminism::UnsupportedSuspension,
                     );
                 }
+                HostOutcome::RetryScheduled { .. } | HostOutcome::Waiting { .. } => {
+                    return DurableRunnerOutcome::Nondeterministic(
+                        Nondeterminism::UnsupportedSuspension,
+                    );
+                }
             };
         }
 
@@ -940,6 +945,11 @@ impl DurableRunner {
                     return DurableRunnerOutcome::Nondeterministic(error);
                 }
                 HostOutcome::ObservationAccepted { .. } | HostOutcome::ScheduleAccepted { .. } => {
+                    return DurableRunnerOutcome::Nondeterministic(
+                        Nondeterminism::UnsupportedSuspension,
+                    );
+                }
+                HostOutcome::RetryScheduled { .. } | HostOutcome::Waiting { .. } => {
                     return DurableRunnerOutcome::Nondeterministic(
                         Nondeterminism::UnsupportedSuspension,
                     );

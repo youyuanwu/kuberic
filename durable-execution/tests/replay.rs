@@ -3,14 +3,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityCallError, ActivityName, ActivityRecord, ActivitySequence, ActivitySpec, ActivityState,
-    AttemptId, CheckpointEnvelope, CheckpointError, CheckpointLimits, CheckpointPayload,
-    CompletionClass, DurableActivity, DurableEffect, EffectActivity, EffectAttempt,
-    EffectAttemptState, EffectCallError, EffectMetadata, EffectOutcome, Evaluation, ExactBytes,
-    ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
-    Nondeterminism, PreparedActivityError, PreparedActivityResolver, PreparedCommand,
-    PreparedEffectResolver, TerminalOutcome, Workflow, WorkflowContext, encode_activity_input,
-    encode_activity_result, evaluate as evaluate_with_spec, evaluate_effects, evaluate_prepared,
+    ActivityCallError, ActivityName, ActivityOptions, ActivityRecord, ActivitySequence,
+    ActivitySpec, ActivityState, AttemptId, CheckpointEnvelope, CheckpointError, CheckpointLimits,
+    CheckpointPayload, CompletionClass, DurableActivity, DurableEffect, EffectActivity,
+    EffectAttempt, EffectAttemptState, EffectCallError, EffectMetadata, EffectOutcome, Evaluation,
+    ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError,
+    LogicalActivityId, Nondeterminism, PreparedActivityError, PreparedActivityResolver,
+    PreparedCommand, PreparedEffectResolver, TerminalOutcome, Workflow, WorkflowContext,
+    encode_activity_input, encode_activity_result, evaluate as evaluate_with_spec,
+    evaluate_effects, evaluate_prepared,
 };
 use serde::{Deserialize, Serialize};
 
@@ -862,10 +863,12 @@ impl Workflow for TypedWorkflowV2 {
 }
 
 fn typed_spec<A: DurableActivity<Input = String>>(input: &str) -> ActivitySpec {
-    ActivitySpec::new(
+    ActivitySpec::with_bounds_and_options(
         ActivityName::new(A::NAME, A::VERSION).unwrap(),
         encode_activity_input::<A>(&input.to_owned()).unwrap(),
+        A::MAX_INPUT_BYTES,
         A::MAX_RESULT_BYTES,
+        ActivityOptions::default(),
     )
 }
 

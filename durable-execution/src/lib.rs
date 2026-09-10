@@ -21,6 +21,7 @@ mod identity;
 mod in_memory;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
+mod registry;
 mod replay;
 mod store;
 mod typed;
@@ -28,8 +29,9 @@ mod workflow;
 
 pub use assessment::{FeasibilityClassification, FeasibilityInputs, classify_feasibility};
 pub use checkpoint::{
-    ActivityRecord, ActivityState, CHECKPOINT_FORMAT_VERSION, CheckpointEnvelope, CheckpointError,
-    CheckpointLimits, CheckpointPayload, CheckpointState, ExecutionContract,
+    ActivityAttemptState, ActivityFailure, ActivityRecord, ActivityState,
+    CHECKPOINT_FORMAT_VERSION, CheckpointEnvelope, CheckpointError, CheckpointLimits,
+    CheckpointPayload, CheckpointState, ExecutionContract,
 };
 pub use effect::{
     BoundedEffectError, CompletionClass, CompletionMetadata, DispatchEffect, DurableEffect,
@@ -47,8 +49,8 @@ pub use host::{
     TerminalCheckpointStatus,
 };
 pub use identity::{
-    ActivityName, ActivitySequence, ActivitySpec, AttemptId, ExactBytes, ExecutionId,
-    ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
+    ActivityName, ActivityOptions, ActivitySequence, ActivitySpec, AttemptId, ExactBytes,
+    ExecutionId, ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
 };
 pub use in_memory::{InMemoryCheckpointStore, InMemoryFault};
 #[cfg(feature = "kubernetes")]
@@ -57,13 +59,17 @@ pub use kubernetes::{
     KubernetesCheckpointMetricsSnapshot, KubernetesCheckpointOwner, KubernetesCheckpointOwnerScope,
     KubernetesCheckpointStore, KubernetesCheckpointStoreOptions, MAX_CONFIG_MAP_DATA_BUDGET_BYTES,
 };
+pub use registry::{
+    ActivityContext, ActivityHandlerError, ActivityRegistry, ActivityRegistryBuilder,
+    ActivityRegistryError, ActivityRunner, ActivityWakeups,
+};
 pub use replay::{Evaluation, Nondeterminism, evaluate, evaluate_effects, evaluate_prepared};
 pub use store::{
     CasOutcome, CheckpointStore, StorageRevision, StoreError, StoreErrorKind, StoredCheckpoint,
 };
 pub use typed::{
-    ActivityCallError, DurableActivity, IdentityActivityResolver, PreparedActivityError,
-    PreparedActivityResolver, decode_activity_input, decode_activity_result, encode_activity_input,
-    encode_activity_result,
+    ActivityCallError, ActivityInvocationError, DurableActivity, IdentityActivityResolver,
+    PreparedActivityError, PreparedActivityResolver, decode_activity_input, decode_activity_result,
+    encode_activity_input, encode_activity_result,
 };
 pub use workflow::{TerminalOutcome, Workflow, WorkflowContext};

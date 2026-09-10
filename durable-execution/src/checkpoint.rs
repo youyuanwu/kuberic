@@ -9,7 +9,7 @@ use crate::{
     validate_effect_attempts,
 };
 
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 4;
 
 /// Required limits for every loaded or proposed checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -557,12 +557,16 @@ impl CheckpointPayload {
 pub struct ActivityRecord {
     sequence: ActivitySequence,
     spec: ActivitySpec,
+    #[serde(default = "ActivityAttemptState::first")]
+    attempt: ActivityAttemptState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepared_command: Option<PreparedCommand>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completion_class: Option<CompletionClass>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attempts: Vec<EffectAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<ActivityFailure>,
     state: ActivityState,
 }
 
@@ -571,9 +575,11 @@ impl ActivityRecord {
         Self {
             sequence,
             spec,
+            attempt: ActivityAttemptState::first(),
             prepared_command: None,
             completion_class: None,
             attempts: Vec::new(),
+            failure: None,
             state,
         }
     }
@@ -591,9 +597,11 @@ impl ActivityRecord {
         Ok(Self {
             sequence,
             spec,
+            attempt: ActivityAttemptState::first(),
             prepared_command: Some(prepared_command),
             completion_class: Some(completion_class),
             attempts,
+            failure: None,
             state,
         })
     }
@@ -646,6 +654,10 @@ impl ActivityRecord {
         &self.state
     }
 
+    pub const fn attempt(&self) -> ActivityAttemptState {
+        self.attempt
+    }
+
     pub const fn prepared_command(&self) -> Option<&PreparedCommand> {
         self.prepared_command.as_ref()
     }
@@ -658,12 +670,65 @@ impl ActivityRecord {
         &self.attempts
     }
 
+    pub const fn failure(&self) -> Option<&ActivityFailure> {
+        self.failure.as_ref()
+    }
+
     pub(crate) fn with_state(mut self, state: ActivityState) -> Self {
+        self.failure = None;
         self.state = state;
         self
     }
 
+    pub(crate) fn with_failure(mut self, failure: ActivityFailure) -> Self {
+        self.failure = Some(failure);
+        self.state = ActivityState::Completed {
+            result: ExactBytes::default(),
+        };
+        self
+    }
+
+    pub fn schedule_retry(
+        mut self,
+        retry_not_before_unix_millis: i64,
+    ) -> Result<Self, CheckpointError> {
+        if !matches!(self.state, ActivityState::DispatchExposed { .. }) {
+            return Err(CheckpointError::RetryRequiresExposedActivity {
+                sequence: self.sequence,
+            });
+        }
+        let next = self.attempt.ordinal.checked_add(1).ok_or(
+            CheckpointError::ActivityAttemptLimitExceeded {
+                sequence: self.sequence,
+                attempted: u32::MAX,
+                maximum: self.spec.options().max_attempts(),
+            },
+        )?;
+        if next > self.spec.options().max_attempts() {
+            return Err(CheckpointError::ActivityAttemptLimitExceeded {
+                sequence: self.sequence,
+                attempted: next,
+                maximum: self.spec.options().max_attempts(),
+            });
+        }
+        self.attempt = ActivityAttemptState::new(next, Some(retry_not_before_unix_millis), None);
+        self.state = ActivityState::Scheduled;
+        Ok(self)
+    }
+
+    pub fn defer_wait(mut self, wait_until_unix_millis: i64) -> Result<Self, CheckpointError> {
+        if !matches!(self.state, ActivityState::DispatchExposed { .. }) {
+            return Err(CheckpointError::RetryRequiresExposedActivity {
+                sequence: self.sequence,
+            });
+        }
+        self.attempt.handler_wait_until_unix_millis = Some(wait_until_unix_millis);
+        self.state = ActivityState::Scheduled;
+        Ok(self)
+    }
+
     pub(crate) fn expose_attempt(mut self, attempt_id: AttemptId) -> Result<Self, CheckpointError> {
+        self.attempt.handler_wait_until_unix_millis = None;
         if self.prepared_command.is_some() {
             self.attempts
                 .push(EffectAttempt::new(attempt_id, EffectAttemptState::Exposed));
@@ -724,6 +789,64 @@ pub enum ActivityState {
     Completed { result: ExactBytes },
 }
 
+/// Durable non-success result of an ordinary activity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum ActivityFailure {
+    Application(ExactBytes),
+    TimedOut,
+    ActionDeadlineExceeded,
+}
+
+impl ActivityFailure {
+    pub const fn payload(&self) -> Option<&ExactBytes> {
+        match self {
+            Self::Application(payload) => Some(payload),
+            Self::TimedOut | Self::ActionDeadlineExceeded => None,
+        }
+    }
+}
+
+/// Persisted physical-attempt state for one stable logical activity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityAttemptState {
+    ordinal: u32,
+    retry_not_before_unix_millis: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handler_wait_until_unix_millis: Option<i64>,
+}
+
+impl ActivityAttemptState {
+    pub const fn new(
+        ordinal: u32,
+        retry_not_before_unix_millis: Option<i64>,
+        handler_wait_until_unix_millis: Option<i64>,
+    ) -> Self {
+        Self {
+            ordinal,
+            retry_not_before_unix_millis,
+            handler_wait_until_unix_millis,
+        }
+    }
+
+    pub const fn first() -> Self {
+        Self::new(1, None, None)
+    }
+
+    pub const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn retry_not_before_unix_millis(self) -> Option<i64> {
+        self.retry_not_before_unix_millis
+    }
+
+    pub const fn handler_wait_until_unix_millis(self) -> Option<i64> {
+        self.handler_wait_until_unix_millis
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CheckpointError {
     #[error("prepared activity was rejected: {0}")]
@@ -752,6 +875,18 @@ pub enum CheckpointError {
     ZeroTerminalEncodedCheckpointLimit,
     #[error("checkpoint has {actual} activity records; configured maximum is {maximum}")]
     ActivityRecordLimitExceeded { actual: usize, maximum: usize },
+    #[error(
+        "activity {sequence} attempted ordinal {attempted}, exceeding the configured maximum {maximum}"
+    )]
+    ActivityAttemptLimitExceeded {
+        sequence: ActivitySequence,
+        attempted: u32,
+        maximum: u32,
+    },
+    #[error("activity {sequence} must be exposed before a retry can be scheduled")]
+    RetryRequiresExposedActivity { sequence: ActivitySequence },
+    #[error("activity {sequence} stores a failure without completed state")]
+    FailureRequiresCompletedActivity { sequence: ActivitySequence },
     #[error("encoded checkpoint uses {actual} bytes; configured maximum is {maximum}")]
     EncodedCheckpointLimitExceeded { actual: usize, maximum: usize },
     #[error("terminal encoded checkpoint uses {actual} bytes; configured maximum is {maximum}")]
@@ -784,6 +919,12 @@ pub enum CheckpointError {
     ExpectedActiveCheckpoint,
     #[error("activity {sequence} result uses {actual} bytes; declared maximum is {maximum}")]
     CompletedResultExceedsDeclared {
+        sequence: ActivitySequence,
+        actual: u64,
+        maximum: u64,
+    },
+    #[error("activity {sequence} input uses {actual} bytes; declared maximum is {maximum}")]
+    ActivityInputExceedsDeclared {
         sequence: ActivitySequence,
         actual: u64,
         maximum: u64,
@@ -830,6 +971,29 @@ fn validate_active_history(activities: &[ActivityRecord]) -> Result<(), Checkpoi
                 actual: record.sequence,
             });
         }
+        if record.attempt.ordinal == 0
+            || record.attempt.ordinal > record.spec.options().max_attempts()
+        {
+            return Err(CheckpointError::ActivityAttemptLimitExceeded {
+                sequence: record.sequence,
+                attempted: record.attempt.ordinal,
+                maximum: record.spec.options().max_attempts(),
+            });
+        }
+        if record.attempt.ordinal == 1 && record.attempt.retry_not_before_unix_millis.is_some() {
+            return Err(CheckpointError::RetryRequiresExposedActivity {
+                sequence: record.sequence,
+            });
+        }
+        let input_actual = u64::try_from(record.spec.input().as_slice().len())
+            .map_err(|_| CheckpointError::ResultLengthUnrepresentable)?;
+        if input_actual > record.spec.max_input_bytes() {
+            return Err(CheckpointError::ActivityInputExceedsDeclared {
+                sequence: record.sequence,
+                actual: input_actual,
+                maximum: record.spec.max_input_bytes(),
+            });
+        }
         match (&record.prepared_command, record.completion_class) {
             (Some(command), Some(_)) => {
                 PreparedCommand::new(command.bytes().clone(), command.max_bytes())
@@ -852,6 +1016,22 @@ fn validate_active_history(activities: &[ActivityRecord]) -> Result<(), Checkpoi
             (None, None) => {
                 return Err(CheckpointError::MissingPreparedCommand {
                     sequence: record.sequence,
+                });
+            }
+        }
+        if record.failure.is_some() && !matches!(record.state, ActivityState::Completed { .. }) {
+            return Err(CheckpointError::FailureRequiresCompletedActivity {
+                sequence: record.sequence,
+            });
+        }
+        if let Some(failure) = record.failure.as_ref().and_then(ActivityFailure::payload) {
+            let actual = u64::try_from(failure.as_slice().len())
+                .map_err(|_| CheckpointError::ResultLengthUnrepresentable)?;
+            if actual > record.spec.max_result_bytes() {
+                return Err(CheckpointError::CompletedResultExceedsDeclared {
+                    sequence: record.sequence,
+                    actual,
+                    maximum: record.spec.max_result_bytes(),
                 });
             }
         }

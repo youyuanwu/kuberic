@@ -1,6 +1,6 @@
 use crate::{
-    ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError,
-    CheckpointLimits, CheckpointPayload, CheckpointStore, CompletionMetadata,
+    ActivityFailure, ActivityRecord, ActivityState, AttemptId, CasOutcome, CheckpointEnvelope,
+    CheckpointError, CheckpointLimits, CheckpointPayload, CheckpointStore, CompletionMetadata,
     EffectObservationDisposition, Evaluation, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
     LogicalActivityId, Nondeterminism, PreparedActivityResolver, PreparedCommand,
     PreparedEffectResolver, StorageRevision, StoreError, TerminalOutcome, Workflow, evaluate,
@@ -15,6 +15,8 @@ pub enum PersistenceBoundary {
     ScheduleExposure,
     Observation,
     ObservationProgression,
+    Retry,
+    Wait,
     Completion,
 }
 
@@ -205,6 +207,15 @@ define_host_outcomes! {
     ObservationAccepted {
         activity: LogicalActivityId,
         revision: StorageRevision,
+    },
+    RetryScheduled {
+        activity: LogicalActivityId,
+        retry_not_before_unix_millis: i64,
+        revision: StorageRevision,
+    },
+    Waiting {
+        activity: LogicalActivityId,
+        wake_at_unix_millis: i64,
     },
     WorkflowCompleted {
         outcome: TerminalOutcome,
@@ -407,6 +418,24 @@ impl<S: CheckpointStore> DurableHost<S> {
             .await
     }
 
+    /// Evaluate an ordinary activity while enforcing persisted retry
+    /// not-before and action-deadline wakeups against a caller-supplied
+    /// deterministic clock.
+    pub async fn turn_and_expose_at<W: Workflow>(
+        &mut self,
+        workflow: &W,
+        execution: ExecutionSpec,
+        now_unix_millis: i64,
+    ) -> HostOutcome {
+        self.turn_and_expose_resolved(
+            workflow,
+            execution,
+            ExposureResolver::Activity(&crate::IdentityActivityResolver),
+            Some(now_unix_millis),
+        )
+        .await
+    }
+
     /// Evaluate and atomically expose an activity resolved to an exact prepared
     /// specification.
     pub async fn turn_and_expose_with<W: Workflow>(
@@ -415,8 +444,13 @@ impl<S: CheckpointStore> DurableHost<S> {
         execution: ExecutionSpec,
         resolver: &dyn PreparedActivityResolver,
     ) -> HostOutcome {
-        self.turn_and_expose_resolved(workflow, execution, ExposureResolver::Activity(resolver))
-            .await
+        self.turn_and_expose_resolved(
+            workflow,
+            execution,
+            ExposureResolver::Activity(resolver),
+            None,
+        )
+        .await
     }
 
     /// Evaluate and atomically expose a typed effect whose exact command is
@@ -427,8 +461,13 @@ impl<S: CheckpointStore> DurableHost<S> {
         execution: ExecutionSpec,
         resolver: &dyn PreparedEffectResolver,
     ) -> HostOutcome {
-        self.turn_and_expose_resolved(workflow, execution, ExposureResolver::Effect(resolver))
-            .await
+        self.turn_and_expose_resolved(
+            workflow,
+            execution,
+            ExposureResolver::Effect(resolver),
+            None,
+        )
+        .await
     }
 
     async fn turn_and_expose_resolved<W: Workflow>(
@@ -436,6 +475,7 @@ impl<S: CheckpointStore> DurableHost<S> {
         workflow: &W,
         execution: ExecutionSpec,
         resolver: ExposureResolver<'_>,
+        now_unix_millis: Option<i64>,
     ) -> HostOutcome {
         let execution_id = execution.execution_id();
         let loaded = match self.store.load(execution_id).await {
@@ -480,6 +520,36 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
         }
         let checkpoint = loaded.as_ref().map(|stored| stored.checkpoint());
+        if let (Some(now), Some(stored)) = (now_unix_millis, loaded.as_ref())
+            && let Ok(payload) = stored
+                .checkpoint()
+                .decode_and_validate(&execution, self.limits)
+            && let Some(record) = payload
+                .active_activities()
+                .and_then(|activities| activities.last())
+            && matches!(record.state(), ActivityState::Scheduled)
+        {
+            let attempt = record.attempt();
+            let gated_wakeup = [
+                attempt.retry_not_before_unix_millis(),
+                attempt.handler_wait_until_unix_millis(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|wake| *wake > now)
+            .max();
+            if let Some(gated_wakeup) = gated_wakeup {
+                let wake_at_unix_millis = record
+                    .spec()
+                    .options()
+                    .action_deadline_unix_millis()
+                    .map_or(gated_wakeup, |deadline| deadline.min(gated_wakeup));
+                return HostOutcome::Waiting {
+                    activity: record.logical_id(execution_id),
+                    wake_at_unix_millis,
+                };
+            }
+        }
         let evaluation = match resolver {
             ExposureResolver::Activity(resolver) => {
                 evaluate_prepared(workflow, &execution, checkpoint, self.limits, resolver)
@@ -684,6 +754,236 @@ impl<S: CheckpointStore> DurableHost<S> {
             }
             Ok(other) => reload_outcome(PersistenceBoundary::Observation, other),
             Err(error) => store_failed(PersistenceBoundary::Observation, error),
+        }
+    }
+
+    /// Persist another physical attempt for an exposed ordinary activity.
+    ///
+    /// The caller may use this for a retryable application failure or a
+    /// crash/lost-result recovery decision. Codec, registration,
+    /// nondeterminism, storage, and timeout failures must not call this API.
+    pub async fn schedule_retry(
+        &self,
+        execution: &ExecutionSpec,
+        activity: &LogicalActivityId,
+        observed_at_unix_millis: i64,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected = record.logical_id(execution_id);
+        if &expected != activity {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected,
+                    observed: activity.clone(),
+                },
+            );
+        }
+        if !matches!(record.state(), ActivityState::DispatchExposed { .. }) {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        }
+        let Some(retry_not_before_unix_millis) = record
+            .spec()
+            .options()
+            .retry_not_before_unix_millis(record.attempt().ordinal(), observed_at_unix_millis)
+        else {
+            return HostOutcome::CheckpointRejected(
+                CheckpointError::ActivityAttemptLimitExceeded {
+                    sequence: record.sequence(),
+                    attempted: record.attempt().ordinal().saturating_add(1),
+                    maximum: record.spec().options().max_attempts(),
+                },
+            );
+        };
+        let retried = match record.schedule_retry(retry_not_before_unix_millis) {
+            Ok(record) => record,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        replace_final_record(&mut payload, retried);
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(revision)) => HostOutcome::RetryScheduled {
+                activity: activity.clone(),
+                retry_not_before_unix_millis,
+                revision,
+            },
+            Ok(other) => reload_outcome(PersistenceBoundary::Retry, other),
+            Err(error) => store_failed(PersistenceBoundary::Retry, error),
+        }
+    }
+
+    /// Persist a terminal ordinary activity failure for replay through the
+    /// workflow's normal `Result` value.
+    pub async fn observe_failure(
+        &self,
+        execution: &ExecutionSpec,
+        activity: &LogicalActivityId,
+        failure: ActivityFailure,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected = record.logical_id(execution_id);
+        if &expected != activity {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected,
+                    observed: activity.clone(),
+                },
+            );
+        }
+        if !matches!(record.state(), ActivityState::DispatchExposed { .. }) {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        }
+        let actual = failure.payload().map_or(0, |payload| {
+            u64::try_from(payload.as_slice().len()).unwrap_or(u64::MAX)
+        });
+        if actual > record.max_result_bytes() {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::ResultExceedsDeclaredBound {
+                    actual,
+                    maximum: record.max_result_bytes(),
+                },
+            );
+        }
+        replace_final_record(&mut payload, record.with_failure(failure));
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(revision)) => HostOutcome::ObservationAccepted {
+                activity: activity.clone(),
+                revision,
+            },
+            Ok(other) => reload_outcome(PersistenceBoundary::Observation, other),
+            Err(error) => store_failed(PersistenceBoundary::Observation, error),
+        }
+    }
+
+    /// Persist a handler-requested observation wait without consuming a retry.
+    pub async fn defer_wait(
+        &self,
+        execution: &ExecutionSpec,
+        activity: &LogicalActivityId,
+        wait_until_unix_millis: i64,
+    ) -> HostOutcome {
+        let execution_id = execution.execution_id();
+        let loaded = match self.store.load(execution_id).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                return HostOutcome::StoreFailed {
+                    operation: StoreOperation::Load,
+                    error,
+                };
+            }
+        };
+        let Some(stored) = loaded else {
+            return HostOutcome::ObservationRejected(ObservationRejection::CheckpointMissing);
+        };
+        let mut payload = match stored
+            .checkpoint()
+            .decode_and_validate(execution, self.limits)
+        {
+            Ok(payload) => payload,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        let Some(record) = payload
+            .active_activities()
+            .and_then(|activities| activities.last())
+            .cloned()
+        else {
+            return HostOutcome::ObservationRejected(ObservationRejection::ActivityNotExposed);
+        };
+        let expected = record.logical_id(execution_id);
+        if &expected != activity {
+            return HostOutcome::ObservationRejected(
+                ObservationRejection::LogicalActivityMismatch {
+                    expected,
+                    observed: activity.clone(),
+                },
+            );
+        }
+        let deferred = match record.defer_wait(wait_until_unix_millis) {
+            Ok(record) => record,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        replace_final_record(&mut payload, deferred);
+        let checkpoint = match CheckpointEnvelope::encode_with_limits(&payload, self.limits) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => return HostOutcome::CheckpointRejected(error),
+        };
+        match self
+            .store
+            .compare_and_swap(execution_id, Some(stored.revision().clone()), checkpoint)
+            .await
+        {
+            Ok(CasOutcome::Accepted(_)) => HostOutcome::Waiting {
+                activity: activity.clone(),
+                wake_at_unix_millis: wait_until_unix_millis,
+            },
+            Ok(other) => reload_outcome(PersistenceBoundary::Wait, other),
+            Err(error) => store_failed(PersistenceBoundary::Wait, error),
         }
     }
 
