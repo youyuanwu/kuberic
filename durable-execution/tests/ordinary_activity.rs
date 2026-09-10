@@ -14,8 +14,9 @@ use kuberic_durable_execution::{
     ActivityWakeups, AttemptId, CasOutcome, CheckpointEnvelope, CheckpointError, CheckpointLimits,
     CheckpointStore, DurableActivity, DurableHost, Evaluation, ExactBytes, ExecutionId,
     ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore, InMemoryFault,
-    LogicalActivityId, Nondeterminism, ReloadReason, StorageRevision, StoreError, StoredCheckpoint,
-    TerminalCheckpointStatus, TerminalOutcome, Workflow, WorkflowContext, evaluate,
+    LogicalActivityId, Nondeterminism, ReloadReason, ScopedActivityRegistry, StorageRevision,
+    StoreError, StoredCheckpoint, TerminalCheckpointStatus, TerminalOutcome, Workflow,
+    WorkflowContext, evaluate,
 };
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +138,54 @@ async fn registry_invokes_an_ordinary_send_handler_with_runtime_identity() {
     assert_eq!(
         serde_json::from_slice::<String>(result.as_slice()).unwrap(),
         "hello-2"
+    );
+}
+
+#[tokio::test]
+async fn scoped_registry_owns_handlers_that_borrow_embedding_state() {
+    struct State {
+        suffix: String,
+        calls: usize,
+    }
+
+    let registry = ScopedActivityRegistry::<State>::builder()
+        .register::<Echo, _>("Echo", |state, context, input| {
+            Box::pin(async move {
+                state.calls += 1;
+                Ok(format!(
+                    "{}-{}-{}",
+                    input.value,
+                    state.suffix,
+                    context.attempt_ordinal()
+                ))
+            })
+        })
+        .build()
+        .unwrap();
+    let context = ActivityContext::new(
+        logical(ActivityOptions::default()),
+        AttemptId::new(HostEpoch::from_bytes([28; 16]), 1).unwrap(),
+        1,
+        None,
+    );
+    let mut state = State {
+        suffix: "scoped".to_string(),
+        calls: 0,
+    };
+
+    let result = registry
+        .invoke_classified(
+            &mut state,
+            context,
+            ExactBytes::new(br#"{"value":"hello"}"#),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(state.calls, 1);
+    assert_eq!(
+        serde_json::from_slice::<String>(result.as_slice()).unwrap(),
+        "hello-scoped-1"
     );
 }
 

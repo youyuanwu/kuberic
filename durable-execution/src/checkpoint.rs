@@ -755,6 +755,7 @@ impl ActivityRecord {
         attempt_id: AttemptId,
         disposition: EffectObservationDisposition,
         result: ExactBytes,
+        failure: Option<ActivityFailure>,
     ) -> Result<Self, CheckpointError> {
         let attempt_count = self.attempts.len();
         let Some(attempt) = self.attempts.last_mut() else {
@@ -770,7 +771,11 @@ impl ActivityRecord {
         match disposition {
             EffectObservationDisposition::Completed => {
                 *attempt = EffectAttempt::new(attempt_id, EffectAttemptState::Observed);
-                self.state = ActivityState::Completed { result };
+                if let Some(failure) = failure {
+                    self = self.with_failure(failure);
+                } else {
+                    self.state = ActivityState::Completed { result };
+                }
             }
             EffectObservationDisposition::ProvenNoAdmission if attempt_count == 1 => {
                 *attempt = EffectAttempt::new(attempt_id, EffectAttemptState::ProvenNoAdmission);
@@ -778,7 +783,11 @@ impl ActivityRecord {
             }
             EffectObservationDisposition::ProvenNoAdmission => {
                 *attempt = EffectAttempt::new(attempt_id, EffectAttemptState::Observed);
-                self.state = ActivityState::Completed { result };
+                if let Some(failure) = failure {
+                    self = self.with_failure(failure);
+                } else {
+                    self.state = ActivityState::Completed { result };
+                }
             }
         }
         validate_effect_attempts(&self.attempts)

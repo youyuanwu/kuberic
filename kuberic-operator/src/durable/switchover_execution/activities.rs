@@ -2,7 +2,7 @@ use kuberic_durable_execution::{CompletionClass, DurableActivity, DurableEffect}
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::crd::{EpochStatus, StablePartitionSnapshotStatus};
-use crate::durable::effects::{LabelEffectCommand, ReplicaEffectCommand};
+use crate::durable::effects::ReplicaEffectCommand;
 
 pub const DIRECT_SWITCHOVER_CONTRACT_VERSION: u32 = 4;
 pub const DIRECT_ACTIVITY_VERSION: u32 = 1;
@@ -12,86 +12,6 @@ pub const DIRECT_ACTIVITY_ERROR_MAX_BYTES: usize = 512;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EffectApplied {
     pub observed_at_unix_seconds: i64,
-}
-
-/// Reconciler-native result of an ordinary switchover activity.
-///
-/// The workflow contract is independent from the optional strict-effect
-/// implementation used behind four activity handlers.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "status", content = "value", rename_all = "snake_case")]
-pub enum SwitchoverActivityOutcome<T> {
-    Applied(T),
-    ProvenNoAdmission,
-    DomainFailure(kuberic_durable_execution::BoundedEffectError),
-    DeadlineExceeded(kuberic_durable_execution::BoundedEffectError),
-    UnavailableAtDeadline(kuberic_durable_execution::BoundedEffectError),
-    ConflictingEvidence(kuberic_durable_execution::BoundedEffectError),
-}
-
-impl<T> SwitchoverActivityOutcome<T> {
-    pub fn into_workflow_result(
-        self,
-        max_message_bytes: u64,
-    ) -> Result<T, kuberic_durable_execution::BoundedEffectError> {
-        use kuberic_durable_execution::{BoundedEffectError, EffectErrorKind};
-        match self {
-            Self::Applied(output) => Ok(output),
-            Self::ProvenNoAdmission => Err(BoundedEffectError::new(
-                EffectErrorKind::ProvenNoAdmission,
-                "dispatch was proven not admitted",
-                max_message_bytes,
-            )
-            .expect("fixed activity error fits the switchover error bound")),
-            Self::DomainFailure(error)
-            | Self::DeadlineExceeded(error)
-            | Self::UnavailableAtDeadline(error)
-            | Self::ConflictingEvidence(error) => {
-                error
-                    .validate(max_message_bytes)
-                    .expect("decoded activity result already satisfies its declared bound");
-                Err(error)
-            }
-        }
-    }
-}
-
-impl<T> From<kuberic_durable_execution::EffectOutcome<T>> for SwitchoverActivityOutcome<T> {
-    fn from(outcome: kuberic_durable_execution::EffectOutcome<T>) -> Self {
-        match outcome {
-            kuberic_durable_execution::EffectOutcome::Applied(value) => Self::Applied(value),
-            kuberic_durable_execution::EffectOutcome::ProvenNoAdmission => Self::ProvenNoAdmission,
-            kuberic_durable_execution::EffectOutcome::DomainFailure(error) => {
-                Self::DomainFailure(error)
-            }
-            kuberic_durable_execution::EffectOutcome::DeadlineExceeded(error) => {
-                Self::DeadlineExceeded(error)
-            }
-            kuberic_durable_execution::EffectOutcome::UnavailableAtDeadline(error) => {
-                Self::UnavailableAtDeadline(error)
-            }
-            kuberic_durable_execution::EffectOutcome::ConflictingEvidence(error) => {
-                Self::ConflictingEvidence(error)
-            }
-        }
-    }
-}
-
-impl<T> From<SwitchoverActivityOutcome<T>> for kuberic_durable_execution::EffectOutcome<T> {
-    fn from(outcome: SwitchoverActivityOutcome<T>) -> Self {
-        match outcome {
-            SwitchoverActivityOutcome::Applied(value) => Self::Applied(value),
-            SwitchoverActivityOutcome::ProvenNoAdmission => Self::ProvenNoAdmission,
-            SwitchoverActivityOutcome::DomainFailure(error) => Self::DomainFailure(error),
-            SwitchoverActivityOutcome::DeadlineExceeded(error) => Self::DeadlineExceeded(error),
-            SwitchoverActivityOutcome::UnavailableAtDeadline(error) => {
-                Self::UnavailableAtDeadline(error)
-            }
-            SwitchoverActivityOutcome::ConflictingEvidence(error) => {
-                Self::ConflictingEvidence(error)
-            }
-        }
-    }
 }
 
 pub trait SwitchoverActivityContract {
@@ -105,14 +25,11 @@ pub trait SwitchoverActivityContract {
     const COMPLETION_CLASS: CompletionClass;
 }
 
-pub(crate) trait SwitchoverActivityHandlerContract: SwitchoverActivityContract {
-    type Command;
+pub(crate) trait StrictSwitchoverActivityContract: SwitchoverActivityContract {
     type Family;
 }
 
 pub(crate) struct ReplicaEffectFamily;
-pub(crate) struct LabelEffectFamily;
-pub(crate) struct PassiveEffectFamily;
 
 pub type RevokeWritesOutput = EffectApplied;
 pub type DemoteOldPrimaryOutput = EffectApplied;
@@ -146,11 +63,6 @@ macro_rules! define_replica_activity {
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
         }
-
-        impl SwitchoverActivityHandlerContract for $activity {
-            type Command = Option<ReplicaEffectCommand>;
-            type Family = ReplicaEffectFamily;
-        }
     };
 }
 
@@ -168,11 +80,6 @@ macro_rules! define_label_activity {
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::ExternalEffect;
-        }
-
-        impl SwitchoverActivityHandlerContract for $activity {
-            type Command = Option<LabelEffectCommand>;
-            type Family = LabelEffectFamily;
         }
     };
 }
@@ -395,6 +302,10 @@ macro_rules! implement_strict_effect {
             const COMPLETION_CLASS: CompletionClass =
                 <Self as SwitchoverActivityContract>::COMPLETION_CLASS;
         }
+
+        impl StrictSwitchoverActivityContract for $activity {
+            type Family = ReplicaEffectFamily;
+        }
     };
 }
 
@@ -517,11 +428,6 @@ impl SwitchoverActivityContract for CaptureFrozenLsnActivity {
     const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
 }
 
-impl SwitchoverActivityHandlerContract for CaptureFrozenLsnActivity {
-    type Command = ();
-    type Family = PassiveEffectFamily;
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WaitTargetCaughtUpInput {
@@ -545,11 +451,6 @@ impl SwitchoverActivityContract for WaitTargetCaughtUpActivity {
     const MAX_RESULT_BYTES: u64 = 1_024;
     const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
     const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
-}
-
-impl SwitchoverActivityHandlerContract for WaitTargetCaughtUpActivity {
-    type Command = ();
-    type Family = PassiveEffectFamily;
 }
 
 macro_rules! define_attestation_activity {
@@ -579,11 +480,6 @@ macro_rules! define_attestation_activity {
             const MAX_RESULT_BYTES: u64 = $max_result;
             const MAX_ERROR_MESSAGE_BYTES: u64 = DIRECT_ACTIVITY_ERROR_MAX_BYTES as u64;
             const COMPLETION_CLASS: CompletionClass = CompletionClass::PassiveObservation;
-        }
-
-        impl SwitchoverActivityHandlerContract for $activity {
-            type Command = ();
-            type Family = PassiveEffectFamily;
         }
     };
 }
@@ -736,7 +632,7 @@ impl<'de, E: SwitchoverActivityContract> Deserialize<'de> for SwitchoverActivity
 
 impl<E: SwitchoverActivityContract> DurableActivity for OrdinarySwitchoverActivity<E> {
     type Input = SwitchoverActivityInput<E>;
-    type Output = SwitchoverActivityOutcome<E::Output>;
+    type Output = E::Output;
 
     const NAME: &'static str = E::NAME;
     const VERSION: u32 = E::VERSION;
@@ -860,7 +756,6 @@ mod tests {
     use kuberic_durable_execution::{
         ActivityCallError, BoundedEffectError, EffectContractError, EffectErrorKind, EffectOutcome,
         decode_activity_input, decode_activity_result, encode_activity_input,
-        encode_activity_result,
     };
 
     fn snapshot() -> StablePartitionSnapshotStatus {
@@ -956,14 +851,9 @@ mod tests {
                 <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
             )
             .unwrap();
-            let encoded = encode_activity_result::<OrdinarySwitchoverActivity<A>>(
-                &SwitchoverActivityOutcome::<EffectApplied>::UnavailableAtDeadline(error),
-            )
-            .unwrap();
             assert!(
-                decode_activity_result::<OrdinarySwitchoverActivity<A>>(&encoded).is_ok(),
-                "{}",
-                <A as SwitchoverActivityContract>::NAME
+                serde_json::to_vec(&error).unwrap().len()
+                    <= <A as SwitchoverActivityContract>::MAX_RESULT_BYTES as usize
             );
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
@@ -1044,11 +934,10 @@ mod tests {
                 <A as SwitchoverActivityContract>::MAX_ERROR_MESSAGE_BYTES,
             )
             .unwrap();
-            let encoded = encode_activity_result::<OrdinarySwitchoverActivity<A>>(
-                &SwitchoverActivityOutcome::<A::Output>::ConflictingEvidence(error),
-            )
-            .unwrap();
-            assert!(decode_activity_result::<OrdinarySwitchoverActivity<A>>(&encoded).is_ok());
+            assert!(
+                serde_json::to_vec(&error).unwrap().len()
+                    <= <A as SwitchoverActivityContract>::MAX_RESULT_BYTES as usize
+            );
         }
         for message in ["x".repeat(513), "é".repeat(257)] {
             assert!(matches!(

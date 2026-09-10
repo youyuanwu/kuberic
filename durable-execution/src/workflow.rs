@@ -122,18 +122,15 @@ impl<'history> WorkflowContext<'history> {
         let result = if let Some(metadata) = A::strict_effect_metadata() {
             poll_fn(|_| self.poll_effect(&spec, metadata)).await
         } else {
-            poll_fn(|_| self.poll_activity(&spec, A::completion_class()))
-                .await
-                .map_err(|failure| match failure {
-                    ActivityFailure::Application(error) => {
-                        ActivityInvocationError::Application(error)
-                    }
-                    ActivityFailure::TimedOut => ActivityInvocationError::TimedOut,
-                    ActivityFailure::ActionDeadlineExceeded => {
-                        ActivityInvocationError::ActionDeadlineExceeded
-                    }
-                })?
-        };
+            poll_fn(|_| self.poll_activity(&spec, A::completion_class())).await
+        }
+        .map_err(|failure| match failure {
+            ActivityFailure::Application(error) => ActivityInvocationError::Application(error),
+            ActivityFailure::TimedOut => ActivityInvocationError::TimedOut,
+            ActivityFailure::ActionDeadlineExceeded => {
+                ActivityInvocationError::ActionDeadlineExceeded
+            }
+        })?;
         decode_activity_result::<A>(&result).map_err(ActivityInvocationError::Call)
     }
 
@@ -220,7 +217,11 @@ impl<'history> WorkflowContext<'history> {
         }
     }
 
-    fn poll_effect(&mut self, spec: &ActivitySpec, metadata: EffectMetadata) -> Poll<ExactBytes> {
+    fn poll_effect(
+        &mut self,
+        spec: &ActivitySpec,
+        metadata: EffectMetadata,
+    ) -> Poll<Result<ExactBytes, ActivityFailure>> {
         if self.decision.is_some() {
             return Poll::Pending;
         }
@@ -312,7 +313,10 @@ impl<'history> WorkflowContext<'history> {
         match record.state() {
             ActivityState::Completed { result } => {
                 self.cursor += 1;
-                Poll::Ready(result.clone())
+                Poll::Ready(match record.failure() {
+                    Some(failure) => Err(failure.clone()),
+                    None => Ok(result.clone()),
+                })
             }
             state @ (ActivityState::Scheduled | ActivityState::DispatchExposed { .. }) => {
                 self.decision = Some(ContextDecision::ExistingPending {

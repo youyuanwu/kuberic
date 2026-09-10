@@ -83,6 +83,7 @@ pub struct EffectObservation {
     activity: LogicalActivityId,
     attempt_id: AttemptId,
     result: ExactBytes,
+    failure: Option<ActivityFailure>,
     disposition: EffectObservationDisposition,
 }
 
@@ -99,7 +100,36 @@ impl EffectObservation {
             activity,
             attempt_id,
             result,
+            failure: None,
             disposition: EffectObservationDisposition::Completed,
+        }
+    }
+
+    pub fn completed_failure(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        failure: ActivityFailure,
+    ) -> Self {
+        Self {
+            activity,
+            attempt_id,
+            result: ExactBytes::default(),
+            failure: Some(failure),
+            disposition: EffectObservationDisposition::Completed,
+        }
+    }
+
+    pub fn proven_no_admission(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        failure: ActivityFailure,
+    ) -> Self {
+        Self {
+            activity,
+            attempt_id,
+            result: ExactBytes::default(),
+            failure: Some(failure),
+            disposition: EffectObservationDisposition::ProvenNoAdmission,
         }
     }
 
@@ -124,6 +154,7 @@ impl EffectObservation {
             activity,
             attempt_id,
             result: crate::encode_activity_result::<crate::EffectActivity<E>>(outcome)?,
+            failure: None,
             disposition,
         })
     }
@@ -1088,10 +1119,18 @@ impl<S: CheckpointStore> DurableHost<S> {
         }
         let actual_result_bytes =
             u64::try_from(observation.result.as_slice().len()).unwrap_or(u64::MAX);
-        if actual_result_bytes > record.max_result_bytes() {
+        let actual_failure_bytes = observation
+            .failure
+            .as_ref()
+            .and_then(ActivityFailure::payload)
+            .map_or(0, |payload| {
+                u64::try_from(payload.as_slice().len()).unwrap_or(u64::MAX)
+            });
+        let actual_bytes = actual_result_bytes.max(actual_failure_bytes);
+        if actual_bytes > record.max_result_bytes() {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::ResultExceedsDeclaredBound {
-                    actual: actual_result_bytes,
+                    actual: actual_bytes,
                     maximum: record.max_result_bytes(),
                 },
             );
@@ -1101,6 +1140,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             observation.attempt_id,
             observation.disposition,
             observation.result,
+            observation.failure,
         ) {
             Ok(record) => record,
             Err(error) => return HostOutcome::CheckpointRejected(error),

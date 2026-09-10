@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    ActivityOptions, BoundedEffectError, EffectErrorKind, ExactBytes, TerminalOutcome, Workflow,
-    WorkflowContext,
+    ActivityInvocationError, ActivityOptions, BoundedEffectError, EffectErrorKind, ExactBytes,
+    TerminalOutcome, Workflow, WorkflowContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -650,9 +650,7 @@ async fn call_activity<A: SwitchoverActivityContract>(
     context
         .schedule_activity_typed::<OrdinarySwitchoverActivity<A>>(A::NAME, &input, options)
         .await
-        .map_err(|error| error.to_string())?
-        .into_workflow_result(A::MAX_ERROR_MESSAGE_BYTES)
-        .map_err(|error| error.to_string())
+        .map_err(activity_invocation_message)
 }
 
 async fn call_activity_branch<A: SwitchoverActivityContract>(
@@ -673,9 +671,32 @@ async fn call_activity_branch<A: SwitchoverActivityContract>(
     context
         .schedule_activity_typed::<OrdinarySwitchoverActivity<A>>(A::NAME, &input, options)
         .await
-        .map_err(|error| EffectBranch::Stopped(error.to_string()))?
-        .into_workflow_result(A::MAX_ERROR_MESSAGE_BYTES)
-        .map_err(effect_call_branch)
+        .map_err(activity_invocation_branch)
+}
+
+fn activity_invocation_message(error: ActivityInvocationError) -> String {
+    match error {
+        ActivityInvocationError::Application(payload) => {
+            serde_json::from_slice::<BoundedEffectError>(payload.as_slice())
+                .map(|error| error.to_string())
+                .unwrap_or_else(|_| "activity returned an invalid application failure".to_string())
+        }
+        other => other.to_string(),
+    }
+}
+
+fn activity_invocation_branch(error: ActivityInvocationError) -> EffectBranch {
+    match error {
+        ActivityInvocationError::Application(payload) => {
+            match serde_json::from_slice::<BoundedEffectError>(payload.as_slice()) {
+                Ok(error) => effect_call_branch(error),
+                Err(_) => EffectBranch::Stopped(
+                    "activity returned an invalid application failure".to_string(),
+                ),
+            }
+        }
+        other => EffectBranch::Stopped(other.to_string()),
+    }
 }
 
 fn effect_call_branch(error: BoundedEffectError) -> EffectBranch {
@@ -733,9 +754,10 @@ fn terminal(record: DirectSwitchoverTerminalRecord) -> TerminalOutcome {
 mod tests {
     use super::*;
     use kuberic_durable_execution::{
-        ActivityObservation, CheckpointLimits, DurableActivity, DurableHost, EffectMetadata,
-        ExactBytes, ExecutionId, ExecutionSpec, HostEpoch, HostOutcome, InMemoryCheckpointStore,
-        PreparedActivityError, PreparedCommand, PreparedEffectResolver, decode_effect_observation,
+        ActivityFailure, ActivityObservation, CheckpointLimits, DurableActivity, DurableHost,
+        EffectMetadata, EffectObservation, ExactBytes, ExecutionId, ExecutionSpec, HostEpoch,
+        HostOutcome, InMemoryCheckpointStore, PreparedActivityError, PreparedCommand,
+        PreparedEffectResolver,
     };
 
     use crate::crd::{EpochStatus, StableReplicaRoleStatus, StableReplicaSnapshotStatus};
@@ -872,55 +894,62 @@ mod tests {
                     );
                     *occurrence += 1;
                     observed_at += 1;
-                    let outcome = if matches!(
+                    let strict = matches!(
                         super::super::activities::activity_class(&name),
                         Some(
                             super::super::activities::SwitchoverActivityClass::StrictEffectRequired
                         )
-                    ) {
-                        macro_rules! decode {
-                                () => {
-                                    if name == <RevokeWritesActivity as SwitchoverActivityContract>::NAME {
-                                        decode_effect_observation::<RevokeWritesActivity>(
-                                            permit.activity().clone(),
-                                            permit.attempt_id(),
-                                            &result,
-                                        )
-                                        .unwrap()
-                                    } else if name == <DemoteOldPrimaryActivity as SwitchoverActivityContract>::NAME {
-                                        decode_effect_observation::<DemoteOldPrimaryActivity>(
-                                            permit.activity().clone(),
-                                            permit.attempt_id(),
-                                            &result,
-                                        )
-                                        .unwrap()
-                                    } else if name == <PromoteTargetActivity as SwitchoverActivityContract>::NAME {
-                                        decode_effect_observation::<PromoteTargetActivity>(
-                                            permit.activity().clone(),
-                                            permit.attempt_id(),
-                                            &result,
-                                        )
-                                        .unwrap()
-                                    } else if name == <CompensatePromoteOldPrimaryActivity as SwitchoverActivityContract>::NAME {
-                                        decode_effect_observation::<
-                                            CompensatePromoteOldPrimaryActivity,
-                                        >(
-                                            permit.activity().clone(), permit.attempt_id(), &result
-                                        )
-                                        .unwrap()
-                                    } else {
-                                        panic!("unregistered strict activity {name}")
-                                    }
-                                };
-                            }
-                        let observation = decode!();
-                        host.observe_effect(&execution, observation).await
-                    } else {
-                        host.observe(
-                            &execution,
-                            ActivityObservation::new(permit.activity().clone(), result),
-                        )
-                        .await
+                    );
+                    let outcome = match (strict, result) {
+                        (true, ScriptedResult::Success(result)) => {
+                            host.observe_effect(
+                                &execution,
+                                EffectObservation::completed(
+                                    permit.activity().clone(),
+                                    permit.attempt_id(),
+                                    result,
+                                ),
+                            )
+                            .await
+                        }
+                        (true, ScriptedResult::Failure(failure)) => {
+                            host.observe_effect(
+                                &execution,
+                                EffectObservation::completed_failure(
+                                    permit.activity().clone(),
+                                    permit.attempt_id(),
+                                    ActivityFailure::Application(failure),
+                                ),
+                            )
+                            .await
+                        }
+                        (true, ScriptedResult::ProvenNoAdmission(failure)) => {
+                            host.observe_effect(
+                                &execution,
+                                EffectObservation::proven_no_admission(
+                                    permit.activity().clone(),
+                                    permit.attempt_id(),
+                                    ActivityFailure::Application(failure),
+                                ),
+                            )
+                            .await
+                        }
+                        (false, ScriptedResult::Success(result)) => {
+                            host.observe(
+                                &execution,
+                                ActivityObservation::new(permit.activity().clone(), result),
+                            )
+                            .await
+                        }
+                        (false, ScriptedResult::Failure(failure))
+                        | (false, ScriptedResult::ProvenNoAdmission(failure)) => {
+                            host.observe_failure(
+                                &execution,
+                                permit.activity(),
+                                ActivityFailure::Application(failure),
+                            )
+                            .await
+                        }
                     };
                     assert!(matches!(outcome, HostOutcome::ObservationAccepted { .. }));
                 }
@@ -936,67 +965,61 @@ mod tests {
         }
     }
 
+    enum ScriptedResult {
+        Success(ExactBytes),
+        Failure(ExactBytes),
+        ProvenNoAdmission(ExactBytes),
+    }
+
     fn scripted_result(
         name: &str,
         observed_at: i64,
         failure: Option<ScriptedFailure>,
         proven_no_admission: bool,
         activity_input: &serde_json::Value,
-    ) -> ExactBytes {
-        let value = if proven_no_admission {
-            serde_json::json!({
-                "status": "proven_no_admission",
-            })
-        } else if let Some(failure) = failure {
-            let (status, kind) = match failure.kind {
-                ScriptedFailureKind::Failed => ("domain_failure", "domain_failure"),
-                ScriptedFailureKind::DeadlineExceeded => ("deadline_exceeded", "deadline_exceeded"),
+    ) -> ScriptedResult {
+        if proven_no_admission {
+            let error = BoundedEffectError::observed_at(
+                EffectErrorKind::ProvenNoAdmission,
+                "dispatch was proven not admitted",
+                observed_at,
+                512,
+            )
+            .unwrap();
+            return ScriptedResult::ProvenNoAdmission(ExactBytes::new(
+                serde_json::to_vec(&error).unwrap(),
+            ));
+        }
+        if let Some(failure) = failure {
+            let kind = match failure.kind {
+                ScriptedFailureKind::Failed => EffectErrorKind::DomainFailure,
+                ScriptedFailureKind::DeadlineExceeded => EffectErrorKind::DeadlineExceeded,
                 ScriptedFailureKind::UnavailableAtDeadline => {
-                    ("unavailable_at_deadline", "unavailable_at_deadline")
+                    EffectErrorKind::UnavailableAtDeadline
                 }
             };
+            let error =
+                BoundedEffectError::observed_at(kind, failure.message, observed_at, 512).unwrap();
+            return ScriptedResult::Failure(ExactBytes::new(serde_json::to_vec(&error).unwrap()));
+        }
+        let value = if name == CaptureFrozenLsnActivity::NAME {
             serde_json::json!({
-                "status": status,
-                "value": {
-                    "kind": kind,
-                    "message": failure.message,
-                    "observed_at_unix_seconds": observed_at,
-                }
-            })
-        } else if name == CaptureFrozenLsnActivity::NAME {
-            serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "frozenLsn": 55,
-                    "observedAtUnixSeconds": observed_at,
-                }
-            })
-        } else if name == WaitTargetCaughtUpActivity::NAME {
-            serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "observedAtUnixSeconds": observed_at,
-                }
+                "frozenLsn": 55,
+                "observedAtUnixSeconds": observed_at,
             })
         } else if name == AttestTargetTopologyActivity::NAME
             || name == AttestCompensatedTopologyActivity::NAME
         {
             serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "observedAtUnixSeconds": observed_at,
-                    "snapshot": activity_input.get("expectedSnapshot").unwrap(),
-                }
+                "observedAtUnixSeconds": observed_at,
+                "snapshot": activity_input.get("expectedSnapshot").unwrap(),
             })
         } else {
             serde_json::json!({
-                "status": "applied",
-                "value": {
-                    "observedAtUnixSeconds": observed_at,
-                }
+                "observedAtUnixSeconds": observed_at,
             })
         };
-        ExactBytes::new(serde_json::to_vec(&value).unwrap())
+        ScriptedResult::Success(ExactBytes::new(serde_json::to_vec(&value).unwrap()))
     }
 
     #[tokio::test]

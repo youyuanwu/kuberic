@@ -547,11 +547,18 @@ pub async fn execute_label_command(
     namespace: &str,
     command: &LabelEffectCommand,
 ) {
+    let _ = execute_label_command_checked(api, namespace, command).await;
+}
+
+pub async fn execute_label_command_checked(
+    api: &dyn ClusterApi,
+    namespace: &str,
+    command: &LabelEffectCommand,
+) -> Result<(), String> {
     let mut labels = BTreeMap::new();
     labels.insert("kuberic.io/role".to_string(), command.role.clone());
-    let _ = api
-        .patch_pod_labels_if_uid(namespace, &command.pod_name, &command.expected_uid, labels)
-        .await;
+    api.patch_pod_labels_if_uid(namespace, &command.pod_name, &command.expected_uid, labels)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

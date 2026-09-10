@@ -401,7 +401,7 @@ pub struct EffectMetadata {
 /// Result of one framework-owned typed lifecycle evaluation.
 #[derive(Debug, Eq, PartialEq)]
 pub enum EffectHostStep {
-    Observed(crate::EffectObservation),
+    Observed(Box<crate::EffectObservation>),
     Pending,
 }
 
@@ -488,6 +488,7 @@ where
         .map_err(|error| error.to_string())?
     {
         return crate::EffectObservation::from_outcome::<E>(activity.clone(), attempt_id, &outcome)
+            .map(Box::new)
             .map(EffectHostStep::Observed)
             .map_err(|error| error.to_string());
     }
@@ -497,6 +498,7 @@ where
     {
         Some(outcome) => {
             crate::EffectObservation::from_outcome::<E>(activity.clone(), attempt_id, &outcome)
+                .map(Box::new)
                 .map(EffectHostStep::Observed)
                 .map_err(|error| error.to_string())
         }
