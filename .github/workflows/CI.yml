@@ -54,6 +54,15 @@ jobs:
         config: deploy/kind-isolated-config.yaml
         kubeconfig: ${{ env.KUBECONFIG }}
 
+    - name: Record and verify isolated KinD ownership
+      run: |
+        printf '%s\n' \
+          "cluster=${KIND_CLUSTER_NAME}" \
+          "context=${KUBE_CONTEXT}" \
+          "kubeconfig=${KUBECONFIG}" \
+          | install -m 600 /dev/stdin "${KUBECONFIG}.kuberic-owner"
+        just verify-kind-context
+
     - name: Build and load Docker images
       run: just images
 

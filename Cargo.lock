@@ -1418,6 +1418,7 @@ dependencies = [
  "prost",
  "rand",
  "serde_json",
+ "serial_test",
  "test-log",
  "tokio",
  "tokio-util",

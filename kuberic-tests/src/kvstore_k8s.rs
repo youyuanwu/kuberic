@@ -1,6 +1,7 @@
 /// Test kvstore deployed in KinD: write and read via gRPC client over NodePort.
 #[tokio::test]
 #[test_log::test]
+#[serial_test::serial]
 async fn test_kvstore_k8s_write_read() {
     crate::test_utils::ensure_kvstore_deployed().await;
 
@@ -46,6 +47,7 @@ async fn test_kvstore_k8s_write_read() {
 /// Test kvstore KubericSet status shows Healthy with 3 replicas.
 #[tokio::test]
 #[test_log::test]
+#[serial_test::serial]
 async fn test_kvstore_k8s_status_healthy() {
     crate::test_utils::ensure_kvstore_deployed().await;
 
