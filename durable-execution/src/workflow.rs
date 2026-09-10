@@ -120,7 +120,9 @@ impl<'history> WorkflowContext<'history> {
         options: ActivityOptions,
     ) -> Result<A::Output, ActivityInvocationError> {
         let spec = activity_spec_named::<A>(name, input, options)?;
-        let result =
+        let result = if let Some(metadata) = A::strict_effect_metadata() {
+            poll_fn(|_| self.poll_effect(&spec, metadata)).await
+        } else {
             poll_fn(|_| self.poll_activity(&spec))
                 .await
                 .map_err(|failure| match failure {
@@ -131,7 +133,8 @@ impl<'history> WorkflowContext<'history> {
                     ActivityFailure::ActionDeadlineExceeded => {
                         ActivityInvocationError::ActionDeadlineExceeded
                     }
-                })?;
+                })?
+        };
         decode_activity_result::<A>(&result).map_err(ActivityInvocationError::Call)
     }
 

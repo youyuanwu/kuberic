@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
-    DurableEffect, EffectCallError, EffectErrorKind, ExactBytes, TerminalOutcome, Workflow,
-    WorkflowContext,
+    ActivityCallError, ActivityOptions, DurableEffect, EffectCallError, EffectErrorKind,
+    ExactBytes, TerminalOutcome, Workflow, WorkflowContext,
 };
 use serde::{Deserialize, Serialize};
 
@@ -20,9 +20,10 @@ use super::activities::{
     InstallCompensationCurrentConfigurationActivity, InstallCompensationCurrentConfigurationInput,
     InstallTargetCatchUpConfigurationActivity, InstallTargetCatchUpConfigurationInput,
     InstallTargetCurrentConfigurationActivity, InstallTargetCurrentConfigurationInput,
-    PromoteTargetActivity, PromoteTargetInput, PublishOldPrimarySecondaryLabelActivity,
-    PublishOldPrimarySecondaryLabelInput, PublishTargetPrimaryLabelActivity,
-    PublishTargetPrimaryLabelInput, RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
+    OrdinarySwitchoverActivity, PromoteTargetActivity, PromoteTargetInput,
+    PublishOldPrimarySecondaryLabelActivity, PublishOldPrimarySecondaryLabelInput,
+    PublishTargetPrimaryLabelActivity, PublishTargetPrimaryLabelInput,
+    RestoreOldPrimaryLabelActivity, RestoreOldPrimaryLabelInput,
     RestorePreviousCurrentConfigurationActivity, RestorePreviousCurrentConfigurationInput,
     RestoreTargetSecondaryLabelActivity, RestoreTargetSecondaryLabelInput, RevokeWritesActivity,
     RevokeWritesInput, WaitTargetCaughtUpActivity, WaitTargetCaughtUpInput,
@@ -673,8 +674,14 @@ async fn call_activity<A: DurableEffect>(
 ) -> Result<A::Output, String> {
     budget.consume(A::NAME)?;
     context
-        .call_effect::<A>(input)
+        .schedule_activity_typed::<OrdinarySwitchoverActivity<A>>(
+            A::NAME,
+            &input,
+            ActivityOptions::default(),
+        )
         .await
+        .map_err(|error| error.to_string())?
+        .into_workflow_result(A::MAX_ERROR_MESSAGE_BYTES)
         .map_err(|error| error.to_string())
 }
 
@@ -685,8 +692,18 @@ async fn call_activity_branch<A: DurableEffect>(
 ) -> Result<A::Output, EffectBranch> {
     budget.consume(A::NAME).map_err(EffectBranch::Stopped)?;
     context
-        .call_effect::<A>(input)
+        .schedule_activity_typed::<OrdinarySwitchoverActivity<A>>(
+            A::NAME,
+            &input,
+            ActivityOptions::default(),
+        )
         .await
+        .map_err(|error| {
+            effect_call_branch(EffectCallError::Activity(ActivityCallError::Handler(
+                error.to_string(),
+            )))
+        })?
+        .into_workflow_result(A::MAX_ERROR_MESSAGE_BYTES)
         .map_err(effect_call_branch)
 }
 

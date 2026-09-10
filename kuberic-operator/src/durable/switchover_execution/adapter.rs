@@ -1280,7 +1280,7 @@ mod tests {
             )
             .unwrap();
             let outcome = runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1361,7 +1361,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1625,7 +1625,7 @@ mod tests {
                     )
                     .unwrap();
                     match runner
-                        .run_effects(
+                        .run_activities(
                             &mut restarted,
                             &DirectSwitchoverWorkflow,
                             execution.clone(),
@@ -1873,7 +1873,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1935,7 +1935,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1960,7 +1960,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -1986,7 +1986,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2053,7 +2053,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2079,7 +2079,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2142,7 +2142,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2208,7 +2208,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2239,7 +2239,7 @@ mod tests {
                     .unwrap();
                     assert!(matches!(
                         runner
-                            .run_effects(
+                            .run_activities(
                                 &mut host,
                                 &DirectSwitchoverWorkflow,
                                 execution.clone(),
@@ -2315,7 +2315,7 @@ mod tests {
             )
             .unwrap();
             match runner
-                .run_effects(
+                .run_activities(
                     &mut host,
                     &DirectSwitchoverWorkflow,
                     execution.clone(),
@@ -2449,7 +2449,7 @@ mod tests {
                 )
                 .unwrap();
                 match runner
-                    .run_effects(
+                    .run_activities(
                         &mut host,
                         &DirectSwitchoverWorkflow,
                         execution.clone(),

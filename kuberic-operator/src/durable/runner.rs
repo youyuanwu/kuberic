@@ -644,7 +644,7 @@ impl DurableRunner {
     }
 
     /// Run the shared lifecycle for a statically routed typed-effect adapter.
-    pub async fn run_effects<W, A>(
+    pub async fn run_activities<W, A>(
         &self,
         host: &mut DurableOperatorHost,
         workflow: &W,
@@ -2016,7 +2016,7 @@ mod durable_runner_tests {
         adapter.prove_first_no_admission = true;
         let outcome = DurableRunner::new(12)
             .unwrap()
-            .run_effects(&mut host, &TypedWorkflow, execution(40), &mut adapter, 0)
+            .run_activities(&mut host, &TypedWorkflow, execution(40), &mut adapter, 0)
             .await;
         let DurableRunnerOutcome::Terminal(metadata) = outcome else {
             panic!("typed workflow did not complete");
@@ -2040,7 +2040,7 @@ mod durable_runner_tests {
         first_adapter.interrupt_first = true;
         let interrupted = DurableRunner::new(8)
             .unwrap()
-            .run_effects(
+            .run_activities(
                 &mut first_host,
                 &TypedWorkflow,
                 execution(41),
@@ -2055,7 +2055,7 @@ mod durable_runner_tests {
         let mut restarted_adapter = typed_adapter();
         let completed = DurableRunner::new(12)
             .unwrap()
-            .run_effects(
+            .run_activities(
                 &mut restarted_host,
                 &TypedWorkflow,
                 execution(41),

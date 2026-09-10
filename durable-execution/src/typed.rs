@@ -138,6 +138,11 @@ pub trait DurableActivity {
     const VERSION: u32;
     const MAX_INPUT_BYTES: u64;
     const MAX_RESULT_BYTES: u64;
+
+    #[doc(hidden)]
+    fn strict_effect_metadata() -> Option<crate::EffectMetadata> {
+        None
+    }
 }
 
 /// Portable deterministic failure while constructing or decoding a typed call.

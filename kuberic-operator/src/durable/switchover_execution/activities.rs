@@ -622,12 +622,16 @@ pub struct OrdinarySwitchoverActivity<E>(std::marker::PhantomData<E>);
 
 impl<E: DurableEffect> DurableActivity for OrdinarySwitchoverActivity<E> {
     type Input = E::Request;
-    type Output = E::Output;
+    type Output = kuberic_durable_execution::EffectOutcome<E::Output>;
 
     const NAME: &'static str = E::NAME;
     const VERSION: u32 = E::VERSION;
     const MAX_INPUT_BYTES: u64 = E::MAX_REQUEST_BYTES;
     const MAX_RESULT_BYTES: u64 = E::MAX_RESULT_BYTES;
+
+    fn strict_effect_metadata() -> Option<kuberic_durable_execution::EffectMetadata> {
+        Some(kuberic_durable_execution::EffectMetadata::of::<E>())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
