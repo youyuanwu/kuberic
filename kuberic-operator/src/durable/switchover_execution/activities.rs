@@ -1,4 +1,6 @@
-use kuberic_durable_execution::{CompletionClass, DurableEffect, durable_effect_set};
+use kuberic_durable_execution::{
+    CompletionClass, DurableActivity, DurableEffect, durable_effect_set,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::crd::{EpochStatus, StablePartitionSnapshotStatus};
@@ -616,6 +618,115 @@ pub const ALL_DIRECT_ACTIVITY_IDENTITIES: &[(&str, u32)] = &[
     ),
 ];
 
+pub struct OrdinarySwitchoverActivity<E>(std::marker::PhantomData<E>);
+
+impl<E: DurableEffect> DurableActivity for OrdinarySwitchoverActivity<E> {
+    type Input = E::Request;
+    type Output = E::Output;
+
+    const NAME: &'static str = E::NAME;
+    const VERSION: u32 = E::VERSION;
+    const MAX_INPUT_BYTES: u64 = E::MAX_REQUEST_BYTES;
+    const MAX_RESULT_BYTES: u64 = E::MAX_RESULT_BYTES;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwitchoverActivityClass {
+    PassiveReadOnly,
+    NaturallyIdempotent,
+    IdentityFencedIdempotent,
+    StrictEffectRequired,
+}
+
+pub const SWITCHOVER_ACTIVITY_CLASSIFICATION: &[(&str, SwitchoverActivityClass)] = &[
+    (
+        CaptureFrozenLsnActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        WaitTargetCaughtUpActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        AttestTargetTopologyActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        AttestCompensatedTopologyActivity::NAME,
+        SwitchoverActivityClass::PassiveReadOnly,
+    ),
+    (
+        PublishTargetPrimaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        PublishOldPrimarySecondaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        RestoreOldPrimaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        RestoreTargetSecondaryLabelActivity::NAME,
+        SwitchoverActivityClass::NaturallyIdempotent,
+    ),
+    (
+        DistributeReplicaEpochActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallTargetCatchUpConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        WaitTargetWriteQuorumActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallTargetCurrentConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        RestorePreviousCurrentConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        CompensateDistributeReplicaEpochActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallCompensationCatchUpConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        InstallCompensationCurrentConfigurationActivity::NAME,
+        SwitchoverActivityClass::IdentityFencedIdempotent,
+    ),
+    (
+        RevokeWritesActivity::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+    (
+        DemoteOldPrimaryActivity::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+    (
+        PromoteTargetActivity::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+    (
+        CompensatePromoteOldPrimaryActivity::NAME,
+        SwitchoverActivityClass::StrictEffectRequired,
+    ),
+];
+
+pub fn activity_class(name: &str) -> Option<SwitchoverActivityClass> {
+    SWITCHOVER_ACTIVITY_CLASSIFICATION
+        .iter()
+        .find_map(|(registered, class)| (*registered == name).then_some(*class))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1142,5 +1253,53 @@ mod tests {
             }
         });
         assert_bounded_message_result::<AttestCompensatedTopologyActivity>();
+    }
+
+    #[test]
+    fn every_switchover_activity_has_one_reviewed_implementation_class() {
+        let identities = ALL_DIRECT_ACTIVITY_IDENTITIES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let classified = SWITCHOVER_ACTIVITY_CLASSIFICATION
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities, classified);
+        assert_eq!(classified.len(), 20);
+        for class in [
+            SwitchoverActivityClass::PassiveReadOnly,
+            SwitchoverActivityClass::NaturallyIdempotent,
+            SwitchoverActivityClass::IdentityFencedIdempotent,
+            SwitchoverActivityClass::StrictEffectRequired,
+        ] {
+            let expected = if class == SwitchoverActivityClass::IdentityFencedIdempotent {
+                8
+            } else {
+                4
+            };
+            assert_eq!(
+                SWITCHOVER_ACTIVITY_CLASSIFICATION
+                    .iter()
+                    .filter(|(_, actual)| *actual == class)
+                    .count(),
+                expected
+            );
+        }
+        assert!(identities.iter().all(|name| activity_class(name).is_some()));
+    }
+
+    #[test]
+    fn ordinary_contract_preserves_the_typed_name_and_bounds() {
+        type Contract = OrdinarySwitchoverActivity<PromoteTargetActivity>;
+        assert_eq!(Contract::NAME, PromoteTargetActivity::NAME);
+        assert_eq!(
+            Contract::MAX_INPUT_BYTES,
+            PromoteTargetActivity::MAX_REQUEST_BYTES
+        );
+        assert_eq!(
+            Contract::MAX_RESULT_BYTES,
+            PromoteTargetActivity::MAX_RESULT_BYTES
+        );
     }
 }
