@@ -55,9 +55,11 @@ let sent = context
 ```
 
 An immutable `ActivityRegistry` validates names, versions, exact recorded
-bounds, and typed input before invoking a handler. `invoke_embedded` lets an
-operator handler borrow current reconciliation state without moving identity
-or codec validation out of the framework.
+bounds, and typed input before invoking an owned handler.
+`ScopedActivityRegistry<S>` provides the same registry-owned dispatch while
+letting a handler borrow mutable embedding state, such as one reconciliation
+snapshot, for the duration of an invocation. Identity, codec validation, and
+handler selection remain framework-owned.
 
 Ordinary activities have practical at-least-once semantics. One logical record
 contains bounded physical attempts; the default policy permits three attempts

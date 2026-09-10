@@ -218,25 +218,27 @@ operation-specific version-1 typed activities in one immutable registry.
 Four passive/read-only, four naturally idempotent, and eight identity-fenced
 idempotent handlers use ordinary at-least-once semantics. Only four
 write-authority handlers retain exact prepared-command strict handling.
-The direct async workflow
-visibly spells out ordered normal, pre-promotion restore, and post-promotion
-compensation paths. The adapter prepares individually correlated
-`ReplicaAgent` and exact-UID label commands but does not select protocol
-progression. A coarse agent-owned switchover intent was not introduced: unlike
-add and remove, the sequence spans multiple replicas and Kubernetes routing
-objects, and the existing per-command fences already supply authoritative
-ambiguity recovery.
+The direct async workflow visibly spells out ordered normal, pre-promotion
+restore, and post-promotion compensation paths. The scoped registry owns all
+16 ordinary async handlers and lends each one the current reconciliation
+state. The adapter prepares individually correlated `ReplicaAgent` commands
+only for the four strict write-authority operations; ordinary ReplicaAgent and
+exact-UID label handlers use normal typed results, retryable failures, and
+authoritative observation. A coarse agent-owned switchover intent was not
+introduced: unlike add and remove, the sequence spans multiple replicas and
+Kubernetes routing objects, and the existing per-command fences already
+supply authoritative ambiguity recovery.
 
 The activity requests are operation-local rather than aliases of a shared
 replica/label request and contain no host redelivery or prepared-command
-fields. Prepared exposed commands use a stricter recovery mode
-than undispatched requests: replica quarantine accepts only matching terminal
-ledger evidence, an exact postcondition, or generation-change non-admission;
-labels accept only their exact UID-fenced postcondition. Evidence-only exposed
-effects are re-evaluated without dispatch authority and wait rather than
-isolate if a command would be required. Compact terminals record the completed
-branch; the kernel authenticates exact completion and classification totals
-while the operator validates the legal branch and topology before publication.
+fields. Prepared exposed commands use a stricter recovery mode than undispatched
+requests: strict replica quarantine accepts only matching terminal ledger
+evidence, an exact postcondition, or generation-change non-admission.
+Ordinary recovery invokes the same registered handler observation-only; a
+missing result consumes a bounded persisted retry before redispatch. Compact
+terminals record the completed branch; the kernel authenticates exact
+completion and classification totals while the operator validates the legal
+branch and topology before publication.
 
 The product supports 1–9 replicas. A one-member set has no distinct switchover
 target; direct switchover accepts valid stable topologies with 2–9 members.
