@@ -1,4 +1,4 @@
-cluster_name := "kind"
+cluster_name := env_var_or_default("KIND_CLUSTER_NAME", "kind")
 
 # Build and load all container images into Kind.
 default: images
