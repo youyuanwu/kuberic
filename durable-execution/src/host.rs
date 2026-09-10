@@ -109,6 +109,15 @@ impl EffectObservation {
             disposition,
         })
     }
+
+    /// Whether this observation proves that the exposed attempt was not
+    /// admitted and is therefore eligible for the single bounded redelivery.
+    pub const fn is_proven_no_admission(&self) -> bool {
+        matches!(
+            self.disposition,
+            EffectObservationDisposition::ProvenNoAdmission
+        )
+    }
 }
 
 /// Unforgeable evidence that the dispatch-exposed checkpoint was accepted.

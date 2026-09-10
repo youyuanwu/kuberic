@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use crate::{
     ActivityCallError, ActivitySpec, AttemptId, DurableActivity, ExactBytes, ExecutionId,
-    PreparedActivityError,
+    LogicalActivityId, PreparedActivityError,
 };
 
 /// Immutable framework classification authenticated with completed history.
@@ -149,6 +149,8 @@ pub fn validate_effect_attempts(attempts: &[EffectAttempt]) -> Result<(), Effect
 pub struct BoundedEffectError {
     kind: EffectErrorKind,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at_unix_seconds: Option<i64>,
 }
 
 impl BoundedEffectError {
@@ -165,7 +167,22 @@ impl BoundedEffectError {
                 max_bytes: max_message_bytes,
             });
         }
-        Ok(Self { kind, message })
+        Ok(Self {
+            kind,
+            message,
+            observed_at_unix_seconds: None,
+        })
+    }
+
+    pub fn observed_at(
+        kind: EffectErrorKind,
+        message: impl Into<String>,
+        observed_at_unix_seconds: i64,
+        max_message_bytes: u64,
+    ) -> Result<Self, EffectContractError> {
+        let mut error = Self::new(kind, message, max_message_bytes)?;
+        error.observed_at_unix_seconds = Some(observed_at_unix_seconds);
+        Ok(error)
     }
 
     pub const fn kind(&self) -> EffectErrorKind {
@@ -174,6 +191,10 @@ impl BoundedEffectError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub const fn observed_at_unix_seconds(&self) -> Option<i64> {
+        self.observed_at_unix_seconds
     }
 
     pub fn validate(&self, max_message_bytes: u64) -> Result<(), EffectContractError> {
@@ -442,6 +463,12 @@ pub trait DurableEffectSet {
         command: &PreparedCommand,
     ) -> Result<Self::Route, EffectRoutingError>;
 
+    fn observation(
+        activity: LogicalActivityId,
+        attempt_id: AttemptId,
+        result: &ExactBytes,
+    ) -> Result<crate::EffectObservation, EffectRoutingError>;
+
     fn validate() -> Result<(), EffectRoutingError> {
         validate_effect_registrations(Self::registrations())
     }
@@ -493,6 +520,50 @@ pub trait HostedEffectSet<H>: DurableEffectSet {
     ) -> Result<Option<crate::EffectObservation>, String>;
 }
 
+/// Static preparation routing for a closed effect set.
+pub trait PreparedEffectSet<H>: DurableEffectSet {
+    fn resolve_prepared(
+        handler: &H,
+        execution_id: ExecutionId,
+        logical: &ActivitySpec,
+        metadata: EffectMetadata,
+        recorded: Option<&PreparedCommand>,
+    ) -> Result<PreparedCommand, PreparedActivityError>;
+}
+
+pub struct StaticEffectResolver<'a, S, H> {
+    handler: &'a H,
+    marker: PhantomData<S>,
+}
+
+impl<'a, S, H> StaticEffectResolver<'a, S, H>
+where
+    S: PreparedEffectSet<H>,
+{
+    pub const fn new(handler: &'a H) -> Self {
+        Self {
+            handler,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<S, H> PreparedEffectResolver for StaticEffectResolver<'_, S, H>
+where
+    S: PreparedEffectSet<H> + Sync,
+    H: Sync,
+{
+    fn resolve(
+        &self,
+        execution_id: ExecutionId,
+        logical: &ActivitySpec,
+        metadata: EffectMetadata,
+        recorded: Option<&PreparedCommand>,
+    ) -> Result<PreparedCommand, PreparedActivityError> {
+        S::resolve_prepared(self.handler, execution_id, logical, metadata, recorded)
+    }
+}
+
 pub fn validate_effect_registrations(
     registrations: &[EffectRegistration],
 ) -> Result<(), EffectRoutingError> {
@@ -535,6 +606,8 @@ pub enum EffectRoutingError {
     RequestDecoding,
     #[error("effect command could not be decoded")]
     CommandDecoding,
+    #[error("effect result could not be decoded")]
+    ResultDecoding,
 }
 
 /// Declare a closed effect set and its statically typed route enum.
@@ -587,6 +660,31 @@ macro_rules! durable_effect_set {
                         let command = $crate::decode_effect_command::<$effect>(command)
                             .map_err(|_| $crate::EffectRoutingError::CommandDecoding)?;
                         return Ok($route::$effect { request, command });
+                    }
+                )+
+                unreachable!("registration was selected from the generated effect list")
+            }
+
+            fn observation(
+                activity: $crate::LogicalActivityId,
+                attempt_id: $crate::AttemptId,
+                result: &$crate::ExactBytes,
+            ) -> Result<$crate::EffectObservation, $crate::EffectRoutingError> {
+                let registration = Self::registration(activity.spec())?;
+                $(
+                    if registration.name() == <$effect as $crate::DurableEffect>::NAME
+                        && registration.version() == <$effect as $crate::DurableEffect>::VERSION
+                    {
+                        let outcome = $crate::decode_activity_result::<
+                            $crate::EffectActivity<$effect>
+                        >(result)
+                        .map_err(|_| $crate::EffectRoutingError::ResultDecoding)?;
+                        return $crate::EffectObservation::from_outcome::<$effect>(
+                            activity,
+                            attempt_id,
+                            &outcome,
+                        )
+                        .map_err(|_| $crate::EffectRoutingError::ResultDecoding);
                     }
                 )+
                 unreachable!("registration was selected from the generated effect list")
@@ -689,6 +787,72 @@ macro_rules! durable_effect_set {
                         }
                     )+
                 }
+            }
+        }
+
+        impl<H> $crate::PreparedEffectSet<H> for $set
+        where
+            H: Sync $(+ $crate::PrepareEffect<
+                $effect,
+                Evidence = (),
+                Authority = (),
+            >)+,
+        {
+            fn resolve_prepared(
+                handler: &H,
+                _execution_id: $crate::ExecutionId,
+                logical: &$crate::ActivitySpec,
+                metadata: $crate::EffectMetadata,
+                recorded: Option<&$crate::PreparedCommand>,
+            ) -> Result<$crate::PreparedCommand, $crate::PreparedActivityError> {
+                let registration =
+                    <Self as $crate::DurableEffectSet>::registration(logical)
+                        .map_err(|_| $crate::PreparedActivityError::Validation)?;
+                if registration.max_command_bytes() != metadata.max_command_bytes()
+                    || registration.completion_class() != metadata.completion_class()
+                {
+                    return Err($crate::PreparedActivityError::Validation);
+                }
+                $(
+                    if registration.name() == <$effect as $crate::DurableEffect>::NAME
+                        && registration.version() == <$effect as $crate::DurableEffect>::VERSION
+                    {
+                        let request = $crate::decode_effect_request::<$effect>(logical.input())
+                            .map_err(|_| $crate::PreparedActivityError::Encoding)?;
+                        let command = if let Some(recorded) = recorded {
+                            let command = $crate::decode_effect_command::<$effect>(recorded)
+                                .map_err(|_| $crate::PreparedActivityError::Validation)?;
+                            <H as $crate::PrepareEffect<$effect>>::validate_recorded(
+                                handler,
+                                &request,
+                                &command,
+                                &(),
+                            )
+                            .map_err(|_| $crate::PreparedActivityError::Validation)?;
+                            command
+                        } else {
+                            <H as $crate::PrepareEffect<$effect>>::prepare(
+                                handler,
+                                &request,
+                                &(),
+                                &(),
+                            )
+                            .map_err(|_| $crate::PreparedActivityError::Derivation)?
+                        };
+                        return $crate::encode_effect_command::<$effect>(&command)
+                            .map_err(|error| match error {
+                                $crate::EffectContractError::CommandTooLarge {
+                                    actual_bytes,
+                                    max_bytes,
+                                } => $crate::PreparedActivityError::CommandTooLarge {
+                                    actual_bytes,
+                                    max_bytes,
+                                },
+                                _ => $crate::PreparedActivityError::Encoding,
+                            });
+                    }
+                )+
+                unreachable!("registration was selected from the generated effect list")
             }
         }
     };
