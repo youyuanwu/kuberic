@@ -12,7 +12,7 @@ type HandlerFuture = Pin<Box<dyn Future<Output = Result<ExactBytes, ActivityHand
 type ErasedHandler = dyn Fn(ActivityContext, ExactBytes) -> HandlerFuture + Send + Sync;
 
 struct RegistryEntry {
-    handler: Arc<ErasedHandler>,
+    handler: Option<Arc<ErasedHandler>>,
     max_input_bytes: u64,
     max_result_bytes: u64,
 }
@@ -132,6 +132,15 @@ pub struct ActivityRegistryBuilder {
 }
 
 impl ActivityRegistryBuilder {
+    /// Register a typed contract whose concrete handler is hosted by an
+    /// embedding runtime.
+    pub fn register_contract<A>(self, name: &str) -> Self
+    where
+        A: DurableActivity + Send + Sync + 'static,
+    {
+        self.register_entry::<A>(name, None)
+    }
+
     pub fn register<A, H, F>(self, name: &str, handler: H) -> Self
     where
         A: DurableActivity + Send + Sync + 'static,
@@ -143,13 +152,34 @@ impl ActivityRegistryBuilder {
         self.register_inner::<A, H, F>(name, handler)
     }
 
-    fn register_inner<A, H, F>(mut self, name: &str, handler: H) -> Self
+    fn register_inner<A, H, F>(self, name: &str, handler: H) -> Self
     where
         A: DurableActivity + Send + Sync + 'static,
         A::Input: Send + 'static,
         A::Output: Send + 'static,
         H: Fn(ActivityContext, A::Input) -> F + Send + Sync + 'static,
         F: Future<Output = Result<A::Output, ActivityHandlerError>> + Send + 'static,
+    {
+        let erased = move |context: ActivityContext, input: ExactBytes| {
+            let decoded = decode_activity_input::<A>(&input);
+            match decoded {
+                Ok(input) => {
+                    let future = handler(context, input);
+                    Box::pin(async move {
+                        let output = future.await?;
+                        encode_activity_result::<A>(&output).map_err(ActivityHandlerError::Codec)
+                    }) as HandlerFuture
+                }
+                Err(error) => Box::pin(async move { Err(ActivityHandlerError::Codec(error)) })
+                    as HandlerFuture,
+            }
+        };
+        self.register_entry::<A>(name, Some(Arc::new(erased)))
+    }
+
+    fn register_entry<A>(mut self, name: &str, handler: Option<Arc<ErasedHandler>>) -> Self
+    where
+        A: DurableActivity,
     {
         if self.error.is_some() {
             return self;
@@ -176,24 +206,10 @@ impl ActivityRegistryBuilder {
             self.error = Some(ActivityRegistryError::DuplicateRegistration(activity_name));
             return self;
         }
-        let erased = move |context: ActivityContext, input: ExactBytes| {
-            let decoded = decode_activity_input::<A>(&input);
-            match decoded {
-                Ok(input) => {
-                    let future = handler(context, input);
-                    Box::pin(async move {
-                        let output = future.await?;
-                        encode_activity_result::<A>(&output).map_err(ActivityHandlerError::Codec)
-                    }) as HandlerFuture
-                }
-                Err(error) => Box::pin(async move { Err(ActivityHandlerError::Codec(error)) })
-                    as HandlerFuture,
-            }
-        };
         self.handlers.insert(
             activity_name,
             RegistryEntry {
-                handler: Arc::new(erased),
+                handler,
                 max_input_bytes: A::MAX_INPUT_BYTES,
                 max_result_bytes: A::MAX_RESULT_BYTES,
             },
@@ -234,17 +250,18 @@ impl ActivityRegistry {
         let entry = self
             .handlers
             .get(&name)
-            .ok_or_else(|| ActivityRegistryError::NotRegistered(name))?;
+            .ok_or(ActivityRegistryError::NotRegistered(name))?;
         validate_registered_contract(entry, &context, &input)
             .map_err(ActivityRegistryError::Contract)?;
-        (entry.handler)(context, input)
-            .await
-            .map_err(|error| match error {
-                ActivityHandlerError::Codec(error) => ActivityRegistryError::Contract(error),
-                other => {
-                    ActivityRegistryError::Contract(ActivityCallError::Handler(other.to_string()))
-                }
-            })
+        let handler = entry.handler.as_ref().ok_or_else(|| {
+            ActivityRegistryError::Contract(ActivityCallError::Handler(
+                "activity handler is hosted by the embedding runtime".to_string(),
+            ))
+        })?;
+        handler(context, input).await.map_err(|error| match error {
+            ActivityHandlerError::Codec(error) => ActivityRegistryError::Contract(error),
+            other => ActivityRegistryError::Contract(ActivityCallError::Handler(other.to_string())),
+        })
     }
 
     pub async fn invoke_classified(
@@ -260,7 +277,60 @@ impl ActivityRegistry {
         };
         validate_registered_contract(entry, &context, &input)
             .map_err(ActivityHandlerError::Codec)?;
-        (entry.handler)(context, input).await
+        let Some(handler) = entry.handler.as_ref() else {
+            return Err(ActivityHandlerError::Codec(ActivityCallError::Handler(
+                "activity handler is hosted by the embedding runtime".to_string(),
+            )));
+        };
+        handler(context, input).await
+    }
+
+    /// Validate an invocation against an immutable typed contract registry.
+    pub fn validate_invocation(
+        &self,
+        context: &ActivityContext,
+        input: &ExactBytes,
+    ) -> Result<(), ActivityRegistryError> {
+        let name = context.activity_instance_id().name().clone();
+        let entry = self
+            .handlers
+            .get(&name)
+            .ok_or(ActivityRegistryError::NotRegistered(name))?;
+        validate_registered_contract(entry, context, input).map_err(ActivityRegistryError::Contract)
+    }
+
+    /// Invoke an embedding-runtime handler through this registry's typed
+    /// contract. This keeps identity, bounds, and input decoding owned by the
+    /// framework while allowing the handler to borrow reconciliation state.
+    pub async fn invoke_embedded<A, H, F, R>(
+        &self,
+        context: ActivityContext,
+        input: ExactBytes,
+        handler: H,
+    ) -> Result<R, ActivityRegistryError>
+    where
+        A: DurableActivity,
+        H: FnOnce(ActivityContext, A::Input) -> F,
+        F: Future<Output = R>,
+    {
+        let name = context.activity_instance_id().name().clone();
+        let entry = self
+            .handlers
+            .get(&name)
+            .ok_or_else(|| ActivityRegistryError::NotRegistered(name.clone()))?;
+        if name.name() != A::NAME || name.version() != A::VERSION {
+            return Err(ActivityRegistryError::Contract(
+                ActivityCallError::NameMismatch {
+                    registered: name.to_string(),
+                    contract: format!("{}@{}", A::NAME, A::VERSION),
+                },
+            ));
+        }
+        validate_registered_contract(entry, &context, &input)
+            .map_err(ActivityRegistryError::Contract)?;
+        let decoded =
+            decode_activity_input::<A>(&input).map_err(ActivityRegistryError::Contract)?;
+        Ok(handler(context, decoded).await)
     }
 }
 

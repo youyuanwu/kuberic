@@ -48,7 +48,7 @@ pub enum ObservationRejection {
     ActivityNotExposed,
     LogicalActivityMismatch {
         expected: LogicalActivityId,
-        observed: LogicalActivityId,
+        observed: Box<LogicalActivityId>,
     },
     ResultExceedsDeclaredBound {
         actual: u64,
@@ -706,7 +706,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected: expected_activity,
-                    observed: observation.activity,
+                    observed: Box::new(observation.activity),
                 },
             );
         }
@@ -800,7 +800,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected,
-                    observed: activity.clone(),
+                    observed: Box::new(activity.clone()),
                 },
             );
         }
@@ -884,7 +884,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected,
-                    observed: activity.clone(),
+                    observed: Box::new(activity.clone()),
                 },
             );
         }
@@ -960,7 +960,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected,
-                    observed: activity.clone(),
+                    observed: Box::new(activity.clone()),
                 },
             );
         }
@@ -1052,7 +1052,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected: expected_activity,
-                    observed: observation.activity,
+                    observed: Box::new(observation.activity),
                 },
             );
         }
@@ -1162,7 +1162,7 @@ impl<S: CheckpointStore> DurableHost<S> {
             return HostOutcome::ObservationRejected(
                 ObservationRejection::LogicalActivityMismatch {
                     expected: expected_activity,
-                    observed: observation.activity,
+                    observed: Box::new(observation.activity),
                 },
             );
         }
@@ -1472,10 +1472,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActivityName, ActivitySequence, ActivitySpec, CheckpointLimits, CompletionClass,
-        DurableEffect, EffectMetadata, EffectOutcome, InMemoryCheckpointStore, InMemoryFault,
-        PreparedActivityError, PreparedActivityResolver, PreparedCommand, PreparedEffectResolver,
-        StoreErrorKind, WorkflowContext,
+        ActivityName, ActivityOptions, ActivitySequence, ActivitySpec, CheckpointLimits,
+        CompletionClass, DurableEffect, EffectActivity, EffectMetadata, EffectOutcome,
+        InMemoryCheckpointStore, InMemoryFault, PreparedActivityError, PreparedActivityResolver,
+        PreparedCommand, PreparedEffectResolver, StoreErrorKind, WorkflowContext,
     };
     use serde::{Deserialize, Serialize};
 
@@ -1514,8 +1514,20 @@ mod tests {
             context: &mut WorkflowContext<'_>,
             _input: ExactBytes,
         ) -> TerminalOutcome {
-            match context.call_effect::<OneEffect>(UnitRequest).await {
-                Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+            match context
+                .schedule_activity_typed::<EffectActivity<OneEffect>>(
+                    OneEffect::NAME,
+                    &UnitRequest,
+                    ActivityOptions::default(),
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    match outcome.into_workflow_result(OneEffect::MAX_ERROR_MESSAGE_BYTES) {
+                        Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+                        Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
+                    }
+                }
                 Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
             }
         }

@@ -3,10 +3,10 @@
 use async_trait::async_trait;
 use kuberic_durable_execution::{
     ActivityObservation, AttemptId, CheckpointError, CheckpointLimits, CheckpointPayload,
-    CheckpointStore, CompletionMetadata, DurableEffectSet, EffectObservation, ExecutionSpec,
-    HostOutcome, LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
-    PreparedActivityResolver, PreparedCommand, PreparedEffectResolver, RegisteredEffectResolver,
-    ReloadReason, StoreError, StoreOperation, TerminalCheckpointStatus, TerminalOutcome, Workflow,
+    CheckpointStore, CompletionMetadata, EffectObservation, ExecutionSpec, HostOutcome,
+    LogicalActivityId, Nondeterminism, ObservationRejection, PersistenceBoundary,
+    PreparedActivityResolver, PreparedCommand, PreparedEffectResolver, ReloadReason, StoreError,
+    StoreOperation, TerminalCheckpointStatus, TerminalOutcome, Workflow,
 };
 use thiserror::Error;
 
@@ -80,7 +80,7 @@ pub enum DurableCheckpointDisposition {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableAdapterBoundary {
-    Observed(ActivityObservation),
+    Observed(Box<ActivityObservation>),
     ObserveAndWait {
         observation: Box<ActivityObservation>,
         reason: String,
@@ -94,6 +94,10 @@ pub enum DurableAdapterBoundary {
         requeue_after_seconds: u64,
     },
     Wait {
+        reason: String,
+        detail: String,
+    },
+    Retry {
         reason: String,
         detail: String,
     },
@@ -144,9 +148,8 @@ impl DurableEffectQuarantine {
 }
 
 #[async_trait]
-pub trait TypedDurableOperationAdapter: Send {
+pub(crate) trait ReconcilerActivityAdapter: Send {
     type Resolver: PreparedEffectResolver + Sync;
-    type Effects: DurableEffectSet + Sync;
     type Terminal: Send;
     type Publication: Send;
 
@@ -161,6 +164,27 @@ pub trait TypedDurableOperationAdapter: Send {
 
     async fn prepare(&mut self) -> Result<(), TypedDurableAdapterBoundary> {
         Ok(())
+    }
+
+    async fn observe_or_dispatch_activity(
+        &mut self,
+        _activity: &LogicalActivityId,
+        _attempt_id: AttemptId,
+        _permit: &mut DurablePermitGuard,
+    ) -> DurableAdapterBoundary {
+        DurableAdapterBoundary::Isolated(
+            "ordinary activity handler is not registered for this operation".to_string(),
+        )
+    }
+
+    async fn resolve_activity_quarantine(
+        &mut self,
+        _activity: &LogicalActivityId,
+        _attempt_id: AttemptId,
+    ) -> DurableAdapterBoundary {
+        DurableAdapterBoundary::Isolated(
+            "ordinary activity quarantine handler is not registered for this operation".to_string(),
+        )
     }
 
     async fn observe_or_dispatch(
@@ -200,7 +224,8 @@ pub trait TypedDurableOperationAdapter: Send {
     fn validate_terminal(
         &mut self,
         outcome: TerminalOutcome,
-        completion_metadata: CompletionMetadata,
+        completed_activity_count: u64,
+        completion_metadata: Option<CompletionMetadata>,
     ) -> Result<Self::Terminal, TypedDurableAdapterBoundary>;
 
     fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication;
@@ -456,6 +481,31 @@ impl DurableRunner {
                                 .to_string(),
                         );
                     }
+                    if let DurableAdapterBoundary::Retry { reason, detail } = &boundary {
+                        let retried = host
+                            .schedule_retry(
+                                &execution,
+                                &activity,
+                                now_unix_seconds.saturating_mul(1_000),
+                            )
+                            .await;
+                        host.store().correlate_host_outcome(&retried);
+                        return match retried {
+                            HostOutcome::RetryScheduled {
+                                retry_not_before_unix_millis,
+                                ..
+                            } => DurableRunnerOutcome::Active {
+                                reason: DurableActiveReason::Adapter,
+                                condition_reason: reason.clone(),
+                                detail: detail.clone(),
+                                requeue_after_seconds: millis_requeue_seconds(
+                                    now_unix_seconds.saturating_mul(1_000),
+                                    retry_not_before_unix_millis,
+                                ),
+                            },
+                            other => host_outcome_failure(other),
+                        };
+                    }
                     match self.handle_adapter_boundary(boundary, adapter, now_unix_seconds) {
                         AdapterHandling::Observe(observation) => {
                             host.observe_and_turn_with(
@@ -540,8 +590,12 @@ impl DurableRunner {
                     checkpoint_status: TerminalCheckpointStatus::Accepted,
                     ..
                 } => {
-                    host.turn_and_expose_with(workflow, execution.clone(), adapter.resolver())
-                        .await
+                    return DurableRunnerOutcome::Active {
+                        reason: DurableActiveReason::Adapter,
+                        condition_reason: "AwaitingTerminalReload".to_string(),
+                        detail: "terminal checkpoint was accepted and must be authoritatively reloaded before publication".to_string(),
+                        requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                    };
                 }
                 HostOutcome::WorkflowCompleted {
                     outcome,
@@ -644,7 +698,7 @@ impl DurableRunner {
     }
 
     /// Run the shared lifecycle for a statically routed typed-effect adapter.
-    pub async fn run_activities<W, A>(
+    pub(crate) async fn run_activities<W, A>(
         &self,
         host: &mut DurableOperatorHost,
         workflow: &W,
@@ -654,13 +708,8 @@ impl DurableRunner {
     ) -> DurableRunnerOutcome<A::Publication>
     where
         W: Workflow,
-        A: TypedDurableOperationAdapter,
+        A: ReconcilerActivityAdapter,
     {
-        if let Err(error) = A::Effects::validate() {
-            return DurableRunnerOutcome::Rejected(format!(
-                "invalid typed durable effect set: {error}"
-            ));
-        }
         let loaded = match host.store().load(execution.execution_id()).await {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -678,14 +727,12 @@ impl DurableRunner {
                 Ok(payload) => payload,
                 Err(error) => return typed_checkpoint_failure(adapter, error),
             };
-            if let Some((outcome, _)) = payload.terminal_outcome() {
-                let Some(metadata) = payload.terminal_completion_metadata() else {
-                    return DurableRunnerOutcome::Isolated(
-                        "typed durable terminal checkpoint has no authenticated completion metadata"
-                            .to_string(),
-                    );
-                };
-                return match adapter.validate_terminal(outcome.clone(), metadata) {
+            if let Some((outcome, completed_activity_count)) = payload.terminal_outcome() {
+                return match adapter.validate_terminal(
+                    outcome.clone(),
+                    completed_activity_count,
+                    payload.terminal_completion_metadata(),
+                ) {
                     Ok(terminal) => {
                         DurableRunnerOutcome::Terminal(adapter.publication_handoff(terminal))
                     }
@@ -742,55 +789,151 @@ impl DurableRunner {
                             ),
                         };
                     }
+                    let ordinary = permit.prepared_command().is_none();
                     let mut guard = DurablePermitGuard::new(permit);
-                    let boundary = adapter
-                        .observe_or_dispatch(&activity, attempt_id, &mut guard)
-                        .await;
-                    if guard.activity().is_some() {
-                        return DurableRunnerOutcome::Isolated(
-                            "typed operation adapter did not consume the durable dispatch permit"
-                                .to_string(),
-                        );
-                    }
-                    match typed_boundary_result(
-                        boundary,
-                        adapter.deadline_unix_seconds(),
-                        now_unix_seconds,
-                    ) {
-                        TypedAdapterHandling::Observe(observation) => {
-                            let observed = host.observe_effect(&execution, observation).await;
-                            match observed {
-                                HostOutcome::ObservationAccepted { .. } => {
-                                    turn_registered_effects(
-                                        host,
-                                        workflow,
-                                        execution.clone(),
-                                        adapter,
-                                    )
-                                    .await
-                                }
-                                other => other,
-                            }
+                    if ordinary {
+                        let boundary = adapter
+                            .observe_or_dispatch_activity(&activity, attempt_id, &mut guard)
+                            .await;
+                        if guard.activity().is_some() {
+                            return DurableRunnerOutcome::Isolated(
+                                "activity adapter did not consume the durable dispatch permit"
+                                    .to_string(),
+                            );
                         }
-                        TypedAdapterHandling::ObserveAndWait {
-                            observation,
-                            reason,
-                            detail,
-                            requeue_after_seconds,
-                        } => {
-                            let observed = host.observe_effect(&execution, observation).await;
-                            host.store().correlate_host_outcome(&observed);
-                            if matches!(observed, HostOutcome::ObservationAccepted { .. }) {
-                                return DurableRunnerOutcome::Active {
+                        if let DurableAdapterBoundary::Retry { reason, detail } = &boundary {
+                            let retried = host
+                                .schedule_retry(
+                                    &execution,
+                                    &activity,
+                                    now_unix_seconds.saturating_mul(1_000),
+                                )
+                                .await;
+                            host.store().correlate_host_outcome(&retried);
+                            return match retried {
+                                HostOutcome::RetryScheduled {
+                                    retry_not_before_unix_millis,
+                                    ..
+                                } => DurableRunnerOutcome::Active {
                                     reason: DurableActiveReason::Adapter,
-                                    condition_reason: reason,
-                                    detail,
-                                    requeue_after_seconds,
-                                };
-                            }
-                            observed
+                                    condition_reason: reason.clone(),
+                                    detail: detail.clone(),
+                                    requeue_after_seconds: millis_requeue_seconds(
+                                        now_unix_seconds.saturating_mul(1_000),
+                                        retry_not_before_unix_millis,
+                                    ),
+                                },
+                                other => host_outcome_failure(other),
+                            };
                         }
-                        TypedAdapterHandling::Return(result) => return result,
+                        match activity_boundary_result(
+                            boundary,
+                            adapter.deadline_unix_seconds(),
+                            now_unix_seconds,
+                        ) {
+                            AdapterHandling::Observe(observation) => {
+                                let observed = host.observe(&execution, observation).await;
+                                match observed {
+                                    HostOutcome::ObservationAccepted { .. } => {
+                                        turn_registered_effects(
+                                            host,
+                                            workflow,
+                                            execution.clone(),
+                                            adapter,
+                                        )
+                                        .await
+                                    }
+                                    other => other,
+                                }
+                            }
+                            AdapterHandling::ObserveAndWait {
+                                observation,
+                                reason,
+                                detail,
+                                requeue_after_seconds,
+                            } => {
+                                let observed = host.observe(&execution, observation).await;
+                                host.store().correlate_host_outcome(&observed);
+                                if matches!(observed, HostOutcome::ObservationAccepted { .. }) {
+                                    return DurableRunnerOutcome::Active {
+                                        reason: DurableActiveReason::Adapter,
+                                        condition_reason: reason,
+                                        detail,
+                                        requeue_after_seconds,
+                                    };
+                                }
+                                observed
+                            }
+                            AdapterHandling::ObserveAndProgressThenWait {
+                                observation,
+                                reason,
+                                detail,
+                                requeue_after_seconds,
+                            } => {
+                                let observed = host.observe(&execution, observation).await;
+                                host.store().correlate_host_outcome(&observed);
+                                if matches!(observed, HostOutcome::ObservationAccepted { .. }) {
+                                    return DurableRunnerOutcome::Active {
+                                        reason: DurableActiveReason::Adapter,
+                                        condition_reason: reason,
+                                        detail,
+                                        requeue_after_seconds,
+                                    };
+                                }
+                                observed
+                            }
+                            AdapterHandling::Return(result) => return result,
+                        }
+                    } else {
+                        let boundary = adapter
+                            .observe_or_dispatch(&activity, attempt_id, &mut guard)
+                            .await;
+                        if guard.activity().is_some() {
+                            return DurableRunnerOutcome::Isolated(
+                                "typed operation adapter did not consume the durable dispatch permit"
+                                    .to_string(),
+                            );
+                        }
+                        match typed_boundary_result(
+                            boundary,
+                            adapter.deadline_unix_seconds(),
+                            now_unix_seconds,
+                        ) {
+                            TypedAdapterHandling::Observe(observation) => {
+                                let observed = host.observe_effect(&execution, observation).await;
+                                match observed {
+                                    HostOutcome::ObservationAccepted { .. } => {
+                                        turn_registered_effects(
+                                            host,
+                                            workflow,
+                                            execution.clone(),
+                                            adapter,
+                                        )
+                                        .await
+                                    }
+                                    other => other,
+                                }
+                            }
+                            TypedAdapterHandling::ObserveAndWait {
+                                observation,
+                                reason,
+                                detail,
+                                requeue_after_seconds,
+                            } => {
+                                let observed = host.observe_effect(&execution, observation).await;
+                                host.store().correlate_host_outcome(&observed);
+                                if matches!(observed, HostOutcome::ObservationAccepted { .. }) {
+                                    return DurableRunnerOutcome::Active {
+                                        reason: DurableActiveReason::Adapter,
+                                        condition_reason: reason,
+                                        detail,
+                                        requeue_after_seconds,
+                                    };
+                                }
+                                observed
+                            }
+                            TypedAdapterHandling::Return(result) => return result,
+                        }
                     }
                 }
                 HostOutcome::Quarantined {
@@ -800,9 +943,78 @@ impl DurableRunner {
                     completion_class,
                 } => {
                     let Some(prepared_command) = prepared_command else {
-                        return DurableRunnerOutcome::Isolated(
-                            "typed quarantined activity has no prepared command".to_string(),
-                        );
+                        let boundary = adapter
+                            .resolve_activity_quarantine(&activity, attempt_id)
+                            .await;
+                        if let DurableAdapterBoundary::Retry { reason, detail } = &boundary {
+                            let retried = host
+                                .schedule_retry(
+                                    &execution,
+                                    &activity,
+                                    now_unix_seconds.saturating_mul(1_000),
+                                )
+                                .await;
+                            host.store().correlate_host_outcome(&retried);
+                            return match retried {
+                                HostOutcome::RetryScheduled {
+                                    retry_not_before_unix_millis,
+                                    ..
+                                } => DurableRunnerOutcome::Active {
+                                    reason: DurableActiveReason::Adapter,
+                                    condition_reason: reason.clone(),
+                                    detail: detail.clone(),
+                                    requeue_after_seconds: millis_requeue_seconds(
+                                        now_unix_seconds.saturating_mul(1_000),
+                                        retry_not_before_unix_millis,
+                                    ),
+                                },
+                                other => host_outcome_failure(other),
+                            };
+                        }
+                        return match activity_boundary_result(
+                            boundary,
+                            adapter.deadline_unix_seconds(),
+                            now_unix_seconds,
+                        ) {
+                            AdapterHandling::Observe(observation)
+                            | AdapterHandling::ObserveAndProgressThenWait { observation, .. } => {
+                                let observed = host.observe(&execution, observation).await;
+                                match observed {
+                                    HostOutcome::ObservationAccepted { .. } => {
+                                        DurableRunnerOutcome::Active {
+                                            reason: DurableActiveReason::Adapter,
+                                            condition_reason: "ActivityObserved".to_string(),
+                                            detail: format!(
+                                                "ordinary activity {} was reconciled",
+                                                activity.spec().name().name()
+                                            ),
+                                            requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                                        }
+                                    }
+                                    other => host_outcome_failure(other),
+                                }
+                            }
+                            AdapterHandling::ObserveAndWait {
+                                observation,
+                                reason,
+                                detail,
+                                requeue_after_seconds,
+                            } => {
+                                let observed = host.observe(&execution, observation).await;
+                                match observed {
+                                    HostOutcome::ObservationAccepted { .. } => {
+                                        DurableRunnerOutcome::Active {
+                                            reason: DurableActiveReason::Adapter,
+                                            condition_reason: reason,
+                                            detail,
+                                            requeue_after_seconds,
+                                        }
+                                    }
+                                    other => host_outcome_failure(other),
+                                }
+                            }
+                            AdapterHandling::Return(result) => result,
+                        };
                     };
                     let Some(completion_class) = completion_class else {
                         return DurableRunnerOutcome::Isolated(
@@ -810,24 +1022,13 @@ impl DurableRunner {
                                 .to_string(),
                         );
                     };
-                    let registration = match A::Effects::registration(activity.spec()) {
-                        Ok(registration) => registration,
-                        Err(error) => {
-                            return DurableRunnerOutcome::Isolated(format!(
-                                "typed quarantined activity is not registered: {error}"
-                            ));
-                        }
-                    };
-                    if registration.completion_class() != completion_class {
+                    if completion_class
+                        != kuberic_durable_execution::CompletionClass::ExternalEffect
+                    {
                         return DurableRunnerOutcome::Isolated(
                             "typed quarantined activity completion classification changed"
                                 .to_string(),
                         );
-                    }
-                    if let Err(error) = A::Effects::route(activity.spec(), &prepared_command) {
-                        return DurableRunnerOutcome::Isolated(format!(
-                            "typed quarantined activity command is invalid: {error}"
-                        ));
                     }
                     let boundary = adapter
                         .resolve_quarantine(DurableEffectQuarantine {
@@ -884,14 +1085,26 @@ impl DurableRunner {
                 HostOutcome::WorkflowCompleted {
                     checkpoint_status: TerminalCheckpointStatus::Accepted,
                     ..
-                } => turn_registered_effects(host, workflow, execution.clone(), adapter).await,
+                } => {
+                    return DurableRunnerOutcome::Active {
+                        reason: DurableActiveReason::Adapter,
+                        condition_reason: "AwaitingTerminalReload".to_string(),
+                        detail: "terminal checkpoint was accepted and must be authoritatively reloaded before publication".to_string(),
+                        requeue_after_seconds: MIN_REQUEUE_SECONDS,
+                    };
+                }
                 HostOutcome::WorkflowCompleted {
                     outcome,
-                    completion_metadata: Some(metadata),
+                    completed_activity_count,
+                    completion_metadata,
                     checkpoint_status: TerminalCheckpointStatus::Reloaded,
                     ..
                 } => {
-                    return match adapter.validate_terminal(outcome, metadata) {
+                    return match adapter.validate_terminal(
+                        outcome,
+                        completed_activity_count,
+                        completion_metadata,
+                    ) {
                         Ok(terminal) => {
                             DurableRunnerOutcome::Terminal(adapter.publication_handoff(terminal))
                         }
@@ -902,14 +1115,6 @@ impl DurableRunner {
                         )
                         .into_result(),
                     };
-                }
-                HostOutcome::WorkflowCompleted {
-                    completion_metadata: None,
-                    ..
-                } => {
-                    return DurableRunnerOutcome::Isolated(
-                        "typed durable completion has no authenticated metadata".to_string(),
-                    );
                 }
                 HostOutcome::CheckpointRejected(CheckpointError::PreparedActivityRejected(
                     ref error,
@@ -949,10 +1154,23 @@ impl DurableRunner {
                         Nondeterminism::UnsupportedSuspension,
                     );
                 }
-                HostOutcome::RetryScheduled { .. } | HostOutcome::Waiting { .. } => {
-                    return DurableRunnerOutcome::Nondeterministic(
-                        Nondeterminism::UnsupportedSuspension,
-                    );
+                HostOutcome::RetryScheduled {
+                    retry_not_before_unix_millis,
+                    ..
+                }
+                | HostOutcome::Waiting {
+                    wake_at_unix_millis: retry_not_before_unix_millis,
+                    ..
+                } => {
+                    return DurableRunnerOutcome::Active {
+                        reason: DurableActiveReason::Adapter,
+                        condition_reason: "ActivityWaiting".to_string(),
+                        detail: "ordinary activity is waiting for its persisted wakeup".to_string(),
+                        requeue_after_seconds: millis_requeue_seconds(
+                            now_unix_seconds.saturating_mul(1_000),
+                            retry_not_before_unix_millis,
+                        ),
+                    };
                 }
             };
         }
@@ -974,56 +1192,68 @@ impl DurableRunner {
         adapter: &A,
         now_unix_seconds: i64,
     ) -> AdapterHandling<A::Publication> {
-        match boundary {
-            DurableAdapterBoundary::Observed(observation) => AdapterHandling::Observe(observation),
-            DurableAdapterBoundary::ObserveAndWait {
-                observation,
-                reason,
-                detail,
-                requeue_after_seconds,
-            } => AdapterHandling::ObserveAndWait {
-                observation: *observation,
-                reason,
-                detail,
-                requeue_after_seconds,
-            },
-            DurableAdapterBoundary::ObserveAndProgressThenWait {
-                observation,
-                reason,
-                detail,
-                requeue_after_seconds,
-            } => AdapterHandling::ObserveAndProgressThenWait {
-                observation: *observation,
-                reason,
-                detail,
-                requeue_after_seconds,
-            },
-            DurableAdapterBoundary::Wait { reason, detail } => {
-                AdapterHandling::Return(DurableRunnerOutcome::Active {
-                    reason: DurableActiveReason::Adapter,
-                    condition_reason: reason,
-                    detail,
-                    requeue_after_seconds: deadline_requeue_seconds(
-                        now_unix_seconds,
-                        adapter.deadline_unix_seconds(),
-                    ),
-                })
-            }
+        activity_boundary_result(boundary, adapter.deadline_unix_seconds(), now_unix_seconds)
+    }
+}
 
-            DurableAdapterBoundary::Incompatible(message) => {
-                AdapterHandling::Return(DurableRunnerOutcome::Incompatible(message))
-            }
-            DurableAdapterBoundary::Rejected(message) => {
-                AdapterHandling::Return(DurableRunnerOutcome::Rejected(message))
-            }
-            DurableAdapterBoundary::Isolated(message) => {
-                AdapterHandling::Return(DurableRunnerOutcome::Isolated(message))
-            }
+fn activity_boundary_result<P>(
+    boundary: DurableAdapterBoundary,
+    deadline_unix_seconds: i64,
+    now_unix_seconds: i64,
+) -> AdapterHandling<P> {
+    match boundary {
+        DurableAdapterBoundary::Observed(observation) => AdapterHandling::Observe(*observation),
+        DurableAdapterBoundary::ObserveAndWait {
+            observation,
+            reason,
+            detail,
+            requeue_after_seconds,
+        } => AdapterHandling::ObserveAndWait {
+            observation: *observation,
+            reason,
+            detail,
+            requeue_after_seconds,
+        },
+        DurableAdapterBoundary::ObserveAndProgressThenWait {
+            observation,
+            reason,
+            detail,
+            requeue_after_seconds,
+        } => AdapterHandling::ObserveAndProgressThenWait {
+            observation: *observation,
+            reason,
+            detail,
+            requeue_after_seconds,
+        },
+        DurableAdapterBoundary::Wait { reason, detail } => {
+            AdapterHandling::Return(DurableRunnerOutcome::Active {
+                reason: DurableActiveReason::Adapter,
+                condition_reason: reason,
+                detail,
+                requeue_after_seconds: deadline_requeue_seconds(
+                    now_unix_seconds,
+                    deadline_unix_seconds,
+                ),
+            })
+        }
+        DurableAdapterBoundary::Retry { reason, detail } => {
+            AdapterHandling::Return(DurableRunnerOutcome::Isolated(format!(
+                "activity retry was not handled at its dispatch boundary: {reason}: {detail}"
+            )))
+        }
+        DurableAdapterBoundary::Incompatible(message) => {
+            AdapterHandling::Return(DurableRunnerOutcome::Incompatible(message))
+        }
+        DurableAdapterBoundary::Rejected(message) => {
+            AdapterHandling::Return(DurableRunnerOutcome::Rejected(message))
+        }
+        DurableAdapterBoundary::Isolated(message) => {
+            AdapterHandling::Return(DurableRunnerOutcome::Isolated(message))
         }
     }
 }
 
-fn typed_checkpoint_failure<A: TypedDurableOperationAdapter>(
+fn typed_checkpoint_failure<A: ReconcilerActivityAdapter>(
     adapter: &A,
     error: CheckpointError,
 ) -> DurableRunnerOutcome<A::Publication> {
@@ -1043,11 +1273,9 @@ async fn turn_registered_effects<W, A>(
 ) -> HostOutcome
 where
     W: Workflow,
-    A: TypedDurableOperationAdapter,
+    A: ReconcilerActivityAdapter,
 {
-    let resolver = RegisteredEffectResolver::<A::Effects, A::Resolver>::new(adapter.resolver())
-        .expect("typed effect set was validated before entering the host loop");
-    host.turn_and_expose_effects(workflow, execution, &resolver)
+    host.turn_and_expose_effects(workflow, execution, adapter.resolver())
         .await
 }
 
@@ -1159,6 +1387,33 @@ fn deadline_requeue_seconds(now_unix_seconds: i64, deadline_unix_seconds: i64) -
         .clamp(MIN_REQUEUE_SECONDS, MAX_REQUEUE_SECONDS)
 }
 
+fn millis_requeue_seconds(now_unix_millis: i64, wake_unix_millis: i64) -> u64 {
+    let remaining_millis = wake_unix_millis.saturating_sub(now_unix_millis);
+    let remaining_seconds = remaining_millis.saturating_add(999) / 1_000;
+    u64::try_from(remaining_seconds)
+        .unwrap_or(MIN_REQUEUE_SECONDS)
+        .clamp(MIN_REQUEUE_SECONDS, MAX_REQUEUE_SECONDS)
+}
+
+fn host_outcome_failure<P>(outcome: HostOutcome) -> DurableRunnerOutcome<P> {
+    match outcome {
+        HostOutcome::CheckpointRejected(error) => DurableRunnerOutcome::Rejected(error.to_string()),
+        HostOutcome::ObservationRejected(error) => {
+            DurableRunnerOutcome::Isolated(observation_rejection(error))
+        }
+        HostOutcome::ReloadRequired { boundary, reason } => {
+            DurableRunnerOutcome::ReloadRequired { boundary, reason }
+        }
+        HostOutcome::StoreFailed { operation, error } => {
+            DurableRunnerOutcome::PersistenceFailed { operation, error }
+        }
+        HostOutcome::Nondeterminism(error) => DurableRunnerOutcome::Nondeterministic(error),
+        other => DurableRunnerOutcome::Isolated(format!(
+            "unexpected durable activity host outcome: {other:?}"
+        )),
+    }
+}
+
 fn observation_rejection(error: ObservationRejection) -> String {
     match error {
         ObservationRejection::CheckpointMissing => {
@@ -1181,11 +1436,13 @@ mod durable_runner_tests {
     use async_trait::async_trait;
     use kuberic_durable_execution::{
         ActivitySpec, ActivityState, CheckpointEnvelope, CheckpointStore, CompletionClass,
-        DispatchEffect, DurableActivity, DurableEffect, EffectHostStep, EffectMetadata,
-        EffectOutcome, ExactBytes, ExecutionId, HostEpoch, HostedEffectSet,
-        InMemoryCheckpointStore, InMemoryFault, ObserveEffect, ObserveQuarantinedEffect,
-        PreparedActivityError, PreparedEffectResolver, StoreErrorKind, WorkflowContext,
-        durable_effect_set,
+        DurableActivity, DurableEffect, EffectHostStep, EffectMetadata, EffectOutcome, ExactBytes,
+        ExecutionId, HostEpoch, InMemoryCheckpointStore, InMemoryFault, PreparedActivityError,
+        PreparedEffectResolver, StoreErrorKind, WorkflowContext,
+        strict::{
+            DispatchEffect, EffectQuarantineContext, ObserveEffect, ObserveQuarantinedEffect,
+            observe_or_dispatch_effect, observe_quarantined_effect,
+        },
     };
 
     use super::*;
@@ -1359,7 +1616,7 @@ mod durable_runner_tests {
                     requeue_after_seconds: 1,
                 }
             } else {
-                DurableAdapterBoundary::Observed(observation)
+                DurableAdapterBoundary::Observed(Box::new(observation))
             }
         }
 
@@ -1368,10 +1625,10 @@ mod durable_runner_tests {
             activity: LogicalActivityId,
             _attempt_id: AttemptId,
         ) -> DurableAdapterBoundary {
-            DurableAdapterBoundary::Observed(ActivityObservation::new(
+            DurableAdapterBoundary::Observed(Box::new(ActivityObservation::new(
                 activity,
                 ExactBytes::new(br#""recovered""#),
-            ))
+            )))
         }
 
         fn deadline_unix_seconds(&self) -> i64 {
@@ -1438,16 +1695,28 @@ mod durable_runner_tests {
         let store = InMemoryCheckpointStore::new();
         let mut host = fixture_host(store.clone(), 1);
         let mut adapter = FakeAdapter::new(AdapterMode::Observe);
-        let outcome = DurableRunner::new(8)
+        let accepted = DurableRunner::new(8)
             .unwrap()
             .run(&mut host, &OneEffect, execution(1), &mut adapter, 0)
             .await;
 
         assert!(matches!(
+            accepted,
+            DurableRunnerOutcome::Active {
+                ref condition_reason,
+                ..
+            } if condition_reason == "AwaitingTerminalReload"
+        ));
+        assert!(adapter.second_consume_rejected);
+        assert_eq!(adapter.publication_calls, 0);
+        let outcome = DurableRunner::new(8)
+            .unwrap()
+            .run(&mut host, &OneEffect, execution(1), &mut adapter, 0)
+            .await;
+        assert!(matches!(
             outcome,
             DurableRunnerOutcome::Terminal((TerminalOutcome::Succeeded { .. }, 1))
         ));
-        assert!(adapter.second_consume_rejected);
         assert_eq!(adapter.publication_calls, 1);
         assert_eq!(host.store().measurements().load_attempts, 4);
 
@@ -1544,6 +1813,23 @@ mod durable_runner_tests {
 
         let mut restarted = fixture_host(store, 9);
         let mut restarted_adapter = FakeAdapter::new(AdapterMode::Observe);
+        let accepted = DurableRunner::new(8)
+            .unwrap()
+            .run(
+                &mut restarted,
+                &TwoEffects,
+                execution(9),
+                &mut restarted_adapter,
+                0,
+            )
+            .await;
+        assert!(matches!(
+            accepted,
+            DurableRunnerOutcome::Active {
+                ref condition_reason,
+                ..
+            } if condition_reason == "AwaitingTerminalReload"
+        ));
         let completed = DurableRunner::new(8)
             .unwrap()
             .run(
@@ -1755,13 +2041,6 @@ mod durable_runner_tests {
         CompletionClass::PassiveObservation
     );
 
-    durable_effect_set! {
-        FixtureEffects => FixtureEffectRoute {
-            TypedAlpha,
-            TypedBeta,
-        }
-    }
-
     struct TypedWorkflow;
 
     #[async_trait]
@@ -1771,11 +2050,41 @@ mod durable_runner_tests {
             context: &mut WorkflowContext<'_>,
             _input: ExactBytes,
         ) -> TerminalOutcome {
-            if let Err(error) = context.call_effect::<TypedAlpha>("alpha".to_string()).await {
+            let alpha = context
+                .schedule_activity_typed::<kuberic_durable_execution::EffectActivity<TypedAlpha>>(
+                    TypedAlpha::NAME,
+                    &"alpha".to_string(),
+                    kuberic_durable_execution::ActivityOptions::default(),
+                )
+                .await
+                .and_then(|outcome| {
+                    outcome
+                        .into_workflow_result(TypedAlpha::MAX_ERROR_MESSAGE_BYTES)
+                        .map_err(|error| {
+                            kuberic_durable_execution::ActivityInvocationError::Call(
+                                kuberic_durable_execution::ActivityCallError::Handler(
+                                    error.to_string(),
+                                ),
+                            )
+                        })
+                });
+            if let Err(error) = alpha {
                 return TerminalOutcome::failed(error.to_string().into_bytes());
             }
-            match context.call_effect::<TypedBeta>("beta".to_string()).await {
-                Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+            let beta = context
+                .schedule_activity_typed::<kuberic_durable_execution::EffectActivity<TypedBeta>>(
+                    TypedBeta::NAME,
+                    &"beta".to_string(),
+                    kuberic_durable_execution::ActivityOptions::default(),
+                )
+                .await;
+            match beta {
+                Ok(outcome) => {
+                    match outcome.into_workflow_result(TypedBeta::MAX_ERROR_MESSAGE_BYTES) {
+                        Ok(value) => TerminalOutcome::succeeded(value.into_bytes()),
+                        Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
+                    }
+                }
                 Err(error) => TerminalOutcome::failed(error.to_string().into_bytes()),
             }
         }
@@ -1855,7 +2164,7 @@ mod durable_runner_tests {
 
         async fn observe_quarantined(
             &mut self,
-            context: kuberic_durable_execution::EffectQuarantineContext<'_, TypedAlpha>,
+            context: EffectQuarantineContext<'_, TypedAlpha>,
         ) -> Result<Option<EffectOutcome<String>>, Self::Error> {
             assert_eq!(context.request(), "alpha");
             assert!(context.command().contains(TypedAlpha::NAME));
@@ -1902,7 +2211,7 @@ mod durable_runner_tests {
 
         async fn observe_quarantined(
             &mut self,
-            context: kuberic_durable_execution::EffectQuarantineContext<'_, TypedBeta>,
+            context: EffectQuarantineContext<'_, TypedBeta>,
         ) -> Result<Option<EffectOutcome<String>>, Self::Error> {
             assert_eq!(context.request(), "beta");
             assert!(context.command().contains(TypedBeta::NAME));
@@ -1912,9 +2221,8 @@ mod durable_runner_tests {
     }
 
     #[async_trait]
-    impl TypedDurableOperationAdapter for TypedAdapter {
+    impl ReconcilerActivityAdapter for TypedAdapter {
         type Resolver = TypedResolver;
-        type Effects = FixtureEffects;
         type Terminal = CompletionMetadata;
         type Publication = CompletionMetadata;
 
@@ -1929,12 +2237,18 @@ mod durable_runner_tests {
             permit: &mut DurablePermitGuard,
         ) -> TypedDurableAdapterBoundary {
             let command = permit
-                .consume_effect_command::<FixtureEffects>(activity, attempt_id, "typed fixture")
+                .consume_prepared_command(activity, attempt_id, "typed fixture")
                 .unwrap();
-            match FixtureEffects::observe_or_dispatch(self, activity, attempt_id, &command)
-                .await
-                .unwrap()
-            {
+            let step = if activity.spec().name().name() == TypedAlpha::NAME {
+                observe_or_dispatch_effect::<TypedAlpha, _>(self, activity, attempt_id, &command)
+                    .await
+                    .unwrap()
+            } else {
+                observe_or_dispatch_effect::<TypedBeta, _>(self, activity, attempt_id, &command)
+                    .await
+                    .unwrap()
+            };
+            match step {
                 EffectHostStep::Observed(observation) => {
                     TypedDurableAdapterBoundary::Observed(Box::new(observation))
                 }
@@ -1949,15 +2263,26 @@ mod durable_runner_tests {
             &mut self,
             quarantine: DurableEffectQuarantine,
         ) -> TypedDurableAdapterBoundary {
-            match FixtureEffects::observe_quarantined(
-                self,
-                quarantine.activity(),
-                quarantine.attempt_id(),
-                quarantine.prepared_command(),
-            )
-            .await
-            .unwrap()
-            {
+            let observation = if quarantine.activity().spec().name().name() == TypedAlpha::NAME {
+                observe_quarantined_effect::<TypedAlpha, _>(
+                    self,
+                    quarantine.activity(),
+                    quarantine.attempt_id(),
+                    quarantine.prepared_command(),
+                )
+                .await
+                .unwrap()
+            } else {
+                observe_quarantined_effect::<TypedBeta, _>(
+                    self,
+                    quarantine.activity(),
+                    quarantine.attempt_id(),
+                    quarantine.prepared_command(),
+                )
+                .await
+                .unwrap()
+            };
+            match observation {
                 Some(observation) => TypedDurableAdapterBoundary::Observed(Box::new(observation)),
                 None => TypedDurableAdapterBoundary::Wait {
                     reason: "AwaitingQuarantineEvidence".to_string(),
@@ -1989,9 +2314,14 @@ mod durable_runner_tests {
         fn validate_terminal(
             &mut self,
             _outcome: TerminalOutcome,
-            completion_metadata: CompletionMetadata,
+            _completed_activity_count: u64,
+            completion_metadata: Option<CompletionMetadata>,
         ) -> Result<Self::Terminal, TypedDurableAdapterBoundary> {
-            Ok(completion_metadata)
+            completion_metadata.ok_or_else(|| {
+                TypedDurableAdapterBoundary::Isolated(
+                    "typed test terminal has no completion metadata".to_string(),
+                )
+            })
         }
 
         fn publication_handoff(&mut self, terminal: Self::Terminal) -> Self::Publication {
@@ -2014,6 +2344,17 @@ mod durable_runner_tests {
         let mut host = fixture_host(InMemoryCheckpointStore::new(), 40);
         let mut adapter = typed_adapter();
         adapter.prove_first_no_admission = true;
+        let accepted = DurableRunner::new(12)
+            .unwrap()
+            .run_activities(&mut host, &TypedWorkflow, execution(40), &mut adapter, 0)
+            .await;
+        assert!(matches!(
+            accepted,
+            DurableRunnerOutcome::Active {
+                ref condition_reason,
+                ..
+            } if condition_reason == "AwaitingTerminalReload"
+        ));
         let outcome = DurableRunner::new(12)
             .unwrap()
             .run_activities(&mut host, &TypedWorkflow, execution(40), &mut adapter, 0)
@@ -2053,6 +2394,23 @@ mod durable_runner_tests {
 
         let mut restarted_host = fixture_host(store, 41);
         let mut restarted_adapter = typed_adapter();
+        let accepted = DurableRunner::new(12)
+            .unwrap()
+            .run_activities(
+                &mut restarted_host,
+                &TypedWorkflow,
+                execution(41),
+                &mut restarted_adapter,
+                0,
+            )
+            .await;
+        assert!(matches!(
+            accepted,
+            DurableRunnerOutcome::Active {
+                ref condition_reason,
+                ..
+            } if condition_reason == "AwaitingTerminalReload"
+        ));
         let completed = DurableRunner::new(12)
             .unwrap()
             .run_activities(

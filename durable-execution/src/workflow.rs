@@ -6,9 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ActivityFailure, ActivityOptions, ActivityRecord, ActivitySequence, ActivitySpec,
-    ActivityState, CompletionClass, DurableEffect, EffectActivity, EffectCallError, EffectMetadata,
-    ExactBytes, ExecutionId, LogicalActivityId, Nondeterminism, PreparedCommand,
-    PreparedEffectResolver,
+    ActivityState, CompletionClass, EffectMetadata, ExactBytes, ExecutionId, LogicalActivityId,
+    Nondeterminism, PreparedCommand, PreparedEffectResolver,
     typed::{
         ActivityCallError, ActivityInvocationError, DurableActivity, PreparedActivityError,
         PreparedActivityResolver, activity_spec, activity_spec_named, decode_activity_result,
@@ -136,18 +135,6 @@ impl<'history> WorkflowContext<'history> {
                 })?
         };
         decode_activity_result::<A>(&result).map_err(ActivityInvocationError::Call)
-    }
-
-    /// Invoke a durable effect and expose only its typed applied value or
-    /// bounded typed failure to workflow code.
-    pub async fn call_effect<E: DurableEffect>(
-        &mut self,
-        request: E::Request,
-    ) -> Result<E::Output, EffectCallError> {
-        let spec = activity_spec::<EffectActivity<E>>(&request)?;
-        let result = poll_fn(|_| self.poll_effect(&spec, EffectMetadata::of::<E>())).await;
-        decode_activity_result::<EffectActivity<E>>(&result)?
-            .into_workflow_result(E::MAX_ERROR_MESSAGE_BYTES)
     }
 
     pub(crate) const fn cursor(&self) -> usize {

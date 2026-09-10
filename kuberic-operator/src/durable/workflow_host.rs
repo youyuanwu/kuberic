@@ -3,9 +3,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use kuberic_durable_execution::{
-    ActivitySpec, AttemptId, CheckpointLimits, DispatchPermit, DurableEffectSet, DurableHost,
-    EffectRoutingError, ExecutionId, HostEpoch, InMemoryCheckpointStore, KubernetesCheckpointStore,
-    KubernetesCheckpointStoreOptions, LogicalActivityId,
+    ActivitySpec, AttemptId, CheckpointLimits, DispatchPermit, DurableHost, ExecutionId, HostEpoch,
+    InMemoryCheckpointStore, KubernetesCheckpointStore, KubernetesCheckpointStoreOptions,
+    LogicalActivityId,
 };
 use rand::random;
 use tokio::sync::Mutex;
@@ -57,37 +57,7 @@ impl DurablePermitGuard {
             .expect("permit existence checked before consumption"))
     }
 
-    /// Consume a permit through a statically declared typed effect set.
-    ///
-    /// Routing validates the exact logical identity, result bound, request,
-    /// command bound, and command type before the one-use permit is removed.
-    pub fn consume_effect<S: DurableEffectSet>(
-        &mut self,
-        expected_activity: &LogicalActivityId,
-        attempt_id: AttemptId,
-        workflow: &str,
-    ) -> Result<S::Route, String> {
-        let permit = self
-            .permit
-            .as_ref()
-            .ok_or_else(|| format!("durable {workflow} dispatch permit was already consumed"))?;
-        if permit.attempt_id() != attempt_id || permit.activity() != expected_activity {
-            return Err(format!(
-                "durable {workflow} dispatch permit does not match logical activity or attempt"
-            ));
-        }
-        let command = permit.prepared_command().ok_or_else(|| {
-            format!("durable {workflow} typed dispatch permit has no prepared command")
-        })?;
-        let route = S::route(permit.activity().spec(), command)
-            .map_err(|error: EffectRoutingError| format!("durable {workflow} route: {error}"))?;
-        self.permit
-            .take()
-            .expect("permit existence checked before consumption");
-        Ok(route)
-    }
-
-    pub fn consume_effect_command<S: DurableEffectSet>(
+    pub fn consume_prepared_command(
         &mut self,
         expected_activity: &LogicalActivityId,
         attempt_id: AttemptId,
@@ -105,8 +75,6 @@ impl DurablePermitGuard {
         let command = permit.prepared_command().cloned().ok_or_else(|| {
             format!("durable {workflow} typed dispatch permit has no prepared command")
         })?;
-        S::route(permit.activity().spec(), &command)
-            .map_err(|error| format!("durable {workflow} route: {error}"))?;
         self.permit
             .take()
             .expect("permit existence checked before consumption");

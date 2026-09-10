@@ -34,15 +34,21 @@ pub use checkpoint::{
     CheckpointPayload, CheckpointState, ExecutionContract,
 };
 pub use effect::{
-    BoundedEffectError, CompletionClass, CompletionMetadata, DispatchEffect, DurableEffect,
-    DurableEffectSet, EffectActivity, EffectAttempt, EffectAttemptState, EffectCallError,
-    EffectContractError, EffectErrorKind, EffectHostStep, EffectMetadata,
-    EffectObservationDisposition, EffectOutcome, EffectQuarantineContext, EffectRegistration,
-    EffectRoutingError, HostedEffectSet, ObserveEffect, ObserveQuarantinedEffect, PrepareEffect,
-    PreparedCommand, PreparedEffectResolver, PreparedEffectSet, RegisteredEffectResolver,
-    StaticEffectResolver, decode_effect_command, decode_effect_request, encode_effect_command,
-    encode_effect_request, validate_effect_attempts, validate_effect_registrations,
+    BoundedEffectError, CompletionClass, CompletionMetadata, DurableEffect, EffectActivity,
+    EffectAttempt, EffectAttemptState, EffectCallError, EffectContractError, EffectErrorKind,
+    EffectHostStep, EffectMetadata, EffectObservationDisposition, EffectOutcome, PreparedCommand,
+    PreparedEffectResolver, decode_effect_command, decode_effect_observation,
+    decode_effect_request, encode_effect_command, encode_effect_request, validate_effect_attempts,
 };
+/// Narrow integration surface for optional strict-effect activity handlers.
+#[doc(hidden)]
+pub mod strict {
+    pub use crate::effect::{
+        DispatchEffect, EffectQuarantineContext, ObserveEffect, ObserveQuarantinedEffect,
+        PrepareEffect, observe_or_dispatch_effect, observe_quarantined_effect,
+        resolve_prepared_effect,
+    };
+}
 pub use host::{
     ActivityObservation, DispatchPermit, DurableHost, EffectObservation, HOST_OUTCOME_VARIANTS,
     HostOutcome, ObservationRejection, PersistenceBoundary, ReloadReason, StoreOperation,

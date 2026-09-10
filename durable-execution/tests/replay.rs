@@ -6,12 +6,11 @@ use kuberic_durable_execution::{
     ActivityCallError, ActivityName, ActivityOptions, ActivityRecord, ActivitySequence,
     ActivitySpec, ActivityState, AttemptId, CheckpointEnvelope, CheckpointError, CheckpointLimits,
     CheckpointPayload, CompletionClass, DurableActivity, DurableEffect, EffectActivity,
-    EffectAttempt, EffectAttemptState, EffectCallError, EffectMetadata, EffectOutcome, Evaluation,
-    ExactBytes, ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError,
-    LogicalActivityId, Nondeterminism, PreparedActivityError, PreparedActivityResolver,
-    PreparedCommand, PreparedEffectResolver, TerminalOutcome, Workflow, WorkflowContext,
-    encode_activity_input, encode_activity_result, evaluate as evaluate_with_spec,
-    evaluate_effects, evaluate_prepared,
+    EffectAttempt, EffectAttemptState, EffectMetadata, EffectOutcome, Evaluation, ExactBytes,
+    ExecutionContract, ExecutionId, ExecutionSpec, HostEpoch, IdentityError, LogicalActivityId,
+    Nondeterminism, PreparedActivityError, PreparedActivityResolver, PreparedCommand,
+    PreparedEffectResolver, TerminalOutcome, Workflow, WorkflowContext, encode_activity_input,
+    encode_activity_result, evaluate as evaluate_with_spec, evaluate_effects, evaluate_prepared,
 };
 use serde::{Deserialize, Serialize};
 
@@ -993,10 +992,18 @@ impl PreparedEffectResolver for ExactEffectResolver {
     }
 }
 
-async fn effect_body(context: &mut WorkflowContext<'_>) -> Result<String, EffectCallError> {
-    let value = context
-        .call_effect::<WorkflowEffect>("hello".to_owned())
-        .await?;
+async fn effect_body(context: &mut WorkflowContext<'_>) -> Result<String, String> {
+    let outcome = context
+        .schedule_activity_typed::<EffectActivity<WorkflowEffect>>(
+            WorkflowEffect::NAME,
+            &"hello".to_owned(),
+            ActivityOptions::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let value = outcome
+        .into_workflow_result(WorkflowEffect::MAX_ERROR_MESSAGE_BYTES)
+        .map_err(|error| error.to_string())?;
     Ok(format!("{value}!"))
 }
 
