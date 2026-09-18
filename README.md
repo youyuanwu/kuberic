@@ -62,12 +62,24 @@ loopback port. `just kvstore-deploy` installs this setup in the owned cluster.
 
 The operator watches `KubericSet` resources and manages the full lifecycle: pod creation, Open → Idle → Active → Primary promotion, failover, and scale up/down.
 
+## Continuous Delivery
+
+After CI passes, pushes to `main` and version tags publish Linux AMD64 images to
+GitHub Container Registry:
+
+- `ghcr.io/${{ github.repository_owner }}/kvstore`
+- `ghcr.io/${{ github.repository_owner }}/kuberic-operator`
+
+Main-branch images receive immutable commit SHA tags. A semantic version tag
+such as `v0.1.0` also publishes the exact version tag.
+
 ## Design
 
 - [Core protocols](docs/features/kuberic/protocols.md) — replication, copy, failover, switchover
 - [Operator design](docs/features/kuberic/operator.md) — reconciler, CRD, pod management
 - [User API](docs/features/kuberic/user-api.md) — PodRuntime, lifecycle events, StateProvider
 - [SQLite design](docs/features/sqlite/design.md) — WAL frame shipping, persist-then-ACK
+- [SQL Server design](docs/features/sqlserver/design.md) — native AG contract and safety gates
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
