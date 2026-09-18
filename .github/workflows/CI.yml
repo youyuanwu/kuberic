@@ -49,6 +49,9 @@ jobs:
         done
         bash scripts/download_test.sh
 
+    - name: Install RocksDB build prerequisites
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq clang libclang-dev
+
     - name: Install PostgreSQL
       run: |
         sudo apt-get update -qq
