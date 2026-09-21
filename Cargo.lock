@@ -1408,6 +1408,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kuberic-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kuberic-tests"
 version = "0.1.0"
 dependencies = [
@@ -1427,6 +1436,18 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "kuberic-wire"
+version = "0.1.0"
+dependencies = [
+ "kuberic-protocol",
+ "prost",
+ "thiserror 2.0.20",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]

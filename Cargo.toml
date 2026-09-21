@@ -5,6 +5,8 @@ members = [
   "examples/kvstore",
   "examples/postgres",
   "examples/sqlite",
+  "kuberic-protocol",
+  "kuberic-wire",
   "kuberic-core",
   "kuberic-operator",
   "kuberic-tests",
@@ -29,6 +31,7 @@ futures = "0.3"
 async-trait = "0.1"
 serde = "1"
 serde_json = "1"
+sha2 = "0.11"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tonic = "0.14"

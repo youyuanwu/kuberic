@@ -257,6 +257,7 @@ Examples include:
 - operation ID;
 - operation kind;
 - target replica and exact incarnation;
+- provisioning ID and exact PVC UID for a fresh agent store;
 - start time or failover-delay timestamp.
 
 ### Fail Closed
@@ -275,6 +276,7 @@ evidence results in `Wait` or `Unsafe`.
 | Replica process session | Ephemeral agent session ID |
 | Replica-local role, epoch, and configuration | Persisted replica-agent state |
 | Committed topology | Quorum-attested configuration accepted into status |
+| Current out-of-authority provisioning target | Compact `status.provisioning` intent |
 | Current transition target | Compact `status.transition` intent |
 | Effective transition safety inputs | Frozen `status.transition.effectivePolicy` |
 | Reconfiguration authority | Previous/Current Configuration, epochs, roles, and exact replica incarnations selected by the operator |
@@ -325,6 +327,13 @@ status:
       - id: 3
         instanceId: "..."
     writeQuorum: 2
+  provisioning:
+    id: "..."
+    kind: Replacement
+    replicaId: 3
+    instanceId: "..."
+    pvcUid: "..."
+    operationId: "..."
   transition:
     id: "..."
     kind: Failover
@@ -373,6 +382,15 @@ bootstrap, Kubernetes scaffolding derives from `spec.replicas`; afterward it
 uses the frozen accepted replica-set size. Every replacement or primary
 authority change requires explicit Previous/Current Configuration intent and a
 new current epoch.
+
+`status.provisioning` is also optional and identifies at most one exact fresh
+Pod/PVC target that remains outside replication authority. It is persisted
+before `InitializeAgentStore` or build dispatch. It does not count toward
+quorum, does not modify topology, and may be abandoned only before that
+incarnation enters an outstanding CC and after any old work is proven unable to
+complete. Bootstrap uses its persisted Bootstrap transition directly instead
+of a separate provisioning marker. Beginning the replacement PC/CC transition
+atomically clears the matching provisioning intent.
 
 Transition ownership is asymmetric:
 
@@ -426,6 +444,11 @@ The following invariants apply:
     frozen `effectivePolicy.replicaSetSize`.
 15. A changed `spec.replicas` value does not authorize Kubernetes deletion,
     creation, or replication membership changes.
+16. `status.provisioning` never grants role, membership, quorum, or write
+    authority. Its resource UID, Pod UID, PVC UID, logical replica ID, and
+    initialization ID must match the `InitializeAgentStore` command.
+17. At most one provisioning intent exists, and no unrelated membership
+    transition begins while it is active.
 
 ### Initialization Authority
 
@@ -515,10 +538,81 @@ report:
 - pending runtime action identity and bounded terminal result;
 - build or retirement state.
 
+The durable state is stored in a replica-local SQLite database on the replica
+PVC, under a Kuberic-owned metadata directory separate from application data.
+The database records the owning resource UID, logical replica ID, exact replica
+incarnation, durable agent generation, and schema version so persisted
+authority cannot be silently rebound to a different Pod incarnation.
+
+SQLite transactions define the agent's local commit boundary:
+
+- command intent and pending runtime-action identity are committed before the
+  corresponding runtime effect is issued;
+- authority and terminal evidence required for recovery are committed before
+  command completion is acknowledged;
+- related epoch, configuration, role, access, deactivation, and action updates
+  are committed atomically;
+- schema migration is explicit and transactional;
+- missing, corrupt, incompatible, or identity-mismatched storage is reported
+  as `Unsafe` rather than recreated as empty authority.
+
+The agent is the single writer. SQLite journaling and synchronization settings
+must provide durable commit semantics on the supported PVC filesystem and are
+validated by crash-boundary tests. The database does not contain application
+state. A process session ID remains ephemeral and changes on every agent
+process start; only the durable agent generation survives a process restart.
+
+Database absence has two distinct meanings:
+
+1. **Fresh provisioning:** The exact Pod and PVC were created for a
+   never-initialized bootstrap member or for a replacement that is still
+   outside PC and CC. The agent reports an uninitialized store and does not
+   create authority by itself. After the operator persists the corresponding
+   bootstrap or replacement intent, it may issue one fenced
+   `InitializeAgentStore` command naming the resource UID, logical replica ID,
+   Pod UID, PVC UID, initialization ID, operator-assigned durable agent
+   generation, and effective policy. The generation is deterministically
+   derived from the persisted initialization identity, allowing the complete
+   exact configuration to be persisted before store creation. The agent
+   atomically creates the schema and adopts that generation.
+2. **Established storage missing:** The Pod incarnation or accepted/outstanding
+   authority requires an existing durable generation, but the database is
+   absent, unreadable, incompatible, or identity-mismatched. The agent and
+   operator report `Unsafe`; they do not create a replacement database on that
+   PVC.
+
+A newly created PVC UID and persisted transition intent are therefore
+provisioning evidence, not authority by themselves. A retained PVC must not be
+rebound to a new Pod UID in the minimum contract.
+
+Runtime-effect recovery follows an explicit ordering:
+
+1. validate the command against current durable authority;
+2. commit operation intent and the pending runtime-effect identity;
+3. issue or reissue the idempotent runtime effect;
+4. observe its durable or reconstructible postcondition;
+5. atomically commit the resulting authority and terminal evidence;
+6. acknowledge command completion.
+
+A committed intent does not imply that its runtime effect ran. After a crash,
+the agent distinguishes pending intent from durable completion and resumes from
+the observed postcondition. Runtime authority that gates replication is
+persisted before the runtime can acknowledge work in that authority. In
+particular, a secondary must durably accept the exact epoch, configuration,
+replica incarnation, and agent generation before acknowledging replication in
+that epoch.
+
+Application state and RA metadata do not share a transaction. Recovery
+therefore uses conservative postconditions: application acknowledgements prove
+durable application progress, runtime operations are safe to repeat, and RA
+completion is recorded only after the corresponding application/runtime
+postcondition is observed. A crash between those commits causes re-observation
+or repetition, never inferred success or rollback of acknowledged progress.
+
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and
-rebuild. Operator2 should not depend on volatile correlation state for normal
-recovery.
+rebuild. The level-triggered operator must not depend on volatile correlation
+state for normal recovery.
 
 The durable agent generation identifies persisted authority across process
 restarts. The process session ID identifies a specific running agent process.
@@ -528,6 +622,19 @@ persisted configuration or action evidence.
 ### Declarative Fenced Commands
 
 Commands should describe a desired postcondition and include exact authority:
+
+```text
+InitializeAgentStore {
+    initialization_id,
+    resource_uid,
+    local_replica_id,
+    expected_instance_id,
+    expected_pod_uid,
+    expected_pvc_uid,
+    assigned_agent_generation,
+    effective_policy
+}
+```
 
 ```text
 EnsureConfiguration {
@@ -906,16 +1013,19 @@ an implementation sequence or phased delivery plan.
 3. Select the deterministic initial primary incarnation.
 4. Persist a Bootstrap transition with empty PC, full-size genesis CC, initial
    epoch, initialization ID, and frozen effective policy.
-5. Ask that replica agent to open the runtime, install the epoch and genesis
+5. Initialize each exact fresh agent store using the persisted Bootstrap
+   transition, resource UID, Pod UID, PVC UID, logical replica ID, and
+   initialization ID.
+6. Ask the selected replica agent to open the runtime, install the epoch and genesis
    bootstrap authority, and change role to runtime Primary with WriteStatus
    denied.
-6. Build every other genesis member as an Idle Secondary outside the installed
+7. Build every other genesis member as an Idle Secondary outside the installed
    configuration.
-7. Observe each member's copy/replication-gap completion, then install the full
+8. Observe each member's copy/replication-gap completion, then install the full
    genesis CC.
-8. Atomically set `initialized = true`, accept genesis CC as
+9. Atomically set `initialized = true`, accept genesis CC as
    `status.topology`, and clear the Bootstrap transition.
-9. Observe granted WriteStatus and publish write routing.
+10. Observe granted WriteStatus and publish write routing.
 
 The operator may resume at any step by observing which configurations are
 already committed.
@@ -940,21 +1050,25 @@ configuration.
 2. Ensure the replacement Pod and PVC exist and observe its exact identity.
 3. Derive a deterministic operation ID from PC and the replacement
    incarnation.
-4. Open the replacement as an Idle Secondary outside PC and CC.
-5. Ask the primary replicator to build the exact replacement through copy plus
+4. Persist `status.provisioning`, then initialize the exact fresh agent
+   store using the resource UID, Pod UID, PVC UID, logical replica ID, and
+   initialization ID.
+5. Open the replacement as an Idle Secondary outside PC and CC.
+6. Ask the primary replicator to build the exact replacement through copy plus
    concurrent replication.
-6. Observe acknowledgement of both the final copy operation and the captured
+7. Observe acknowledgement of both the final copy operation and the captured
    replication boundary.
-7. Allocate a newer configuration epoch. PC contains the old incarnation; CC
-   replaces it with the new incarnation and retains exactly `N` members.
-8. Install the catch-up configuration and wait for the required CC quorum
+8. Allocate a newer configuration epoch. Atomically clear provisioning and
+   persist the transition: PC contains the old incarnation; CC replaces it
+   with the new incarnation and retains exactly `N` members.
+9. Install the catch-up configuration and wait for the required CC quorum
    progress. A replacement secondary is not unconditionally
    `must_catch_up`.
-9. Enter deactivation and collect the required PC deactivation/read-quorum
+10. Enter deactivation and collect the required PC deactivation/read-quorum
    evidence.
-10. Activate CC and complete the replica-agent reconfiguration.
-11. Install CC without PC and accept the same-cardinality topology.
-12. Close, retire, and delete or retain the old incarnation only after it is
+11. Activate CC and complete the replica-agent reconfiguration.
+12. Install CC without PC and accept the same-cardinality topology.
+13. Close, retire, and delete or retain the old incarnation only after it is
     absent from accepted topology and outstanding transition authority.
 
 Before CC is persisted, a failed build target may be abandoned after proving
@@ -1224,11 +1338,6 @@ Protocol-version negotiation is outside this design. Every participant in PC
 and CC must expose a version supported by the operator and by the other
 participants. The evaluator returns `Unsafe` for incompatible mixed versions
 rather than silently downgrading guarantees.
-
-## Open Questions
-
-1. Where should the replica agent persist reconfiguration state, deactivation
-   information, and retained runtime results?
 
 ## Appendix: Minimum Viable Feature Set
 

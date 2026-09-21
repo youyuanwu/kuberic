@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package kuberic.level.v1;
+
+message Epoch {
+  int64 data_loss_number = 1;
+  int64 configuration_number = 2;
+}
+
+enum ReplicaRole {
+  REPLICA_ROLE_UNKNOWN = 0;
+  REPLICA_ROLE_PRIMARY = 1;
+  REPLICA_ROLE_ACTIVE_SECONDARY = 2;
+  REPLICA_ROLE_IDLE_SECONDARY = 3;
+  REPLICA_ROLE_NONE = 4;
+}
+
+enum AccessStatus {
+  ACCESS_STATUS_UNKNOWN = 0;
+  ACCESS_STATUS_GRANTED = 1;
+  ACCESS_STATUS_RECONFIGURATION_PENDING = 2;
+  ACCESS_STATUS_NOT_PRIMARY = 3;
+  ACCESS_STATUS_NO_WRITE_QUORUM = 4;
+}
+
+enum AgentStorageState {
+  AGENT_STORAGE_STATE_UNKNOWN = 0;
+  AGENT_STORAGE_STATE_UNINITIALIZED = 1;
+  AGENT_STORAGE_STATE_INITIALIZED = 2;
+  AGENT_STORAGE_STATE_UNSAFE = 3;
+}
+
+message ReplicaIdentity {
+  int64 replica_id = 1;
+  string instance_id = 2;
+  string agent_generation = 3;
+}
+
+message ConfigurationMember {
+  ReplicaIdentity identity = 1;
+  ReplicaRole role = 2;
+}
+
+message Configuration {
+  string configuration_id = 1;
+  Epoch epoch = 2;
+  int64 primary_id = 3;
+  repeated ConfigurationMember members = 4;
+  uint32 write_quorum = 5;
+}
+
+message EffectivePolicy {
+  uint32 replica_set_size = 1;
+  uint32 write_quorum = 2;
+  uint32 read_quorum = 3;
+  uint64 failover_delay_seconds = 4;
+}
+
+message GetAgentStatusRequest {
+  uint32 protocol_version = 1;
+  string resource_uid = 2;
+  int64 replica_id = 3;
+  string expected_instance_id = 4;
+}
+
+message AgentStatusReport {
+  uint32 protocol_version = 1;
+  string resource_uid = 2;
+  ReplicaIdentity identity = 3;
+  string process_session_id = 4;
+  uint64 report_sequence = 5;
+  ReplicaRole role = 6;
+  AccessStatus write_status = 7;
+  Epoch epoch = 8;
+  Configuration previous_configuration = 9;
+  Configuration current_configuration = 10;
+  int64 current_progress = 11;
+  int64 committed_lsn = 12;
+  optional int64 catch_up_capability = 13;
+  AgentStorageState storage_state = 14;
+  string pod_uid = 15;
+  string pvc_uid = 16;
+  string storage_error = 17;
+}
+
+message InitializeAgentStoreCommand {
+  string initialization_id = 1;
+  string resource_uid = 2;
+  int64 local_replica_id = 3;
+  string expected_instance_id = 4;
+  string expected_pod_uid = 5;
+  string expected_pvc_uid = 6;
+  string assigned_agent_generation = 7;
+  EffectivePolicy effective_policy = 8;
+}
+
+message EnsureConfigurationCommand {
+  string operation_id = 1;
+  Configuration previous_configuration = 2;
+  Configuration current_configuration = 3;
+  Epoch previous_epoch = 4;
+  Epoch current_epoch = 5;
+  EffectivePolicy effective_policy = 6;
+  int64 local_replica_id = 7;
+  string expected_instance_id = 8;
+  string expected_agent_generation = 9;
+}
+
+message ExecuteCommandRequest {
+  uint32 protocol_version = 1;
+  string resource_uid = 2;
+  ReplicaIdentity target = 3;
+  oneof command {
+    InitializeAgentStoreCommand initialize_agent_store = 10;
+    EnsureConfigurationCommand ensure_configuration = 11;
+  }
+}
+
+message ExecuteCommandResponse {
+  uint32 protocol_version = 1;
+  AgentStatusReport observation = 2;
+}
+
+message ReplicationItem {
+  uint32 protocol_version = 1;
+  ReplicaIdentity sender = 2;
+  Epoch epoch = 3;
+  string previous_configuration_id = 4;
+  string current_configuration_id = 5;
+  int64 lsn = 6;
+  int64 committed_lsn = 7;
+  bytes data = 8;
+}
+
+message ReplicationAck {
+  uint32 protocol_version = 1;
+  ReplicaIdentity sender = 2;
+  ReplicaIdentity receiver = 3;
+  Epoch epoch = 4;
+  string previous_configuration_id = 5;
+  string current_configuration_id = 6;
+  int64 received_lsn = 7;
+  int64 applied_lsn = 8;
+  int64 committed_lsn = 9;
+}
+
+service AgentControl {
+  rpc GetStatus(GetAgentStatusRequest) returns (AgentStatusReport);
+  rpc Execute(ExecuteCommandRequest) returns (ExecuteCommandResponse);
+}
+
+service ReplicaPeer {
+  rpc GetStatus(GetAgentStatusRequest) returns (AgentStatusReport);
+  rpc Execute(ExecuteCommandRequest) returns (ExecuteCommandResponse);
+}
+
+service ReplicationData {
+  rpc Replicate(stream ReplicationItem) returns (stream ReplicationAck);
+}
