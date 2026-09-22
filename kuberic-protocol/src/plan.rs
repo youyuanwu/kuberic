@@ -1,3 +1,5 @@
+//! Side-effect-free reconciliation outcomes returned by the evaluator.
+
 use serde::{Deserialize, Serialize};
 
 use crate::command::{KubernetesChange, ProtocolCommand, SafetyChange};
@@ -30,6 +32,7 @@ pub enum UnsafeReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
+/// Complete outcome of one pure evaluation cycle.
 pub enum Plan {
     Stable {
         status: AcceptedStatus,

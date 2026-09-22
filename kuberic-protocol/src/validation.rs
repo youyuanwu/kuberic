@@ -1,3 +1,5 @@
+//! Fail-closed validation for accepted authority and observed replica state.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
@@ -120,6 +122,7 @@ pub enum ValidationError {
     UninitializedScaffoldingMismatch,
 }
 
+/// Validates accepted status and every observed exact replica incarnation.
 pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), ValidationError> {
     if snapshot.desired.replicas == 0 {
         return Err(ValidationError::DesiredReplicasZero);
@@ -465,6 +468,7 @@ fn observation_key_string(key: &ReplicaObservationKey) -> String {
     format!("{}@{}", key.replica_id, key.instance_id)
 }
 
+/// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     match (status.initialized, status.topology.as_ref()) {
         (true, None) => return Err(ValidationError::InitializedWithoutTopology),
@@ -527,6 +531,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validates the relationship between PC, CC, epoch, membership, and policy.
 pub fn validate_transition_relationship(
     kind: TransitionKind,
     previous: Option<&ConfigurationDescriptor>,
@@ -610,6 +615,7 @@ pub fn validate_transition_relationship(
     Ok(())
 }
 
+/// Validates one canonical configuration independently.
 pub fn validate_configuration(
     configuration: &ConfigurationDescriptor,
     policy: Option<&EffectivePolicy>,

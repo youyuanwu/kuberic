@@ -1,3 +1,8 @@
+//! Versioned transport contracts for the level-triggered Kuberic stack.
+//!
+//! Generated protobuf types remain transport-only. Validation and conversion
+//! establish canonical `kuberic-protocol` authority before callers use them.
+
 pub mod convert;
 
 pub mod proto {

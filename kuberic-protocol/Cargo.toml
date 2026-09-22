@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Pure authority model and evaluator for the level-triggered Kuberic stack"
+readme = "README.md"
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }

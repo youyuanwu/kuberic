@@ -1,3 +1,5 @@
+//! Fenced protocol commands and declarative Kubernetes changes.
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
@@ -43,6 +45,7 @@ pub struct EnsureConfiguration {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
+/// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
     InitializeAgentStore(InitializeAgentStore),
     EnsureConfiguration(Box<EnsureConfiguration>),
@@ -59,6 +62,7 @@ impl ProtocolCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
+/// Idempotent Kubernetes or status convergence performed by the controller.
 pub enum KubernetesChange {
     EnsureReplicaScaffolding {
         replica_ids: Vec<ReplicaId>,

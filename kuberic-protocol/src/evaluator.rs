@@ -1,3 +1,5 @@
+//! Deterministic reconciliation decisions over a normalized observation.
+
 use crate::command::{InitializeAgentStore, KubernetesChange, ProtocolCommand, SafetyChange};
 use crate::observation::{AgentObservation, ObservationSnapshot};
 use crate::plan::{Plan, UnsafeReason, WaitReason};
@@ -29,6 +31,7 @@ impl Default for EvaluationConfig {
     }
 }
 
+/// Validates one snapshot and returns the next safe reconciliation outcome.
 pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
     if let Err(error) = validate_snapshot(snapshot) {
         let reason = if error == ValidationError::DesiredReplicasZero {

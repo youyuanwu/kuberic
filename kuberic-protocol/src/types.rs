@@ -1,3 +1,5 @@
+//! Canonical identities, configurations, policies, and durable status intent.
+
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -72,6 +74,7 @@ impl fmt::Display for ReplicaId {
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
 )]
 #[serde(rename_all = "camelCase")]
+/// Monotonic replication authority version, ordered by data loss then configuration.
 pub struct Epoch {
     pub data_loss_number: i64,
     pub configuration_number: i64,
@@ -88,6 +91,7 @@ impl Epoch {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Runtime role of one exact replica incarnation.
 pub enum ReplicaRole {
     Primary,
     ActiveSecondary,
@@ -97,6 +101,7 @@ pub enum ReplicaRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Current write-access decision exposed by the replica runtime.
 pub enum AccessStatus {
     Granted,
     ReconfigurationPending,
@@ -106,6 +111,7 @@ pub enum AccessStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Exact authority identity: logical replica, Pod incarnation, and durable generation.
 pub struct ReplicaIdentity {
     pub replica_id: ReplicaId,
     pub instance_id: ReplicaInstanceId,
@@ -121,6 +127,7 @@ pub struct ConfigurationMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Canonical Current or Previous Configuration with a content-derived ID.
 pub struct ConfigurationDescriptor {
     pub configuration_id: ConfigurationId,
     pub epoch: Epoch,
@@ -183,6 +190,7 @@ impl ConfigurationDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Fixed replica-set size and majority quorum values frozen for an operation.
 pub struct EffectivePolicy {
     pub replica_set_size: u32,
     pub write_quorum: u32,
@@ -208,18 +216,21 @@ impl EffectivePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Last quorum-attested configuration accepted by the operator.
 pub struct AcceptedTopology {
     pub configuration: ConfigurationDescriptor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Supported out-of-authority provisioning operation.
 pub enum ProvisioningKind {
     Replacement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Compact intent for one fresh replica that has not entered PC or CC.
 pub struct ProvisioningIntent {
     pub provisioning_id: ProvisioningId,
     pub kind: ProvisioningKind,
@@ -235,6 +246,7 @@ pub struct ProvisioningIntent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Supported authority-changing transition.
 pub enum TransitionKind {
     Bootstrap,
     Replacement,
@@ -253,6 +265,7 @@ impl TransitionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Frozen PC/CC target and policy for one active transition.
 pub struct TransitionIntent {
     pub transition_id: TransitionId,
     pub kind: TransitionKind,
@@ -282,6 +295,7 @@ pub struct StatusCondition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+/// Durable controller authority: accepted topology plus compact active intent.
 pub struct AcceptedStatus {
     pub initialized: bool,
     pub observed_generation: u64,

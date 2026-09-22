@@ -1,3 +1,7 @@
+//! Strict validation and conversion between protobuf and canonical protocol types.
+
+use std::collections::BTreeSet;
+
 use kuberic_protocol::observation::{AgentObservation, AgentReport, UninitializedAgentObservation};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
@@ -22,6 +26,7 @@ pub enum WireError {
     InvalidAuthority(String),
 }
 
+/// Requires an exact protocol-version match; negotiation is intentionally unsupported.
 pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
     if observed == kuberic_protocol::PROTOCOL_VERSION {
         Ok(())
@@ -33,10 +38,12 @@ pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
     }
 }
 
+/// Validates an agent report without retaining its canonical representation.
 pub fn validate_agent_status_report(report: &proto::AgentStatusReport) -> Result<(), WireError> {
     normalize_agent_status_report(report.clone()).map(|_| ())
 }
 
+/// Converts a fully validated wire report into canonical observation evidence.
 pub fn normalize_agent_status_report(
     report: proto::AgentStatusReport,
 ) -> Result<AgentObservation, WireError> {
@@ -181,6 +188,7 @@ pub fn normalize_agent_status_report(
     }
 }
 
+/// Validates command fencing, policy, and PC/CC relationships.
 pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Result<(), WireError> {
     ensure_supported_version(request.protocol_version)?;
     if request.resource_uid.is_empty() {
@@ -361,6 +369,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
     }
 }
 
+/// Validates the exact authority carried by one replication item.
 pub fn validate_replication_item(item: &proto::ReplicationItem) -> Result<(), WireError> {
     ensure_supported_version(item.protocol_version)?;
     item.sender
@@ -384,6 +393,7 @@ pub fn validate_replication_item(item: &proto::ReplicationItem) -> Result<(), Wi
     Ok(())
 }
 
+/// Validates exact sender/receiver authority and monotonic ACK progress.
 pub fn validate_replication_ack(ack: &proto::ReplicationAck) -> Result<(), WireError> {
     ensure_supported_version(ack.protocol_version)?;
     ack.sender
@@ -639,4 +649,3 @@ fn validate_policy(policy: &proto::EffectivePolicy) -> Result<(), WireError> {
     }
     Ok(())
 }
-use std::collections::BTreeSet;

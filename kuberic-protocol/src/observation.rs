@@ -1,3 +1,5 @@
+//! Normalized Kubernetes, storage, routing, and replica-agent evidence.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -66,6 +68,7 @@ pub struct AgentReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Lookup key that preserves multiple incarnations of one logical replica.
 pub struct ReplicaObservationKey {
     pub replica_id: ReplicaId,
     pub instance_id: ReplicaInstanceId,
@@ -119,6 +122,7 @@ pub struct RoutingObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Immutable input consumed by one evaluator invocation.
 pub struct ObservationSnapshot {
     pub resource_uid: ResourceUid,
     pub resource_version: String,
