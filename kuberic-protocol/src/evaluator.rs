@@ -132,7 +132,8 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 requeue_after_seconds: config.wait_requeue_seconds,
             };
         };
-        let authority_matches = report.healthy
+        let authority_matches = report.identity == member.identity
+            && report.healthy
             && report.role == member.role
             && report.epoch == configuration.epoch
             && report
@@ -327,82 +328,41 @@ fn evaluate_transition(
 
     for member in &transition.current_configuration.members {
         let Some(observation) = snapshot.observation_for_identity(&member.identity) else {
+            continue;
+        };
+        if let Err(message) = bootstrap_initialization_command(snapshot, member, observation) {
+            return unsafe_plan(
+                status,
+                UnsafeReason::ContradictoryReplicaEvidence(message),
+                config,
+            );
+        }
+    }
+
+    for member in &transition.current_configuration.members {
+        let Some(observation) = snapshot.observation_for_identity(&member.identity) else {
             return Plan::Wait {
                 reason: WaitReason::AgentUnavailable,
                 status,
                 requeue_after_seconds: config.wait_requeue_seconds,
             };
         };
-        match &observation.agent {
-            AgentObservation::Uninitialized(report) => {
-                let kubernetes = observation
-                    .kubernetes
-                    .as_ref()
-                    .expect("validated uninitialized report matches scaffolding");
-                let pod_uid = kubernetes
-                    .pod_uid
-                    .clone()
-                    .expect("validated uninitialized report has Pod UID");
-                let pvc_uid = kubernetes
-                    .pvc_uid
-                    .clone()
-                    .expect("validated uninitialized report has PVC UID");
-                let initialization_id = derive_initialization_id(
-                    &snapshot.resource_uid,
-                    member.identity.replica_id,
-                    &pod_uid,
-                    &pvc_uid,
-                );
-                if derive_agent_generation(&initialization_id) != member.identity.agent_generation
-                    || ReplicaInstanceId::new(pod_uid.as_str()) != member.identity.instance_id
-                {
-                    return unsafe_plan(
-                        status,
-                        UnsafeReason::ContradictoryReplicaEvidence(format!(
-                            "bootstrap member {} does not match persisted identity",
-                            member.identity.replica_id
-                        )),
-                        config,
-                    );
-                }
+        match bootstrap_initialization_command(snapshot, member, observation)
+            .expect("bootstrap observations were prevalidated")
+        {
+            Some(command) => {
                 return Plan::Execute {
-                    command: ProtocolCommand::InitializeAgentStore(InitializeAgentStore {
-                        initialization_id,
-                        resource_uid: snapshot.resource_uid.clone(),
-                        local_replica_id: member.identity.replica_id,
-                        expected_instance_id: member.identity.instance_id.clone(),
-                        expected_pod_uid: report.pod_uid.clone(),
-                        expected_pvc_uid: report.pvc_uid.clone(),
-                        assigned_agent_generation: member.identity.agent_generation.clone(),
-                        effective_policy: transition.effective_policy.clone(),
-                    }),
+                    command: ProtocolCommand::InitializeAgentStore(command),
                 };
             }
-            AgentObservation::Report(report) => {
-                if report.identity != member.identity {
-                    return unsafe_plan(
-                        status,
-                        UnsafeReason::ContradictoryReplicaEvidence(format!(
-                            "bootstrap member {} reports identity {}@{} instead of {}@{}",
-                            member.identity.replica_id,
-                            report.identity.instance_id,
-                            report.identity.agent_generation,
-                            member.identity.instance_id,
-                            member.identity.agent_generation,
-                        )),
-                        config,
-                    );
-                }
-            }
-            AgentObservation::Absent
-            | AgentObservation::Unreachable { .. }
-            | AgentObservation::Invalid { .. } => {
+            None if !matches!(observation.agent, AgentObservation::Report(_)) => {
                 return Plan::Wait {
                     reason: WaitReason::AgentUnavailable,
                     status,
                     requeue_after_seconds: config.wait_requeue_seconds,
                 };
             }
+            None => {}
         }
     }
 
@@ -410,6 +370,74 @@ fn evaluate_transition(
         reason: WaitReason::ActiveTransition,
         status,
         requeue_after_seconds: config.wait_requeue_seconds,
+    }
+}
+
+fn bootstrap_initialization_command(
+    snapshot: &ObservationSnapshot,
+    member: &ConfigurationMember,
+    observation: &crate::observation::ReplicaObservation,
+) -> Result<Option<InitializeAgentStore>, String> {
+    match &observation.agent {
+        AgentObservation::Uninitialized(report) => {
+            let kubernetes = observation
+                .kubernetes
+                .as_ref()
+                .expect("validated uninitialized report matches scaffolding");
+            let pod_uid = kubernetes
+                .pod_uid
+                .clone()
+                .expect("validated uninitialized report has Pod UID");
+            let pvc_uid = kubernetes
+                .pvc_uid
+                .clone()
+                .expect("validated uninitialized report has PVC UID");
+            let initialization_id = derive_initialization_id(
+                &snapshot.resource_uid,
+                member.identity.replica_id,
+                &pod_uid,
+                &pvc_uid,
+            );
+            if derive_agent_generation(&initialization_id) != member.identity.agent_generation
+                || ReplicaInstanceId::new(pod_uid.as_str()) != member.identity.instance_id
+            {
+                return Err(format!(
+                    "bootstrap member {} does not match persisted identity",
+                    member.identity.replica_id
+                ));
+            }
+            let transition = snapshot
+                .status
+                .transition
+                .as_ref()
+                .expect("bootstrap command requires persisted transition");
+            Ok(Some(InitializeAgentStore {
+                initialization_id,
+                resource_uid: snapshot.resource_uid.clone(),
+                local_replica_id: member.identity.replica_id,
+                expected_instance_id: member.identity.instance_id.clone(),
+                expected_pod_uid: report.pod_uid.clone(),
+                expected_pvc_uid: report.pvc_uid.clone(),
+                assigned_agent_generation: member.identity.agent_generation.clone(),
+                effective_policy: transition.effective_policy.clone(),
+            }))
+        }
+        AgentObservation::Report(report) => {
+            if report.identity != member.identity {
+                return Err(format!(
+                    "bootstrap member {} reports identity {}@{} instead of {}@{}",
+                    member.identity.replica_id,
+                    report.identity.instance_id,
+                    report.identity.agent_generation,
+                    member.identity.instance_id,
+                    member.identity.agent_generation,
+                ));
+            }
+            Ok(None)
+        }
+        AgentObservation::Absent
+        | AgentObservation::Unreachable { .. }
+        | AgentObservation::Invalid { .. } => Ok(None),
     }
 }
 

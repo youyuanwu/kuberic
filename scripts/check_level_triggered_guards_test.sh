@@ -123,6 +123,24 @@ const PROTECTED: &str = include_str!(
 EOF
 expect_dependency_failure "$multiline_include"
 
+nested_include="$temporary/nested-include"
+new_cargo_repo "$nested_include"
+cat > "$nested_include/kuberic-protocol/src/lib.rs" <<'EOF'
+const PROTECTED: &str = include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../kuberic-core/src/types.rs"
+));
+EOF
+expect_dependency_failure "$nested_include"
+
+cfg_attr_path="$temporary/cfg-attr-path"
+new_cargo_repo "$cfg_attr_path"
+cat > "$cfg_attr_path/kuberic-protocol/src/lib.rs" <<'EOF'
+#[cfg_attr(all(), path = "../../kuberic-core/src/types.rs")]
+mod protected;
+EOF
+expect_dependency_failure "$cfg_attr_path"
+
 symlink_import="$temporary/symlink-import"
 new_cargo_repo "$symlink_import"
 printf 'pub fn protocol() {}\n' > "$symlink_import/kuberic-protocol/src/lib.rs"

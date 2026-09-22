@@ -60,11 +60,9 @@ protected_tokens = {
     "examples/postgres",
     "kuberic-tests",
 }
-path_attribute = re.compile(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]', re.DOTALL)
-include_expression = re.compile(
-    r'(?:include|include_str|include_bytes)!\s*\((.*?)\)',
-    re.DOTALL,
-)
+attribute = re.compile(r'#\s*\[(.*?)\]', re.DOTALL)
+path_assignment = re.compile(r'\bpath\s*=\s*"([^"]+)"')
+include_start = re.compile(r'(?:include|include_str|include_bytes)!\s*\(')
 string_literal = re.compile(r'"([^"]+)"')
 
 def is_protected(path):
@@ -73,6 +71,64 @@ def is_protected(path):
         resolved == root or root in resolved.parents
         for root in protected_roots
     )
+
+def include_expressions(text):
+    for match in include_start.finditer(text):
+        depth = 1
+        index = match.end()
+        quote = None
+        escaped = False
+        line_comment = False
+        block_comment_depth = 0
+        while index < len(text):
+            character = text[index]
+            following = text[index + 1] if index + 1 < len(text) else ""
+            if line_comment:
+                if character == "\n":
+                    line_comment = False
+                index += 1
+                continue
+            if block_comment_depth:
+                if character == "/" and following == "*":
+                    block_comment_depth += 1
+                    index += 2
+                elif character == "*" and following == "/":
+                    block_comment_depth -= 1
+                    index += 2
+                else:
+                    index += 1
+                continue
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                index += 1
+                continue
+            if character == "/" and following == "/":
+                line_comment = True
+                index += 2
+                continue
+            if character == "/" and following == "*":
+                block_comment_depth = 1
+                index += 2
+                continue
+            if character in {'"', "'"}:
+                quote = character
+                index += 1
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    yield text[match.end():index]
+                    break
+            index += 1
+        else:
+            raise ValueError("unterminated include expression")
 
 for package in metadata["packages"]:
     if package["name"] not in new_packages:
@@ -85,12 +141,18 @@ for package in metadata["packages"]:
             )
     for source in package_root.rglob("*.rs"):
         text = source.read_text(errors="replace")
-        for relative in path_attribute.findall(text):
-            if is_protected(source.parent / relative):
-                violations.append(
-                    f"{package['name']} imports protected source via {source}: {relative}"
-                )
-        for expression in include_expression.findall(text):
+        for body in attribute.findall(text):
+            for relative in path_assignment.findall(body):
+                if is_protected(source.parent / relative):
+                    violations.append(
+                        f"{package['name']} imports protected source via {source}: {relative}"
+                    )
+        try:
+            expressions = list(include_expressions(text))
+        except ValueError as error:
+            violations.append(f"{package['name']} has {error} in {source}")
+            expressions = []
+        for expression in expressions:
             literals = string_literal.findall(expression)
             if any(is_protected(source.parent / relative) for relative in literals):
                 violations.append(

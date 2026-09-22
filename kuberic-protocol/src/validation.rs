@@ -98,6 +98,8 @@ pub enum ValidationError {
     },
     #[error("replica {replica_id} identity contradicts accepted member identity")]
     ConflictingReplicaIdentity { replica_id: i64 },
+    #[error("replica {0} reports missing storage for an established authority incarnation")]
+    EstablishedStoreMissing(i64),
     #[error("replica {0} report epoch or role contradicts its installed configuration")]
     InvalidReplicaReportAuthority(i64),
     #[error("replica {replica_id} reports epoch {observed:?} newer than authorized {authorized:?}")]
@@ -120,6 +122,12 @@ pub enum ValidationError {
     ConflictingPrimaryClaims(Vec<i64>),
     #[error("uninitialized agent identity does not match observed Pod/PVC scaffolding")]
     UninitializedScaffoldingMismatch,
+    #[error("uninitialized agent identity does not match authorized provisioning")]
+    UninitializedProvisioningMismatch,
+    #[error("bootstrap replica {0} reports a Previous Configuration")]
+    BootstrapReportHasPreviousConfiguration(i64),
+    #[error("replica {0} reports a Previous Configuration that differs from frozen authority")]
+    ReportedPreviousConfigurationMismatch(i64),
 }
 
 /// Validates accepted status and every observed exact replica incarnation.
@@ -191,6 +199,40 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                     });
                 if !matches_scaffolding {
                     return Err(ValidationError::UninitializedScaffoldingMismatch);
+                }
+                let accepted_instance = snapshot.status.topology.as_ref().is_some_and(|topology| {
+                    topology.configuration.members.iter().any(|member| {
+                        member.identity.replica_id == key.replica_id
+                            && member.identity.instance_id == key.instance_id
+                    })
+                });
+                let established_transition_instance = snapshot
+                    .status
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| {
+                        transition.kind != TransitionKind::Bootstrap
+                            && transition
+                                .current_configuration
+                                .members
+                                .iter()
+                                .any(|member| {
+                                    member.identity.replica_id == key.replica_id
+                                        && member.identity.instance_id == key.instance_id
+                                })
+                    });
+                if accepted_instance || established_transition_instance {
+                    return Err(ValidationError::EstablishedStoreMissing(
+                        key.replica_id.value(),
+                    ));
+                }
+                if let Some(provisioning) = snapshot.status.provisioning.as_ref()
+                    && provisioning.replica_id == key.replica_id
+                    && provisioning.instance_id == key.instance_id
+                    && (provisioning.pod_uid != report.pod_uid
+                        || provisioning.pvc_uid != report.pvc_uid)
+                {
+                    return Err(ValidationError::UninitializedProvisioningMismatch);
                 }
             }
             AgentObservation::Report(report) => {
@@ -370,11 +412,33 @@ fn validate_report_authority(
             .iter()
             .any(|member| member.identity == report.identity)
     });
+    let accepted_instance = accepted.is_some_and(|configuration| {
+        configuration.members.iter().any(|member| {
+            member.identity.replica_id == report.identity.replica_id
+                && member.identity.instance_id == report.identity.instance_id
+        })
+    });
+    let current_instance = current.is_some_and(|configuration| {
+        configuration.members.iter().any(|member| {
+            member.identity.replica_id == report.identity.replica_id
+                && member.identity.instance_id == report.identity.instance_id
+        })
+    });
+    if !accepted_exact && !current_exact && (accepted_instance || current_instance) {
+        return Err(ValidationError::ConflictingReplicaIdentity {
+            replica_id: report.identity.replica_id.value(),
+        });
+    }
 
     if let Some(transition) = &snapshot.status.transition
         && transition.kind == TransitionKind::Bootstrap
         && current_exact
     {
+        if report.previous_configuration.is_some() {
+            return Err(ValidationError::BootstrapReportHasPreviousConfiguration(
+                report.identity.replica_id.value(),
+            ));
+        }
         if report.write_status == AccessStatus::Granted {
             return Err(ValidationError::BootstrapWriteGranted(
                 report.identity.replica_id.value(),
@@ -388,6 +452,24 @@ fn validate_report_authority(
             .expect("current exact identity has a member");
         if expected.role != ReplicaRole::Primary && report.role == ReplicaRole::Primary {
             return Err(ValidationError::BootstrapRoleConflict(
+                report.identity.replica_id.value(),
+            ));
+        }
+    }
+    if let Some(transition) = &snapshot.status.transition
+        && transition.kind != TransitionKind::Bootstrap
+        && report.epoch == transition.current_configuration.epoch
+        && report
+            .current_configuration
+            .as_ref()
+            .is_some_and(|current| {
+                current.configuration_id == transition.current_configuration.configuration_id
+            })
+        && let Some(reported_previous) = report.previous_configuration.as_ref()
+    {
+        let accepted = accepted.expect("validated non-bootstrap transition has topology");
+        if reported_previous != accepted {
+            return Err(ValidationError::ReportedPreviousConfigurationMismatch(
                 report.identity.replica_id.value(),
             ));
         }
