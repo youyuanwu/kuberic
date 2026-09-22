@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use kuberic_protocol::types::{AccessStatus, Epoch, ReplicaIdentity, ReplicaRole};
@@ -17,6 +17,7 @@ use kuberic_runtime::replicator::{
     ReplicatorRegistration, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
+use kuberic_runtime_internal::RuntimeHostToken;
 use kuberic_runtime_internal::authority::{
     AuthorityStore, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
     ReplicaAuthorityStore, ReplicationProgressStore,
@@ -91,7 +92,6 @@ impl PodRuntime {
                 identity,
                 application: application.clone(),
                 default_dependencies: DefaultReplicatorDependencies {
-                    application,
                     replica_authority_store,
                     replication_progress_store,
                     local_write_journal,
@@ -104,6 +104,7 @@ impl PodRuntime {
                 }),
                 effect_lock: Mutex::new(()),
                 registered: OnceLock::new(),
+                pending_managed: StdMutex::new(None),
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
@@ -185,6 +186,7 @@ struct RuntimeHost {
     state: RwLock<HostState>,
     effect_lock: Mutex<()>,
     registered: OnceLock<RegisteredReplicator>,
+    pending_managed: StdMutex<Option<(u64, Arc<dyn ManagedReplicator>)>>,
     weak_self: Weak<Self>,
     aborted: AtomicBool,
     closed: AtomicBool,
@@ -223,6 +225,11 @@ impl ReplicatorRegistration for RuntimeHost {
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation) {
         if reservation.0 == REPLICATOR_RESERVATION_ID {
+            if let Ok(mut pending) = self.pending_managed.lock()
+                && pending.as_ref().is_some_and(|(id, _)| *id == reservation.0)
+            {
+                *pending = None;
+            }
             let _ = self.replicator_creation.compare_exchange(
                 REPLICATOR_CREATION_RESERVED,
                 REPLICATOR_CREATION_AVAILABLE,
@@ -230,6 +237,30 @@ impl ReplicatorRegistration for RuntimeHost {
                 Ordering::Acquire,
             );
         }
+    }
+
+    async fn register_managed(
+        &self,
+        managed: Arc<dyn ManagedReplicator>,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<()> {
+        if reservation.0 != REPLICATOR_RESERVATION_ID
+            || self.replicator_creation.load(Ordering::Acquire) != REPLICATOR_CREATION_RESERVED
+        {
+            return Err(RuntimeError::Application(
+                "CreateReplicator reservation is not active".into(),
+            ));
+        }
+        let mut pending = self.pending_managed.lock().map_err(|_| {
+            RuntimeError::Application("managed replicator registration was poisoned".into())
+        })?;
+        if pending.is_some() {
+            return Err(RuntimeError::Application(
+                "managed replicator may be registered only once".into(),
+            ));
+        }
+        *pending = Some((reservation.0, managed));
+        Ok(())
     }
 
     async fn register_interfaces(
@@ -245,19 +276,23 @@ impl ReplicatorRegistration for RuntimeHost {
                 "CreateReplicator reservation is not active".into(),
             ));
         }
-        let managed_replicator = interfaces.managed_replicator();
+        let managed_replicator = self
+            .pending_managed
+            .lock()
+            .map_err(|_| {
+                RuntimeError::Application("managed replicator registration was poisoned".into())
+            })?
+            .take()
+            .and_then(|(id, managed)| (id == reservation.0).then_some(managed));
         if let Some(managed) = managed_replicator.as_ref() {
             managed
-                .attach_interfaces(
-                    interfaces.replicator.clone(),
-                    interfaces.primary_replicator.clone(),
-                )
+                .attach_interfaces(interfaces.replicator(), interfaces.primary_replicator())
                 .await?;
         }
         self.registered
             .set(RegisteredReplicator {
-                control: interfaces.replicator.clone(),
-                primary: interfaces.primary_replicator.clone(),
+                control: interfaces.replicator(),
+                primary: interfaces.primary_replicator(),
                 provider,
                 managed: managed_replicator,
             })
@@ -310,13 +345,10 @@ impl RuntimeHost {
         if self.closed.load(Ordering::Acquire) || self.aborted.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.application.abort();
         if let Some(registered) = self.registered.get() {
             registered.control.abort();
-            if let Some(managed) = registered.managed.as_ref() {
-                managed.abort();
-            }
         }
+        self.application.abort();
     }
 
     async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
@@ -385,22 +417,28 @@ impl RuntimeHost {
             host: self,
             complete: false,
         };
+        let registration: Arc<dyn ReplicatorRegistration> =
+            self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
         let context = ReplicatorFactoryContext::new(
+            RuntimeHostToken::new(),
             self.identity.clone(),
             Arc::new(HostAccessView {
                 host: self.weak_self.clone(),
             }),
+            registration.clone(),
             self.default_dependencies.clone(),
         );
-        let registration: Arc<dyn ReplicatorRegistration> =
-            self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
         let control = self
             .application
             .clone()
             .open(OpenContext {
                 identity: self.identity.clone(),
                 mode,
-                partition: StatefulServicePartition::new(registration, context),
+                partition: StatefulServicePartition::new(
+                    RuntimeHostToken::new(),
+                    registration,
+                    context,
+                ),
             })
             .await?;
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
@@ -456,6 +494,7 @@ impl RuntimeHost {
                     completed_role: snapshot.role,
                     target_role: role,
                     replicator_completed: false,
+                    epoch_completed: role != ReplicaRole::Primary,
                     application_completed: false,
                 };
                 state.fallback_snapshot.role_transition = Some(transition.clone());
@@ -474,6 +513,16 @@ impl RuntimeHost {
                 .as_mut()
                 .ok_or(RuntimeError::ReconfigurationPending)?
                 .replicator_completed = true;
+        }
+        if role == ReplicaRole::Primary && !transition.epoch_completed {
+            registered.control.update_epoch(epoch).await?;
+            let mut state = self.state.write().await;
+            state
+                .fallback_snapshot
+                .role_transition
+                .as_mut()
+                .ok_or(RuntimeError::ReconfigurationPending)?
+                .epoch_completed = true;
         }
         if !transition.application_completed {
             let _ = self.application.change_role(role).await?;

@@ -664,11 +664,15 @@ implement default-engine storage callbacks merely to implement the SF API.
 The factory constructs one complete shared `DefaultReplicatorInner` during
 CreateReplicator. Hosting retains application lifetime, one-shot registration,
 effect ordering, exact returned-interface identity, and control/primary
-discovery. The public factory context exposes immutable identity and partition
+discovery. A primary-capable bundle derives control and primary views from one
+implementation; independently supplied control and primary objects are not a
+valid construction. The public factory context exposes immutable identity and partition
 access capabilities, never a concrete hosting or default-engine root.
-A doc-hidden managed bridge carries Kuberic hosting/default-replicator
-integration across the unpublished agent/runtime boundary and MUST NOT become
-part of the application or custom-factory API.
+A managed bridge carries Kuberic hosting/default-replicator integration
+through agent-owned registration and is not returned in the
+application-visible interface bundle. The construction token comes from the
+unpublished runtime-internal package so ordinary runtime consumers cannot
+forge the hosting boundary.
 User code constructs only the SF-shaped control, primary, and state interface
 bundle. Custom replicators own their data plane independently.
 Reservations, retries, exact ACK handling, authority admission, durable
@@ -693,29 +697,37 @@ delivery. Waiting for a build or catch-up quorum requires observed completion,
 not successful enqueueing.
 
 Lifecycle ordering follows Service Fabric: role changes fence access as
-required, drive the replicator, and then notify the service. The completed role
-is published only after both callbacks succeed; partial completion remains
-explicit recovery evidence. Graceful close fences access, closes the
-replicator, and then closes the service. Failed/cancelled Open aborts created
-interfaces. Failures, cancellation, epoch regression, and stale ACKs MUST fail
-closed.
+required and drive the replicator before notifying the service. Primary
+promotion performs `ChangeRole`, replicator/state-provider `UpdateEpoch`, and
+then application `ChangeRole`. The completed role is published only after
+every required stage succeeds; partial completion remains explicit recovery
+evidence. Graceful close fences access, closes the replicator, and then closes
+the service. Abort stops the returned control before application teardown.
+Failed/cancelled Open aborts created interfaces. Failures, cancellation, epoch
+regression, and stale ACKs MUST fail closed.
 
 Copy context and copy state retain their multi-item stream semantics.
 Snapshot chunks, the captured copy boundary, and post-boundary replication use
 one bounded ordered build stream. Provider enumeration does not hold the global
-runtime effect/write lock. Exact duplicate durable snapshot chunks are
-acknowledged without application redelivery; conflicting contents are rejected.
+runtime effect/write lock. Retained-operation enumeration also occurs outside
+that lock after the build is installed as a catching-up target, so concurrent
+writes enter its pending handoff lane. Exact duplicate durable snapshot chunks
+are acknowledged without application redelivery; conflicting contents are
+rejected.
 
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
+| Durable recovery of promotion substages across process restart | Replica-agent coordinator in Phase 4 |
+| Partition information, independent read access, load reporting, and fault reporting | Runtime/agent contract in Phase 4; controller consumption in Phase 5 |
 | Runtime-domain replication messages and removal of the temporary runtime-to-wire dependency | Runtime/agent adapter before Phase 4 transport |
 | Fresh endpoint/session incarnation, stale-session rejection, endpoint readiness, reconnect, ordered delivery, and cancellation | Reliable agent transport in Phase 4 |
 | Resend payload retention, truthful catch-up capability, truncation, and full-copy fallback | Reliable transport/build owner in Phases 4 and 7 |
 | Durable demote, GetLSN, catch-up, deactivate, and activate sequencing | Replica-agent coordinator in Phase 4 |
 | Operation-specific removal, cancellation, backpressure, and reconfiguration error mapping | Runtime/agent integration in Phase 4 |
+| Role-specific primary/secondary session state and cleanup | Default replicator plus reliable transport in Phase 4 |
 | Transport crash and stale-session acceptance tests for later owners | Phases 4, 7, and 9 |
 
 The current classic design treats loss of process-local role, epoch, or action

@@ -14,6 +14,8 @@ pub struct RoleTransition {
     pub completed_role: ReplicaRole,
     pub target_role: ReplicaRole,
     pub replicator_completed: bool,
+    #[serde(default)]
+    pub epoch_completed: bool,
     pub application_completed: bool,
 }
 

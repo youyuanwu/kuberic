@@ -2,7 +2,7 @@ use kuberic_protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, ReplicaId,
     ReplicaIdentity, ReplicaInstanceId, ReplicaRole, TransitionKind,
 };
-use kuberic_runtime::replicator::quorum::QuorumTracker;
+use kuberic_runtime::internal::QuorumTracker;
 use kuberic_runtime_internal::authority::AdmittedAuthority;
 use kuberic_wire::ReplicationAcknowledgement;
 

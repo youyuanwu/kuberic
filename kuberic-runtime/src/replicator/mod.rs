@@ -1,5 +1,7 @@
+#[doc(hidden)]
 pub mod copy;
-pub mod queue;
+mod queue;
+#[doc(hidden)]
 pub mod quorum;
 pub mod stream;
 
@@ -12,6 +14,7 @@ use async_trait::async_trait;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, Epoch, ReplicaId, ReplicaIdentity, ReplicaRole,
 };
+use kuberic_runtime_internal::RuntimeHostToken;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
@@ -90,7 +93,6 @@ pub trait ManagedReplicator: Send + Sync {
     async fn receive_replication(&self, item: proto::ReplicationItem)
     -> Result<PendingReplication>;
     async fn next_outbound(&self) -> Option<OutboundReplication>;
-    fn abort(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,45 +112,51 @@ pub struct ReplicatorSettings {
     pub replication_address: String,
 }
 
-/// Rust's explicit counterpart of obtaining both interfaces from CreateReplicator.
+/// Rust's explicit counterpart of obtaining coherent interfaces from CreateReplicator.
 pub struct ReplicatorInterfaces {
-    pub replicator: Arc<dyn Replicator>,
-    pub state_replicator: Arc<dyn StateReplicator>,
-    pub primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
-    managed_replicator: Option<Arc<dyn ManagedReplicator>>,
+    replicator: Arc<dyn Replicator>,
+    state_replicator: Arc<dyn StateReplicator>,
+    primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
 }
 
 impl ReplicatorInterfaces {
-    pub fn new(
+    pub fn secondary(
         replicator: Arc<dyn Replicator>,
         state_replicator: Arc<dyn StateReplicator>,
-        primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Self {
         Self {
             replicator,
             state_replicator,
-            primary_replicator,
-            managed_replicator: None,
+            primary_replicator: None,
         }
     }
 
-    pub(crate) fn with_managed(
-        replicator: Arc<dyn Replicator>,
+    pub fn primary<T>(
+        primary_replicator: Arc<T>,
         state_replicator: Arc<dyn StateReplicator>,
-        primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
-        managed_replicator: Arc<dyn ManagedReplicator>,
-    ) -> Self {
+    ) -> Self
+    where
+        T: PrimaryReplicator + 'static,
+    {
+        let replicator: Arc<dyn Replicator> = primary_replicator.clone();
+        let primary_replicator: Arc<dyn PrimaryReplicator> = primary_replicator;
         Self {
             replicator,
             state_replicator,
-            primary_replicator,
-            managed_replicator: Some(managed_replicator),
+            primary_replicator: Some(primary_replicator),
         }
     }
 
-    #[doc(hidden)]
-    pub fn managed_replicator(&self) -> Option<Arc<dyn ManagedReplicator>> {
-        self.managed_replicator.clone()
+    pub fn replicator(&self) -> Arc<dyn Replicator> {
+        self.replicator.clone()
+    }
+
+    pub fn state_replicator(&self) -> Arc<dyn StateReplicator> {
+        self.state_replicator.clone()
+    }
+
+    pub fn primary_replicator(&self) -> Option<Arc<dyn PrimaryReplicator>> {
+        self.primary_replicator.clone()
     }
 }
 
@@ -156,19 +164,25 @@ impl ReplicatorInterfaces {
 pub struct ReplicatorFactoryContext {
     identity: ReplicaIdentity,
     access: Arc<dyn PartitionAccessView>,
+    registration: Arc<dyn ReplicatorRegistration>,
+    reservation: Option<ReplicatorCreationReservation>,
     pub(crate) default_dependencies: Option<DefaultReplicatorDependencies>,
 }
 
 impl ReplicatorFactoryContext {
     #[doc(hidden)]
     pub fn new(
+        _token: RuntimeHostToken,
         identity: ReplicaIdentity,
         access: Arc<dyn PartitionAccessView>,
+        registration: Arc<dyn ReplicatorRegistration>,
         default_dependencies: DefaultReplicatorDependencies,
     ) -> Self {
         Self {
             identity,
             access,
+            registration,
+            reservation: None,
             default_dependencies: Some(default_dependencies),
         }
     }
@@ -179,6 +193,21 @@ impl ReplicatorFactoryContext {
 
     pub async fn write_status(&self) -> Result<AccessStatus> {
         self.access.write_status().await
+    }
+
+    fn for_creation(&self, reservation: ReplicatorCreationReservation) -> Self {
+        let mut context = self.clone();
+        context.reservation = Some(reservation);
+        context
+    }
+
+    async fn register_managed(&self, managed: Arc<dyn ManagedReplicator>) -> Result<()> {
+        let reservation = self.reservation.ok_or_else(|| {
+            RuntimeError::Application("managed replicator registration is not reserved".into())
+        })?;
+        self.registration
+            .register_managed(managed, reservation)
+            .await
     }
 }
 
@@ -191,7 +220,6 @@ pub trait PartitionAccessView: Send + Sync {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct DefaultReplicatorDependencies {
-    pub application: Arc<dyn crate::application::StatefulServiceReplica>,
     pub replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
     pub replication_progress_store: Arc<dyn ReplicationProgressStore>,
     pub local_write_journal: Arc<dyn LocalWriteJournal>,
@@ -209,6 +237,12 @@ pub trait ReplicatorRegistration: Send + Sync {
     fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation>;
 
     fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
+
+    async fn register_managed(
+        &self,
+        managed: Arc<dyn ManagedReplicator>,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<()>;
 
     async fn register_interfaces(
         &self,
@@ -238,6 +272,7 @@ pub struct StatefulServicePartition {
 impl StatefulServicePartition {
     #[doc(hidden)]
     pub fn new(
+        _token: RuntimeHostToken,
         registration: Arc<dyn ReplicatorRegistration>,
         context: ReplicatorFactoryContext,
     ) -> Self {
@@ -270,9 +305,10 @@ impl StatefulServicePartition {
             RuntimeError::Application("select a replicator factory during Open".into())
         })?;
         let reservation = self.registration.reserve_replicator_creation()?;
+        let context = self.context.for_creation(reservation);
         let interfaces = match factory
             .create_replicator(
-                self.context.clone(),
+                context,
                 state_provider.clone(),
                 settings.unwrap_or_default(),
             )
@@ -289,7 +325,7 @@ impl StatefulServicePartition {
             .register_interfaces(&interfaces, state_provider, reservation)
             .await
         {
-            interfaces.replicator.abort();
+            interfaces.replicator().abort();
             self.registration.cancel_replicator_creation(reservation);
             return Err(error);
         }
@@ -323,7 +359,6 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         })?;
         let engine = DefaultReplicatorInner::new(
             context.identity.clone(),
-            dependencies.application,
             dependencies.replica_authority_store,
             dependencies.replication_progress_store,
             dependencies.local_write_journal,
@@ -353,12 +388,8 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
             next_operation,
             pending,
         });
-        Ok(ReplicatorInterfaces::with_managed(
-            replicator.clone(),
-            state_replicator,
-            Some(replicator),
-            engine,
-        ))
+        context.register_managed(engine).await?;
+        Ok(ReplicatorInterfaces::primary(replicator, state_replicator))
     }
 }
 

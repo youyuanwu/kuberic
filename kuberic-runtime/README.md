@@ -4,9 +4,11 @@ Application and replication runtime for the level-triggered Kuberic stack.
 
 ## Service Fabric V1 interfaces and ownership
 
-The public traits follow the **V1 COM divisions**, not an expanded
-“SF-inspired” callback API. Begin/End pairs become async Rust methods; Abort
-remains synchronous. The authoritative definitions are
+The implemented public traits preserve the **V1 COM divisions**, rather than
+adding engine or agent operations to the application callbacks. This is an
+implemented subset of the complete V1 partition contract: Begin/End pairs
+become async Rust methods and Abort remains synchronous. The authoritative
+definitions are
 `FabricRuntime.idl:495–539,577–633,687–758`.
 
 | Rust interface | Methods |
@@ -16,6 +18,11 @@ remains synchronous. The authoritative definitions are
 | `PrimaryReplicator: Replicator` | `on_data_loss`, `update_catch_up_replica_set_configuration`, `wait_for_catch_up_quorum`, `update_current_replica_set_configuration`, `build_replica`, `remove_replica` |
 | `StateReplicator` | `replicate(operation_data)` → committed LSN, `get_replication_stream`, `get_copy_stream`, `update_replicator_settings` |
 | `StateProvider` | `update_epoch(epoch, previous_epoch_last_lsn)`, `last_committed_lsn`, `get_copy_context`, `get_copy_state`, `on_data_loss` |
+
+`StatefulServicePartition` currently provides `CreateReplicator` and write
+status. Partition information, independent read status, load reporting, and
+fault reporting require agent/controller sources of truth and are assigned to
+Phase 4 rather than represented by placeholder methods.
 
 Service Open receives a `StatefulServicePartition` in its `OpenContext`.
 The service selects a `ReplicatorFactory` with `partition.with_factory(...)`,
@@ -41,7 +48,9 @@ separate object. Custom factories use the same partition boundary and need not
 use the default engine or implement `DurableState` on the service.
 `CreateReplicator` is the construction boundary: the default factory creates
 one shared `DefaultReplicatorInner`, and the control, primary, state, and
-optional managed façades all reference that inner. `PodRuntime` owns the
+agent-managed façades all reference that inner. The managed façade is
+transferred directly to agent registration and is never returned in the
+application-visible interface bundle. `PodRuntime` owns the
 hosting registrar, application lifetime, Open registration, effect ordering,
 and exact returned-interface identity; it does not preconstruct unused default
 replication state for a custom factory. `PodRuntime` and that hosting registrar
@@ -55,9 +64,16 @@ from the Primary role.
 `ReplicatorFactoryContext` exposes stable identity and partition-access
 capabilities, not a concrete runtime or default-engine pointer. Application
 and custom-factory code constructs only the SF-shaped interface bundle through
-`ReplicatorInterfaces::new`. The default implementation's managed data-plane
-bridge is doc-hidden and exists only for the unpublished agent/runtime
-integration; custom replicators own their transport independently.
+`ReplicatorInterfaces::secondary` or `ReplicatorInterfaces::primary`. The
+primary constructor derives the control and primary views from the same
+allocation, matching SF's coherent interface-query invariant. The default
+implementation's managed data-plane bridge is transferred through an
+unforgeable unpublished agent/runtime registration boundary; custom
+replicators own their transport independently.
+
+Service Fabric custom implementations return a custom control object from
+Open. Kuberic deliberately uses a Rust factory wrapper so creation can reserve
+and register one coherent interface bundle before Open completes.
 
 ## Durable streams and engine integration
 
@@ -98,11 +114,14 @@ because a request was queued. Logical outbound work uses a bounded,
 abort-aware queue; network resend windows and reconnect remain agent-owned.
 The runtime does not start a network server.
 
-Role changes drive the replicator before the service callback. The completed
-role is published only after both callbacks succeed; an in-process
-`RoleTransition` exposes partial completion after failure. Close fences writes,
+Role changes drive the replicator before the service callback. Primary
+promotion additionally invokes replicator/state-provider `UpdateEpoch`
+between those callbacks. The completed role is published only after every
+required stage succeeds; an in-process `RoleTransition` exposes partial
+completion after failure. Close fences writes,
 closes the replicator, then closes the service, with abort cleanup on callback
-failure. Failed or cancelled Open aborts created interfaces;
+failure. Abort also stops the returned control before application teardown.
+Failed or cancelled Open aborts created interfaces;
 lifecycle/epoch failures never reopen writes.
 
 Hosting, effect, authority-store, and snapshot types are absent from the

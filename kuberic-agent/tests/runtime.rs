@@ -19,8 +19,9 @@ use kuberic_runtime::internal::OutboundReplication;
 use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest, PreparedCopy};
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
-    DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorFactoryContext,
-    ReplicatorInterfaces, ReplicatorSettings, StateReplicator,
+    DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode,
+    Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
+    ReplicatorSettings, StateReplicator,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{
@@ -239,6 +240,9 @@ struct TestApplication {
     pause_copy_enumeration: Arc<AtomicBool>,
     copy_enumeration_notify: Arc<Notify>,
     resume_copy_enumeration_notify: Arc<Notify>,
+    pause_retained_enumeration: Arc<AtomicBool>,
+    retained_enumeration_notify: Arc<Notify>,
+    resume_retained_enumeration_notify: Arc<Notify>,
     fail_apply: AtomicBool,
     fail_after_apply: AtomicBool,
     pause_after_apply: AtomicBool,
@@ -314,6 +318,7 @@ struct CountingFactory {
 
 struct CountingReplicator {
     inner: Arc<dyn Replicator>,
+    primary: Arc<dyn PrimaryReplicator>,
     counts: CountingFactory,
 }
 
@@ -325,15 +330,19 @@ impl ReplicatorFactory for CountingFactory {
         provider: Arc<dyn StateProvider>,
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
-        let mut interfaces =
+        let interfaces =
             DefaultReplicatorFactory::new(self.storage.upgrade().ok_or(RuntimeError::Closed)?)
                 .create_replicator(context, provider, settings)
                 .await?;
-        interfaces.replicator = Arc::new(CountingReplicator {
-            inner: interfaces.replicator,
+        let state_replicator = interfaces.state_replicator();
+        let replicator = Arc::new(CountingReplicator {
+            inner: interfaces.replicator(),
+            primary: interfaces
+                .primary_replicator()
+                .ok_or(RuntimeError::NotPrimary)?,
             counts: self.clone(),
         });
-        Ok(interfaces)
+        Ok(ReplicatorInterfaces::primary(replicator, state_replicator))
     }
 }
 
@@ -417,6 +426,44 @@ impl Replicator for CountingReplicator {
 }
 
 #[async_trait]
+impl PrimaryReplicator for CountingReplicator {
+    async fn on_data_loss(&self) -> Result<bool> {
+        self.primary.on_data_loss().await
+    }
+
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        current: ConfigurationDescriptor,
+        previous: ConfigurationDescriptor,
+    ) -> Result<()> {
+        self.primary
+            .update_catch_up_replica_set_configuration(current, previous)
+            .await
+    }
+
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+        self.primary.wait_for_catch_up_quorum(mode).await
+    }
+
+    async fn update_current_replica_set_configuration(
+        &self,
+        current: ConfigurationDescriptor,
+    ) -> Result<()> {
+        self.primary
+            .update_current_replica_set_configuration(current)
+            .await
+    }
+
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        self.primary.build_replica(replica).await
+    }
+
+    async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
+        self.primary.remove_replica(replica_id).await
+    }
+}
+
+#[async_trait]
 impl RuntimeControlPlane for TestControlPlane {
     async fn next_effect(&mut self) -> Result<Option<RuntimeEffect>> {
         Ok(self.effects.pop_front())
@@ -442,8 +489,9 @@ impl StatefulServiceReplica for TestApplication {
         let partition = context.partition.with_factory(factory);
         let settings = self.settings.lock().unwrap().clone();
         let interfaces = partition.create_replicator(self.clone(), settings).await?;
-        let replication = interfaces.state_replicator.get_replication_stream().await?;
-        let copy = interfaces.state_replicator.get_copy_stream().await?;
+        let state_replicator = interfaces.state_replicator();
+        let replication = state_replicator.get_replication_stream().await?;
+        let copy = state_replicator.get_copy_stream().await?;
         self.streams_taken.fetch_add(2, Ordering::SeqCst);
         for stream in [replication, copy] {
             if self.manual_streams.load(Ordering::SeqCst) {
@@ -452,8 +500,8 @@ impl StatefulServiceReplica for TestApplication {
                 tokio::spawn(consume_stream(Arc::downgrade(&self), stream));
             }
         }
-        *self.state_replicator.lock().unwrap() = Some(interfaces.state_replicator);
-        *self.returned_control.lock().unwrap() = Some(interfaces.replicator.clone());
+        *self.state_replicator.lock().unwrap() = Some(state_replicator);
+        *self.returned_control.lock().unwrap() = Some(interfaces.replicator());
         if self.pause_open.load(Ordering::SeqCst) {
             self.open_notify.notify_one();
             self.resume_open_notify.notified().await;
@@ -461,7 +509,7 @@ impl StatefulServiceReplica for TestApplication {
         if self.fail_open.load(Ordering::SeqCst) {
             return Err(RuntimeError::Application("injected Open failure".into()));
         }
-        Ok(interfaces.replicator)
+        Ok(interfaces.replicator())
     }
 
     async fn change_role(&self, _role: ReplicaRole) -> Result<RoleChange> {
@@ -612,7 +660,25 @@ impl DurableState for TestApplication {
             .range(from_lsn..=to_lsn)
             .map(|(_, operation)| Ok(operation.clone()))
             .collect::<Vec<_>>();
-        Ok(Box::pin(stream::iter(operations)))
+        let pause = self.pause_retained_enumeration.clone();
+        let paused = self.retained_enumeration_notify.clone();
+        let resume = self.resume_retained_enumeration_notify.clone();
+        Ok(Box::pin(stream::unfold(
+            (operations.into_iter(), true),
+            move |(mut operations, first)| {
+                let pause = pause.clone();
+                let paused = paused.clone();
+                let resume = resume.clone();
+                async move {
+                    if first && pause.load(Ordering::SeqCst) {
+                        paused.notify_one();
+                        resume.notified().await;
+                    }
+                    std::iter::Iterator::next(&mut operations)
+                        .map(|operation| (operation, (operations, false)))
+                }
+            },
+        )))
     }
 
     async fn apply_copy_chunk(
@@ -904,6 +970,8 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         replication.contains("#[doc(hidden)]\npub trait ManagedReplicator"),
         "the cross-crate managed bridge must remain hidden from generated user documentation"
     );
+    assert!(!replication.contains("fn managed_replicator("));
+    assert!(!replication.contains("ReplicatorInterfaces::new"));
     for internal_module in ["authority", "effects", "runtime"] {
         assert!(
             !library.contains(&format!("pub mod {internal_module};")),
@@ -1424,6 +1492,107 @@ async fn lifecycle_orders_role_changes_and_close_like_service_fabric() {
 }
 
 #[tokio::test]
+async fn primary_promotion_retries_epoch_stage_before_application_role() {
+    let local = identity(1, "promotion-primary");
+    let application = Arc::new(TestApplication::default());
+    let events = application.events.clone();
+    let role_changes = Arc::new(AtomicUsize::new(0));
+    let epoch_updates = Arc::new(AtomicUsize::new(0));
+    let runtime = runtime_with_factory(
+        local.clone(),
+        application.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+        CountingFactory {
+            storage: Arc::downgrade(&application),
+            opened: Arc::new(AtomicUsize::new(0)),
+            role_changes: role_changes.clone(),
+            epoch_updates: epoch_updates.clone(),
+            events: events.clone(),
+            fail_change_role: Arc::new(AtomicBool::new(false)),
+            fail_close: Arc::new(AtomicBool::new(false)),
+        },
+    )
+    .unwrap();
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority(local.clone(), vec![local]))),
+        ))
+        .await
+        .unwrap();
+    events.lock().unwrap().clear();
+    application.fail_update_epoch.store(true, Ordering::SeqCst);
+    let promote = effect(3, RuntimeEffectAction::ChangeRole(ReplicaRole::Primary));
+    assert!(matches!(
+        runtime.apply_effect(promote.clone()).await,
+        Err(RuntimeError::Application(_))
+    ));
+    assert_eq!(
+        runtime.snapshot().await.role_transition,
+        Some(kuberic_runtime_internal::effects::RoleTransition {
+            completed_role: ReplicaRole::None,
+            target_role: ReplicaRole::Primary,
+            replicator_completed: true,
+            epoch_completed: false,
+            application_completed: false,
+        })
+    );
+    runtime.apply_effect(promote).await.unwrap();
+
+    assert_eq!(role_changes.load(Ordering::SeqCst), 1);
+    assert_eq!(epoch_updates.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "replicator.change_role",
+            "replicator.update_epoch",
+            "provider.update_epoch",
+            "replicator.update_epoch",
+            "provider.update_epoch",
+            "service.change_role",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn explicit_abort_stops_replicator_before_application() {
+    let application = Arc::new(TestApplication::default());
+    let events = application.events.clone();
+    let runtime = runtime_with_factory(
+        identity(1, "explicit-abort"),
+        application.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+        CountingFactory {
+            storage: Arc::downgrade(&application),
+            opened: Arc::new(AtomicUsize::new(0)),
+            role_changes: Arc::new(AtomicUsize::new(0)),
+            epoch_updates: Arc::new(AtomicUsize::new(0)),
+            events: events.clone(),
+            fail_change_role: Arc::new(AtomicBool::new(false)),
+            fail_close: Arc::new(AtomicBool::new(false)),
+        },
+    )
+    .unwrap();
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    events.lock().unwrap().clear();
+    runtime
+        .apply_effect(effect(2, RuntimeEffectAction::Abort))
+        .await
+        .unwrap();
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["replicator.abort", "service.abort"]
+    );
+}
+
+#[tokio::test]
 async fn ambiguous_primary_authority_admission_fences_pending_writes_and_old_acks() {
     let local = identity(1, "primary");
     let secondary = identity(2, "secondary");
@@ -1583,8 +1752,8 @@ async fn dropping_runtime_always_aborts_application_and_selected_control() {
         [
             "service.open",
             "replicator.open",
-            "service.abort",
             "replicator.abort",
+            "service.abort",
         ]
     );
 }
@@ -1710,10 +1879,9 @@ impl ReplicatorFactory for ExternalFactory {
             settings: Mutex::new(settings),
             closed: AtomicBool::new(false),
         });
-        Ok(ReplicatorInterfaces::new(
+        Ok(ReplicatorInterfaces::secondary(
             replicator.clone(),
             replicator,
-            None,
         ))
     }
 }
@@ -1764,7 +1932,7 @@ impl StatefulServiceReplica for DoubleCreateService {
                 .await,
             Err(RuntimeError::Application(_))
         ));
-        Ok(first.replicator)
+        Ok(first.replicator())
     }
 
     async fn change_role(&self, _role: ReplicaRole) -> Result<RoleChange> {
@@ -1788,13 +1956,14 @@ impl StatefulServiceReplica for ExternalService {
             .with_factory(Arc::new(ExternalFactory))
             .create_replicator(Arc::new(TestApplication::default()), None)
             .await?;
+        let state_replicator = interfaces.state_replicator();
         let streams = vec![
-            interfaces.state_replicator.get_replication_stream().await?,
-            interfaces.state_replicator.get_copy_stream().await?,
+            state_replicator.get_replication_stream().await?,
+            state_replicator.get_copy_stream().await?,
         ];
         *self.streams.lock().unwrap() = streams;
-        *self.state.lock().unwrap() = Some(interfaces.state_replicator);
-        Ok(interfaces.replicator)
+        *self.state.lock().unwrap() = Some(state_replicator);
+        Ok(interfaces.replicator())
     }
     async fn change_role(&self, _role: ReplicaRole) -> Result<RoleChange> {
         Ok(RoleChange {
@@ -2685,6 +2854,8 @@ async fn runtime_accepts_custom_primary_replicator_and_exposes_state_replicator_
             "service.open",
             "replicator.open",
             "replicator.change_role",
+            "replicator.update_epoch",
+            "provider.update_epoch",
             "service.change_role",
         ]
     );
@@ -3043,6 +3214,7 @@ async fn failed_demotion_callback_preserves_completed_role_and_transition_stage(
             completed_role: ReplicaRole::Primary,
             target_role: ReplicaRole::ActiveSecondary,
             replicator_completed: true,
+            epoch_completed: true,
             application_completed: false,
         })
     );
@@ -3388,6 +3560,103 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
     assert_eq!(live.lsn, 2);
     assert!(!live.snapshot_chunk);
     assert!(!live.final_item);
+}
+
+#[tokio::test]
+async fn retained_gap_enumeration_does_not_block_primary_writes() {
+    let local = identity(1, "retained-gap-source");
+    let target = identity(1, "retained-gap-target");
+    let application = Arc::new(TestApplication::default());
+    application.seed_operation(1, Bytes::from_static(b"seed"));
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let admitted = authority(local.clone(), vec![local.clone()]);
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        application.clone(),
+        store.clone(),
+    ));
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let build_id = OperationId::new("retained-gap-copy");
+    store
+        .admit_build(&BuildAuthority {
+            build_id: build_id.clone(),
+            kind: BuildAuthorityKind::Provisioning,
+            source: local,
+            target: target.clone(),
+            current_configuration: admitted.current_configuration,
+            replication_boundary_lsn: 0,
+        })
+        .await
+        .unwrap();
+    application
+        .pause_retained_enumeration
+        .store(true, Ordering::SeqCst);
+    let cancelled_runtime = runtime.clone();
+    let cancelled_build_id = build_id.clone();
+    let cancelled_target = target.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_runtime
+            .prepare_copy(PrepareCopyRequest {
+                build_id: cancelled_build_id,
+                target: cancelled_target,
+                configuration: BuildConfiguration::Current,
+                copy_context: empty_copy_context(),
+            })
+            .await
+    });
+    application.retained_enumeration_notify.notified().await;
+    cancelled.abort();
+    assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
+    tokio::task::yield_now().await;
+    assert!(runtime.snapshot().await.builds.is_empty());
+
+    let runtime_for_copy = runtime.clone();
+    let prepare = tokio::spawn(async move {
+        runtime_for_copy
+            .prepare_copy(PrepareCopyRequest {
+                build_id,
+                target,
+                configuration: BuildConfiguration::Current,
+                copy_context: empty_copy_context(),
+            })
+            .await
+    });
+    application.retained_enumeration_notify.notified().await;
+    let pending = timeout(
+        Duration::from_secs(1),
+        runtime.begin_write(ClientWrite {
+            operation_id: OperationId::new("write-during-gap-scan"),
+            data: Bytes::from_static(b"live"),
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    pending.committed().await.unwrap();
+    application
+        .pause_retained_enumeration
+        .store(false, Ordering::SeqCst);
+    application
+        .resume_retained_enumeration_notify
+        .notify_waiters();
+
+    let mut prepared = prepare.await.unwrap().unwrap();
+    let _snapshot = copy_through_final(&mut prepared).await;
+    assert_eq!(next_copy_item(&mut prepared).await.lsn, 1);
+    assert_eq!(next_copy_item(&mut prepared).await.lsn, 2);
 }
 
 #[tokio::test]

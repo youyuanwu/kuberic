@@ -14,3 +14,20 @@ pub enum ContractError {
 }
 
 pub type Result<T> = std::result::Result<T, ContractError>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeHostToken {
+    _private: (),
+}
+
+impl RuntimeHostToken {
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Default for RuntimeHostToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}

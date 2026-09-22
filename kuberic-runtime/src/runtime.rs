@@ -18,14 +18,14 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch};
 
 use crate::application::{
     ClientWrite, DurableApplicationAck, DurableApplicationProgress, Operation, OperationDataStream,
-    StateProvider, StatefulServiceReplica, WriteReceipt,
+    StateProvider, WriteReceipt,
 };
 use crate::authority::{
     AdmittedAuthority, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
     DurableBuildProgress, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
-use crate::effects::{BuildPostcondition, RoleTransition, RuntimeEffectAction, RuntimeSnapshot};
+use crate::effects::{BuildPostcondition, RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
 use crate::replicator::copy::{
     BuildConfiguration, BuildProgress, PrepareCopyRequest, PreparedCopy,
@@ -37,12 +37,14 @@ use crate::replicator::{
 };
 use crate::{Result, RuntimeError};
 
+#[doc(hidden)]
+pub use crate::replicator::quorum::QuorumTracker;
+
 #[derive(Debug)]
 struct RuntimeState {
     open: bool,
     replication_address: Option<String>,
     role: ReplicaRole,
-    role_transition: Option<RoleTransition>,
     write_status: AccessStatus,
     authority: Option<AdmittedAuthority>,
     replication_progress: Option<ReplicationProgress>,
@@ -65,6 +67,54 @@ struct OutboundBuild {
     catching_up: bool,
     stream_tx: mpsc::Sender<Result<proto::CopyItem>>,
     generation: u64,
+}
+
+struct BuildPreparationGuard {
+    engine: Weak<DefaultReplicatorInner>,
+    build_id: OperationId,
+    generation: u64,
+    armed: bool,
+}
+
+impl BuildPreparationGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BuildPreparationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(engine) = self.engine.upgrade() else {
+            return;
+        };
+        let build_id = self.build_id.clone();
+        let generation = self.generation;
+        if let Ok(mut state) = engine.state.try_write() {
+            if state
+                .outbound_builds
+                .get(&build_id)
+                .is_some_and(|build| build.generation == generation)
+            {
+                state.outbound_builds.remove(&build_id);
+            }
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut state = engine.state.write().await;
+                if state
+                    .outbound_builds
+                    .get(&build_id)
+                    .is_some_and(|build| build.generation == generation)
+                {
+                    state.outbound_builds.remove(&build_id);
+                }
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,9 +170,10 @@ pub enum OutboundReplication {
     Remove(ReplicaId),
 }
 
+const MAX_BUILD_PENDING_OPERATIONS: usize = 64;
+
 pub(crate) struct DefaultReplicatorInner {
     pub(crate) identity: ReplicaIdentity,
-    application: Arc<dyn StatefulServiceReplica>,
     storage: RwLock<Option<Arc<dyn DurableState>>>,
     replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
     replication_progress_store: Arc<dyn ReplicationProgressStore>,
@@ -154,7 +205,6 @@ pub(crate) struct DefaultReplicatorInner {
 impl DefaultReplicatorInner {
     pub(crate) fn new(
         identity: ReplicaIdentity,
-        application: Arc<dyn StatefulServiceReplica>,
         replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
         replication_progress_store: Arc<dyn ReplicationProgressStore>,
         local_write_journal: Arc<dyn LocalWriteJournal>,
@@ -166,7 +216,6 @@ impl DefaultReplicatorInner {
         Arc::new_cyclic(|weak_self| Self {
             replicator: Mutex::new(ReplicationLog::new(identity.clone())),
             identity,
-            application,
             storage: RwLock::new(None),
             replica_authority_store,
             replication_progress_store,
@@ -177,7 +226,6 @@ impl DefaultReplicatorInner {
                 open: false,
                 replication_address: None,
                 role: ReplicaRole::None,
-                role_transition: None,
                 write_status: AccessStatus::NotPrimary,
                 authority: None,
                 replication_progress: None,
@@ -716,6 +764,11 @@ impl DefaultReplicatorInner {
         if state.write_status != AccessStatus::Granted {
             return Err(RuntimeError::WriteClosed(state.write_status));
         }
+        if state.outbound_builds.values().any(|build| {
+            build.catching_up && build.pending_operations.len() >= MAX_BUILD_PENDING_OPERATIONS
+        }) {
+            return Err(RuntimeError::QueueFull);
+        }
         let authority = state
             .authority
             .as_ref()
@@ -917,7 +970,7 @@ impl DefaultReplicatorInner {
             configuration,
             copy_context,
         } = request;
-        let _guard = self.effect_lock.lock().await;
+        let guard = self.effect_lock.lock().await;
         let prepare_generation = self.fence_generation.load(Ordering::Acquire);
         let state = self.state.read().await;
         if !state.open {
@@ -952,7 +1005,7 @@ impl DefaultReplicatorInner {
 
         let replicator = self.replicator.lock().await;
         let replicator_progress = replicator.current_progress();
-        let committed_lsn = local_committed_lsn.max(replicator.committed_lsn());
+        let mut committed_lsn = local_committed_lsn.max(replicator.committed_lsn());
         let retained = replicator.retained_operations_from(1);
         drop(replicator);
         let application_progress = self.storage().await?.durable_progress().await?;
@@ -1002,41 +1055,6 @@ impl DefaultReplicatorInner {
             ));
         }
 
-        let mut operations = BTreeMap::new();
-        let mut stream = self
-            .storage()
-            .await?
-            .get_replication_operations(boundary + 1, current_highest)
-            .await?;
-        while let Some(operation) = stream.next().await {
-            let operation = operation?;
-            if operation.lsn > boundary && operation.lsn <= current_highest {
-                insert_copy_operation(&mut operations, operation)?;
-            }
-        }
-        for operation in retained
-            .into_iter()
-            .filter(|operation| operation.lsn > boundary && operation.lsn <= current_highest)
-        {
-            insert_copy_operation(&mut operations, operation)?;
-        }
-        if current_highest > boundary
-            && ((boundary + 1)..=current_highest).any(|lsn| !operations.contains_key(&lsn))
-        {
-            return Err(RuntimeError::InvalidReplication(
-                "retained operations do not close the post-snapshot gap".to_string(),
-            ));
-        }
-
-        self.check_delivery_generation(prepare_generation)?;
-        let replicator_epoch = self.replicator.lock().await.epoch();
-        if replicator_epoch != Epoch::default()
-            && replicator_epoch != build_authority.current_configuration.epoch
-        {
-            return Err(RuntimeError::AuthorityMismatch(
-                "build authority was fenced during preparation".into(),
-            ));
-        }
         if self
             .state
             .read()
@@ -1060,7 +1078,88 @@ impl DefaultReplicatorInner {
                 generation: prepare_generation,
             },
         );
-        drop(_guard);
+        let mut preparation = BuildPreparationGuard {
+            engine: self.weak_self.clone(),
+            build_id: build_authority.build_id.clone(),
+            generation: prepare_generation,
+            armed: true,
+        };
+        drop(guard);
+        let operations_result = async {
+            let mut operations = BTreeMap::new();
+            let mut stream = self
+                .storage()
+                .await?
+                .get_replication_operations(boundary + 1, current_highest)
+                .await?;
+            while let Some(operation) = stream.next().await {
+                let operation = operation?;
+                if operation.lsn > boundary && operation.lsn <= current_highest {
+                    insert_copy_operation(&mut operations, operation)?;
+                }
+            }
+            for operation in retained
+                .into_iter()
+                .filter(|operation| operation.lsn > boundary && operation.lsn <= current_highest)
+            {
+                insert_copy_operation(&mut operations, operation)?;
+            }
+            Ok::<_, RuntimeError>(operations)
+        }
+        .await;
+        let operations = match operations_result {
+            Ok(operations) => operations,
+            Err(error) => {
+                self.state
+                    .write()
+                    .await
+                    .outbound_builds
+                    .remove(&build_authority.build_id);
+                preparation.disarm();
+                return Err(error);
+            }
+        };
+        let guard = self.effect_lock.lock().await;
+        if let Err(error) = self.check_delivery_generation(prepare_generation) {
+            self.state
+                .write()
+                .await
+                .outbound_builds
+                .remove(&build_authority.build_id);
+            preparation.disarm();
+            return Err(error);
+        }
+        let replicator = self.replicator.lock().await;
+        let replicator_epoch = replicator.epoch();
+        committed_lsn = committed_lsn.max(replicator.committed_lsn());
+        drop(replicator);
+        if replicator_epoch != Epoch::default()
+            && replicator_epoch != build_authority.current_configuration.epoch
+        {
+            self.state
+                .write()
+                .await
+                .outbound_builds
+                .remove(&build_authority.build_id);
+            preparation.disarm();
+            return Err(RuntimeError::AuthorityMismatch(
+                "build authority was fenced during preparation".into(),
+            ));
+        }
+        if current_highest > boundary
+            && ((boundary + 1)..=current_highest).any(|lsn| !operations.contains_key(&lsn))
+        {
+            self.state
+                .write()
+                .await
+                .outbound_builds
+                .remove(&build_authority.build_id);
+            preparation.disarm();
+            return Err(RuntimeError::InvalidReplication(
+                "retained operations do not close the post-snapshot gap".to_string(),
+            ));
+        }
+        drop(guard);
         let copy_stream = match self
             .provider()
             .await?
@@ -1074,9 +1173,11 @@ impl DefaultReplicatorInner {
                     .await
                     .outbound_builds
                     .remove(&build_authority.build_id);
+                preparation.disarm();
                 return Err(error);
             }
         };
+        preparation.disarm();
         let engine = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
         let producer_authority = build_authority.clone();
         tokio::spawn(async move {
@@ -1828,7 +1929,6 @@ impl DefaultReplicatorInner {
         let snapshot = (
             state.open,
             state.role,
-            state.role_transition.clone(),
             state.write_status,
             state.authority.clone(),
             state.current_progress,
@@ -1846,17 +1946,17 @@ impl DefaultReplicatorInner {
             open: snapshot.0 && !self.aborted.load(Ordering::Acquire),
             replication_address: self.state.read().await.replication_address.clone(),
             role: snapshot.1,
-            role_transition: snapshot.2,
-            write_status: snapshot.3,
-            authority: snapshot.4,
-            current_progress: snapshot.5,
-            verified_replication_lsn: snapshot.6,
-            committed_lsn: snapshot.7.max(replicator.committed_lsn()),
+            role_transition: None,
+            write_status: snapshot.2,
+            authority: snapshot.3,
+            current_progress: snapshot.4,
+            verified_replication_lsn: snapshot.5,
+            committed_lsn: snapshot.6.max(replicator.committed_lsn()),
             current_configuration_quorum_progress: replicator
                 .current_configuration_quorum_progress(),
             catch_up_boundary: replicator.catch_up_boundary(),
             catch_up_complete: replicator.catch_up_complete(),
-            builds: snapshot.8,
+            builds: snapshot.7,
         }
     }
 
@@ -1884,9 +1984,12 @@ impl DefaultReplicatorInner {
 
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
         match action {
-            RuntimeEffectAction::Open(_) => {
+            RuntimeEffectAction::Open(_)
+            | RuntimeEffectAction::ChangeRole(_)
+            | RuntimeEffectAction::Close
+            | RuntimeEffectAction::Abort => {
                 return Err(RuntimeError::Application(
-                    "Open must be executed by the hosting runtime".into(),
+                    "application lifecycle actions belong to the hosting runtime".into(),
                 ));
             }
             RuntimeEffectAction::AdmitAuthority(authority) => {
@@ -2008,60 +2111,6 @@ impl DefaultReplicatorInner {
                     );
                 }
             }
-            RuntimeEffectAction::ChangeRole(role) => {
-                let state = self.state.read().await;
-                if !state.open {
-                    return Err(RuntimeError::NotOpen);
-                }
-                let epoch = state
-                    .authority
-                    .as_ref()
-                    .map_or_else(kuberic_protocol::types::Epoch::default, |authority| {
-                        authority.current_configuration.epoch
-                    });
-                let completed_role = state.role;
-                let transition = state.role_transition.clone();
-                drop(state);
-                self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
-                self.replicator.lock().await.fence_client_writes();
-                let transition = if let Some(transition) = transition {
-                    if transition.target_role != role {
-                        return Err(RuntimeError::ReconfigurationPending);
-                    }
-                    transition
-                } else {
-                    let transition = RoleTransition {
-                        completed_role,
-                        target_role: role,
-                        replicator_completed: false,
-                        application_completed: false,
-                    };
-                    self.state.write().await.role_transition = Some(transition.clone());
-                    transition
-                };
-                self.changed.notify_waiters();
-                if !transition.replicator_completed {
-                    self.control().await?.change_role(epoch, role).await?;
-                    let mut state = self.state.write().await;
-                    let active = state
-                        .role_transition
-                        .as_mut()
-                        .ok_or(RuntimeError::ReconfigurationPending)?;
-                    active.replicator_completed = true;
-                }
-                if !transition.application_completed {
-                    let _ = self.application.change_role(role).await?;
-                    let mut state = self.state.write().await;
-                    let active = state
-                        .role_transition
-                        .as_mut()
-                        .ok_or(RuntimeError::ReconfigurationPending)?;
-                    active.application_completed = true;
-                }
-                let mut state = self.state.write().await;
-                state.role = role;
-                state.role_transition = None;
-            }
             RuntimeEffectAction::SetWriteStatus(write_status) => {
                 let state = self.state.read().await;
                 if write_status == AccessStatus::Granted {
@@ -2113,52 +2162,6 @@ impl DefaultReplicatorInner {
                 let mut state = self.state.write().await;
                 state.builds.remove(&build_id);
                 state.outbound_builds.remove(&build_id);
-            }
-            RuntimeEffectAction::Close => {
-                {
-                    let mut state = self.state.write().await;
-                    state.write_status = AccessStatus::ReconfigurationPending;
-                    state.open = false;
-                }
-                self.replicator.lock().await.fence_client_writes();
-                self.changed.notify_waiters();
-                if let Err(error) = self.control().await?.close().await {
-                    self.control_abort();
-                    self.application.abort();
-                    let mut state = self.state.write().await;
-                    state.role = ReplicaRole::None;
-                    state.role_transition = None;
-                    state.write_status = AccessStatus::NotPrimary;
-                    return Err(error);
-                }
-                if let Err(error) = self.application.close().await {
-                    self.application.abort();
-                    let mut state = self.state.write().await;
-                    state.role = ReplicaRole::None;
-                    state.role_transition = None;
-                    state.write_status = AccessStatus::NotPrimary;
-                    return Err(error);
-                }
-                self.closed.store(true, Ordering::Release);
-                let mut state = self.state.write().await;
-                state.role = ReplicaRole::None;
-                state.role_transition = None;
-                state.write_status = AccessStatus::NotPrimary;
-            }
-            RuntimeEffectAction::Abort => {
-                {
-                    let mut state = self.state.write().await;
-                    state.open = false;
-                    state.role = ReplicaRole::None;
-                    state.role_transition = None;
-                    state.write_status = AccessStatus::NotPrimary;
-                }
-                self.replicator.lock().await.fence_client_writes();
-                self.control_abort();
-                self.application.abort();
-                if let Some(control) = self.control.read().await.as_ref() {
-                    control.abort();
-                }
             }
         }
         Ok(())
@@ -2404,10 +2407,6 @@ impl ManagedReplicator for DefaultReplicatorInner {
 
     async fn next_outbound(&self) -> Option<OutboundReplication> {
         self.outbound_rx.lock().await.recv().await
-    }
-
-    fn abort(&self) {
-        self.control_abort();
     }
 }
 

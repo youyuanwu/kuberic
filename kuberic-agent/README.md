@@ -21,6 +21,13 @@ Missing established metadata, corruption, incompatible schema, or identity
 mismatch fails closed instead of creating empty authority. SQLite uses WAL and
 `synchronous=FULL`; the agent is the single writer.
 
+Primary promotion follows the SF host sequence: replicator role, epoch and
+state-provider update, then application role. Abort stops the returned control
+before application teardown. The default replicator's managed capability is
+transferred directly into agent registration and is not returned to
+application code.
+
 The crate currently exposes runtime-domain forwarding for the future transport.
 Network listeners, reliable peer sessions, declarative reconfiguration
-coordination, and protobuf conversion remain Phase 4 work.
+coordination, durable recovery of individual promotion substages, partition
+read/load/fault reporting, and protobuf conversion remain Phase 4 work.

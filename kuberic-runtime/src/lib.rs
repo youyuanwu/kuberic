@@ -3,6 +3,7 @@
 pub mod application;
 mod authority;
 mod effects;
+#[doc(hidden)]
 pub mod engine;
 #[doc(hidden)]
 #[path = "runtime.rs"]
