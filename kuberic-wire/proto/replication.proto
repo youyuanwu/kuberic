@@ -41,6 +41,7 @@ message CopyItem {
   int64 replication_boundary_lsn = 10;
   bool final_item = 11;
   bytes data = 12;
+  bool snapshot_chunk = 13;
 }
 
 message CopyAck {
@@ -54,6 +55,7 @@ message CopyAck {
   int64 durable_lsn = 8;
   int64 replication_boundary_lsn = 9;
   bool final_item = 10;
+  bool snapshot_chunk = 11;
 }
 
 service ReplicationData {

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use kuberic_protocol::types::{AccessStatus, OperationId, ReplicaRole};
 
 use crate::Result;
+use crate::application::OpenMode;
 use crate::authority::{AdmittedAuthority, BuildAuthority};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +14,7 @@ pub struct RuntimeEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEffectAction {
-    Open,
+    Open(OpenMode),
     AdmitAuthority(Box<AdmittedAuthority>),
     AdmitBuildAuthority(Box<BuildAuthority>),
     ChangeRole(ReplicaRole),
@@ -21,6 +22,7 @@ pub enum RuntimeEffectAction {
     RefreshApplicationProgress,
     RetireBuild(OperationId),
     Close,
+    Abort,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +40,7 @@ pub struct RuntimePostcondition {
     pub write_status: AccessStatus,
     pub authority: Option<AdmittedAuthority>,
     pub current_progress: i64,
+    pub verified_replication_lsn: Option<i64>,
     pub committed_lsn: i64,
     pub current_configuration_quorum_progress: i64,
     pub catch_up_boundary: Option<i64>,

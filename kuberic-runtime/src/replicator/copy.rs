@@ -1,7 +1,22 @@
+use bytes::Bytes;
+use kuberic_protocol::types::{ConfigurationDescriptor, OperationId, ReplicaIdentity};
 use kuberic_wire::proto;
 
-use crate::application::Lsn;
-use crate::authority::BuildAuthority;
+use crate::authority::{BuildAuthority, DurableBuildProgress};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildConfiguration {
+    Current,
+    Bootstrap(ConfigurationDescriptor),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareCopyRequest {
+    pub build_id: OperationId,
+    pub target: ReplicaIdentity,
+    pub configuration: BuildConfiguration,
+    pub copy_context: Bytes,
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedCopy {
@@ -9,10 +24,4 @@ pub struct PreparedCopy {
     pub items: Vec<proto::CopyItem>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildProgress {
-    pub authority: BuildAuthority,
-    pub last_sequence: u64,
-    pub durable_lsn: Lsn,
-    pub completed: bool,
-}
+pub type BuildProgress = DurableBuildProgress;

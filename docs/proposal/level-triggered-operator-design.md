@@ -609,6 +609,15 @@ completion is recorded only after the corresponding application/runtime
 postcondition is observed. A crash between those commits causes re-observation
 or repetition, never inferred success or rollback of acknowledged progress.
 
+The application API follows Service Fabric V1 semantics with Rust async
+interfaces. Service lifecycle (`Open`, `ChangeRole`, `Close`, and `Abort`) is
+separate from state-provider callbacks (`UpdateEpoch`, committed progress,
+copy context/state, data loss, and durable operation acceptance). Copy state is
+an opaque chunk stream installed through a captured LSN boundary; incremental
+replication remains a distinct ordered stream. Exact replica identity, epoch,
+configuration fencing, quorum accounting, and build sequencing remain runtime
+and agent responsibilities rather than application authority.
+
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and
 rebuild. The level-triggered operator must not depend on volatile correlation

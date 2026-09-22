@@ -27,6 +27,8 @@ pub enum RuntimeError {
     EffectConflict { sequence: u64 },
     #[error("write completion channel closed")]
     WriteCompletionClosed,
+    #[error("local write {0} must be resolved before another write can be assigned")]
+    LocalWritePending(String),
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

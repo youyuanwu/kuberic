@@ -265,11 +265,12 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         }),
         current_configuration_id: "cfg".to_string(),
         sequence: 1,
-        lsn: 1,
+        lsn: 0,
         committed_lsn: 0,
         replication_boundary_lsn: 2,
         final_item: false,
         data: vec![1],
+        snapshot_chunk: true,
     };
     assert!(validate_copy_item(&item).is_ok());
 
@@ -284,6 +285,7 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         durable_lsn: 2,
         replication_boundary_lsn: 2,
         final_item: true,
+        snapshot_chunk: false,
     };
     assert!(validate_copy_ack(&final_ack).is_ok());
 

@@ -62,6 +62,7 @@ pub struct CopyEnvelope {
     pub committed_lsn: i64,
     pub replication_boundary_lsn: i64,
     pub final_item: bool,
+    pub snapshot_chunk: bool,
     pub data: Vec<u8>,
 }
 
@@ -76,6 +77,7 @@ pub struct CopyAcknowledgement {
     pub durable_lsn: i64,
     pub replication_boundary_lsn: i64,
     pub final_item: bool,
+    pub snapshot_chunk: bool,
 }
 
 /// Requires an exact protocol-version match; negotiation is intentionally unsupported.
@@ -551,9 +553,12 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
         || if item.final_item {
             item.lsn != item.replication_boundary_lsn
                 || item.committed_lsn > item.replication_boundary_lsn
+                || item.snapshot_chunk
                 || !item.data.is_empty()
+        } else if item.snapshot_chunk {
+            item.lsn != 0 || item.committed_lsn != 0
         } else {
-            item.lsn <= 0 || item.committed_lsn > item.lsn
+            item.lsn <= item.replication_boundary_lsn || item.committed_lsn > item.lsn
         }
     {
         return Err(WireError::InvalidAuthority(
@@ -571,6 +576,7 @@ pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireEr
         committed_lsn: item.committed_lsn,
         replication_boundary_lsn: item.replication_boundary_lsn,
         final_item: item.final_item,
+        snapshot_chunk: item.snapshot_chunk,
         data: item.data,
     })
 }
@@ -598,7 +604,9 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
     if ack.sequence == 0
         || ack.durable_lsn < 0
         || ack.replication_boundary_lsn < 0
-        || (ack.final_item && ack.durable_lsn != ack.replication_boundary_lsn)
+        || (ack.final_item
+            && (ack.snapshot_chunk || ack.durable_lsn != ack.replication_boundary_lsn))
+        || (ack.snapshot_chunk && (ack.final_item || ack.durable_lsn != 0))
     {
         return Err(WireError::InvalidAuthority(
             "copy acknowledgement progress is inconsistent".to_string(),
@@ -614,6 +622,7 @@ pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, Wi
         durable_lsn: ack.durable_lsn,
         replication_boundary_lsn: ack.replication_boundary_lsn,
         final_item: ack.final_item,
+        snapshot_chunk: ack.snapshot_chunk,
     })
 }
 

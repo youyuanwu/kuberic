@@ -1,20 +1,29 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use kuberic_protocol::types::{
-    ConfigurationDescriptor, EffectivePolicy, OperationId, ReplicaIdentity, ReplicaRole,
-    TransitionKind,
+    ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, ReplicaIdentity,
+    ReplicaRole, TransitionKind,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
 use kuberic_wire::{ReplicationAcknowledgement, ReplicationEnvelope};
 
 use crate::{Result, RuntimeError};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildAuthorityKind {
+    Bootstrap,
+    Provisioning,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildAuthority {
     pub build_id: OperationId,
+    pub kind: BuildAuthorityKind,
     pub source: ReplicaIdentity,
     pub target: ReplicaIdentity,
     pub current_configuration: ConfigurationDescriptor,
     pub replication_boundary_lsn: i64,
+    pub snapshot_chunk_count: u64,
 }
 
 impl BuildAuthority {
@@ -35,15 +44,28 @@ impl BuildAuthority {
                 "copy source is not the exact Current Configuration primary".to_string(),
             ));
         }
-        if self
+        let target_member = self
             .current_configuration
             .members
             .iter()
-            .any(|member| member.identity == self.target)
-        {
-            return Err(RuntimeError::AuthorityMismatch(
-                "copy target must remain outside configuration membership".to_string(),
-            ));
+            .find(|member| member.identity == self.target);
+        match self.kind {
+            BuildAuthorityKind::Bootstrap => {
+                if target_member.is_none_or(|member| member.role == ReplicaRole::Primary) {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "bootstrap copy target must be an exact non-primary genesis member"
+                            .to_string(),
+                    ));
+                }
+            }
+            BuildAuthorityKind::Provisioning => {
+                if target_member.is_some() {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "provisioning copy target must remain outside configuration membership"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         if self.replication_boundary_lsn < 0 {
             return Err(RuntimeError::AuthorityMismatch(
@@ -69,6 +91,42 @@ impl BuildAuthority {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AuthorityFence {
+    pub epoch: Epoch,
+    pub previous_configuration_id: Option<ConfigurationId>,
+    pub current_configuration_id: ConfigurationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationProgress {
+    pub fence: AuthorityFence,
+    pub verified_lsn: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableBuildProgress {
+    pub authority: BuildAuthority,
+    pub last_sequence: u64,
+    pub durable_lsn: i64,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalWritePhase {
+    Reserved,
+    Registered,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableLocalWrite {
+    pub operation_id: OperationId,
+    pub lsn: i64,
+    pub data: Bytes,
+    pub phase: LocalWritePhase,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmittedAuthority {
     pub local_identity: ReplicaIdentity,
@@ -78,6 +136,17 @@ pub struct AdmittedAuthority {
 }
 
 impl AdmittedAuthority {
+    pub fn fence(&self) -> AuthorityFence {
+        AuthorityFence {
+            epoch: self.current_configuration.epoch,
+            previous_configuration_id: self
+                .previous_configuration
+                .as_ref()
+                .map(|configuration| configuration.configuration_id.clone()),
+            current_configuration_id: self.current_configuration.configuration_id.clone(),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_configuration(&self.current_configuration, None)
             .map_err(|error| RuntimeError::AuthorityMismatch(error.to_string()))?;
@@ -227,7 +296,36 @@ pub trait AuthorityStore: Send + Sync {
 
     async fn admit(&self, authority: &AdmittedAuthority) -> Result<()>;
 
+    async fn load_replication_progress(
+        &self,
+        fence: &AuthorityFence,
+    ) -> Result<Option<ReplicationProgress>>;
+
+    async fn load_configuration_progress(
+        &self,
+        epoch: Epoch,
+        current_configuration_id: &ConfigurationId,
+    ) -> Result<Option<ReplicationProgress>>;
+
+    async fn record_replication_progress(&self, progress: &ReplicationProgress) -> Result<()>;
+
+    async fn load_local_write(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<Option<DurableLocalWrite>>;
+
+    async fn load_local_writes(&self) -> Result<Vec<DurableLocalWrite>>;
+
+    async fn record_local_write(&self, write: &DurableLocalWrite) -> Result<()>;
+
     async fn load_build(&self, build_id: &OperationId) -> Result<Option<BuildAuthority>>;
 
     async fn admit_build(&self, authority: &BuildAuthority) -> Result<()>;
+
+    async fn load_build_progress(
+        &self,
+        build_id: &OperationId,
+    ) -> Result<Option<DurableBuildProgress>>;
+
+    async fn record_build_progress(&self, progress: &DurableBuildProgress) -> Result<()>;
 }

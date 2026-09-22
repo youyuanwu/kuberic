@@ -12,7 +12,7 @@ use crate::{Result, RuntimeError};
 pub struct QuorumTracker {
     authority: Option<AdmittedAuthority>,
     progress: BTreeMap<ReplicaIdentity, Lsn>,
-    pending: BTreeMap<Lsn, oneshot::Sender<Result<Lsn>>>,
+    pending: BTreeMap<Lsn, Vec<oneshot::Sender<Result<Lsn>>>>,
     highest_lsn: Lsn,
     committed_lsn: Lsn,
     catch_up_boundary: Option<Lsn>,
@@ -35,10 +35,12 @@ impl QuorumTracker {
                         .map(|configuration| &configuration.configuration_id)
         });
         if self.authority.is_some() && !same_fence {
-            for (_, sender) in std::mem::take(&mut self.pending) {
-                let _ = sender.send(Err(RuntimeError::AuthorityMismatch(
-                    "authority changed before the write committed".to_string(),
-                )));
+            for (_, senders) in std::mem::take(&mut self.pending) {
+                for sender in senders {
+                    let _ = sender.send(Err(RuntimeError::AuthorityMismatch(
+                        "authority changed before the write committed".to_string(),
+                    )));
+                }
             }
             self.progress.clear();
         }
@@ -67,7 +69,7 @@ impl QuorumTracker {
         }
         self.highest_lsn = self.highest_lsn.max(lsn);
         let (sender, receiver) = oneshot::channel();
-        self.pending.insert(lsn, sender);
+        self.pending.entry(lsn).or_default().push(sender);
         Ok(receiver)
     }
 
@@ -118,10 +120,12 @@ impl QuorumTracker {
     }
 
     pub fn fail_pending(&mut self) {
-        for (_, sender) in std::mem::take(&mut self.pending) {
-            let _ = sender.send(Err(RuntimeError::WriteClosed(
-                kuberic_protocol::types::AccessStatus::ReconfigurationPending,
-            )));
+        for (_, senders) in std::mem::take(&mut self.pending) {
+            for sender in senders {
+                let _ = sender.send(Err(RuntimeError::WriteClosed(
+                    kuberic_protocol::types::AccessStatus::ReconfigurationPending,
+                )));
+            }
         }
     }
 
@@ -161,12 +165,32 @@ impl QuorumTracker {
             .take_while(|lsn| *lsn <= committed_lsn)
             .collect::<Vec<_>>();
         for lsn in completed {
-            if let Some(sender) = self.pending.remove(&lsn) {
-                let _ = sender.send(Ok(lsn));
+            if let Some(senders) = self.pending.remove(&lsn) {
+                for sender in senders {
+                    let _ = sender.send(Ok(lsn));
+                }
             }
         }
         self.committed_lsn = self.committed_lsn.max(committed_lsn);
         Ok(())
+    }
+
+    pub fn restore_committed_lsn(&mut self, committed_lsn: Lsn) {
+        let completed = self
+            .pending
+            .keys()
+            .copied()
+            .take_while(|lsn| *lsn <= committed_lsn)
+            .collect::<Vec<_>>();
+        for lsn in completed {
+            if let Some(senders) = self.pending.remove(&lsn) {
+                for sender in senders {
+                    let _ = sender.send(Ok(lsn));
+                }
+            }
+        }
+        self.highest_lsn = self.highest_lsn.max(committed_lsn);
+        self.committed_lsn = self.committed_lsn.max(committed_lsn);
     }
 }
 

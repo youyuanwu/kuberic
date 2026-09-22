@@ -2,12 +2,20 @@
 
 Application and replication runtime for the level-triggered Kuberic stack.
 
-The crate provides a caller-driven `PodRuntime`, application lifecycle and
-operation-stream callbacks, durable authority admission, ordered idempotent
-effects, exact-incarnation replication, and PC/CC quorum tracking. Runtime role
-and write access are separate: startup is write-closed, becoming Primary does
-not grant writes, and direct client writes require an explicit granted
-`WriteStatus`.
+The public application contract follows Service Fabric V1 semantics using
+Rust async traits:
+
+- `StatefulServiceReplica` owns Open, ChangeRole, Close, and Abort lifecycle;
+- `StateProvider` owns epoch updates, committed progress, copy context/state,
+  data-loss handling, and durable operation acknowledgement;
+- `ClientWrite` carries a retry identity, while committed writes return a
+  `WriteReceipt`.
+
+The crate also provides a caller-driven `PodRuntime`, durable authority
+admission, ordered idempotent effects, exact-incarnation replication, and PC/CC
+quorum tracking. Runtime role and write access are separate: startup is
+write-closed, becoming Primary does not grant writes, and direct client writes
+require an explicit granted `WriteStatus`.
 
 The runtime does not create an operator, replica agent, or control-plane
 server. A caller supplies `RuntimeControlPlane` and `AuthorityStore`

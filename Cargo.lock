@@ -1425,7 +1425,6 @@ dependencies = [
  "futures",
  "kuberic-protocol",
  "kuberic-wire",
- "sha2",
  "thiserror 2.0.20",
  "tokio",
 ]

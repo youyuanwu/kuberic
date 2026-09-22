@@ -14,6 +14,5 @@ bytes.workspace = true
 futures.workspace = true
 kuberic-protocol = { path = "../kuberic-protocol" }
 kuberic-wire = { path = "../kuberic-wire" }
-sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
