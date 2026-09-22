@@ -894,6 +894,8 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     }
     let replication = include_str!("../src/replicator/mod.rs");
     let application = include_str!("../src/application.rs");
+    assert!(!replication.contains("pub trait ManagedReplicator"));
+    assert!(replication.contains("pub(crate) trait ManagedReplicator"));
     for (source, name, expected) in [
         (
             replication,
@@ -1696,12 +1698,11 @@ impl ReplicatorFactory for ExternalFactory {
             settings: Mutex::new(settings),
             closed: AtomicBool::new(false),
         });
-        Ok(ReplicatorInterfaces {
-            replicator: replicator.clone(),
-            state_replicator: replicator,
-            primary_replicator: None,
-            managed_replicator: None,
-        })
+        Ok(ReplicatorInterfaces::new(
+            replicator.clone(),
+            replicator,
+            None,
+        ))
     }
 }
 

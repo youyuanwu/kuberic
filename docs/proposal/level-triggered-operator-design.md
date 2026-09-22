@@ -655,9 +655,10 @@ CreateReplicator. Hosting retains application lifetime, one-shot registration,
 effect ordering, exact returned-interface identity, and control/primary
 discovery. The public factory context exposes immutable identity and partition
 access capabilities, never a concrete hosting or default-engine root.
-An optional non-application `ManagedReplicator` capability carries Kuberic
-agent-facing data-plane operations; custom replicators may omit it and own
-their data plane independently.
+A crate-private managed bridge carries Kuberic hosting/default-replicator
+integration and MUST NOT become part of the application or custom-factory API.
+User code constructs only the SF-shaped control, primary, and state interface
+bundle. Custom replicators own their data plane independently.
 Reservations, retries, exact ACK handling, authority admission, durable
 quorum finalization, queues, and copy/build bookkeeping belong to a distinct
 replication engine and MUST NOT be added to the public SF traits.

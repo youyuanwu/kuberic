@@ -450,7 +450,8 @@ impl RuntimeHost {
         provider: Arc<dyn StateProvider>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()> {
-        if let Some(managed) = interfaces.managed_replicator.as_ref() {
+        let managed_replicator = interfaces.managed_replicator();
+        if let Some(managed) = managed_replicator.as_ref() {
             managed
                 .attach_interfaces(
                     interfaces.replicator.clone(),
@@ -462,7 +463,7 @@ impl RuntimeHost {
             control: interfaces.replicator.clone(),
             primary: interfaces.primary_replicator.clone(),
             provider,
-            managed: interfaces.managed_replicator.clone(),
+            managed: managed_replicator,
         };
         self.registered.set(registered).map_err(|_| {
             RuntimeError::Application("CreateReplicator may be called only once per Open".into())

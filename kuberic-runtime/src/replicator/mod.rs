@@ -70,7 +70,7 @@ pub trait StateReplicator: Send + Sync {
 }
 
 #[async_trait]
-pub trait ManagedReplicator: Send + Sync {
+pub(crate) trait ManagedReplicator: Send + Sync {
     async fn attach_interfaces(
         &self,
         control: Arc<dyn Replicator>,
@@ -113,7 +113,40 @@ pub struct ReplicatorInterfaces {
     pub replicator: Arc<dyn Replicator>,
     pub state_replicator: Arc<dyn StateReplicator>,
     pub primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
-    pub managed_replicator: Option<Arc<dyn ManagedReplicator>>,
+    managed_replicator: Option<Arc<dyn ManagedReplicator>>,
+}
+
+impl ReplicatorInterfaces {
+    pub fn new(
+        replicator: Arc<dyn Replicator>,
+        state_replicator: Arc<dyn StateReplicator>,
+        primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+    ) -> Self {
+        Self {
+            replicator,
+            state_replicator,
+            primary_replicator,
+            managed_replicator: None,
+        }
+    }
+
+    pub(crate) fn with_managed(
+        replicator: Arc<dyn Replicator>,
+        state_replicator: Arc<dyn StateReplicator>,
+        primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+        managed_replicator: Arc<dyn ManagedReplicator>,
+    ) -> Self {
+        Self {
+            replicator,
+            state_replicator,
+            primary_replicator,
+            managed_replicator: Some(managed_replicator),
+        }
+    }
+
+    pub(crate) fn managed_replicator(&self) -> Option<Arc<dyn ManagedReplicator>> {
+        self.managed_replicator.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -146,7 +179,7 @@ impl ReplicatorFactoryContext {
 }
 
 #[async_trait]
-pub trait PartitionAccessView: Send + Sync {
+pub(crate) trait PartitionAccessView: Send + Sync {
     async fn write_status(&self) -> Result<AccessStatus>;
 }
 
@@ -283,12 +316,12 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
             next_operation,
             pending,
         });
-        Ok(ReplicatorInterfaces {
-            replicator: replicator.clone(),
+        Ok(ReplicatorInterfaces::with_managed(
+            replicator.clone(),
             state_replicator,
-            primary_replicator: Some(replicator),
-            managed_replicator: Some(engine),
-        })
+            Some(replicator),
+            engine,
+        ))
     }
 }
 

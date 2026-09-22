@@ -52,9 +52,10 @@ Custom implementations must honor that gate rather than infer write access
 from the Primary role.
 
 `ReplicatorFactoryContext` exposes stable identity and partition-access
-capabilities, not a concrete runtime or default-engine pointer. A selected
-factory may return an optional `ManagedReplicator` for Kuberic's agent-facing
-data plane. Custom replicators may omit it and own their transport themselves.
+capabilities, not a concrete runtime or default-engine pointer. Application
+and custom-factory code constructs only the SF-shaped interface bundle through
+`ReplicatorInterfaces::new`. The default implementation's managed data-plane
+bridge is crate-private; custom replicators own their transport independently.
 
 ## Durable streams and engine integration
 
