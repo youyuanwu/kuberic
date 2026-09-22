@@ -894,8 +894,15 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
     }
     let replication = include_str!("../src/replicator/mod.rs");
     let application = include_str!("../src/application.rs");
+    let library = include_str!("../src/lib.rs");
     assert!(!replication.contains("pub trait ManagedReplicator"));
     assert!(replication.contains("pub(crate) trait ManagedReplicator"));
+    for internal_module in ["authority", "effects", "runtime"] {
+        assert!(
+            library.contains(&format!("#[doc(hidden)]\npub mod {internal_module};")),
+            "{internal_module} must remain outside generated user documentation"
+        );
+    }
     for (source, name, expected) in [
         (
             replication,
@@ -1405,8 +1412,6 @@ async fn lifecycle_orders_role_changes_and_close_like_service_fabric() {
             "service.change_role",
             "replicator.close",
             "service.close",
-            "service.abort",
-            "replicator.abort",
         ]
     );
 }

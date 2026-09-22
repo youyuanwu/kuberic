@@ -699,7 +699,7 @@ end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
-| Final hosting ownership of managed role/close callback orchestration | Runtime hosting boundary before Phase 3 completion |
+| Move hidden process hosting/effect APIs out of the public runtime crate | Internal runtime contract plus `kuberic-agent` in Phase 3 |
 | Runtime-domain replication messages and removal of the temporary runtime-to-wire dependency | Runtime/agent adapter before Phase 4 transport |
 | Fresh endpoint/session incarnation, stale-session rejection, endpoint readiness, reconnect, ordered delivery, and cancellation | Reliable agent transport in Phase 4 |
 | Resend payload retention, truthful catch-up capability, truncation, and full-copy fallback | Reliable transport/build owner in Phases 4 and 7 |

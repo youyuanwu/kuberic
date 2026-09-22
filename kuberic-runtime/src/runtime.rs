@@ -513,18 +513,14 @@ impl RuntimeHost {
         }
         match effect.action.clone() {
             RuntimeEffectAction::Open(mode) => self.open(mode).await?,
+            RuntimeEffectAction::ChangeRole(role) => self.change_role(role).await?,
+            RuntimeEffectAction::Close => self.close().await?,
+            RuntimeEffectAction::Abort => self.abort_action().await,
             action => {
                 if let Ok(managed) = self.managed() {
-                    managed.execute_action(action.clone()).await?;
-                    match action {
-                        RuntimeEffectAction::Close => {
-                            self.closed.store(true, Ordering::Release);
-                        }
-                        RuntimeEffectAction::Abort => {
-                            self.aborted.store(true, Ordering::Release);
-                        }
-                        _ => {}
-                    }
+                    let result = managed.execute_action(action).await;
+                    self.sync_access_projection(managed.as_ref()).await;
+                    result?;
                 } else {
                     self.execute_custom_action(action).await?;
                 }
@@ -588,18 +584,131 @@ impl RuntimeHost {
         }
         let address = registered.control.open().await?;
         if let Some(managed) = registered.managed.as_ref() {
-            managed.complete_open(address).await?;
+            managed.complete_open(address.clone()).await?;
+            self.sync_access_projection(managed.as_ref()).await;
         } else {
             let progress = registered.control.current_progress().await?;
             let committed = registered.provider.last_committed_lsn().await?;
             let mut state = self.state.write().await;
             state.fallback_snapshot.open = true;
-            state.fallback_snapshot.replication_address = Some(address);
             state.fallback_snapshot.current_progress = progress;
             state.fallback_snapshot.committed_lsn = committed;
         }
+        {
+            let mut state = self.state.write().await;
+            state.fallback_snapshot.open = true;
+            state.fallback_snapshot.replication_address = Some(address);
+        }
         attempt.complete = true;
         Ok(())
+    }
+
+    async fn change_role(&self, role: ReplicaRole) -> Result<()> {
+        let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        let snapshot = self.snapshot().await;
+        if !snapshot.open {
+            return Err(RuntimeError::NotOpen);
+        }
+        let epoch = snapshot
+            .authority
+            .as_ref()
+            .map_or_else(Epoch::default, |authority| {
+                authority.current_configuration.epoch
+            });
+        let transition = {
+            let mut state = self.state.write().await;
+            state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+            if let Some(transition) = state.fallback_snapshot.role_transition.clone() {
+                if transition.target_role != role {
+                    return Err(RuntimeError::ReconfigurationPending);
+                }
+                transition
+            } else {
+                let transition = RoleTransition {
+                    completed_role: snapshot.role,
+                    target_role: role,
+                    replicator_completed: false,
+                    application_completed: false,
+                };
+                state.fallback_snapshot.role_transition = Some(transition.clone());
+                transition
+            }
+        };
+        if let Ok(managed) = self.managed() {
+            managed.fence_writes().await?;
+        }
+        if !transition.replicator_completed {
+            registered.control.change_role(epoch, role).await?;
+            let mut state = self.state.write().await;
+            let transition = state
+                .fallback_snapshot
+                .role_transition
+                .as_mut()
+                .ok_or(RuntimeError::ReconfigurationPending)?;
+            transition.replicator_completed = true;
+        }
+        if !transition.application_completed {
+            let _ = self.application.change_role(role).await?;
+        }
+        let mut state = self.state.write().await;
+        let transition = state
+            .fallback_snapshot
+            .role_transition
+            .as_mut()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        transition.application_completed = true;
+        state.fallback_snapshot.role = role;
+        state.fallback_snapshot.role_transition = None;
+        Ok(())
+    }
+
+    async fn close(&self) -> Result<()> {
+        let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        {
+            let mut state = self.state.write().await;
+            state.fallback_snapshot.open = false;
+            state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+        }
+        if let Ok(managed) = self.managed() {
+            managed.fence_writes().await?;
+        }
+        if let Err(error) = registered.control.close().await {
+            self.abort();
+            return Err(error);
+        }
+        if let Err(error) = self.application.close().await {
+            self.application.abort();
+            self.closed.store(true, Ordering::Release);
+            let mut state = self.state.write().await;
+            state.fallback_snapshot.role = ReplicaRole::None;
+            state.fallback_snapshot.role_transition = None;
+            state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+            return Err(error);
+        }
+        self.closed.store(true, Ordering::Release);
+        let mut state = self.state.write().await;
+        state.fallback_snapshot.role = ReplicaRole::None;
+        state.fallback_snapshot.role_transition = None;
+        state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+        Ok(())
+    }
+
+    async fn abort_action(&self) {
+        {
+            let mut state = self.state.write().await;
+            state.fallback_snapshot.open = false;
+            state.fallback_snapshot.role = ReplicaRole::None;
+            state.fallback_snapshot.role_transition = None;
+            state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+        }
+        self.abort();
+    }
+
+    async fn sync_access_projection(&self, managed: &dyn ManagedReplicator) {
+        let managed_snapshot = managed.snapshot().await;
+        let mut state = self.state.write().await;
+        state.fallback_snapshot.write_status = managed_snapshot.write_status;
+        state.fallback_snapshot.authority = managed_snapshot.authority;
     }
 
     async fn execute_custom_action(&self, action: RuntimeEffectAction) -> Result<()> {
@@ -667,7 +776,18 @@ impl RuntimeHost {
 
     async fn snapshot(&self) -> RuntimeSnapshot {
         if let Ok(managed) = self.managed() {
-            managed.snapshot().await
+            let mut snapshot = managed.snapshot().await;
+            let host = self.state.read().await.fallback_snapshot.clone();
+            snapshot.open = host.open;
+            snapshot.replication_address = host.replication_address;
+            snapshot.role = host.role;
+            snapshot.role_transition = host.role_transition;
+            snapshot.write_status = host.write_status;
+            snapshot.authority = host.authority.or(snapshot.authority);
+            if self.aborted.load(Ordering::Acquire) {
+                snapshot.open = false;
+            }
+            snapshot
         } else {
             let mut snapshot = self.state.read().await.fallback_snapshot.clone();
             if self.aborted.load(Ordering::Acquire) {
@@ -843,6 +963,7 @@ impl DefaultReplicatorInner {
         self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
         self.replicator.lock().await.fence_client_writes();
         self.replicator.lock().await.change_role(epoch, role)?;
+        self.state.write().await.role = role;
         self.changed.notify_waiters();
         Ok(())
     }
@@ -876,6 +997,7 @@ impl DefaultReplicatorInner {
         {
             let mut state = self.state.write().await;
             state.open = false;
+            state.role = ReplicaRole::None;
             state.write_status = AccessStatus::NotPrimary;
             state.outbound_builds.clear();
         }
@@ -2861,15 +2983,32 @@ impl ManagedReplicator for DefaultReplicatorInner {
         self.complete_open(replication_address).await
     }
 
+    async fn fence_writes(&self) -> Result<()> {
+        self.check_aborted()?;
+        self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
+        self.replicator.lock().await.fence_client_writes();
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
     async fn restore_authority(&self) -> Result<()> {
         self.restore_authority().await
     }
 
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
-        let _guard = self.effect_lock.lock().await;
-        if !matches!(action, RuntimeEffectAction::Abort) {
-            self.check_aborted()?;
+        if matches!(
+            action,
+            RuntimeEffectAction::Open(_)
+                | RuntimeEffectAction::ChangeRole(_)
+                | RuntimeEffectAction::Close
+                | RuntimeEffectAction::Abort
+        ) {
+            return Err(RuntimeError::Application(
+                "application lifecycle actions belong to the hosting runtime".into(),
+            ));
         }
+        let _guard = self.effect_lock.lock().await;
+        self.check_aborted()?;
         self.execute_action(action).await?;
         self.changed.notify_waiters();
         Ok(())

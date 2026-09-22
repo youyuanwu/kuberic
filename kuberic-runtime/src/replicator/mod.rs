@@ -77,6 +77,7 @@ pub(crate) trait ManagedReplicator: Send + Sync {
         primary: Option<Arc<dyn PrimaryReplicator>>,
     ) -> Result<()>;
     async fn complete_open(&self, replication_address: String) -> Result<()>;
+    async fn fence_writes(&self) -> Result<()>;
     async fn restore_authority(&self) -> Result<()>;
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;

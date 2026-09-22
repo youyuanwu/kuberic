@@ -103,11 +103,12 @@ closes the replicator, then closes the service, with abort cleanup on callback
 failure. Failed or cancelled Open aborts created interfaces;
 lifecycle/epoch failures never reopen writes.
 
-The crate also provides a caller-driven `PodRuntime`, durable authority
-admission, ordered idempotent effects, exact-incarnation replication, and PC/CC
-quorum tracking. Runtime role and write access are separate: startup is
-write-closed, becoming Primary does not grant writes, and direct client writes
-require an explicit granted `WriteStatus`.
+Hosting/effect compatibility types are hidden from the generated user
+documentation. They exist until `kuberic-agent` owns process hosting and
+durable effect execution; they are not application programming-model APIs.
+Runtime role and write access remain separate: startup is write-closed,
+becoming Primary does not grant writes, and direct client writes require an
+explicit granted `WriteStatus`.
 
 The runtime does not create an operator, replica agent, or control-plane
 server. Persistence is exposed as narrow `ReplicaAuthorityStore`,
@@ -136,8 +137,6 @@ owners must provide:
 - a named resend-retention owner whose actual retained range determines
   catch-up capability, truncation, and fallback to full copy;
 - durable agent-owned effect intent/result sequencing across process restart;
-- final extraction of managed role/close callback orchestration from the
-  default inner into the hosting runtime;
 - the FM/RA-equivalent coordinator that persists and resumes demote, GetLSN,
   catch-up, deactivate, and activate stages;
 - operation-specific mappings for removal, cancellation, backpressure, and
