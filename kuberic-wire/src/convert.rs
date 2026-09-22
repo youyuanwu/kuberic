@@ -1,9 +1,11 @@
+use kuberic_protocol::observation::{AgentObservation, AgentReport, UninitializedAgentObservation};
 use kuberic_protocol::types::{
-    AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
-    EffectivePolicy, Epoch, InitializationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRole, derive_agent_generation,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
+    EffectivePolicy, Epoch, InitializationId, PodUid, ProcessSessionId, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
+    derive_agent_generation,
 };
-use kuberic_protocol::validation::validate_configuration;
+use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
 use thiserror::Error;
 
 use crate::proto;
@@ -32,6 +34,12 @@ pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
 }
 
 pub fn validate_agent_status_report(report: &proto::AgentStatusReport) -> Result<(), WireError> {
+    normalize_agent_status_report(report.clone()).map(|_| ())
+}
+
+pub fn normalize_agent_status_report(
+    report: proto::AgentStatusReport,
+) -> Result<AgentObservation, WireError> {
     ensure_supported_version(report.protocol_version)?;
     if report.resource_uid.is_empty() {
         return Err(WireError::MissingField("agent_status.resource_uid"));
@@ -51,6 +59,11 @@ pub fn validate_agent_status_report(report: &proto::AgentStatusReport) -> Result
             value: report.storage_state,
         }),
         proto::AgentStorageState::Uninitialized => {
+            if report.replica_id <= 0 {
+                return Err(WireError::InvalidAuthority(
+                    "uninitialized replica ID must be positive".to_string(),
+                ));
+            }
             if report.pod_uid.is_empty() {
                 return Err(WireError::MissingField("agent_status.pod_uid"));
             }
@@ -62,36 +75,108 @@ pub fn validate_agent_status_report(report: &proto::AgentStatusReport) -> Result
                     "uninitialized agent status must not claim durable identity".to_string(),
                 ));
             }
-            Ok(())
+            if report.epoch.is_some()
+                || report.previous_configuration.is_some()
+                || report.current_configuration.is_some()
+                || report.role != proto::ReplicaRole::Unknown as i32
+                || report.write_status != proto::AccessStatus::Unknown as i32
+                || report.current_progress != 0
+                || report.committed_lsn != 0
+                || report.catch_up_capability.is_some()
+            {
+                return Err(WireError::InvalidAuthority(
+                    "uninitialized status contains durable authority".to_string(),
+                ));
+            }
+            Ok(AgentObservation::Uninitialized(
+                UninitializedAgentObservation {
+                    protocol_version: report.protocol_version,
+                    resource_uid: ResourceUid::new(report.resource_uid),
+                    replica_id: ReplicaId::new(report.replica_id),
+                    pod_uid: PodUid::new(report.pod_uid),
+                    pvc_uid: PvcUid::new(report.pvc_uid),
+                    process_session_id: ProcessSessionId::new(report.process_session_id),
+                    report_sequence: report.report_sequence,
+                },
+            ))
         }
         proto::AgentStorageState::Initialized => {
-            let _: ReplicaIdentity = report
+            let identity: ReplicaIdentity = report
                 .identity
                 .clone()
                 .ok_or(WireError::MissingField("agent_status.identity"))?
                 .try_into()?;
-            if report.epoch.is_none() {
-                return Err(WireError::MissingField("agent_status.epoch"));
+            if report.replica_id != 0 && report.replica_id != identity.replica_id.value() {
+                return Err(WireError::InvalidAuthority(
+                    "status replica ID differs from durable identity".to_string(),
+                ));
             }
-            if report.role == proto::ReplicaRole::Unknown as i32 {
-                return Err(WireError::InvalidEnum {
+            let epoch: Epoch = report
+                .epoch
+                .ok_or(WireError::MissingField("agent_status.epoch"))?
+                .into();
+            let role = proto::ReplicaRole::try_from(report.role)
+                .map_err(|_| WireError::InvalidEnum {
                     field: "agent_status.role",
                     value: report.role,
-                });
-            }
-            if report.write_status == proto::AccessStatus::Unknown as i32 {
-                return Err(WireError::InvalidEnum {
+                })
+                .and_then(role_from_proto)?;
+            let write_status = proto::AccessStatus::try_from(report.write_status)
+                .map_err(|_| WireError::InvalidEnum {
                     field: "agent_status.write_status",
                     value: report.write_status,
-                });
-            }
-            Ok(())
+                })
+                .and_then(access_status_from_proto)?;
+            let previous_configuration = report
+                .previous_configuration
+                .map(ConfigurationDescriptor::try_from)
+                .transpose()?;
+            let current_configuration = report
+                .current_configuration
+                .map(ConfigurationDescriptor::try_from)
+                .transpose()?;
+            validate_report_configurations(
+                epoch,
+                previous_configuration.as_ref(),
+                current_configuration.as_ref(),
+                role,
+                write_status,
+            )?;
+            Ok(AgentObservation::Report(Box::new(AgentReport {
+                protocol_version: report.protocol_version,
+                resource_uid: ResourceUid::new(report.resource_uid),
+                identity,
+                process_session_id: ProcessSessionId::new(report.process_session_id),
+                report_sequence: report.report_sequence,
+                role,
+                write_status,
+                healthy: report.healthy,
+                epoch,
+                previous_configuration,
+                current_configuration,
+                current_progress: report.current_progress,
+                committed_lsn: report.committed_lsn,
+                catch_up_capability: report.catch_up_capability,
+            })))
         }
         proto::AgentStorageState::Unsafe => {
             if report.storage_error.is_empty() {
                 return Err(WireError::MissingField("agent_status.storage_error"));
             }
-            Ok(())
+            if report.identity.is_some()
+                || report.epoch.is_some()
+                || report.previous_configuration.is_some()
+                || report.current_configuration.is_some()
+                || report.role != proto::ReplicaRole::Unknown as i32
+                || report.write_status != proto::AccessStatus::Unknown as i32
+            {
+                return Err(WireError::InvalidAuthority(
+                    "unsafe storage report contains untrusted authority".to_string(),
+                ));
+            }
+            Ok(AgentObservation::Invalid {
+                message: report.storage_error,
+            })
         }
     }
 }
@@ -193,6 +278,12 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     "ensure_configuration.effective_policy",
                 ))?;
             validate_policy(policy)?;
+            let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
+                .map_err(|_| WireError::InvalidEnum {
+                    field: "ensure_configuration.transition_kind",
+                    value: command.transition_kind,
+                })
+                .and_then(transition_kind_from_proto)?;
             if command.expected_instance_id.is_empty() {
                 return Err(WireError::MissingField(
                     "ensure_configuration.expected_instance_id",
@@ -223,7 +314,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     "ensure policy differs from Current Configuration".to_string(),
                 ));
             }
-            if let Some(previous) = command.previous_configuration.clone() {
+            let previous = if let Some(previous) = command.previous_configuration.clone() {
                 let previous = ConfigurationDescriptor::try_from(previous)?;
                 let previous_epoch: Epoch = command
                     .previous_epoch
@@ -236,11 +327,14 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         "ensure previous epoch differs from Previous Configuration".to_string(),
                     ));
                 }
+                Some(previous)
             } else if command.previous_epoch.is_some() {
                 return Err(WireError::InvalidAuthority(
                     "ensure previous epoch exists without Previous Configuration".to_string(),
                 ));
-            }
+            } else {
+                None
+            };
             if !current
                 .members
                 .iter()
@@ -250,6 +344,18 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     "ensure target is not an exact Current Configuration member".to_string(),
                 ));
             }
+            validate_transition_relationship(
+                transition_kind,
+                previous.as_ref(),
+                &current,
+                &EffectivePolicy {
+                    replica_set_size: policy.replica_set_size,
+                    write_quorum: policy.write_quorum,
+                    read_quorum: policy.read_quorum,
+                    failover_delay_seconds: policy.failover_delay_seconds,
+                },
+            )
+            .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             Ok(())
         }
     }
@@ -443,6 +549,84 @@ fn role_from_proto(role: proto::ReplicaRole) -> Result<ReplicaRole, WireError> {
     }
 }
 
+fn transition_kind_from_proto(kind: proto::TransitionKind) -> Result<TransitionKind, WireError> {
+    match kind {
+        proto::TransitionKind::Unknown => Err(WireError::InvalidEnum {
+            field: "ensure_configuration.transition_kind",
+            value: kind as i32,
+        }),
+        proto::TransitionKind::Bootstrap => Ok(TransitionKind::Bootstrap),
+        proto::TransitionKind::Replacement => Ok(TransitionKind::Replacement),
+        proto::TransitionKind::Failover => Ok(TransitionKind::Failover),
+    }
+}
+
+fn access_status_from_proto(status: proto::AccessStatus) -> Result<AccessStatus, WireError> {
+    match status {
+        proto::AccessStatus::Unknown => Err(WireError::InvalidEnum {
+            field: "agent_status.write_status",
+            value: status as i32,
+        }),
+        proto::AccessStatus::Granted => Ok(AccessStatus::Granted),
+        proto::AccessStatus::ReconfigurationPending => Ok(AccessStatus::ReconfigurationPending),
+        proto::AccessStatus::NotPrimary => Ok(AccessStatus::NotPrimary),
+        proto::AccessStatus::NoWriteQuorum => Ok(AccessStatus::NoWriteQuorum),
+    }
+}
+
+fn validate_report_configurations(
+    epoch: Epoch,
+    previous: Option<&ConfigurationDescriptor>,
+    current: Option<&ConfigurationDescriptor>,
+    role: ReplicaRole,
+    write_status: AccessStatus,
+) -> Result<(), WireError> {
+    if previous.is_some() && current.is_none() {
+        return Err(WireError::InvalidAuthority(
+            "report has Previous Configuration without Current Configuration".to_string(),
+        ));
+    }
+    if let Some(current) = current
+        && current.epoch != epoch
+    {
+        return Err(WireError::InvalidAuthority(
+            "report epoch differs from Current Configuration".to_string(),
+        ));
+    }
+    if let (Some(previous), Some(current)) = (previous, current) {
+        let previous_ids = previous
+            .members
+            .iter()
+            .map(|member| member.identity.replica_id)
+            .collect::<BTreeSet<_>>();
+        let current_ids = current
+            .members
+            .iter()
+            .map(|member| member.identity.replica_id)
+            .collect::<BTreeSet<_>>();
+        if previous.epoch.data_loss_number != current.epoch.data_loss_number
+            || previous.epoch.configuration_number >= current.epoch.configuration_number
+            || previous_ids != current_ids
+            || previous.write_quorum != current.write_quorum
+        {
+            return Err(WireError::InvalidAuthority(
+                "report PC/CC relationship is invalid".to_string(),
+            ));
+        }
+    }
+    if role == ReplicaRole::Primary && current.is_none() {
+        return Err(WireError::InvalidAuthority(
+            "Primary report has no Current Configuration".to_string(),
+        ));
+    }
+    if write_status == AccessStatus::Granted && role != ReplicaRole::Primary {
+        return Err(WireError::InvalidAuthority(
+            "granted WriteStatus requires Primary role".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_policy(policy: &proto::EffectivePolicy) -> Result<(), WireError> {
     let expected = EffectivePolicy::fixed(policy.replica_set_size, policy.failover_delay_seconds)
         .ok_or_else(|| {
@@ -455,3 +639,4 @@ fn validate_policy(policy: &proto::EffectivePolicy) -> Result<(), WireError> {
     }
     Ok(())
 }
+use std::collections::BTreeSet;

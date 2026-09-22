@@ -14,17 +14,25 @@ changed=$(mktemp)
 trap 'rm -f -- "$changed"' EXIT
 
 {
-    git diff --name-only "$merge_base"...HEAD
-    git diff --cached --name-only
-    git diff --name-only
-    git ls-files --others --exclude-standard
-} | sort -u > "$changed"
+    git diff --no-renames --name-only -z "$merge_base"...HEAD
+    git diff --cached --no-renames --name-only -z
+    git diff --no-renames --name-only -z
+    git ls-files --others --exclude-standard -z
+} | sort -zu > "$changed"
 
-protected_pattern='^(kuberic-core/|kuberic-operator/|examples/kvstore/|examples/sqlite/|examples/postgres/|kuberic-tests/)'
-violations=$(grep -E "$protected_pattern" "$changed" || true)
-if [[ -n "$violations" ]]; then
+violations=()
+while IFS= read -r -d '' path; do
+    case "$path" in
+        kuberic-core/* | kuberic-operator/* | examples/kvstore/* | \
+            examples/sqlite/* | examples/postgres/* | kuberic-tests/*)
+            violations+=("$path")
+            ;;
+    esac
+done < "$changed"
+
+if ((${#violations[@]} > 0)); then
     echo "Level-triggered work modified protected v1 paths:" >&2
-    printf '%s\n' "$violations" >&2
+    printf '%s\n' "${violations[@]}" >&2
     exit 1
 fi
 

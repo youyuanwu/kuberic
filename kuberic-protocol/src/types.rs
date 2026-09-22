@@ -104,7 +104,7 @@ pub enum AccessStatus {
     NoWriteQuorum,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaIdentity {
     pub replica_id: ReplicaId,
@@ -296,6 +296,11 @@ impl AcceptedStatus {
         self.conditions
             .retain(|existing| existing.type_ != condition.type_);
         self.conditions.push(condition);
+        self
+    }
+
+    pub fn without_condition(mut self, type_: &str) -> Self {
+        self.conditions.retain(|existing| existing.type_ != type_);
         self
     }
 }

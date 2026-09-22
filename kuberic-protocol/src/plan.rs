@@ -9,6 +9,7 @@ pub enum WaitReason {
     ActiveTransition,
     ProvisioningInProgress,
     AgentUnavailable,
+    AwaitingStableEvidence,
     AwaitingAgentInitialization,
     UnsupportedSpecDuringTransition,
 }

@@ -2,9 +2,10 @@ use crate::command::{InitializeAgentStore, KubernetesChange, ProtocolCommand, Sa
 use crate::observation::{AgentObservation, ObservationSnapshot};
 use crate::plan::{Plan, UnsafeReason, WaitReason};
 use crate::types::{
-    AcceptedStatus, ConditionStatus, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
-    Epoch, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, StatusCondition, TransitionIntent,
-    TransitionKind, derive_agent_generation, derive_initialization_id, derive_transition_id,
+    AcceptedStatus, AccessStatus, ConditionStatus, ConfigurationDescriptor, ConfigurationMember,
+    EffectivePolicy, Epoch, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, StatusCondition,
+    TransitionIntent, TransitionKind, derive_agent_generation, derive_initialization_id,
+    derive_transition_id,
 };
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
@@ -47,7 +48,11 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     if !snapshot.observation_failures.is_empty() {
         return Plan::Wait {
             reason: WaitReason::AgentUnavailable,
-            status: snapshot.status.clone(),
+            status: waiting_status(
+                snapshot.status.clone(),
+                "ObservationFailed",
+                "A required observation failed",
+            ),
             requeue_after_seconds: config.wait_requeue_seconds,
         };
     }
@@ -59,7 +64,11 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     if snapshot.status.provisioning.is_some() {
         return Plan::Wait {
             reason: WaitReason::ProvisioningInProgress,
-            status: snapshot.status.clone(),
+            status: waiting_status(
+                snapshot.status.clone(),
+                "ProvisioningInProgress",
+                "An exact replacement remains outside authority",
+            ),
             requeue_after_seconds: config.wait_requeue_seconds,
         };
     }
@@ -77,17 +86,112 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         .topology
         .as_ref()
         .expect("validated initialized status has topology");
-    let frozen_size = topology.configuration.members.len() as u32;
-    let mut status = snapshot.status.clone();
-    if snapshot.desired.replicas != frozen_size {
+    let configuration = &topology.configuration;
+    let frozen_size = configuration.members.len() as u32;
+    let mut status = clear_evaluator_conditions(snapshot.status.clone());
+    let unsupported = snapshot.desired.replicas != frozen_size;
+    if unsupported {
         status = status.with_condition(unsupported_replica_count_condition(
             snapshot.desired.replicas,
             frozen_size,
         ));
     } else {
         status.observed_generation = snapshot.desired.generation;
-        status = status.with_condition(ready_condition());
     }
+
+    let primary = configuration
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == configuration.primary_id)
+        .expect("validated configuration has primary member");
+    let mut attested_members = 0_u32;
+    let mut primary_attested = false;
+    for member in &configuration.members {
+        let Some(observation) = snapshot.observation_for_identity(&member.identity) else {
+            return Plan::Wait {
+                reason: WaitReason::AwaitingStableEvidence,
+                status: waiting_status(
+                    status,
+                    "ReplicaEvidenceMissing",
+                    "Accepted topology is not fully observed",
+                ),
+                requeue_after_seconds: config.wait_requeue_seconds,
+            };
+        };
+        let AgentObservation::Report(report) = &observation.agent else {
+            return Plan::Wait {
+                reason: WaitReason::AwaitingStableEvidence,
+                status: waiting_status(
+                    status,
+                    "ReplicaEvidenceMissing",
+                    "Accepted member has no initialized report",
+                ),
+                requeue_after_seconds: config.wait_requeue_seconds,
+            };
+        };
+        let authority_matches = report.healthy
+            && report.role == member.role
+            && report.epoch == configuration.epoch
+            && report
+                .current_configuration
+                .as_ref()
+                .is_some_and(|current| current.configuration_id == configuration.configuration_id);
+        if authority_matches {
+            attested_members += 1;
+        }
+        if member.identity == primary.identity {
+            primary_attested = authority_matches
+                && report.role == ReplicaRole::Primary
+                && report.write_status == AccessStatus::Granted;
+        }
+    }
+
+    if !primary_attested || attested_members < configuration.write_quorum {
+        return Plan::Wait {
+            reason: WaitReason::AwaitingStableEvidence,
+            status: waiting_status(
+                status,
+                "WriteAuthorityUnproven",
+                "Primary WriteStatus or Current Configuration quorum is not proven",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        };
+    }
+
+    match &snapshot.routing.write_target {
+        Some(target) if target == &primary.identity => {}
+        Some(_) => {
+            return Plan::Apply {
+                changes: vec![
+                    KubernetesChange::RemoveWriteRouting,
+                    KubernetesChange::PersistStatus {
+                        status: Box::new(waiting_status(
+                            status,
+                            "RoutingFencePending",
+                            "Removing routing to a non-authoritative target",
+                        )),
+                    },
+                ],
+            };
+        }
+        None => {
+            return Plan::Apply {
+                changes: vec![
+                    KubernetesChange::PublishWriteRouting {
+                        primary: primary.identity.clone(),
+                    },
+                    KubernetesChange::PersistStatus {
+                        status: Box::new(waiting_status(
+                            status,
+                            "RoutingPublicationPending",
+                            "Publishing routing to the attested primary",
+                        )),
+                    },
+                ],
+            };
+        }
+    }
+    status = status.with_condition(ready_condition());
     Plan::Stable {
         status,
         requeue_after_seconds: config.stable_resync_seconds,
@@ -132,9 +236,7 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
     let mut members = Vec::with_capacity(policy.replica_set_size as usize);
     for replica_id in snapshot.intended_replica_ids() {
         let kubernetes = snapshot
-            .replicas
-            .get(&replica_id)
-            .and_then(|observation| observation.kubernetes.as_ref())
+            .scaffolding_for(replica_id)
             .expect("complete scaffolding has every intended member");
         let pod_uid = kubernetes
             .pod_uid
@@ -193,20 +295,19 @@ fn evaluate_transition(
     transition: &TransitionIntent,
     config: &EvaluationConfig,
 ) -> Plan {
-    let mut status = snapshot.status.clone();
+    let mut status = transition_status(snapshot.status.clone());
     if snapshot.desired.replicas != transition.effective_policy.replica_set_size {
-        let condition = unsupported_replica_count_condition(
+        status = status.with_condition(unsupported_replica_count_condition(
             snapshot.desired.replicas,
             transition.effective_policy.replica_set_size,
-        );
-        if !has_condition(&status, &condition) {
-            status = status.with_condition(condition);
-            return Plan::Apply {
-                changes: vec![KubernetesChange::PersistStatus {
-                    status: Box::new(status),
-                }],
-            };
-        }
+        ));
+    }
+    if status != snapshot.status {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(status),
+            }],
+        };
     }
 
     if transition.kind != TransitionKind::Bootstrap {
@@ -222,7 +323,7 @@ fn evaluate_transition(
     }
 
     for member in &transition.current_configuration.members {
-        let Some(observation) = snapshot.replicas.get(&member.identity.replica_id) else {
+        let Some(observation) = snapshot.observation_for_identity(&member.identity) else {
             return Plan::Wait {
                 reason: WaitReason::AgentUnavailable,
                 status,
@@ -313,47 +414,42 @@ fn incompatible_protocol_plan(
     snapshot: &ObservationSnapshot,
     config: &EvaluationConfig,
 ) -> Option<Plan> {
-    snapshot
-        .replicas
-        .iter()
-        .find_map(|(replica_id, observation)| {
-            let observed = match &observation.agent {
-                AgentObservation::Uninitialized(report) => report.protocol_version,
-                AgentObservation::Report(report) => report.protocol_version,
-                AgentObservation::Absent
-                | AgentObservation::Unreachable { .. }
-                | AgentObservation::Invalid { .. } => return None,
-            };
-            (observed != config.supported_protocol_version).then(|| {
-                unsafe_plan(
-                    snapshot.status.clone(),
-                    UnsafeReason::IncompatibleProtocolVersion {
-                        replica_id: replica_id.value(),
-                        expected: config.supported_protocol_version,
-                        observed,
-                    },
-                    config,
-                )
-            })
+    snapshot.replicas.iter().find_map(|(key, observation)| {
+        let observed = match &observation.agent {
+            AgentObservation::Uninitialized(report) => report.protocol_version,
+            AgentObservation::Report(report) => report.protocol_version,
+            AgentObservation::Absent
+            | AgentObservation::Unreachable { .. }
+            | AgentObservation::Invalid { .. } => return None,
+        };
+        (observed != config.supported_protocol_version).then(|| {
+            unsafe_plan(
+                snapshot.status.clone(),
+                UnsafeReason::IncompatibleProtocolVersion {
+                    replica_id: key.replica_id.value(),
+                    expected: config.supported_protocol_version,
+                    observed,
+                },
+                config,
+            )
         })
+    })
 }
 
 fn invalid_agent_plan(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Option<Plan> {
-    snapshot
-        .replicas
-        .iter()
-        .find_map(|(replica_id, observation)| {
-            let AgentObservation::Invalid { message } = &observation.agent else {
-                return None;
-            };
-            Some(unsafe_plan(
-                snapshot.status.clone(),
-                UnsafeReason::ContradictoryReplicaEvidence(format!(
-                    "replica {replica_id} returned invalid evidence: {message}"
-                )),
-                config,
-            ))
-        })
+    snapshot.replicas.iter().find_map(|(key, observation)| {
+        let AgentObservation::Invalid { message } = &observation.agent else {
+            return None;
+        };
+        Some(unsafe_plan(
+            snapshot.status.clone(),
+            UnsafeReason::ContradictoryReplicaEvidence(format!(
+                "replica {}@{} returned invalid evidence: {message}",
+                key.replica_id, key.instance_id
+            )),
+            config,
+        ))
+    })
 }
 
 fn has_durable_replica_evidence(snapshot: &ObservationSnapshot) -> bool {
@@ -365,12 +461,19 @@ fn has_durable_replica_evidence(snapshot: &ObservationSnapshot) -> bool {
 }
 
 fn unsafe_plan(status: AcceptedStatus, reason: UnsafeReason, config: &EvaluationConfig) -> Plan {
-    let status = status.with_condition(StatusCondition {
-        type_: "Unsafe".to_string(),
-        status: ConditionStatus::True,
-        reason: "UnsafeAuthority".to_string(),
-        message: format!("{reason:?}"),
-    });
+    let status = clear_runtime_conditions(status)
+        .with_condition(StatusCondition {
+            type_: "Ready".to_string(),
+            status: ConditionStatus::False,
+            reason: "Unsafe".to_string(),
+            message: "Replica authority is unsafe".to_string(),
+        })
+        .with_condition(StatusCondition {
+            type_: "Unsafe".to_string(),
+            status: ConditionStatus::True,
+            reason: "UnsafeAuthority".to_string(),
+            message: format!("{reason:?}"),
+        });
     Plan::Unsafe {
         reason,
         status,
@@ -408,11 +511,32 @@ fn unsupported_replica_count_condition(requested: u32, frozen: u32) -> StatusCon
     }
 }
 
-fn has_condition(status: &AcceptedStatus, condition: &StatusCondition) -> bool {
-    status.conditions.iter().any(|existing| {
-        existing.type_ == condition.type_
-            && existing.status == condition.status
-            && existing.reason == condition.reason
-            && existing.message == condition.message
-    })
+fn waiting_status(status: AcceptedStatus, reason: &str, message: &str) -> AcceptedStatus {
+    clear_runtime_conditions(status)
+        .with_condition(StatusCondition {
+            type_: "Ready".to_string(),
+            status: ConditionStatus::Unknown,
+            reason: reason.to_string(),
+            message: message.to_string(),
+        })
+        .with_condition(progressing_condition(reason, message))
+}
+
+fn transition_status(status: AcceptedStatus) -> AcceptedStatus {
+    waiting_status(
+        status.without_condition("UnsupportedSpec"),
+        "TransitionActive",
+        "Persisted transition remains in progress",
+    )
+}
+
+fn clear_evaluator_conditions(status: AcceptedStatus) -> AcceptedStatus {
+    clear_runtime_conditions(status).without_condition("UnsupportedSpec")
+}
+
+fn clear_runtime_conditions(status: AcceptedStatus) -> AcceptedStatus {
+    status
+        .without_condition("Ready")
+        .without_condition("Unsafe")
+        .without_condition("Progressing")
 }

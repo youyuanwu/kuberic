@@ -38,6 +38,7 @@ pub struct EnsureConfiguration {
     pub local_replica_id: ReplicaId,
     pub expected_instance_id: ReplicaInstanceId,
     pub expected_agent_generation: AgentGeneration,
+    pub transition_kind: crate::types::TransitionKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{
     AcceptedStatus, AccessStatus, ConfigurationDescriptor, Epoch, PodUid, ProcessSessionId, PvcUid,
-    ReplicaId, ReplicaIdentity, ReplicaRole, ResourceUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,12 +55,29 @@ pub struct AgentReport {
     pub report_sequence: u64,
     pub role: ReplicaRole,
     pub write_status: AccessStatus,
+    pub healthy: bool,
     pub epoch: Epoch,
     pub previous_configuration: Option<ConfigurationDescriptor>,
     pub current_configuration: Option<ConfigurationDescriptor>,
     pub current_progress: i64,
     pub committed_lsn: i64,
     pub catch_up_capability: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaObservationKey {
+    pub replica_id: ReplicaId,
+    pub instance_id: ReplicaInstanceId,
+}
+
+impl ReplicaObservationKey {
+    pub fn new(replica_id: ReplicaId, instance_id: ReplicaInstanceId) -> Self {
+        Self {
+            replica_id,
+            instance_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,8 +124,8 @@ pub struct ObservationSnapshot {
     pub resource_version: String,
     pub desired: DesiredState,
     pub status: AcceptedStatus,
-    pub replicas: BTreeMap<ReplicaId, ReplicaObservation>,
-    pub previous_report_watermarks: BTreeMap<ReplicaId, ReportWatermark>,
+    pub replicas: BTreeMap<ReplicaObservationKey, ReplicaObservation>,
+    pub previous_report_watermarks: BTreeMap<ReplicaObservationKey, ReportWatermark>,
     pub durable_storage_evidence: bool,
     pub routing: RoutingObservation,
     pub observation_failures: Vec<ObservationFailure>,
@@ -124,10 +141,28 @@ impl ObservationSnapshot {
 
     pub fn has_complete_scaffolding(&self) -> bool {
         self.intended_replica_ids().into_iter().all(|replica_id| {
-            self.replicas
-                .get(&replica_id)
-                .and_then(|observation| observation.kubernetes.as_ref())
+            self.scaffolding_for(replica_id)
                 .is_some_and(KubernetesReplicaObservation::has_exact_scaffolding)
         })
+    }
+
+    pub fn scaffolding_for(&self, replica_id: ReplicaId) -> Option<&KubernetesReplicaObservation> {
+        let mut matching = self
+            .replicas
+            .iter()
+            .filter(|(key, _)| key.replica_id == replica_id)
+            .filter_map(|(_, observation)| observation.kubernetes.as_ref());
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
+    pub fn observation_for_identity(
+        &self,
+        identity: &ReplicaIdentity,
+    ) -> Option<&ReplicaObservation> {
+        self.replicas.get(&ReplicaObservationKey::new(
+            identity.replica_id,
+            identity.instance_id.clone(),
+        ))
     }
 }

@@ -894,6 +894,12 @@ Each reconcile builds an immutable normalized snapshot containing:
 - current time;
 - explicit observation failures.
 
+Replica observations are keyed by logical replica ID plus exact Pod
+incarnation, not by logical replica ID alone. A replacement snapshot may
+therefore contain the accepted old PC incarnation and a new provisioning or CC
+incarnation simultaneously. Report watermarks are scoped to that exact
+incarnation and process session.
+
 Unreachable and absent are different states. A missing observation must never
 be represented as a default replica report.
 
@@ -955,6 +961,12 @@ It performs:
 
 Pure evaluation enables exhaustive table tests, model-based testing, and fault
 injection without Kubernetes or gRPC.
+
+A stable `Ready=True` projection requires fresh evidence for the exact accepted
+primary, granted WriteStatus, the accepted epoch and Current Configuration,
+the required write quorum of healthy exact members, and write routing to that
+attested primary. Accepted status without that evidence produces bounded
+`Wait`; it is not sufficient to infer readiness.
 
 ## Reconciliation Flow
 

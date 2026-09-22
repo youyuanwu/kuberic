@@ -30,6 +30,13 @@ enum AgentStorageState {
   AGENT_STORAGE_STATE_UNSAFE = 3;
 }
 
+enum TransitionKind {
+  TRANSITION_KIND_UNKNOWN = 0;
+  TRANSITION_KIND_BOOTSTRAP = 1;
+  TRANSITION_KIND_REPLACEMENT = 2;
+  TRANSITION_KIND_FAILOVER = 3;
+}
+
 message ReplicaIdentity {
   int64 replica_id = 1;
   string instance_id = 2;
@@ -81,6 +88,8 @@ message AgentStatusReport {
   string pod_uid = 15;
   string pvc_uid = 16;
   string storage_error = 17;
+  bool healthy = 18;
+  int64 replica_id = 19;
 }
 
 message InitializeAgentStoreCommand {
@@ -104,6 +113,7 @@ message EnsureConfigurationCommand {
   int64 local_replica_id = 7;
   string expected_instance_id = 8;
   string expected_agent_generation = 9;
+  TransitionKind transition_kind = 10;
 }
 
 message ExecuteCommandRequest {

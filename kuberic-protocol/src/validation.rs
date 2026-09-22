@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use crate::observation::{AgentObservation, ObservationSnapshot};
+use crate::observation::{AgentObservation, ObservationSnapshot, ReplicaObservationKey};
 use crate::types::{
-    AcceptedStatus, ConfigurationDescriptor, EffectivePolicy, ReplicaId, ReplicaRole,
-    TransitionKind, derive_agent_generation, duplicate_replica_ids,
+    AcceptedStatus, AccessStatus, ConfigurationDescriptor, EffectivePolicy, Epoch, ReplicaId,
+    ReplicaIdentity, ReplicaRole, TransitionKind, derive_agent_generation, duplicate_replica_ids,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -55,12 +55,26 @@ pub enum ValidationError {
         actual: Option<String>,
         expected: String,
     },
+    #[error("Current Configuration data-loss epoch differs from Previous Configuration")]
+    TransitionDataLossChanged,
+    #[error("Current Configuration epoch must be newer than Previous Configuration")]
+    TransitionEpochNotNewer,
+    #[error("Previous and Current Configuration logical membership differs")]
+    TransitionLogicalMembershipChanged,
+    #[error("failover must preserve exact membership")]
+    FailoverMembershipChanged,
+    #[error("replacement must change exactly one non-primary incarnation")]
+    InvalidReplacementMembership,
+    #[error("replacement must preserve the accepted primary")]
+    ReplacementPrimaryChanged,
     #[error("provisioning target does not match resource UID")]
     ProvisioningResourceMismatch,
     #[error("provisioning target reuses the accepted exact incarnation")]
     ProvisioningReusesAcceptedIncarnation,
-    #[error("replica map key {key} does not match reported replica ID {reported}")]
-    ReplicaObservationKeyMismatch { key: i64, reported: i64 },
+    #[error("replica observation key {key} does not match reported identity {reported}")]
+    ReplicaObservationKeyMismatch { key: String, reported: String },
+    #[error("replica observation key does not match Kubernetes Pod identity")]
+    KubernetesObservationKeyMismatch,
     #[error("replica {0} reports a different resource UID")]
     ReplicaResourceMismatch(i64),
     #[error("replica {replica_id} report sequence {observed} did not advance past {previous}")]
@@ -82,6 +96,24 @@ pub enum ValidationError {
     },
     #[error("replica {replica_id} identity contradicts accepted member identity")]
     ConflictingReplicaIdentity { replica_id: i64 },
+    #[error("replica {0} report epoch or role contradicts its installed configuration")]
+    InvalidReplicaReportAuthority(i64),
+    #[error("replica {replica_id} reports epoch {observed:?} newer than authorized {authorized:?}")]
+    UnauthorizedReplicaEpoch {
+        replica_id: i64,
+        observed: Epoch,
+        authorized: Epoch,
+    },
+    #[error("provisioning replica {0} claims replication or write authority")]
+    ProvisioningClaimsAuthority(i64),
+    #[error("unrelated replica {0} claims primary or write authority")]
+    UnrelatedReplicaClaimsAuthority(i64),
+    #[error("bootstrap observed initialized authority outside its frozen Current Configuration")]
+    BootstrapHasUnrelatedAuthority,
+    #[error("bootstrap replica {0} granted writes before topology acceptance")]
+    BootstrapWriteGranted(i64),
+    #[error("bootstrap replica {0} claims Primary contrary to frozen role")]
+    BootstrapRoleConflict(i64),
     #[error("multiple replicas claim Primary for the same accepted authority: {0:?}")]
     ConflictingPrimaryClaims(Vec<i64>),
     #[error("uninitialized agent identity does not match observed Pod/PVC scaffolding")]
@@ -116,28 +148,41 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
         }
     }
 
-    let mut primary_claims: BTreeMap<_, Vec<ReplicaId>> = BTreeMap::new();
-    for (replica_id, observation) in &snapshot.replicas {
+    let mut primary_claims: BTreeMap<_, Vec<ReplicaIdentity>> = BTreeMap::new();
+    for (key, observation) in &snapshot.replicas {
+        if let Some(kubernetes) = &observation.kubernetes
+            && (kubernetes.replica_id != key.replica_id
+                || kubernetes
+                    .pod_uid
+                    .as_ref()
+                    .is_some_and(|pod_uid| pod_uid.as_str() != key.instance_id.as_str()))
+        {
+            return Err(ValidationError::KubernetesObservationKeyMismatch);
+        }
         match &observation.agent {
             AgentObservation::Uninitialized(report) => {
-                if report.replica_id != *replica_id {
+                if report.replica_id != key.replica_id
+                    || report.pod_uid.as_str() != key.instance_id.as_str()
+                {
                     return Err(ValidationError::ReplicaObservationKeyMismatch {
-                        key: replica_id.value(),
-                        reported: report.replica_id.value(),
+                        key: observation_key_string(key),
+                        reported: format!("{}@{}", report.replica_id, report.pod_uid),
                     });
                 }
                 if report.resource_uid != snapshot.resource_uid {
-                    return Err(ValidationError::ReplicaResourceMismatch(replica_id.value()));
+                    return Err(ValidationError::ReplicaResourceMismatch(
+                        key.replica_id.value(),
+                    ));
                 }
                 validate_report_sequence(
                     snapshot,
-                    *replica_id,
+                    key,
                     &report.process_session_id,
                     report.report_sequence,
                 )?;
                 let matches_scaffolding =
                     observation.kubernetes.as_ref().is_some_and(|kubernetes| {
-                        kubernetes.replica_id == *replica_id
+                        kubernetes.replica_id == key.replica_id
                             && kubernetes.pod_uid.as_ref() == Some(&report.pod_uid)
                             && kubernetes.pvc_uid.as_ref() == Some(&report.pvc_uid)
                     });
@@ -146,18 +191,25 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                 }
             }
             AgentObservation::Report(report) => {
-                if report.identity.replica_id != *replica_id {
+                if report.identity.replica_id != key.replica_id
+                    || report.identity.instance_id != key.instance_id
+                {
                     return Err(ValidationError::ReplicaObservationKeyMismatch {
-                        key: replica_id.value(),
-                        reported: report.identity.replica_id.value(),
+                        key: observation_key_string(key),
+                        reported: format!(
+                            "{}@{}",
+                            report.identity.replica_id, report.identity.instance_id
+                        ),
                     });
                 }
                 if report.resource_uid != snapshot.resource_uid {
-                    return Err(ValidationError::ReplicaResourceMismatch(replica_id.value()));
+                    return Err(ValidationError::ReplicaResourceMismatch(
+                        key.replica_id.value(),
+                    ));
                 }
                 validate_report_sequence(
                     snapshot,
-                    *replica_id,
+                    key,
                     &report.process_session_id,
                     report.report_sequence,
                 )?;
@@ -168,48 +220,15 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                 if let Some(current) = &report.current_configuration {
                     validate_configuration(current, None)?;
                 }
-                if let Some(topology) = &snapshot.status.topology {
-                    let accepted = &topology.configuration;
-                    if report.epoch < accepted.epoch {
-                        return Err(ValidationError::StaleReplicaEpoch {
-                            replica_id: replica_id.value(),
-                            observed: report.epoch,
-                            accepted: accepted.epoch,
-                        });
-                    }
-                    if report.epoch == accepted.epoch
-                        && report
-                            .current_configuration
-                            .as_ref()
-                            .is_some_and(|current| {
-                                current.configuration_id != accepted.configuration_id
-                            })
-                    {
-                        return Err(ValidationError::ConflictingReplicaConfiguration {
-                            replica_id: replica_id.value(),
-                            epoch: report.epoch,
-                        });
-                    }
-                    if report.epoch == accepted.epoch {
-                        let accepted_member = accepted
-                            .members
-                            .iter()
-                            .find(|member| member.identity.replica_id == *replica_id);
-                        if accepted_member.is_some_and(|member| member.identity != report.identity)
-                        {
-                            return Err(ValidationError::ConflictingReplicaIdentity {
-                                replica_id: replica_id.value(),
-                            });
-                        }
-                    }
-                }
+                validate_report_internal(report)?;
+                validate_report_authority(snapshot, report)?;
                 if report.role == ReplicaRole::Primary
                     && let Some(current) = &report.current_configuration
                 {
                     primary_claims
                         .entry((report.epoch, current.configuration_id.clone()))
                         .or_default()
-                        .push(*replica_id);
+                        .push(report.identity.clone());
                 }
             }
             AgentObservation::Absent
@@ -223,30 +242,227 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
         .find(|(_, claims)| claims.len() > 1)
     {
         return Err(ValidationError::ConflictingPrimaryClaims(
-            claims.into_iter().map(ReplicaId::value).collect(),
+            claims
+                .into_iter()
+                .map(|identity| identity.replica_id.value())
+                .collect(),
         ));
     }
 
     Ok(())
 }
 
+fn validate_report_internal(
+    report: &crate::observation::AgentReport,
+) -> Result<(), ValidationError> {
+    if report.previous_configuration.is_some() && report.current_configuration.is_none() {
+        return Err(ValidationError::InvalidReplicaReportAuthority(
+            report.identity.replica_id.value(),
+        ));
+    }
+    if let Some(current) = &report.current_configuration
+        && current.epoch != report.epoch
+    {
+        return Err(ValidationError::InvalidReplicaReportAuthority(
+            report.identity.replica_id.value(),
+        ));
+    }
+    if report.role == ReplicaRole::Primary && report.current_configuration.is_none() {
+        return Err(ValidationError::InvalidReplicaReportAuthority(
+            report.identity.replica_id.value(),
+        ));
+    }
+    if report.write_status == AccessStatus::Granted && report.role != ReplicaRole::Primary {
+        return Err(ValidationError::InvalidReplicaReportAuthority(
+            report.identity.replica_id.value(),
+        ));
+    }
+    if let (Some(previous), Some(current)) = (
+        report.previous_configuration.as_ref(),
+        report.current_configuration.as_ref(),
+    ) {
+        let previous_ids = previous
+            .members
+            .iter()
+            .map(|member| member.identity.replica_id)
+            .collect::<BTreeSet<_>>();
+        let current_ids = current
+            .members
+            .iter()
+            .map(|member| member.identity.replica_id)
+            .collect::<BTreeSet<_>>();
+        if previous.epoch.data_loss_number != current.epoch.data_loss_number
+            || previous.epoch.configuration_number >= current.epoch.configuration_number
+            || previous_ids != current_ids
+        {
+            return Err(ValidationError::InvalidReplicaReportAuthority(
+                report.identity.replica_id.value(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_report_sequence(
     snapshot: &ObservationSnapshot,
-    replica_id: ReplicaId,
+    key: &ReplicaObservationKey,
     session_id: &crate::types::ProcessSessionId,
     sequence: u64,
 ) -> Result<(), ValidationError> {
-    if let Some(previous) = snapshot.previous_report_watermarks.get(&replica_id)
+    if let Some(previous) = snapshot.previous_report_watermarks.get(key)
         && previous.process_session_id == *session_id
         && sequence <= previous.report_sequence
     {
         return Err(ValidationError::StaleReportSequence {
-            replica_id: replica_id.value(),
+            replica_id: key.replica_id.value(),
             observed: sequence,
             previous: previous.report_sequence,
         });
     }
     Ok(())
+}
+
+fn validate_report_authority(
+    snapshot: &ObservationSnapshot,
+    report: &crate::observation::AgentReport,
+) -> Result<(), ValidationError> {
+    let provisioning = snapshot.status.provisioning.as_ref().is_some_and(|intent| {
+        intent.replica_id == report.identity.replica_id
+            && intent.instance_id == report.identity.instance_id
+            && intent.assigned_agent_generation == report.identity.agent_generation
+    });
+    if provisioning {
+        if !matches!(report.role, ReplicaRole::None | ReplicaRole::IdleSecondary)
+            || report.write_status == AccessStatus::Granted
+            || report.epoch != Epoch::default()
+            || report.previous_configuration.is_some()
+            || report.current_configuration.is_some()
+        {
+            return Err(ValidationError::ProvisioningClaimsAuthority(
+                report.identity.replica_id.value(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let accepted = snapshot
+        .status
+        .topology
+        .as_ref()
+        .map(|topology| &topology.configuration);
+    let current = snapshot
+        .status
+        .transition
+        .as_ref()
+        .map(|transition| &transition.current_configuration);
+    let accepted_exact = accepted.is_some_and(|configuration| {
+        configuration
+            .members
+            .iter()
+            .any(|member| member.identity == report.identity)
+    });
+    let current_exact = current.is_some_and(|configuration| {
+        configuration
+            .members
+            .iter()
+            .any(|member| member.identity == report.identity)
+    });
+
+    if let Some(transition) = &snapshot.status.transition
+        && transition.kind == TransitionKind::Bootstrap
+        && current_exact
+    {
+        if report.write_status == AccessStatus::Granted {
+            return Err(ValidationError::BootstrapWriteGranted(
+                report.identity.replica_id.value(),
+            ));
+        }
+        let expected = transition
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == report.identity)
+            .expect("current exact identity has a member");
+        if expected.role != ReplicaRole::Primary && report.role == ReplicaRole::Primary {
+            return Err(ValidationError::BootstrapRoleConflict(
+                report.identity.replica_id.value(),
+            ));
+        }
+    }
+
+    if !accepted_exact && !current_exact {
+        if snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|transition| transition.kind == TransitionKind::Bootstrap)
+        {
+            return Err(ValidationError::BootstrapHasUnrelatedAuthority);
+        }
+        if report.role == ReplicaRole::Primary || report.write_status == AccessStatus::Granted {
+            return Err(ValidationError::UnrelatedReplicaClaimsAuthority(
+                report.identity.replica_id.value(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let highest_authorized = current.or(accepted).expect("known identity has authority");
+    if report.epoch > highest_authorized.epoch {
+        return Err(ValidationError::UnauthorizedReplicaEpoch {
+            replica_id: report.identity.replica_id.value(),
+            observed: report.epoch,
+            authorized: highest_authorized.epoch,
+        });
+    }
+
+    if let Some(accepted) = accepted
+        && accepted_exact
+        && report.epoch < accepted.epoch
+    {
+        return Err(ValidationError::StaleReplicaEpoch {
+            replica_id: report.identity.replica_id.value(),
+            observed: report.epoch,
+            accepted: accepted.epoch,
+        });
+    }
+
+    for configuration in [accepted, current].into_iter().flatten() {
+        if report.epoch == configuration.epoch
+            && report
+                .current_configuration
+                .as_ref()
+                .is_some_and(|observed| observed.configuration_id != configuration.configuration_id)
+        {
+            return Err(ValidationError::ConflictingReplicaConfiguration {
+                replica_id: report.identity.replica_id.value(),
+                epoch: report.epoch,
+            });
+        }
+    }
+
+    if report.write_status == AccessStatus::Granted {
+        let matches_current_authority = current.or(accepted).is_some_and(|configuration| {
+            report.epoch == configuration.epoch
+                && report
+                    .current_configuration
+                    .as_ref()
+                    .is_some_and(|observed| {
+                        observed.configuration_id == configuration.configuration_id
+                    })
+        });
+        if !matches_current_authority {
+            return Err(ValidationError::ConflictingReplicaConfiguration {
+                replica_id: report.identity.replica_id.value(),
+                epoch: report.epoch,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn observation_key_string(key: &ReplicaObservationKey) -> String {
+    format!("{}@{}", key.replica_id, key.instance_id)
 }
 
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
@@ -299,6 +515,95 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                     &topology.configuration,
                     Some(&transition.effective_policy),
                 )?;
+                validate_transition_relationship(
+                    transition.kind,
+                    Some(&topology.configuration),
+                    &transition.current_configuration,
+                    &transition.effective_policy,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_transition_relationship(
+    kind: TransitionKind,
+    previous: Option<&ConfigurationDescriptor>,
+    current: &ConfigurationDescriptor,
+    policy: &EffectivePolicy,
+) -> Result<(), ValidationError> {
+    validate_policy(policy)?;
+    validate_configuration(current, Some(policy))?;
+    if kind == TransitionKind::Bootstrap {
+        if previous.is_some() {
+            return Err(ValidationError::BootstrapHasPreviousConfiguration);
+        }
+        return Ok(());
+    }
+
+    let previous = previous.ok_or(ValidationError::TransitionWithoutTopology)?;
+    validate_configuration(previous, Some(policy))?;
+    if current.epoch.data_loss_number != previous.epoch.data_loss_number {
+        return Err(ValidationError::TransitionDataLossChanged);
+    }
+    if current.epoch.configuration_number <= previous.epoch.configuration_number {
+        return Err(ValidationError::TransitionEpochNotNewer);
+    }
+
+    let previous_ids = previous
+        .members
+        .iter()
+        .map(|member| member.identity.replica_id)
+        .collect::<BTreeSet<_>>();
+    let current_ids = current
+        .members
+        .iter()
+        .map(|member| member.identity.replica_id)
+        .collect::<BTreeSet<_>>();
+    if previous_ids != current_ids {
+        return Err(ValidationError::TransitionLogicalMembershipChanged);
+    }
+
+    match kind {
+        TransitionKind::Bootstrap => unreachable!("bootstrap returned above"),
+        TransitionKind::Failover => {
+            let previous_identities = previous
+                .members
+                .iter()
+                .map(|member| member.identity.clone())
+                .collect::<BTreeSet<_>>();
+            let current_identities = current
+                .members
+                .iter()
+                .map(|member| member.identity.clone())
+                .collect::<BTreeSet<_>>();
+            if previous_identities != current_identities {
+                return Err(ValidationError::FailoverMembershipChanged);
+            }
+        }
+        TransitionKind::Replacement => {
+            if current.primary_id != previous.primary_id {
+                return Err(ValidationError::ReplacementPrimaryChanged);
+            }
+            let changed = previous
+                .members
+                .iter()
+                .filter(|previous_member| {
+                    current
+                        .members
+                        .iter()
+                        .find(|current_member| {
+                            current_member.identity.replica_id
+                                == previous_member.identity.replica_id
+                        })
+                        .is_none_or(|current_member| {
+                            current_member.identity != previous_member.identity
+                        })
+                })
+                .collect::<Vec<_>>();
+            if changed.len() != 1 || changed[0].identity.replica_id == previous.primary_id {
+                return Err(ValidationError::InvalidReplacementMembership);
             }
         }
     }

@@ -113,10 +113,12 @@ fn uninitialized_status_requires_pod_and_pvc_without_durable_identity() {
         pod_uid: "pod".to_string(),
         pvc_uid: "pvc".to_string(),
         storage_error: String::new(),
+        healthy: false,
+        replica_id: 1,
     };
     assert!(validate_agent_status_report(&report).is_ok());
 
-    let mut invalid = report;
+    let mut invalid = report.clone();
     invalid.identity = Some(proto::ReplicaIdentity {
         replica_id: 1,
         instance_id: "pod".to_string(),
@@ -124,6 +126,17 @@ fn uninitialized_status_requires_pod_and_pvc_without_durable_identity() {
     });
     assert!(matches!(
         validate_agent_status_report(&invalid),
+        Err(WireError::InvalidAuthority(_))
+    ));
+
+    let mut contradictory = report;
+    contradictory.role = proto::ReplicaRole::Primary as i32;
+    contradictory.epoch = Some(proto::Epoch {
+        data_loss_number: 0,
+        configuration_number: 1,
+    });
+    assert!(matches!(
+        validate_agent_status_report(&contradictory),
         Err(WireError::InvalidAuthority(_))
     ));
 }
@@ -216,6 +229,170 @@ fn replication_ack_requires_exact_authority_and_consistent_progress() {
     invalid.applied_lsn = 11;
     assert!(matches!(
         validate_replication_ack(&invalid),
+        Err(WireError::InvalidAuthority(_))
+    ));
+}
+
+#[test]
+fn initialized_status_rejects_unknown_enums_and_malformed_configuration() {
+    let identity = proto::ReplicaIdentity {
+        replica_id: 1,
+        instance_id: "pod-1".to_string(),
+        agent_generation: "generation-1".to_string(),
+    };
+    let configuration: proto::Configuration = configuration().into();
+    let report = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource".to_string(),
+        identity: Some(identity),
+        process_session_id: "session".to_string(),
+        report_sequence: 1,
+        role: 999,
+        write_status: proto::AccessStatus::Granted as i32,
+        epoch: configuration.epoch,
+        previous_configuration: None,
+        current_configuration: Some(configuration),
+        current_progress: 10,
+        committed_lsn: 10,
+        catch_up_capability: Some(10),
+        storage_state: proto::AgentStorageState::Initialized as i32,
+        pod_uid: "pod-1".to_string(),
+        pvc_uid: "pvc-1".to_string(),
+        storage_error: String::new(),
+        healthy: true,
+        replica_id: 1,
+    };
+    assert!(matches!(
+        validate_agent_status_report(&report),
+        Err(WireError::InvalidEnum {
+            field: "agent_status.role",
+            ..
+        })
+    ));
+
+    let mut unknown_write_status = report.clone();
+    unknown_write_status.role = proto::ReplicaRole::Primary as i32;
+    unknown_write_status.write_status = 999;
+    assert!(matches!(
+        validate_agent_status_report(&unknown_write_status),
+        Err(WireError::InvalidEnum {
+            field: "agent_status.write_status",
+            ..
+        })
+    ));
+
+    let mut malformed = report;
+    malformed.role = proto::ReplicaRole::Primary as i32;
+    malformed
+        .current_configuration
+        .as_mut()
+        .unwrap()
+        .configuration_id = "conflict".to_string();
+    assert!(matches!(
+        validate_agent_status_report(&malformed),
+        Err(WireError::InvalidAuthority(_))
+    ));
+}
+
+#[test]
+fn ensure_request_rejects_previous_configuration_outside_frozen_policy() {
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 5),
+        ReplicaId::new(1),
+        vec![ConfigurationMember {
+            identity: ReplicaIdentity {
+                replica_id: ReplicaId::new(1),
+                instance_id: ReplicaInstanceId::new("pod-1"),
+                agent_generation: AgentGeneration::new("generation-1"),
+            },
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 6),
+        ReplicaId::new(1),
+        configuration().members,
+        2,
+    );
+    let target = current.members[0].identity.clone();
+    let request = proto::ExecuteCommandRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource".to_string(),
+        target: Some(target.clone().into()),
+        command: Some(
+            proto::execute_command_request::Command::EnsureConfiguration(
+                proto::EnsureConfigurationCommand {
+                    operation_id: "operation".to_string(),
+                    previous_configuration: Some(previous.clone().into()),
+                    current_configuration: Some(current.clone().into()),
+                    previous_epoch: Some(previous.epoch.into()),
+                    current_epoch: Some(current.epoch.into()),
+                    effective_policy: Some(proto::EffectivePolicy {
+                        replica_set_size: 3,
+                        write_quorum: 2,
+                        read_quorum: 2,
+                        failover_delay_seconds: 10,
+                    }),
+                    local_replica_id: target.replica_id.value(),
+                    expected_instance_id: target.instance_id.to_string(),
+                    expected_agent_generation: target.agent_generation.to_string(),
+                    transition_kind: proto::TransitionKind::Failover as i32,
+                },
+            ),
+        ),
+    };
+
+    assert!(matches!(
+        validate_execute_request(&request),
+        Err(WireError::InvalidAuthority(_))
+    ));
+}
+
+#[test]
+fn ensure_request_rejects_regressing_pc_cc_relationship() {
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 5),
+        ReplicaId::new(1),
+        configuration().members,
+        2,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 4),
+        ReplicaId::new(1),
+        previous.members.clone(),
+        2,
+    );
+    let target = current.members[0].identity.clone();
+    let request = proto::ExecuteCommandRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource".to_string(),
+        target: Some(target.clone().into()),
+        command: Some(
+            proto::execute_command_request::Command::EnsureConfiguration(
+                proto::EnsureConfigurationCommand {
+                    operation_id: "operation".to_string(),
+                    previous_configuration: Some(previous.clone().into()),
+                    current_configuration: Some(current.clone().into()),
+                    previous_epoch: Some(previous.epoch.into()),
+                    current_epoch: Some(current.epoch.into()),
+                    effective_policy: Some(proto::EffectivePolicy {
+                        replica_set_size: 3,
+                        write_quorum: 2,
+                        read_quorum: 2,
+                        failover_delay_seconds: 10,
+                    }),
+                    local_replica_id: target.replica_id.value(),
+                    expected_instance_id: target.instance_id.to_string(),
+                    expected_agent_generation: target.agent_generation.to_string(),
+                    transition_kind: proto::TransitionKind::Failover as i32,
+                },
+            ),
+        ),
+    };
+
+    assert!(matches!(
+        validate_execute_request(&request),
         Err(WireError::InvalidAuthority(_))
     ));
 }
