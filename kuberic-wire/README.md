@@ -6,6 +6,10 @@ This crate owns the new control-plane, replica-peer, and replication schemas.
 It validates wire messages before converting them into
 `kuberic-protocol` authority types.
 
+Control and peer messages are defined in `proto/kuberic.proto`; exact-target
+replication items, acknowledgements, and streaming RPCs are defined separately
+in `proto/replication.proto`.
+
 The wire contract carries exact replica incarnation, durable agent generation,
 epoch, configuration identity, protocol version, and replication progress.
 Unknown versions, enum values, missing fields, and contradictory authority are

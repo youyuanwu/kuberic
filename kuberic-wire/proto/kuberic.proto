@@ -131,29 +131,6 @@ message ExecuteCommandResponse {
   AgentStatusReport observation = 2;
 }
 
-message ReplicationItem {
-  uint32 protocol_version = 1;
-  ReplicaIdentity sender = 2;
-  Epoch epoch = 3;
-  string previous_configuration_id = 4;
-  string current_configuration_id = 5;
-  int64 lsn = 6;
-  int64 committed_lsn = 7;
-  bytes data = 8;
-}
-
-message ReplicationAck {
-  uint32 protocol_version = 1;
-  ReplicaIdentity sender = 2;
-  ReplicaIdentity receiver = 3;
-  Epoch epoch = 4;
-  string previous_configuration_id = 5;
-  string current_configuration_id = 6;
-  int64 received_lsn = 7;
-  int64 applied_lsn = 8;
-  int64 committed_lsn = 9;
-}
-
 service AgentControl {
   rpc GetStatus(GetAgentStatusRequest) returns (AgentStatusReport);
   rpc Execute(ExecuteCommandRequest) returns (ExecuteCommandResponse);
@@ -162,8 +139,4 @@ service AgentControl {
 service ReplicaPeer {
   rpc GetStatus(GetAgentStatusRequest) returns (AgentStatusReport);
   rpc Execute(ExecuteCommandRequest) returns (ExecuteCommandResponse);
-}
-
-service ReplicationData {
-  rpc Replicate(stream ReplicationItem) returns (stream ReplicationAck);
 }

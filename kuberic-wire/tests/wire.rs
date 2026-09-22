@@ -4,8 +4,9 @@ use kuberic_protocol::types::{
 };
 use kuberic_wire::convert::WireError;
 use kuberic_wire::{
-    ensure_supported_version, proto, validate_agent_status_report, validate_execute_request,
-    validate_replication_ack, validate_replication_item,
+    ensure_supported_version, proto, validate_agent_status_report, validate_copy_ack,
+    validate_copy_item, validate_execute_request, validate_replication_ack,
+    validate_replication_item,
 };
 
 fn configuration() -> ConfigurationDescriptor {
@@ -222,13 +223,81 @@ fn replication_ack_requires_exact_authority_and_consistent_progress() {
         lsn: 10,
         committed_lsn: 9,
         data: vec![1],
+        receiver: ack.receiver.clone(),
     };
     assert!(validate_replication_item(&item).is_ok());
 
     let mut invalid = ack;
-    invalid.applied_lsn = 11;
+    invalid.applied_lsn = 9;
     assert!(matches!(
         validate_replication_ack(&invalid),
+        Err(WireError::InvalidAuthority(_))
+    ));
+
+    let mut missing_receiver = item;
+    missing_receiver.receiver = None;
+    assert!(matches!(
+        validate_replication_item(&missing_receiver),
+        Err(WireError::MissingField("replication_item.receiver"))
+    ));
+}
+
+#[test]
+fn copy_contract_requires_exact_target_and_final_boundary_ack() {
+    let sender = proto::ReplicaIdentity {
+        replica_id: 1,
+        instance_id: "pod-1".to_string(),
+        agent_generation: "generation-1".to_string(),
+    };
+    let receiver = proto::ReplicaIdentity {
+        replica_id: 3,
+        instance_id: "replacement-pod".to_string(),
+        agent_generation: "replacement-generation".to_string(),
+    };
+    let item = proto::CopyItem {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: "build".to_string(),
+        sender: Some(sender.clone()),
+        receiver: Some(receiver.clone()),
+        epoch: Some(proto::Epoch {
+            data_loss_number: 0,
+            configuration_number: 2,
+        }),
+        current_configuration_id: "cfg".to_string(),
+        sequence: 1,
+        lsn: 1,
+        committed_lsn: 0,
+        replication_boundary_lsn: 2,
+        final_item: false,
+        data: vec![1],
+    };
+    assert!(validate_copy_item(&item).is_ok());
+
+    let final_ack = proto::CopyAck {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: "build".to_string(),
+        sender: Some(sender),
+        receiver: Some(receiver),
+        epoch: item.epoch,
+        current_configuration_id: "cfg".to_string(),
+        sequence: 3,
+        durable_lsn: 2,
+        replication_boundary_lsn: 2,
+        final_item: true,
+    };
+    assert!(validate_copy_ack(&final_ack).is_ok());
+
+    let mut missing_target = item;
+    missing_target.receiver = None;
+    assert!(matches!(
+        validate_copy_item(&missing_target),
+        Err(WireError::MissingField("copy_item.receiver"))
+    ));
+
+    let mut early_final = final_ack;
+    early_final.durable_lsn = 1;
+    assert!(matches!(
+        validate_copy_ack(&early_final),
         Err(WireError::InvalidAuthority(_))
     ));
 }

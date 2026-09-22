@@ -6,6 +6,7 @@ members = [
   "examples/postgres",
   "examples/sqlite",
   "kuberic-protocol",
+  "kuberic-runtime",
   "kuberic-wire",
   "kuberic-core",
   "kuberic-operator",

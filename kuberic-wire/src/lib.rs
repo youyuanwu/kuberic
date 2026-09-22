@@ -10,7 +10,9 @@ pub mod proto {
 }
 
 pub use convert::{
-    WireError, ensure_supported_version, normalize_agent_status_report,
-    validate_agent_status_report, validate_execute_request, validate_replication_ack,
-    validate_replication_item,
+    CopyAcknowledgement, CopyEnvelope, ReplicationAcknowledgement, ReplicationEnvelope, WireError,
+    ensure_supported_version, normalize_agent_status_report, normalize_copy_ack,
+    normalize_copy_item, normalize_replication_ack, normalize_replication_item,
+    validate_agent_status_report, validate_copy_ack, validate_copy_item, validate_execute_request,
+    validate_replication_ack, validate_replication_item,
 };

@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use kuberic_protocol::observation::{AgentObservation, AgentReport, UninitializedAgentObservation};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
-    EffectivePolicy, Epoch, InitializationId, PodUid, ProcessSessionId, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
+    EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, ProcessSessionId, PvcUid,
+    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
     derive_agent_generation,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
@@ -24,6 +24,58 @@ pub enum WireError {
     InvalidEnum { field: &'static str, value: i32 },
     #[error("invalid wire authority: {0}")]
     InvalidAuthority(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationEnvelope {
+    pub sender: ReplicaIdentity,
+    pub receiver: ReplicaIdentity,
+    pub epoch: Epoch,
+    pub previous_configuration_id: Option<ConfigurationId>,
+    pub current_configuration_id: ConfigurationId,
+    pub lsn: i64,
+    pub committed_lsn: i64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationAcknowledgement {
+    pub sender: ReplicaIdentity,
+    pub receiver: ReplicaIdentity,
+    pub epoch: Epoch,
+    pub previous_configuration_id: Option<ConfigurationId>,
+    pub current_configuration_id: ConfigurationId,
+    pub received_lsn: i64,
+    pub applied_lsn: i64,
+    pub committed_lsn: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyEnvelope {
+    pub build_id: OperationId,
+    pub sender: ReplicaIdentity,
+    pub receiver: ReplicaIdentity,
+    pub epoch: Epoch,
+    pub current_configuration_id: ConfigurationId,
+    pub sequence: u64,
+    pub lsn: i64,
+    pub committed_lsn: i64,
+    pub replication_boundary_lsn: i64,
+    pub final_item: bool,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyAcknowledgement {
+    pub build_id: OperationId,
+    pub sender: ReplicaIdentity,
+    pub receiver: ReplicaIdentity,
+    pub epoch: Epoch,
+    pub current_configuration_id: ConfigurationId,
+    pub sequence: u64,
+    pub durable_lsn: i64,
+    pub replication_boundary_lsn: i64,
+    pub final_item: bool,
 }
 
 /// Requires an exact protocol-version match; negotiation is intentionally unsupported.
@@ -371,58 +423,198 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
 
 /// Validates the exact authority carried by one replication item.
 pub fn validate_replication_item(item: &proto::ReplicationItem) -> Result<(), WireError> {
+    normalize_replication_item(item.clone()).map(|_| ())
+}
+
+/// Validates exact sender/receiver authority and monotonic ACK progress.
+pub fn validate_replication_ack(ack: &proto::ReplicationAck) -> Result<(), WireError> {
+    normalize_replication_ack(ack.clone()).map(|_| ())
+}
+
+/// Converts a validated replication item into exact canonical authority.
+pub fn normalize_replication_item(
+    item: proto::ReplicationItem,
+) -> Result<ReplicationEnvelope, WireError> {
     ensure_supported_version(item.protocol_version)?;
-    item.sender
-        .clone()
+    let sender = item
+        .sender
         .ok_or(WireError::MissingField("replication_item.sender"))?
-        .try_into()
-        .map(|_: ReplicaIdentity| ())?;
-    if item.epoch.is_none() {
-        return Err(WireError::MissingField("replication_item.epoch"));
-    }
+        .try_into()?;
+    let receiver = item
+        .receiver
+        .ok_or(WireError::MissingField("replication_item.receiver"))?
+        .try_into()?;
+    let epoch = item
+        .epoch
+        .ok_or(WireError::MissingField("replication_item.epoch"))?
+        .into();
     if item.current_configuration_id.is_empty() {
         return Err(WireError::MissingField(
             "replication_item.current_configuration_id",
         ));
     }
-    if item.lsn <= 0 {
+    if item.lsn <= 0 || item.committed_lsn < 0 || item.committed_lsn > item.lsn {
         return Err(WireError::InvalidAuthority(
-            "replication item LSN must be positive".to_string(),
+            "replication item progress is inconsistent".to_string(),
         ));
     }
-    Ok(())
+    Ok(ReplicationEnvelope {
+        sender,
+        receiver,
+        epoch,
+        previous_configuration_id: (!item.previous_configuration_id.is_empty())
+            .then(|| ConfigurationId::new(item.previous_configuration_id)),
+        current_configuration_id: ConfigurationId::new(item.current_configuration_id),
+        lsn: item.lsn,
+        committed_lsn: item.committed_lsn,
+        data: item.data,
+    })
 }
 
-/// Validates exact sender/receiver authority and monotonic ACK progress.
-pub fn validate_replication_ack(ack: &proto::ReplicationAck) -> Result<(), WireError> {
+/// Converts a validated acknowledgement into exact canonical authority.
+pub fn normalize_replication_ack(
+    ack: proto::ReplicationAck,
+) -> Result<ReplicationAcknowledgement, WireError> {
     ensure_supported_version(ack.protocol_version)?;
-    ack.sender
-        .clone()
+    let sender = ack
+        .sender
         .ok_or(WireError::MissingField("replication_ack.sender"))?
-        .try_into()
-        .map(|_: ReplicaIdentity| ())?;
-    ack.receiver
-        .clone()
+        .try_into()?;
+    let receiver = ack
+        .receiver
         .ok_or(WireError::MissingField("replication_ack.receiver"))?
-        .try_into()
-        .map(|_: ReplicaIdentity| ())?;
-    if ack.epoch.is_none() {
-        return Err(WireError::MissingField("replication_ack.epoch"));
-    }
+        .try_into()?;
+    let epoch = ack
+        .epoch
+        .ok_or(WireError::MissingField("replication_ack.epoch"))?
+        .into();
     if ack.current_configuration_id.is_empty() {
         return Err(WireError::MissingField(
             "replication_ack.current_configuration_id",
         ));
     }
     if ack.received_lsn <= 0
-        || ack.applied_lsn > ack.received_lsn
+        || ack.applied_lsn < ack.received_lsn
+        || ack.committed_lsn < 0
         || ack.committed_lsn > ack.applied_lsn
     {
         return Err(WireError::InvalidAuthority(
             "replication ACK progress is inconsistent".to_string(),
         ));
     }
-    Ok(())
+    Ok(ReplicationAcknowledgement {
+        sender,
+        receiver,
+        epoch,
+        previous_configuration_id: (!ack.previous_configuration_id.is_empty())
+            .then(|| ConfigurationId::new(ack.previous_configuration_id)),
+        current_configuration_id: ConfigurationId::new(ack.current_configuration_id),
+        received_lsn: ack.received_lsn,
+        applied_lsn: ack.applied_lsn,
+        committed_lsn: ack.committed_lsn,
+    })
+}
+
+pub fn validate_copy_item(item: &proto::CopyItem) -> Result<(), WireError> {
+    normalize_copy_item(item.clone()).map(|_| ())
+}
+
+pub fn validate_copy_ack(ack: &proto::CopyAck) -> Result<(), WireError> {
+    normalize_copy_ack(ack.clone()).map(|_| ())
+}
+
+pub fn normalize_copy_item(item: proto::CopyItem) -> Result<CopyEnvelope, WireError> {
+    ensure_supported_version(item.protocol_version)?;
+    if item.build_id.is_empty() {
+        return Err(WireError::MissingField("copy_item.build_id"));
+    }
+    let sender = item
+        .sender
+        .ok_or(WireError::MissingField("copy_item.sender"))?
+        .try_into()?;
+    let receiver = item
+        .receiver
+        .ok_or(WireError::MissingField("copy_item.receiver"))?
+        .try_into()?;
+    let epoch = item
+        .epoch
+        .ok_or(WireError::MissingField("copy_item.epoch"))?
+        .into();
+    if item.current_configuration_id.is_empty() {
+        return Err(WireError::MissingField(
+            "copy_item.current_configuration_id",
+        ));
+    }
+    if item.sequence == 0
+        || item.replication_boundary_lsn < 0
+        || item.committed_lsn < 0
+        || if item.final_item {
+            item.lsn != item.replication_boundary_lsn
+                || item.committed_lsn > item.replication_boundary_lsn
+                || !item.data.is_empty()
+        } else {
+            item.lsn <= 0 || item.committed_lsn > item.lsn
+        }
+    {
+        return Err(WireError::InvalidAuthority(
+            "copy item progress is inconsistent".to_string(),
+        ));
+    }
+    Ok(CopyEnvelope {
+        build_id: OperationId::new(item.build_id),
+        sender,
+        receiver,
+        epoch,
+        current_configuration_id: ConfigurationId::new(item.current_configuration_id),
+        sequence: item.sequence,
+        lsn: item.lsn,
+        committed_lsn: item.committed_lsn,
+        replication_boundary_lsn: item.replication_boundary_lsn,
+        final_item: item.final_item,
+        data: item.data,
+    })
+}
+
+pub fn normalize_copy_ack(ack: proto::CopyAck) -> Result<CopyAcknowledgement, WireError> {
+    ensure_supported_version(ack.protocol_version)?;
+    if ack.build_id.is_empty() {
+        return Err(WireError::MissingField("copy_ack.build_id"));
+    }
+    let sender = ack
+        .sender
+        .ok_or(WireError::MissingField("copy_ack.sender"))?
+        .try_into()?;
+    let receiver = ack
+        .receiver
+        .ok_or(WireError::MissingField("copy_ack.receiver"))?
+        .try_into()?;
+    let epoch = ack
+        .epoch
+        .ok_or(WireError::MissingField("copy_ack.epoch"))?
+        .into();
+    if ack.current_configuration_id.is_empty() {
+        return Err(WireError::MissingField("copy_ack.current_configuration_id"));
+    }
+    if ack.sequence == 0
+        || ack.durable_lsn < 0
+        || ack.replication_boundary_lsn < 0
+        || (ack.final_item && ack.durable_lsn != ack.replication_boundary_lsn)
+    {
+        return Err(WireError::InvalidAuthority(
+            "copy acknowledgement progress is inconsistent".to_string(),
+        ));
+    }
+    Ok(CopyAcknowledgement {
+        build_id: OperationId::new(ack.build_id),
+        sender,
+        receiver,
+        epoch,
+        current_configuration_id: ConfigurationId::new(ack.current_configuration_id),
+        sequence: ack.sequence,
+        durable_lsn: ack.durable_lsn,
+        replication_boundary_lsn: ack.replication_boundary_lsn,
+        final_item: ack.final_item,
+    })
 }
 
 impl From<Epoch> for proto::Epoch {
