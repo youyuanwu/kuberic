@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
+use kuberic_agent::hosting::{PodRuntime, RuntimeControlPlane};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch,
     OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, TransitionKind,
@@ -13,23 +14,22 @@ use kuberic_runtime::application::{
     ClientWrite, CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext,
     OpenMode, Operation, OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
 };
-use kuberic_runtime::authority::{
-    AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
-    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
-    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
-};
-use kuberic_runtime::effects::{
-    RuntimeControlPlane, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult,
-};
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
+use kuberic_runtime::internal::OutboundReplication;
 use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest, PreparedCopy};
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorFactoryContext,
     ReplicatorInterfaces, ReplicatorSettings, StateReplicator,
 };
-use kuberic_runtime::runtime::{OutboundReplication, PodRuntime};
 use kuberic_runtime::{Result, RuntimeError};
+use kuberic_runtime_internal::authority::{
+    AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
+    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
+    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+};
+use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
+use kuberic_runtime_internal::{ContractError, Result as ContractResult};
 use kuberic_wire::proto;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
@@ -55,15 +55,15 @@ struct MemoryAuthorityStore {
 
 #[async_trait]
 impl ReplicaAuthorityStore for MemoryAuthorityStore {
-    async fn load(&self) -> Result<Option<AdmittedAuthority>> {
+    async fn load(&self) -> ContractResult<Option<AdmittedAuthority>> {
         Ok(self.authority.lock().unwrap().clone())
     }
 
-    async fn admit(&self, authority: &AdmittedAuthority) -> Result<()> {
+    async fn admit(&self, authority: &AdmittedAuthority) -> ContractResult<()> {
         self.admit_count.fetch_add(1, Ordering::SeqCst);
         *self.authority.lock().unwrap() = Some(authority.clone());
         if self.fail_after_admit.swap(false, Ordering::SeqCst) {
-            return Err(RuntimeError::Application(
+            return Err(ContractError::Persistence(
                 "injected ambiguous authority admission".into(),
             ));
         }
@@ -76,7 +76,7 @@ impl ReplicationProgressStore for MemoryAuthorityStore {
     async fn load_replication_progress(
         &self,
         fence: &AuthorityFence,
-    ) -> Result<Option<ReplicationProgress>> {
+    ) -> ContractResult<Option<ReplicationProgress>> {
         Ok(self
             .replication_progress
             .lock()
@@ -89,7 +89,7 @@ impl ReplicationProgressStore for MemoryAuthorityStore {
         &self,
         epoch: Epoch,
         current_configuration_id: &kuberic_protocol::types::ConfigurationId,
-    ) -> Result<Option<ReplicationProgress>> {
+    ) -> ContractResult<Option<ReplicationProgress>> {
         Ok(self
             .replication_progress
             .lock()
@@ -103,7 +103,10 @@ impl ReplicationProgressStore for MemoryAuthorityStore {
             .cloned())
     }
 
-    async fn record_replication_progress(&self, progress: &ReplicationProgress) -> Result<()> {
+    async fn record_replication_progress(
+        &self,
+        progress: &ReplicationProgress,
+    ) -> ContractResult<()> {
         self.replication_progress
             .lock()
             .unwrap()
@@ -117,28 +120,30 @@ impl LocalWriteJournal for MemoryAuthorityStore {
     async fn load_local_write(
         &self,
         operation_id: &OperationId,
-    ) -> Result<Option<DurableLocalWrite>> {
+    ) -> ContractResult<Option<DurableLocalWrite>> {
         Ok(self.local_writes.lock().unwrap().get(operation_id).cloned())
     }
 
-    async fn load_local_writes(&self) -> Result<Vec<DurableLocalWrite>> {
+    async fn load_local_writes(&self) -> ContractResult<Vec<DurableLocalWrite>> {
         Ok(self
             .local_writes
             .lock()
             .unwrap()
             .values()
-            .filter(|write| write.phase != kuberic_runtime::authority::LocalWritePhase::Committed)
+            .filter(|write| {
+                write.phase != kuberic_runtime_internal::authority::LocalWritePhase::Committed
+            })
             .cloned()
             .collect())
     }
 
-    async fn record_local_write(&self, write: &DurableLocalWrite) -> Result<()> {
-        if write.phase == kuberic_runtime::authority::LocalWritePhase::Registered
+    async fn record_local_write(&self, write: &DurableLocalWrite) -> ContractResult<()> {
+        if write.phase == kuberic_runtime_internal::authority::LocalWritePhase::Registered
             && self
                 .fail_registered_write_once
                 .swap(false, Ordering::SeqCst)
         {
-            return Err(RuntimeError::Application(
+            return Err(ContractError::Persistence(
                 "injected registered-write persistence failure".to_string(),
             ));
         }
@@ -146,13 +151,13 @@ impl LocalWriteJournal for MemoryAuthorityStore {
             .lock()
             .unwrap()
             .insert(write.operation_id.clone(), write.clone());
-        if write.phase == kuberic_runtime::authority::LocalWritePhase::Registered
+        if write.phase == kuberic_runtime_internal::authority::LocalWritePhase::Registered
             && self.pause_registered_write.load(Ordering::SeqCst)
         {
             self.registered_write_notify.notify_one();
             self.resume_registered_write_notify.notified().await;
         }
-        if write.phase == kuberic_runtime::authority::LocalWritePhase::Committed
+        if write.phase == kuberic_runtime_internal::authority::LocalWritePhase::Committed
             && self.pause_committed_write.load(Ordering::SeqCst)
         {
             self.committed_write_notify.notify_one();
@@ -161,9 +166,9 @@ impl LocalWriteJournal for MemoryAuthorityStore {
         Ok(())
     }
 
-    async fn reset_local_writes_after_data_loss(&self, committed_lsn: i64) -> Result<()> {
+    async fn reset_local_writes_after_data_loss(&self, committed_lsn: i64) -> ContractResult<()> {
         self.local_writes.lock().unwrap().retain(|_, write| {
-            write.phase == kuberic_runtime::authority::LocalWritePhase::Committed
+            write.phase == kuberic_runtime_internal::authority::LocalWritePhase::Committed
                 && write.lsn <= committed_lsn
         });
         Ok(())
@@ -172,16 +177,16 @@ impl LocalWriteJournal for MemoryAuthorityStore {
 
 #[async_trait]
 impl BuildAuthorityStore for MemoryAuthorityStore {
-    async fn load_build(&self, build_id: &OperationId) -> Result<Option<BuildAuthority>> {
+    async fn load_build(&self, build_id: &OperationId) -> ContractResult<Option<BuildAuthority>> {
         Ok(self.builds.lock().unwrap().get(build_id).cloned())
     }
 
-    async fn admit_build(&self, authority: &BuildAuthority) -> Result<()> {
+    async fn admit_build(&self, authority: &BuildAuthority) -> ContractResult<()> {
         let mut builds = self.builds.lock().unwrap();
         if let Some(existing) = builds.get(&authority.build_id)
             && existing != authority
         {
-            return Err(RuntimeError::AuthorityMismatch(
+            return Err(ContractError::AuthorityMismatch(
                 "test store rejected conflicting build authority".to_string(),
             ));
         }
@@ -195,13 +200,13 @@ impl BuildProgressStore for MemoryAuthorityStore {
     async fn load_build_progress(
         &self,
         build_id: &OperationId,
-    ) -> Result<Option<DurableBuildProgress>> {
+    ) -> ContractResult<Option<DurableBuildProgress>> {
         Ok(self.build_progress.lock().unwrap().get(build_id).cloned())
     }
 
-    async fn record_build_progress(&self, progress: &DurableBuildProgress) -> Result<()> {
+    async fn record_build_progress(&self, progress: &DurableBuildProgress) -> ContractResult<()> {
         if self.fail_build_progress_once.swap(false, Ordering::SeqCst) {
-            return Err(RuntimeError::Application(
+            return Err(ContractError::Persistence(
                 "injected build progress failure".to_string(),
             ));
         }
@@ -892,15 +897,17 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         names.sort();
         names
     }
-    let replication = include_str!("../src/replicator/mod.rs");
-    let application = include_str!("../src/application.rs");
-    let library = include_str!("../src/lib.rs");
-    assert!(!replication.contains("pub trait ManagedReplicator"));
-    assert!(replication.contains("pub(crate) trait ManagedReplicator"));
+    let replication = include_str!("../../kuberic-runtime/src/replicator/mod.rs");
+    let application = include_str!("../../kuberic-runtime/src/application.rs");
+    let library = include_str!("../../kuberic-runtime/src/lib.rs");
+    assert!(
+        replication.contains("#[doc(hidden)]\npub trait ManagedReplicator"),
+        "the cross-crate managed bridge must remain hidden from generated user documentation"
+    );
     for internal_module in ["authority", "effects", "runtime"] {
         assert!(
-            library.contains(&format!("#[doc(hidden)]\npub mod {internal_module};")),
-            "{internal_module} must remain outside generated user documentation"
+            !library.contains(&format!("pub mod {internal_module};")),
+            "{internal_module} must not be a public runtime module"
         );
     }
     for (source, name, expected) in [
@@ -3032,7 +3039,7 @@ async fn failed_demotion_callback_preserves_completed_role_and_transition_stage(
     assert_eq!(snapshot.role, ReplicaRole::Primary);
     assert_eq!(
         snapshot.role_transition,
-        Some(kuberic_runtime::runtime::RoleTransition {
+        Some(kuberic_runtime_internal::effects::RoleTransition {
             completed_role: ReplicaRole::Primary,
             target_role: ReplicaRole::ActiveSecondary,
             replicator_completed: true,

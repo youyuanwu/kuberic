@@ -1,20 +1,17 @@
 [package]
-name = "kuberic-runtime"
+name = "kuberic-runtime-internal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Independent level-triggered application and replication runtime for Kuberic"
-readme = "README.md"
+publish = false
+description = "Internal agent/runtime contracts for the level-triggered Kuberic stack"
 
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
-futures.workspace = true
 kuberic-protocol = { path = "../kuberic-protocol" }
-kuberic-runtime-internal = { path = "../kuberic-runtime-internal" }
 kuberic-wire = { path = "../kuberic-wire" }
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
-tokio.workspace = true
-uuid = { workspace = true, features = ["v4"] }

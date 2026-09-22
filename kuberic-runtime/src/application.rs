@@ -8,16 +8,11 @@ use kuberic_protocol::types::{Epoch, OperationId, ReplicaIdentity, ReplicaRole};
 
 use crate::Result;
 use crate::replicator::{Replicator, StatefulServicePartition};
+pub use kuberic_runtime_internal::effects::OpenMode;
 
 pub type Lsn = i64;
 pub type OperationData = Bytes;
 pub type OperationDataStream = Pin<Box<dyn Stream<Item = Result<OperationData>> + Send>>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenMode {
-    New,
-    Existing,
-}
 
 #[derive(Clone)]
 pub struct OpenContext {

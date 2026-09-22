@@ -42,3 +42,16 @@ pub enum RuntimeError {
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
+
+impl From<kuberic_runtime_internal::ContractError> for RuntimeError {
+    fn from(error: kuberic_runtime_internal::ContractError) -> Self {
+        match error {
+            kuberic_runtime_internal::ContractError::AuthorityMismatch(message) => {
+                Self::AuthorityMismatch(message)
+            }
+            kuberic_runtime_internal::ContractError::Persistence(message) => {
+                Self::Application(message)
+            }
+        }
+    }
+}

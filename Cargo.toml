@@ -7,6 +7,8 @@ members = [
   "examples/sqlite",
   "kuberic-protocol",
   "kuberic-runtime",
+  "kuberic-runtime-internal",
+  "kuberic-agent",
   "kuberic-wire",
   "kuberic-core",
   "kuberic-operator",
@@ -26,7 +28,7 @@ rust-version = "1.85"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tokio-stream = "0.1"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 base64 = "0.23"
 futures = "0.3"
 async-trait = "0.1"

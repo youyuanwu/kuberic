@@ -5,8 +5,8 @@ pub mod stream;
 
 pub(crate) mod log;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use kuberic_protocol::types::{
@@ -20,12 +20,12 @@ use crate::authority::{
     ReplicationProgressStore,
 };
 use crate::effects::RuntimeEffectAction;
+use crate::effects::RuntimeSnapshot;
 use crate::engine::DurableState;
-use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
-use crate::runtime::{
-    DefaultReplicatorInner, OutboundReplication, PendingReplication, PendingWrite, RuntimeHost,
-    RuntimeSnapshot,
+use crate::internal::{
+    DefaultReplicatorInner, OutboundReplication, PendingReplication, PendingWrite,
 };
+use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 use crate::{Result, RuntimeError};
 use kuberic_wire::proto;
 use stream::{OperationStream, ServiceStreams};
@@ -70,7 +70,8 @@ pub trait StateReplicator: Send + Sync {
 }
 
 #[async_trait]
-pub(crate) trait ManagedReplicator: Send + Sync {
+#[doc(hidden)]
+pub trait ManagedReplicator: Send + Sync {
     async fn attach_interfaces(
         &self,
         control: Arc<dyn Replicator>,
@@ -145,7 +146,8 @@ impl ReplicatorInterfaces {
         }
     }
 
-    pub(crate) fn managed_replicator(&self) -> Option<Arc<dyn ManagedReplicator>> {
+    #[doc(hidden)]
+    pub fn managed_replicator(&self) -> Option<Arc<dyn ManagedReplicator>> {
         self.managed_replicator.clone()
     }
 }
@@ -158,7 +160,8 @@ pub struct ReplicatorFactoryContext {
 }
 
 impl ReplicatorFactoryContext {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         identity: ReplicaIdentity,
         access: Arc<dyn PartitionAccessView>,
         default_dependencies: DefaultReplicatorDependencies,
@@ -180,18 +183,39 @@ impl ReplicatorFactoryContext {
 }
 
 #[async_trait]
-pub(crate) trait PartitionAccessView: Send + Sync {
+#[doc(hidden)]
+pub trait PartitionAccessView: Send + Sync {
     async fn write_status(&self) -> Result<AccessStatus>;
 }
 
+#[doc(hidden)]
 #[derive(Clone)]
-pub(crate) struct DefaultReplicatorDependencies {
+pub struct DefaultReplicatorDependencies {
     pub application: Arc<dyn crate::application::StatefulServiceReplica>,
     pub replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
     pub replication_progress_store: Arc<dyn ReplicationProgressStore>,
     pub local_write_journal: Arc<dyn LocalWriteJournal>,
     pub build_authority_store: Arc<dyn BuildAuthorityStore>,
     pub build_progress_store: Arc<dyn BuildProgressStore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ReplicatorCreationReservation(pub u64);
+
+#[async_trait]
+#[doc(hidden)]
+pub trait ReplicatorRegistration: Send + Sync {
+    fn reserve_replicator_creation(&self) -> Result<ReplicatorCreationReservation>;
+
+    fn cancel_replicator_creation(&self, reservation: ReplicatorCreationReservation);
+
+    async fn register_interfaces(
+        &self,
+        interfaces: &ReplicatorInterfaces,
+        provider: Arc<dyn StateProvider>,
+        reservation: ReplicatorCreationReservation,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -207,15 +231,19 @@ pub trait ReplicatorFactory: Send + Sync {
 #[derive(Clone)]
 pub struct StatefulServicePartition {
     context: ReplicatorFactoryContext,
-    host: Weak<RuntimeHost>,
+    registration: Arc<dyn ReplicatorRegistration>,
     factory: Option<Arc<dyn ReplicatorFactory>>,
 }
 
 impl StatefulServicePartition {
-    pub(crate) fn new(host: Weak<RuntimeHost>, context: ReplicatorFactoryContext) -> Self {
+    #[doc(hidden)]
+    pub fn new(
+        registration: Arc<dyn ReplicatorRegistration>,
+        context: ReplicatorFactoryContext,
+    ) -> Self {
         Self {
             context,
-            host,
+            registration,
             factory: None,
         }
     }
@@ -224,7 +252,7 @@ impl StatefulServicePartition {
     pub fn with_factory(&self, factory: Arc<dyn ReplicatorFactory>) -> Self {
         Self {
             context: self.context.clone(),
-            host: self.host.clone(),
+            registration: self.registration.clone(),
             factory: Some(factory),
         }
     }
@@ -241,20 +269,28 @@ impl StatefulServicePartition {
         let factory = self.factory.as_ref().ok_or_else(|| {
             RuntimeError::Application("select a replicator factory during Open".into())
         })?;
-        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
-        let reservation = host.reserve_replicator_creation()?;
-        let interfaces = factory
+        let reservation = self.registration.reserve_replicator_creation()?;
+        let interfaces = match factory
             .create_replicator(
                 self.context.clone(),
                 state_provider.clone(),
                 settings.unwrap_or_default(),
             )
-            .await?;
-        if let Err(error) = host
+            .await
+        {
+            Ok(interfaces) => interfaces,
+            Err(error) => {
+                self.registration.cancel_replicator_creation(reservation);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .registration
             .register_interfaces(&interfaces, state_provider, reservation)
             .await
         {
             interfaces.replicator.abort();
+            self.registration.cancel_replicator_creation(reservation);
             return Err(error);
         }
         Ok(interfaces)

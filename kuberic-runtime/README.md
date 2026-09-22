@@ -24,12 +24,12 @@ the control and state-replicator interfaces; the optional primary interface is
 the explicit Rust counterpart of querying `IFabricPrimaryReplicator`.
 
 ```text
-PodRuntime ── Open(partition) ──► StatefulServiceReplica
-                                  │
-                                  ├─ CreateReplicator(StateProvider, settings)
-                                  ├─ retains StateReplicator
-                                  ├─ takes and consumes copy/replication streams
-PodRuntime ◄── returns Replicator ─┘
+kuberic-agent::PodRuntime ── Open(partition) ──► StatefulServiceReplica
+                                                │
+                                                ├─ CreateReplicator(StateProvider, settings)
+                                                ├─ retains StateReplicator
+                                                ├─ consumes copy/replication streams
+agent hosting ◄──────── returns Replicator ─────┘
      │
      └─ opens and drives exactly the returned control interface
 ```
@@ -44,7 +44,8 @@ one shared `DefaultReplicatorInner`, and the control, primary, state, and
 optional managed façades all reference that inner. `PodRuntime` owns the
 hosting registrar, application lifetime, Open registration, effect ordering,
 and exact returned-interface identity; it does not preconstruct unused default
-replication state for a custom factory.
+replication state for a custom factory. `PodRuntime` and that hosting registrar
+now live in `kuberic-agent`, not this application-facing crate.
 There is no `PodRuntime::new_with_replicator` ownership shortcut.
 Services can observe `partition.get_write_status()`; custom factories receive
 the same access gate through `ReplicatorFactoryContext::write_status`.
@@ -55,7 +56,8 @@ from the Primary role.
 capabilities, not a concrete runtime or default-engine pointer. Application
 and custom-factory code constructs only the SF-shaped interface bundle through
 `ReplicatorInterfaces::new`. The default implementation's managed data-plane
-bridge is crate-private; custom replicators own their transport independently.
+bridge is doc-hidden and exists only for the unpublished agent/runtime
+integration; custom replicators own their transport independently.
 
 ## Durable streams and engine integration
 
@@ -83,10 +85,10 @@ engines. Streams can be taken only once from the default state interface.
 Reservations, exact-authority admission and ACK validation, queue retention,
 quorum finalization, copy/build bookkeeping, and durable retry IDs live in the
 non-COM replication engine, not the SF traits. The default state interface
-retains write identity across failures and cancellation. The lower-level
-`PodRuntime` data-plane methods are compatibility forwarders to the selected
-managed replicator; they fail explicitly for a custom implementation that does
-not opt into that capability.
+retains write identity across failures and cancellation. The agent's
+lower-level `PodRuntime` data-plane methods are compatibility forwarders to the
+selected managed replicator; they fail explicitly for a custom implementation
+that does not opt into that capability.
 
 Transport remains caller-driven: drain `PodRuntime::next_outbound()` for
 state-interface replication and primary build/remove requests, exchange the
@@ -103,19 +105,20 @@ closes the replicator, then closes the service, with abort cleanup on callback
 failure. Failed or cancelled Open aborts created interfaces;
 lifecycle/epoch failures never reopen writes.
 
-Hosting/effect compatibility types are hidden from the generated user
-documentation. They exist until `kuberic-agent` owns process hosting and
-durable effect execution; they are not application programming-model APIs.
+Hosting, effect, authority-store, and snapshot types are absent from the
+runtime root and generated user documentation. Process hosting and durable
+effect execution are owned by `kuberic-agent`; shared persistence and
+postcondition data live in unpublished `kuberic-runtime-internal`.
 Runtime role and write access remain separate: startup is write-closed,
 becoming Primary does not grant writes, and direct client writes require an
 explicit granted `WriteStatus`.
 
 The runtime does not create an operator, replica agent, or control-plane
-server. Persistence is exposed as narrow `ReplicaAuthorityStore`,
+server. It consumes narrow `ReplicaAuthorityStore`,
 `ReplicationProgressStore`, `LocalWriteJournal`, `BuildAuthorityStore`, and
-`BuildProgressStore` capabilities. `AuthorityStore` is only their composite
-compatibility bound; one future SQLite implementation may implement them all
-without granting every caller every mutation right.
+`BuildProgressStore` capabilities from the unpublished contract crate.
+`kuberic-agent::SqliteStore` implements all capabilities while callers receive
+only the mutation authority they require.
 
 Replica builds use separate exact-target authority outside quorum membership.
 Copy context remains a multi-item operation-data stream. `prepare_copy` returns
@@ -136,7 +139,6 @@ owners must provide:
   `PodRuntime` compatibility forwarding;
 - a named resend-retention owner whose actual retained range determines
   catch-up capability, truncation, and fallback to full copy;
-- durable agent-owned effect intent/result sequencing across process restart;
 - the FM/RA-equivalent coordinator that persists and resumes demote, GetLSN,
   catch-up, deactivate, and activate stages;
 - operation-specific mappings for removal, cancellation, backpressure, and

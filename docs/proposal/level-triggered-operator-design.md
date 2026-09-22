@@ -594,6 +594,17 @@ Runtime-effect recovery follows an explicit ordering:
 5. atomically commit the resulting authority and terminal evidence;
 6. acknowledge command completion.
 
+Phase 3 implements this boundary in `kuberic-agent`. Process hosting and
+runtime effect sequencing live in the agent crate; unpublished
+`kuberic-runtime-internal` owns the narrow persistence and postcondition data
+contracts. `SqliteStore` is created only from validated bootstrap or
+replacement initialization authority, records exact storage identity, uses
+WAL with `synchronous=FULL`, and implements the narrow authority, replication,
+local-write, build-authorization, and build-progress capabilities. Reopen
+rejects missing established metadata, corruption, schema mismatch, and
+identity mismatch. Pending effect intent and retained terminal results are
+durable independently of process-session identity.
+
 A committed intent does not imply that its runtime effect ran. After a crash,
 the agent distinguishes pending intent from durable completion and resumes from
 the observed postcondition. Runtime authority that gates replication is
@@ -655,8 +666,9 @@ CreateReplicator. Hosting retains application lifetime, one-shot registration,
 effect ordering, exact returned-interface identity, and control/primary
 discovery. The public factory context exposes immutable identity and partition
 access capabilities, never a concrete hosting or default-engine root.
-A crate-private managed bridge carries Kuberic hosting/default-replicator
-integration and MUST NOT become part of the application or custom-factory API.
+A doc-hidden managed bridge carries Kuberic hosting/default-replicator
+integration across the unpublished agent/runtime boundary and MUST NOT become
+part of the application or custom-factory API.
 User code constructs only the SF-shaped control, primary, and state interface
 bundle. Custom replicators own their data plane independently.
 Reservations, retries, exact ACK handling, authority admission, durable
@@ -699,14 +711,12 @@ end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
-| Move hidden process hosting/effect APIs out of the public runtime crate | Internal runtime contract plus `kuberic-agent` in Phase 3 |
 | Runtime-domain replication messages and removal of the temporary runtime-to-wire dependency | Runtime/agent adapter before Phase 4 transport |
 | Fresh endpoint/session incarnation, stale-session rejection, endpoint readiness, reconnect, ordered delivery, and cancellation | Reliable agent transport in Phase 4 |
 | Resend payload retention, truthful catch-up capability, truncation, and full-copy fallback | Reliable transport/build owner in Phases 4 and 7 |
-| Intent-before-effect and terminal-result-before-reply across process restart | SQLite agent store/runtime adapter in Phase 3 |
 | Durable demote, GetLSN, catch-up, deactivate, and activate sequencing | Replica-agent coordinator in Phase 4 |
 | Operation-specific removal, cancellation, backpressure, and reconfiguration error mapping | Runtime/agent integration in Phase 4 |
-| Crash and stale-session acceptance tests for those owners | Phases 3, 4, 7, and 9 |
+| Transport crash and stale-session acceptance tests for later owners | Phases 4, 7, and 9 |
 
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and
