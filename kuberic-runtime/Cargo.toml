@@ -16,3 +16,4 @@ kuberic-protocol = { path = "../kuberic-protocol" }
 kuberic-wire = { path = "../kuberic-wire" }
 thiserror.workspace = true
 tokio.workspace = true
+uuid = { workspace = true, features = ["v4"] }

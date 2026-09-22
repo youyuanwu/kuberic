@@ -140,6 +140,16 @@ impl QuorumTracker {
             })
     }
 
+    pub(crate) fn all_caught_up(&self, lsn: Lsn) -> bool {
+        self.authority.as_ref().is_some_and(|authority| {
+            authority
+                .current_configuration
+                .members
+                .iter()
+                .all(|member| self.progress.get(&member.identity).copied().unwrap_or(0) >= lsn)
+        })
+    }
+
     pub fn ready_commit_lsn(&self) -> Option<Lsn> {
         let authority = self.authority.as_ref()?;
         self.pending
@@ -191,6 +201,21 @@ impl QuorumTracker {
         }
         self.highest_lsn = self.highest_lsn.max(committed_lsn);
         self.committed_lsn = self.committed_lsn.max(committed_lsn);
+    }
+
+    pub fn reset_progress_after_data_loss(
+        &mut self,
+        local_identity: ReplicaIdentity,
+        current_progress: Lsn,
+        committed_lsn: Lsn,
+    ) {
+        self.fail_pending();
+        self.progress.clear();
+        self.progress.insert(local_identity, current_progress);
+        self.highest_lsn = current_progress;
+        self.committed_lsn = committed_lsn;
+        self.catch_up_boundary = None;
+        self.must_catch_up.clear();
     }
 }
 

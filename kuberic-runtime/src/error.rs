@@ -29,6 +29,8 @@ pub enum RuntimeError {
     WriteCompletionClosed,
     #[error("local write {0} must be resolved before another write can be assigned")]
     LocalWritePending(String),
+    #[error("local write was fenced by data-loss recovery")]
+    DataLossFenced,
 }
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

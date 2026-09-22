@@ -612,11 +612,61 @@ or repetition, never inferred success or rollback of acknowledged progress.
 The application API follows Service Fabric V1 semantics with Rust async
 interfaces. Service lifecycle (`Open`, `ChangeRole`, `Close`, and `Abort`) is
 separate from state-provider callbacks (`UpdateEpoch`, committed progress,
-copy context/state, data loss, and durable operation acceptance). Copy state is
+copy context/state, and data loss). Durable operation acceptance is an explicit
+acknowledgement on a service-owned operation stream, not a state-provider
+callback. Copy state is
 an opaque chunk stream installed through a captured LSN boundary; incremental
 replication remains a distinct ordered stream. Exact replica identity, epoch,
 configuration fencing, quorum accounting, and build sequencing remain runtime
 and agent responsibilities rather than application authority.
+
+The runtime MUST preserve the exact SF V1 interface divisions from
+`FabricRuntime.idl:495–539,577–633,687–758`, collapsing COM Begin/End pairs
+into async Rust methods:
+
+- `Replicator`: Open returning the replication address, ChangeRole(epoch,
+  role), UpdateEpoch, Close, Abort, CurrentProgress, and CatchUpCapability.
+- `PrimaryReplicator: Replicator`: OnDataLoss, UpdateCatchUpReplicaSetConfiguration,
+  WaitForCatchUpQuorum, UpdateCurrentReplicaSetConfiguration, BuildReplica,
+  and RemoveReplica.
+- `StateReplicator`: Replicate(operation data), GetReplicationStream,
+  GetCopyStream, and UpdateReplicatorSettings.
+- `StateProvider`: UpdateEpoch(epoch, previous epoch last LSN),
+  GetLastCommittedSequenceNumber, OnDataLoss, GetCopyContext, and GetCopyState.
+  Copy context and copy state are operation-data streams.
+
+`StatefulServiceReplica::open` MUST return the control `Replicator`, matching
+EndOpen. During Open the service selects a factory through its stateful
+partition and calls CreateReplicator with its state provider and settings.
+CreateReplicator returns both control and state interfaces. The service keeps
+the `StateReplicator` and consumes its copy/replication streams; `PodRuntime`
+retains and drives exactly the returned control interface. The primary
+interface is a separate, explicit Rust interface reference, corresponding to
+COM interface discovery. Constructor injection into `PodRuntime` is not the
+public replicator ownership model.
+
+`DefaultReplicatorFactory` provides the built-in exact-authority replicator;
+custom factories use the same partition boundary. The default factory
+selects a non-COM durable-storage adapter, independently of the SF
+`StateProvider`. Services and custom replicators MUST NOT be required to
+implement default-engine storage callbacks merely to implement the SF API.
+Reservations, retries, exact ACK handling, authority admission, durable
+quorum finalization, queues, and copy/build bookkeeping belong to a distinct
+replication engine and MUST NOT be added to the public SF traits.
+
+Delivery acknowledgement is explicit and one-shot. Dropping a delivered
+operation is not durable acceptance. Application acceptance precedes durable
+authority/build progress, which precedes a peer ACK; quorum readiness precedes
+application commit and retry-record completion, which precede client success.
+Transport remains caller-supplied, including build request dispatch and ACK
+delivery. Waiting for a build or catch-up quorum requires observed completion,
+not successful enqueueing.
+
+Lifecycle ordering follows the v1 ownership model: promotion drives the
+replicator before the service; demotion fences access before the service and
+then drives the replicator; graceful close fences before closing the service
+and then the replicator. Failed/cancelled Open aborts created interfaces.
+Failures, cancellation, epoch regression, and stale ACKs MUST fail closed.
 
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and

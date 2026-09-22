@@ -318,6 +318,8 @@ pub trait AuthorityStore: Send + Sync {
 
     async fn record_local_write(&self, write: &DurableLocalWrite) -> Result<()>;
 
+    async fn reset_local_writes_after_data_loss(&self, committed_lsn: i64) -> Result<()>;
+
     async fn load_build(&self, build_id: &OperationId) -> Result<Option<BuildAuthority>>;
 
     async fn admit_build(&self, authority: &BuildAuthority) -> Result<()>;

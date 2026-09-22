@@ -25,6 +25,10 @@ impl ReplicationQueue {
             .collect()
     }
 
+    pub fn first_lsn(&self) -> Option<Lsn> {
+        self.operations.first_key_value().map(|(&lsn, _)| lsn)
+    }
+
     pub fn truncate_committed(&mut self, committed_lsn: Lsn) {
         self.operations = self.operations.split_off(&(committed_lsn + 1));
     }

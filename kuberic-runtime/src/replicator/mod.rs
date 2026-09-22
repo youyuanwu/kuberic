@@ -1,251 +1,396 @@
 pub mod copy;
 pub mod queue;
 pub mod quorum;
+pub mod stream;
 
-use std::collections::BTreeSet;
+pub(crate) mod log;
 
-use bytes::Bytes;
-use kuberic_protocol::types::{OperationId, ReplicaIdentity};
-use kuberic_wire::{ReplicationAcknowledgement, proto};
-use tokio::sync::oneshot;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
-use crate::application::{ClientWrite, Lsn, Operation};
-use crate::authority::AdmittedAuthority;
-use crate::replicator::queue::ReplicationQueue;
+use async_trait::async_trait;
+use kuberic_protocol::types::{
+    AccessStatus, ConfigurationDescriptor, Epoch, ReplicaId, ReplicaIdentity, ReplicaRole,
+};
+use tokio::sync::{Mutex, RwLock};
+
+use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
+use crate::engine::DurableState;
+use crate::runtime::ReplicationEngine;
 use crate::{Result, RuntimeError};
+use stream::{OperationStream, ServiceStreams};
 
-use self::quorum::QuorumTracker;
-
-#[derive(Debug)]
-pub struct PreparedWrite {
-    pub lsn: Lsn,
-    pub items: Vec<proto::ReplicationItem>,
-    pub completion: oneshot::Receiver<Result<Lsn>>,
+/// IFabricReplicator, with COM Begin/End pairs collapsed to async calls.
+#[async_trait]
+pub trait Replicator: Send + Sync {
+    async fn open(&self) -> Result<String>;
+    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()>;
+    async fn update_epoch(&self, epoch: Epoch) -> Result<()>;
+    async fn close(&self) -> Result<()>;
+    fn abort(&self);
+    async fn current_progress(&self) -> Result<Lsn>;
+    async fn catch_up_capability(&self) -> Result<Lsn>;
 }
 
-#[derive(Debug)]
-pub struct Replicator {
-    local_identity: ReplicaIdentity,
-    authority: Option<AdmittedAuthority>,
-    next_lsn: Lsn,
-    pending_local_write: Option<PendingLocalWrite>,
-    queue: ReplicationQueue,
-    quorum: QuorumTracker,
+/// IFabricPrimaryReplicator; engine bookkeeping is deliberately not part of this API.
+#[async_trait]
+pub trait PrimaryReplicator: Replicator {
+    async fn on_data_loss(&self) -> Result<bool>;
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        current: ConfigurationDescriptor,
+        previous: ConfigurationDescriptor,
+    ) -> Result<()>;
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()>;
+    async fn update_current_replica_set_configuration(
+        &self,
+        current: ConfigurationDescriptor,
+    ) -> Result<()>;
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()>;
+    async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()>;
 }
 
-#[derive(Debug, Clone)]
-struct PendingLocalWrite {
-    operation_id: OperationId,
-    lsn: Lsn,
-    data: Bytes,
+#[async_trait]
+pub trait StateReplicator: Send + Sync {
+    /// Completes only after durable local acceptance and the admitted PC/CC write quorums.
+    async fn replicate(&self, data: OperationData) -> Result<Lsn>;
+    async fn get_replication_stream(&self) -> Result<OperationStream>;
+    async fn get_copy_stream(&self) -> Result<OperationStream>;
+    async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()>;
 }
 
-impl Replicator {
-    pub fn new(local_identity: ReplicaIdentity) -> Self {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaSetQuorumMode {
+    WriteQuorum,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaInformation {
+    pub identity: ReplicaIdentity,
+    pub replication_address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReplicatorSettings {
+    pub replication_address: String,
+}
+
+/// Rust's explicit counterpart of obtaining both interfaces from CreateReplicator.
+pub struct ReplicatorInterfaces {
+    pub replicator: Arc<dyn Replicator>,
+    pub state_replicator: Arc<dyn StateReplicator>,
+    pub primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+}
+
+#[derive(Clone)]
+pub struct ReplicatorFactoryContext {
+    pub(crate) engine: Weak<ReplicationEngine>,
+}
+
+impl ReplicatorFactoryContext {
+    pub fn identity(&self) -> Result<ReplicaIdentity> {
+        Ok(self.engine()?.identity.clone())
+    }
+
+    pub async fn write_status(&self) -> Result<AccessStatus> {
+        Ok(self.engine()?.write_status().await)
+    }
+
+    fn engine(&self) -> Result<Arc<ReplicationEngine>> {
+        self.engine.upgrade().ok_or(RuntimeError::Closed)
+    }
+}
+
+#[async_trait]
+pub trait ReplicatorFactory: Send + Sync {
+    async fn create_replicator(
+        &self,
+        context: ReplicatorFactoryContext,
+        state_provider: Arc<dyn StateProvider>,
+        settings: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces>;
+}
+
+#[derive(Clone)]
+pub struct StatefulServicePartition {
+    context: ReplicatorFactoryContext,
+    factory: Option<Arc<dyn ReplicatorFactory>>,
+}
+
+impl StatefulServicePartition {
+    pub(crate) fn new(engine: Weak<ReplicationEngine>) -> Self {
         Self {
-            local_identity,
-            authority: None,
-            next_lsn: 0,
-            pending_local_write: None,
-            queue: ReplicationQueue::default(),
-            quorum: QuorumTracker::default(),
+            context: ReplicatorFactoryContext { engine },
+            factory: None,
         }
     }
 
-    pub fn configure(&mut self, authority: AdmittedAuthority, local_progress: Lsn) -> Result<()> {
-        if authority.local_identity != self.local_identity {
-            return Err(RuntimeError::AuthorityMismatch(
-                "admitted local identity differs from runtime identity".to_string(),
-            ));
+    /// Select an implementation during service Open, not in the PodRuntime constructor.
+    pub fn with_factory(&self, factory: Arc<dyn ReplicatorFactory>) -> Self {
+        Self {
+            context: self.context.clone(),
+            factory: Some(factory),
         }
-        if self.authority.as_ref() != Some(&authority) {
-            self.pending_local_write = None;
-        }
-        self.next_lsn = self.next_lsn.max(local_progress);
-        self.quorum.configure(authority.clone(), local_progress)?;
-        self.authority = Some(authority);
-        Ok(())
     }
 
-    pub fn reserve_write(&mut self, write: &ClientWrite) -> Result<Lsn> {
-        let authority = self
-            .authority
-            .as_ref()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        if authority.primary_identity() != &self.local_identity {
-            return Err(RuntimeError::NotPrimary);
-        }
-        if let Some(pending) = &self.pending_local_write {
-            if pending.operation_id == write.operation_id && pending.data == write.data {
-                return Ok(pending.lsn);
-            }
-            return Err(RuntimeError::LocalWritePending(
-                pending.operation_id.to_string(),
-            ));
-        }
-        let lsn = self.next_lsn + 1;
-        self.pending_local_write = Some(PendingLocalWrite {
-            operation_id: write.operation_id.clone(),
-            lsn,
-            data: write.data.clone(),
+    pub async fn get_write_status(&self) -> Result<AccessStatus> {
+        self.context.write_status().await
+    }
+
+    pub async fn create_replicator(
+        &self,
+        state_provider: Arc<dyn StateProvider>,
+        settings: Option<ReplicatorSettings>,
+    ) -> Result<ReplicatorInterfaces> {
+        let factory = self.factory.as_ref().ok_or_else(|| {
+            RuntimeError::Application("select a replicator factory during Open".into())
+        })?;
+        let interfaces = factory
+            .create_replicator(
+                self.context.clone(),
+                state_provider.clone(),
+                settings.unwrap_or_default(),
+            )
+            .await?;
+        self.context
+            .engine()?
+            .register_interfaces(&interfaces, state_provider)
+            .await?;
+        Ok(interfaces)
+    }
+}
+
+pub struct DefaultReplicatorFactory {
+    storage: Arc<dyn DurableState>,
+}
+
+impl DefaultReplicatorFactory {
+    pub fn new(storage: Arc<dyn DurableState>) -> Self {
+        Self { storage }
+    }
+}
+
+#[async_trait]
+impl ReplicatorFactory for DefaultReplicatorFactory {
+    async fn create_replicator(
+        &self,
+        context: ReplicatorFactoryContext,
+        state_provider: Arc<dyn StateProvider>,
+        settings: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces> {
+        let streams = Arc::new(ServiceStreams::new());
+        let engine = context.engine()?;
+        engine
+            .install_provider(
+                state_provider.clone(),
+                self.storage.clone(),
+                streams.clone(),
+            )
+            .await?;
+        let pending = Arc::new(Mutex::new(None));
+        let next_operation = Arc::new(AtomicU64::new(0));
+        let replicator = Arc::new(DefaultReplicator {
+            context: context.clone(),
+            provider: state_provider,
+            settings: Arc::new(RwLock::new(settings)),
+            pending: pending.clone(),
+            next_operation: next_operation.clone(),
         });
+        let state_replicator = Arc::new(DefaultStateReplicator {
+            context,
+            streams,
+            settings: replicator.settings.clone(),
+            next_operation,
+            pending,
+        });
+        Ok(ReplicatorInterfaces {
+            replicator: replicator.clone(),
+            state_replicator,
+            primary_replicator: Some(replicator),
+        })
+    }
+}
+
+pub struct DefaultReplicator {
+    context: ReplicatorFactoryContext,
+    provider: Arc<dyn StateProvider>,
+    settings: Arc<RwLock<ReplicatorSettings>>,
+    pending: Arc<Mutex<Option<ClientWrite>>>,
+    next_operation: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl Replicator for DefaultReplicator {
+    async fn open(&self) -> Result<String> {
+        let committed_lsn = self.provider.last_committed_lsn().await?;
+        self.context.engine()?.control_open(committed_lsn).await?;
+        Ok(self.settings.read().await.replication_address.clone())
+    }
+
+    async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
+        self.context
+            .engine()?
+            .control_change_role(epoch, role)
+            .await
+    }
+
+    async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
+        let engine = self.context.engine()?;
+        engine
+            .control_update_epoch(epoch, self.provider.as_ref())
+            .await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.context.engine()?.control_close().await
+    }
+
+    fn abort(&self) {
+        if let Ok(engine) = self.context.engine() {
+            engine.control_abort();
+        }
+    }
+
+    async fn current_progress(&self) -> Result<Lsn> {
+        self.context.engine()?.control_progress().await
+    }
+
+    async fn catch_up_capability(&self) -> Result<Lsn> {
+        self.context.engine()?.control_catch_up_capability().await
+    }
+}
+
+#[async_trait]
+impl PrimaryReplicator for DefaultReplicator {
+    async fn on_data_loss(&self) -> Result<bool> {
+        let engine = self.context.engine()?;
+        if let Some(progress) = engine.control_on_data_loss(self.provider.as_ref()).await? {
+            *self.pending.lock().await = None;
+            self.next_operation
+                .store(progress.max(0) as u64, Ordering::Release);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn update_catch_up_replica_set_configuration(
+        &self,
+        current: ConfigurationDescriptor,
+        previous: ConfigurationDescriptor,
+    ) -> Result<()> {
+        self.context
+            .engine()?
+            .configure_replicas(current, Some(previous))
+            .await
+    }
+
+    async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
+        self.context.engine()?.wait_for_quorum(mode).await
+    }
+
+    async fn update_current_replica_set_configuration(
+        &self,
+        current: ConfigurationDescriptor,
+    ) -> Result<()> {
+        self.context
+            .engine()?
+            .configure_replicas(current, None)
+            .await
+    }
+
+    async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
+        self.context.engine()?.wait_for_build(replica).await
+    }
+
+    async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
+        self.context.engine()?.remove_replica(replica_id).await
+    }
+}
+
+struct DefaultStateReplicator {
+    context: ReplicatorFactoryContext,
+    streams: Arc<ServiceStreams>,
+    settings: Arc<RwLock<ReplicatorSettings>>,
+    next_operation: Arc<AtomicU64>,
+    pending: Arc<Mutex<Option<ClientWrite>>>,
+}
+
+#[async_trait]
+impl StateReplicator for DefaultStateReplicator {
+    async fn replicate(&self, data: OperationData) -> Result<Lsn> {
+        let engine = self.context.engine()?;
+        engine.require_write_access().await?;
+        let mut reservation = self.pending.lock().await;
+        engine.require_write_access().await?;
+        if let Some(write) = reservation.as_ref() {
+            if write.data != data {
+                return Err(RuntimeError::LocalWritePending(
+                    write.operation_id.to_string(),
+                ));
+            }
+        } else {
+            let id = self.next_operation.fetch_add(1, Ordering::Relaxed);
+            *reservation = Some(engine.recover_replicate_write(data, id).await);
+        }
+        let pending = match engine
+            .begin_write(reservation.as_ref().expect("write reserved").clone())
+            .await
+        {
+            Ok(pending) => pending,
+            Err(
+                error @ (RuntimeError::DataLossFenced
+                | RuntimeError::WriteClosed(_)
+                | RuntimeError::AuthorityMismatch(_)
+                | RuntimeError::NotPrimary),
+            ) => {
+                *reservation = None;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = engine.publish_replication(&pending).await {
+            if matches!(
+                error,
+                RuntimeError::DataLossFenced
+                    | RuntimeError::WriteClosed(_)
+                    | RuntimeError::AuthorityMismatch(_)
+                    | RuntimeError::NotPrimary
+            ) {
+                *reservation = None;
+            }
+            return Err(error);
+        }
+        let lsn = match pending.committed().await {
+            Ok(receipt) => receipt.lsn,
+            Err(error) => {
+                if matches!(
+                    error,
+                    RuntimeError::DataLossFenced
+                        | RuntimeError::WriteClosed(_)
+                        | RuntimeError::AuthorityMismatch(_)
+                        | RuntimeError::NotPrimary
+                ) {
+                    *reservation = None;
+                }
+                return Err(error);
+            }
+        };
+        *reservation = None;
         Ok(lsn)
     }
 
-    pub fn restore_write_reservation(&mut self, write: &ClientWrite, lsn: Lsn) -> Result<()> {
-        if let Some(pending) = &self.pending_local_write {
-            if pending.operation_id == write.operation_id
-                && pending.lsn == lsn
-                && pending.data == write.data
-            {
-                return Ok(());
-            }
-            return Err(RuntimeError::LocalWritePending(
-                pending.operation_id.to_string(),
-            ));
-        }
-        self.pending_local_write = Some(PendingLocalWrite {
-            operation_id: write.operation_id.clone(),
-            lsn,
-            data: write.data.clone(),
-        });
-        self.next_lsn = self.next_lsn.max(lsn - 1);
+    async fn get_replication_stream(&self) -> Result<OperationStream> {
+        self.streams.take_replication().await
+    }
+
+    async fn get_copy_stream(&self) -> Result<OperationStream> {
+        self.streams.take_copy().await
+    }
+
+    async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()> {
+        *self.settings.write().await = settings;
         Ok(())
-    }
-
-    pub fn ensure_local_write_registered(
-        &mut self,
-        operation: &Operation,
-    ) -> Result<PreparedWrite> {
-        if let Some(pending) = self.pending_local_write.as_ref()
-            && (pending.lsn != operation.lsn || pending.data != operation.data)
-        {
-            return Err(RuntimeError::Application(
-                "local write differs from its reserved operation".to_string(),
-            ));
-        }
-        self.queue.push(operation.clone());
-        self.quorum.record_local_progress(operation.lsn)?;
-        let completion = if operation.lsn <= self.quorum.committed_lsn() {
-            let (sender, receiver) = oneshot::channel();
-            let _ = sender.send(Ok(operation.lsn));
-            receiver
-        } else {
-            self.quorum.register_write(operation.lsn)?
-        };
-        let items = self.replication_items(operation)?;
-        self.queue.truncate_committed(self.quorum.committed_lsn());
-        self.next_lsn = self.next_lsn.max(operation.lsn);
-        self.pending_local_write = None;
-        Ok(PreparedWrite {
-            lsn: operation.lsn,
-            items,
-            completion,
-        })
-    }
-
-    fn replication_items(&self, operation: &Operation) -> Result<Vec<proto::ReplicationItem>> {
-        let authority = self
-            .authority
-            .as_ref()
-            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-        let targets = authority
-            .current_configuration
-            .members
-            .iter()
-            .chain(
-                authority
-                    .previous_configuration
-                    .iter()
-                    .flat_map(|configuration| configuration.members.iter()),
-            )
-            .map(|member| member.identity.clone())
-            .filter(|identity| identity != &self.local_identity)
-            .collect::<BTreeSet<_>>();
-        Ok(targets
-            .into_iter()
-            .map(|receiver| proto::ReplicationItem {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-                sender: Some(self.local_identity.clone().into()),
-                epoch: Some(authority.current_configuration.epoch.into()),
-                previous_configuration_id: authority
-                    .previous_configuration
-                    .as_ref()
-                    .map_or_else(String::new, |configuration| {
-                        configuration.configuration_id.to_string()
-                    }),
-                current_configuration_id: authority
-                    .current_configuration
-                    .configuration_id
-                    .to_string(),
-                lsn: operation.lsn,
-                committed_lsn: self.quorum.committed_lsn(),
-                data: operation.data.to_vec(),
-                receiver: Some(receiver.into()),
-            })
-            .collect())
-    }
-
-    pub fn acknowledge(&mut self, acknowledgement: &ReplicationAcknowledgement) -> Result<()> {
-        self.quorum.acknowledge(acknowledgement)
-    }
-
-    pub fn record_local_progress(&mut self, lsn: Lsn) -> Result<()> {
-        self.next_lsn = self.next_lsn.max(lsn);
-        self.quorum.record_local_progress(lsn)
-    }
-
-    pub fn committed_lsn(&self) -> Lsn {
-        self.quorum.committed_lsn()
-    }
-
-    pub fn ready_commit_lsn(&self) -> Option<Lsn> {
-        self.quorum.ready_commit_lsn()
-    }
-
-    pub fn finalize_commit(&mut self, committed_lsn: Lsn) -> Result<()> {
-        self.quorum.finalize_commit(committed_lsn)?;
-        self.queue.truncate_committed(committed_lsn);
-        Ok(())
-    }
-
-    pub fn restore_committed_write(&mut self, operation: &Operation) -> Result<()> {
-        if let Some(pending) = self.pending_local_write.as_ref()
-            && (pending.lsn != operation.lsn || pending.data != operation.data)
-        {
-            return Err(RuntimeError::Application(
-                "committed write conflicts with the active reservation".to_string(),
-            ));
-        }
-        self.pending_local_write = None;
-        self.next_lsn = self.next_lsn.max(operation.lsn);
-        self.quorum.record_local_progress(operation.lsn)?;
-        self.quorum.restore_committed_lsn(operation.lsn);
-        self.queue.truncate_committed(operation.lsn);
-        Ok(())
-    }
-
-    pub fn current_configuration_quorum_progress(&self) -> Lsn {
-        self.quorum.current_configuration_quorum_progress()
-    }
-
-    pub fn catch_up_boundary(&self) -> Option<Lsn> {
-        self.quorum.catch_up_boundary()
-    }
-
-    pub fn retained_operations_from(&self, from_lsn: Lsn) -> Vec<Operation> {
-        self.queue.operations_from(from_lsn)
-    }
-
-    pub fn catch_up_complete(&self) -> bool {
-        self.quorum.catch_up_complete()
-    }
-
-    pub fn highest_lsn(&self) -> Lsn {
-        self.quorum.highest_lsn()
-    }
-
-    pub fn fence_client_writes(&mut self) {
-        self.quorum.fail_pending();
     }
 }

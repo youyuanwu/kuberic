@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -6,10 +7,11 @@ use futures::Stream;
 use kuberic_protocol::types::{Epoch, OperationId, ReplicaIdentity, ReplicaRole};
 
 use crate::Result;
+use crate::replicator::{Replicator, StatefulServicePartition};
 
 pub type Lsn = i64;
-pub type OperationStream = Pin<Box<dyn Stream<Item = Result<Operation>> + Send>>;
-pub type CopyStream = Pin<Box<dyn Stream<Item = Result<CopyChunk>> + Send>>;
+pub type OperationData = Bytes;
+pub type OperationDataStream = Pin<Box<dyn Stream<Item = Result<OperationData>> + Send>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
@@ -17,10 +19,11 @@ pub enum OpenMode {
     Existing,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct OpenContext {
     pub identity: ReplicaIdentity,
     pub mode: OpenMode,
+    pub partition: StatefulServicePartition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +65,7 @@ pub struct WriteReceipt {
 
 #[async_trait]
 pub trait StatefulServiceReplica: Send + Sync {
-    async fn open(&self, context: OpenContext) -> Result<()>;
+    async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>>;
 
     async fn change_role(&self, role: ReplicaRole) -> Result<RoleChange>;
 
@@ -77,41 +80,13 @@ pub trait StateProvider: Send + Sync {
 
     async fn last_committed_lsn(&self) -> Result<Lsn>;
 
-    async fn get_copy_context(&self) -> Result<Bytes>;
+    async fn get_copy_context(&self) -> Result<OperationDataStream>;
 
-    async fn get_copy_state(&self, up_to_lsn: Lsn, copy_context: Bytes) -> Result<CopyStream>;
-
-    async fn get_replication_operations(
+    async fn get_copy_state(
         &self,
-        from_lsn: Lsn,
-        to_lsn: Lsn,
-    ) -> Result<OperationStream>;
-
-    async fn apply_copy_chunk(
-        &self,
-        build_id: &OperationId,
-        sequence: u64,
-        chunk: CopyChunk,
-    ) -> Result<()>;
-
-    async fn finish_copy(
-        &self,
-        build_id: &OperationId,
         up_to_lsn: Lsn,
-        committed_lsn: Lsn,
-    ) -> Result<DurableApplicationProgress>;
+        copy_context: OperationDataStream,
+    ) -> Result<OperationDataStream>;
 
     async fn on_data_loss(&self) -> Result<bool>;
-
-    async fn apply(&self, operation: Operation) -> Result<DurableApplicationAck>;
-
-    async fn durable_progress(&self) -> Result<DurableApplicationProgress>;
-
-    async fn verify_applied(&self, operation: &Operation) -> Result<bool>;
-
-    async fn commit(&self, committed_lsn: Lsn) -> Result<DurableApplicationProgress>;
 }
-
-pub trait StatefulApplication: StatefulServiceReplica + StateProvider {}
-
-impl<T> StatefulApplication for T where T: StatefulServiceReplica + StateProvider {}
