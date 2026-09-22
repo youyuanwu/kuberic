@@ -56,8 +56,14 @@ metadata, data, and a one-shot acknowledgement:
 - `reject(error)` reports a failed application operation.
 - Dropping an operation is **not** success; the waiting delivery fails.
 - The engine validates durable progress and commits authority/build metadata
-  before returning a peer ACK. Close/Abort and runtime drop terminate outstanding
-  deliveries.
+  before returning an applied peer ACK. Close/Abort and runtime drop terminate
+  outstanding deliveries.
+
+Inbound replication exposes two acknowledgements. `PendingReplication::received`
+is available after ordered receiver admission and may advance transport resend
+state without granting quorum credit. `PendingReplication::applied()` completes
+only after durable service acceptance; only its applied progress is eligible
+for quorum accounting.
 
 `OperationStream::channel` supplies the producer/consumer boundary for custom
 engines. Streams can be taken only once from the default state interface.
@@ -75,10 +81,12 @@ exact-authority wire items, and return their ACKs. Build requests use the
 existing `prepare_copy`/copy-ACK path; `build_replica` does not complete merely
 because a request was queued. The runtime does not start a network server.
 
-Promotion drives the replicator before the service callback. Demotion fences
-writes, calls the service, then changes the replicator role. Close fences
-first, closes the service, then closes the replicator. Failed or cancelled
-Open aborts created interfaces; lifecycle/epoch failures never reopen writes.
+Role changes drive the replicator before the service callback. The completed
+role is published only after both callbacks succeed; an in-process
+`RoleTransition` exposes partial completion after failure. Close fences writes,
+closes the replicator, then closes the service, with abort cleanup on callback
+failure. Failed or cancelled Open aborts created interfaces;
+lifecycle/epoch failures never reopen writes.
 
 The crate also provides a caller-driven `PodRuntime`, durable authority
 admission, ordered idempotent effects, exact-incarnation replication, and PC/CC
@@ -92,5 +100,26 @@ implementations. Replication acknowledgements are accepted only when exact
 identity, epoch, and configuration fences match durable authority.
 
 Replica builds use separate exact-target authority outside quorum membership.
-Copy closes at a captured replication boundary, then a live build lane carries
-new writes until the target joins configuration authority.
+Copy context remains a multi-item operation-data stream. `prepare_copy` returns
+a bounded stream that incrementally carries snapshot chunks, the captured copy
+boundary, and subsequent live replication without holding the global runtime
+effect lock across provider enumeration. Durable duplicate snapshot chunks are
+verified and acknowledged without redelivery to the application.
+
+## Deferred Service Fabric completion contracts
+
+This crate provides data-plane primitives, not end-to-end SF failover. Later
+owners must provide:
+
+- a reliable transport session with a fresh endpoint incarnation, stale-session
+  rejection, ordered delivery, reconnect, cancellation, and endpoint readiness;
+- a named resend-retention owner whose actual retained range determines
+  catch-up capability, truncation, and fallback to full copy;
+- durable agent-owned effect intent/result sequencing across process restart;
+- the FM/RA-equivalent coordinator that persists and resumes demote, GetLSN,
+  catch-up, deactivate, and activate stages;
+- operation-specific mappings for removal, cancellation, backpressure, and
+  transient reconfiguration outcomes.
+
+Until those owners are implemented, the crate is an SF-aligned runtime
+foundation rather than a deployable SF-equivalent failover system.

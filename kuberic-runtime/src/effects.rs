@@ -4,6 +4,7 @@ use kuberic_protocol::types::{AccessStatus, OperationId, ReplicaRole};
 use crate::Result;
 use crate::application::OpenMode;
 use crate::authority::{AdmittedAuthority, BuildAuthority};
+use crate::runtime::RoleTransition;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeEffect {
@@ -37,6 +38,7 @@ pub struct BuildPostcondition {
 pub struct RuntimePostcondition {
     pub open: bool,
     pub role: ReplicaRole,
+    pub role_transition: Option<RoleTransition>,
     pub write_status: AccessStatus,
     pub authority: Option<AdmittedAuthority>,
     pub current_progress: i64,

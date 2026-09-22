@@ -30,6 +30,21 @@ pub struct StreamOperation {
     completion: oneshot::Sender<Result<DurableApplicationProgress>>,
 }
 
+pub(crate) struct OperationCompletion {
+    receiver: oneshot::Receiver<Result<DurableApplicationProgress>>,
+    closed: watch::Receiver<bool>,
+}
+
+impl OperationCompletion {
+    pub(crate) async fn completed(mut self) -> Result<DurableApplicationProgress> {
+        tokio::select! {
+            biased;
+            _ = self.closed.changed() => Err(RuntimeError::Closed),
+            result = self.receiver => result.map_err(|_| RuntimeError::WriteCompletionClosed)?,
+        }
+    }
+}
+
 impl StreamOperation {
     pub fn acknowledge(self, progress: DurableApplicationProgress) -> Result<()> {
         self.completion
@@ -86,11 +101,11 @@ impl OperationSender {
         self.closed.send_replace(true);
     }
 
-    pub async fn send(
+    pub(crate) async fn enqueue(
         &self,
         metadata: OperationMetadata,
         data: Bytes,
-    ) -> Result<DurableApplicationProgress> {
+    ) -> Result<OperationCompletion> {
         let mut closed = self.closed.subscribe();
         if *closed.borrow() {
             return Err(RuntimeError::Closed);
@@ -99,11 +114,19 @@ impl OperationSender {
         tokio::select! {
             biased;
             _ = closed.changed() => Err(RuntimeError::Closed),
-            result = async {
-                self.sender.send(StreamOperation { metadata, data, completion }).await.map_err(|_| RuntimeError::Closed)?;
-                receiver.await.map_err(|_| RuntimeError::WriteCompletionClosed)?
-            } => result,
+            result = self.sender.send(StreamOperation { metadata, data, completion }) => {
+                result.map_err(|_| RuntimeError::Closed)?;
+                Ok(OperationCompletion { receiver, closed })
+            },
         }
+    }
+
+    pub async fn send(
+        &self,
+        metadata: OperationMetadata,
+        data: Bytes,
+    ) -> Result<DurableApplicationProgress> {
+        self.enqueue(metadata, data).await?.completed().await
     }
 }
 
@@ -153,6 +176,21 @@ impl ServiceStreams {
     ) -> Result<DurableApplicationProgress> {
         self.replication_tx
             .send(
+                OperationMetadata::Replication {
+                    lsn: operation.lsn,
+                    committed_lsn: operation.committed_lsn,
+                },
+                operation.data,
+            )
+            .await
+    }
+
+    pub(crate) async fn enqueue_replication(
+        &self,
+        operation: Operation,
+    ) -> Result<OperationCompletion> {
+        self.replication_tx
+            .enqueue(
                 OperationMetadata::Replication {
                     lsn: operation.lsn,
                     committed_lsn: operation.committed_lsn,

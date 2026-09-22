@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream;
+use futures::{StreamExt, stream};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch,
     OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, TransitionKind,
@@ -21,7 +21,7 @@ use kuberic_runtime::effects::{
     RuntimeControlPlane, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
-use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
+use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest, PreparedCopy};
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorFactory, ReplicatorFactoryContext,
@@ -216,6 +216,11 @@ struct TestApplication {
     applied: Mutex<BTreeMap<i64, Operation>>,
     progress: Mutex<DurableApplicationProgress>,
     copy_chunks: Mutex<BTreeMap<(String, u64), Bytes>>,
+    copy_context_items: Mutex<Vec<Bytes>>,
+    copy_apply_count: AtomicUsize,
+    pause_copy_enumeration: Arc<AtomicBool>,
+    copy_enumeration_notify: Arc<Notify>,
+    resume_copy_enumeration_notify: Arc<Notify>,
     fail_apply: AtomicBool,
     fail_after_apply: AtomicBool,
     pause_after_apply: AtomicBool,
@@ -511,8 +516,16 @@ impl StateProvider for TestApplication {
     async fn get_copy_state(
         &self,
         up_to_lsn: i64,
-        _copy_context: OperationDataStream,
+        mut copy_context: OperationDataStream,
     ) -> Result<OperationDataStream> {
+        let mut context_items = Vec::new();
+        while let Some(item) = copy_context.next().await {
+            context_items.push(item?);
+        }
+        self.copy_context_items
+            .lock()
+            .unwrap()
+            .extend(context_items);
         let mut snapshot = Vec::new();
         for operation in self
             .applied
@@ -535,7 +548,24 @@ impl StateProvider for TestApplication {
                 Ok(Bytes::copy_from_slice(&snapshot[split..])),
             ]
         };
-        Ok(Box::pin(stream::iter(chunks)))
+        let pause = self.pause_copy_enumeration.clone();
+        let paused = self.copy_enumeration_notify.clone();
+        let resume = self.resume_copy_enumeration_notify.clone();
+        Ok(Box::pin(stream::unfold(
+            (chunks.into_iter(), true),
+            move |(mut chunks, first)| {
+                let pause = pause.clone();
+                let paused = paused.clone();
+                let resume = resume.clone();
+                async move {
+                    if first && pause.load(Ordering::SeqCst) {
+                        paused.notify_one();
+                        resume.notified().await;
+                    }
+                    std::iter::Iterator::next(&mut chunks).map(|chunk| (chunk, (chunks, false)))
+                }
+            },
+        )))
     }
 
     async fn on_data_loss(&self) -> Result<bool> {
@@ -573,6 +603,7 @@ impl DurableState for TestApplication {
         sequence: u64,
         chunk: CopyChunk,
     ) -> Result<()> {
+        self.copy_apply_count.fetch_add(1, Ordering::SeqCst);
         let key = (build_id.to_string(), sequence);
         let mut chunks = self.copy_chunks.lock().unwrap();
         if let Some(existing) = chunks.get(&key)
@@ -584,6 +615,20 @@ impl DurableState for TestApplication {
         }
         chunks.insert(key, chunk.data);
         Ok(())
+    }
+
+    async fn verify_copy_chunk(
+        &self,
+        build_id: &OperationId,
+        sequence: u64,
+        chunk: &CopyChunk,
+    ) -> Result<bool> {
+        Ok(self
+            .copy_chunks
+            .lock()
+            .unwrap()
+            .get(&(build_id.to_string(), sequence))
+            .is_some_and(|stored| stored == &chunk.data))
     }
 
     async fn finish_copy(
@@ -761,6 +806,30 @@ async fn consume_stream(
             Err(error) => {
                 let _ = operation.reject(error);
             }
+        }
+    }
+}
+
+fn empty_copy_context() -> OperationDataStream {
+    Box::pin(stream::empty())
+}
+
+async fn next_copy_item(prepared: &mut PreparedCopy) -> proto::CopyItem {
+    timeout(Duration::from_secs(1), prepared.items.next())
+        .await
+        .unwrap()
+        .expect("copy stream ended")
+        .unwrap()
+}
+
+async fn copy_through_final(prepared: &mut PreparedCopy) -> Vec<proto::CopyItem> {
+    let mut items = Vec::new();
+    loop {
+        let item = next_copy_item(prepared).await;
+        let final_item = item.final_item;
+        items.push(item);
+        if final_item {
+            return items;
         }
     }
 }
@@ -981,7 +1050,13 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     };
     let mut stream = target_app.held_streams.lock().unwrap().remove(0);
     let operation = stream.get_operation().await.unwrap().unwrap();
-    assert!(!receive.is_finished());
+    let receive = receive.await.unwrap().unwrap();
+    assert_eq!(receive.received.received_lsn, 1);
+    assert_eq!(receive.received.applied_lsn, 0);
+    source
+        .accept_acknowledgement(receive.received.clone())
+        .await
+        .unwrap();
     assert!(!write.is_finished());
     let OperationMetadata::Replication { lsn, committed_lsn } = operation.metadata else {
         panic!("expected replication metadata")
@@ -994,13 +1069,10 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
         })
         .await
         .unwrap();
-    assert!(
-        !receive.is_finished(),
-        "durability alone does not acknowledge the stream"
-    );
+    assert!(!write.is_finished());
     operation.acknowledge(progress).unwrap();
     source
-        .accept_acknowledgement(receive.await.unwrap().unwrap())
+        .accept_acknowledgement(receive.applied().await.unwrap())
         .await
         .unwrap();
     assert_eq!(write.await.unwrap().unwrap(), 1);
@@ -1056,12 +1128,12 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         source.next_outbound().await,
         Some(OutboundReplication::Build(_))
     ));
-    let prepared = source
+    let mut prepared = source
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("sf-build"),
             target: replacement.clone(),
             configuration: BuildConfiguration::Current,
-            copy_context: Bytes::new(),
+            copy_context: empty_copy_context(),
         })
         .await
         .unwrap();
@@ -1075,7 +1147,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
     for (index, action) in [
         RuntimeEffectAction::Open(OpenMode::New),
         RuntimeEffectAction::ChangeRole(ReplicaRole::IdleSecondary),
-        RuntimeEffectAction::AdmitBuildAuthority(Box::new(prepared.authority)),
+        RuntimeEffectAction::AdmitBuildAuthority(Box::new(prepared.authority.clone())),
     ]
     .into_iter()
     .enumerate()
@@ -1088,7 +1160,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
     let mut copy = target_app.held_streams.lock().unwrap().remove(1);
     let delivery = {
         let target = target.clone();
-        let item = prepared.items[0].clone();
+        let item = next_copy_item(&mut prepared).await;
         tokio::spawn(async move { target.receive_copy_item(item).await })
     };
     let operation = copy.get_operation().await.unwrap().unwrap();
@@ -1273,7 +1345,7 @@ async fn quorum_modes_data_loss_and_configuration_methods_use_the_default_engine
 }
 
 #[tokio::test]
-async fn lifecycle_orders_promotions_demotions_close_and_abort_like_v1() {
+async fn lifecycle_orders_role_changes_and_close_like_service_fabric() {
     let app = Arc::new(TestApplication::default());
     let events = app.events.clone();
     *app.factory.lock().unwrap() = Some(Arc::new(CountingFactory {
@@ -1311,12 +1383,12 @@ async fn lifecycle_orders_promotions_demotions_close_and_abort_like_v1() {
     assert_eq!(
         events.lock().unwrap().as_slice(),
         [
-            "service.change_role",
-            "replicator.change_role",
             "replicator.change_role",
             "service.change_role",
-            "service.close",
+            "replicator.change_role",
+            "service.change_role",
             "replicator.close",
+            "service.close",
             "service.abort",
             "replicator.abort",
         ]
@@ -1416,7 +1488,7 @@ async fn removing_a_replica_terminates_its_pending_build_wait() {
             .await
             .unwrap()
             .unwrap(),
-        Err(RuntimeError::Closed)
+        Err(RuntimeError::ReplicaRemoved(2))
     ));
 }
 
@@ -1549,10 +1621,66 @@ impl ReplicatorFactory for ExternalFactory {
     }
 }
 
+struct CountingExternalFactory {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ReplicatorFactory for CountingExternalFactory {
+    async fn create_replicator(
+        &self,
+        context: ReplicatorFactoryContext,
+        provider: Arc<dyn StateProvider>,
+        settings: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ExternalFactory
+            .create_replicator(context, provider, settings)
+            .await
+    }
+}
+
 #[derive(Default)]
 struct ExternalService {
     state: Mutex<Option<Arc<dyn StateReplicator>>>,
     streams: Mutex<Vec<OperationStream>>,
+}
+
+struct DoubleCreateService {
+    factory_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StatefulServiceReplica for DoubleCreateService {
+    async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        let partition = context
+            .partition
+            .with_factory(Arc::new(CountingExternalFactory {
+                calls: self.factory_calls.clone(),
+            }));
+        let first = partition
+            .create_replicator(Arc::new(TestApplication::default()), None)
+            .await?;
+        assert!(matches!(
+            partition
+                .create_replicator(Arc::new(TestApplication::default()), None)
+                .await,
+            Err(RuntimeError::Application(_))
+        ));
+        Ok(first.replicator)
+    }
+
+    async fn change_role(&self, _role: ReplicaRole) -> Result<RoleChange> {
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
+
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn abort(&self) {}
 }
 
 #[async_trait]
@@ -1614,6 +1742,23 @@ async fn custom_factory_does_not_require_the_default_engine_or_service_storage_t
     for mut stream in streams {
         assert!(stream.get_operation().await.unwrap().is_none());
     }
+}
+
+#[tokio::test]
+async fn create_replicator_reserves_one_shot_ownership_before_factory_invocation() {
+    let factory_calls = Arc::new(AtomicUsize::new(0));
+    let runtime = PodRuntime::new(
+        identity(1, "double-create"),
+        Arc::new(DoubleCreateService {
+            factory_calls: factory_calls.clone(),
+        }),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::New)))
+        .await
+        .unwrap();
+    assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
 }
 
 fn authority(local: ReplicaIdentity, members: Vec<ReplicaIdentity>) -> AdmittedAuthority {
@@ -2011,24 +2156,42 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
 
     application.fail_apply.store(true, Ordering::SeqCst);
     assert!(matches!(
-        runtime.receive_replication(item.clone()).await,
+        runtime
+            .receive_replication(item.clone())
+            .await
+            .unwrap()
+            .applied()
+            .await,
         Err(RuntimeError::Application(_))
     ));
     application.fail_apply.store(false, Ordering::SeqCst);
 
-    let acknowledgement = runtime.receive_replication(item.clone()).await.unwrap();
-    assert_eq!(acknowledgement.received_lsn, 1);
+    let delivery = runtime.receive_replication(item.clone()).await.unwrap();
+    assert_eq!(delivery.received.received_lsn, 1);
+    assert_eq!(delivery.received.applied_lsn, 0);
+    let acknowledgement = delivery.applied().await.unwrap();
     assert_eq!(acknowledgement.applied_lsn, 1);
     assert_eq!(application.applied.lock().unwrap().len(), 1);
 
-    let retry = runtime.receive_replication(item.clone()).await.unwrap();
+    let retry = runtime
+        .receive_replication(item.clone())
+        .await
+        .unwrap()
+        .applied()
+        .await
+        .unwrap();
     assert_eq!(retry.applied_lsn, 1);
     assert_eq!(application.applied.lock().unwrap().len(), 1);
 
     let mut conflicting = item;
     conflicting.data = b"different".to_vec();
     assert!(matches!(
-        runtime.receive_replication(conflicting).await,
+        runtime
+            .receive_replication(conflicting)
+            .await
+            .unwrap()
+            .applied()
+            .await,
         Err(RuntimeError::InvalidReplication(_))
     ));
 
@@ -2036,7 +2199,13 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
     committed.lsn = 2;
     committed.committed_lsn = 1;
     committed.data = b"next".to_vec();
-    runtime.receive_replication(committed).await.unwrap();
+    runtime
+        .receive_replication(committed)
+        .await
+        .unwrap()
+        .applied()
+        .await
+        .unwrap();
     let snapshot = runtime.snapshot().await;
     assert_eq!(snapshot.current_progress, 2);
     assert_eq!(snapshot.committed_lsn, 1);
@@ -2141,7 +2310,13 @@ async fn new_authority_ack_does_not_credit_an_unverified_old_suffix() {
         replay.lsn = 1;
         replay.committed_lsn = 1;
         replay.data = b"one".to_vec();
-        let ack = runtime.receive_replication(replay).await.unwrap();
+        let ack = runtime
+            .receive_replication(replay)
+            .await
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
         assert_eq!(ack.applied_lsn, 1);
         primary_runtime.accept_acknowledgement(ack).await.unwrap();
 
@@ -2155,7 +2330,12 @@ async fn new_authority_ack_does_not_credit_an_unverified_old_suffix() {
             .unwrap()
             .clone();
         assert!(matches!(
-            runtime.receive_replication(conflicting).await,
+            runtime
+                .receive_replication(conflicting)
+                .await
+                .unwrap()
+                .applied()
+                .await,
             Err(RuntimeError::InvalidReplication(_))
         ));
     }
@@ -2465,8 +2645,8 @@ async fn secondary_authority_dispatches_replicator_and_provider_epoch_before_rol
             "replicator.open",
             "replicator.update_epoch",
             "provider.update_epoch",
-            "service.change_role",
             "replicator.change_role",
+            "service.change_role",
         ]
     );
 }
@@ -2695,7 +2875,7 @@ async fn close_fences_pending_client_writes_before_ack_processing() {
 }
 
 #[tokio::test]
-async fn failed_demotion_callback_leaves_writes_fenced_and_role_demoted() {
+async fn failed_demotion_callback_preserves_completed_role_and_transition_stage() {
     let local = identity(1, "primary");
     let application = Arc::new(TestApplication::default());
     let runtime = PodRuntime::new(
@@ -2759,7 +2939,16 @@ async fn failed_demotion_callback_leaves_writes_fenced_and_role_demoted() {
         ))
     ));
     let snapshot = runtime.snapshot().await;
-    assert_eq!(snapshot.role, ReplicaRole::ActiveSecondary);
+    assert_eq!(snapshot.role, ReplicaRole::Primary);
+    assert_eq!(
+        snapshot.role_transition,
+        Some(kuberic_runtime::runtime::RoleTransition {
+            completed_role: ReplicaRole::Primary,
+            target_role: ReplicaRole::ActiveSecondary,
+            replicator_completed: true,
+            application_completed: false,
+        })
+    );
     assert_eq!(snapshot.write_status, AccessStatus::ReconfigurationPending);
 }
 
@@ -2846,12 +3035,19 @@ async fn injected_replicator_failures_cannot_leave_pending_writes_live() {
                 .await
         };
         assert!(matches!(result, Err(RuntimeError::Application(_))));
-        assert!(matches!(
-            pending.committed().await,
-            Err(RuntimeError::WriteClosed(
-                AccessStatus::ReconfigurationPending
-            ))
-        ));
+        if fail_close {
+            assert!(matches!(
+                pending.committed().await,
+                Err(RuntimeError::Closed)
+            ));
+        } else {
+            assert!(matches!(
+                pending.committed().await,
+                Err(RuntimeError::WriteClosed(
+                    AccessStatus::ReconfigurationPending
+                ))
+            ));
+        }
     }
 }
 
@@ -2902,17 +3098,18 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .committed()
         .await
         .unwrap();
-    let prepared = source_runtime
+    let mut prepared = source_runtime
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("build"),
             target: target.clone(),
             configuration: BuildConfiguration::Current,
-            copy_context: Bytes::new(),
+            copy_context: empty_copy_context(),
         })
         .await
         .unwrap();
     assert_eq!(prepared.authority.replication_boundary_lsn, 1);
-    assert_eq!(prepared.items.len(), 3);
+    let items = copy_through_final(&mut prepared).await;
+    assert_eq!(items.len(), 3);
     let live_write = source_runtime
         .begin_write(ClientWrite {
             operation_id: OperationId::new("two"),
@@ -2920,8 +3117,8 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         })
         .await
         .unwrap();
-    assert_eq!(live_write.build_items.len(), 1);
-    let live_build_item = live_write.build_items[0].clone();
+    assert!(live_write.build_items.is_empty());
+    let live_build_item = next_copy_item(&mut prepared).await;
     live_write.committed().await.unwrap();
 
     let target_application = Arc::new(TestApplication::default());
@@ -2950,13 +3147,11 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .unwrap();
 
     assert!(matches!(
-        target_runtime
-            .receive_copy_item(prepared.items[2].clone())
-            .await,
+        target_runtime.receive_copy_item(items[2].clone()).await,
         Err(RuntimeError::InvalidReplication(_))
     ));
     let first_ack = target_runtime
-        .receive_copy_item(prepared.items[0].clone())
+        .receive_copy_item(items[0].clone())
         .await
         .unwrap();
     source_runtime
@@ -2964,17 +3159,25 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .await
         .unwrap();
     assert!(!first_ack.final_item);
+    assert_eq!(
+        target_application.copy_apply_count.load(Ordering::SeqCst),
+        1
+    );
     target_runtime
-        .receive_copy_item(prepared.items[0].clone())
+        .receive_copy_item(items[0].clone())
         .await
         .unwrap();
+    assert_eq!(
+        target_application.copy_apply_count.load(Ordering::SeqCst),
+        1
+    );
     assert_eq!(target_application.applied.lock().unwrap().len(), 0);
     target_runtime
-        .receive_copy_item(prepared.items[1].clone())
+        .receive_copy_item(items[1].clone())
         .await
         .unwrap();
     let final_ack = target_runtime
-        .receive_copy_item(prepared.items[2].clone())
+        .receive_copy_item(items[2].clone())
         .await
         .unwrap();
     assert_eq!(target_application.applied.lock().unwrap().len(), 1);
@@ -3000,7 +3203,7 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .await
         .unwrap();
     let retried_final = target_runtime
-        .receive_copy_item(prepared.items[2].clone())
+        .receive_copy_item(items[2].clone())
         .await
         .unwrap();
     assert_eq!(retried_final.durable_lsn, 1);
@@ -3009,7 +3212,7 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .await
         .unwrap();
     let retried_chunk = target_runtime
-        .receive_copy_item(prepared.items[0].clone())
+        .receive_copy_item(items[0].clone())
         .await
         .unwrap();
     assert!(retried_chunk.snapshot_chunk);
@@ -3018,12 +3221,76 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .accept_copy_acknowledgement(retried_chunk)
         .await
         .unwrap();
+    let mut conflicting_chunk = items[0].clone();
+    conflicting_chunk.data.push(0xff);
+    assert!(matches!(
+        target_runtime.receive_copy_item(conflicting_chunk).await,
+        Err(RuntimeError::InvalidReplication(_))
+    ));
+    assert_eq!(
+        target_application.copy_apply_count.load(Ordering::SeqCst),
+        2
+    );
     let snapshot = target_runtime.snapshot().await;
     assert_eq!(snapshot.current_progress, 2);
     assert!(snapshot.builds[0].completed);
     let source_snapshot = source_runtime.snapshot().await;
     assert!(source_snapshot.builds[0].completed);
     assert_eq!(source_snapshot.builds[0].durable_lsn, 2);
+}
+
+#[tokio::test]
+async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
+    let application = Arc::new(TestApplication::default());
+    application.seed_operation(1, Bytes::from_static(b"seed"));
+    application
+        .pause_copy_enumeration
+        .store(true, Ordering::SeqCst);
+    let runtime = open_primary(application.clone(), vec![identity(1, "source")]).await;
+    let mut prepared = runtime
+        .prepare_copy(PrepareCopyRequest {
+            build_id: OperationId::new("streaming-copy"),
+            target: identity(1, "replacement"),
+            configuration: BuildConfiguration::Current,
+            copy_context: Box::pin(stream::iter([
+                Ok(Bytes::from_static(b"context-1")),
+                Ok(Bytes::from_static(b"context-2")),
+            ])),
+        })
+        .await
+        .unwrap();
+    application.copy_enumeration_notify.notified().await;
+    let pending = timeout(
+        Duration::from_secs(1),
+        runtime.begin_write(ClientWrite {
+            operation_id: OperationId::new("write-during-copy"),
+            data: Bytes::from_static(b"live"),
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    pending.committed().await.unwrap();
+    assert_eq!(
+        application.copy_context_items.lock().unwrap().as_slice(),
+        [
+            Bytes::from_static(b"context-1"),
+            Bytes::from_static(b"context-2")
+        ]
+    );
+    application
+        .pause_copy_enumeration
+        .store(false, Ordering::SeqCst);
+    application.resume_copy_enumeration_notify.notify_waiters();
+    let snapshot = copy_through_final(&mut prepared).await;
+    assert_eq!(
+        snapshot.iter().filter(|item| item.snapshot_chunk).count(),
+        2
+    );
+    let live = next_copy_item(&mut prepared).await;
+    assert_eq!(live.lsn, 2);
+    assert!(!live.snapshot_chunk);
+    assert!(!live.final_item);
 }
 
 #[tokio::test]
@@ -3059,15 +3326,16 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         ))
         .await
         .unwrap();
-    let prepared = source_runtime
+    let mut prepared = source_runtime
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("handoff-build"),
             target: replacement.clone(),
             configuration: BuildConfiguration::Current,
-            copy_context: Bytes::new(),
+            copy_context: empty_copy_context(),
         })
         .await
         .unwrap();
+    let items = copy_through_final(&mut prepared).await;
 
     let target_application = Arc::new(TestApplication::default());
     let target_store = Arc::new(MemoryAuthorityStore::default());
@@ -3090,7 +3358,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         ))
         .await
         .unwrap();
-    for item in prepared.items {
+    for item in items {
         target_runtime.receive_copy_item(item).await.unwrap();
     }
 
@@ -3200,9 +3468,21 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
     for item in pending.replication_items.clone() {
         let receiver = item.receiver.as_ref().unwrap();
         let ack = if receiver.instance_id == replacement.instance_id.as_str() {
-            target_runtime.receive_replication(item).await.unwrap()
+            target_runtime
+                .receive_replication(item)
+                .await
+                .unwrap()
+                .applied()
+                .await
+                .unwrap()
         } else if receiver.instance_id == secondary.instance_id.as_str() {
-            secondary_runtime.receive_replication(item).await.unwrap()
+            secondary_runtime
+                .receive_replication(item)
+                .await
+                .unwrap()
+                .applied()
+                .await
+                .unwrap()
         } else {
             continue;
         };
@@ -3255,7 +3535,13 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         })
         .unwrap()
         .clone();
-    let ack = target_runtime.receive_replication(item).await.unwrap();
+    let ack = target_runtime
+        .receive_replication(item)
+        .await
+        .unwrap()
+        .applied()
+        .await
+        .unwrap();
     source_runtime.accept_acknowledgement(ack).await.unwrap();
     assert_eq!(pending.committed().await.unwrap().committed_lsn, 3);
 }
@@ -3300,19 +3586,20 @@ async fn bootstrap_primary_builds_full_genesis_members_before_configuration_admi
         .await
         .unwrap();
 
-    let prepared = runtime
+    let mut prepared = runtime
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("bootstrap-secondary"),
             target: secondary,
             configuration: BuildConfiguration::Bootstrap(genesis),
-            copy_context: Bytes::new(),
+            copy_context: empty_copy_context(),
         })
         .await
         .unwrap();
     assert_eq!(prepared.authority.kind, BuildAuthorityKind::Bootstrap);
     assert_eq!(prepared.authority.replication_boundary_lsn, 0);
-    assert_eq!(prepared.items.len(), 1);
-    assert!(prepared.items[0].final_item);
+    let items = copy_through_final(&mut prepared).await;
+    assert_eq!(items.len(), 1);
+    assert!(items[0].final_item);
 }
 
 #[tokio::test]
@@ -3348,14 +3635,15 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         ))
         .await
         .unwrap();
-    let request = PrepareCopyRequest {
+    let request = |target| PrepareCopyRequest {
         build_id: OperationId::new("immutable-build"),
-        target: target.clone(),
+        target,
         configuration: BuildConfiguration::Current,
-        copy_context: Bytes::new(),
+        copy_context: empty_copy_context(),
     };
-    let first = runtime.prepare_copy(request.clone()).await.unwrap();
+    let mut first = runtime.prepare_copy(request(target.clone())).await.unwrap();
     assert_eq!(first.authority.replication_boundary_lsn, 0);
+    let _ = copy_through_final(&mut first).await;
     runtime
         .begin_write(ClientWrite {
             operation_id: OperationId::new("after-boundary"),
@@ -3366,19 +3654,18 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         .committed()
         .await
         .unwrap();
-    let retry = runtime.prepare_copy(request.clone()).await.unwrap();
-    assert_eq!(retry.authority.replication_boundary_lsn, 0);
-    assert!(
-        retry
-            .items
-            .iter()
-            .any(|item| item.lsn == 1 && !item.final_item)
-    );
-
-    let mut conflicting = request.clone();
-    conflicting.target = identity(2, "different-target");
+    let live = next_copy_item(&mut first).await;
+    assert_eq!(live.lsn, 1);
+    assert!(!live.final_item);
     assert!(matches!(
-        runtime.prepare_copy(conflicting).await,
+        runtime.prepare_copy(request(target.clone())).await,
+        Err(RuntimeError::ReconfigurationPending)
+    ));
+
+    assert!(matches!(
+        runtime
+            .prepare_copy(request(identity(2, "different-target")))
+            .await,
         Err(RuntimeError::AuthorityMismatch(_))
     ));
 
@@ -3401,14 +3688,12 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         ))
         .await
         .unwrap();
-    let resumed = restarted.prepare_copy(request).await.unwrap();
+    let mut resumed = restarted.prepare_copy(request(target)).await.unwrap();
     assert_eq!(resumed.authority.replication_boundary_lsn, 0);
-    assert!(
-        resumed
-            .items
-            .iter()
-            .any(|item| item.lsn == 1 && !item.final_item)
-    );
+    let _ = copy_through_final(&mut resumed).await;
+    let resumed_operation = next_copy_item(&mut resumed).await;
+    assert_eq!(resumed_operation.lsn, 1);
+    assert!(!resumed_operation.final_item);
 }
 
 #[tokio::test]
@@ -3455,21 +3740,20 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
         runtime.begin_write(write.clone()).await,
         Err(RuntimeError::Application(_))
     ));
-    let prepared = runtime
+    let mut prepared = runtime
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("final-sequence"),
             target,
             configuration: BuildConfiguration::Current,
-            copy_context: Bytes::new(),
+            copy_context: empty_copy_context(),
         })
         .await
         .unwrap();
-    let final_item = prepared
-        .items
-        .iter()
+    let final_item = copy_through_final(&mut prepared)
+        .await
+        .into_iter()
         .find(|item| item.final_item)
-        .unwrap()
-        .clone();
+        .unwrap();
     let retry = runtime.begin_write(write).await.unwrap();
     assert!(retry.build_items.is_empty());
     retry.committed().await.unwrap();
@@ -3536,15 +3820,16 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .committed()
         .await
         .unwrap();
-    let prepared = source_runtime
+    let mut prepared = source_runtime
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("restartable-build"),
             target: target.clone(),
             configuration: BuildConfiguration::Current,
-            copy_context: Bytes::new(),
+            copy_context: empty_copy_context(),
         })
         .await
         .unwrap();
+    let items = copy_through_final(&mut prepared).await;
 
     let application = Arc::new(TestApplication::default());
     let store = Arc::new(MemoryAuthorityStore::default());
@@ -3568,7 +3853,7 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .await
         .unwrap();
     first_runtime
-        .receive_copy_item(prepared.items[0].clone())
+        .receive_copy_item(items[0].clone())
         .await
         .unwrap();
 
@@ -3591,17 +3876,11 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         ))
         .await
         .unwrap();
-    restarted
-        .receive_copy_item(prepared.items[0].clone())
-        .await
-        .unwrap();
-    restarted
-        .receive_copy_item(prepared.items[1].clone())
-        .await
-        .unwrap();
+    restarted.receive_copy_item(items[0].clone()).await.unwrap();
+    restarted.receive_copy_item(items[1].clone()).await.unwrap();
     store.fail_build_progress_once.store(true, Ordering::SeqCst);
     assert!(matches!(
-        restarted.receive_copy_item(prepared.items[2].clone()).await,
+        restarted.receive_copy_item(items[2].clone()).await,
         Err(RuntimeError::Application(_))
     ));
 
@@ -3625,7 +3904,7 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .await
         .unwrap();
     let final_ack = after_final_crash
-        .receive_copy_item(prepared.items[2].clone())
+        .receive_copy_item(items[2].clone())
         .await
         .unwrap();
     assert!(final_ack.final_item);
@@ -3700,9 +3979,30 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
         ))
         .await
         .unwrap();
+    runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        ))
+        .await
+        .unwrap();
     let waiting = runtime.snapshot().await;
     assert_eq!(waiting.catch_up_boundary, Some(10));
     assert!(!waiting.catch_up_complete);
+    let pending_after_configuration = runtime
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("after-catch-up-boundary"),
+            data: Bytes::from_static(b"newer-write"),
+        })
+        .await
+        .unwrap();
 
     runtime
         .accept_acknowledgement(acknowledgement(&admitted, secondary, 10))
@@ -3711,6 +4011,20 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
     let complete = runtime.snapshot().await;
     assert_eq!(complete.current_configuration_quorum_progress, 10);
     assert!(complete.catch_up_complete);
+    timeout(
+        Duration::from_secs(1),
+        runtime
+            .primary_replicator()
+            .await
+            .unwrap()
+            .wait_for_catch_up_quorum(
+                kuberic_runtime::replicator::ReplicaSetQuorumMode::WriteQuorum,
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(pending_after_configuration);
 }
 
 #[tokio::test]

@@ -656,17 +656,39 @@ replication engine and MUST NOT be added to the public SF traits.
 
 Delivery acknowledgement is explicit and one-shot. Dropping a delivered
 operation is not durable acceptance. Application acceptance precedes durable
-authority/build progress, which precedes a peer ACK; quorum readiness precedes
-application commit and retry-record completion, which precede client success.
+authority/build applied progress, which precedes an applied peer ACK; quorum
+readiness precedes application commit and retry-record completion, which
+precede client success. A receive-only ACK may precede application acceptance
+and never grants quorum credit.
 Transport remains caller-supplied, including build request dispatch and ACK
 delivery. Waiting for a build or catch-up quorum requires observed completion,
 not successful enqueueing.
 
-Lifecycle ordering follows the v1 ownership model: promotion drives the
-replicator before the service; demotion fences access before the service and
-then drives the replicator; graceful close fences before closing the service
-and then the replicator. Failed/cancelled Open aborts created interfaces.
-Failures, cancellation, epoch regression, and stale ACKs MUST fail closed.
+Lifecycle ordering follows Service Fabric: role changes fence access as
+required, drive the replicator, and then notify the service. The completed role
+is published only after both callbacks succeed; partial completion remains
+explicit recovery evidence. Graceful close fences access, closes the
+replicator, and then closes the service. Failed/cancelled Open aborts created
+interfaces. Failures, cancellation, epoch regression, and stale ACKs MUST fail
+closed.
+
+Copy context and copy state retain their multi-item stream semantics.
+Snapshot chunks, the captured copy boundary, and post-boundary replication use
+one bounded ordered build stream. Provider enumeration does not hold the global
+runtime effect/write lock. Exact duplicate durable snapshot chunks are
+acknowledged without application redelivery; conflicting contents are rejected.
+
+The following contracts remain assigned to later phases and block an
+end-to-end Service Fabric equivalence claim:
+
+| Contract | Required owner and phase |
+|---|---|
+| Fresh endpoint/session incarnation, stale-session rejection, endpoint readiness, reconnect, ordered delivery, and cancellation | Reliable agent transport in Phase 4 |
+| Resend payload retention, truthful catch-up capability, truncation, and full-copy fallback | Reliable transport/build owner in Phases 4 and 7 |
+| Intent-before-effect and terminal-result-before-reply across process restart | SQLite agent store/runtime adapter in Phase 3 |
+| Durable demote, GetLSN, catch-up, deactivate, and activate sequencing | Replica-agent coordinator in Phase 4 |
+| Operation-specific removal, cancellation, backpressure, and reconfiguration error mapping | Runtime/agent integration in Phase 4 |
+| Crash and stale-session acceptance tests for those owners | Phases 3, 4, 7, and 9 |
 
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and
@@ -905,6 +927,11 @@ Every acknowledgement is scoped to:
 - epoch;
 - Previous/Current Configuration membership;
 - received, applied, and committed LSN as applicable.
+
+The progress ordering is `received >= applied >= committed`. Ordered receiver
+admission may publish received progress before the service durably applies the
+operation. Received progress may retire transport resend work, but only applied
+progress may contribute replication quorum credit.
 
 The required Service Fabric predicates are:
 

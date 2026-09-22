@@ -23,7 +23,6 @@ pub struct BuildAuthority {
     pub target: ReplicaIdentity,
     pub current_configuration: ConfigurationDescriptor,
     pub replication_boundary_lsn: i64,
-    pub snapshot_chunk_count: u64,
 }
 
 impl BuildAuthority {

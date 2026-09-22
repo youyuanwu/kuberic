@@ -496,7 +496,8 @@ pub fn normalize_replication_ack(
         ));
     }
     if ack.received_lsn <= 0
-        || ack.applied_lsn < ack.received_lsn
+        || ack.applied_lsn < 0
+        || ack.received_lsn < ack.applied_lsn
         || ack.committed_lsn < 0
         || ack.committed_lsn > ack.applied_lsn
     {

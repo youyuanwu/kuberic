@@ -146,6 +146,8 @@ impl StatefulServicePartition {
         let factory = self.factory.as_ref().ok_or_else(|| {
             RuntimeError::Application("select a replicator factory during Open".into())
         })?;
+        let engine = self.context.engine()?;
+        let reservation = engine.reserve_replicator_creation()?;
         let interfaces = factory
             .create_replicator(
                 self.context.clone(),
@@ -153,10 +155,13 @@ impl StatefulServicePartition {
                 settings.unwrap_or_default(),
             )
             .await?;
-        self.context
-            .engine()?
-            .register_interfaces(&interfaces, state_provider)
-            .await?;
+        if let Err(error) = engine
+            .register_interfaces(&interfaces, state_provider, reservation)
+            .await
+        {
+            interfaces.replicator.abort();
+            return Err(error);
+        }
         Ok(interfaces)
     }
 }

@@ -9,6 +9,14 @@ pub enum RuntimeError {
     NotOpen,
     #[error("runtime is not primary")]
     NotPrimary,
+    #[error("operation was cancelled")]
+    OperationCancelled,
+    #[error("replica {0} was removed")]
+    ReplicaRemoved(i64),
+    #[error("runtime reconfiguration is still pending")]
+    ReconfigurationPending,
+    #[error("bounded operation queue is full")]
+    QueueFull,
     #[error("writes are closed with status {0:?}")]
     WriteClosed(AccessStatus),
     #[error("durable authority has not been admitted")]

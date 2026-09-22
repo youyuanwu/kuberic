@@ -209,8 +209,8 @@ fn replication_ack_requires_exact_authority_and_consistent_progress() {
         previous_configuration_id: String::new(),
         current_configuration_id: "cfg".to_string(),
         received_lsn: 10,
-        applied_lsn: 10,
-        committed_lsn: 9,
+        applied_lsn: 9,
+        committed_lsn: 8,
     };
     assert!(validate_replication_ack(&ack).is_ok());
 
@@ -221,14 +221,14 @@ fn replication_ack_requires_exact_authority_and_consistent_progress() {
         previous_configuration_id: String::new(),
         current_configuration_id: "cfg".to_string(),
         lsn: 10,
-        committed_lsn: 9,
+        committed_lsn: 8,
         data: vec![1],
         receiver: ack.receiver.clone(),
     };
     assert!(validate_replication_item(&item).is_ok());
 
     let mut invalid = ack;
-    invalid.applied_lsn = 9;
+    invalid.applied_lsn = 11;
     assert!(matches!(
         validate_replication_ack(&invalid),
         Err(WireError::InvalidAuthority(_))

@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
@@ -16,7 +18,7 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch};
 
 use crate::application::{
     ClientWrite, DurableApplicationAck, DurableApplicationProgress, OpenContext, Operation,
-    StateProvider, StatefulServiceReplica, WriteReceipt,
+    OperationDataStream, StateProvider, StatefulServiceReplica, WriteReceipt,
 };
 use crate::authority::{
     AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, DurableBuildProgress,
@@ -31,7 +33,7 @@ use crate::replicator::copy::{
     BuildConfiguration, BuildProgress, PrepareCopyRequest, PreparedCopy,
 };
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
-use crate::replicator::stream::{OperationMetadata, ServiceStreams};
+use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
 use crate::replicator::{
     PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator, ReplicatorInterfaces,
     StatefulServicePartition,
@@ -44,6 +46,7 @@ pub struct RuntimeSnapshot {
     pub open: bool,
     pub replication_address: Option<String>,
     pub role: ReplicaRole,
+    pub role_transition: Option<RoleTransition>,
     pub write_status: AccessStatus,
     pub authority: Option<AdmittedAuthority>,
     pub current_progress: i64,
@@ -55,11 +58,20 @@ pub struct RuntimeSnapshot {
     pub builds: Vec<BuildPostcondition>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleTransition {
+    pub completed_role: ReplicaRole,
+    pub target_role: ReplicaRole,
+    pub replicator_completed: bool,
+    pub application_completed: bool,
+}
+
 #[derive(Debug)]
 struct RuntimeState {
     open: bool,
     replication_address: Option<String>,
     role: ReplicaRole,
+    role_transition: Option<RoleTransition>,
     write_status: AccessStatus,
     authority: Option<AdmittedAuthority>,
     replication_progress: Option<ReplicationProgress>,
@@ -82,9 +94,12 @@ struct AppliedEffect {
 #[derive(Debug, Clone)]
 struct OutboundBuild {
     progress: BuildProgress,
-    final_sequence: u64,
+    final_sequence: Option<u64>,
     next_sequence: u64,
     emitted: BTreeMap<u64, EmittedBuildItem>,
+    pending_operations: BTreeMap<i64, Operation>,
+    catching_up: bool,
+    stream_tx: mpsc::Sender<Result<proto::CopyItem>>,
     generation: u64,
 }
 
@@ -101,6 +116,17 @@ pub struct PendingWrite {
     pub build_items: Vec<proto::CopyItem>,
     completion: oneshot::Receiver<Result<i64>>,
     aborted: watch::Receiver<bool>,
+}
+
+pub struct PendingReplication {
+    pub received: proto::ReplicationAck,
+    applied: Pin<Box<dyn Future<Output = Result<proto::ReplicationAck>> + Send>>,
+}
+
+impl PendingReplication {
+    pub async fn applied(self) -> Result<proto::ReplicationAck> {
+        self.applied.await
+    }
 }
 
 impl PendingWrite {
@@ -157,7 +183,8 @@ pub(crate) struct ReplicationEngine {
     authority_store: Arc<dyn AuthorityStore>,
     state: RwLock<RuntimeState>,
     effect_lock: Mutex<()>,
-    delivery_lock: Mutex<()>,
+    copy_prepare_lock: Mutex<()>,
+    delivery_lock: Arc<Mutex<()>>,
     write_lock: Mutex<()>,
     write_generation: AtomicU64,
     fence_generation: AtomicU64,
@@ -174,6 +201,53 @@ pub(crate) struct ReplicationEngine {
     outbound_tx: mpsc::UnboundedSender<OutboundReplication>,
     outbound_rx: Mutex<mpsc::UnboundedReceiver<OutboundReplication>>,
     session_id: String,
+    replicator_creation: AtomicU8,
+}
+
+const REPLICATOR_CREATION_AVAILABLE: u8 = 0;
+const REPLICATOR_CREATION_RESERVED: u8 = 1;
+const REPLICATOR_CREATION_REGISTERED: u8 = 2;
+
+pub(crate) struct ReplicatorCreationReservation {
+    engine: Weak<ReplicationEngine>,
+    committed: bool,
+}
+
+impl ReplicatorCreationReservation {
+    fn commit(mut self) -> Result<()> {
+        let engine = self.engine.upgrade().ok_or(RuntimeError::Closed)?;
+        engine
+            .replicator_creation
+            .compare_exchange(
+                REPLICATOR_CREATION_RESERVED,
+                REPLICATOR_CREATION_REGISTERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| {
+                RuntimeError::Application(
+                    "CreateReplicator reservation was lost before registration".into(),
+                )
+            })?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ReplicatorCreationReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(engine) = self.engine.upgrade() {
+            let _ = engine.replicator_creation.compare_exchange(
+                REPLICATOR_CREATION_RESERVED,
+                REPLICATOR_CREATION_AVAILABLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
 }
 
 struct OpenAttempt<'a> {
@@ -218,6 +292,7 @@ impl PodRuntime {
                     open: false,
                     replication_address: None,
                     role: ReplicaRole::None,
+                    role_transition: None,
                     write_status: AccessStatus::NotPrimary,
                     authority: None,
                     replication_progress: None,
@@ -231,7 +306,8 @@ impl PodRuntime {
                     effects: BTreeMap::new(),
                 }),
                 effect_lock: Mutex::new(()),
-                delivery_lock: Mutex::new(()),
+                copy_prepare_lock: Mutex::new(()),
+                delivery_lock: Arc::new(Mutex::new(())),
                 write_lock: Mutex::new(()),
                 write_generation: AtomicU64::new(0),
                 fence_generation: AtomicU64::new(0),
@@ -247,6 +323,7 @@ impl PodRuntime {
                 outbound_tx,
                 outbound_rx: Mutex::new(outbound_rx),
                 session_id: uuid::Uuid::new_v4().to_string(),
+                replicator_creation: AtomicU8::new(REPLICATOR_CREATION_AVAILABLE),
             }),
         }
     }
@@ -289,8 +366,8 @@ impl PodRuntime {
     pub async fn receive_replication(
         &self,
         item: proto::ReplicationItem,
-    ) -> Result<proto::ReplicationAck> {
-        self.engine.receive_replication(item).await
+    ) -> Result<PendingReplication> {
+        self.engine.clone().receive_replication(item).await
     }
 
     pub async fn snapshot(&self) -> RuntimeSnapshot {
@@ -330,10 +407,32 @@ impl ReplicationEngine {
         }
     }
 
+    pub(crate) fn reserve_replicator_creation(
+        self: &Arc<Self>,
+    ) -> Result<ReplicatorCreationReservation> {
+        self.replicator_creation
+            .compare_exchange(
+                REPLICATOR_CREATION_AVAILABLE,
+                REPLICATOR_CREATION_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| {
+                RuntimeError::Application(
+                    "CreateReplicator may be called only once per Open".into(),
+                )
+            })?;
+        Ok(ReplicatorCreationReservation {
+            engine: Arc::downgrade(self),
+            committed: false,
+        })
+    }
+
     pub(crate) async fn register_interfaces(
         &self,
         interfaces: &ReplicatorInterfaces,
         provider: Arc<dyn StateProvider>,
+        reservation: ReplicatorCreationReservation,
     ) -> Result<()> {
         let mut control = self.control.write().await;
         if control.is_some() {
@@ -347,6 +446,7 @@ impl ReplicationEngine {
         if installed.is_none() {
             *installed = Some(provider);
         }
+        reservation.commit()?;
         Ok(())
     }
 
@@ -456,6 +556,7 @@ impl ReplicationEngine {
             let mut state = self.state.write().await;
             state.open = false;
             state.write_status = AccessStatus::NotPrimary;
+            state.outbound_builds.clear();
         }
         self.replicator.lock().await.close()?;
         self.closed.store(true, Ordering::Release);
@@ -474,6 +575,9 @@ impl ReplicationEngine {
             && let Some(streams) = streams.as_ref()
         {
             streams.shutdown();
+        }
+        if let Ok(mut state) = self.state.try_write() {
+            state.outbound_builds.clear();
         }
         self.changed.notify_waiters();
     }
@@ -633,10 +737,7 @@ impl ReplicationEngine {
                 ));
             }
             let complete = match mode {
-                ReplicaSetQuorumMode::WriteQuorum => {
-                    log.catch_up_complete()
-                        && log.current_configuration_quorum_progress() >= boundary
-                }
+                ReplicaSetQuorumMode::WriteQuorum => log.catch_up_complete(),
                 ReplicaSetQuorumMode::All => log.all_caught_up(boundary),
             };
             drop(log);
@@ -683,7 +784,9 @@ impl ReplicationEngine {
                 .removed_replicas
                 .contains(&replica.identity.replica_id)
             {
-                return Err(RuntimeError::Closed);
+                return Err(RuntimeError::ReplicaRemoved(
+                    replica.identity.replica_id.value(),
+                ));
             }
             if state.authority.as_ref().map(|a| a.fence()) != fence {
                 return Err(RuntimeError::AuthorityMismatch(
@@ -998,52 +1101,42 @@ impl ReplicationEngine {
         }
         let mut state = self.state.write().await;
         state.current_progress = durable_ack.applied_lsn;
-        let build_items = state
+        let mut live_items = Vec::new();
+        for build in state
             .outbound_builds
             .values_mut()
             .filter(|build| build_operation.lsn > build.progress.authority.replication_boundary_lsn)
-            .map(|build| {
-                let sequence = build.progress.authority.snapshot_chunk_count
-                    + 1
-                    + (build_operation.lsn - build.progress.authority.replication_boundary_lsn)
-                        as u64;
-                build.next_sequence = build.next_sequence.max(sequence + 1);
-                let item = proto::CopyItem {
-                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-                    build_id: build.progress.authority.build_id.to_string(),
-                    sender: Some(build.progress.authority.source.clone().into()),
-                    receiver: Some(build.progress.authority.target.clone().into()),
-                    epoch: Some(build.progress.authority.current_configuration.epoch.into()),
-                    current_configuration_id: build
-                        .progress
-                        .authority
-                        .current_configuration
-                        .configuration_id
-                        .to_string(),
-                    sequence,
+        {
+            if build.final_sequence.is_none() || build.catching_up {
+                build
+                    .pending_operations
+                    .insert(build_operation.lsn, build_operation.clone());
+                continue;
+            }
+            let sequence = build.next_sequence;
+            build.next_sequence += 1;
+            let item = copy_operation_item(&build.progress.authority, sequence, &build_operation);
+            build.emitted.insert(
+                sequence,
+                EmittedBuildItem {
                     lsn: build_operation.lsn,
-                    committed_lsn: build_operation.committed_lsn.min(build_operation.lsn),
-                    replication_boundary_lsn: build.progress.authority.replication_boundary_lsn,
                     final_item: false,
-                    data: build_operation.data.to_vec(),
                     snapshot_chunk: false,
-                };
-                build.emitted.insert(
-                    sequence,
-                    EmittedBuildItem {
-                        lsn: build_operation.lsn,
-                        final_item: false,
-                        snapshot_chunk: false,
-                    },
-                );
-                item
-            })
-            .collect();
+                },
+            );
+            live_items.push((build.stream_tx.clone(), item));
+        }
         drop(state);
+        for (sender, item) in live_items {
+            sender
+                .send(Ok(item))
+                .await
+                .map_err(|_| RuntimeError::Closed)?;
+        }
         Ok(PendingWrite {
             lsn,
             replication_items: items,
-            build_items,
+            build_items: Vec::new(),
             completion,
             aborted: self.abort_signal.subscribe(),
         })
@@ -1070,6 +1163,13 @@ impl ReplicationEngine {
     }
 
     pub async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        let _prepare = self.copy_prepare_lock.lock().await;
+        let PrepareCopyRequest {
+            build_id,
+            target,
+            configuration,
+            copy_context,
+        } = request;
         let _guard = self.effect_lock.lock().await;
         let prepare_generation = self.fence_generation.load(Ordering::Acquire);
         let state = self.state.read().await;
@@ -1079,7 +1179,7 @@ impl ReplicationEngine {
         if state.role != ReplicaRole::Primary {
             return Err(RuntimeError::NotPrimary);
         }
-        let (kind, configuration) = match request.configuration.clone() {
+        let (kind, configuration) = match configuration {
             BuildConfiguration::Current => {
                 let authority = state
                     .authority
@@ -1110,7 +1210,7 @@ impl ReplicationEngine {
         drop(replicator);
         let application_progress = self.storage().await?.durable_progress().await?;
         let current_highest = replicator_progress.max(application_progress.applied_lsn);
-        let existing = self.authority_store.load_build(&request.build_id).await?;
+        let existing = self.authority_store.load_build(&build_id).await?;
         let boundary = existing.as_ref().map_or(current_highest, |authority| {
             authority.replication_boundary_lsn
         });
@@ -1119,26 +1219,13 @@ impl ReplicationEngine {
                 "application progress regressed below the copy boundary".to_string(),
             ));
         }
-        let mut copy_stream = self
-            .provider()
-            .await?
-            .get_copy_state(
-                boundary,
-                Box::pin(futures::stream::iter([Ok(request.copy_context)])),
-            )
-            .await?;
-        let mut chunks = Vec::new();
-        while let Some(chunk) = copy_stream.next().await {
-            chunks.push(chunk?);
-        }
         let candidate = BuildAuthority {
-            build_id: request.build_id.clone(),
+            build_id: build_id.clone(),
             kind,
             source: self.identity.clone(),
-            target: request.target,
+            target,
             current_configuration: configuration,
             replication_boundary_lsn: boundary,
-            snapshot_chunk_count: chunks.len() as u64,
         };
         candidate.validate()?;
         let build_authority = if let Some(existing) = existing {
@@ -1194,80 +1281,6 @@ impl ReplicationEngine {
             ));
         }
 
-        let mut items = Vec::with_capacity(chunks.len() + operations.len() + 1);
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            items.push(proto::CopyItem {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-                build_id: build_authority.build_id.to_string(),
-                sender: Some(build_authority.source.clone().into()),
-                receiver: Some(build_authority.target.clone().into()),
-                epoch: Some(build_authority.current_configuration.epoch.into()),
-                current_configuration_id: build_authority
-                    .current_configuration
-                    .configuration_id
-                    .to_string(),
-                sequence: index as u64 + 1,
-                lsn: 0,
-                committed_lsn: 0,
-                replication_boundary_lsn: boundary,
-                final_item: false,
-                data: chunk.to_vec(),
-                snapshot_chunk: true,
-            });
-        }
-        let final_sequence = build_authority.snapshot_chunk_count + 1;
-        items.push(proto::CopyItem {
-            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-            build_id: build_authority.build_id.to_string(),
-            sender: Some(build_authority.source.clone().into()),
-            receiver: Some(build_authority.target.clone().into()),
-            epoch: Some(build_authority.current_configuration.epoch.into()),
-            current_configuration_id: build_authority
-                .current_configuration
-                .configuration_id
-                .to_string(),
-            sequence: final_sequence,
-            lsn: boundary,
-            committed_lsn: committed_lsn.min(boundary),
-            replication_boundary_lsn: boundary,
-            final_item: true,
-            data: Vec::new(),
-            snapshot_chunk: false,
-        });
-        for operation in operations.into_values() {
-            items.push(proto::CopyItem {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-                build_id: build_authority.build_id.to_string(),
-                sender: Some(build_authority.source.clone().into()),
-                receiver: Some(build_authority.target.clone().into()),
-                epoch: Some(build_authority.current_configuration.epoch.into()),
-                current_configuration_id: build_authority
-                    .current_configuration
-                    .configuration_id
-                    .to_string(),
-                sequence: final_sequence + (operation.lsn - boundary) as u64,
-                lsn: operation.lsn,
-                committed_lsn: operation.committed_lsn.min(operation.lsn),
-                replication_boundary_lsn: boundary,
-                final_item: false,
-                data: operation.data.to_vec(),
-                snapshot_chunk: false,
-            });
-        }
-        items.sort_by_key(|item| item.sequence);
-        let emitted = items
-            .iter()
-            .map(|item| {
-                (
-                    item.sequence,
-                    EmittedBuildItem {
-                        lsn: item.lsn,
-                        final_item: item.final_item,
-                        snapshot_chunk: item.snapshot_chunk,
-                    },
-                )
-            })
-            .collect();
         self.check_delivery_generation(prepare_generation)?;
         let replicator_epoch = self.replicator.lock().await.epoch();
         if replicator_epoch != Epoch::default()
@@ -1277,20 +1290,251 @@ impl ReplicationEngine {
                 "build authority was fenced during preparation".into(),
             ));
         }
+        if self
+            .state
+            .read()
+            .await
+            .outbound_builds
+            .contains_key(&build_authority.build_id)
+        {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        let (stream_tx, stream_rx) = mpsc::channel(64);
         self.state.write().await.outbound_builds.insert(
             build_authority.build_id.clone(),
             OutboundBuild {
                 progress: build_progress,
-                final_sequence,
-                next_sequence: final_sequence + (current_highest - boundary) as u64 + 1,
-                emitted,
+                final_sequence: None,
+                next_sequence: 1,
+                emitted: BTreeMap::new(),
+                pending_operations: BTreeMap::new(),
+                catching_up: true,
+                stream_tx: stream_tx.clone(),
                 generation: prepare_generation,
             },
         );
+        drop(_guard);
+        let copy_stream = match self
+            .provider()
+            .await?
+            .get_copy_state(boundary, copy_context)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.state
+                    .write()
+                    .await
+                    .outbound_builds
+                    .remove(&build_authority.build_id);
+                return Err(error);
+            }
+        };
+        let engine = self.weak_self.upgrade().ok_or(RuntimeError::Closed)?;
+        let producer_authority = build_authority.clone();
+        tokio::spawn(async move {
+            engine
+                .produce_copy_stream(
+                    producer_authority,
+                    committed_lsn,
+                    copy_stream,
+                    operations,
+                    stream_tx,
+                    prepare_generation,
+                )
+                .await;
+        });
+        let items = Box::pin(futures::stream::unfold(stream_rx, |mut receiver| async {
+            receiver.recv().await.map(|item| (item, receiver))
+        }));
         Ok(PreparedCopy {
             authority: build_authority,
             items,
         })
+    }
+
+    async fn produce_copy_stream(
+        &self,
+        authority: BuildAuthority,
+        committed_lsn: i64,
+        mut copy_stream: OperationDataStream,
+        initial_operations: BTreeMap<i64, Operation>,
+        sender: mpsc::Sender<Result<proto::CopyItem>>,
+        generation: u64,
+    ) {
+        let result = self
+            .produce_copy_stream_inner(
+                &authority,
+                committed_lsn,
+                &mut copy_stream,
+                initial_operations,
+                &sender,
+                generation,
+            )
+            .await;
+        if let Err(error) = result {
+            let mut state = self.state.write().await;
+            if state
+                .outbound_builds
+                .get(&authority.build_id)
+                .is_some_and(|build| build.generation == generation)
+            {
+                state.outbound_builds.remove(&authority.build_id);
+            }
+            drop(state);
+            let _ = sender.send(Err(error)).await;
+        }
+    }
+
+    async fn produce_copy_stream_inner(
+        &self,
+        authority: &BuildAuthority,
+        committed_lsn: i64,
+        copy_stream: &mut OperationDataStream,
+        initial_operations: BTreeMap<i64, Operation>,
+        sender: &mpsc::Sender<Result<proto::CopyItem>>,
+        generation: u64,
+    ) -> Result<()> {
+        let mut sequence = 1;
+        while let Some(chunk) = copy_stream.next().await {
+            self.check_delivery_generation(generation)?;
+            let item = copy_snapshot_item(authority, sequence, chunk?);
+            self.record_emitted_copy_item(authority, &item, generation)
+                .await?;
+            sender
+                .send(Ok(item))
+                .await
+                .map_err(|_| RuntimeError::OperationCancelled)?;
+            sequence += 1;
+        }
+
+        self.check_delivery_generation(generation)?;
+        let final_item = copy_final_item(authority, sequence, committed_lsn);
+        {
+            let mut state = self.state.write().await;
+            let build = state
+                .outbound_builds
+                .get_mut(&authority.build_id)
+                .ok_or(RuntimeError::OperationCancelled)?;
+            if build.generation != generation {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "copy stream belongs to a fenced generation".into(),
+                ));
+            }
+            build.final_sequence = Some(sequence);
+            build.next_sequence = sequence + 1;
+            build.emitted.insert(
+                sequence,
+                EmittedBuildItem {
+                    lsn: final_item.lsn,
+                    final_item: true,
+                    snapshot_chunk: false,
+                },
+            );
+        }
+        sender
+            .send(Ok(final_item))
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)?;
+
+        for operation in initial_operations.into_values() {
+            self.emit_copy_operation(authority, operation, sender, generation)
+                .await?;
+        }
+        loop {
+            let pending = {
+                let mut state = self.state.write().await;
+                let build = state
+                    .outbound_builds
+                    .get_mut(&authority.build_id)
+                    .ok_or(RuntimeError::OperationCancelled)?;
+                if build.generation != generation {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "copy stream belongs to a fenced generation".into(),
+                    ));
+                }
+                if build.pending_operations.is_empty() {
+                    build.catching_up = false;
+                    BTreeMap::new()
+                } else {
+                    std::mem::take(&mut build.pending_operations)
+                }
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for operation in pending.into_values() {
+                self.emit_copy_operation(authority, operation, sender, generation)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_emitted_copy_item(
+        &self,
+        authority: &BuildAuthority,
+        item: &proto::CopyItem,
+        generation: u64,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        let build = state
+            .outbound_builds
+            .get_mut(&authority.build_id)
+            .ok_or(RuntimeError::OperationCancelled)?;
+        if build.generation != generation {
+            return Err(RuntimeError::AuthorityMismatch(
+                "copy stream belongs to a fenced generation".into(),
+            ));
+        }
+        build.next_sequence = build.next_sequence.max(item.sequence + 1);
+        build.emitted.insert(
+            item.sequence,
+            EmittedBuildItem {
+                lsn: item.lsn,
+                final_item: item.final_item,
+                snapshot_chunk: item.snapshot_chunk,
+            },
+        );
+        Ok(())
+    }
+
+    async fn emit_copy_operation(
+        &self,
+        authority: &BuildAuthority,
+        operation: Operation,
+        sender: &mpsc::Sender<Result<proto::CopyItem>>,
+        generation: u64,
+    ) -> Result<()> {
+        self.check_delivery_generation(generation)?;
+        let item = {
+            let mut state = self.state.write().await;
+            let build = state
+                .outbound_builds
+                .get_mut(&authority.build_id)
+                .ok_or(RuntimeError::OperationCancelled)?;
+            if build.generation != generation {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "copy stream belongs to a fenced generation".into(),
+                ));
+            }
+            let sequence = build.next_sequence;
+            build.next_sequence += 1;
+            let item = copy_operation_item(authority, sequence, &operation);
+            build.emitted.insert(
+                sequence,
+                EmittedBuildItem {
+                    lsn: operation.lsn,
+                    final_item: false,
+                    snapshot_chunk: false,
+                },
+            );
+            item
+        };
+        sender
+            .send(Ok(item))
+            .await
+            .map_err(|_| RuntimeError::OperationCancelled)
     }
 
     pub async fn accept_copy_acknowledgement(&self, ack: proto::CopyAck) -> Result<()> {
@@ -1340,7 +1584,8 @@ impl ReplicationEngine {
             })?;
         if acknowledgement.final_item != emitted.final_item
             || acknowledgement.snapshot_chunk != emitted.snapshot_chunk
-            || acknowledgement.final_item != (acknowledgement.sequence == build.final_sequence)
+            || acknowledgement.final_item
+                != (build.final_sequence == Some(acknowledgement.sequence))
         {
             return Err(RuntimeError::InvalidReplication(
                 "copy acknowledgement does not match an emitted item".to_string(),
@@ -1434,29 +1679,33 @@ impl ReplicationEngine {
                 "copy item belongs to a fenced epoch".into(),
             ));
         }
-        let final_sequence = authority.snapshot_chunk_count + 1;
-        let expected_snapshot_chunk = envelope.sequence <= authority.snapshot_chunk_count;
-        let expected_final = envelope.sequence == final_sequence;
-        if envelope.snapshot_chunk != expected_snapshot_chunk
-            || envelope.final_item != expected_final
+        if envelope.sequence > progress.last_sequence
+            && ((!progress.completed && !envelope.snapshot_chunk && !envelope.final_item)
+                || (progress.completed && (envelope.snapshot_chunk || envelope.final_item)))
         {
             return Err(RuntimeError::InvalidReplication(
-                "copy item kind does not match its authority-bound sequence".to_string(),
+                "copy item kind does not match the current build phase".to_string(),
             ));
         }
 
         let durable_lsn = if envelope.sequence <= progress.last_sequence {
             if envelope.snapshot_chunk {
-                self.service_streams()
+                if !self
+                    .storage()
                     .await?
-                    .copy(
-                        OperationMetadata::Copy {
-                            build_id: envelope.build_id.clone(),
-                            sequence: envelope.sequence,
+                    .verify_copy_chunk(
+                        &envelope.build_id,
+                        envelope.sequence,
+                        &crate::application::CopyChunk {
+                            data: Bytes::from(envelope.data.clone()),
                         },
-                        Bytes::from(envelope.data.clone()),
                     )
-                    .await?;
+                    .await?
+                {
+                    return Err(RuntimeError::InvalidReplication(
+                        "duplicate snapshot chunk has conflicting durable contents".to_string(),
+                    ));
+                }
                 0
             } else if envelope.final_item {
                 if !progress.completed {
@@ -1618,10 +1867,10 @@ impl ReplicationEngine {
     }
 
     pub async fn receive_replication(
-        &self,
+        self: Arc<Self>,
         item: proto::ReplicationItem,
-    ) -> Result<proto::ReplicationAck> {
-        let _delivery = self.delivery_lock.lock().await;
+    ) -> Result<PendingReplication> {
+        let delivery = self.delivery_lock.clone().lock_owned().await;
         let delivery_generation = self.fence_generation.load(Ordering::Acquire);
         self.check_aborted()?;
         let envelope = normalize_replication_item(item)
@@ -1690,7 +1939,74 @@ impl ReplicationEngine {
             data: Bytes::from(envelope.data.clone()),
         };
         let application_progress = self.storage().await?.durable_progress().await?;
-        let durable_ack = if envelope.lsn <= application_progress.applied_lsn {
+        let completion = if envelope.lsn <= application_progress.applied_lsn {
+            None
+        } else {
+            if envelope.lsn != application_progress.applied_lsn + 1 {
+                return Err(RuntimeError::InvalidReplication(format!(
+                    "application gap: expected LSN {}, observed {}",
+                    application_progress.applied_lsn + 1,
+                    envelope.lsn
+                )));
+            }
+            Some(
+                self.service_streams()
+                    .await?
+                    .enqueue_replication(operation.clone())
+                    .await?,
+            )
+        };
+        let received_applied_lsn = replication_progress
+            .verified_lsn
+            .min(application_progress.applied_lsn);
+        let received = proto::ReplicationAck {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            sender: Some(envelope.sender.clone().into()),
+            receiver: Some(self.identity.clone().into()),
+            epoch: Some(envelope.epoch.into()),
+            previous_configuration_id: envelope
+                .previous_configuration_id
+                .clone()
+                .map_or_else(String::new, |configuration_id| configuration_id.to_string()),
+            current_configuration_id: envelope.current_configuration_id.to_string(),
+            received_lsn: envelope.lsn,
+            applied_lsn: received_applied_lsn,
+            committed_lsn: application_progress.committed_lsn.min(received_applied_lsn),
+        };
+        let engine = self.clone();
+        let applied = Box::pin(async move {
+            let _delivery = delivery;
+            engine
+                .complete_replication_delivery(
+                    delivery_generation,
+                    authority,
+                    envelope,
+                    operation,
+                    application_progress,
+                    completion,
+                    &mut replication_progress,
+                )
+                .await
+        });
+        Ok(PendingReplication { received, applied })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_replication_delivery(
+        &self,
+        delivery_generation: u64,
+        authority: AdmittedAuthority,
+        envelope: kuberic_wire::ReplicationEnvelope,
+        operation: Operation,
+        application_progress: DurableApplicationProgress,
+        completion: Option<OperationCompletion>,
+        replication_progress: &mut ReplicationProgress,
+    ) -> Result<proto::ReplicationAck> {
+        let durable_ack = if let Some(completion) = completion {
+            let durable_ack = completion.completed().await?;
+            validate_durable_ack(envelope.lsn, envelope.committed_lsn, durable_ack)?;
+            durable_ack
+        } else {
             if !self.storage().await?.verify_applied(&operation).await? {
                 return Err(RuntimeError::InvalidReplication(
                     "authority operation conflicts with durable application state".to_string(),
@@ -1701,17 +2017,6 @@ impl ReplicationEngine {
             } else {
                 application_progress
             }
-        } else {
-            if envelope.lsn != application_progress.applied_lsn + 1 {
-                return Err(RuntimeError::InvalidReplication(format!(
-                    "application gap: expected LSN {}, observed {}",
-                    application_progress.applied_lsn + 1,
-                    envelope.lsn
-                )));
-            }
-            let durable_ack = self.service_streams().await?.replication(operation).await?;
-            validate_durable_ack(envelope.lsn, envelope.committed_lsn, durable_ack)?;
-            durable_ack
         };
         self.check_delivery_generation(delivery_generation)?;
         let current_state = self.state.read().await;
@@ -1735,7 +2040,7 @@ impl ReplicationEngine {
         if envelope.lsn == replication_progress.verified_lsn + 1 {
             replication_progress.verified_lsn = envelope.lsn;
             self.authority_store
-                .record_replication_progress(&replication_progress)
+                .record_replication_progress(replication_progress)
                 .await?;
             self.check_delivery_generation(delivery_generation)?;
         }
@@ -1770,6 +2075,7 @@ impl ReplicationEngine {
         let snapshot = (
             state.open,
             state.role,
+            state.role_transition.clone(),
             state.write_status,
             state.authority.clone(),
             state.current_progress,
@@ -1787,16 +2093,17 @@ impl ReplicationEngine {
             open: snapshot.0 && !self.aborted.load(Ordering::Acquire),
             replication_address: self.state.read().await.replication_address.clone(),
             role: snapshot.1,
-            write_status: snapshot.2,
-            authority: snapshot.3,
-            current_progress: snapshot.4,
-            verified_replication_lsn: snapshot.5,
-            committed_lsn: snapshot.6.max(replicator.committed_lsn()),
+            role_transition: snapshot.2,
+            write_status: snapshot.3,
+            authority: snapshot.4,
+            current_progress: snapshot.5,
+            verified_replication_lsn: snapshot.6,
+            committed_lsn: snapshot.7.max(replicator.committed_lsn()),
             current_configuration_quorum_progress: replicator
                 .current_configuration_quorum_progress(),
             catch_up_boundary: replicator.catch_up_boundary(),
             catch_up_complete: replicator.catch_up_complete(),
-            builds: snapshot.7,
+            builds: snapshot.8,
         }
     }
 
@@ -1988,24 +2295,48 @@ impl ReplicationEngine {
                     .map_or_else(kuberic_protocol::types::Epoch::default, |authority| {
                         authority.current_configuration.epoch
                     });
-                let promotion = role == ReplicaRole::Primary
-                    || (role == ReplicaRole::ActiveSecondary
-                        && state.role == ReplicaRole::IdleSecondary);
+                let completed_role = state.role;
+                let transition = state.role_transition.clone();
                 drop(state);
                 self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
                 self.replicator.lock().await.fence_client_writes();
-                if role != ReplicaRole::Primary {
-                    self.state.write().await.role = role;
-                }
-                self.changed.notify_waiters();
-                if promotion {
-                    self.control().await?.change_role(epoch, role).await?;
-                    self.state.write().await.role = role;
-                    let _ = self.application.change_role(role).await?;
+                let transition = if let Some(transition) = transition {
+                    if transition.target_role != role {
+                        return Err(RuntimeError::ReconfigurationPending);
+                    }
+                    transition
                 } else {
-                    let _ = self.application.change_role(role).await?;
+                    let transition = RoleTransition {
+                        completed_role,
+                        target_role: role,
+                        replicator_completed: false,
+                        application_completed: false,
+                    };
+                    self.state.write().await.role_transition = Some(transition.clone());
+                    transition
+                };
+                self.changed.notify_waiters();
+                if !transition.replicator_completed {
                     self.control().await?.change_role(epoch, role).await?;
+                    let mut state = self.state.write().await;
+                    let active = state
+                        .role_transition
+                        .as_mut()
+                        .ok_or(RuntimeError::ReconfigurationPending)?;
+                    active.replicator_completed = true;
                 }
+                if !transition.application_completed {
+                    let _ = self.application.change_role(role).await?;
+                    let mut state = self.state.write().await;
+                    let active = state
+                        .role_transition
+                        .as_mut()
+                        .ok_or(RuntimeError::ReconfigurationPending)?;
+                    active.application_completed = true;
+                }
+                let mut state = self.state.write().await;
+                state.role = role;
+                state.role_transition = None;
             }
             RuntimeEffectAction::SetWriteStatus(write_status) => {
                 let state = self.state.read().await;
@@ -2067,11 +2398,27 @@ impl ReplicationEngine {
                 }
                 self.replicator.lock().await.fence_client_writes();
                 self.changed.notify_waiters();
-                self.application.close().await?;
-                self.control().await?.close().await?;
+                if let Err(error) = self.control().await?.close().await {
+                    self.control_abort();
+                    self.application.abort();
+                    let mut state = self.state.write().await;
+                    state.role = ReplicaRole::None;
+                    state.role_transition = None;
+                    state.write_status = AccessStatus::NotPrimary;
+                    return Err(error);
+                }
+                if let Err(error) = self.application.close().await {
+                    self.application.abort();
+                    let mut state = self.state.write().await;
+                    state.role = ReplicaRole::None;
+                    state.role_transition = None;
+                    state.write_status = AccessStatus::NotPrimary;
+                    return Err(error);
+                }
                 self.closed.store(true, Ordering::Release);
                 let mut state = self.state.write().await;
                 state.role = ReplicaRole::None;
+                state.role_transition = None;
                 state.write_status = AccessStatus::NotPrimary;
             }
             RuntimeEffectAction::Abort => {
@@ -2079,6 +2426,7 @@ impl ReplicationEngine {
                     let mut state = self.state.write().await;
                     state.open = false;
                     state.role = ReplicaRole::None;
+                    state.role_transition = None;
                     state.write_status = AccessStatus::NotPrimary;
                 }
                 self.replicator.lock().await.fence_client_writes();
@@ -2097,6 +2445,7 @@ impl ReplicationEngine {
         let postcondition = (
             state.open,
             state.role,
+            state.role_transition.clone(),
             state.write_status,
             state.authority.clone(),
             state.current_progress,
@@ -2112,16 +2461,17 @@ impl ReplicationEngine {
         RuntimePostcondition {
             open: postcondition.0,
             role: postcondition.1,
-            write_status: postcondition.2,
-            authority: postcondition.3,
-            current_progress: postcondition.4,
-            verified_replication_lsn: postcondition.5,
-            committed_lsn: postcondition.6.max(replicator.committed_lsn()),
+            role_transition: postcondition.2,
+            write_status: postcondition.3,
+            authority: postcondition.4,
+            current_progress: postcondition.5,
+            verified_replication_lsn: postcondition.6,
+            committed_lsn: postcondition.7.max(replicator.committed_lsn()),
             current_configuration_quorum_progress: replicator
                 .current_configuration_quorum_progress(),
             catch_up_boundary: replicator.catch_up_boundary(),
             catch_up_complete: replicator.catch_up_complete(),
-            builds: postcondition.7,
+            builds: postcondition.8,
         }
     }
 
@@ -2320,6 +2670,68 @@ fn insert_copy_operation(
     }
     operations.insert(operation.lsn, operation);
     Ok(())
+}
+
+fn copy_snapshot_item(authority: &BuildAuthority, sequence: u64, data: Bytes) -> proto::CopyItem {
+    proto::CopyItem {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: authority.build_id.to_string(),
+        sender: Some(authority.source.clone().into()),
+        receiver: Some(authority.target.clone().into()),
+        epoch: Some(authority.current_configuration.epoch.into()),
+        current_configuration_id: authority.current_configuration.configuration_id.to_string(),
+        sequence,
+        lsn: 0,
+        committed_lsn: 0,
+        replication_boundary_lsn: authority.replication_boundary_lsn,
+        final_item: false,
+        data: data.to_vec(),
+        snapshot_chunk: true,
+    }
+}
+
+fn copy_final_item(
+    authority: &BuildAuthority,
+    sequence: u64,
+    committed_lsn: i64,
+) -> proto::CopyItem {
+    proto::CopyItem {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: authority.build_id.to_string(),
+        sender: Some(authority.source.clone().into()),
+        receiver: Some(authority.target.clone().into()),
+        epoch: Some(authority.current_configuration.epoch.into()),
+        current_configuration_id: authority.current_configuration.configuration_id.to_string(),
+        sequence,
+        lsn: authority.replication_boundary_lsn,
+        committed_lsn: committed_lsn.min(authority.replication_boundary_lsn),
+        replication_boundary_lsn: authority.replication_boundary_lsn,
+        final_item: true,
+        data: Vec::new(),
+        snapshot_chunk: false,
+    }
+}
+
+fn copy_operation_item(
+    authority: &BuildAuthority,
+    sequence: u64,
+    operation: &Operation,
+) -> proto::CopyItem {
+    proto::CopyItem {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: authority.build_id.to_string(),
+        sender: Some(authority.source.clone().into()),
+        receiver: Some(authority.target.clone().into()),
+        epoch: Some(authority.current_configuration.epoch.into()),
+        current_configuration_id: authority.current_configuration.configuration_id.to_string(),
+        sequence,
+        lsn: operation.lsn,
+        committed_lsn: operation.committed_lsn.min(operation.lsn),
+        replication_boundary_lsn: authority.replication_boundary_lsn,
+        final_item: false,
+        data: operation.data.to_vec(),
+        snapshot_chunk: false,
+    }
 }
 
 fn build_handoff_matches(build: &BuildAuthority, authority: &AdmittedAuthority) -> bool {

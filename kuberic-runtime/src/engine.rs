@@ -29,6 +29,12 @@ pub trait DurableState: Send + Sync {
         sequence: u64,
         chunk: CopyChunk,
     ) -> Result<()>;
+    async fn verify_copy_chunk(
+        &self,
+        build_id: &OperationId,
+        sequence: u64,
+        chunk: &CopyChunk,
+    ) -> Result<bool>;
     async fn finish_copy(
         &self,
         build_id: &OperationId,
