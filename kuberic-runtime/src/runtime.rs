@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -21,8 +21,9 @@ use crate::application::{
     OperationDataStream, StateProvider, StatefulServiceReplica, WriteReceipt,
 };
 use crate::authority::{
-    AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, DurableBuildProgress,
-    DurableLocalWrite, LocalWritePhase, ReplicationProgress,
+    AdmittedAuthority, AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
+    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
+    LocalWritePhase, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use crate::effects::{
     BuildPostcondition, RuntimeControlPlane, RuntimeEffect, RuntimeEffectAction,
@@ -35,8 +36,9 @@ use crate::replicator::copy::{
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
 use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
 use crate::replicator::{
-    PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode, Replicator, ReplicatorInterfaces,
-    StatefulServicePartition,
+    DefaultReplicatorDependencies, ManagedReplicator, PartitionAccessView, PrimaryReplicator,
+    ReplicaInformation, ReplicaSetQuorumMode, Replicator, ReplicatorFactoryContext,
+    ReplicatorInterfaces, StatefulServicePartition,
 };
 use crate::{Result, RuntimeError};
 
@@ -82,7 +84,6 @@ struct RuntimeState {
     outbound_builds: BTreeMap<OperationId, OutboundBuild>,
     removed_replicas: BTreeSet<ReplicaId>,
     local_writes: BTreeMap<OperationId, DurableLocalWrite>,
-    effects: BTreeMap<u64, AppliedEffect>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,22 +149,12 @@ impl PendingWrite {
 }
 
 pub struct PodRuntime {
-    engine: Arc<ReplicationEngine>,
+    host: Arc<RuntimeHost>,
 }
 
 impl Drop for PodRuntime {
     fn drop(&mut self) {
-        if !self.engine.closed.load(Ordering::Acquire)
-            && !self.engine.aborted.load(Ordering::Acquire)
-        {
-            self.engine.control_abort();
-            if let Ok(control) = self.engine.control.try_read()
-                && let Some(control) = control.as_ref()
-            {
-                self.engine.application.abort();
-                control.abort();
-            }
-        }
+        self.host.abort();
     }
 }
 
@@ -176,11 +167,41 @@ pub enum OutboundReplication {
     Remove(ReplicaId),
 }
 
-pub(crate) struct ReplicationEngine {
+#[derive(Debug)]
+struct HostState {
+    effects: BTreeMap<u64, AppliedEffect>,
+    fallback_snapshot: RuntimeSnapshot,
+}
+
+struct RegisteredReplicator {
+    control: Arc<dyn Replicator>,
+    primary: Option<Arc<dyn PrimaryReplicator>>,
+    provider: Arc<dyn StateProvider>,
+    managed: Option<Arc<dyn ManagedReplicator>>,
+}
+
+pub(crate) struct RuntimeHost {
+    identity: ReplicaIdentity,
+    application: Arc<dyn StatefulServiceReplica>,
+    default_dependencies: DefaultReplicatorDependencies,
+    state: RwLock<HostState>,
+    effect_lock: Mutex<()>,
+    registered: OnceLock<RegisteredReplicator>,
+    weak_self: Weak<Self>,
+    aborted: AtomicBool,
+    closed: AtomicBool,
+    replicator_creation: AtomicU8,
+}
+
+pub(crate) struct DefaultReplicatorInner {
     pub(crate) identity: ReplicaIdentity,
     application: Arc<dyn StatefulServiceReplica>,
     storage: RwLock<Option<Arc<dyn DurableState>>>,
-    authority_store: Arc<dyn AuthorityStore>,
+    replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
+    replication_progress_store: Arc<dyn ReplicationProgressStore>,
+    local_write_journal: Arc<dyn LocalWriteJournal>,
+    build_authority_store: Arc<dyn BuildAuthorityStore>,
+    build_progress_store: Arc<dyn BuildProgressStore>,
     state: RwLock<RuntimeState>,
     effect_lock: Mutex<()>,
     copy_prepare_lock: Mutex<()>,
@@ -198,10 +219,9 @@ pub(crate) struct ReplicationEngine {
     closed: AtomicBool,
     abort_signal: watch::Sender<bool>,
     changed: Notify,
-    outbound_tx: mpsc::UnboundedSender<OutboundReplication>,
-    outbound_rx: Mutex<mpsc::UnboundedReceiver<OutboundReplication>>,
+    outbound_tx: mpsc::Sender<OutboundReplication>,
+    outbound_rx: Mutex<mpsc::Receiver<OutboundReplication>>,
     session_id: String,
-    replicator_creation: AtomicU8,
 }
 
 const REPLICATOR_CREATION_AVAILABLE: u8 = 0;
@@ -209,15 +229,14 @@ const REPLICATOR_CREATION_RESERVED: u8 = 1;
 const REPLICATOR_CREATION_REGISTERED: u8 = 2;
 
 pub(crate) struct ReplicatorCreationReservation {
-    engine: Weak<ReplicationEngine>,
+    host: Weak<RuntimeHost>,
     committed: bool,
 }
 
 impl ReplicatorCreationReservation {
     fn commit(mut self) -> Result<()> {
-        let engine = self.engine.upgrade().ok_or(RuntimeError::Closed)?;
-        engine
-            .replicator_creation
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        host.replicator_creation
             .compare_exchange(
                 REPLICATOR_CREATION_RESERVED,
                 REPLICATOR_CREATION_REGISTERED,
@@ -239,8 +258,8 @@ impl Drop for ReplicatorCreationReservation {
         if self.committed {
             return;
         }
-        if let Some(engine) = self.engine.upgrade() {
-            let _ = engine.replicator_creation.compare_exchange(
+        if let Some(host) = self.host.upgrade() {
+            let _ = host.replicator_creation.compare_exchange(
                 REPLICATOR_CREATION_RESERVED,
                 REPLICATOR_CREATION_AVAILABLE,
                 Ordering::AcqRel,
@@ -251,20 +270,14 @@ impl Drop for ReplicatorCreationReservation {
 }
 
 struct OpenAttempt<'a> {
-    engine: &'a ReplicationEngine,
+    host: &'a RuntimeHost,
     complete: bool,
 }
 
 impl Drop for OpenAttempt<'_> {
     fn drop(&mut self) {
         if !self.complete {
-            self.engine.control_abort();
-            if let Ok(control) = self.engine.control.try_read()
-                && let Some(control) = control.as_ref()
-            {
-                control.abort();
-            }
-            self.engine.application.abort();
+            self.host.abort();
         }
     }
 }
@@ -279,131 +292,134 @@ impl PodRuntime {
         A: StatefulServiceReplica + 'static,
         S: AuthorityStore + 'static,
     {
-        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel();
-        let (abort_signal, _) = watch::channel(false);
+        let application: Arc<dyn StatefulServiceReplica> = application;
+        let replica_authority_store: Arc<dyn ReplicaAuthorityStore> = authority_store.clone();
+        let replication_progress_store: Arc<dyn ReplicationProgressStore> = authority_store.clone();
+        let local_write_journal: Arc<dyn LocalWriteJournal> = authority_store.clone();
+        let build_authority_store: Arc<dyn BuildAuthorityStore> = authority_store.clone();
+        let build_progress_store: Arc<dyn BuildProgressStore> = authority_store;
+        let fallback_snapshot = empty_snapshot(identity.clone());
         Self {
-            engine: Arc::new_cyclic(|weak_self| ReplicationEngine {
-                replicator: Mutex::new(ReplicationLog::new(identity.clone())),
+            host: Arc::new_cyclic(|weak_self| RuntimeHost {
                 identity,
-                application,
-                storage: RwLock::new(None),
-                authority_store,
-                state: RwLock::new(RuntimeState {
-                    open: false,
-                    replication_address: None,
-                    role: ReplicaRole::None,
-                    role_transition: None,
-                    write_status: AccessStatus::NotPrimary,
-                    authority: None,
-                    replication_progress: None,
-                    current_progress: 0,
-                    committed_lsn: 0,
-                    builds: BTreeMap::new(),
-                    inbound_build_generations: BTreeMap::new(),
-                    outbound_builds: BTreeMap::new(),
-                    removed_replicas: BTreeSet::new(),
-                    local_writes: BTreeMap::new(),
+                application: application.clone(),
+                default_dependencies: DefaultReplicatorDependencies {
+                    application,
+                    replica_authority_store,
+                    replication_progress_store,
+                    local_write_journal,
+                    build_authority_store,
+                    build_progress_store,
+                },
+                state: RwLock::new(HostState {
                     effects: BTreeMap::new(),
+                    fallback_snapshot,
                 }),
                 effect_lock: Mutex::new(()),
-                copy_prepare_lock: Mutex::new(()),
-                delivery_lock: Arc::new(Mutex::new(())),
-                write_lock: Mutex::new(()),
-                write_generation: AtomicU64::new(0),
-                fence_generation: AtomicU64::new(0),
-                control: RwLock::new(None),
-                primary: RwLock::new(None),
-                provider: RwLock::new(None),
-                streams: RwLock::new(None),
+                registered: OnceLock::new(),
                 weak_self: weak_self.clone(),
                 aborted: AtomicBool::new(false),
                 closed: AtomicBool::new(false),
-                abort_signal,
-                changed: Notify::new(),
-                outbound_tx,
-                outbound_rx: Mutex::new(outbound_rx),
-                session_id: uuid::Uuid::new_v4().to_string(),
                 replicator_creation: AtomicU8::new(REPLICATOR_CREATION_AVAILABLE),
             }),
         }
     }
 
     pub async fn serve<C: RuntimeControlPlane>(&self, control_plane: &mut C) -> Result<()> {
-        self.engine.serve(control_plane).await
+        self.host.serve(control_plane).await
     }
 
     pub async fn restore_authority(&self) -> Result<()> {
-        self.engine.restore_authority().await
+        self.host.managed()?.restore_authority().await
     }
 
     pub async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
-        self.engine.apply_effect(effect).await
+        self.host.apply_effect(effect).await
     }
 
     pub async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
-        self.engine.begin_write(write).await
+        self.host.managed()?.begin_write(write).await
     }
 
     pub async fn accept_acknowledgement(
         &self,
         acknowledgement: proto::ReplicationAck,
     ) -> Result<()> {
-        self.engine.accept_acknowledgement(acknowledgement).await
+        self.host
+            .managed()?
+            .accept_acknowledgement(acknowledgement)
+            .await
     }
 
     pub async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
-        self.engine.prepare_copy(request).await
+        self.host.managed()?.prepare_copy(request).await
     }
 
     pub async fn accept_copy_acknowledgement(&self, ack: proto::CopyAck) -> Result<()> {
-        self.engine.accept_copy_acknowledgement(ack).await
+        self.host.managed()?.accept_copy_acknowledgement(ack).await
     }
 
     pub async fn receive_copy_item(&self, item: proto::CopyItem) -> Result<proto::CopyAck> {
-        self.engine.receive_copy_item(item).await
+        self.host.managed()?.receive_copy_item(item).await
     }
 
     pub async fn receive_replication(
         &self,
         item: proto::ReplicationItem,
     ) -> Result<PendingReplication> {
-        self.engine.clone().receive_replication(item).await
+        self.host.managed()?.receive_replication(item).await
     }
 
     pub async fn snapshot(&self) -> RuntimeSnapshot {
-        self.engine.snapshot().await
+        self.host.snapshot().await
     }
 
     pub async fn next_outbound(&self) -> Option<OutboundReplication> {
-        self.engine.outbound_rx.lock().await.recv().await
+        self.host.managed().ok()?.next_outbound().await
     }
 
     pub async fn primary_replicator(&self) -> Result<Arc<dyn PrimaryReplicator>> {
-        self.engine
-            .primary
-            .read()
-            .await
-            .clone()
+        self.host
+            .registered
+            .get()
+            .and_then(|registered| registered.primary.clone())
             .ok_or(RuntimeError::NotOpen)
     }
 }
 
-impl ReplicationEngine {
-    fn check_aborted(&self) -> Result<()> {
-        if self.aborted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
-            Err(RuntimeError::Closed)
-        } else {
-            Ok(())
-        }
+struct HostAccessView {
+    host: Weak<RuntimeHost>,
+}
+
+#[async_trait::async_trait]
+impl PartitionAccessView for HostAccessView {
+    async fn write_status(&self) -> Result<AccessStatus> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        Ok(host.snapshot().await.write_status)
+    }
+}
+
+impl RuntimeHost {
+    fn managed(&self) -> Result<Arc<dyn ManagedReplicator>> {
+        let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        registered.managed.clone().ok_or_else(|| {
+            RuntimeError::Application(
+                "the selected replicator does not expose Kuberic managed data-plane capabilities"
+                    .into(),
+            )
+        })
     }
 
-    fn check_delivery_generation(&self, generation: u64) -> Result<()> {
-        if self.fence_generation.load(Ordering::Acquire) != generation {
-            Err(RuntimeError::AuthorityMismatch(
-                "delivery was fenced before acknowledgement".into(),
-            ))
-        } else {
-            self.check_aborted()
+    fn abort(&self) {
+        if self.closed.load(Ordering::Acquire) || self.aborted.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.application.abort();
+        if let Some(registered) = self.registered.get() {
+            registered.control.abort();
+            if let Some(managed) = registered.managed.as_ref() {
+                managed.abort();
+            }
         }
     }
 
@@ -423,7 +439,7 @@ impl ReplicationEngine {
                 )
             })?;
         Ok(ReplicatorCreationReservation {
-            engine: Arc::downgrade(self),
+            host: Arc::downgrade(self),
             committed: false,
         })
     }
@@ -434,19 +450,323 @@ impl ReplicationEngine {
         provider: Arc<dyn StateProvider>,
         reservation: ReplicatorCreationReservation,
     ) -> Result<()> {
+        if let Some(managed) = interfaces.managed_replicator.as_ref() {
+            managed
+                .attach_interfaces(
+                    interfaces.replicator.clone(),
+                    interfaces.primary_replicator.clone(),
+                )
+                .await?;
+        }
+        let registered = RegisteredReplicator {
+            control: interfaces.replicator.clone(),
+            primary: interfaces.primary_replicator.clone(),
+            provider,
+            managed: interfaces.managed_replicator.clone(),
+        };
+        self.registered.set(registered).map_err(|_| {
+            RuntimeError::Application("CreateReplicator may be called only once per Open".into())
+        })?;
+        reservation.commit()?;
+        Ok(())
+    }
+
+    async fn serve<C>(&self, control_plane: &mut C) -> Result<()>
+    where
+        C: RuntimeControlPlane,
+    {
+        while let Some(effect) = control_plane.next_effect().await? {
+            let result = self.apply_effect(effect).await?;
+            control_plane.publish(result).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        let _guard = self.effect_lock.lock().await;
+        {
+            let state = self.state.read().await;
+            if let Some(previous) = state.effects.get(&effect.sequence) {
+                if effect == previous.effect {
+                    return Ok(previous.result.clone());
+                }
+                return Err(RuntimeError::EffectConflict {
+                    sequence: effect.sequence,
+                });
+            }
+            let expected = state
+                .effects
+                .last_key_value()
+                .map_or(1, |(sequence, _)| sequence + 1);
+            if effect.sequence != expected {
+                return Err(RuntimeError::EffectOutOfOrder {
+                    expected,
+                    observed: effect.sequence,
+                });
+            }
+        }
+        if !matches!(effect.action, RuntimeEffectAction::Abort)
+            && (self.aborted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire))
+        {
+            return Err(RuntimeError::Closed);
+        }
+        match effect.action.clone() {
+            RuntimeEffectAction::Open(mode) => self.open(mode).await?,
+            action => {
+                if let Ok(managed) = self.managed() {
+                    managed.execute_action(action.clone()).await?;
+                    match action {
+                        RuntimeEffectAction::Close => {
+                            self.closed.store(true, Ordering::Release);
+                        }
+                        RuntimeEffectAction::Abort => {
+                            self.aborted.store(true, Ordering::Release);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    self.execute_custom_action(action).await?;
+                }
+            }
+        }
+        let result = RuntimeEffectResult {
+            operation_id: effect.operation_id.clone(),
+            sequence: effect.sequence,
+            postcondition: snapshot_postcondition(self.snapshot().await),
+        };
+        self.state.write().await.effects.insert(
+            result.sequence,
+            AppliedEffect {
+                effect,
+                result: result.clone(),
+            },
+        );
+        Ok(result)
+    }
+
+    async fn open(&self, mode: crate::application::OpenMode) -> Result<()> {
+        if self.registered.get().is_some() {
+            return Err(RuntimeError::Application("replica already opened".into()));
+        }
+        let mut attempt = OpenAttempt {
+            host: self,
+            complete: false,
+        };
+        let context = ReplicatorFactoryContext::new(
+            self.identity.clone(),
+            Arc::new(HostAccessView {
+                host: self.weak_self.clone(),
+            }),
+            DefaultReplicatorDependencies {
+                application: self.default_dependencies.application.clone(),
+                replica_authority_store: self.default_dependencies.replica_authority_store.clone(),
+                replication_progress_store: self
+                    .default_dependencies
+                    .replication_progress_store
+                    .clone(),
+                local_write_journal: self.default_dependencies.local_write_journal.clone(),
+                build_authority_store: self.default_dependencies.build_authority_store.clone(),
+                build_progress_store: self.default_dependencies.build_progress_store.clone(),
+            },
+        );
+        let control = self
+            .application
+            .clone()
+            .open(OpenContext {
+                identity: self.identity.clone(),
+                mode,
+                partition: StatefulServicePartition::new(self.weak_self.clone(), context),
+            })
+            .await?;
+        let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        if !Arc::ptr_eq(&control, &registered.control) {
+            control.abort();
+            return Err(RuntimeError::Application(
+                "Open returned a different replicator than CreateReplicator".into(),
+            ));
+        }
+        let address = registered.control.open().await?;
+        if let Some(managed) = registered.managed.as_ref() {
+            managed.complete_open(address).await?;
+        } else {
+            let progress = registered.control.current_progress().await?;
+            let committed = registered.provider.last_committed_lsn().await?;
+            let mut state = self.state.write().await;
+            state.fallback_snapshot.open = true;
+            state.fallback_snapshot.replication_address = Some(address);
+            state.fallback_snapshot.current_progress = progress;
+            state.fallback_snapshot.committed_lsn = committed;
+        }
+        attempt.complete = true;
+        Ok(())
+    }
+
+    async fn execute_custom_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        match action {
+            RuntimeEffectAction::ChangeRole(role) => {
+                let epoch = self
+                    .state
+                    .read()
+                    .await
+                    .fallback_snapshot
+                    .authority
+                    .as_ref()
+                    .map_or_else(Epoch::default, |authority| {
+                        authority.current_configuration.epoch
+                    });
+                registered.control.change_role(epoch, role).await?;
+                let _ = self.application.change_role(role).await?;
+                let mut state = self.state.write().await;
+                state.fallback_snapshot.role = role;
+                state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
+            }
+            RuntimeEffectAction::SetWriteStatus(status) => {
+                self.state.write().await.fallback_snapshot.write_status = status;
+            }
+            RuntimeEffectAction::RefreshApplicationProgress => {
+                let current = registered.control.current_progress().await?;
+                let committed = registered.provider.last_committed_lsn().await?;
+                let mut state = self.state.write().await;
+                state.fallback_snapshot.current_progress = current;
+                state.fallback_snapshot.committed_lsn = committed;
+            }
+            RuntimeEffectAction::Close => {
+                registered.control.close().await?;
+                self.application.close().await?;
+                self.closed.store(true, Ordering::Release);
+                let mut state = self.state.write().await;
+                state.fallback_snapshot.open = false;
+                state.fallback_snapshot.role = ReplicaRole::None;
+                state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+            }
+            RuntimeEffectAction::Abort => {
+                self.abort();
+                let mut state = self.state.write().await;
+                state.fallback_snapshot.open = false;
+                state.fallback_snapshot.role = ReplicaRole::None;
+                state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+            }
+            RuntimeEffectAction::AdmitAuthority(_)
+            | RuntimeEffectAction::AdmitBuildAuthority(_)
+            | RuntimeEffectAction::RetireBuild(_) => {
+                return Err(RuntimeError::Application(
+                    "the selected custom replicator does not expose managed authority/build capabilities"
+                        .into(),
+                ));
+            }
+            RuntimeEffectAction::Open(_) => {
+                return Err(RuntimeError::Application(
+                    "Open must be executed by the hosting runtime".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        if let Ok(managed) = self.managed() {
+            managed.snapshot().await
+        } else {
+            let mut snapshot = self.state.read().await.fallback_snapshot.clone();
+            if self.aborted.load(Ordering::Acquire) {
+                snapshot.open = false;
+            }
+            snapshot
+        }
+    }
+}
+
+impl DefaultReplicatorInner {
+    pub(crate) fn new(
+        identity: ReplicaIdentity,
+        application: Arc<dyn StatefulServiceReplica>,
+        replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
+        replication_progress_store: Arc<dyn ReplicationProgressStore>,
+        local_write_journal: Arc<dyn LocalWriteJournal>,
+        build_authority_store: Arc<dyn BuildAuthorityStore>,
+        build_progress_store: Arc<dyn BuildProgressStore>,
+    ) -> Arc<Self> {
+        let (outbound_tx, outbound_rx) = mpsc::channel(64);
+        let (abort_signal, _) = watch::channel(false);
+        Arc::new_cyclic(|weak_self| Self {
+            replicator: Mutex::new(ReplicationLog::new(identity.clone())),
+            identity,
+            application,
+            storage: RwLock::new(None),
+            replica_authority_store,
+            replication_progress_store,
+            local_write_journal,
+            build_authority_store,
+            build_progress_store,
+            state: RwLock::new(RuntimeState {
+                open: false,
+                replication_address: None,
+                role: ReplicaRole::None,
+                role_transition: None,
+                write_status: AccessStatus::NotPrimary,
+                authority: None,
+                replication_progress: None,
+                current_progress: 0,
+                committed_lsn: 0,
+                builds: BTreeMap::new(),
+                inbound_build_generations: BTreeMap::new(),
+                outbound_builds: BTreeMap::new(),
+                removed_replicas: BTreeSet::new(),
+                local_writes: BTreeMap::new(),
+            }),
+            effect_lock: Mutex::new(()),
+            copy_prepare_lock: Mutex::new(()),
+            delivery_lock: Arc::new(Mutex::new(())),
+            write_lock: Mutex::new(()),
+            write_generation: AtomicU64::new(0),
+            fence_generation: AtomicU64::new(0),
+            control: RwLock::new(None),
+            primary: RwLock::new(None),
+            provider: RwLock::new(None),
+            streams: RwLock::new(None),
+            weak_self: weak_self.clone(),
+            aborted: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            abort_signal,
+            changed: Notify::new(),
+            outbound_tx,
+            outbound_rx: Mutex::new(outbound_rx),
+            session_id: uuid::Uuid::new_v4().to_string(),
+        })
+    }
+
+    fn check_aborted(&self) -> Result<()> {
+        if self.aborted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            Err(RuntimeError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn check_delivery_generation(&self, generation: u64) -> Result<()> {
+        if self.fence_generation.load(Ordering::Acquire) != generation {
+            Err(RuntimeError::AuthorityMismatch(
+                "delivery was fenced before acknowledgement".into(),
+            ))
+        } else {
+            self.check_aborted()
+        }
+    }
+
+    pub(crate) async fn attach_interfaces(
+        &self,
+        control_interface: Arc<dyn Replicator>,
+        primary_interface: Option<Arc<dyn PrimaryReplicator>>,
+    ) -> Result<()> {
         let mut control = self.control.write().await;
         if control.is_some() {
             return Err(RuntimeError::Application(
-                "CreateReplicator may be called only once per Open".into(),
+                "default replicator interfaces are already attached".into(),
             ));
         }
-        *control = Some(interfaces.replicator.clone());
-        *self.primary.write().await = interfaces.primary_replicator.clone();
-        let mut installed = self.provider.write().await;
-        if installed.is_none() {
-            *installed = Some(provider);
-        }
-        reservation.commit()?;
+        *control = Some(control_interface);
+        *self.primary.write().await = primary_interface;
         Ok(())
     }
 
@@ -606,7 +926,7 @@ impl ReplicationEngine {
     ) -> Result<()> {
         self.fence_generation.fetch_add(1, Ordering::AcqRel);
         let _delivery = self.delivery_lock.lock().await;
-        self.authority_store
+        self.local_write_journal
             .reset_local_writes_after_data_loss(committed_lsn)
             .await?;
         self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
@@ -668,13 +988,6 @@ impl ReplicationEngine {
         Ok(())
     }
 
-    pub(crate) async fn write_status(&self) -> AccessStatus {
-        if self.check_aborted().is_err() {
-            return AccessStatus::NotPrimary;
-        }
-        self.state.read().await.write_status
-    }
-
     pub(crate) async fn configure_replicas(
         &self,
         current: ConfigurationDescriptor,
@@ -682,7 +995,7 @@ impl ReplicationEngine {
     ) -> Result<()> {
         self.check_aborted()?;
         let authority = self
-            .authority_store
+            .replica_authority_store
             .load()
             .await?
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
@@ -768,9 +1081,8 @@ impl ReplicationEngine {
             .await
             .removed_replicas
             .remove(&replica.identity.replica_id);
-        self.outbound_tx
-            .send(OutboundReplication::Build(replica.clone()))
-            .map_err(|_| RuntimeError::Closed)?;
+        self.send_outbound(OutboundReplication::Build(replica.clone()))
+            .await?;
         loop {
             let changed = self.changed.notified();
             self.require_primary().await?;
@@ -829,9 +1141,9 @@ impl ReplicationEngine {
             .outbound_builds
             .retain(|_, build| build.progress.authority.target.replica_id != replica_id);
         state.removed_replicas.insert(replica_id);
-        self.outbound_tx
-            .send(OutboundReplication::Remove(replica_id))
-            .map_err(|_| RuntimeError::Closed)?;
+        drop(state);
+        self.send_outbound(OutboundReplication::Remove(replica_id))
+            .await?;
         self.changed.notify_waiters();
         Ok(())
     }
@@ -851,32 +1163,31 @@ impl ReplicationEngine {
 
     pub(crate) async fn publish_replication(&self, pending: &PendingWrite) -> Result<()> {
         for item in &pending.replication_items {
-            self.outbound_tx
-                .send(OutboundReplication::Replication(item.clone()))
-                .map_err(|_| RuntimeError::Closed)?;
+            self.send_outbound(OutboundReplication::Replication(item.clone()))
+                .await?;
         }
         for item in &pending.build_items {
-            self.outbound_tx
-                .send(OutboundReplication::Copy(item.clone()))
-                .map_err(|_| RuntimeError::Closed)?;
+            self.send_outbound(OutboundReplication::Copy(item.clone()))
+                .await?;
         }
         Ok(())
     }
 
-    pub async fn serve<C>(&self, control_plane: &mut C) -> Result<()>
-    where
-        C: RuntimeControlPlane,
-    {
-        while let Some(effect) = control_plane.next_effect().await? {
-            let result = self.apply_effect(effect).await?;
-            control_plane.publish(result).await?;
+    async fn send_outbound(&self, outbound: OutboundReplication) -> Result<()> {
+        let mut aborted = self.abort_signal.subscribe();
+        if *aborted.borrow() {
+            return Err(RuntimeError::Closed);
         }
-        Ok(())
+        tokio::select! {
+            biased;
+            _ = aborted.changed() => Err(RuntimeError::Closed),
+            result = self.outbound_tx.send(outbound) => result.map_err(|_| RuntimeError::Closed),
+        }
     }
 
     pub async fn restore_authority(&self) -> Result<()> {
         let _guard = self.effect_lock.lock().await;
-        let Some(authority) = self.authority_store.load().await? else {
+        let Some(authority) = self.replica_authority_store.load().await? else {
             return Ok(());
         };
         authority.validate()?;
@@ -912,50 +1223,6 @@ impl ReplicationEngine {
         state.authority = Some(authority);
         state.replication_progress = Some(replication_progress);
         Ok(())
-    }
-
-    pub async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
-        let _guard = self.effect_lock.lock().await;
-        {
-            let state = self.state.read().await;
-            if let Some(previous) = state.effects.get(&effect.sequence) {
-                if effect == previous.effect {
-                    return Ok(previous.result.clone());
-                }
-                return Err(RuntimeError::EffectConflict {
-                    sequence: effect.sequence,
-                });
-            }
-            let expected = state
-                .effects
-                .last_key_value()
-                .map_or(1, |(sequence, _)| sequence + 1);
-            if effect.sequence != expected {
-                return Err(RuntimeError::EffectOutOfOrder {
-                    expected,
-                    observed: effect.sequence,
-                });
-            }
-        }
-
-        if !matches!(effect.action, RuntimeEffectAction::Abort) {
-            self.check_aborted()?;
-        }
-        self.execute_action(effect.action.clone()).await?;
-        self.changed.notify_waiters();
-        let result = RuntimeEffectResult {
-            operation_id: effect.operation_id.clone(),
-            sequence: effect.sequence,
-            postcondition: self.postcondition().await,
-        };
-        self.state.write().await.effects.insert(
-            result.sequence,
-            AppliedEffect {
-                effect,
-                result: result.clone(),
-            },
-        );
-        Ok(result)
     }
 
     pub async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
@@ -994,7 +1261,7 @@ impl ReplicationEngine {
         drop(state);
 
         let durable_write = if let Some(existing) = self
-            .authority_store
+            .local_write_journal
             .load_local_write(&write.operation_id)
             .await?
         {
@@ -1012,7 +1279,9 @@ impl ReplicationEngine {
                 data: write.data.clone(),
                 phase: LocalWritePhase::Reserved,
             };
-            self.authority_store.record_local_write(&reserved).await?;
+            self.local_write_journal
+                .record_local_write(&reserved)
+                .await?;
             self.state
                 .write()
                 .await
@@ -1074,7 +1343,9 @@ impl ReplicationEngine {
             phase: LocalWritePhase::Registered,
             ..durable_write
         };
-        self.authority_store.record_local_write(&registered).await?;
+        self.local_write_journal
+            .record_local_write(&registered)
+            .await?;
         self.state
             .write()
             .await
@@ -1150,7 +1421,7 @@ impl ReplicationEngine {
         let acknowledgement = normalize_replication_ack(acknowledgement)
             .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
         self.check_aborted()?;
-        let durable_authority = self.authority_store.load().await?;
+        let durable_authority = self.replica_authority_store.load().await?;
         if durable_authority != self.state.read().await.authority {
             return Err(RuntimeError::AuthorityMismatch(
                 "acknowledgement authority differs from durable admission".into(),
@@ -1210,7 +1481,7 @@ impl ReplicationEngine {
         drop(replicator);
         let application_progress = self.storage().await?.durable_progress().await?;
         let current_highest = replicator_progress.max(application_progress.applied_lsn);
-        let existing = self.authority_store.load_build(&build_id).await?;
+        let existing = self.build_authority_store.load_build(&build_id).await?;
         let boundary = existing.as_ref().map_or(current_highest, |authority| {
             authority.replication_boundary_lsn
         });
@@ -1236,11 +1507,11 @@ impl ReplicationEngine {
             }
             existing
         } else {
-            self.authority_store.admit_build(&candidate).await?;
+            self.build_authority_store.admit_build(&candidate).await?;
             candidate
         };
         let build_progress = self
-            .authority_store
+            .build_progress_store
             .load_build_progress(&build_authority.build_id)
             .await?
             .unwrap_or(DurableBuildProgress {
@@ -1610,7 +1881,7 @@ impl ReplicationEngine {
         if acknowledgement.final_item {
             progress.completed = true;
         }
-        self.authority_store
+        self.build_progress_store
             .record_build_progress(&progress)
             .await?;
         self.check_delivery_generation(delivery_generation)?;
@@ -1662,7 +1933,7 @@ impl ReplicationEngine {
             ));
         }
         let authority = self
-            .authority_store
+            .build_authority_store
             .load_build(&envelope.build_id)
             .await?
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
@@ -1753,7 +2024,9 @@ impl ReplicationEngine {
                     completed: false,
                 };
                 self.check_delivery_generation(delivery_generation)?;
-                self.authority_store.record_build_progress(&updated).await?;
+                self.build_progress_store
+                    .record_build_progress(&updated)
+                    .await?;
                 self.check_delivery_generation(delivery_generation)?;
                 self.state
                     .write()
@@ -1789,7 +2062,9 @@ impl ReplicationEngine {
                     completed: true,
                 };
                 self.check_delivery_generation(delivery_generation)?;
-                self.authority_store.record_build_progress(&updated).await?;
+                self.build_progress_store
+                    .record_build_progress(&updated)
+                    .await?;
                 self.check_delivery_generation(delivery_generation)?;
                 let mut state = self.state.write().await;
                 state.builds.insert(envelope.build_id.clone(), updated);
@@ -1841,7 +2116,9 @@ impl ReplicationEngine {
                     completed: progress.completed,
                 };
                 self.check_delivery_generation(delivery_generation)?;
-                self.authority_store.record_build_progress(&updated).await?;
+                self.build_progress_store
+                    .record_build_progress(&updated)
+                    .await?;
                 self.check_delivery_generation(delivery_generation)?;
                 let mut state = self.state.write().await;
                 state.builds.insert(envelope.build_id.clone(), updated);
@@ -1890,7 +2167,7 @@ impl ReplicationEngine {
         let role = state.role;
         drop(state);
         let authority = self
-            .authority_store
+            .replica_authority_store
             .load()
             .await?
             .ok_or(RuntimeError::AuthorityNotAdmitted)?;
@@ -2031,7 +2308,7 @@ impl ReplicationEngine {
                 "replication epoch changed before service acknowledgement".into(),
             ));
         }
-        if self.authority_store.load().await?.as_ref() != Some(&authority) {
+        if self.replica_authority_store.load().await?.as_ref() != Some(&authority) {
             return Err(RuntimeError::AuthorityMismatch(
                 "durable authority changed before service acknowledgement".into(),
             ));
@@ -2039,7 +2316,7 @@ impl ReplicationEngine {
         self.check_delivery_generation(delivery_generation)?;
         if envelope.lsn == replication_progress.verified_lsn + 1 {
             replication_progress.verified_lsn = envelope.lsn;
-            self.authority_store
+            self.replication_progress_store
                 .record_replication_progress(replication_progress)
                 .await?;
             self.check_delivery_generation(delivery_generation)?;
@@ -2107,66 +2384,34 @@ impl ReplicationEngine {
         }
     }
 
+    async fn complete_open(&self, replication_address: String) -> Result<()> {
+        let progress = if let Some(storage) = self.storage.read().await.clone() {
+            storage.durable_progress().await?
+        } else {
+            DurableApplicationProgress {
+                applied_lsn: self.control().await?.current_progress().await?,
+                committed_lsn: 0,
+            }
+        };
+        let local_writes = self.local_write_journal.load_local_writes().await?;
+        let mut state = self.state.write().await;
+        state.open = true;
+        state.replication_address = Some(replication_address);
+        state.current_progress = progress.applied_lsn;
+        state.committed_lsn = progress.committed_lsn;
+        state.local_writes = local_writes
+            .into_iter()
+            .map(|write| (write.operation_id.clone(), write))
+            .collect();
+        Ok(())
+    }
+
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
         match action {
-            RuntimeEffectAction::Open(mode) => {
-                if self.control.read().await.is_some() {
-                    return Err(RuntimeError::Application("replica already opened".into()));
-                }
-                let mut attempt = OpenAttempt {
-                    engine: self,
-                    complete: false,
-                };
-                let control = self
-                    .application
-                    .clone()
-                    .open(OpenContext {
-                        identity: self.identity.clone(),
-                        mode,
-                        partition: StatefulServicePartition::new(self.weak_self.clone()),
-                    })
-                    .await?;
-                let registered = match self.control().await {
-                    Ok(registered) => registered,
-                    Err(error) => {
-                        control.abort();
-                        return Err(error);
-                    }
-                };
-                if !Arc::ptr_eq(&control, &registered) {
-                    control.abort();
-                    return Err(RuntimeError::Application(
-                        "Open must return the partition-created control interface".into(),
-                    ));
-                }
-                let opened = async {
-                    let address = control.open().await?;
-                    let progress = if let Some(storage) = self.storage.read().await.clone() {
-                        storage.durable_progress().await?
-                    } else {
-                        DurableApplicationProgress {
-                            applied_lsn: control.current_progress().await?,
-                            committed_lsn: 0,
-                        }
-                    };
-                    Ok((
-                        address,
-                        progress,
-                        self.authority_store.load_local_writes().await?,
-                    ))
-                }
-                .await;
-                let (address, progress, local_writes) = opened?;
-                let mut state = self.state.write().await;
-                state.open = true;
-                state.replication_address = Some(address);
-                state.current_progress = progress.applied_lsn;
-                state.committed_lsn = progress.committed_lsn;
-                state.local_writes = local_writes
-                    .into_iter()
-                    .map(|write| (write.operation_id.clone(), write))
-                    .collect();
-                attempt.complete = true;
+            RuntimeEffectAction::Open(_) => {
+                return Err(RuntimeError::Application(
+                    "Open must be executed by the hosting runtime".into(),
+                ));
             }
             RuntimeEffectAction::AdmitAuthority(authority) => {
                 let authority = *authority;
@@ -2206,7 +2451,7 @@ impl ReplicationEngine {
                     }
                     self.replicator.lock().await.fence_client_writes();
                 }
-                self.authority_store.admit(&authority).await?;
+                self.replica_authority_store.admit(&authority).await?;
                 let state = self.state.read().await;
                 let current_progress = state.current_progress;
                 let previous_epoch = state
@@ -2244,7 +2489,10 @@ impl ReplicationEngine {
                         "build authority does not address this runtime".to_string(),
                     ));
                 }
-                if let Some(existing) = self.authority_store.load_build(&authority.build_id).await?
+                if let Some(existing) = self
+                    .build_authority_store
+                    .load_build(&authority.build_id)
+                    .await?
                 {
                     if existing != authority {
                         return Err(RuntimeError::AuthorityMismatch(
@@ -2252,10 +2500,10 @@ impl ReplicationEngine {
                         ));
                     }
                 } else {
-                    self.authority_store.admit_build(&authority).await?;
+                    self.build_authority_store.admit_build(&authority).await?;
                 }
                 let progress = self
-                    .authority_store
+                    .build_progress_store
                     .load_build_progress(&authority.build_id)
                     .await?
                     .unwrap_or(DurableBuildProgress {
@@ -2440,41 +2688,6 @@ impl ReplicationEngine {
         Ok(())
     }
 
-    async fn postcondition(&self) -> RuntimePostcondition {
-        let state = self.state.read().await;
-        let postcondition = (
-            state.open,
-            state.role,
-            state.role_transition.clone(),
-            state.write_status,
-            state.authority.clone(),
-            state.current_progress,
-            state
-                .replication_progress
-                .as_ref()
-                .map(|progress| progress.verified_lsn),
-            state.committed_lsn,
-            build_postconditions(&state),
-        );
-        drop(state);
-        let replicator = self.replicator.lock().await;
-        RuntimePostcondition {
-            open: postcondition.0,
-            role: postcondition.1,
-            role_transition: postcondition.2,
-            write_status: postcondition.3,
-            authority: postcondition.4,
-            current_progress: postcondition.5,
-            verified_replication_lsn: postcondition.6,
-            committed_lsn: postcondition.7.max(replicator.committed_lsn()),
-            current_configuration_quorum_progress: replicator
-                .current_configuration_quorum_progress(),
-            catch_up_boundary: replicator.catch_up_boundary(),
-            catch_up_complete: replicator.catch_up_complete(),
-            builds: postcondition.8,
-        }
-    }
-
     async fn configure_admitted_authority(
         &self,
         authority: &AdmittedAuthority,
@@ -2535,7 +2748,7 @@ impl ReplicationEngine {
             })
             .collect::<Vec<_>>();
         for write in &committed_writes {
-            self.authority_store.record_local_write(write).await?;
+            self.local_write_journal.record_local_write(write).await?;
         }
         self.replicator.lock().await.finalize_commit(ready_lsn)?;
         let mut state = self.state.write().await;
@@ -2551,7 +2764,7 @@ impl ReplicationEngine {
         authority: &AdmittedAuthority,
     ) -> Result<ReplicationProgress> {
         let mut progress = self
-            .authority_store
+            .replication_progress_store
             .load_replication_progress(&authority.fence())
             .await?
             .unwrap_or(ReplicationProgress {
@@ -2560,7 +2773,7 @@ impl ReplicationEngine {
             });
         if authority.previous_configuration.is_none()
             && let Some(configuration_progress) = self
-                .authority_store
+                .replication_progress_store
                 .load_configuration_progress(
                     authority.current_configuration.epoch,
                     &authority.current_configuration.configuration_id,
@@ -2603,7 +2816,7 @@ impl ReplicationEngine {
                 current_configuration_id: previous.configuration_id.clone(),
             };
             if let Some(previous_progress) = self
-                .authority_store
+                .replication_progress_store
                 .load_replication_progress(&previous_fence)
                 .await?
             {
@@ -2626,10 +2839,82 @@ impl ReplicationEngine {
         {
             progress.verified_lsn = handoff_lsn;
         }
-        self.authority_store
+        self.replication_progress_store
             .record_replication_progress(&progress)
             .await?;
         Ok(progress)
+    }
+}
+
+#[async_trait::async_trait]
+impl ManagedReplicator for DefaultReplicatorInner {
+    async fn attach_interfaces(
+        &self,
+        control: Arc<dyn Replicator>,
+        primary: Option<Arc<dyn PrimaryReplicator>>,
+    ) -> Result<()> {
+        self.attach_interfaces(control, primary).await
+    }
+
+    async fn complete_open(&self, replication_address: String) -> Result<()> {
+        self.complete_open(replication_address).await
+    }
+
+    async fn restore_authority(&self) -> Result<()> {
+        self.restore_authority().await
+    }
+
+    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
+        let _guard = self.effect_lock.lock().await;
+        if !matches!(action, RuntimeEffectAction::Abort) {
+            self.check_aborted()?;
+        }
+        self.execute_action(action).await?;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn snapshot(&self) -> RuntimeSnapshot {
+        self.snapshot().await
+    }
+
+    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
+        self.begin_write(write).await
+    }
+
+    async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()> {
+        self.accept_acknowledgement(acknowledgement).await
+    }
+
+    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        self.prepare_copy(request).await
+    }
+
+    async fn accept_copy_acknowledgement(&self, acknowledgement: proto::CopyAck) -> Result<()> {
+        self.accept_copy_acknowledgement(acknowledgement).await
+    }
+
+    async fn receive_copy_item(&self, item: proto::CopyItem) -> Result<proto::CopyAck> {
+        self.receive_copy_item(item).await
+    }
+
+    async fn receive_replication(
+        &self,
+        item: proto::ReplicationItem,
+    ) -> Result<PendingReplication> {
+        self.weak_self
+            .upgrade()
+            .ok_or(RuntimeError::Closed)?
+            .receive_replication(item)
+            .await
+    }
+
+    async fn next_outbound(&self) -> Option<OutboundReplication> {
+        self.outbound_rx.lock().await.recv().await
+    }
+
+    fn abort(&self) {
+        self.control_abort();
     }
 }
 
@@ -2647,6 +2932,42 @@ fn validate_durable_ack(
         ));
     }
     Ok(())
+}
+
+fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
+    RuntimeSnapshot {
+        identity,
+        open: false,
+        replication_address: None,
+        role: ReplicaRole::None,
+        role_transition: None,
+        write_status: AccessStatus::NotPrimary,
+        authority: None,
+        current_progress: 0,
+        verified_replication_lsn: None,
+        committed_lsn: 0,
+        current_configuration_quorum_progress: 0,
+        catch_up_boundary: None,
+        catch_up_complete: false,
+        builds: Vec::new(),
+    }
+}
+
+fn snapshot_postcondition(snapshot: RuntimeSnapshot) -> RuntimePostcondition {
+    RuntimePostcondition {
+        open: snapshot.open,
+        role: snapshot.role,
+        role_transition: snapshot.role_transition,
+        write_status: snapshot.write_status,
+        authority: snapshot.authority,
+        current_progress: snapshot.current_progress,
+        verified_replication_lsn: snapshot.verified_replication_lsn,
+        committed_lsn: snapshot.committed_lsn,
+        current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
+        catch_up_boundary: snapshot.catch_up_boundary,
+        catch_up_complete: snapshot.catch_up_complete,
+        builds: snapshot.builds,
+    }
 }
 
 fn insert_copy_operation(

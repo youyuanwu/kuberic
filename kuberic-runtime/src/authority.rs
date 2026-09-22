@@ -290,11 +290,14 @@ impl AdmittedAuthority {
 }
 
 #[async_trait]
-pub trait AuthorityStore: Send + Sync {
+pub trait ReplicaAuthorityStore: Send + Sync {
     async fn load(&self) -> Result<Option<AdmittedAuthority>>;
 
     async fn admit(&self, authority: &AdmittedAuthority) -> Result<()>;
+}
 
+#[async_trait]
+pub trait ReplicationProgressStore: Send + Sync {
     async fn load_replication_progress(
         &self,
         fence: &AuthorityFence,
@@ -307,7 +310,10 @@ pub trait AuthorityStore: Send + Sync {
     ) -> Result<Option<ReplicationProgress>>;
 
     async fn record_replication_progress(&self, progress: &ReplicationProgress) -> Result<()>;
+}
 
+#[async_trait]
+pub trait LocalWriteJournal: Send + Sync {
     async fn load_local_write(
         &self,
         operation_id: &OperationId,
@@ -318,15 +324,39 @@ pub trait AuthorityStore: Send + Sync {
     async fn record_local_write(&self, write: &DurableLocalWrite) -> Result<()>;
 
     async fn reset_local_writes_after_data_loss(&self, committed_lsn: i64) -> Result<()>;
+}
 
+#[async_trait]
+pub trait BuildAuthorityStore: Send + Sync {
     async fn load_build(&self, build_id: &OperationId) -> Result<Option<BuildAuthority>>;
 
     async fn admit_build(&self, authority: &BuildAuthority) -> Result<()>;
+}
 
+#[async_trait]
+pub trait BuildProgressStore: Send + Sync {
     async fn load_build_progress(
         &self,
         build_id: &OperationId,
     ) -> Result<Option<DurableBuildProgress>>;
 
     async fn record_build_progress(&self, progress: &DurableBuildProgress) -> Result<()>;
+}
+
+pub trait AuthorityStore:
+    ReplicaAuthorityStore
+    + ReplicationProgressStore
+    + LocalWriteJournal
+    + BuildAuthorityStore
+    + BuildProgressStore
+{
+}
+
+impl<T> AuthorityStore for T where
+    T: ReplicaAuthorityStore
+        + ReplicationProgressStore
+        + LocalWriteJournal
+        + BuildAuthorityStore
+        + BuildProgressStore
+{
 }

@@ -39,11 +39,22 @@ Choose the built-in implementation with
 non-COM `engine::DurableState` persistence adapter. The state provider may be a
 separate object. Custom factories use the same partition boundary and need not
 use the default engine or implement `DurableState` on the service.
+`CreateReplicator` is the construction boundary: the default factory creates
+one shared `DefaultReplicatorInner`, and the control, primary, state, and
+optional managed façades all reference that inner. `PodRuntime` owns the
+hosting registrar, application lifetime, Open registration, effect ordering,
+and exact returned-interface identity; it does not preconstruct unused default
+replication state for a custom factory.
 There is no `PodRuntime::new_with_replicator` ownership shortcut.
 Services can observe `partition.get_write_status()`; custom factories receive
 the same access gate through `ReplicatorFactoryContext::write_status`.
 Custom implementations must honor that gate rather than infer write access
 from the Primary role.
+
+`ReplicatorFactoryContext` exposes stable identity and partition-access
+capabilities, not a concrete runtime or default-engine pointer. A selected
+factory may return an optional `ManagedReplicator` for Kuberic's agent-facing
+data plane. Custom replicators may omit it and own their transport themselves.
 
 ## Durable streams and engine integration
 
@@ -72,14 +83,17 @@ Reservations, exact-authority admission and ACK validation, queue retention,
 quorum finalization, copy/build bookkeeping, and durable retry IDs live in the
 non-COM replication engine, not the SF traits. The default state interface
 retains write identity across failures and cancellation. The lower-level
-`PodRuntime::begin_write(ClientWrite)` additionally accepts caller-owned retry
-IDs and returns a `PendingWrite` with transport items and a durable completion.
+`PodRuntime` data-plane methods are compatibility forwarders to the selected
+managed replicator; they fail explicitly for a custom implementation that does
+not opt into that capability.
 
 Transport remains caller-driven: drain `PodRuntime::next_outbound()` for
 state-interface replication and primary build/remove requests, exchange the
 exact-authority wire items, and return their ACKs. Build requests use the
 existing `prepare_copy`/copy-ACK path; `build_replica` does not complete merely
-because a request was queued. The runtime does not start a network server.
+because a request was queued. Logical outbound work uses a bounded,
+abort-aware queue; network resend windows and reconnect remain agent-owned.
+The runtime does not start a network server.
 
 Role changes drive the replicator before the service callback. The completed
 role is published only after both callbacks succeed; an in-process
@@ -95,9 +109,11 @@ write-closed, becoming Primary does not grant writes, and direct client writes
 require an explicit granted `WriteStatus`.
 
 The runtime does not create an operator, replica agent, or control-plane
-server. A caller supplies `RuntimeControlPlane` and `AuthorityStore`
-implementations. Replication acknowledgements are accepted only when exact
-identity, epoch, and configuration fences match durable authority.
+server. Persistence is exposed as narrow `ReplicaAuthorityStore`,
+`ReplicationProgressStore`, `LocalWriteJournal`, `BuildAuthorityStore`, and
+`BuildProgressStore` capabilities. `AuthorityStore` is only their composite
+compatibility bound; one future SQLite implementation may implement them all
+without granting every caller every mutation right.
 
 Replica builds use separate exact-target authority outside quorum membership.
 Copy context remains a multi-item operation-data stream. `prepare_copy` returns
@@ -113,9 +129,14 @@ owners must provide:
 
 - a reliable transport session with a fresh endpoint incarnation, stale-session
   rejection, ordered delivery, reconnect, cancellation, and endpoint readiness;
+- runtime-domain replication messages and agent-side protobuf conversion,
+  replacing the temporary `kuberic-runtime -> kuberic-wire` dependency and
+  `PodRuntime` compatibility forwarding;
 - a named resend-retention owner whose actual retained range determines
   catch-up capability, truncation, and fallback to full copy;
 - durable agent-owned effect intent/result sequencing across process restart;
+- final extraction of managed role/close callback orchestration from the
+  default inner into the hosting runtime;
 - the FM/RA-equivalent coordinator that persists and resumes demote, GetLSN,
   catch-up, deactivate, and activate stages;
 - operation-specific mappings for removal, cancellation, backpressure, and

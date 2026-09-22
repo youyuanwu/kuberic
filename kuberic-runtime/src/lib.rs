@@ -12,6 +12,7 @@ mod error;
 pub use application::{StateProvider, StatefulServiceReplica};
 pub use error::{Result, RuntimeError};
 pub use replicator::{
-    DefaultReplicator, DefaultReplicatorFactory, PrimaryReplicator, Replicator, ReplicatorFactory,
-    ReplicatorInterfaces, StateReplicator, StatefulServicePartition,
+    DefaultReplicator, DefaultReplicatorFactory, ManagedReplicator, PartitionAccessView,
+    PrimaryReplicator, Replicator, ReplicatorFactory, ReplicatorInterfaces, StateReplicator,
+    StatefulServicePartition,
 };

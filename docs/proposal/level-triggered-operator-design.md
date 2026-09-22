@@ -650,9 +650,24 @@ custom factories use the same partition boundary. The default factory
 selects a non-COM durable-storage adapter, independently of the SF
 `StateProvider`. Services and custom replicators MUST NOT be required to
 implement default-engine storage callbacks merely to implement the SF API.
+The factory constructs one complete shared `DefaultReplicatorInner` during
+CreateReplicator. Hosting retains application lifetime, one-shot registration,
+effect ordering, exact returned-interface identity, and control/primary
+discovery. The public factory context exposes immutable identity and partition
+access capabilities, never a concrete hosting or default-engine root.
+An optional non-application `ManagedReplicator` capability carries Kuberic
+agent-facing data-plane operations; custom replicators may omit it and own
+their data plane independently.
 Reservations, retries, exact ACK handling, authority admission, durable
 quorum finalization, queues, and copy/build bookkeeping belong to a distinct
 replication engine and MUST NOT be added to the public SF traits.
+
+Replica-local persistence uses least-authority interfaces even when one SQLite
+database implements them: replica authority, agent effect intent/result,
+replication progress, local-write journal, build authorization, and build
+execution progress. Build execution cannot authorize itself, replication code
+cannot mutate agent effect state, and application durability remains a
+separate transaction boundary.
 
 Delivery acknowledgement is explicit and one-shot. Dropping a delivered
 operation is not durable acceptance. Application acceptance precedes durable
@@ -683,6 +698,8 @@ end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
+| Final hosting ownership of managed role/close callback orchestration | Runtime hosting boundary before Phase 3 completion |
+| Runtime-domain replication messages and removal of the temporary runtime-to-wire dependency | Runtime/agent adapter before Phase 4 transport |
 | Fresh endpoint/session incarnation, stale-session rejection, endpoint readiness, reconnect, ordered delivery, and cancellation | Reliable agent transport in Phase 4 |
 | Resend payload retention, truthful catch-up capability, truncation, and full-copy fallback | Reliable transport/build owner in Phases 4 and 7 |
 | Intent-before-effect and terminal-result-before-reply across process restart | SQLite agent store/runtime adapter in Phase 3 |

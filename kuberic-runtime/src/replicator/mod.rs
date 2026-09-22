@@ -15,9 +15,19 @@ use kuberic_protocol::types::{
 use tokio::sync::{Mutex, RwLock};
 
 use crate::application::{ClientWrite, Lsn, OperationData, StateProvider};
+use crate::authority::{
+    BuildAuthorityStore, BuildProgressStore, LocalWriteJournal, ReplicaAuthorityStore,
+    ReplicationProgressStore,
+};
+use crate::effects::RuntimeEffectAction;
 use crate::engine::DurableState;
-use crate::runtime::ReplicationEngine;
+use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
+use crate::runtime::{
+    DefaultReplicatorInner, OutboundReplication, PendingReplication, PendingWrite, RuntimeHost,
+    RuntimeSnapshot,
+};
 use crate::{Result, RuntimeError};
+use kuberic_wire::proto;
 use stream::{OperationStream, ServiceStreams};
 
 /// IFabricReplicator, with COM Begin/End pairs collapsed to async calls.
@@ -59,6 +69,28 @@ pub trait StateReplicator: Send + Sync {
     async fn update_replicator_settings(&self, settings: ReplicatorSettings) -> Result<()>;
 }
 
+#[async_trait]
+pub trait ManagedReplicator: Send + Sync {
+    async fn attach_interfaces(
+        &self,
+        control: Arc<dyn Replicator>,
+        primary: Option<Arc<dyn PrimaryReplicator>>,
+    ) -> Result<()>;
+    async fn complete_open(&self, replication_address: String) -> Result<()>;
+    async fn restore_authority(&self) -> Result<()>;
+    async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
+    async fn snapshot(&self) -> RuntimeSnapshot;
+    async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
+    async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()>;
+    async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy>;
+    async fn accept_copy_acknowledgement(&self, acknowledgement: proto::CopyAck) -> Result<()>;
+    async fn receive_copy_item(&self, item: proto::CopyItem) -> Result<proto::CopyAck>;
+    async fn receive_replication(&self, item: proto::ReplicationItem)
+    -> Result<PendingReplication>;
+    async fn next_outbound(&self) -> Option<OutboundReplication>;
+    fn abort(&self);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicaSetQuorumMode {
     WriteQuorum,
@@ -81,25 +113,51 @@ pub struct ReplicatorInterfaces {
     pub replicator: Arc<dyn Replicator>,
     pub state_replicator: Arc<dyn StateReplicator>,
     pub primary_replicator: Option<Arc<dyn PrimaryReplicator>>,
+    pub managed_replicator: Option<Arc<dyn ManagedReplicator>>,
 }
 
 #[derive(Clone)]
 pub struct ReplicatorFactoryContext {
-    pub(crate) engine: Weak<ReplicationEngine>,
+    identity: ReplicaIdentity,
+    access: Arc<dyn PartitionAccessView>,
+    pub(crate) default_dependencies: Option<DefaultReplicatorDependencies>,
 }
 
 impl ReplicatorFactoryContext {
+    pub(crate) fn new(
+        identity: ReplicaIdentity,
+        access: Arc<dyn PartitionAccessView>,
+        default_dependencies: DefaultReplicatorDependencies,
+    ) -> Self {
+        Self {
+            identity,
+            access,
+            default_dependencies: Some(default_dependencies),
+        }
+    }
+
     pub fn identity(&self) -> Result<ReplicaIdentity> {
-        Ok(self.engine()?.identity.clone())
+        Ok(self.identity.clone())
     }
 
     pub async fn write_status(&self) -> Result<AccessStatus> {
-        Ok(self.engine()?.write_status().await)
+        self.access.write_status().await
     }
+}
 
-    fn engine(&self) -> Result<Arc<ReplicationEngine>> {
-        self.engine.upgrade().ok_or(RuntimeError::Closed)
-    }
+#[async_trait]
+pub trait PartitionAccessView: Send + Sync {
+    async fn write_status(&self) -> Result<AccessStatus>;
+}
+
+#[derive(Clone)]
+pub(crate) struct DefaultReplicatorDependencies {
+    pub application: Arc<dyn crate::application::StatefulServiceReplica>,
+    pub replica_authority_store: Arc<dyn ReplicaAuthorityStore>,
+    pub replication_progress_store: Arc<dyn ReplicationProgressStore>,
+    pub local_write_journal: Arc<dyn LocalWriteJournal>,
+    pub build_authority_store: Arc<dyn BuildAuthorityStore>,
+    pub build_progress_store: Arc<dyn BuildProgressStore>,
 }
 
 #[async_trait]
@@ -115,13 +173,15 @@ pub trait ReplicatorFactory: Send + Sync {
 #[derive(Clone)]
 pub struct StatefulServicePartition {
     context: ReplicatorFactoryContext,
+    host: Weak<RuntimeHost>,
     factory: Option<Arc<dyn ReplicatorFactory>>,
 }
 
 impl StatefulServicePartition {
-    pub(crate) fn new(engine: Weak<ReplicationEngine>) -> Self {
+    pub(crate) fn new(host: Weak<RuntimeHost>, context: ReplicatorFactoryContext) -> Self {
         Self {
-            context: ReplicatorFactoryContext { engine },
+            context,
+            host,
             factory: None,
         }
     }
@@ -130,6 +190,7 @@ impl StatefulServicePartition {
     pub fn with_factory(&self, factory: Arc<dyn ReplicatorFactory>) -> Self {
         Self {
             context: self.context.clone(),
+            host: self.host.clone(),
             factory: Some(factory),
         }
     }
@@ -146,8 +207,8 @@ impl StatefulServicePartition {
         let factory = self.factory.as_ref().ok_or_else(|| {
             RuntimeError::Application("select a replicator factory during Open".into())
         })?;
-        let engine = self.context.engine()?;
-        let reservation = engine.reserve_replicator_creation()?;
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let reservation = host.reserve_replicator_creation()?;
         let interfaces = factory
             .create_replicator(
                 self.context.clone(),
@@ -155,7 +216,7 @@ impl StatefulServicePartition {
                 settings.unwrap_or_default(),
             )
             .await?;
-        if let Err(error) = engine
+        if let Err(error) = host
             .register_interfaces(&interfaces, state_provider, reservation)
             .await
         {
@@ -185,7 +246,20 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         settings: ReplicatorSettings,
     ) -> Result<ReplicatorInterfaces> {
         let streams = Arc::new(ServiceStreams::new());
-        let engine = context.engine()?;
+        let dependencies = context.default_dependencies.clone().ok_or_else(|| {
+            RuntimeError::Application(
+                "default replicator dependencies are unavailable for this partition".into(),
+            )
+        })?;
+        let engine = DefaultReplicatorInner::new(
+            context.identity.clone(),
+            dependencies.application,
+            dependencies.replica_authority_store,
+            dependencies.replication_progress_store,
+            dependencies.local_write_journal,
+            dependencies.build_authority_store,
+            dependencies.build_progress_store,
+        );
         engine
             .install_provider(
                 state_provider.clone(),
@@ -196,14 +270,14 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
         let pending = Arc::new(Mutex::new(None));
         let next_operation = Arc::new(AtomicU64::new(0));
         let replicator = Arc::new(DefaultReplicator {
-            context: context.clone(),
+            engine: engine.clone(),
             provider: state_provider,
             settings: Arc::new(RwLock::new(settings)),
             pending: pending.clone(),
             next_operation: next_operation.clone(),
         });
         let state_replicator = Arc::new(DefaultStateReplicator {
-            context,
+            engine: engine.clone(),
             streams,
             settings: replicator.settings.clone(),
             next_operation,
@@ -213,12 +287,13 @@ impl ReplicatorFactory for DefaultReplicatorFactory {
             replicator: replicator.clone(),
             state_replicator,
             primary_replicator: Some(replicator),
+            managed_replicator: Some(engine),
         })
     }
 }
 
 pub struct DefaultReplicator {
-    context: ReplicatorFactoryContext,
+    engine: Arc<DefaultReplicatorInner>,
     provider: Arc<dyn StateProvider>,
     settings: Arc<RwLock<ReplicatorSettings>>,
     pending: Arc<Mutex<Option<ClientWrite>>>,
@@ -229,48 +304,45 @@ pub struct DefaultReplicator {
 impl Replicator for DefaultReplicator {
     async fn open(&self) -> Result<String> {
         let committed_lsn = self.provider.last_committed_lsn().await?;
-        self.context.engine()?.control_open(committed_lsn).await?;
+        self.engine.control_open(committed_lsn).await?;
         Ok(self.settings.read().await.replication_address.clone())
     }
 
     async fn change_role(&self, epoch: Epoch, role: ReplicaRole) -> Result<()> {
-        self.context
-            .engine()?
-            .control_change_role(epoch, role)
-            .await
+        self.engine.control_change_role(epoch, role).await
     }
 
     async fn update_epoch(&self, epoch: Epoch) -> Result<()> {
-        let engine = self.context.engine()?;
-        engine
+        self.engine
             .control_update_epoch(epoch, self.provider.as_ref())
             .await
     }
 
     async fn close(&self) -> Result<()> {
-        self.context.engine()?.control_close().await
+        self.engine.control_close().await
     }
 
     fn abort(&self) {
-        if let Ok(engine) = self.context.engine() {
-            engine.control_abort();
-        }
+        self.engine.control_abort();
     }
 
     async fn current_progress(&self) -> Result<Lsn> {
-        self.context.engine()?.control_progress().await
+        self.engine.control_progress().await
     }
 
     async fn catch_up_capability(&self) -> Result<Lsn> {
-        self.context.engine()?.control_catch_up_capability().await
+        self.engine.control_catch_up_capability().await
     }
 }
 
 #[async_trait]
 impl PrimaryReplicator for DefaultReplicator {
     async fn on_data_loss(&self) -> Result<bool> {
-        let engine = self.context.engine()?;
-        if let Some(progress) = engine.control_on_data_loss(self.provider.as_ref()).await? {
+        if let Some(progress) = self
+            .engine
+            .control_on_data_loss(self.provider.as_ref())
+            .await?
+        {
             *self.pending.lock().await = None;
             self.next_operation
                 .store(progress.max(0) as u64, Ordering::Release);
@@ -285,37 +357,33 @@ impl PrimaryReplicator for DefaultReplicator {
         current: ConfigurationDescriptor,
         previous: ConfigurationDescriptor,
     ) -> Result<()> {
-        self.context
-            .engine()?
+        self.engine
             .configure_replicas(current, Some(previous))
             .await
     }
 
     async fn wait_for_catch_up_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
-        self.context.engine()?.wait_for_quorum(mode).await
+        self.engine.wait_for_quorum(mode).await
     }
 
     async fn update_current_replica_set_configuration(
         &self,
         current: ConfigurationDescriptor,
     ) -> Result<()> {
-        self.context
-            .engine()?
-            .configure_replicas(current, None)
-            .await
+        self.engine.configure_replicas(current, None).await
     }
 
     async fn build_replica(&self, replica: ReplicaInformation) -> Result<()> {
-        self.context.engine()?.wait_for_build(replica).await
+        self.engine.wait_for_build(replica).await
     }
 
     async fn remove_replica(&self, replica_id: ReplicaId) -> Result<()> {
-        self.context.engine()?.remove_replica(replica_id).await
+        self.engine.remove_replica(replica_id).await
     }
 }
 
 struct DefaultStateReplicator {
-    context: ReplicatorFactoryContext,
+    engine: Arc<DefaultReplicatorInner>,
     streams: Arc<ServiceStreams>,
     settings: Arc<RwLock<ReplicatorSettings>>,
     next_operation: Arc<AtomicU64>,
@@ -325,7 +393,7 @@ struct DefaultStateReplicator {
 #[async_trait]
 impl StateReplicator for DefaultStateReplicator {
     async fn replicate(&self, data: OperationData) -> Result<Lsn> {
-        let engine = self.context.engine()?;
+        let engine = &self.engine;
         engine.require_write_access().await?;
         let mut reservation = self.pending.lock().await;
         engine.require_write_access().await?;

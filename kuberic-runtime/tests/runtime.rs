@@ -14,8 +14,9 @@ use kuberic_runtime::application::{
     OpenMode, Operation, OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
 };
 use kuberic_runtime::authority::{
-    AdmittedAuthority, AuthorityFence, AuthorityStore, BuildAuthority, BuildAuthorityKind,
-    DurableBuildProgress, DurableLocalWrite, ReplicationProgress,
+    AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore,
+    BuildProgressStore, DurableBuildProgress, DurableLocalWrite, LocalWriteJournal,
+    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
 use kuberic_runtime::effects::{
     RuntimeControlPlane, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult,
@@ -53,7 +54,7 @@ struct MemoryAuthorityStore {
 }
 
 #[async_trait]
-impl AuthorityStore for MemoryAuthorityStore {
+impl ReplicaAuthorityStore for MemoryAuthorityStore {
     async fn load(&self) -> Result<Option<AdmittedAuthority>> {
         Ok(self.authority.lock().unwrap().clone())
     }
@@ -68,7 +69,10 @@ impl AuthorityStore for MemoryAuthorityStore {
         }
         Ok(())
     }
+}
 
+#[async_trait]
+impl ReplicationProgressStore for MemoryAuthorityStore {
     async fn load_replication_progress(
         &self,
         fence: &AuthorityFence,
@@ -106,7 +110,10 @@ impl AuthorityStore for MemoryAuthorityStore {
             .insert(progress.fence.clone(), progress.clone());
         Ok(())
     }
+}
 
+#[async_trait]
+impl LocalWriteJournal for MemoryAuthorityStore {
     async fn load_local_write(
         &self,
         operation_id: &OperationId,
@@ -161,7 +168,10 @@ impl AuthorityStore for MemoryAuthorityStore {
         });
         Ok(())
     }
+}
 
+#[async_trait]
+impl BuildAuthorityStore for MemoryAuthorityStore {
     async fn load_build(&self, build_id: &OperationId) -> Result<Option<BuildAuthority>> {
         Ok(self.builds.lock().unwrap().get(build_id).cloned())
     }
@@ -178,7 +188,10 @@ impl AuthorityStore for MemoryAuthorityStore {
         builds.insert(authority.build_id.clone(), authority.clone());
         Ok(())
     }
+}
 
+#[async_trait]
+impl BuildProgressStore for MemoryAuthorityStore {
     async fn load_build_progress(
         &self,
         build_id: &OperationId,
@@ -1380,6 +1393,7 @@ async fn lifecycle_orders_role_changes_and_close_like_service_fabric() {
         .apply_effect(effect(8, RuntimeEffectAction::Abort))
         .await
         .unwrap();
+    drop(runtime);
     assert_eq!(
         events.lock().unwrap().as_slice(),
         [
@@ -1490,6 +1504,75 @@ async fn removing_a_replica_terminates_its_pending_build_wait() {
             .unwrap(),
         Err(RuntimeError::ReplicaRemoved(2))
     ));
+}
+
+#[tokio::test]
+async fn bounded_outbound_build_queue_is_cancelled_by_abort() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "primary")],
+    )
+    .await;
+    let control = runtime.primary_replicator().await.unwrap();
+    let mut builds = Vec::new();
+    for id in 2..=66 {
+        let control = control.clone();
+        builds.push(tokio::spawn(async move {
+            control
+                .build_replica(kuberic_runtime::replicator::ReplicaInformation {
+                    identity: identity(id, &format!("target-{id}")),
+                    replication_address: format!("target-{id}"),
+                })
+                .await
+        }));
+    }
+    tokio::task::yield_now().await;
+    assert!(builds.iter().any(|build| !build.is_finished()));
+    control.abort();
+    for build in builds {
+        assert!(matches!(
+            timeout(Duration::from_secs(1), build)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(RuntimeError::Closed)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn dropping_runtime_always_aborts_application_and_selected_control() {
+    let application = Arc::new(TestApplication::default());
+    let events = application.events.clone();
+    let runtime = runtime_with_factory(
+        identity(1, "drop-abort"),
+        application.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+        CountingFactory {
+            storage: Arc::downgrade(&application),
+            opened: Arc::new(AtomicUsize::new(0)),
+            role_changes: Arc::new(AtomicUsize::new(0)),
+            epoch_updates: Arc::new(AtomicUsize::new(0)),
+            events: events.clone(),
+            fail_change_role: Arc::new(AtomicBool::new(false)),
+            fail_close: Arc::new(AtomicBool::new(false)),
+        },
+    )
+    .unwrap();
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    drop(runtime);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "service.open",
+            "replicator.open",
+            "service.abort",
+            "replicator.abort",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1617,6 +1700,7 @@ impl ReplicatorFactory for ExternalFactory {
             replicator: replicator.clone(),
             state_replicator: replicator,
             primary_replicator: None,
+            managed_replicator: None,
         })
     }
 }
