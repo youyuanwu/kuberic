@@ -37,6 +37,7 @@ macro_rules! string_id {
 }
 
 string_id!(ResourceUid);
+string_id!(PartitionId);
 string_id!(PodUid);
 string_id!(PvcUid);
 string_id!(ReplicaInstanceId);
@@ -107,6 +108,26 @@ pub enum AccessStatus {
     ReconfigurationPending,
     NotPrimary,
     NoWriteQuorum,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartitionInformation {
+    pub partition_id: PartitionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadMetric {
+    pub name: String,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FaultType {
+    Transient,
+    Permanent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

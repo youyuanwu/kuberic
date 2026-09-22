@@ -14,6 +14,8 @@ message ReplicationItem {
   int64 committed_lsn = 7;
   bytes data = 8;
   ReplicaIdentity receiver = 9;
+  string sender_session_id = 10;
+  string receiver_session_id = 11;
 }
 
 message ReplicationAck {
@@ -26,6 +28,8 @@ message ReplicationAck {
   int64 received_lsn = 7;
   int64 applied_lsn = 8;
   int64 committed_lsn = 9;
+  string sender_session_id = 10;
+  string receiver_session_id = 11;
 }
 
 message CopyItem {
@@ -42,6 +46,8 @@ message CopyItem {
   bool final_item = 11;
   bytes data = 12;
   bool snapshot_chunk = 13;
+  string sender_session_id = 14;
+  string receiver_session_id = 15;
 }
 
 message CopyAck {
@@ -56,6 +62,8 @@ message CopyAck {
   int64 replication_boundary_lsn = 9;
   bool final_item = 10;
   bool snapshot_chunk = 11;
+  string sender_session_id = 12;
+  string receiver_session_id = 13;
 }
 
 service ReplicationData {

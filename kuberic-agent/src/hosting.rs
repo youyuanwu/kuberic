@@ -1,16 +1,23 @@
 //! Service Fabric-aligned process hosting boundary.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use async_trait::async_trait;
-use kuberic_protocol::types::{AccessStatus, Epoch, ReplicaIdentity, ReplicaRole};
-use kuberic_runtime::application::{
-    ClientWrite, OpenContext, OpenMode, StateProvider, StatefulServiceReplica,
+use futures::{Stream, StreamExt};
+use kuberic_protocol::types::{
+    AccessStatus, Epoch, FaultType, LoadMetric, PartitionId, PartitionInformation, ReplicaIdentity,
+    ReplicaRole,
 };
-use kuberic_runtime::internal::{OutboundReplication, PendingReplication, PendingWrite};
-use kuberic_runtime::replicator::copy::{PrepareCopyRequest, PreparedCopy};
+use kuberic_runtime::application::{
+    ClientWrite, OpenContext, OpenMode, StateProvider, StatefulServiceReplica, WriteReceipt,
+};
+use kuberic_runtime::internal::{
+    PendingReplication as RuntimePendingReplication, PendingWrite as RuntimePendingWrite,
+};
+use kuberic_runtime::replicator::copy::{PrepareCopyRequest, PreparedCopy as RuntimePreparedCopy};
 use kuberic_runtime::replicator::{
     DefaultReplicatorDependencies, ManagedReplicator, PartitionAccessView, PrimaryReplicator,
     Replicator, ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorInterfaces,
@@ -26,8 +33,15 @@ use kuberic_runtime_internal::effects::{
     RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
     RuntimeSnapshot,
 };
+use kuberic_runtime_internal::transport::{OutboundOperation, ReplicaEndpoint};
 use kuberic_wire::proto;
 use tokio::sync::{Mutex, RwLock};
+
+use crate::transport::{
+    copy_ack_from_proto, copy_ack_to_proto, copy_from_proto, copy_to_proto,
+    replication_ack_from_proto, replication_ack_to_proto, replication_from_proto,
+    replication_to_proto,
+};
 
 const REPLICATOR_CREATION_AVAILABLE: u8 = 0;
 const REPLICATOR_CREATION_RESERVED: u8 = 1;
@@ -41,6 +55,43 @@ pub trait RuntimeControlPlane: Send {
     async fn publish(&mut self, result: RuntimeEffectResult) -> Result<()>;
 }
 
+pub struct PendingWrite {
+    pub lsn: i64,
+    pub replication_items: Vec<proto::ReplicationItem>,
+    pub build_items: Vec<proto::CopyItem>,
+    inner: RuntimePendingWrite,
+}
+
+impl PendingWrite {
+    pub async fn committed(self) -> Result<WriteReceipt> {
+        self.inner.committed().await
+    }
+}
+
+pub struct PendingReplication {
+    pub received: proto::ReplicationAck,
+    inner: RuntimePendingReplication,
+}
+
+impl PendingReplication {
+    pub async fn applied(self) -> Result<proto::ReplicationAck> {
+        self.inner.applied().await.map(replication_ack_to_proto)
+    }
+}
+
+pub struct PreparedCopy {
+    pub authority: kuberic_runtime_internal::authority::BuildAuthority,
+    pub items: Pin<Box<dyn Stream<Item = Result<proto::CopyItem>> + Send>>,
+}
+
+#[derive(Debug)]
+pub enum OutboundReplication {
+    Replication(proto::ReplicationItem),
+    Copy(proto::CopyItem),
+    Build(ReplicaEndpoint),
+    Remove(kuberic_protocol::types::ReplicaId),
+}
+
 #[derive(Debug, Clone)]
 struct AppliedEffect {
     effect: RuntimeEffect,
@@ -51,6 +102,9 @@ struct AppliedEffect {
 struct HostState {
     effects: BTreeMap<u64, AppliedEffect>,
     fallback_snapshot: RuntimeSnapshot,
+    partition_information: PartitionInformation,
+    load_metrics: BTreeMap<String, i64>,
+    reported_fault: Option<FaultType>,
 }
 
 struct RegisteredReplicator {
@@ -64,6 +118,20 @@ pub struct PodRuntime {
     host: Arc<RuntimeHost>,
 }
 
+#[derive(Clone)]
+pub struct RuntimeDataPlane {
+    host: Arc<RuntimeHost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionReportSnapshot {
+    pub information: PartitionInformation,
+    pub read_status: AccessStatus,
+    pub write_status: AccessStatus,
+    pub load_metrics: Vec<LoadMetric>,
+    pub reported_fault: Option<FaultType>,
+}
+
 impl Drop for PodRuntime {
     fn drop(&mut self) {
         self.host.abort();
@@ -72,6 +140,26 @@ impl Drop for PodRuntime {
 
 impl PodRuntime {
     pub fn new<A, S>(
+        identity: ReplicaIdentity,
+        application: Arc<A>,
+        authority_store: Arc<S>,
+    ) -> Self
+    where
+        A: StatefulServiceReplica + 'static,
+        S: AuthorityStore + 'static,
+    {
+        let partition_id =
+            PartitionId::new(format!("partition-{}", identity.agent_generation.as_str()));
+        Self::new_for_partition(
+            PartitionInformation { partition_id },
+            identity,
+            application,
+            authority_store,
+        )
+    }
+
+    pub fn new_for_partition<A, S>(
+        partition_information: PartitionInformation,
         identity: ReplicaIdentity,
         application: Arc<A>,
         authority_store: Arc<S>,
@@ -101,6 +189,9 @@ impl PodRuntime {
                 state: RwLock::new(HostState {
                     effects: BTreeMap::new(),
                     fallback_snapshot,
+                    partition_information,
+                    load_metrics: BTreeMap::new(),
+                    reported_fault: None,
                 }),
                 effect_lock: Mutex::new(()),
                 registered: OnceLock::new(),
@@ -129,45 +220,14 @@ impl PodRuntime {
         self.host.apply_effect(effect).await
     }
 
-    pub async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
-        self.host.managed()?.begin_write(write).await
-    }
-
-    pub async fn accept_acknowledgement(
-        &self,
-        acknowledgement: proto::ReplicationAck,
-    ) -> Result<()> {
-        self.host
-            .managed()?
-            .accept_acknowledgement(acknowledgement)
-            .await
-    }
-
-    pub async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
-        self.host.managed()?.prepare_copy(request).await
-    }
-
-    pub async fn accept_copy_acknowledgement(&self, ack: proto::CopyAck) -> Result<()> {
-        self.host.managed()?.accept_copy_acknowledgement(ack).await
-    }
-
-    pub async fn receive_copy_item(&self, item: proto::CopyItem) -> Result<proto::CopyAck> {
-        self.host.managed()?.receive_copy_item(item).await
-    }
-
-    pub async fn receive_replication(
-        &self,
-        item: proto::ReplicationItem,
-    ) -> Result<PendingReplication> {
-        self.host.managed()?.receive_replication(item).await
+    pub fn data_plane(&self) -> RuntimeDataPlane {
+        RuntimeDataPlane {
+            host: self.host.clone(),
+        }
     }
 
     pub async fn snapshot(&self) -> RuntimeSnapshot {
         self.host.snapshot().await
-    }
-
-    pub async fn next_outbound(&self) -> Option<OutboundReplication> {
-        self.host.managed().ok()?.next_outbound().await
     }
 
     pub async fn primary_replicator(&self) -> Result<Arc<dyn PrimaryReplicator>> {
@@ -176,6 +236,126 @@ impl PodRuntime {
             .get()
             .and_then(|registered| registered.primary.clone())
             .ok_or(RuntimeError::NotOpen)
+    }
+
+    pub async fn catch_up_capability(&self) -> Result<i64> {
+        self.host
+            .registered
+            .get()
+            .ok_or(RuntimeError::NotOpen)?
+            .control
+            .catch_up_capability()
+            .await
+    }
+
+    pub async fn partition_report(&self) -> PartitionReportSnapshot {
+        let state = self.host.state.read().await;
+        PartitionReportSnapshot {
+            information: state.partition_information.clone(),
+            read_status: state.fallback_snapshot.read_status,
+            write_status: state.fallback_snapshot.write_status,
+            load_metrics: state
+                .load_metrics
+                .iter()
+                .map(|(name, value)| LoadMetric {
+                    name: name.clone(),
+                    value: *value,
+                })
+                .collect(),
+            reported_fault: state.reported_fault,
+        }
+    }
+}
+
+impl RuntimeDataPlane {
+    pub async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite> {
+        let pending = self.host.managed()?.begin_write(write).await?;
+        Ok(PendingWrite {
+            lsn: pending.lsn,
+            replication_items: pending
+                .replication_items
+                .iter()
+                .cloned()
+                .map(replication_to_proto)
+                .collect(),
+            build_items: pending
+                .build_items
+                .iter()
+                .cloned()
+                .map(copy_to_proto)
+                .collect(),
+            inner: pending,
+        })
+    }
+
+    pub async fn accept_acknowledgement(
+        &self,
+        acknowledgement: proto::ReplicationAck,
+    ) -> Result<()> {
+        let acknowledgement = replication_ack_from_proto(acknowledgement)?;
+        self.host
+            .managed()?
+            .accept_acknowledgement(acknowledgement)
+            .await
+    }
+
+    pub async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {
+        let RuntimePreparedCopy { authority, items } =
+            self.host.managed()?.prepare_copy(request).await?;
+        Ok(PreparedCopy {
+            authority,
+            items: Box::pin(items.map(|item| item.map(copy_to_proto))),
+        })
+    }
+
+    pub async fn accept_copy_acknowledgement(&self, ack: proto::CopyAck) -> Result<()> {
+        self.host
+            .managed()?
+            .accept_copy_acknowledgement(copy_ack_from_proto(ack)?)
+            .await
+    }
+
+    pub async fn receive_copy_item(&self, item: proto::CopyItem) -> Result<proto::CopyAck> {
+        self.host
+            .managed()?
+            .receive_copy_item(copy_from_proto(item)?)
+            .await
+            .map(copy_ack_to_proto)
+    }
+
+    pub async fn receive_replication(
+        &self,
+        item: proto::ReplicationItem,
+    ) -> Result<PendingReplication> {
+        let pending = self
+            .host
+            .managed()?
+            .receive_replication(replication_from_proto(item)?)
+            .await?;
+        Ok(PendingReplication {
+            received: replication_ack_to_proto(pending.received.clone()),
+            inner: pending,
+        })
+    }
+
+    pub async fn next_outbound(&self) -> Option<OutboundReplication> {
+        self.host
+            .managed()
+            .ok()?
+            .next_outbound()
+            .await
+            .map(|outbound| match outbound {
+                OutboundOperation::Replication(item) => {
+                    OutboundReplication::Replication(replication_to_proto(item))
+                }
+                OutboundOperation::Copy(item) => OutboundReplication::Copy(copy_to_proto(item)),
+                OutboundOperation::Build(replica) => OutboundReplication::Build(replica),
+                OutboundOperation::Remove(replica_id) => OutboundReplication::Remove(replica_id),
+            })
+    }
+
+    pub(crate) async fn next_domain_outbound(&self) -> Option<OutboundOperation> {
+        self.host.managed().ok()?.next_outbound().await
     }
 }
 
@@ -195,13 +375,46 @@ struct RuntimeHost {
 
 struct HostAccessView {
     host: Weak<RuntimeHost>,
+    partition_information: PartitionInformation,
 }
 
 #[async_trait]
 impl PartitionAccessView for HostAccessView {
+    fn partition_information(&self) -> PartitionInformation {
+        self.partition_information.clone()
+    }
+
+    async fn read_status(&self) -> Result<AccessStatus> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        Ok(host.snapshot().await.read_status)
+    }
+
     async fn write_status(&self) -> Result<AccessStatus> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
         Ok(host.snapshot().await.write_status)
+    }
+
+    async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let mut names = std::collections::BTreeSet::new();
+        if metrics.iter().any(|metric| {
+            metric.name.is_empty() || metric.value < 0 || !names.insert(metric.name.clone())
+        }) {
+            return Err(RuntimeError::Application(
+                "load metrics require unique nonempty names and nonnegative values".into(),
+            ));
+        }
+        host.state.write().await.load_metrics = metrics
+            .into_iter()
+            .map(|metric| (metric.name, metric.value))
+            .collect();
+        Ok(())
+    }
+
+    async fn report_fault(&self, fault: FaultType) -> Result<()> {
+        let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        host.state.write().await.reported_fault = Some(fault);
+        Ok(())
     }
 }
 
@@ -366,7 +579,7 @@ impl RuntimeHost {
             let expected = state
                 .effects
                 .last_key_value()
-                .map_or(1, |(sequence, _)| sequence + 1);
+                .map_or(effect.sequence, |(sequence, _)| sequence + 1);
             if effect.sequence != expected {
                 return Err(RuntimeError::EffectOutOfOrder {
                     expected,
@@ -382,6 +595,13 @@ impl RuntimeHost {
         match effect.action.clone() {
             RuntimeEffectAction::Open(mode) => self.open(mode).await?,
             RuntimeEffectAction::ChangeRole(role) => self.change_role(role).await?,
+            RuntimeEffectAction::ChangeReplicatorRole(role) => {
+                self.change_replicator_role(role).await?
+            }
+            RuntimeEffectAction::UpdateEpoch => self.update_epoch().await?,
+            RuntimeEffectAction::ChangeApplicationRole(role) => {
+                self.change_application_role(role).await?
+            }
             RuntimeEffectAction::Close => self.close().await?,
             RuntimeEffectAction::Abort => self.abort_action().await,
             action => {
@@ -424,6 +644,7 @@ impl RuntimeHost {
             self.identity.clone(),
             Arc::new(HostAccessView {
                 host: self.weak_self.clone(),
+                partition_information: self.state.read().await.partition_information.clone(),
             }),
             registration.clone(),
             self.default_dependencies.clone(),
@@ -470,6 +691,14 @@ impl RuntimeHost {
     }
 
     async fn change_role(&self, role: ReplicaRole) -> Result<()> {
+        self.change_replicator_role(role).await?;
+        if role == ReplicaRole::Primary {
+            self.update_epoch().await?;
+        }
+        self.change_application_role(role).await
+    }
+
+    async fn change_replicator_role(&self, role: ReplicaRole) -> Result<()> {
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
         let snapshot = self.snapshot().await;
         if !snapshot.open {
@@ -504,6 +733,8 @@ impl RuntimeHost {
         if let Ok(managed) = self.managed() {
             managed.fence_writes().await?;
         }
+        self.state.write().await.fallback_snapshot.read_status =
+            AccessStatus::ReconfigurationPending;
         if !transition.replicator_completed {
             registered.control.change_role(epoch, role).await?;
             let mut state = self.state.write().await;
@@ -514,7 +745,31 @@ impl RuntimeHost {
                 .ok_or(RuntimeError::ReconfigurationPending)?
                 .replicator_completed = true;
         }
-        if role == ReplicaRole::Primary && !transition.epoch_completed {
+        Ok(())
+    }
+
+    async fn update_epoch(&self) -> Result<()> {
+        let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
+        let transition = self
+            .state
+            .read()
+            .await
+            .fallback_snapshot
+            .role_transition
+            .clone()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        if transition.target_role != ReplicaRole::Primary || !transition.replicator_completed {
+            return Err(RuntimeError::ReconfigurationPending);
+        }
+        if !transition.epoch_completed {
+            let epoch = self
+                .snapshot()
+                .await
+                .authority
+                .as_ref()
+                .map_or_else(Epoch::default, |authority| {
+                    authority.current_configuration.epoch
+                });
             registered.control.update_epoch(epoch).await?;
             let mut state = self.state.write().await;
             state
@@ -523,6 +778,24 @@ impl RuntimeHost {
                 .as_mut()
                 .ok_or(RuntimeError::ReconfigurationPending)?
                 .epoch_completed = true;
+        }
+        Ok(())
+    }
+
+    async fn change_application_role(&self, role: ReplicaRole) -> Result<()> {
+        let transition = self
+            .state
+            .read()
+            .await
+            .fallback_snapshot
+            .role_transition
+            .clone()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        if transition.target_role != role
+            || !transition.replicator_completed
+            || (role == ReplicaRole::Primary && !transition.epoch_completed)
+        {
+            return Err(RuntimeError::ReconfigurationPending);
         }
         if !transition.application_completed {
             let _ = self.application.change_role(role).await?;
@@ -544,6 +817,7 @@ impl RuntimeHost {
         {
             let mut state = self.state.write().await;
             state.fallback_snapshot.open = false;
+            state.fallback_snapshot.read_status = AccessStatus::ReconfigurationPending;
             state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
         }
         if let Ok(managed) = self.managed() {
@@ -559,6 +833,7 @@ impl RuntimeHost {
             let mut state = self.state.write().await;
             state.fallback_snapshot.role = ReplicaRole::None;
             state.fallback_snapshot.role_transition = None;
+            state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
             return Err(error);
         }
@@ -566,6 +841,7 @@ impl RuntimeHost {
         let mut state = self.state.write().await;
         state.fallback_snapshot.role = ReplicaRole::None;
         state.fallback_snapshot.role_transition = None;
+        state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
         state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
         Ok(())
     }
@@ -576,6 +852,7 @@ impl RuntimeHost {
             state.fallback_snapshot.open = false;
             state.fallback_snapshot.role = ReplicaRole::None;
             state.fallback_snapshot.role_transition = None;
+            state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
             state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
         }
         self.abort();
@@ -584,6 +861,7 @@ impl RuntimeHost {
     async fn sync_access_projection(&self, managed: &dyn ManagedReplicator) {
         let managed_snapshot = managed.snapshot().await;
         let mut state = self.state.write().await;
+        state.fallback_snapshot.read_status = managed_snapshot.read_status;
         state.fallback_snapshot.write_status = managed_snapshot.write_status;
         state.fallback_snapshot.authority = managed_snapshot.authority;
     }
@@ -591,6 +869,14 @@ impl RuntimeHost {
     async fn execute_custom_action(&self, action: RuntimeEffectAction) -> Result<()> {
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
         match action {
+            RuntimeEffectAction::SetAccessStatus { read, write } => {
+                let mut state = self.state.write().await;
+                state.fallback_snapshot.read_status = read;
+                state.fallback_snapshot.write_status = write;
+            }
+            RuntimeEffectAction::SetReadStatus(status) => {
+                self.state.write().await.fallback_snapshot.read_status = status;
+            }
             RuntimeEffectAction::SetWriteStatus(status) => {
                 self.state.write().await.fallback_snapshot.write_status = status;
             }
@@ -603,6 +889,7 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::AdmitAuthority(_)
             | RuntimeEffectAction::AdmitBuildAuthority(_)
+            | RuntimeEffectAction::WaitForCatchup
             | RuntimeEffectAction::RetireBuild(_) => {
                 return Err(RuntimeError::Application(
                     "the selected custom replicator does not expose managed authority/build capabilities"
@@ -611,6 +898,9 @@ impl RuntimeHost {
             }
             RuntimeEffectAction::Open(_)
             | RuntimeEffectAction::ChangeRole(_)
+            | RuntimeEffectAction::ChangeReplicatorRole(_)
+            | RuntimeEffectAction::UpdateEpoch
+            | RuntimeEffectAction::ChangeApplicationRole(_)
             | RuntimeEffectAction::Close
             | RuntimeEffectAction::Abort => {
                 return Err(RuntimeError::Application(
@@ -629,6 +919,7 @@ impl RuntimeHost {
             snapshot.replication_address = host.replication_address;
             snapshot.role = host.role;
             snapshot.role_transition = host.role_transition;
+            snapshot.read_status = host.read_status;
             snapshot.write_status = host.write_status;
             snapshot.authority = host.authority.or(snapshot.authority);
             if self.aborted.load(Ordering::Acquire) {
@@ -652,6 +943,7 @@ fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
         replication_address: None,
         role: ReplicaRole::None,
         role_transition: None,
+        read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,
         authority: None,
         current_progress: 0,
@@ -669,6 +961,7 @@ fn snapshot_postcondition(snapshot: RuntimeSnapshot) -> RuntimePostcondition {
         open: snapshot.open,
         role: snapshot.role,
         role_transition: snapshot.role_transition,
+        read_status: snapshot.read_status,
         write_status: snapshot.write_status,
         authority: snapshot.authority,
         current_progress: snapshot.current_progress,

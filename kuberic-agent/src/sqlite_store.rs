@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use kuberic_protocol::types::{ConfigurationId, Epoch, OperationId};
+use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::types::{ConfigurationId, Epoch, FaultType, LoadMetric, OperationId};
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityStore, BuildProgressStore,
     DurableBuildProgress, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
@@ -16,9 +17,10 @@ use kuberic_runtime_internal::{ContractError, Result as ContractResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
 use crate::state::{
-    AgentState, EffectStage, PendingEffect, RetainedResult, SCHEMA_VERSION, StorageIdentity,
+    AgentState, CoordinatorStage, DeactivationState, EffectStage, PendingEffect,
+    ReconfigurationRecord, RetainedCommandResult, RetainedResult, SCHEMA_VERSION, StorageIdentity,
 };
-use crate::store::{AgentStore, BeginEffect};
+use crate::store::{AgentStore, BeginConfiguration, BeginEffect};
 use crate::{AgentError, Result};
 
 const DATABASE_FILE: &str = "agent.sqlite3";
@@ -207,6 +209,7 @@ impl AgentStore for SqliteStore {
                 ));
             }
             state.role = result.postcondition.role;
+            state.read_status = result.postcondition.read_status;
             state.write_status = result.postcondition.write_status;
             state.previous_configuration = result
                 .postcondition
@@ -226,7 +229,103 @@ impl AgentStore for SqliteStore {
                 effect: pending.effect,
                 result: result.clone(),
             });
+            state.next_effect_sequence = state.next_effect_sequence.max(result.sequence + 1);
             write_agent_state(transaction, &state)
+        })
+    }
+
+    async fn begin_configuration(
+        &self,
+        command: &EnsureConfiguration,
+    ) -> Result<BeginConfiguration> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            if let Some(retained) = state.retained_command.as_ref()
+                && retained.command.operation_id == command.operation_id
+            {
+                if retained.command != *command {
+                    return Err(AgentError::EffectConflict(
+                        "operation ID was reused with different configuration authority".into(),
+                    ));
+                }
+                return Ok(BeginConfiguration::Completed(retained.clone()));
+            }
+            if let Some(pending) = state.reconfiguration.as_ref() {
+                if pending.command != *command {
+                    return Err(AgentError::EffectConflict(
+                        "another configuration command is pending".into(),
+                    ));
+                }
+                return Ok(BeginConfiguration::Pending(pending.clone()));
+            }
+            let record = ReconfigurationRecord {
+                command: command.clone(),
+                stage: CoordinatorStage::AdmitAuthority,
+                observed_lsn: None,
+            };
+            state.reconfiguration = Some(record.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(BeginConfiguration::Execute(record))
+        })
+    }
+
+    async fn advance_configuration(
+        &self,
+        operation_id: &OperationId,
+        expected: CoordinatorStage,
+        next: CoordinatorStage,
+        observed_lsn: Option<i64>,
+    ) -> Result<ReconfigurationRecord> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let record = state.reconfiguration.as_mut().ok_or_else(|| {
+                AgentError::EffectConflict("configuration command is not pending".into())
+            })?;
+            if &record.command.operation_id != operation_id || record.stage != expected {
+                return Err(AgentError::EffectConflict(
+                    "configuration stage does not match durable command".into(),
+                ));
+            }
+            record.stage = next;
+            if observed_lsn.is_some() {
+                record.observed_lsn = observed_lsn;
+            }
+            let result = record.clone();
+            if expected == CoordinatorStage::Deactivate {
+                state.deactivation = Some(DeactivationState {
+                    epoch: result.command.current_epoch,
+                    deactivated_lsn: result.observed_lsn.unwrap_or(0),
+                });
+            }
+            write_agent_state(transaction, &state)?;
+            Ok(result)
+        })
+    }
+
+    async fn complete_configuration(
+        &self,
+        operation_id: &OperationId,
+    ) -> Result<RetainedCommandResult> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let record = state.reconfiguration.take().ok_or_else(|| {
+                AgentError::EffectConflict("configuration command is not pending".into())
+            })?;
+            if &record.command.operation_id != operation_id
+                || record.stage != CoordinatorStage::Complete
+            {
+                return Err(AgentError::EffectConflict(
+                    "configuration command has not reached its terminal stage".into(),
+                ));
+            }
+            let result = RetainedCommandResult {
+                command: record.command,
+                role: state.role,
+                epoch: state.highest_epoch,
+            };
+            state.retained_command = Some(result.clone());
+            write_agent_state(transaction, &state)?;
+            Ok(result)
         })
     }
 
@@ -269,6 +368,27 @@ impl AgentStore for SqliteStore {
                 [target_version],
             )?;
             Ok(())
+        })
+    }
+
+    async fn record_partition_reports(
+        &self,
+        load_metrics: Vec<LoadMetric>,
+        reported_fault: Option<FaultType>,
+    ) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut names = std::collections::BTreeSet::new();
+            if load_metrics.iter().any(|metric| {
+                metric.name.is_empty() || metric.value < 0 || !names.insert(metric.name.clone())
+            }) {
+                return Err(AgentError::CommandRejected(
+                    "load metrics require unique nonempty names and nonnegative values".into(),
+                ));
+            }
+            let mut state = load_state_from_connection(transaction)?;
+            state.load_metrics = load_metrics;
+            state.reported_fault = reported_fault;
+            write_agent_state(transaction, &state)
         })
     }
 }

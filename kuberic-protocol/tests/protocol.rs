@@ -131,6 +131,7 @@ fn attest_stable_topology(
                     current_progress: 10,
                     committed_lsn: 10,
                     catch_up_capability: Some(10),
+                    ..AgentReport::default()
                 })),
             },
         );
@@ -487,6 +488,7 @@ fn bootstrap_validates_all_members_before_initializing_any_store() {
         current_progress: 0,
         committed_lsn: 0,
         catch_up_capability: None,
+        ..AgentReport::default()
     }));
 
     assert!(matches!(
@@ -553,6 +555,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
                 current_progress: 10,
                 committed_lsn: 10,
                 catch_up_capability: Some(10),
+                ..AgentReport::default()
             })),
         },
     );
@@ -578,6 +581,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
                 current_progress: 0,
                 committed_lsn: 0,
                 catch_up_capability: None,
+                ..AgentReport::default()
             })),
         },
     );
@@ -784,6 +788,7 @@ fn stale_replica_epoch_is_unsafe() {
                 current_progress: 1,
                 committed_lsn: 1,
                 catch_up_capability: Some(1),
+                ..AgentReport::default()
             })),
         },
     );
@@ -835,6 +840,7 @@ fn conflicting_primary_claims_are_unsafe() {
                     current_progress: 1,
                     committed_lsn: 1,
                     catch_up_capability: Some(1),
+                    ..AgentReport::default()
                 })),
             },
         );
@@ -879,6 +885,7 @@ fn accepted_replica_cannot_report_another_incarnation() {
                 current_progress: 1,
                 committed_lsn: 1,
                 catch_up_capability: Some(1),
+                ..AgentReport::default()
             })),
         },
     );
@@ -1101,6 +1108,7 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
                 current_progress: 1,
                 committed_lsn: 1,
                 catch_up_capability: Some(1),
+                ..AgentReport::default()
             })),
         },
     );
@@ -1145,6 +1153,7 @@ fn bootstrap_report_cannot_claim_previous_configuration() {
         current_progress: 0,
         committed_lsn: 0,
         catch_up_capability: Some(0),
+        ..AgentReport::default()
     }));
 
     assert!(matches!(

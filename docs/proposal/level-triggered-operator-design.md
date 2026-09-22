@@ -715,20 +715,38 @@ writes enter its pending handoff lane. Exact duplicate durable snapshot chunks
 are acknowledged without application redelivery; conflicting contents are
 rejected.
 
+Phase 4 implements the replica-local RA boundary. `EnsureConfiguration`
+commands are admitted against exact resource, incarnation, durable generation,
+epoch, PC/CC, policy, and operation identity. The agent persists private
+Demote, GetLSN, Catchup, Deactivate, ReplicatorRole, Epoch,
+ApplicationRole, and Activate stages. Each runtime effect has a durable
+sequence and retained postcondition, so restart resumes the first incomplete
+stage rather than exposing a controller workflow cursor.
+
+Partition information and independent read/write access are available through
+the application partition. Load and fault reports are accepted by the hosting
+owner and included in agent observations. Primary promotion uses separate
+durable replicator-role, provider-epoch, and application-role effects.
+
+Runtime replication and copy messages are implementation-neutral contracts in
+`kuberic-runtime-internal`; protobuf validation and conversion belong to the
+agent. The runtime crates no longer depend on `kuberic-wire`. The agent binds
+separate authenticated control/peer and replication listeners, opens the
+runtime only after both listeners bind, assigns a fresh process session,
+rejects retired sender or receiver sessions, and exposes bounded reliable send
+windows with reconnect, cancellation, truthful retained-range capability, and
+full-copy fallback.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
-| Durable recovery of promotion substages across process restart | Replica-agent coordinator in Phase 4 |
-| Partition information, independent read access, load reporting, and fault reporting | Runtime/agent contract in Phase 4; controller consumption in Phase 5 |
-| Runtime-domain replication messages and removal of the temporary runtime-to-wire dependency | Runtime/agent adapter before Phase 4 transport |
-| Fresh endpoint/session incarnation, stale-session rejection, endpoint readiness, reconnect, ordered delivery, and cancellation | Reliable agent transport in Phase 4 |
-| Resend payload retention, truthful catch-up capability, truncation, and full-copy fallback | Reliable transport/build owner in Phases 4 and 7 |
-| Durable demote, GetLSN, catch-up, deactivate, and activate sequencing | Replica-agent coordinator in Phase 4 |
-| Operation-specific removal, cancellation, backpressure, and reconfiguration error mapping | Runtime/agent integration in Phase 4 |
-| Role-specific primary/secondary session state and cleanup | Default replicator plus reliable transport in Phase 4 |
-| Transport crash and stale-session acceptance tests for later owners | Phases 4, 7, and 9 |
+| Controller selection, dispatch, bounded re-observation, and routing fences | Level-triggered controller in Phase 5 |
+| Concrete outbound gRPC peer dialing and deployment credential distribution | Bootstrap vertical slice in Phase 6 |
+| Persistent resend payloads across process sessions where full copy is not acceptable | Reliable build/replacement owner in Phase 7 |
+| Full replacement, failover, quorum-loss, and destructive-recovery orchestration | Phases 7-9 |
+| Cross-operation transport crash and partition acceptance tests | Phases 7 and 9 |
 
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and

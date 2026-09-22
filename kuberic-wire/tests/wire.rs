@@ -116,6 +116,7 @@ fn uninitialized_status_requires_pod_and_pvc_without_durable_identity() {
         storage_error: String::new(),
         healthy: false,
         replica_id: 1,
+        ..Default::default()
     };
     assert!(validate_agent_status_report(&report).is_ok());
 
@@ -211,6 +212,7 @@ fn replication_ack_requires_exact_authority_and_consistent_progress() {
         received_lsn: 10,
         applied_lsn: 9,
         committed_lsn: 8,
+        ..Default::default()
     };
     assert!(validate_replication_ack(&ack).is_ok());
 
@@ -224,6 +226,7 @@ fn replication_ack_requires_exact_authority_and_consistent_progress() {
         committed_lsn: 8,
         data: vec![1],
         receiver: ack.receiver.clone(),
+        ..Default::default()
     };
     assert!(validate_replication_item(&item).is_ok());
 
@@ -271,6 +274,7 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         final_item: false,
         data: vec![1],
         snapshot_chunk: true,
+        ..Default::default()
     };
     assert!(validate_copy_item(&item).is_ok());
 
@@ -286,6 +290,7 @@ fn copy_contract_requires_exact_target_and_final_boundary_ack() {
         replication_boundary_lsn: 2,
         final_item: true,
         snapshot_chunk: false,
+        ..Default::default()
     };
     assert!(validate_copy_ack(&final_ack).is_ok());
 
@@ -332,6 +337,8 @@ fn initialized_status_rejects_unknown_enums_and_malformed_configuration() {
         storage_error: String::new(),
         healthy: true,
         replica_id: 1,
+        read_status: proto::AccessStatus::Granted as i32,
+        ..Default::default()
     };
     assert!(matches!(
         validate_agent_status_report(&report),

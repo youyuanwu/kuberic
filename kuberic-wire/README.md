@@ -17,3 +17,10 @@ rejected rather than defaulted.
 
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.
+
+Control and peer commands carry exact resource, replica-incarnation,
+generation, epoch, and PC/CC authority. Replication and copy streams also carry
+sender and receiver process-session IDs; the agent rejects retired sessions
+before runtime mutation. Agent reports include independent read/write access,
+quorum/catch-up progress, deactivation evidence, load/fault reports, and
+pending or retained command identity.

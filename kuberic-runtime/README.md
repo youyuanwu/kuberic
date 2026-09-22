@@ -19,10 +19,10 @@ definitions are
 | `StateReplicator` | `replicate(operation_data)` → committed LSN, `get_replication_stream`, `get_copy_stream`, `update_replicator_settings` |
 | `StateProvider` | `update_epoch(epoch, previous_epoch_last_lsn)`, `last_committed_lsn`, `get_copy_context`, `get_copy_state`, `on_data_loss` |
 
-`StatefulServicePartition` currently provides `CreateReplicator` and write
-status. Partition information, independent read status, load reporting, and
-fault reporting require agent/controller sources of truth and are assigned to
-Phase 4 rather than represented by placeholder methods.
+`StatefulServicePartition` provides partition information, independent read
+and write status, `CreateReplicator`, load reporting, and fault reporting.
+The agent owns the access and report source of truth rather than inferring it
+from the replica role.
 
 Service Open receives a `StatefulServicePartition` in its `OpenContext`.
 The service selects a `ReplicatorFactory` with `partition.with_factory(...)`,
@@ -101,18 +101,15 @@ engines. Streams can be taken only once from the default state interface.
 Reservations, exact-authority admission and ACK validation, queue retention,
 quorum finalization, copy/build bookkeeping, and durable retry IDs live in the
 non-COM replication engine, not the SF traits. The default state interface
-retains write identity across failures and cancellation. The agent's
-lower-level `PodRuntime` data-plane methods are compatibility forwarders to the
-selected managed replicator; they fail explicitly for a custom implementation
-that does not opt into that capability.
+retains write identity across failures and cancellation. Agent transport uses
+a separate `RuntimeDataPlane` handle; `PodRuntime` remains the hosting and
+lifecycle owner.
 
-Transport remains caller-driven: drain `PodRuntime::next_outbound()` for
-state-interface replication and primary build/remove requests, exchange the
-exact-authority wire items, and return their ACKs. Build requests use the
-existing `prepare_copy`/copy-ACK path; `build_replica` does not complete merely
-because a request was queued. Logical outbound work uses a bounded,
-abort-aware queue; network resend windows and reconnect remain agent-owned.
-The runtime does not start a network server.
+The runtime emits implementation-neutral domain messages. `kuberic-agent`
+owns protobuf conversion, separate control and replication listeners, process
+session fencing, reliable resend windows, reconnect, cancellation, and
+full-copy fallback signaling. The runtime has no dependency on
+`kuberic-wire` and does not start a network server.
 
 Role changes drive the replicator before the service callback. Primary
 promotion additionally invokes replicator/state-provider `UpdateEpoch`
@@ -151,17 +148,15 @@ verified and acknowledged without redelivery to the application.
 This crate provides data-plane primitives, not end-to-end SF failover. Later
 owners must provide:
 
-- a reliable transport session with a fresh endpoint incarnation, stale-session
-  rejection, ordered delivery, reconnect, cancellation, and endpoint readiness;
-- runtime-domain replication messages and agent-side protobuf conversion,
-  replacing the temporary `kuberic-runtime -> kuberic-wire` dependency and
-  `PodRuntime` compatibility forwarding;
-- a named resend-retention owner whose actual retained range determines
-  catch-up capability, truncation, and fallback to full copy;
-- the FM/RA-equivalent coordinator that persists and resumes demote, GetLSN,
-  catch-up, deactivate, and activate stages;
+- the controller/FM owner that selects and dispatches durable desired
+  configurations;
+- concrete outbound gRPC peer dialing and deployment-level authentication
+  material around the agent's reliable dispatch abstraction;
+- persistent resend payloads across process sessions where incremental
+  reconnect is required instead of full-copy fallback;
 - operation-specific mappings for removal, cancellation, backpressure, and
-  transient reconfiguration outcomes.
+  transient reconfiguration outcomes beyond the current tonic status mapping;
+- destructive data-loss recovery and its external fencing provider.
 
 Until those owners are implemented, the crate is an SF-aligned runtime
 foundation rather than a deployable SF-equivalent failover system.

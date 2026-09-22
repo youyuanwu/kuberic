@@ -2,7 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use kuberic_protocol::observation::{AgentObservation, AgentReport, UninitializedAgentObservation};
+use kuberic_protocol::command::{EnsureConfiguration, InitializeAgentStore, ProtocolCommand};
+use kuberic_protocol::observation::{
+    AgentBuildReport, AgentObservation, AgentReport, UninitializedAgentObservation,
+};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
     EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, ProcessSessionId, PvcUid,
@@ -80,6 +83,13 @@ pub struct CopyAcknowledgement {
     pub snapshot_chunk: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecuteEnvelope {
+    pub resource_uid: ResourceUid,
+    pub target: ReplicaIdentity,
+    pub command: ProtocolCommand,
+}
+
 /// Requires an exact protocol-version match; negotiation is intentionally unsupported.
 pub fn ensure_supported_version(observed: u32) -> Result<(), WireError> {
     if observed == kuberic_protocol::PROTOCOL_VERSION {
@@ -140,10 +150,20 @@ pub fn normalize_agent_status_report(
                 || report.previous_configuration.is_some()
                 || report.current_configuration.is_some()
                 || report.role != proto::ReplicaRole::Unknown as i32
+                || report.read_status != proto::AccessStatus::Unknown as i32
                 || report.write_status != proto::AccessStatus::Unknown as i32
                 || report.current_progress != 0
                 || report.committed_lsn != 0
                 || report.catch_up_capability.is_some()
+                || report.current_configuration_quorum_progress != 0
+                || report.catch_up_boundary.is_some()
+                || report.catch_up_complete
+                || report.deactivated_lsn.is_some()
+                || !report.load_metrics.is_empty()
+                || report.reported_fault != proto::FaultType::Unknown as i32
+                || !report.pending_operation_id.is_empty()
+                || !report.retained_operation_id.is_empty()
+                || !report.builds.is_empty()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
@@ -188,6 +208,72 @@ pub fn normalize_agent_status_report(
                     value: report.write_status,
                 })
                 .and_then(access_status_from_proto)?;
+            let read_status = proto::AccessStatus::try_from(report.read_status)
+                .map_err(|_| WireError::InvalidEnum {
+                    field: "agent_status.read_status",
+                    value: report.read_status,
+                })
+                .and_then(access_status_from_proto)?;
+            let reported_fault =
+                match proto::FaultType::try_from(report.reported_fault).map_err(|_| {
+                    WireError::InvalidEnum {
+                        field: "agent_status.reported_fault",
+                        value: report.reported_fault,
+                    }
+                })? {
+                    proto::FaultType::Unknown => None,
+                    proto::FaultType::Transient => {
+                        Some(kuberic_protocol::types::FaultType::Transient)
+                    }
+                    proto::FaultType::Permanent => {
+                        Some(kuberic_protocol::types::FaultType::Permanent)
+                    }
+                };
+            let mut load_names = BTreeSet::new();
+            let load_metrics = report
+                .load_metrics
+                .into_iter()
+                .map(|metric| {
+                    if metric.name.is_empty()
+                        || metric.value < 0
+                        || !load_names.insert(metric.name.clone())
+                    {
+                        return Err(WireError::InvalidAuthority(
+                            "load metrics require unique nonempty names and nonnegative values"
+                                .into(),
+                        ));
+                    }
+                    Ok(kuberic_protocol::types::LoadMetric {
+                        name: metric.name,
+                        value: metric.value,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut build_ids = BTreeSet::new();
+            let builds = report
+                .builds
+                .into_iter()
+                .map(|build| {
+                    if build.build_id.is_empty()
+                        || build.durable_lsn < 0
+                        || !build_ids.insert(build.build_id.clone())
+                    {
+                        return Err(WireError::InvalidAuthority(
+                            "build reports require unique IDs and nonnegative progress".into(),
+                        ));
+                    }
+                    Ok(AgentBuildReport {
+                        build_id: OperationId::new(build.build_id),
+                        target: build
+                            .target
+                            .ok_or(WireError::MissingField("build_status.target"))?
+                            .try_into()?,
+                        last_sequence: build.last_sequence,
+                        durable_lsn: build.durable_lsn,
+                        completed: build.completed,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let previous_configuration = report
                 .previous_configuration
                 .map(ConfigurationDescriptor::try_from)
@@ -201,6 +287,7 @@ pub fn normalize_agent_status_report(
                 previous_configuration.as_ref(),
                 current_configuration.as_ref(),
                 role,
+                read_status,
                 write_status,
             )?;
             Ok(AgentObservation::Report(Box::new(AgentReport {
@@ -210,6 +297,7 @@ pub fn normalize_agent_status_report(
                 process_session_id: ProcessSessionId::new(report.process_session_id),
                 report_sequence: report.report_sequence,
                 role,
+                read_status,
                 write_status,
                 healthy: report.healthy,
                 epoch,
@@ -218,6 +306,17 @@ pub fn normalize_agent_status_report(
                 current_progress: report.current_progress,
                 committed_lsn: report.committed_lsn,
                 catch_up_capability: report.catch_up_capability,
+                current_configuration_quorum_progress: report.current_configuration_quorum_progress,
+                catch_up_boundary: report.catch_up_boundary,
+                catch_up_complete: report.catch_up_complete,
+                deactivated_lsn: report.deactivated_lsn,
+                load_metrics,
+                reported_fault,
+                pending_operation_id: (!report.pending_operation_id.is_empty())
+                    .then(|| OperationId::new(report.pending_operation_id)),
+                retained_operation_id: (!report.retained_operation_id.is_empty())
+                    .then(|| OperationId::new(report.retained_operation_id)),
+                builds,
             })))
         }
         proto::AgentStorageState::Unsafe => {
@@ -229,7 +328,9 @@ pub fn normalize_agent_status_report(
                 || report.previous_configuration.is_some()
                 || report.current_configuration.is_some()
                 || report.role != proto::ReplicaRole::Unknown as i32
+                || report.read_status != proto::AccessStatus::Unknown as i32
                 || report.write_status != proto::AccessStatus::Unknown as i32
+                || !report.builds.is_empty()
             {
                 return Err(WireError::InvalidAuthority(
                     "unsafe storage report contains untrusted authority".to_string(),
@@ -248,6 +349,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
     if request.resource_uid.is_empty() {
         return Err(WireError::MissingField("execute.resource_uid"));
     }
+
     let command = request
         .command
         .as_ref()
@@ -421,6 +523,75 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
             Ok(())
         }
     }
+}
+
+pub fn normalize_execute_request(
+    request: proto::ExecuteCommandRequest,
+) -> Result<ExecuteEnvelope, WireError> {
+    validate_execute_request(&request)?;
+    let target = request
+        .target
+        .ok_or(WireError::MissingField("execute.target"))?
+        .try_into()?;
+    let command = match request
+        .command
+        .ok_or(WireError::MissingField("execute.command"))?
+    {
+        proto::execute_command_request::Command::InitializeAgentStore(command) => {
+            ProtocolCommand::InitializeAgentStore(InitializeAgentStore {
+                initialization_id: InitializationId::new(command.initialization_id),
+                resource_uid: ResourceUid::new(command.resource_uid),
+                local_replica_id: ReplicaId::new(command.local_replica_id),
+                expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
+                expected_pod_uid: PodUid::new(command.expected_pod_uid),
+                expected_pvc_uid: PvcUid::new(command.expected_pvc_uid),
+                assigned_agent_generation: AgentGeneration::new(command.assigned_agent_generation),
+                effective_policy: policy_from_proto(
+                    command
+                        .effective_policy
+                        .ok_or(WireError::MissingField("initialize.effective_policy"))?,
+                )?,
+            })
+        }
+        proto::execute_command_request::Command::EnsureConfiguration(command) => {
+            let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
+                .map_err(|_| WireError::InvalidEnum {
+                    field: "ensure.transition_kind",
+                    value: command.transition_kind,
+                })
+                .and_then(transition_kind_from_proto)?;
+            ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
+                operation_id: OperationId::new(command.operation_id),
+                previous_configuration: command
+                    .previous_configuration
+                    .map(ConfigurationDescriptor::try_from)
+                    .transpose()?,
+                current_configuration: command
+                    .current_configuration
+                    .ok_or(WireError::MissingField("ensure.current_configuration"))?
+                    .try_into()?,
+                previous_epoch: command.previous_epoch.map(Into::into),
+                current_epoch: command
+                    .current_epoch
+                    .ok_or(WireError::MissingField("ensure.current_epoch"))?
+                    .into(),
+                effective_policy: policy_from_proto(
+                    command
+                        .effective_policy
+                        .ok_or(WireError::MissingField("ensure.effective_policy"))?,
+                )?,
+                local_replica_id: ReplicaId::new(command.local_replica_id),
+                expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
+                expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
+                transition_kind,
+            }))
+        }
+    };
+    Ok(ExecuteEnvelope {
+        resource_uid: ResourceUid::new(request.resource_uid),
+        target,
+        command,
+    })
 }
 
 /// Validates the exact authority carried by one replication item.
@@ -791,6 +962,7 @@ fn validate_report_configurations(
     previous: Option<&ConfigurationDescriptor>,
     current: Option<&ConfigurationDescriptor>,
     role: ReplicaRole,
+    read_status: AccessStatus,
     write_status: AccessStatus,
 ) -> Result<(), WireError> {
     if previous.is_some() && current.is_none() {
@@ -836,6 +1008,13 @@ fn validate_report_configurations(
             "granted WriteStatus requires Primary role".to_string(),
         ));
     }
+    if read_status == AccessStatus::Granted
+        && !matches!(role, ReplicaRole::Primary | ReplicaRole::ActiveSecondary)
+    {
+        return Err(WireError::InvalidAuthority(
+            "granted ReadStatus requires Primary or Active Secondary role".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -850,4 +1029,14 @@ fn validate_policy(policy: &proto::EffectivePolicy) -> Result<(), WireError> {
         ));
     }
     Ok(())
+}
+
+fn policy_from_proto(policy: proto::EffectivePolicy) -> Result<EffectivePolicy, WireError> {
+    validate_policy(&policy)?;
+    Ok(EffectivePolicy {
+        replica_set_size: policy.replica_set_size,
+        write_quorum: policy.write_quorum,
+        read_quorum: policy.read_quorum,
+        failover_delay_seconds: policy.failover_delay_seconds,
+    })
 }

@@ -1,0 +1,538 @@
+use bytes::Bytes;
+use kuberic_protocol::types::{ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole};
+use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
+use kuberic_runtime_internal::transport::{
+    CopyAck, CopyItem, OutboundOperation, ReplicaEndpoint, ReplicationAck, ReplicationItem,
+};
+use kuberic_wire::{
+    normalize_copy_ack, normalize_copy_item, normalize_replication_ack, normalize_replication_item,
+    proto,
+};
+use std::collections::BTreeMap;
+
+use crate::hosting::PodRuntime;
+use crate::{AgentError, Result};
+use async_trait::async_trait;
+use std::sync::Arc;
+use tokio::sync::{Mutex, watch};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedMessage<T> {
+    pub sequence: u64,
+    pub payload: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeWindow<T> {
+    Retained(Vec<RetainedMessage<T>>),
+    FullCopyRequired,
+}
+
+#[derive(Debug)]
+pub struct ReliableWindow<T> {
+    capacity: usize,
+    next_sequence: u64,
+    acknowledged_sequence: u64,
+    retained: BTreeMap<u64, T>,
+    cancelled: bool,
+}
+
+impl<T: Clone> ReliableWindow<T> {
+    pub fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            return Err(AgentError::Backpressure(
+                "reliable send window capacity must be positive".into(),
+            ));
+        }
+
+        Ok(Self {
+            capacity,
+            next_sequence: 1,
+            acknowledged_sequence: 0,
+            retained: BTreeMap::new(),
+            cancelled: false,
+        })
+    }
+
+    pub fn enqueue(&mut self, payload: T) -> Result<RetainedMessage<T>> {
+        if self.cancelled {
+            return Err(AgentError::SessionRejected(
+                "reliable send window is cancelled".into(),
+            ));
+        }
+        if self.retained.len() >= self.capacity {
+            return Err(AgentError::Backpressure(
+                "reliable send window is full".into(),
+            ));
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.retained.insert(sequence, payload.clone());
+        Ok(RetainedMessage { sequence, payload })
+    }
+
+    pub fn acknowledge_through(&mut self, sequence: u64) -> Result<()> {
+        if sequence < self.acknowledged_sequence || sequence >= self.next_sequence {
+            return Err(AgentError::SessionRejected(
+                "acknowledgement is outside the retained send window".into(),
+            ));
+        }
+        self.acknowledged_sequence = sequence;
+        self.retained.retain(|retained, _| *retained > sequence);
+        Ok(())
+    }
+
+    pub fn reconnect_from(&self, sequence: u64) -> ResumeWindow<T> {
+        if sequence <= self.acknowledged_sequence {
+            return ResumeWindow::Retained(
+                self.retained
+                    .iter()
+                    .map(|(sequence, payload)| RetainedMessage {
+                        sequence: *sequence,
+                        payload: payload.clone(),
+                    })
+                    .collect(),
+            );
+        }
+        let first = self
+            .retained
+            .first_key_value()
+            .map(|(sequence, _)| *sequence);
+        if first.is_some_and(|first| sequence < first) || sequence >= self.next_sequence {
+            return ResumeWindow::FullCopyRequired;
+        }
+        ResumeWindow::Retained(
+            self.retained
+                .range(sequence..)
+                .map(|(sequence, payload)| RetainedMessage {
+                    sequence: *sequence,
+                    payload: payload.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    pub fn retained(&self) -> Vec<RetainedMessage<T>> {
+        self.retained
+            .iter()
+            .map(|(sequence, payload)| RetainedMessage {
+                sequence: *sequence,
+                payload: payload.clone(),
+            })
+            .collect()
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+        self.retained.clear();
+    }
+}
+
+impl ReliableWindow<ReplicationItem> {
+    pub fn catch_up_capability(&self) -> Option<i64> {
+        self.retained.values().map(|item| item.lsn).min()
+    }
+
+    pub fn reconnect_from_lsn(&self, lsn: i64) -> ResumeWindow<ReplicationItem> {
+        let Some(first_lsn) = self.catch_up_capability() else {
+            return ResumeWindow::Retained(Vec::new());
+        };
+        if lsn < first_lsn {
+            return ResumeWindow::FullCopyRequired;
+        }
+        ResumeWindow::Retained(
+            self.retained
+                .iter()
+                .filter(|(_, item)| item.lsn >= lsn)
+                .map(|(sequence, payload)| RetainedMessage {
+                    sequence: *sequence,
+                    payload: payload.clone(),
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum RoleTransportState {
+    None,
+    Primary {
+        sessions: BTreeMap<ReplicaIdentity, ReliableWindow<ReplicationItem>>,
+    },
+    Secondary {
+        source: ReplicaIdentity,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuedOutbound {
+    Replication {
+        receiver: ReplicaIdentity,
+        sequence: u64,
+        item: proto::ReplicationItem,
+    },
+    Copy {
+        receiver: ReplicaIdentity,
+        sequence: u64,
+        item: proto::CopyItem,
+    },
+    Build(ReplicaEndpoint),
+    Remove(ReplicaId),
+}
+
+struct PeerWindows {
+    session: ProcessSessionId,
+    replication: ReliableWindow<ReplicationItem>,
+    copy: ReliableWindow<CopyItem>,
+}
+
+pub struct ReliableTransport {
+    local_session: ProcessSessionId,
+    capacity: usize,
+    peers: BTreeMap<ReplicaIdentity, PeerWindows>,
+}
+
+#[async_trait]
+pub trait OutboundDispatcher: Send + Sync {
+    async fn dispatch(&self, outbound: QueuedOutbound) -> Result<()>;
+}
+
+pub async fn run_outbound<D: OutboundDispatcher>(
+    runtime: Arc<PodRuntime>,
+    transport: Arc<Mutex<ReliableTransport>>,
+    dispatcher: Arc<D>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let data_plane = runtime.data_plane();
+    loop {
+        tokio::select! {
+            _ = shutdown.wait_for(|stopped| *stopped) => return Ok(()),
+            outbound = data_plane.next_domain_outbound() => {
+                let Some(outbound) = outbound else {
+                    return Ok(());
+                };
+                let queued = transport.lock().await.queue(outbound)?;
+                dispatcher.dispatch(queued).await?;
+            }
+        }
+    }
+}
+
+impl ReliableTransport {
+    pub fn new(local_session: ProcessSessionId, capacity: usize) -> Result<Self> {
+        ReliableWindow::<ReplicationItem>::new(capacity)?;
+        Ok(Self {
+            local_session,
+            capacity,
+            peers: BTreeMap::new(),
+        })
+    }
+
+    pub fn admit_peer(
+        &mut self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        self.peers.insert(
+            identity,
+            PeerWindows {
+                session,
+                replication: ReliableWindow::new(self.capacity)?,
+                copy: ReliableWindow::new(self.capacity)?,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn queue(&mut self, outbound: OutboundOperation) -> Result<QueuedOutbound> {
+        match outbound {
+            OutboundOperation::Replication(item) => {
+                let receiver = item.receiver.clone();
+                let peer = self.peers.get_mut(&receiver).ok_or_else(|| {
+                    AgentError::SessionRejected("replication peer is not admitted".into())
+                })?;
+                let retained = peer.replication.enqueue(item)?;
+                Ok(QueuedOutbound::Replication {
+                    receiver,
+                    sequence: retained.sequence,
+                    item: replication_to_session_proto(
+                        retained.payload,
+                        self.local_session.as_str(),
+                        peer.session.as_str(),
+                    ),
+                })
+            }
+            OutboundOperation::Copy(item) => {
+                let receiver = item.receiver.clone();
+                let peer = self.peers.get_mut(&receiver).ok_or_else(|| {
+                    AgentError::SessionRejected("copy peer is not admitted".into())
+                })?;
+                let retained = peer.copy.enqueue(item)?;
+                Ok(QueuedOutbound::Copy {
+                    receiver,
+                    sequence: retained.sequence,
+                    item: copy_to_session_proto(
+                        retained.payload,
+                        self.local_session.as_str(),
+                        peer.session.as_str(),
+                    ),
+                })
+            }
+            OutboundOperation::Build(replica) => Ok(QueuedOutbound::Build(replica)),
+            OutboundOperation::Remove(replica_id) => Ok(QueuedOutbound::Remove(replica_id)),
+        }
+    }
+
+    pub fn acknowledge_replication(
+        &mut self,
+        receiver: &ReplicaIdentity,
+        applied_lsn: i64,
+    ) -> Result<()> {
+        let peer = self.peers.get_mut(receiver).ok_or_else(|| {
+            AgentError::SessionRejected("replication peer is not admitted".into())
+        })?;
+        if let Some(sequence) = peer
+            .replication
+            .retained
+            .iter()
+            .filter(|(_, item)| item.lsn <= applied_lsn)
+            .map(|(sequence, _)| *sequence)
+            .max()
+        {
+            peer.replication.acknowledge_through(sequence)?;
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge_copy(
+        &mut self,
+        receiver: &ReplicaIdentity,
+        item_sequence: u64,
+    ) -> Result<()> {
+        let peer = self
+            .peers
+            .get_mut(receiver)
+            .ok_or_else(|| AgentError::SessionRejected("copy peer is not admitted".into()))?;
+        if let Some(sequence) = peer
+            .copy
+            .retained
+            .iter()
+            .filter(|(_, item)| item.sequence <= item_sequence)
+            .map(|(sequence, _)| *sequence)
+            .max()
+        {
+            peer.copy.acknowledge_through(sequence)?;
+        }
+        Ok(())
+    }
+
+    pub fn reconnect_replication(
+        &self,
+        receiver: &ReplicaIdentity,
+        from_lsn: i64,
+    ) -> Result<ResumeWindow<ReplicationItem>> {
+        self.peers
+            .get(receiver)
+            .ok_or_else(|| AgentError::SessionRejected("replication peer is not admitted".into()))
+            .map(|peer| peer.replication.reconnect_from_lsn(from_lsn))
+    }
+
+    pub fn retire_peer(&mut self, receiver: &ReplicaIdentity) {
+        if let Some(mut peer) = self.peers.remove(receiver) {
+            peer.replication.cancel();
+            peer.copy.cancel();
+        }
+    }
+}
+
+impl RoleTransportState {
+    pub fn transition(&mut self, role: ReplicaRole, source: Option<ReplicaIdentity>) -> Result<()> {
+        for window in match self {
+            Self::Primary { sessions } => Some(sessions.values_mut()),
+            _ => None,
+        }
+        .into_iter()
+        .flatten()
+        {
+            window.cancel();
+        }
+        *self = match role {
+            ReplicaRole::Primary => Self::Primary {
+                sessions: BTreeMap::new(),
+            },
+            ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary => Self::Secondary {
+                source: source.ok_or_else(|| {
+                    AgentError::SessionRejected(
+                        "secondary transport requires an exact primary source".into(),
+                    )
+                })?,
+            },
+            ReplicaRole::None => Self::None,
+        };
+        Ok(())
+    }
+}
+
+pub fn replication_from_proto(item: proto::ReplicationItem) -> RuntimeResult<ReplicationItem> {
+    let item = normalize_replication_item(item)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    Ok(ReplicationItem {
+        sender: item.sender,
+        receiver: item.receiver,
+        epoch: item.epoch,
+        previous_configuration_id: item.previous_configuration_id,
+        current_configuration_id: item.current_configuration_id,
+        lsn: item.lsn,
+        committed_lsn: item.committed_lsn,
+        data: Bytes::from(item.data),
+    })
+}
+
+pub fn replication_to_proto(item: ReplicationItem) -> proto::ReplicationItem {
+    proto::ReplicationItem {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        sender: Some(item.sender.into()),
+        epoch: Some(item.epoch.into()),
+        previous_configuration_id: item
+            .previous_configuration_id
+            .map_or_else(String::new, |configuration| configuration.to_string()),
+        current_configuration_id: item.current_configuration_id.to_string(),
+        lsn: item.lsn,
+        committed_lsn: item.committed_lsn,
+        data: item.data.to_vec(),
+        receiver: Some(item.receiver.into()),
+        sender_session_id: String::new(),
+        receiver_session_id: String::new(),
+    }
+}
+
+pub fn replication_to_session_proto(
+    item: ReplicationItem,
+    sender_session: &str,
+    receiver_session: &str,
+) -> proto::ReplicationItem {
+    let mut item = replication_to_proto(item);
+    item.sender_session_id = sender_session.to_string();
+    item.receiver_session_id = receiver_session.to_string();
+    item
+}
+
+pub fn replication_ack_from_proto(
+    acknowledgement: proto::ReplicationAck,
+) -> RuntimeResult<ReplicationAck> {
+    let acknowledgement = normalize_replication_ack(acknowledgement)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    Ok(ReplicationAck {
+        sender: acknowledgement.sender,
+        receiver: acknowledgement.receiver,
+        epoch: acknowledgement.epoch,
+        previous_configuration_id: acknowledgement.previous_configuration_id,
+        current_configuration_id: acknowledgement.current_configuration_id,
+        received_lsn: acknowledgement.received_lsn,
+        applied_lsn: acknowledgement.applied_lsn,
+        committed_lsn: acknowledgement.committed_lsn,
+    })
+}
+
+pub fn replication_ack_to_proto(acknowledgement: ReplicationAck) -> proto::ReplicationAck {
+    proto::ReplicationAck {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        sender: Some(acknowledgement.sender.into()),
+        receiver: Some(acknowledgement.receiver.into()),
+        epoch: Some(acknowledgement.epoch.into()),
+        previous_configuration_id: acknowledgement
+            .previous_configuration_id
+            .map_or_else(String::new, |configuration| configuration.to_string()),
+        current_configuration_id: acknowledgement.current_configuration_id.to_string(),
+        received_lsn: acknowledgement.received_lsn,
+        applied_lsn: acknowledgement.applied_lsn,
+        committed_lsn: acknowledgement.committed_lsn,
+        sender_session_id: String::new(),
+        receiver_session_id: String::new(),
+    }
+}
+
+pub fn copy_from_proto(item: proto::CopyItem) -> RuntimeResult<CopyItem> {
+    let item = normalize_copy_item(item)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    Ok(CopyItem {
+        build_id: item.build_id,
+        sender: item.sender,
+        receiver: item.receiver,
+        epoch: item.epoch,
+        current_configuration_id: item.current_configuration_id,
+        sequence: item.sequence,
+        lsn: item.lsn,
+        committed_lsn: item.committed_lsn,
+        replication_boundary_lsn: item.replication_boundary_lsn,
+        final_item: item.final_item,
+        snapshot_chunk: item.snapshot_chunk,
+        data: Bytes::from(item.data),
+    })
+}
+
+pub fn copy_to_proto(item: CopyItem) -> proto::CopyItem {
+    proto::CopyItem {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: item.build_id.to_string(),
+        sender: Some(item.sender.into()),
+        receiver: Some(item.receiver.into()),
+        epoch: Some(item.epoch.into()),
+        current_configuration_id: item.current_configuration_id.to_string(),
+        sequence: item.sequence,
+        lsn: item.lsn,
+        committed_lsn: item.committed_lsn,
+        replication_boundary_lsn: item.replication_boundary_lsn,
+        final_item: item.final_item,
+        data: item.data.to_vec(),
+        snapshot_chunk: item.snapshot_chunk,
+        sender_session_id: String::new(),
+        receiver_session_id: String::new(),
+    }
+}
+
+pub fn copy_to_session_proto(
+    item: CopyItem,
+    sender_session: &str,
+    receiver_session: &str,
+) -> proto::CopyItem {
+    let mut item = copy_to_proto(item);
+    item.sender_session_id = sender_session.to_string();
+    item.receiver_session_id = receiver_session.to_string();
+    item
+}
+
+pub fn copy_ack_from_proto(acknowledgement: proto::CopyAck) -> RuntimeResult<CopyAck> {
+    let acknowledgement = normalize_copy_ack(acknowledgement)
+        .map_err(|error| RuntimeError::InvalidReplication(error.to_string()))?;
+    Ok(CopyAck {
+        build_id: acknowledgement.build_id,
+        sender: acknowledgement.sender,
+        receiver: acknowledgement.receiver,
+        epoch: acknowledgement.epoch,
+        current_configuration_id: acknowledgement.current_configuration_id,
+        sequence: acknowledgement.sequence,
+        durable_lsn: acknowledgement.durable_lsn,
+        replication_boundary_lsn: acknowledgement.replication_boundary_lsn,
+        final_item: acknowledgement.final_item,
+        snapshot_chunk: acknowledgement.snapshot_chunk,
+    })
+}
+
+pub fn copy_ack_to_proto(acknowledgement: CopyAck) -> proto::CopyAck {
+    proto::CopyAck {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        build_id: acknowledgement.build_id.to_string(),
+        sender: Some(acknowledgement.sender.into()),
+        receiver: Some(acknowledgement.receiver.into()),
+        epoch: Some(acknowledgement.epoch.into()),
+        current_configuration_id: acknowledgement.current_configuration_id.to_string(),
+        sequence: acknowledgement.sequence,
+        durable_lsn: acknowledgement.durable_lsn,
+        replication_boundary_lsn: acknowledgement.replication_boundary_lsn,
+        final_item: acknowledgement.final_item,
+        snapshot_chunk: acknowledgement.snapshot_chunk,
+        sender_session_id: String::new(),
+        receiver_session_id: String::new(),
+    }
+}

@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    AcceptedStatus, AccessStatus, ConfigurationDescriptor, Epoch, PodUid, ProcessSessionId, PvcUid,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+    AcceptedStatus, AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric,
+    OperationId, PodUid, ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaRole, ResourceUid,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,8 @@ pub struct AgentReport {
     pub process_session_id: ProcessSessionId,
     pub report_sequence: u64,
     pub role: ReplicaRole,
+    #[serde(default = "default_access_status")]
+    pub read_status: AccessStatus,
     pub write_status: AccessStatus,
     pub healthy: bool,
     pub epoch: Epoch,
@@ -64,6 +67,73 @@ pub struct AgentReport {
     pub current_progress: i64,
     pub committed_lsn: i64,
     pub catch_up_capability: Option<i64>,
+    #[serde(default)]
+    pub current_configuration_quorum_progress: i64,
+    #[serde(default)]
+    pub catch_up_boundary: Option<i64>,
+    #[serde(default)]
+    pub catch_up_complete: bool,
+    #[serde(default)]
+    pub deactivated_lsn: Option<i64>,
+    #[serde(default)]
+    pub load_metrics: Vec<LoadMetric>,
+    #[serde(default)]
+    pub reported_fault: Option<FaultType>,
+    #[serde(default)]
+    pub pending_operation_id: Option<OperationId>,
+    #[serde(default)]
+    pub retained_operation_id: Option<OperationId>,
+    #[serde(default)]
+    pub builds: Vec<AgentBuildReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBuildReport {
+    pub build_id: OperationId,
+    pub target: ReplicaIdentity,
+    pub last_sequence: u64,
+    pub durable_lsn: i64,
+    pub completed: bool,
+}
+
+fn default_access_status() -> AccessStatus {
+    AccessStatus::NotPrimary
+}
+
+impl Default for AgentReport {
+    fn default() -> Self {
+        Self {
+            protocol_version: 0,
+            resource_uid: ResourceUid::default(),
+            identity: ReplicaIdentity {
+                replica_id: ReplicaId::default(),
+                instance_id: ReplicaInstanceId::default(),
+                agent_generation: crate::types::AgentGeneration::default(),
+            },
+            process_session_id: ProcessSessionId::default(),
+            report_sequence: 0,
+            role: ReplicaRole::None,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            healthy: false,
+            epoch: Epoch::default(),
+            previous_configuration: None,
+            current_configuration: None,
+            current_progress: 0,
+            committed_lsn: 0,
+            catch_up_capability: None,
+            current_configuration_quorum_progress: 0,
+            catch_up_boundary: None,
+            catch_up_complete: false,
+            deactivated_lsn: None,
+            load_metrics: Vec::new(),
+            reported_fault: None,
+            pending_operation_id: None,
+            retained_operation_id: None,
+            builds: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

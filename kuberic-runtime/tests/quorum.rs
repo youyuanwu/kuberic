@@ -4,7 +4,7 @@ use kuberic_protocol::types::{
 };
 use kuberic_runtime::internal::QuorumTracker;
 use kuberic_runtime_internal::authority::AdmittedAuthority;
-use kuberic_wire::ReplicationAcknowledgement;
+use kuberic_runtime_internal::transport::ReplicationAck;
 
 fn identity(id: i64, instance: &str) -> ReplicaIdentity {
     ReplicaIdentity {
@@ -22,8 +22,8 @@ fn acknowledgement(
     authority: &AdmittedAuthority,
     receiver: ReplicaIdentity,
     lsn: i64,
-) -> ReplicationAcknowledgement {
-    ReplicationAcknowledgement {
+) -> ReplicationAck {
+    ReplicationAck {
         sender: authority.primary_identity().clone(),
         receiver,
         epoch: authority.current_configuration.epoch,

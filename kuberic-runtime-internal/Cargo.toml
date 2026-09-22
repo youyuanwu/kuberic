@@ -12,6 +12,5 @@ description = "Internal agent/runtime contracts for the level-triggered Kuberic 
 async-trait.workspace = true
 bytes.workspace = true
 kuberic-protocol = { path = "../kuberic-protocol" }
-kuberic-wire = { path = "../kuberic-wire" }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kuberic_protocol::types::{ConfigurationDescriptor, ReplicaIdentity, ReplicaRole};
-use kuberic_wire::ReplicationAcknowledgement;
+use kuberic_runtime_internal::transport::ReplicationAck;
 use tokio::sync::oneshot;
 
 use crate::application::Lsn;
@@ -86,7 +86,7 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn acknowledge(&mut self, acknowledgement: &ReplicationAcknowledgement) -> Result<()> {
+    pub fn acknowledge(&mut self, acknowledgement: &ReplicationAck) -> Result<()> {
         let authority = self
             .authority
             .as_ref()

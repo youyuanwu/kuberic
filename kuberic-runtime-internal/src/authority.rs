@@ -5,9 +5,9 @@ use kuberic_protocol::types::{
     ReplicaRole, TransitionKind,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
-use kuberic_wire::{ReplicationAcknowledgement, ReplicationEnvelope};
 use serde::{Deserialize, Serialize};
 
+use crate::transport::{CopyItem, ReplicationAck, ReplicationItem};
 use crate::{ContractError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +75,7 @@ impl BuildAuthority {
         Ok(())
     }
 
-    pub fn validate_envelope(&self, envelope: &kuberic_wire::CopyEnvelope) -> Result<()> {
+    pub fn validate_envelope(&self, envelope: &CopyItem) -> Result<()> {
         if envelope.build_id != self.build_id
             || envelope.sender != self.source
             || envelope.receiver != self.target
@@ -233,7 +233,7 @@ impl AdmittedAuthority {
             .role
     }
 
-    pub fn validate_envelope(&self, envelope: &ReplicationEnvelope) -> Result<()> {
+    pub fn validate_envelope(&self, envelope: &ReplicationItem) -> Result<()> {
         self.validate_fence(
             &envelope.sender,
             &envelope.receiver,
@@ -243,10 +243,7 @@ impl AdmittedAuthority {
         )
     }
 
-    pub fn validate_acknowledgement(
-        &self,
-        acknowledgement: &ReplicationAcknowledgement,
-    ) -> Result<()> {
+    pub fn validate_acknowledgement(&self, acknowledgement: &ReplicationAck) -> Result<()> {
         self.validate_fence(
             &acknowledgement.sender,
             &acknowledgement.receiver,

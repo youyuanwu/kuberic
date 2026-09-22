@@ -1371,6 +1371,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
+ "tonic",
  "uuid",
 ]
 
@@ -1448,7 +1450,6 @@ dependencies = [
  "futures",
  "kuberic-protocol",
  "kuberic-runtime-internal",
- "kuberic-wire",
  "thiserror 2.0.20",
  "tokio",
  "uuid",
@@ -1461,7 +1462,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "kuberic-protocol",
- "kuberic-wire",
  "serde",
  "thiserror 2.0.20",
 ]

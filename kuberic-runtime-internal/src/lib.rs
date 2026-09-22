@@ -2,6 +2,7 @@
 
 pub mod authority;
 pub mod effects;
+pub mod transport;
 
 use thiserror::Error;
 

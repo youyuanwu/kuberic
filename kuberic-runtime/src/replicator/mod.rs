@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, ReplicaId, ReplicaIdentity, ReplicaRole,
+    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, PartitionInformation,
+    ReplicaId, ReplicaIdentity, ReplicaRole,
 };
 use kuberic_runtime_internal::RuntimeHostToken;
 use tokio::sync::{Mutex, RwLock};
@@ -25,12 +26,12 @@ use crate::authority::{
 use crate::effects::RuntimeEffectAction;
 use crate::effects::RuntimeSnapshot;
 use crate::engine::DurableState;
-use crate::internal::{
-    DefaultReplicatorInner, OutboundReplication, PendingReplication, PendingWrite,
-};
+use crate::internal::{DefaultReplicatorInner, PendingReplication, PendingWrite};
 use crate::replicator::copy::{PrepareCopyRequest, PreparedCopy};
 use crate::{Result, RuntimeError};
-use kuberic_wire::proto;
+use kuberic_runtime_internal::transport::{
+    CopyAck, CopyItem, OutboundOperation, ReplicationAck, ReplicationItem,
+};
 use stream::{OperationStream, ServiceStreams};
 
 /// IFabricReplicator, with COM Begin/End pairs collapsed to async calls.
@@ -86,13 +87,12 @@ pub trait ManagedReplicator: Send + Sync {
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()>;
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
-    async fn accept_acknowledgement(&self, acknowledgement: proto::ReplicationAck) -> Result<()>;
+    async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()>;
     async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy>;
-    async fn accept_copy_acknowledgement(&self, acknowledgement: proto::CopyAck) -> Result<()>;
-    async fn receive_copy_item(&self, item: proto::CopyItem) -> Result<proto::CopyAck>;
-    async fn receive_replication(&self, item: proto::ReplicationItem)
-    -> Result<PendingReplication>;
-    async fn next_outbound(&self) -> Option<OutboundReplication>;
+    async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()>;
+    async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck>;
+    async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication>;
+    async fn next_outbound(&self) -> Option<OutboundOperation>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +195,22 @@ impl ReplicatorFactoryContext {
         self.access.write_status().await
     }
 
+    pub async fn read_status(&self) -> Result<AccessStatus> {
+        self.access.read_status().await
+    }
+
+    pub fn partition_information(&self) -> PartitionInformation {
+        self.access.partition_information()
+    }
+
+    pub async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
+        self.access.report_load(metrics).await
+    }
+
+    pub async fn report_fault(&self, fault: FaultType) -> Result<()> {
+        self.access.report_fault(fault).await
+    }
+
     fn for_creation(&self, reservation: ReplicatorCreationReservation) -> Self {
         let mut context = self.clone();
         context.reservation = Some(reservation);
@@ -214,7 +230,15 @@ impl ReplicatorFactoryContext {
 #[async_trait]
 #[doc(hidden)]
 pub trait PartitionAccessView: Send + Sync {
+    fn partition_information(&self) -> PartitionInformation;
+
+    async fn read_status(&self) -> Result<AccessStatus>;
+
     async fn write_status(&self) -> Result<AccessStatus>;
+
+    async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()>;
+
+    async fn report_fault(&self, fault: FaultType) -> Result<()>;
 }
 
 #[doc(hidden)]
@@ -294,6 +318,22 @@ impl StatefulServicePartition {
 
     pub async fn get_write_status(&self) -> Result<AccessStatus> {
         self.context.write_status().await
+    }
+
+    pub async fn get_read_status(&self) -> Result<AccessStatus> {
+        self.context.read_status().await
+    }
+
+    pub fn get_partition_information(&self) -> PartitionInformation {
+        self.context.partition_information()
+    }
+
+    pub async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
+        self.context.report_load(metrics).await
+    }
+
+    pub async fn report_fault(&self, fault: FaultType) -> Result<()> {
+        self.context.report_fault(fault).await
     }
 
     pub async fn create_replicator(

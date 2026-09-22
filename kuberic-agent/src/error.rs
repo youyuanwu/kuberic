@@ -16,6 +16,12 @@ pub enum AgentError {
     InitializationNotAuthorized(String),
     #[error("durable effect conflict: {0}")]
     EffectConflict(String),
+    #[error("command rejected: {0}")]
+    CommandRejected(String),
+    #[error("transport session rejected: {0}")]
+    SessionRejected(String),
+    #[error("transport backpressure: {0}")]
+    Backpressure(String),
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("serialization error: {0}")]

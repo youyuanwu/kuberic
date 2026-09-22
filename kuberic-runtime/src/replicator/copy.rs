@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use futures::Stream;
 use kuberic_protocol::types::{ConfigurationDescriptor, OperationId, ReplicaIdentity};
-use kuberic_wire::proto;
+use kuberic_runtime_internal::transport::CopyItem;
 
 use crate::Result;
 use crate::application::OperationDataStream;
@@ -23,7 +23,7 @@ pub struct PrepareCopyRequest {
 
 pub struct PreparedCopy {
     pub authority: BuildAuthority,
-    pub items: Pin<Box<dyn Stream<Item = Result<proto::CopyItem>> + Send>>,
+    pub items: Pin<Box<dyn Stream<Item = Result<CopyItem>> + Send>>,
 }
 
 pub type BuildProgress = DurableBuildProgress;

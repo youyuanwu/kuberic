@@ -27,7 +27,16 @@ before application teardown. The default replicator's managed capability is
 transferred directly into agent registration and is not returned to
 application code.
 
-The crate currently exposes runtime-domain forwarding for the future transport.
-Network listeners, reliable peer sessions, declarative reconfiguration
-coordination, durable recovery of individual promotion substages, partition
-read/load/fault reporting, and protobuf conversion remain Phase 4 work.
+The agent now owns fenced `EnsureConfiguration` admission, durable private
+Demote/GetLSN/Catchup/Deactivate/Activate stages, restart-safe runtime effect
+sequencing, independent read/write access, partition/load/fault reports,
+separate authenticated control and replication listeners, fresh process
+sessions, stale-session rejection, protobuf conversion, and bounded reliable
+send windows. Missing retained replication payloads explicitly require full
+copy rather than overstating catch-up capability.
+
+The Phase 5 controller remains responsible for selecting configurations,
+re-observing command postconditions, routing fences, and distributing
+deployment authentication material. Concrete outbound peer dialing is wired
+through the agent's `OutboundDispatcher` contract by the later vertical-slice
+phase.

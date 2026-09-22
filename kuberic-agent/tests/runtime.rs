@@ -5,23 +5,23 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use kuberic_agent::hosting::{PodRuntime, RuntimeControlPlane};
+use kuberic_agent::hosting::{OutboundReplication, PodRuntime, PreparedCopy, RuntimeControlPlane};
 use kuberic_protocol::types::{
-    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch,
-    OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, TransitionKind,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, FaultType,
+    LoadMetric, OperationId, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    TransitionKind,
 };
 use kuberic_runtime::application::{
     ClientWrite, CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext,
     OpenMode, Operation, OperationDataStream, RoleChange, StateProvider, StatefulServiceReplica,
 };
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
-use kuberic_runtime::internal::OutboundReplication;
-use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest, PreparedCopy};
+use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, PrimaryReplicator, ReplicaInformation, ReplicaSetQuorumMode,
     Replicator, ReplicatorFactory, ReplicatorFactoryContext, ReplicatorInterfaces,
-    ReplicatorSettings, StateReplicator,
+    ReplicatorSettings, StateReplicator, StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::authority::{
@@ -221,6 +221,7 @@ impl BuildProgressStore for MemoryAuthorityStore {
 
 #[derive(Default)]
 struct TestApplication {
+    partition: Mutex<Option<StatefulServicePartition>>,
     factory: Mutex<Option<Arc<dyn ReplicatorFactory>>>,
     state_replicator: Mutex<Option<Arc<dyn StateReplicator>>>,
     returned_control: Mutex<Option<Arc<dyn Replicator>>>,
@@ -479,6 +480,7 @@ impl RuntimeControlPlane for TestControlPlane {
 impl StatefulServiceReplica for TestApplication {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
         self.events.lock().unwrap().push("service.open".to_string());
+        *self.partition.lock().unwrap() = Some(context.partition.clone());
         assert_eq!(
             context.partition.get_write_status().await?,
             AccessStatus::NotPrimary
@@ -1138,12 +1140,13 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     assert!(state.get_replication_stream().await.is_err());
     assert!(state.get_copy_stream().await.is_err());
     let write = tokio::spawn(async move { state.replicate(Bytes::from_static(b"one")).await });
-    let OutboundReplication::Replication(item) = source.next_outbound().await.unwrap() else {
+    let OutboundReplication::Replication(item) = source.data_plane().next_outbound().await.unwrap()
+    else {
         panic!("expected replication")
     };
     let receive = {
         let target = target.clone();
-        tokio::spawn(async move { target.receive_replication(item).await })
+        tokio::spawn(async move { target.data_plane().receive_replication(item).await })
     };
     let mut stream = target_app.held_streams.lock().unwrap().remove(0);
     let operation = stream.get_operation().await.unwrap().unwrap();
@@ -1151,6 +1154,7 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     assert_eq!(receive.received.received_lsn, 1);
     assert_eq!(receive.received.applied_lsn, 0);
     source
+        .data_plane()
         .accept_acknowledgement(receive.received.clone())
         .await
         .unwrap();
@@ -1169,6 +1173,7 @@ async fn service_owned_state_handle_and_stream_drive_exact_durable_quorum() {
     assert!(!write.is_finished());
     operation.acknowledge(progress).unwrap();
     source
+        .data_plane()
         .accept_acknowledgement(receive.applied().await.unwrap())
         .await
         .unwrap();
@@ -1222,10 +1227,11 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         })
     };
     assert!(matches!(
-        source.next_outbound().await,
+        source.data_plane().next_outbound().await,
         Some(OutboundReplication::Build(_))
     ));
     let mut prepared = source
+        .data_plane()
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("sf-build"),
             target: replacement.clone(),
@@ -1258,7 +1264,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
     let delivery = {
         let target = target.clone();
         let item = next_copy_item(&mut prepared).await;
-        tokio::spawn(async move { target.receive_copy_item(item).await })
+        tokio::spawn(async move { target.data_plane().receive_copy_item(item).await })
     };
     let operation = copy.get_operation().await.unwrap().unwrap();
     assert!(matches!(
@@ -1271,6 +1277,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         .acknowledge(DurableApplicationProgress::default())
         .unwrap();
     source
+        .data_plane()
         .accept_copy_acknowledgement(delivery.await.unwrap().unwrap())
         .await
         .unwrap();
@@ -1289,7 +1296,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         .unwrap();
     assert!(source.snapshot().await.builds.is_empty());
     assert!(matches!(
-        source.next_outbound().await,
+        source.data_plane().next_outbound().await,
         Some(OutboundReplication::Remove(_))
     ));
 }
@@ -1301,6 +1308,7 @@ async fn direct_control_epoch_fences_old_replication_and_abort_ends_pending_quor
     let secondary = identity(2, "secondary");
     let runtime = open_primary(app.clone(), vec![local.clone(), secondary.clone()]).await;
     let pending = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("pending"),
             data: Bytes::from_static(b"one"),
@@ -1315,6 +1323,7 @@ async fn direct_control_epoch_fences_old_replication_and_abort_ends_pending_quor
     ));
     assert!(matches!(
         runtime
+            .data_plane()
             .accept_acknowledgement(acknowledgement(
                 &authority(local, vec![identity(1, "primary"), secondary.clone()]),
                 secondary,
@@ -1425,6 +1434,7 @@ async fn quorum_modes_data_loss_and_configuration_methods_use_the_default_engine
         })
     };
     runtime
+        .data_plane()
         .accept_acknowledgement(acknowledgement(&admitted, members[1].clone(), 1))
         .await
         .unwrap();
@@ -1614,6 +1624,7 @@ async fn ambiguous_primary_authority_admission_fences_pending_writes_and_old_ack
             .unwrap();
     }
     let pending = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("old-epoch"),
             data: Bytes::from_static(b"one"),
@@ -1645,6 +1656,7 @@ async fn ambiguous_primary_authority_admission_fences_pending_writes_and_old_ack
     ));
     assert!(matches!(
         runtime
+            .data_plane()
             .accept_acknowledgement(acknowledgement(&admitted, secondary, 1))
             .await,
         Err(RuntimeError::AuthorityMismatch(_))
@@ -1676,7 +1688,7 @@ async fn removing_a_replica_terminates_its_pending_build_wait() {
         })
     };
     assert!(matches!(
-        runtime.next_outbound().await,
+        runtime.data_plane().next_outbound().await,
         Some(OutboundReplication::Build(_))
     ));
     control.remove_replica(target.replica_id).await.unwrap();
@@ -1773,7 +1785,7 @@ async fn dropping_runtime_aborts_retained_state_handles_streams_and_pending_writ
         tokio::spawn(async move { state.replicate(Bytes::from_static(b"pending")).await })
     };
     assert!(matches!(
-        runtime.next_outbound().await,
+        runtime.data_plane().next_outbound().await,
         Some(OutboundReplication::Replication(_))
     ));
     drop(runtime);
@@ -2082,6 +2094,7 @@ fn acknowledgement(
         received_lsn: lsn,
         applied_lsn: lsn,
         committed_lsn: 0,
+        ..Default::default()
     }
 }
 
@@ -2094,6 +2107,7 @@ async fn direct_writes_require_primary_role_and_explicit_write_grant() {
 
     assert!(matches!(
         runtime
+            .data_plane()
             .begin_write(ClientWrite {
                 operation_id: OperationId::new("closed"),
                 data: Bytes::from_static(b"closed")
@@ -2131,6 +2145,7 @@ async fn direct_writes_require_primary_role_and_explicit_write_grant() {
 
     assert!(matches!(
         runtime
+            .data_plane()
             .begin_write(ClientWrite {
                 operation_id: OperationId::new("still-closed"),
                 data: Bytes::from_static(b"still-closed")
@@ -2149,6 +2164,7 @@ async fn direct_writes_require_primary_role_and_explicit_write_grant() {
         .await
         .unwrap();
     let pending = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("committed"),
             data: Bytes::from_static(b"committed"),
@@ -2161,6 +2177,61 @@ async fn direct_writes_require_primary_role_and_explicit_write_grant() {
         1
     );
     assert_eq!(pending.committed().await.unwrap().committed_lsn, 1);
+}
+
+#[tokio::test]
+async fn partition_contract_reports_independent_access_load_and_fault() {
+    let application = Arc::new(TestApplication::default());
+    let runtime = PodRuntime::new(
+        identity(1, "partition-contract"),
+        application.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+    );
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    let partition = application.partition.lock().unwrap().clone().unwrap();
+    assert!(
+        !partition
+            .get_partition_information()
+            .partition_id
+            .is_empty()
+    );
+    assert_eq!(
+        partition.get_read_status().await.unwrap(),
+        AccessStatus::NotPrimary
+    );
+    assert_eq!(
+        partition.get_write_status().await.unwrap(),
+        AccessStatus::NotPrimary
+    );
+    partition
+        .report_load(vec![LoadMetric {
+            name: "queue-depth".into(),
+            value: 3,
+        }])
+        .await
+        .unwrap();
+    partition.report_fault(FaultType::Transient).await.unwrap();
+    let report = runtime.partition_report().await;
+    assert_eq!(report.load_metrics[0].name, "queue-depth");
+    assert_eq!(report.reported_fault, Some(FaultType::Transient));
+    assert!(
+        partition
+            .report_load(vec![
+                LoadMetric {
+                    name: "duplicate".into(),
+                    value: 1,
+                },
+                LoadMetric {
+                    name: "duplicate".into(),
+                    value: 2,
+                },
+            ])
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -2205,11 +2276,11 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     };
     application.fail_apply.store(true, Ordering::SeqCst);
     assert!(matches!(
-        runtime.begin_write(first.clone()).await,
+        runtime.data_plane().begin_write(first.clone()).await,
         Err(RuntimeError::Application(_))
     ));
     application.fail_apply.store(false, Ordering::SeqCst);
-    let retry = runtime.begin_write(first).await.unwrap();
+    let retry = runtime.data_plane().begin_write(first).await.unwrap();
     assert_eq!(retry.lsn, 1);
     retry.committed().await.unwrap();
 
@@ -2219,11 +2290,11 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     };
     application.fail_after_apply.store(true, Ordering::SeqCst);
     assert!(matches!(
-        runtime.begin_write(second.clone()).await,
+        runtime.data_plane().begin_write(second.clone()).await,
         Err(RuntimeError::Application(_))
     ));
     assert_eq!(application.durable_progress().await.unwrap().applied_lsn, 2);
-    let retry = runtime.begin_write(second).await.unwrap();
+    let retry = runtime.data_plane().begin_write(second).await.unwrap();
     assert_eq!(retry.lsn, 2);
     retry.committed().await.unwrap();
 
@@ -2233,13 +2304,15 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     };
     application.pause_after_apply.store(true, Ordering::SeqCst);
     let runtime_task = runtime.clone();
-    let third_task = tokio::spawn(async move { runtime_task.begin_write(third.clone()).await });
+    let third_task =
+        tokio::spawn(async move { runtime_task.data_plane().begin_write(third.clone()).await });
     application.applied_notify.notified().await;
     third_task.abort();
     assert!(matches!(third_task.await, Err(error) if error.is_cancelled()));
     application.pause_after_apply.store(false, Ordering::SeqCst);
     application.resume_notify.notify_waiters();
     let retry = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("third"),
             data: Bytes::from_static(b"third"),
@@ -2255,10 +2328,10 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     };
     application.fail_commit.store(true, Ordering::SeqCst);
     assert!(matches!(
-        runtime.begin_write(fourth.clone()).await,
+        runtime.data_plane().begin_write(fourth.clone()).await,
         Err(RuntimeError::Application(_))
     ));
-    let retry = runtime.begin_write(fourth).await.unwrap();
+    let retry = runtime.data_plane().begin_write(fourth).await.unwrap();
     assert_eq!(retry.lsn, 4);
     retry.committed().await.unwrap();
 
@@ -2268,13 +2341,15 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     };
     application.pause_commit.store(true, Ordering::SeqCst);
     let runtime_task = runtime.clone();
-    let fifth_task = tokio::spawn(async move { runtime_task.begin_write(fifth).await });
+    let fifth_task =
+        tokio::spawn(async move { runtime_task.data_plane().begin_write(fifth).await });
     application.commit_notify.notified().await;
     fifth_task.abort();
     assert!(matches!(fifth_task.await, Err(error) if error.is_cancelled()));
     application.pause_commit.store(false, Ordering::SeqCst);
     application.resume_commit_notify.notify_waiters();
     let retry = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("fifth"),
             data: Bytes::from_static(b"fifth"),
@@ -2292,11 +2367,12 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
         .fail_registered_write_once
         .store(true, Ordering::SeqCst);
     assert!(matches!(
-        runtime.begin_write(sixth.clone()).await,
+        runtime.data_plane().begin_write(sixth.clone()).await,
         Err(RuntimeError::Application(_))
     ));
     assert!(matches!(
         runtime
+            .data_plane()
             .begin_write(ClientWrite {
                 operation_id: OperationId::new("blocked-by-sixth"),
                 data: Bytes::from_static(b"blocked"),
@@ -2304,7 +2380,7 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
             .await,
         Err(RuntimeError::LocalWritePending(_))
     ));
-    let retry = runtime.begin_write(sixth).await.unwrap();
+    let retry = runtime.data_plane().begin_write(sixth).await.unwrap();
     assert_eq!(retry.lsn, 6);
     retry.committed().await.unwrap();
 
@@ -2314,13 +2390,15 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     };
     store.pause_registered_write.store(true, Ordering::SeqCst);
     let runtime_task = runtime.clone();
-    let seventh_task = tokio::spawn(async move { runtime_task.begin_write(seventh).await });
+    let seventh_task =
+        tokio::spawn(async move { runtime_task.data_plane().begin_write(seventh).await });
     store.registered_write_notify.notified().await;
     seventh_task.abort();
     assert!(matches!(seventh_task.await, Err(error) if error.is_cancelled()));
     store.pause_registered_write.store(false, Ordering::SeqCst);
     store.resume_registered_write_notify.notify_waiters();
     let retry = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("seventh"),
             data: Bytes::from_static(b"seventh"),
@@ -2336,13 +2414,15 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     };
     store.pause_committed_write.store(true, Ordering::SeqCst);
     let runtime_task = runtime.clone();
-    let eighth_task = tokio::spawn(async move { runtime_task.begin_write(eighth).await });
+    let eighth_task =
+        tokio::spawn(async move { runtime_task.data_plane().begin_write(eighth).await });
     store.committed_write_notify.notified().await;
     eighth_task.abort();
     assert!(matches!(eighth_task.await, Err(error) if error.is_cancelled()));
     store.pause_committed_write.store(false, Ordering::SeqCst);
     store.resume_committed_write_notify.notify_waiters();
     let retry = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("eighth"),
             data: Bytes::from_static(b"eighth"),
@@ -2352,6 +2432,7 @@ async fn local_write_retries_the_same_lsn_after_definite_or_ambiguous_failure() 
     assert_eq!(retry.lsn, 8);
     retry.committed().await.unwrap();
     let ninth = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("ninth"),
             data: Bytes::from_static(b"ninth"),
@@ -2387,10 +2468,11 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
         committed_lsn: 0,
         data: b"value".to_vec(),
         receiver: Some(local.clone().into()),
+        ..Default::default()
     };
 
     assert!(matches!(
-        runtime.receive_replication(item.clone()).await,
+        runtime.data_plane().receive_replication(item.clone()).await,
         Err(RuntimeError::AuthorityNotAdmitted)
     ));
     assert!(application.applied.lock().unwrap().is_empty());
@@ -2415,7 +2497,7 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
     gap.lsn = 2;
     gap.data = b"gap".to_vec();
     assert!(matches!(
-        runtime.receive_replication(gap).await,
+        runtime.data_plane().receive_replication(gap).await,
         Err(RuntimeError::InvalidReplication(_))
     ));
     assert!(application.applied.lock().unwrap().is_empty());
@@ -2423,6 +2505,7 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
     application.fail_apply.store(true, Ordering::SeqCst);
     assert!(matches!(
         runtime
+            .data_plane()
             .receive_replication(item.clone())
             .await
             .unwrap()
@@ -2432,7 +2515,11 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
     ));
     application.fail_apply.store(false, Ordering::SeqCst);
 
-    let delivery = runtime.receive_replication(item.clone()).await.unwrap();
+    let delivery = runtime
+        .data_plane()
+        .receive_replication(item.clone())
+        .await
+        .unwrap();
     assert_eq!(delivery.received.received_lsn, 1);
     assert_eq!(delivery.received.applied_lsn, 0);
     let acknowledgement = delivery.applied().await.unwrap();
@@ -2440,6 +2527,7 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
     assert_eq!(application.applied.lock().unwrap().len(), 1);
 
     let retry = runtime
+        .data_plane()
         .receive_replication(item.clone())
         .await
         .unwrap()
@@ -2453,6 +2541,7 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
     conflicting.data = b"different".to_vec();
     assert!(matches!(
         runtime
+            .data_plane()
             .receive_replication(conflicting)
             .await
             .unwrap()
@@ -2466,6 +2555,7 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
     committed.committed_lsn = 1;
     committed.data = b"next".to_vec();
     runtime
+        .data_plane()
         .receive_replication(committed)
         .await
         .unwrap()
@@ -2525,6 +2615,7 @@ async fn new_authority_ack_does_not_credit_an_unverified_old_suffix() {
         .await
         .unwrap();
     let pending = primary_runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("new-two"),
             data: Bytes::from_static(b"new-two"),
@@ -2577,6 +2668,7 @@ async fn new_authority_ack_does_not_credit_an_unverified_old_suffix() {
         replay.committed_lsn = 1;
         replay.data = b"one".to_vec();
         let ack = runtime
+            .data_plane()
             .receive_replication(replay)
             .await
             .unwrap()
@@ -2584,7 +2676,11 @@ async fn new_authority_ack_does_not_credit_an_unverified_old_suffix() {
             .await
             .unwrap();
         assert_eq!(ack.applied_lsn, 1);
-        primary_runtime.accept_acknowledgement(ack).await.unwrap();
+        primary_runtime
+            .data_plane()
+            .accept_acknowledgement(ack)
+            .await
+            .unwrap();
 
         let conflicting = pending_items
             .iter()
@@ -2597,6 +2693,7 @@ async fn new_authority_ack_does_not_credit_an_unverified_old_suffix() {
             .clone();
         assert!(matches!(
             runtime
+                .data_plane()
                 .receive_replication(conflicting)
                 .await
                 .unwrap()
@@ -2723,6 +2820,7 @@ fn retry_item(
         lsn: acknowledgement.received_lsn,
         committed_lsn: acknowledgement.committed_lsn,
         data: b"value".to_vec(),
+        ..Default::default()
     }
 }
 
@@ -2985,6 +3083,7 @@ async fn failed_or_cancelled_secondary_epoch_admission_stays_write_fenced() {
         .await
         .unwrap();
     let pending = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("old-authority-pending"),
             data: Bytes::from_static(b"pending"),
@@ -3039,6 +3138,7 @@ async fn failed_or_cancelled_secondary_epoch_admission_stays_write_fenced() {
     ));
     assert!(matches!(
         runtime
+            .data_plane()
             .accept_acknowledgement(proto::ReplicationAck {
                 protocol_version: kuberic_protocol::PROTOCOL_VERSION,
                 sender: delayed_item.sender,
@@ -3049,6 +3149,7 @@ async fn failed_or_cancelled_secondary_epoch_admission_stays_write_fenced() {
                 received_lsn: delayed_item.lsn,
                 applied_lsn: delayed_item.lsn,
                 committed_lsn: 0,
+                ..Default::default()
             })
             .await,
         Err(RuntimeError::AuthorityMismatch(_))
@@ -3099,6 +3200,7 @@ async fn close_fences_pending_client_writes_before_ack_processing() {
         .await
         .unwrap();
     let pending = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("pending"),
             data: Bytes::from_static(b"pending"),
@@ -3126,6 +3228,7 @@ async fn close_fences_pending_client_writes_before_ack_processing() {
     close_task.await.unwrap().unwrap();
     assert!(matches!(
         runtime
+            .data_plane()
             .accept_acknowledgement(proto::ReplicationAck {
                 protocol_version: kuberic_protocol::PROTOCOL_VERSION,
                 sender: item.sender,
@@ -3136,6 +3239,7 @@ async fn close_fences_pending_client_writes_before_ack_processing() {
                 received_lsn: item.lsn,
                 applied_lsn: item.lsn,
                 committed_lsn: 0,
+                ..Default::default()
             })
             .await,
         Err(RuntimeError::Closed)
@@ -3184,6 +3288,7 @@ async fn failed_demotion_callback_preserves_completed_role_and_transition_stage(
         .await
         .unwrap();
     let pending = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("demotion-pending"),
             data: Bytes::from_static(b"pending"),
@@ -3279,6 +3384,7 @@ async fn injected_replicator_failures_cannot_leave_pending_writes_live() {
             .await
             .unwrap();
         let pending = runtime
+            .data_plane()
             .begin_write(ClientWrite {
                 operation_id: OperationId::new(if fail_close {
                     "close-failure"
@@ -3358,6 +3464,7 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .await
         .unwrap();
     source_runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("one"),
             data: Bytes::from_static(b"one"),
@@ -3368,6 +3475,7 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .await
         .unwrap();
     let mut prepared = source_runtime
+        .data_plane()
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("build"),
             target: target.clone(),
@@ -3380,6 +3488,7 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
     let items = copy_through_final(&mut prepared).await;
     assert_eq!(items.len(), 3);
     let live_write = source_runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("two"),
             data: Bytes::from_static(b"two"),
@@ -3416,14 +3525,19 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .unwrap();
 
     assert!(matches!(
-        target_runtime.receive_copy_item(items[2].clone()).await,
+        target_runtime
+            .data_plane()
+            .receive_copy_item(items[2].clone())
+            .await,
         Err(RuntimeError::InvalidReplication(_))
     ));
     let first_ack = target_runtime
+        .data_plane()
         .receive_copy_item(items[0].clone())
         .await
         .unwrap();
     source_runtime
+        .data_plane()
         .accept_copy_acknowledgement(first_ack.clone())
         .await
         .unwrap();
@@ -3433,6 +3547,7 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         1
     );
     target_runtime
+        .data_plane()
         .receive_copy_item(items[0].clone())
         .await
         .unwrap();
@@ -3442,10 +3557,12 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
     );
     assert_eq!(target_application.applied.lock().unwrap().len(), 0);
     target_runtime
+        .data_plane()
         .receive_copy_item(items[1].clone())
         .await
         .unwrap();
     let final_ack = target_runtime
+        .data_plane()
         .receive_copy_item(items[2].clone())
         .await
         .unwrap();
@@ -3453,47 +3570,60 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
     assert!(final_ack.final_item);
     assert_eq!(final_ack.durable_lsn, 1);
     let live_ack = target_runtime
+        .data_plane()
         .receive_copy_item(live_build_item)
         .await
         .unwrap();
     let mut forged_ack = live_ack.clone();
     forged_ack.durable_lsn = 100;
     assert!(matches!(
-        source_runtime.accept_copy_acknowledgement(forged_ack).await,
+        source_runtime
+            .data_plane()
+            .accept_copy_acknowledgement(forged_ack)
+            .await,
         Err(RuntimeError::InvalidReplication(_))
     ));
     source_runtime
+        .data_plane()
         .accept_copy_acknowledgement(live_ack.clone())
         .await
         .unwrap();
     assert!(!source_runtime.snapshot().await.builds[0].completed);
     source_runtime
+        .data_plane()
         .accept_copy_acknowledgement(final_ack)
         .await
         .unwrap();
     let retried_final = target_runtime
+        .data_plane()
         .receive_copy_item(items[2].clone())
         .await
         .unwrap();
     assert_eq!(retried_final.durable_lsn, 1);
     source_runtime
+        .data_plane()
         .accept_copy_acknowledgement(retried_final)
         .await
         .unwrap();
     let retried_chunk = target_runtime
+        .data_plane()
         .receive_copy_item(items[0].clone())
         .await
         .unwrap();
     assert!(retried_chunk.snapshot_chunk);
     assert_eq!(retried_chunk.durable_lsn, 0);
     source_runtime
+        .data_plane()
         .accept_copy_acknowledgement(retried_chunk)
         .await
         .unwrap();
     let mut conflicting_chunk = items[0].clone();
     conflicting_chunk.data.push(0xff);
     assert!(matches!(
-        target_runtime.receive_copy_item(conflicting_chunk).await,
+        target_runtime
+            .data_plane()
+            .receive_copy_item(conflicting_chunk)
+            .await,
         Err(RuntimeError::InvalidReplication(_))
     ));
     assert_eq!(
@@ -3517,6 +3647,7 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
         .store(true, Ordering::SeqCst);
     let runtime = open_primary(application.clone(), vec![identity(1, "source")]).await;
     let mut prepared = runtime
+        .data_plane()
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("streaming-copy"),
             target: identity(1, "replacement"),
@@ -3531,7 +3662,7 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
     application.copy_enumeration_notify.notified().await;
     let pending = timeout(
         Duration::from_secs(1),
-        runtime.begin_write(ClientWrite {
+        runtime.data_plane().begin_write(ClientWrite {
             operation_id: OperationId::new("write-during-copy"),
             data: Bytes::from_static(b"live"),
         }),
@@ -3609,6 +3740,7 @@ async fn retained_gap_enumeration_does_not_block_primary_writes() {
     let cancelled_target = target.clone();
     let cancelled = tokio::spawn(async move {
         cancelled_runtime
+            .data_plane()
             .prepare_copy(PrepareCopyRequest {
                 build_id: cancelled_build_id,
                 target: cancelled_target,
@@ -3626,6 +3758,7 @@ async fn retained_gap_enumeration_does_not_block_primary_writes() {
     let runtime_for_copy = runtime.clone();
     let prepare = tokio::spawn(async move {
         runtime_for_copy
+            .data_plane()
             .prepare_copy(PrepareCopyRequest {
                 build_id,
                 target,
@@ -3637,7 +3770,7 @@ async fn retained_gap_enumeration_does_not_block_primary_writes() {
     application.retained_enumeration_notify.notified().await;
     let pending = timeout(
         Duration::from_secs(1),
-        runtime.begin_write(ClientWrite {
+        runtime.data_plane().begin_write(ClientWrite {
             operation_id: OperationId::new("write-during-gap-scan"),
             data: Bytes::from_static(b"live"),
         }),
@@ -3693,6 +3826,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .await
         .unwrap();
     let mut prepared = source_runtime
+        .data_plane()
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("handoff-build"),
             target: replacement.clone(),
@@ -3725,7 +3859,11 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .await
         .unwrap();
     for item in items {
-        target_runtime.receive_copy_item(item).await.unwrap();
+        target_runtime
+            .data_plane()
+            .receive_copy_item(item)
+            .await
+            .unwrap();
     }
 
     let current = ConfigurationDescriptor::new(
@@ -3825,6 +3963,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .await
         .unwrap();
     let pending = source_runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("two"),
             data: Bytes::from_static(b"two"),
@@ -3835,6 +3974,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         let receiver = item.receiver.as_ref().unwrap();
         let ack = if receiver.instance_id == replacement.instance_id.as_str() {
             target_runtime
+                .data_plane()
                 .receive_replication(item)
                 .await
                 .unwrap()
@@ -3843,6 +3983,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
                 .unwrap()
         } else if receiver.instance_id == secondary.instance_id.as_str() {
             secondary_runtime
+                .data_plane()
                 .receive_replication(item)
                 .await
                 .unwrap()
@@ -3852,7 +3993,11 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         } else {
             continue;
         };
-        source_runtime.accept_acknowledgement(ack).await.unwrap();
+        source_runtime
+            .data_plane()
+            .accept_acknowledgement(ack)
+            .await
+            .unwrap();
     }
     assert_eq!(pending.committed().await.unwrap().committed_lsn, 2);
 
@@ -3885,6 +4030,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .await
         .unwrap();
     let pending = source_runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("three"),
             data: Bytes::from_static(b"three"),
@@ -3902,13 +4048,18 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .unwrap()
         .clone();
     let ack = target_runtime
+        .data_plane()
         .receive_replication(item)
         .await
         .unwrap()
         .applied()
         .await
         .unwrap();
-    source_runtime.accept_acknowledgement(ack).await.unwrap();
+    source_runtime
+        .data_plane()
+        .accept_acknowledgement(ack)
+        .await
+        .unwrap();
     assert_eq!(pending.committed().await.unwrap().committed_lsn, 3);
 }
 
@@ -3953,6 +4104,7 @@ async fn bootstrap_primary_builds_full_genesis_members_before_configuration_admi
         .unwrap();
 
     let mut prepared = runtime
+        .data_plane()
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("bootstrap-secondary"),
             target: secondary,
@@ -4007,10 +4159,15 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         configuration: BuildConfiguration::Current,
         copy_context: empty_copy_context(),
     };
-    let mut first = runtime.prepare_copy(request(target.clone())).await.unwrap();
+    let mut first = runtime
+        .data_plane()
+        .prepare_copy(request(target.clone()))
+        .await
+        .unwrap();
     assert_eq!(first.authority.replication_boundary_lsn, 0);
     let _ = copy_through_final(&mut first).await;
     runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("after-boundary"),
             data: Bytes::from_static(b"after-boundary"),
@@ -4024,12 +4181,16 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
     assert_eq!(live.lsn, 1);
     assert!(!live.final_item);
     assert!(matches!(
-        runtime.prepare_copy(request(target.clone())).await,
+        runtime
+            .data_plane()
+            .prepare_copy(request(target.clone()))
+            .await,
         Err(RuntimeError::ReconfigurationPending)
     ));
 
     assert!(matches!(
         runtime
+            .data_plane()
             .prepare_copy(request(identity(2, "different-target")))
             .await,
         Err(RuntimeError::AuthorityMismatch(_))
@@ -4054,7 +4215,11 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         ))
         .await
         .unwrap();
-    let mut resumed = restarted.prepare_copy(request(target)).await.unwrap();
+    let mut resumed = restarted
+        .data_plane()
+        .prepare_copy(request(target))
+        .await
+        .unwrap();
     assert_eq!(resumed.authority.replication_boundary_lsn, 0);
     let _ = copy_through_final(&mut resumed).await;
     let resumed_operation = next_copy_item(&mut resumed).await;
@@ -4103,10 +4268,11 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
     };
     application.fail_after_apply.store(true, Ordering::SeqCst);
     assert!(matches!(
-        runtime.begin_write(write.clone()).await,
+        runtime.data_plane().begin_write(write.clone()).await,
         Err(RuntimeError::Application(_))
     ));
     let mut prepared = runtime
+        .data_plane()
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("final-sequence"),
             target,
@@ -4120,10 +4286,11 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
         .into_iter()
         .find(|item| item.final_item)
         .unwrap();
-    let retry = runtime.begin_write(write).await.unwrap();
+    let retry = runtime.data_plane().begin_write(write).await.unwrap();
     assert!(retry.build_items.is_empty());
     retry.committed().await.unwrap();
     runtime
+        .data_plane()
         .accept_copy_acknowledgement(proto::CopyAck {
             protocol_version: kuberic_protocol::PROTOCOL_VERSION,
             build_id: final_item.build_id,
@@ -4136,6 +4303,7 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
             replication_boundary_lsn: final_item.replication_boundary_lsn,
             final_item: true,
             snapshot_chunk: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -4177,6 +4345,7 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .await
         .unwrap();
     source_runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("copy-value"),
             data: Bytes::from_static(b"copy-value"),
@@ -4187,6 +4356,7 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .await
         .unwrap();
     let mut prepared = source_runtime
+        .data_plane()
         .prepare_copy(PrepareCopyRequest {
             build_id: OperationId::new("restartable-build"),
             target: target.clone(),
@@ -4219,6 +4389,7 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .await
         .unwrap();
     first_runtime
+        .data_plane()
         .receive_copy_item(items[0].clone())
         .await
         .unwrap();
@@ -4242,11 +4413,22 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         ))
         .await
         .unwrap();
-    restarted.receive_copy_item(items[0].clone()).await.unwrap();
-    restarted.receive_copy_item(items[1].clone()).await.unwrap();
+    restarted
+        .data_plane()
+        .receive_copy_item(items[0].clone())
+        .await
+        .unwrap();
+    restarted
+        .data_plane()
+        .receive_copy_item(items[1].clone())
+        .await
+        .unwrap();
     store.fail_build_progress_once.store(true, Ordering::SeqCst);
     assert!(matches!(
-        restarted.receive_copy_item(items[2].clone()).await,
+        restarted
+            .data_plane()
+            .receive_copy_item(items[2].clone())
+            .await,
         Err(RuntimeError::Application(_))
     ));
 
@@ -4270,6 +4452,7 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .await
         .unwrap();
     let final_ack = after_final_crash
+        .data_plane()
         .receive_copy_item(items[2].clone())
         .await
         .unwrap();
@@ -4363,6 +4546,7 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
     assert_eq!(waiting.catch_up_boundary, Some(10));
     assert!(!waiting.catch_up_complete);
     let pending_after_configuration = runtime
+        .data_plane()
         .begin_write(ClientWrite {
             operation_id: OperationId::new("after-catch-up-boundary"),
             data: Bytes::from_static(b"newer-write"),
@@ -4371,6 +4555,7 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
         .unwrap();
 
     runtime
+        .data_plane()
         .accept_acknowledgement(acknowledgement(&admitted, secondary, 10))
         .await
         .unwrap();
@@ -4461,10 +4646,12 @@ async fn runtime_exposes_derived_must_catch_up_evidence() {
         .await
         .unwrap();
     runtime
+        .data_plane()
         .accept_acknowledgement(acknowledgement(&admitted, old_primary, 10))
         .await
         .unwrap();
     runtime
+        .data_plane()
         .accept_acknowledgement(acknowledgement(&admitted, third, 10))
         .await
         .unwrap();

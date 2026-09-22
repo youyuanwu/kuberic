@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 use kuberic_protocol::types::{Epoch, OperationId, ReplicaIdentity, ReplicaRole};
-use kuberic_wire::{ReplicationAcknowledgement, proto};
+use kuberic_runtime_internal::transport::{ReplicationAck, ReplicationItem};
 use tokio::sync::oneshot;
 
 use crate::application::{ClientWrite, Lsn, Operation};
@@ -15,7 +15,7 @@ use super::quorum::QuorumTracker;
 #[derive(Debug)]
 pub(crate) struct PreparedWrite {
     pub lsn: Lsn,
-    pub items: Vec<proto::ReplicationItem>,
+    pub items: Vec<ReplicationItem>,
     pub completion: oneshot::Receiver<Result<Lsn>>,
 }
 
@@ -170,7 +170,7 @@ impl ReplicationLog {
         })
     }
 
-    fn replication_items(&self, operation: &Operation) -> Result<Vec<proto::ReplicationItem>> {
+    fn replication_items(&self, operation: &Operation) -> Result<Vec<ReplicationItem>> {
         let authority = self
             .authority
             .as_ref()
@@ -190,29 +190,23 @@ impl ReplicationLog {
             .collect::<BTreeSet<_>>();
         Ok(targets
             .into_iter()
-            .map(|receiver| proto::ReplicationItem {
-                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
-                sender: Some(self.local_identity.clone().into()),
-                epoch: Some(authority.current_configuration.epoch.into()),
+            .map(|receiver| ReplicationItem {
+                sender: self.local_identity.clone(),
+                receiver,
+                epoch: authority.current_configuration.epoch,
                 previous_configuration_id: authority
                     .previous_configuration
                     .as_ref()
-                    .map_or_else(String::new, |configuration| {
-                        configuration.configuration_id.to_string()
-                    }),
-                current_configuration_id: authority
-                    .current_configuration
-                    .configuration_id
-                    .to_string(),
+                    .map(|configuration| configuration.configuration_id.clone()),
+                current_configuration_id: authority.current_configuration.configuration_id.clone(),
                 lsn: operation.lsn,
                 committed_lsn: self.quorum.committed_lsn(),
-                data: operation.data.to_vec(),
-                receiver: Some(receiver.into()),
+                data: operation.data.clone(),
             })
             .collect())
     }
 
-    fn acknowledge_inner(&mut self, acknowledgement: &ReplicationAcknowledgement) -> Result<()> {
+    fn acknowledge_inner(&mut self, acknowledgement: &ReplicationAck) -> Result<()> {
         if acknowledgement.epoch != self.epoch {
             return Err(RuntimeError::AuthorityMismatch(
                 "acknowledgement predates the replicator epoch".into(),
@@ -393,10 +387,7 @@ impl ReplicationLog {
         self.ensure_local_write_registered_inner(operation)
     }
 
-    pub(crate) fn acknowledge(
-        &mut self,
-        acknowledgement: &ReplicationAcknowledgement,
-    ) -> Result<()> {
+    pub(crate) fn acknowledge(&mut self, acknowledgement: &ReplicationAck) -> Result<()> {
         self.acknowledge_inner(acknowledgement)
     }
 
