@@ -3,13 +3,24 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(
-            Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+            Debug,
+            Clone,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+            JsonSchema,
+            Default,
         )]
         #[serde(transparent)]
         pub struct $name(String);
@@ -50,7 +61,18 @@ string_id!(InitializationId);
 string_id!(OperationId);
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    Default,
 )]
 #[serde(transparent)]
 pub struct ReplicaId(i64);
@@ -72,7 +94,18 @@ impl fmt::Display for ReplicaId {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    Default,
 )]
 #[serde(rename_all = "camelCase")]
 /// Monotonic replication authority version, ordered by data loss then configuration.
@@ -90,7 +123,7 @@ impl Epoch {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Runtime role of one exact replica incarnation.
 pub enum ReplicaRole {
@@ -100,7 +133,7 @@ pub enum ReplicaRole {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Current write-access decision exposed by the replica runtime.
 pub enum AccessStatus {
@@ -110,27 +143,29 @@ pub enum AccessStatus {
     NoWriteQuorum,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PartitionInformation {
     pub partition_id: PartitionId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoadMetric {
     pub name: String,
     pub value: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum FaultType {
     Transient,
     Permanent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "camelCase")]
 /// Exact authority identity: logical replica, Pod incarnation, and durable generation.
 pub struct ReplicaIdentity {
@@ -139,14 +174,14 @@ pub struct ReplicaIdentity {
     pub agent_generation: AgentGeneration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigurationMember {
     pub identity: ReplicaIdentity,
     pub role: ReplicaRole,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Canonical Current or Previous Configuration with a content-derived ID.
 pub struct ConfigurationDescriptor {
@@ -209,7 +244,7 @@ impl ConfigurationDescriptor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Fixed replica-set size and majority quorum values frozen for an operation.
 pub struct EffectivePolicy {
@@ -235,21 +270,21 @@ impl EffectivePolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Last quorum-attested configuration accepted by the operator.
 pub struct AcceptedTopology {
     pub configuration: ConfigurationDescriptor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Supported out-of-authority provisioning operation.
 pub enum ProvisioningKind {
     Replacement,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Compact intent for one fresh replica that has not entered PC or CC.
 pub struct ProvisioningIntent {
@@ -265,7 +300,7 @@ pub struct ProvisioningIntent {
     pub operation_id: OperationId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Supported authority-changing transition.
 pub enum TransitionKind {
@@ -284,7 +319,7 @@ impl TransitionKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Frozen PC/CC target and policy for one active transition.
 pub struct TransitionIntent {
@@ -297,7 +332,7 @@ pub struct TransitionIntent {
     pub started_at_unix_seconds: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum ConditionStatus {
     True,
@@ -305,7 +340,7 @@ pub enum ConditionStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusCondition {
     pub type_: String,
@@ -314,7 +349,7 @@ pub struct StatusCondition {
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 /// Durable controller authority: accepted topology plus compact active intent.
 pub struct AcceptedStatus {

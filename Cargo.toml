@@ -9,6 +9,7 @@ members = [
   "kuberic-runtime",
   "kuberic-runtime-internal",
   "kuberic-agent",
+  "kuberic-controller",
   "kuberic-wire",
   "kuberic-core",
   "kuberic-operator",

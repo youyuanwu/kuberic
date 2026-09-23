@@ -758,12 +758,22 @@ epoch. Build selection is admitted by the agent before source execution; the
 engine cannot manufacture build permission. Returned copy-stream drop
 propagates cancellation into provider iteration and removes the build.
 
+The Phase 5 controller is isolated in `kuberic-controller` and watches only
+`operator.kuberic.io/v1alpha1`. Each reconcile loads the latest CR, owned Pods,
+PVCs, write Service, exact Kubernetes UIDs and resource versions, and available
+agent reports before normalizing one immutable `ObservationSnapshot`. The pure
+evaluator remains the only authority-selection owner. Status replacement uses
+optimistic resource-version fencing, routing changes use UID and
+resource-version tests, and one observed snapshot can dispatch at most one
+agent command. Stable, waiting, and recoverable unsafe states all have bounded
+re-observation intervals; agent startup `Unavailable` is a wait rather than
+permission to issue another authority command.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
-| Controller selection, dispatch, bounded re-observation, and routing fences | Level-triggered controller in Phase 5 |
 | Concrete outbound gRPC peer dialing and deployment credential distribution | Bootstrap vertical slice in Phase 6 |
 | True process-kill reconstruction with a live provider and active command | Bootstrap and adversarial suites in Phases 6 and 9 |
 | Persistent resend payloads across process sessions where full copy is not acceptable | Reliable build/replacement owner in Phase 7 |
