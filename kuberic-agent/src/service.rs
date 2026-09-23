@@ -2,13 +2,17 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{Stream, StreamExt};
 use kuberic_protocol::command::ProtocolCommand;
-use kuberic_protocol::types::{ProcessSessionId, ReplicaIdentity};
+use kuberic_protocol::types::{
+    ProcessSessionId, ReplicaId, ReplicaIdentity, TransitionIntent, TransitionKind,
+    derive_transition_id,
+};
 use kuberic_runtime::application::OpenMode;
 use kuberic_wire::{normalize_execute_request, proto};
 use tokio::net::TcpListener;
@@ -18,13 +22,234 @@ use tonic::{Request, Response, Status};
 
 use crate::coordinator::Coordinator;
 use crate::hosting::{PodRuntime, RuntimeDataPlane};
+use crate::provisioning::{InitializationAuthority, ObservedStorageIdentity};
 use crate::report::AgentReporter;
 use crate::runtime_adapter::RuntimeEffectExecutor;
+use crate::session::ProcessSession;
+use crate::sqlite_store::SqliteStore;
 use crate::state::{AgentState, CoordinatorStage};
 use crate::store::AgentStore;
 use crate::{AgentError, Result};
 
 const AUTHORIZATION_HEADER: &str = "authorization";
+
+pub struct InitializationService {
+    observed: ObservedStorageIdentity,
+    replica_id: ReplicaId,
+    database_path: PathBuf,
+    bearer_token: Arc<str>,
+    session: Arc<ProcessSession>,
+    initialized: watch::Sender<bool>,
+}
+
+impl InitializationService {
+    pub fn new(
+        observed: ObservedStorageIdentity,
+        replica_id: ReplicaId,
+        database_path: PathBuf,
+        bearer_token: impl Into<Arc<str>>,
+        initialized: watch::Sender<bool>,
+    ) -> Result<Self> {
+        let bearer_token = bearer_token.into();
+        if bearer_token.is_empty() {
+            return Err(AgentError::CommandRejected(
+                "agent bearer token must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            observed,
+            replica_id,
+            database_path,
+            bearer_token,
+            session: Arc::new(ProcessSession::new()),
+            initialized,
+        })
+    }
+
+    pub async fn serve(
+        self,
+        control_address: SocketAddr,
+        ready: watch::Sender<bool>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let listener = TcpListener::bind(control_address).await?;
+        let control = self.clone();
+        let peer = self;
+        ready.send_replace(true);
+        let result = tonic::transport::Server::builder()
+            .add_service(proto::agent_control_server::AgentControlServer::new(
+                control,
+            ))
+            .add_service(proto::replica_peer_server::ReplicaPeerServer::new(peer))
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                wait_for_shutdown(&mut shutdown).await;
+            })
+            .await
+            .map_err(|error| AgentError::CommandRejected(error.to_string()));
+        ready.send_replace(false);
+        result
+    }
+
+    fn authorize<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
+        authorize_request(request, &self.bearer_token)
+    }
+
+    fn report(&self) -> proto::AgentStatusReport {
+        proto::AgentStatusReport {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: self.observed.resource_uid.to_string(),
+            process_session_id: self.session.id().to_string(),
+            report_sequence: self.session.next_report_sequence(),
+            storage_state: proto::AgentStorageState::Uninitialized as i32,
+            pod_uid: self.observed.pod_uid.to_string(),
+            pvc_uid: self.observed.pvc_uid.to_string(),
+            healthy: true,
+            replica_id: self.replica_id.value(),
+            ..Default::default()
+        }
+    }
+
+    fn validate_status_target(
+        &self,
+        request: &proto::GetAgentStatusRequest,
+    ) -> std::result::Result<(), Status> {
+        if request.protocol_version != kuberic_protocol::PROTOCOL_VERSION {
+            return Err(Status::failed_precondition("unsupported protocol version"));
+        }
+        if request.resource_uid != self.observed.resource_uid.as_str()
+            || request.expected_instance_id != self.observed.instance_id.as_str()
+            || request.replica_id != self.replica_id.value()
+        {
+            return Err(Status::failed_precondition(
+                "status request targets another replica incarnation",
+            ));
+        }
+        Ok(())
+    }
+
+    fn initialize(
+        &self,
+        request: proto::ExecuteCommandRequest,
+    ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
+        let envelope = normalize_execute_request(request)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let ProtocolCommand::InitializeAgentStore(command) = envelope.command else {
+            return Err(Status::failed_precondition(
+                "fresh storage accepts only InitializeAgentStore",
+            ));
+        };
+        if envelope.resource_uid != self.observed.resource_uid
+            || envelope.target.replica_id != command.local_replica_id
+            || envelope.target.instance_id != command.expected_instance_id
+            || envelope.target.agent_generation != command.assigned_agent_generation
+        {
+            return Err(Status::failed_precondition(
+                "initialization targets another replica incarnation",
+            ));
+        }
+        let transition = TransitionIntent {
+            transition_id: derive_transition_id(
+                &command.resource_uid,
+                TransitionKind::Bootstrap,
+                &command.bootstrap_configuration.configuration_id,
+            ),
+            kind: TransitionKind::Bootstrap,
+            spec_generation: 0,
+            effective_policy: command.effective_policy.clone(),
+            previous_configuration_id: None,
+            current_configuration: command.bootstrap_configuration.clone(),
+            started_at_unix_seconds: 0,
+        };
+        let identity = crate::command::admit_initialization(
+            &command,
+            &self.observed,
+            InitializationAuthority::Bootstrap(&transition),
+        )
+        .map_err(status_from_agent)?;
+        match SqliteStore::create_authorized(&self.database_path, AgentState::new(identity.clone()))
+        {
+            Ok(store) => drop(store),
+            Err(AgentError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                SqliteStore::open_existing(&self.database_path, Some(&identity))
+                    .map_err(status_from_agent)?;
+            }
+            Err(error) => return Err(status_from_agent(error)),
+        }
+        self.initialized.send_replace(true);
+        Ok(proto::ExecuteCommandResponse {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            observation: Some(self.report()),
+        })
+    }
+}
+
+impl Clone for InitializationService {
+    fn clone(&self) -> Self {
+        Self {
+            observed: self.observed.clone(),
+            replica_id: self.replica_id,
+            database_path: self.database_path.clone(),
+            bearer_token: self.bearer_token.clone(),
+            session: self.session.clone(),
+            initialized: self.initialized.clone(),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl proto::agent_control_server::AgentControl for InitializationService {
+    async fn get_status(
+        &self,
+        request: Request<proto::GetAgentStatusRequest>,
+    ) -> std::result::Result<Response<proto::AgentStatusReport>, Status> {
+        self.authorize(&request)?;
+        self.validate_status_target(request.get_ref())?;
+        Ok(Response::new(self.report()))
+    }
+
+    async fn execute(
+        &self,
+        request: Request<proto::ExecuteCommandRequest>,
+    ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
+        self.authorize(&request)?;
+        Ok(Response::new(self.initialize(request.into_inner())?))
+    }
+}
+
+#[tonic::async_trait]
+impl proto::replica_peer_server::ReplicaPeer for InitializationService {
+    async fn get_status(
+        &self,
+        request: Request<proto::GetAgentStatusRequest>,
+    ) -> std::result::Result<Response<proto::AgentStatusReport>, Status> {
+        self.authorize(&request)?;
+        self.validate_status_target(request.get_ref())?;
+        Ok(Response::new(self.report()))
+    }
+
+    async fn execute(
+        &self,
+        request: Request<proto::ExecuteCommandRequest>,
+    ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
+        self.authorize(&request)?;
+        Ok(Response::new(self.initialize(request.into_inner())?))
+    }
+}
+
+fn authorize_request<T>(
+    request: &Request<T>,
+    bearer_token: &str,
+) -> std::result::Result<(), Status> {
+    let expected = format!("Bearer {bearer_token}");
+    let observed = request
+        .metadata()
+        .get(AUTHORIZATION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if observed != Some(expected.as_str()) {
+        return Err(Status::unauthenticated("invalid agent credentials"));
+    }
+    Ok(())
+}
 
 pub struct SessionRegistry {
     local_session: ProcessSessionId,

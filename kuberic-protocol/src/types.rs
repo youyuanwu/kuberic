@@ -355,6 +355,8 @@ pub struct StatusCondition {
 pub struct AcceptedStatus {
     pub initialized: bool,
     pub observed_generation: u64,
+    #[serde(default)]
+    pub effective_policy: Option<EffectivePolicy>,
     pub topology: Option<AcceptedTopology>,
     pub provisioning: Option<ProvisioningIntent>,
     pub transition: Option<TransitionIntent>,

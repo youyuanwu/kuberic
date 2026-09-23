@@ -64,6 +64,7 @@ fn bootstrap_fixture() -> (
         expected_pvc_uid: pvc_uid,
         assigned_agent_generation: local.agent_generation.clone(),
         effective_policy: policy.clone(),
+        bootstrap_configuration: current.clone(),
     };
     let observed = ObservedStorageIdentity {
         resource_uid: command.resource_uid.clone(),

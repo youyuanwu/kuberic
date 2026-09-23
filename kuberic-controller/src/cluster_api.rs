@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures::future::join_all;
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, PodSpec,
+    Container, ContainerPort, EnvVar, EnvVarSource, ObjectFieldSelector, PersistentVolumeClaim,
+    PersistentVolumeClaimSpec, Pod, PodSecurityContext, PodSpec, Secret, SecretKeySelector,
     Service, ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -286,21 +287,33 @@ where
         let owner = owner_reference(&observation.set)?;
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
         let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), &namespace);
+        ensure_agent_credentials(
+            self.client.clone(),
+            observation,
+            &namespace,
+            &uid,
+            &owner,
+            &self.bearer_token,
+        )
+        .await?;
+        ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await?;
         for replica_id in replica_ids {
             let pod_name = replica_name(&observation.set, *replica_id);
             let pvc_name = format!("{pod_name}-data");
-            if !observation
+            let pvc = observation
                 .pvcs
                 .iter()
-                .any(|pvc| pvc.name_any() == pvc_name)
-            {
+                .find(|pvc| pvc.name_any() == pvc_name);
+            let Some(pvc) = pvc else {
                 create_exact(
                     &pvcs,
                     &pvc_name,
                     &replica_pvc(&observation.set, *replica_id, &uid, &owner),
                 )
                 .await?;
-            }
+                continue;
+            };
+            let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
             if !observation
                 .pods
                 .iter()
@@ -309,7 +322,14 @@ where
                 create_exact(
                     &pods,
                     &pod_name,
-                    &replica_pod(&observation.set, *replica_id, &uid, &owner, &pvc_name),
+                    &replica_pod(
+                        &observation.set,
+                        *replica_id,
+                        &uid,
+                        &owner,
+                        &pvc_name,
+                        &pvc_uid,
+                    ),
                 )
                 .await?;
             }
@@ -597,8 +617,10 @@ fn replica_pod(
     uid: &str,
     owner: &OwnerReference,
     pvc_name: &str,
+    pvc_uid: &str,
 ) -> Pod {
     let labels = base_labels(set, Some(replica_id), uid);
+    let credential_name = agent_credential_name(set);
     Pod {
         metadata: kube::core::ObjectMeta {
             name: Some(replica_name(set, replica_id)),
@@ -607,9 +629,18 @@ fn replica_pod(
             ..Default::default()
         },
         spec: Some(PodSpec {
+            hostname: Some(replica_name(set, replica_id)),
+            subdomain: Some(format!("{}-peer", set.name_any())),
+            security_context: Some(PodSecurityContext {
+                fs_group: Some(10001),
+                run_as_non_root: Some(true),
+                run_as_user: Some(10001),
+                ..Default::default()
+            }),
             containers: vec![Container {
                 name: "application".to_string(),
                 image: Some(set.spec.image.clone()),
+                image_pull_policy: Some("IfNotPresent".to_string()),
                 ports: Some(vec![
                     ContainerPort {
                         container_port: CONTROL_PORT,
@@ -619,6 +650,83 @@ fn replica_pod(
                     ContainerPort {
                         container_port: REPLICATION_PORT,
                         name: Some("replication".to_string()),
+                        ..Default::default()
+                    },
+                    ContainerPort {
+                        container_port: 8080,
+                        name: Some("application".to_string()),
+                        ..Default::default()
+                    },
+                ]),
+                env: Some(vec![
+                    EnvVar {
+                        name: "KUBERIC_RESOURCE_UID".to_string(),
+                        value: Some(uid.to_string()),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_REPLICA_ID".to_string(),
+                        value: Some(replica_id.to_string()),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_PVC_UID".to_string(),
+                        value: Some(pvc_uid.to_string()),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_SET_NAME".to_string(),
+                        value: Some(set.name_any()),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_NAMESPACE".to_string(),
+                        value_from: Some(EnvVarSource {
+                            field_ref: Some(ObjectFieldSelector {
+                                api_version: Some("v1".to_string()),
+                                field_path: "metadata.namespace".to_string(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_POD_UID".to_string(),
+                        value_from: Some(EnvVarSource {
+                            field_ref: Some(ObjectFieldSelector {
+                                api_version: Some("v1".to_string()),
+                                field_path: "metadata.uid".to_string(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_POD_IP".to_string(),
+                        value_from: Some(EnvVarSource {
+                            field_ref: Some(ObjectFieldSelector {
+                                api_version: Some("v1".to_string()),
+                                field_path: "status.podIP".to_string(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_AGENT_BEARER_TOKEN".to_string(),
+                        value_from: Some(EnvVarSource {
+                            secret_key_ref: Some(SecretKeySelector {
+                                key: "bearer-token".to_string(),
+                                name: credential_name,
+                                optional: Some(false),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    EnvVar {
+                        name: "KUBERIC_DATA_ROOT".to_string(),
+                        value: Some("/var/lib/kuberic".to_string()),
                         ..Default::default()
                     },
                 ]),
@@ -677,7 +785,7 @@ async fn ensure_write_service(
                 name: Some("application".to_string()),
                 port: 80,
                 target_port: Some(
-                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(80),
+                    k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8080),
                 ),
                 ..Default::default()
             }]),
@@ -686,6 +794,116 @@ async fn ensure_write_service(
         ..Default::default()
     };
     create_exact(&services, &service_name, &service).await
+}
+
+fn agent_credential_name(set: &KubericSet) -> String {
+    format!("{}-agent-credentials", set.name_any())
+}
+
+async fn ensure_agent_credentials(
+    client: Client,
+    observation: &RawObservation,
+    namespace: &str,
+    uid: &str,
+    owner: &OwnerReference,
+    bearer_token: &str,
+) -> Result<()> {
+    let name = agent_credential_name(&observation.set);
+    let secrets: Api<Secret> = Api::namespaced(client, namespace);
+    let desired = Secret {
+        metadata: kube::core::ObjectMeta {
+            name: Some(name.clone()),
+            labels: Some(base_labels(&observation.set, None, uid)),
+            owner_references: Some(vec![owner.clone()]),
+            ..Default::default()
+        },
+        string_data: Some(BTreeMap::from([(
+            "bearer-token".to_string(),
+            bearer_token.to_string(),
+        )])),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    };
+    match secrets
+        .get_opt(&name)
+        .await
+        .map_err(map_kube_effect_error)?
+    {
+        None => create_exact(&secrets, &name, &desired).await,
+        Some(existing) => {
+            if existing.labels().get(SET_UID_LABEL).map(String::as_str) != Some(uid) {
+                return Err(ControllerError::Effect(format!(
+                    "Secret {name} is not owned by this KubericSet"
+                )));
+            }
+            let mut replacement = desired;
+            replacement.metadata.resource_version = existing.resource_version();
+            secrets
+                .replace(&name, &PostParams::default(), &replacement)
+                .await
+                .map(|_| ())
+                .map_err(map_kube_effect_error)
+        }
+    }
+}
+
+async fn ensure_peer_service(
+    client: Client,
+    observation: &RawObservation,
+    namespace: &str,
+    uid: &str,
+    owner: &OwnerReference,
+) -> Result<()> {
+    let name = format!("{}-peer", observation.set.name_any());
+    if observation
+        .services
+        .iter()
+        .any(|service| service.name_any() == name)
+    {
+        return Ok(());
+    }
+    let services: Api<Service> = Api::namespaced(client, namespace);
+    let service = Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(name.clone()),
+            labels: Some(base_labels(&observation.set, None, uid)),
+            owner_references: Some(vec![owner.clone()]),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            cluster_ip: Some("None".to_string()),
+            publish_not_ready_addresses: Some(true),
+            selector: Some(BTreeMap::from([(
+                SET_UID_LABEL.to_string(),
+                uid.to_string(),
+            )])),
+            ports: Some(vec![
+                ServicePort {
+                    name: Some("control".to_string()),
+                    port: CONTROL_PORT,
+                    target_port: Some(
+                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                            CONTROL_PORT,
+                        ),
+                    ),
+                    ..Default::default()
+                },
+                ServicePort {
+                    name: Some("replication".to_string()),
+                    port: REPLICATION_PORT,
+                    target_port: Some(
+                        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                            REPLICATION_PORT,
+                        ),
+                    ),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    create_exact(&services, &name, &service).await
 }
 
 async fn patch_pod_instance(
@@ -822,7 +1040,7 @@ fn command_request(
     let command = match command {
         ProtocolCommand::InitializeAgentStore(command) => {
             proto::execute_command_request::Command::InitializeAgentStore(initialize_command(
-                command,
+                *command,
             ))
         }
         ProtocolCommand::EnsureConfiguration(command) => {
@@ -847,6 +1065,7 @@ fn initialize_command(command: InitializeAgentStore) -> proto::InitializeAgentSt
         expected_pvc_uid: command.expected_pvc_uid.to_string(),
         assigned_agent_generation: command.assigned_agent_generation.to_string(),
         effective_policy: Some(policy(command.effective_policy)),
+        bootstrap_configuration: Some(command.bootstrap_configuration.into()),
     }
 }
 
@@ -862,6 +1081,7 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
         expected_instance_id: command.expected_instance_id.to_string(),
         expected_agent_generation: command.expected_agent_generation.to_string(),
         transition_kind: transition_kind(command.transition_kind) as i32,
+        grant_write: command.grant_write,
     }
 }
 

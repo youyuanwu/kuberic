@@ -100,6 +100,39 @@
                         },
                         "type": "array"
                       },
+                      "effectivePolicy": {
+                        "description": "Fixed replica-set size and majority quorum values frozen for an operation.",
+                        "nullable": true,
+                        "properties": {
+                          "failoverDelaySeconds": {
+                            "format": "uint64",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "readQuorum": {
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "replicaSetSize": {
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          },
+                          "writeQuorum": {
+                            "format": "uint32",
+                            "minimum": 0.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "failoverDelaySeconds",
+                          "readQuorum",
+                          "replicaSetSize",
+                          "writeQuorum"
+                        ],
+                        "type": "object"
+                      },
                       "initialized": {
                         "type": "boolean"
                       },

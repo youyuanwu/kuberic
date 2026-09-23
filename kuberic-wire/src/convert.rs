@@ -419,6 +419,42 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 .as_ref()
                 .ok_or(WireError::MissingField("initialize.effective_policy"))?;
             validate_policy(policy)?;
+            let bootstrap_configuration =
+                command
+                    .bootstrap_configuration
+                    .clone()
+                    .ok_or(WireError::MissingField(
+                        "initialize.bootstrap_configuration",
+                    ))?;
+            let bootstrap_configuration =
+                ConfigurationDescriptor::try_from(bootstrap_configuration)?;
+            let effective_policy = EffectivePolicy {
+                replica_set_size: policy.replica_set_size,
+                write_quorum: policy.write_quorum,
+                read_quorum: policy.read_quorum,
+                failover_delay_seconds: policy.failover_delay_seconds,
+            };
+            validate_transition_relationship(
+                TransitionKind::Bootstrap,
+                None,
+                &bootstrap_configuration,
+                &effective_policy,
+            )
+            .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+            let target: ReplicaIdentity = request
+                .target
+                .clone()
+                .ok_or(WireError::MissingField("execute.target"))?
+                .try_into()?;
+            if !bootstrap_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == target)
+            {
+                return Err(WireError::InvalidAuthority(
+                    "initialize target is not an exact genesis member".to_string(),
+                ));
+            }
             Ok(())
         }
         proto::execute_command_request::Command::EnsureConfiguration(command) => {
@@ -546,7 +582,7 @@ pub fn normalize_execute_request(
         .ok_or(WireError::MissingField("execute.command"))?
     {
         proto::execute_command_request::Command::InitializeAgentStore(command) => {
-            ProtocolCommand::InitializeAgentStore(InitializeAgentStore {
+            ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {
                 initialization_id: InitializationId::new(command.initialization_id),
                 resource_uid: ResourceUid::new(command.resource_uid),
                 local_replica_id: ReplicaId::new(command.local_replica_id),
@@ -559,7 +595,13 @@ pub fn normalize_execute_request(
                         .effective_policy
                         .ok_or(WireError::MissingField("initialize.effective_policy"))?,
                 )?,
-            })
+                bootstrap_configuration: command
+                    .bootstrap_configuration
+                    .ok_or(WireError::MissingField(
+                        "initialize.bootstrap_configuration",
+                    ))?
+                    .try_into()?,
+            }))
         }
         proto::execute_command_request::Command::EnsureConfiguration(command) => {
             let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
@@ -592,6 +634,7 @@ pub fn normalize_execute_request(
                 expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
                 expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
                 transition_kind,
+                grant_write: command.grant_write,
             }))
         }
     };

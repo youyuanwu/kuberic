@@ -81,6 +81,7 @@ pub fn authorize_initialization(
             if transition.kind != TransitionKind::Bootstrap
                 || transition.previous_configuration_id.is_some()
                 || transition.effective_policy != command.effective_policy
+                || transition.current_configuration != command.bootstrap_configuration
                 || !transition
                     .current_configuration
                     .members

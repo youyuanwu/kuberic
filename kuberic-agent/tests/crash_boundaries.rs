@@ -165,7 +165,7 @@ async fn recovery_reobserves_effect_applied_before_completion_persistence() {
 }
 
 #[tokio::test]
-async fn retained_result_survives_transition_clearing_and_reopen() {
+async fn bootstrap_terminal_result_survives_transition_clearing_and_reopen() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());
     let store = Arc::new(

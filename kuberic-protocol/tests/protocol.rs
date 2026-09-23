@@ -393,6 +393,116 @@ fn bootstrap_intent_is_deterministic() {
 }
 
 #[test]
+fn bootstrap_installs_full_genesis_accepts_topology_then_grants_writes() {
+    let mut snapshot = scaffolded_snapshot();
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("expected bootstrap persistence");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("expected persisted bootstrap status");
+    };
+    snapshot.status = *status;
+    let transition = snapshot.status.transition.clone().unwrap();
+
+    for member in &transition.current_configuration.members {
+        let observation = snapshot
+            .replicas
+            .get_mut(&ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            ))
+            .unwrap();
+        observation.agent = AgentObservation::Report(Box::new(AgentReport {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: snapshot.resource_uid.clone(),
+            identity: member.identity.clone(),
+            process_session_id: ProcessSessionId::new(format!(
+                "initialized-{}",
+                member.identity.replica_id
+            )),
+            report_sequence: 1,
+            role: ReplicaRole::None,
+            read_status: AccessStatus::NotPrimary,
+            write_status: AccessStatus::NotPrimary,
+            healthy: true,
+            ..AgentReport::default()
+        }));
+    }
+
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("expected transition condition persistence");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("expected transition status");
+    };
+    snapshot.status = *status;
+
+    for member in &transition.current_configuration.members {
+        let Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command),
+        } = evaluate(&snapshot, &EvaluationConfig::default())
+        else {
+            panic!("expected write-closed genesis installation");
+        };
+        assert!(!command.grant_write);
+        assert_eq!(command.local_replica_id, member.identity.replica_id);
+        let observation = snapshot
+            .observation_for_identity(&member.identity)
+            .unwrap()
+            .clone();
+        let AgentObservation::Report(mut report) = observation.agent else {
+            panic!("initialized report");
+        };
+        report.role = member.role;
+        report.read_status = AccessStatus::Granted;
+        report.write_status = if member.role == ReplicaRole::Primary {
+            AccessStatus::ReconfigurationPending
+        } else {
+            AccessStatus::NotPrimary
+        };
+        report.epoch = transition.current_configuration.epoch;
+        report.current_configuration = Some(transition.current_configuration.clone());
+        snapshot
+            .replicas
+            .get_mut(&ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            ))
+            .unwrap()
+            .agent = AgentObservation::Report(report);
+    }
+
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("expected atomic topology acceptance");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("expected accepted topology status");
+    };
+    assert!(status.initialized);
+    assert!(status.transition.is_none());
+    assert_eq!(
+        status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members
+            .len(),
+        3
+    );
+    snapshot.status = *status;
+
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = evaluate(&snapshot, &EvaluationConfig::default())
+    else {
+        panic!("expected separate write grant");
+    };
+    assert!(command.grant_write);
+    assert_eq!(command.local_replica_id, ReplicaId::new(1));
+}
+
+#[test]
 fn persisted_bootstrap_initializes_exact_first_store() {
     let mut snapshot = scaffolded_snapshot();
     let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
@@ -523,6 +633,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
     };
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: accepted.clone(),
         }),
@@ -677,6 +788,7 @@ fn stable_topology_does_not_apply_unsupported_scale_request() {
     let mut snapshot = empty_snapshot(5);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: configuration.clone(),
         }),
@@ -704,6 +816,7 @@ fn stable_topology_waits_without_attested_replica_evidence() {
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology { configuration }),
         ..AcceptedStatus::default()
     };
@@ -723,6 +836,7 @@ fn stable_topology_reconciles_routing_and_clears_resolved_conditions() {
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: configuration.clone(),
         }),
@@ -775,6 +889,7 @@ fn stale_replica_epoch_is_unsafe() {
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: configuration.clone(),
         }),
@@ -819,6 +934,7 @@ fn conflicting_primary_claims_are_unsafe() {
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: configuration.clone(),
         }),
@@ -872,6 +988,7 @@ fn accepted_replica_cannot_report_another_incarnation() {
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: configuration.clone(),
         }),
@@ -917,6 +1034,7 @@ fn wrong_generation_cannot_prove_ready_or_publish_routing() {
         let mut snapshot = empty_snapshot(3);
         snapshot.status = AcceptedStatus {
             initialized: true,
+            effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
             topology: Some(AcceptedTopology {
                 configuration: configuration.clone(),
             }),
@@ -963,6 +1081,7 @@ fn accepted_incarnation_missing_its_store_is_unsafe() {
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: configuration.clone(),
         }),
@@ -1078,6 +1197,7 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
         topology: Some(AcceptedTopology {
             configuration: previous.clone(),
         }),

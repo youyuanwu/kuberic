@@ -16,6 +16,10 @@ pub enum ValidationError {
     DesiredReplicasZero,
     #[error("initialized status has no accepted topology")]
     InitializedWithoutTopology,
+    #[error("initialized status has no frozen effective policy")]
+    InitializedWithoutPolicy,
+    #[error("never-initialized status contains a frozen effective policy")]
+    PolicyBeforeInitialization,
     #[error("never-initialized status contains an accepted topology")]
     TopologyBeforeInitialization,
     #[error("status cannot contain provisioning and a PC/CC transition simultaneously")]
@@ -557,6 +561,16 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         (false, Some(_)) => return Err(ValidationError::TopologyBeforeInitialization),
         _ => {}
     }
+    match (status.initialized, status.effective_policy.as_ref()) {
+        (true, None) => return Err(ValidationError::InitializedWithoutPolicy),
+        (false, Some(_)) if status.transition.is_none() => {
+            return Err(ValidationError::PolicyBeforeInitialization);
+        }
+        _ => {}
+    }
+    if let Some(policy) = &status.effective_policy {
+        validate_policy(policy)?;
+    }
     if status.provisioning.is_some() && status.transition.is_some() {
         return Err(ValidationError::ProvisioningAndTransition);
     }
@@ -564,7 +578,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         return Err(ValidationError::ProvisioningWithoutTopology);
     }
     if let Some(topology) = &status.topology {
-        validate_configuration(&topology.configuration, None)?;
+        validate_configuration(&topology.configuration, status.effective_policy.as_ref())?;
     }
     if let Some(transition) = &status.transition {
         validate_policy(&transition.effective_policy)?;

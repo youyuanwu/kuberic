@@ -1,13 +1,15 @@
 //! Deterministic reconciliation decisions over a normalized observation.
 
-use crate::command::{InitializeAgentStore, KubernetesChange, ProtocolCommand, SafetyChange};
+use crate::command::{
+    EnsureConfiguration, InitializeAgentStore, KubernetesChange, ProtocolCommand, SafetyChange,
+};
 use crate::observation::{AgentObservation, ObservationSnapshot};
 use crate::plan::{Plan, UnsafeReason, WaitReason};
 use crate::types::{
-    AcceptedStatus, AccessStatus, ConditionStatus, ConfigurationDescriptor, ConfigurationMember,
-    EffectivePolicy, Epoch, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, StatusCondition,
-    TransitionIntent, TransitionKind, derive_agent_generation, derive_initialization_id,
-    derive_transition_id,
+    AcceptedStatus, AcceptedTopology, AccessStatus, ConditionStatus, ConfigurationDescriptor,
+    ConfigurationMember, EffectivePolicy, Epoch, OperationId, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaRole, StatusCondition, TransitionIntent, TransitionKind, derive_agent_generation,
+    derive_initialization_id, derive_transition_id,
 };
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
@@ -109,6 +111,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         .expect("validated configuration has primary member");
     let mut attested_members = 0_u32;
     let mut primary_attested = false;
+    let mut primary_authority_attested = false;
     for member in &configuration.members {
         let Some(observation) = snapshot.observation_for_identity(&member.identity) else {
             return Plan::Wait {
@@ -144,10 +147,32 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
             attested_members += 1;
         }
         if member.identity == primary.identity {
-            primary_attested = authority_matches
-                && report.role == ReplicaRole::Primary
-                && report.write_status == AccessStatus::Granted;
+            primary_authority_attested = authority_matches && report.role == ReplicaRole::Primary;
+            primary_attested =
+                primary_authority_attested && report.write_status == AccessStatus::Granted;
         }
+    }
+
+    if primary_authority_attested
+        && attested_members == configuration.members.len() as u32
+        && !primary_attested
+    {
+        return Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(Box::new(ensure_configuration_command(
+                configuration,
+                primary,
+                snapshot
+                    .status
+                    .effective_policy
+                    .as_ref()
+                    .expect("validated stable status has policy"),
+                OperationId::new(format!(
+                    "bootstrap:{}:grant-write",
+                    configuration.configuration_id
+                )),
+                true,
+            ))),
+        };
     }
 
     if !primary_attested || attested_members < configuration.write_quorum {
@@ -386,6 +411,7 @@ fn evaluate_transition(
         }
     }
 
+    let mut installed = 0_u32;
     for member in &transition.current_configuration.members {
         let Some(observation) = snapshot.observation_for_identity(&member.identity) else {
             return Plan::Wait {
@@ -399,7 +425,7 @@ fn evaluate_transition(
         {
             Some(command) => {
                 return Plan::Execute {
-                    command: ProtocolCommand::InitializeAgentStore(command),
+                    command: ProtocolCommand::InitializeAgentStore(Box::new(command)),
                 };
             }
             None if !matches!(observation.agent, AgentObservation::Report(_)) => {
@@ -409,8 +435,58 @@ fn evaluate_transition(
                     requeue_after_seconds: config.wait_requeue_seconds,
                 };
             }
-            None => {}
+            None => {
+                let AgentObservation::Report(report) = &observation.agent else {
+                    continue;
+                };
+                let matches = report.identity == member.identity
+                    && report.healthy
+                    && report.role == member.role
+                    && report.write_status != AccessStatus::Granted
+                    && report.epoch == transition.current_configuration.epoch
+                    && report.previous_configuration.is_none()
+                    && report.current_configuration.as_ref()
+                        == Some(&transition.current_configuration);
+                if matches {
+                    installed += 1;
+                    continue;
+                }
+                return Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(Box::new(
+                        ensure_configuration_command(
+                            &transition.current_configuration,
+                            member,
+                            &transition.effective_policy,
+                            OperationId::new(format!(
+                                "{}:install:{}",
+                                transition.transition_id, member.identity.replica_id
+                            )),
+                            false,
+                        ),
+                    )),
+                };
+            }
         }
+    }
+
+    if installed == transition.current_configuration.members.len() as u32 {
+        let mut accepted = clear_evaluator_conditions(snapshot.status.clone());
+        accepted.initialized = true;
+        accepted.observed_generation = transition.spec_generation;
+        accepted.effective_policy = Some(transition.effective_policy.clone());
+        accepted.topology = Some(AcceptedTopology {
+            configuration: transition.current_configuration.clone(),
+        });
+        accepted.transition = None;
+        accepted = accepted.with_condition(progressing_condition(
+            "BootstrapTopologyAccepted",
+            "Accepted the full write-closed genesis topology",
+        ));
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(accepted),
+            }],
+        };
     }
 
     Plan::Wait {
@@ -467,8 +543,10 @@ fn bootstrap_initialization_command(
                 expected_pvc_uid: report.pvc_uid.clone(),
                 assigned_agent_generation: member.identity.agent_generation.clone(),
                 effective_policy: transition.effective_policy.clone(),
+                bootstrap_configuration: transition.current_configuration.clone(),
             }))
         }
+
         AgentObservation::Report(report) => {
             if report.identity != member.identity {
                 return Err(format!(
@@ -485,6 +563,28 @@ fn bootstrap_initialization_command(
         AgentObservation::Absent
         | AgentObservation::Unreachable { .. }
         | AgentObservation::Invalid { .. } => Ok(None),
+    }
+}
+
+fn ensure_configuration_command(
+    configuration: &ConfigurationDescriptor,
+    member: &ConfigurationMember,
+    policy: &EffectivePolicy,
+    operation_id: OperationId,
+    grant_write: bool,
+) -> EnsureConfiguration {
+    EnsureConfiguration {
+        operation_id,
+        previous_configuration: None,
+        current_configuration: configuration.clone(),
+        previous_epoch: None,
+        current_epoch: configuration.epoch,
+        effective_policy: policy.clone(),
+        local_replica_id: member.identity.replica_id,
+        expected_instance_id: member.identity.instance_id.clone(),
+        expected_agent_generation: member.identity.agent_generation.clone(),
+        transition_kind: TransitionKind::Bootstrap,
+        grant_write,
     }
 }
 

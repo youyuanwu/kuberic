@@ -131,6 +131,7 @@ message InitializeAgentStoreCommand {
   string expected_pvc_uid = 6;
   string assigned_agent_generation = 7;
   EffectivePolicy effective_policy = 8;
+  Configuration bootstrap_configuration = 9;
 }
 
 message EnsureConfigurationCommand {
@@ -144,6 +145,7 @@ message EnsureConfigurationCommand {
   string expected_instance_id = 8;
   string expected_agent_generation = 9;
   TransitionKind transition_kind = 10;
+  bool grant_write = 11;
 }
 
 message ExecuteCommandRequest {

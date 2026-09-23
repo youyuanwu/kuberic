@@ -224,6 +224,7 @@ fn stable_observation() -> RawObservation {
         authority: AcceptedStatus {
             initialized: true,
             observed_generation: 1,
+            effective_policy: Some(kuberic_protocol::types::EffectivePolicy::fixed(1, 10).unwrap()),
             topology: Some(AcceptedTopology {
                 configuration: configuration.clone(),
             }),

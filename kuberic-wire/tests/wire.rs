@@ -146,10 +146,42 @@ fn uninitialized_status_requires_pod_and_pvc_without_durable_identity() {
 #[test]
 fn initialize_request_carries_complete_fresh_storage_fence() {
     let assigned_generation = derive_agent_generation(&InitializationId::new("init"));
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new("pod"),
+        agent_generation: assigned_generation.clone(),
+    };
+    let bootstrap_configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        ReplicaId::new(1),
+        vec![
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: ReplicaIdentity {
+                    replica_id: ReplicaId::new(2),
+                    instance_id: ReplicaInstanceId::new("pod-2"),
+                    agent_generation: AgentGeneration::new("generation-2"),
+                },
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: ReplicaIdentity {
+                    replica_id: ReplicaId::new(3),
+                    instance_id: ReplicaInstanceId::new("pod-3"),
+                    agent_generation: AgentGeneration::new("generation-3"),
+                },
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        2,
+    );
     let request = proto::ExecuteCommandRequest {
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid: "resource".to_string(),
-        target: None,
+        target: Some(target.into()),
         command: Some(
             proto::execute_command_request::Command::InitializeAgentStore(
                 proto::InitializeAgentStoreCommand {
@@ -166,6 +198,7 @@ fn initialize_request_carries_complete_fresh_storage_fence() {
                         read_quorum: 2,
                         failover_delay_seconds: 10,
                     }),
+                    bootstrap_configuration: Some(bootstrap_configuration.into()),
                 },
             ),
         ),
@@ -427,6 +460,7 @@ fn ensure_request_rejects_previous_configuration_outside_frozen_policy() {
                     expected_instance_id: target.instance_id.to_string(),
                     expected_agent_generation: target.agent_generation.to_string(),
                     transition_kind: proto::TransitionKind::Failover as i32,
+                    grant_write: false,
                 },
             ),
         ),
@@ -475,6 +509,7 @@ fn ensure_request_rejects_regressing_pc_cc_relationship() {
                     expected_instance_id: target.instance_id.to_string(),
                     expected_agent_generation: target.agent_generation.to_string(),
                     transition_kind: proto::TransitionKind::Failover as i32,
+                    grant_write: false,
                 },
             ),
         ),

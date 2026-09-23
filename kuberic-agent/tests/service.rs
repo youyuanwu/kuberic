@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::stream;
 use kuberic_agent::hosting::PodRuntime;
+use kuberic_agent::provisioning::ObservedStorageIdentity;
 use kuberic_agent::service::AgentService;
+use kuberic_agent::service::InitializationService;
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_agent::store::AgentStore;
@@ -324,6 +326,18 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
                             .effective_policy
                             .failover_delay_seconds,
                     }),
+                    bootstrap_configuration: Some(
+                        kuberic_protocol::types::ConfigurationDescriptor::new(
+                            kuberic_protocol::types::Epoch::new(0, 1),
+                            kuberic_protocol::types::ReplicaId::new(1),
+                            vec![kuberic_protocol::types::ConfigurationMember {
+                                identity: identity(),
+                                role: kuberic_protocol::types::ReplicaRole::Primary,
+                            }],
+                            1,
+                        )
+                        .into(),
+                    ),
                 },
             ),
         ),
@@ -338,4 +352,113 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
     server.await.unwrap().unwrap();
     assert!(!*ready_rx.borrow());
     assert!(!runtime.snapshot().await.open);
+}
+
+#[tokio::test]
+async fn fresh_storage_reports_uninitialized_and_creates_exact_bootstrap_identity() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let address = free_address();
+    let observed = ObservedStorageIdentity {
+        resource_uid: ResourceUid::new("resource-1"),
+        pod_uid: PodUid::new("pod-1"),
+        pvc_uid: PvcUid::new("pvc-1"),
+        instance_id: ReplicaInstanceId::new("pod-1"),
+    };
+    let (initialized_tx, mut initialized_rx) = watch::channel(false);
+    let service = InitializationService::new(
+        observed,
+        ReplicaId::new(1),
+        path.clone(),
+        "token",
+        initialized_tx,
+    )
+    .unwrap();
+    let (ready_tx, mut ready_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(address, ready_tx, shutdown_rx));
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+    let mut status = Request::new(proto::GetAgentStatusRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-1".into(),
+        replica_id: 1,
+        expected_instance_id: "pod-1".into(),
+    });
+    status.metadata_mut().insert(
+        "authorization",
+        format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    let report = client.get_status(status).await.unwrap().into_inner();
+    assert_eq!(
+        report.storage_state,
+        proto::AgentStorageState::Uninitialized as i32
+    );
+
+    let storage_identity = StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("resource-1"),
+        pod_uid: PodUid::new("pod-1"),
+        pvc_uid: PvcUid::new("pvc-1"),
+        initialization_id: derive_initialization_id(
+            &ResourceUid::new("resource-1"),
+            ReplicaId::new(1),
+            &PodUid::new("pod-1"),
+            &PvcUid::new("pvc-1"),
+        ),
+        local_identity: identity(),
+        effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+    };
+    let configuration = kuberic_protocol::types::ConfigurationDescriptor::new(
+        kuberic_protocol::types::Epoch::new(0, 1),
+        ReplicaId::new(1),
+        vec![kuberic_protocol::types::ConfigurationMember {
+            identity: identity(),
+            role: kuberic_protocol::types::ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let mut initialize = Request::new(proto::ExecuteCommandRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-1".into(),
+        target: Some(identity().into()),
+        command: Some(
+            proto::execute_command_request::Command::InitializeAgentStore(
+                proto::InitializeAgentStoreCommand {
+                    initialization_id: storage_identity.initialization_id.to_string(),
+                    resource_uid: "resource-1".into(),
+                    local_replica_id: 1,
+                    expected_instance_id: "pod-1".into(),
+                    expected_pod_uid: "pod-1".into(),
+                    expected_pvc_uid: "pvc-1".into(),
+                    assigned_agent_generation: identity().agent_generation.to_string(),
+                    effective_policy: Some(proto::EffectivePolicy {
+                        replica_set_size: 1,
+                        write_quorum: 1,
+                        read_quorum: 1,
+                        failover_delay_seconds: 30,
+                    }),
+                    bootstrap_configuration: Some(configuration.into()),
+                },
+            ),
+        ),
+    });
+    initialize.metadata_mut().insert(
+        "authorization",
+        format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    client.execute(initialize).await.unwrap();
+    initialized_rx
+        .wait_for(|initialized| *initialized)
+        .await
+        .unwrap();
+    shutdown_tx.send_replace(true);
+    server.await.unwrap().unwrap();
+
+    let store = SqliteStore::open_existing(path, Some(&storage_identity)).unwrap();
+    assert_eq!(store.identity().await.unwrap(), storage_identity);
 }

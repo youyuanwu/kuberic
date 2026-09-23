@@ -26,6 +26,7 @@ pub struct InitializeAgentStore {
     pub expected_pvc_uid: PvcUid,
     pub assigned_agent_generation: AgentGeneration,
     pub effective_policy: EffectivePolicy,
+    pub bootstrap_configuration: ConfigurationDescriptor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,13 +42,14 @@ pub struct EnsureConfiguration {
     pub expected_instance_id: ReplicaInstanceId,
     pub expected_agent_generation: AgentGeneration,
     pub transition_kind: crate::types::TransitionKind,
+    pub grant_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
-    InitializeAgentStore(InitializeAgentStore),
+    InitializeAgentStore(Box<InitializeAgentStore>),
     EnsureConfiguration(Box<EnsureConfiguration>),
 }
 

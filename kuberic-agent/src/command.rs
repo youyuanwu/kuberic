@@ -84,6 +84,15 @@ pub fn admit_configuration(
             "command policy differs from initialized policy".into(),
         ));
     }
+    if command.grant_write
+        && (command.transition_kind != TransitionKind::Bootstrap
+            || state.current_configuration.as_ref() != Some(&command.current_configuration)
+            || state.role != ReplicaRole::Primary)
+    {
+        return Err(AgentError::CommandRejected(
+            "bootstrap write grant requires the exact installed primary authority".into(),
+        ));
+    }
     validate_transition_relationship(
         command.transition_kind,
         command.previous_configuration.as_ref(),

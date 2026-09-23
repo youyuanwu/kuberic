@@ -15,6 +15,8 @@ use crate::{AgentError, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
+use tokio_stream::iter;
+use tonic::Request;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedMessage<T> {
@@ -210,6 +212,256 @@ pub trait OutboundDispatcher: Send + Sync {
     async fn dispatch(&self, outbound: QueuedOutbound) -> Result<()>;
 }
 
+pub trait ReplicaEndpointResolver: Send + Sync {
+    fn control_endpoint(&self, identity: &ReplicaIdentity) -> String;
+
+    fn replication_endpoint(&self, identity: &ReplicaIdentity) -> String;
+}
+
+#[derive(Debug, Clone)]
+pub struct KubernetesDnsResolver {
+    set_name: Arc<str>,
+    namespace: Arc<str>,
+}
+
+impl KubernetesDnsResolver {
+    pub fn new(set_name: impl Into<Arc<str>>, namespace: impl Into<Arc<str>>) -> Self {
+        Self {
+            set_name: set_name.into(),
+            namespace: namespace.into(),
+        }
+    }
+
+    fn host(&self, identity: &ReplicaIdentity) -> String {
+        format!(
+            "{}-{}.{}-peer.{}.svc",
+            self.set_name,
+            identity.replica_id.value(),
+            self.set_name,
+            self.namespace
+        )
+    }
+}
+
+impl ReplicaEndpointResolver for KubernetesDnsResolver {
+    fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
+        format!("http://{}:50051", self.host(identity))
+    }
+
+    fn replication_endpoint(&self, identity: &ReplicaIdentity) -> String {
+        format!("http://{}:50052", self.host(identity))
+    }
+}
+
+pub struct GrpcOutboundDispatcher<R> {
+    runtime: Arc<PodRuntime>,
+    transport: Arc<Mutex<ReliableTransport>>,
+    resolver: Arc<R>,
+    resource_uid: Arc<str>,
+    bearer_token: Arc<str>,
+    deadline: std::time::Duration,
+}
+
+impl<R> GrpcOutboundDispatcher<R>
+where
+    R: ReplicaEndpointResolver,
+{
+    pub fn new(
+        runtime: Arc<PodRuntime>,
+        transport: Arc<Mutex<ReliableTransport>>,
+        resolver: Arc<R>,
+        resource_uid: impl Into<Arc<str>>,
+        bearer_token: impl Into<Arc<str>>,
+        deadline: std::time::Duration,
+    ) -> Result<Self> {
+        let bearer_token = bearer_token.into();
+        if bearer_token.is_empty() {
+            return Err(AgentError::CommandRejected(
+                "agent bearer token must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            runtime,
+            transport,
+            resolver,
+            resource_uid: resource_uid.into(),
+            bearer_token,
+            deadline,
+        })
+    }
+
+    pub async fn peer_session(&self, receiver: &ReplicaIdentity) -> Result<ProcessSessionId> {
+        let endpoint = self.resolver.control_endpoint(receiver);
+        let mut client = tokio::time::timeout(
+            self.deadline,
+            proto::agent_control_client::AgentControlClient::connect(endpoint),
+        )
+        .await
+        .map_err(|_| AgentError::SessionRejected("peer status connection timed out".into()))?
+        .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
+        let mut request = Request::new(proto::GetAgentStatusRequest {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: self.resource_uid.to_string(),
+            replica_id: receiver.replica_id.value(),
+            expected_instance_id: receiver.instance_id.to_string(),
+        });
+        add_bearer_token(&mut request, &self.bearer_token)?;
+        let report = tokio::time::timeout(self.deadline, client.get_status(request))
+            .await
+            .map_err(|_| AgentError::SessionRejected("peer status request timed out".into()))?
+            .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+            .into_inner();
+        kuberic_wire::validate_agent_status_report(&report)
+            .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
+        let observed = report
+            .identity
+            .clone()
+            .ok_or_else(|| AgentError::SessionRejected("peer is not initialized".into()))?;
+        let observed: ReplicaIdentity =
+            observed
+                .try_into()
+                .map_err(|error: kuberic_wire::WireError| {
+                    AgentError::SessionRejected(error.to_string())
+                })?;
+        if observed != *receiver {
+            return Err(AgentError::SessionRejected(
+                "peer status returned another exact identity".into(),
+            ));
+        }
+        Ok(ProcessSessionId::new(report.process_session_id))
+    }
+}
+
+#[async_trait]
+impl<R> OutboundDispatcher for GrpcOutboundDispatcher<R>
+where
+    R: ReplicaEndpointResolver + 'static,
+{
+    async fn dispatch(&self, outbound: QueuedOutbound) -> Result<()> {
+        match outbound {
+            QueuedOutbound::Replication {
+                receiver,
+                sequence: _,
+                mut item,
+            } => {
+                item.receiver_session_id = self.peer_session(&receiver).await?.to_string();
+                let endpoint = self.resolver.replication_endpoint(&receiver);
+                let mut client = tokio::time::timeout(
+                    self.deadline,
+                    proto::replication_data_client::ReplicationDataClient::connect(endpoint),
+                )
+                .await
+                .map_err(|_| {
+                    AgentError::SessionRejected("replication connection timed out".into())
+                })?
+                .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
+                let mut request = Request::new(iter([item]));
+                add_bearer_token(&mut request, &self.bearer_token)?;
+                let mut acknowledgements =
+                    tokio::time::timeout(self.deadline, client.replicate(request))
+                        .await
+                        .map_err(|_| {
+                            AgentError::SessionRejected("replication request timed out".into())
+                        })?
+                        .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+                        .into_inner();
+                let acknowledgement =
+                    tokio::time::timeout(self.deadline, acknowledgements.message())
+                        .await
+                        .map_err(|_| {
+                            AgentError::SessionRejected(
+                                "replication acknowledgement timed out".into(),
+                            )
+                        })?
+                        .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+                        .ok_or_else(|| {
+                            AgentError::SessionRejected(
+                                "replication peer returned no acknowledgement".into(),
+                            )
+                        })?;
+                let applied_lsn = acknowledgement.applied_lsn;
+                self.runtime
+                    .data_plane()
+                    .accept_acknowledgement(acknowledgement)
+                    .await?;
+                self.transport
+                    .lock()
+                    .await
+                    .acknowledge_replication(&receiver, applied_lsn)
+            }
+            QueuedOutbound::Copy {
+                receiver,
+                sequence: _,
+                mut item,
+            } => {
+                item.receiver_session_id = self.peer_session(&receiver).await?.to_string();
+                let endpoint = self.resolver.replication_endpoint(&receiver);
+                let mut client = tokio::time::timeout(
+                    self.deadline,
+                    proto::replication_data_client::ReplicationDataClient::connect(endpoint),
+                )
+                .await
+                .map_err(|_| AgentError::SessionRejected("copy connection timed out".into()))?
+                .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
+                let mut request = Request::new(iter([item]));
+                add_bearer_token(&mut request, &self.bearer_token)?;
+                let mut acknowledgements =
+                    tokio::time::timeout(self.deadline, client.build(request))
+                        .await
+                        .map_err(|_| AgentError::SessionRejected("copy request timed out".into()))?
+                        .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+                        .into_inner();
+                let acknowledgement =
+                    tokio::time::timeout(self.deadline, acknowledgements.message())
+                        .await
+                        .map_err(|_| {
+                            AgentError::SessionRejected("copy acknowledgement timed out".into())
+                        })?
+                        .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+                        .ok_or_else(|| {
+                            AgentError::SessionRejected(
+                                "copy peer returned no acknowledgement".into(),
+                            )
+                        })?;
+                let sequence = acknowledgement.sequence;
+                self.runtime
+                    .data_plane()
+                    .accept_copy_acknowledgement(acknowledgement)
+                    .await?;
+                self.transport
+                    .lock()
+                    .await
+                    .acknowledge_copy(&receiver, sequence)
+            }
+            QueuedOutbound::Build(_) => Err(AgentError::CommandRejected(
+                "replica build orchestration requires an admitted build authority".into(),
+            )),
+            QueuedOutbound::Remove(replica_id) => {
+                let receiver = self
+                    .transport
+                    .lock()
+                    .await
+                    .peers
+                    .keys()
+                    .find(|identity| identity.replica_id == replica_id)
+                    .cloned();
+                if let Some(receiver) = receiver {
+                    self.transport.lock().await.retire_peer(&receiver);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn add_bearer_token<T>(request: &mut Request<T>, token: &str) -> Result<()> {
+    let value = format!("Bearer {token}")
+        .parse()
+        .map_err(|error| AgentError::CommandRejected(format!("invalid bearer token: {error}")))?;
+    request.metadata_mut().insert("authorization", value);
+    Ok(())
+}
+
 pub async fn run_outbound<D: OutboundDispatcher>(
     runtime: Arc<PodRuntime>,
     transport: Arc<Mutex<ReliableTransport>>,
@@ -220,19 +472,42 @@ pub async fn run_outbound<D: OutboundDispatcher>(
     loop {
         let mut receive_shutdown = shutdown.clone();
         tokio::select! {
-            _ = receive_shutdown.wait_for(|stopped| *stopped) => return Ok(()),
+            _ = wait_for_shutdown_signal(&mut receive_shutdown) => return Ok(()),
             outbound = data_plane.next_domain_outbound() => {
                 let Some(outbound) = outbound else {
                     return Ok(());
                 };
-                let queued = transport.lock().await.queue(outbound)?;
+                let queued = loop {
+                    match transport.lock().await.queue(outbound.clone()) {
+                        Ok(queued) => break queued,
+                        Err(AgentError::SessionRejected(_)) => {
+                            let mut retry_shutdown = shutdown.clone();
+                            tokio::select! {
+                                _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
                 let mut dispatch_shutdown = shutdown.clone();
                 tokio::select! {
                     biased;
-                    _ = dispatch_shutdown.wait_for(|stopped| *stopped) => return Ok(()),
+                    _ = wait_for_shutdown_signal(&mut dispatch_shutdown) => return Ok(()),
                     result = dispatcher.dispatch(queued) => result?,
                 }
             }
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
         }
     }
 }

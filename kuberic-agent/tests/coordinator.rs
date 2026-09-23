@@ -164,6 +164,14 @@ fn command(operation_id: &str, epoch: Epoch) -> EnsureConfiguration {
         expected_instance_id: local.instance_id,
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Bootstrap,
+        grant_write: false,
+    }
+}
+
+fn grant_command(operation_id: &str, epoch: Epoch) -> EnsureConfiguration {
+    EnsureConfiguration {
+        grant_write: true,
+        ..command(operation_id, epoch)
     }
 }
 
@@ -181,12 +189,17 @@ async fn coordinator_converges_duplicates_and_retains_terminal_result() {
     let coordinator = Coordinator::new(store.clone(), runtime.clone());
     let command = command("configuration-1", Epoch::new(0, 1));
 
-    let first = coordinator
+    coordinator
         .ensure_configuration(command.clone())
         .await
         .unwrap();
+    let grant = grant_command("configuration-1-grant", Epoch::new(0, 1));
+    let first = coordinator
+        .ensure_configuration(grant.clone())
+        .await
+        .unwrap();
     let calls = runtime.calls.lock().unwrap().clone();
-    let duplicate = coordinator.ensure_configuration(command).await.unwrap();
+    let duplicate = coordinator.ensure_configuration(grant).await.unwrap();
     assert_eq!(duplicate, first);
     assert_eq!(*runtime.calls.lock().unwrap(), calls);
     let state = store.load_state().await.unwrap();
@@ -220,7 +233,7 @@ async fn coordinator_rejects_operation_reuse_and_stale_authority() {
 }
 
 #[tokio::test]
-async fn coordinator_resumes_from_durable_stage_without_repeating_completed_effects() {
+async fn bootstrap_resumes_pending_effect_without_repeating_completed_effects() {
     let (directory, store) = store();
     let runtime = Arc::new(FakeRuntime::new());
     runtime.fail_once("epoch");
@@ -267,14 +280,13 @@ async fn coordinator_resumes_from_durable_stage_without_repeating_completed_effe
             "epoch",
             "epoch",
             "application-role",
-            "catchup",
             "access",
         ]
     );
 }
 
 #[tokio::test]
-async fn coordinator_observes_completed_effect_before_stage_advance() {
+async fn bootstrap_observes_effect_complete_before_stage_advance() {
     let (_directory, store) = store();
     let runtime = Arc::new(FakeRuntime::new());
     let command = command("lost-stage-advance", Epoch::new(0, 1));
@@ -360,6 +372,7 @@ fn same_epoch_new_operation_cannot_replace_durable_membership() {
         expected_instance_id: local.instance_id,
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Bootstrap,
+        grant_write: false,
     };
     assert!(matches!(
         admit_configuration(&command, &state),

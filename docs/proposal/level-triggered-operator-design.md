@@ -783,13 +783,44 @@ publication, and `Ready` requires the Service selector to match the exact
 label on the attested primary Pod. A failed Service-list observation cannot be
 treated as confirmed routing absence.
 
+The Phase 6 vertical slice adds `examples/kvstore2` and
+`kuberic-level-tests`. Fresh Pods first expose an authenticated
+`Uninitialized` control service. `InitializeAgentStore` carries the exact
+full genesis configuration and creates `.kuberic/agent.sqlite3`; the process
+then reopens the same PVC through the normal durable agent and application
+runtime. Application state is stored separately under the application data
+directory.
+
+Bootstrap installs the deterministic full-size genesis configuration on every
+exact incarnation with WriteStatus closed. Because every genesis member has
+just proven a fresh empty store and progress zero, this initial slice uses a
+proof-based empty-state build: no copy payload exists to transfer, but every
+member must durably attest the same full configuration and assigned role.
+Only then does one status replacement set `initialized`, freeze the effective
+policy, accept the topology, and clear the transition. A separate fenced
+command grants primary WriteStatus; routing publication follows only after the
+granted report is observed.
+
+The application supplies an authenticated gRPC dispatcher for replication and
+copy traffic. Peer addresses use the per-set headless Service, process sessions
+are discovered before enqueue, receivers admit the authenticated exact sender
+session, and acknowledgements return through the runtime quorum tracker.
+Controller-created per-set Secrets distribute the same credential used by the
+controller. Immutable local image tags and explicit `IfNotPresent` policy keep
+the KinD harness offline.
+
+The isolated KinD scenario proves a three-member accepted topology, controller
+restart, exact secondary-container restart with the Pod UID and durable agent
+generation preserved, and a quorum-replicated write. Cluster-dependent tests
+remain ignored by default and require the owned `KUBECONFIG`,
+`KUBE_CONTEXT`, and `KIND_CLUSTER_NAME` tuple.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
-| Concrete outbound gRPC peer dialing and deployment credential distribution | Bootstrap vertical slice in Phase 6 |
-| True process-kill reconstruction with a live provider and active command | Bootstrap and adversarial suites in Phases 6 and 9 |
+| Process-kill reconstruction during replacement/failover and active non-bootstrap commands | Adversarial suite in Phase 9 |
 | Persistent resend payloads across process sessions where full copy is not acceptable | Reliable build/replacement owner in Phase 7 |
 | Full replacement, failover, quorum-loss, and destructive-recovery orchestration | Phases 7-9 |
 | Network-level session replacement, listener shutdown, and partition acceptance tests | Phases 7 and 9 |
@@ -818,7 +849,8 @@ InitializeAgentStore {
     expected_pod_uid,
     expected_pvc_uid,
     assigned_agent_generation,
-    effective_policy
+    effective_policy,
+    bootstrap_configuration
 }
 ```
 
@@ -832,7 +864,8 @@ EnsureConfiguration {
     effective_policy,
     local_replica_id,
     expected_instance_id,
-    expected_agent_generation
+    expected_agent_generation,
+    grant_write
 }
 ```
 
@@ -1219,13 +1252,14 @@ an implementation sequence or phased delivery plan.
 5. Initialize each exact fresh agent store using the persisted Bootstrap
    transition, resource UID, Pod UID, PVC UID, logical replica ID, and
    initialization ID.
-6. Ask the selected replica agent to open the runtime, install the epoch and genesis
-   bootstrap authority, and change role to runtime Primary with WriteStatus
-   denied.
-7. Build every other genesis member as an Idle Secondary outside the installed
-   configuration.
-8. Observe each member's copy/replication-gap completion, then install the full
-   genesis CC.
+6. Ask the selected replica agent to open the runtime and remain write-closed.
+7. Establish every other genesis member. When all stores have just proven
+   fresh empty state at progress zero, no copy payload exists; installing the
+   same full genesis CC on every member is the build postcondition. A
+   non-empty genesis source would instead require the normal Idle Secondary
+   copy and replication-gap path.
+8. Observe every exact member attesting the full genesis CC and assigned role
+   while WriteStatus remains denied.
 9. Atomically set `initialized = true`, accept genesis CC as
    `status.topology`, and clear the Bootstrap transition.
 10. Observe granted WriteStatus and publish write routing.

@@ -167,7 +167,9 @@ where
                         RuntimeEffectAction::ChangeApplicationRole(authority.local_role()),
                     )
                     .await?;
-                    let next = if authority.local_role() == ReplicaRole::Primary {
+                    let next = if authority.local_role() == ReplicaRole::Primary
+                        && record.command.grant_write
+                    {
                         CoordinatorStage::Catchup
                     } else {
                         CoordinatorStage::Activate
@@ -184,6 +186,7 @@ where
                         AccessStatus::NotPrimary
                     };
                     let write_status = if authority.local_role() == ReplicaRole::Primary
+                        && record.command.grant_write
                         && authority.previous_configuration.is_none()
                     {
                         AccessStatus::Granted

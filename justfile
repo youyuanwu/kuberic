@@ -3,6 +3,7 @@ kubeconfig := env_var_or_default("KUBECONFIG", "")
 cluster_context := "kind-" + cluster_name
 kind_config := env_var_or_default("KIND_CONFIG", "deploy/kind-config.yaml")
 ownership_receipt := kubeconfig + ".kuberic-owner"
+level_token := env_var_or_default("KUBERIC_AGENT_BEARER_TOKEN", "")
 
 # Build and load all container images into Kind.
 default: images
@@ -100,3 +101,53 @@ gateway-test: verify-kind-context
 # Collect Gateway and application diagnostics from the owned cluster.
 gateway-diagnostics: verify-kind-context
     timeout --kill-after=5s 180s bash scripts/gateway_kind.sh diagnostics
+
+# Build the isolated level-triggered packages.
+level-triggered-build:
+    cargo build -p kuberic-controller -p kvstore2 -p kuberic-level-tests
+
+# Build and load only the level-triggered controller and application images.
+level-triggered-images: verify-kind-context
+    docker build -t localhost/kuberic-controller:level-triggered-v1 \
+        -f kuberic-controller/Dockerfile .
+    docker build -t localhost/kvstore2:level-triggered-v1 \
+        -f examples/kvstore2/deploy/Dockerfile .
+    kind load docker-image localhost/kuberic-controller:level-triggered-v1 --name {{ cluster_name }}
+    kind load docker-image localhost/kvstore2:level-triggered-v1 --name {{ cluster_name }}
+
+# Install the level-triggered controller and sample without changing classic v1.
+level-triggered-install: verify-kind-context
+    test -n "{{ level_token }}"
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        create namespace kuberic-system --dry-run=client -o yaml | \
+        kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" apply -f -
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n kuberic-system create secret generic kuberic-agent-credentials \
+        --from-literal=bearer-token="{{ level_token }}" \
+        --dry-run=client -o yaml | \
+        kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" apply -f -
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        apply -k kuberic-controller/deploy
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n kuberic-system set image deployment/kuberic-controller \
+        controller=localhost/kuberic-controller:level-triggered-v1
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n kuberic-system rollout status deployment/kuberic-controller --timeout=180s
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        apply -f examples/kvstore2/deploy/sample.yaml
+
+# Run one explicit isolated level-triggered KinD scenario.
+level-triggered-kind-test scenario: verify-kind-context
+    test "{{ scenario }}" = "bootstrap"
+    cargo test -p kuberic-level-tests \
+        level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write \
+        -- --ignored --exact --nocapture
+
+# Collect level-triggered controller, resource, and replica diagnostics.
+level-triggered-diagnostics: verify-kind-context
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n kuberic-system logs deployment/kuberic-controller --all-containers --tail=-1 || true
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default get kubericsets,pods,pvc,services -o wide || true
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default logs -l operator.kuberic.io/set-name=kvstore2 --all-containers --tail=-1 || true

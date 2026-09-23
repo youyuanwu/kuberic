@@ -20,6 +20,7 @@ new_packages = {
     "kuberic-protocol",
     "kuberic-wire",
     "kuberic-runtime",
+    "kuberic-runtime-internal",
     "kuberic-agent",
     "kuberic-controller",
     "kvstore2",
