@@ -298,3 +298,333 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()> {
+    let (kubeconfig, context, _) = cluster_args()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let old_instance = loop {
+        let status = kubectl(
+            &kubeconfig,
+            &context,
+            &[
+                "-n",
+                "default",
+                "get",
+                "kubericset",
+                "kvstore2",
+                "-o",
+                "json",
+            ],
+        )?;
+        let value: serde_json::Value = serde_json::from_str(&status)?;
+        let ready = value["status"]["authority"]["conditions"]
+            .as_array()
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition["type"] == "Ready" && condition["status"] == "true")
+            });
+        let member = value["status"]["authority"]["topology"]["configuration"]["members"]
+            .as_array()
+            .and_then(|members| {
+                members
+                    .iter()
+                    .find(|member| member["identity"]["replicaId"].as_i64() == Some(2))
+            });
+        if ready
+            && let Some(instance) =
+                member.and_then(|member| member["identity"]["instanceId"].as_str())
+        {
+            break instance.to_string();
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("bootstrap did not become ready before replacement");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+
+    let primary = kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            "-l",
+            "operator.kuberic.io/replica-id=1",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+    )?;
+    let before = Command::new("kubectl")
+        .args([
+            "--kubeconfig",
+            &kubeconfig,
+            "--context",
+            &context,
+            "-n",
+            "default",
+            "exec",
+            primary.trim(),
+            "--",
+            "sh",
+            "-c",
+            "curl --fail --silent --show-error -X PUT --data-binary before-replacement http://127.0.0.1:8080/kv/replacement",
+        ])
+        .output()?;
+    if !before.status.success() {
+        bail!(
+            "write before replacement failed: {}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+    }
+
+    let secondary = kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            "-l",
+            "operator.kuberic.io/replica-id=2",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+    )?;
+    kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "delete",
+            "pod",
+            secondary.trim(),
+            "--wait=true",
+            "--timeout=120s",
+        ],
+    )?;
+
+    let replacement_deadline = std::time::Instant::now() + Duration::from_secs(420);
+    loop {
+        let status = kubectl(
+            &kubeconfig,
+            &context,
+            &[
+                "-n",
+                "default",
+                "get",
+                "kubericset",
+                "kvstore2",
+                "-o",
+                "json",
+            ],
+        )?;
+        let value: serde_json::Value = serde_json::from_str(&status)?;
+        let ready = value["status"]["authority"]["conditions"]
+            .as_array()
+            .is_some_and(|conditions| {
+                conditions
+                    .iter()
+                    .any(|condition| condition["type"] == "Ready" && condition["status"] == "true")
+            });
+        let replacement = value["status"]["authority"]["topology"]["configuration"]["members"]
+            .as_array()
+            .and_then(|members| {
+                members
+                    .iter()
+                    .find(|member| member["identity"]["replicaId"].as_i64() == Some(2))
+            })
+            .and_then(|member| member["identity"]["instanceId"].as_str());
+        if ready && replacement.is_some_and(|instance| instance != old_instance) {
+            break;
+        }
+        if std::time::Instant::now() >= replacement_deadline {
+            bail!("same-cardinality replacement did not converge");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let old_pvc = kubectl(
+            &kubeconfig,
+            &context,
+            &["-n", "default", "get", "pvc", "kvstore2-2-data"],
+        );
+        if old_pvc.is_err() {
+            break;
+        }
+        if std::time::Instant::now() >= cleanup_deadline {
+            bail!("old replacement PVC was not retired");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    let primary = kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            "-l",
+            "operator.kuberic.io/replica-id=1",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+    )?;
+    let after = Command::new("kubectl")
+        .args([
+            "--kubeconfig",
+            &kubeconfig,
+            "--context",
+            &context,
+            "-n",
+            "default",
+            "exec",
+            primary.trim(),
+            "--",
+            "sh",
+            "-c",
+            "curl --fail --silent --show-error -X PUT --data-binary after-replacement http://127.0.0.1:8080/kv/replacement",
+        ])
+        .output()?;
+    if !after.status.success() {
+        bail!(
+            "write after replacement failed: {}",
+            String::from_utf8_lossy(&after.stderr)
+        );
+    }
+
+    let replacement = kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            "-l",
+            "operator.kuberic.io/replica-id=2",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+    )?;
+    let before_restart: serde_json::Value = serde_json::from_str(&kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "exec",
+            replacement.trim(),
+            "--",
+            "curl",
+            "--fail",
+            "--silent",
+            "http://127.0.0.1:8080/status",
+        ],
+    )?)?;
+    let node = kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            replacement.trim(),
+            "-o",
+            "jsonpath={.spec.nodeName}",
+        ],
+    )?;
+    let container = Command::new("docker")
+        .args([
+            "exec",
+            node.trim(),
+            "crictl",
+            "ps",
+            "--label",
+            &format!("io.kubernetes.pod.name={}", replacement.trim()),
+            "-q",
+        ])
+        .output()
+        .context("resolving replacement container")?;
+    let container_id = String::from_utf8(container.stdout)?;
+    let container_id = container_id.trim();
+    if !container.status.success() || container_id.is_empty() || container_id.lines().count() != 1 {
+        bail!("cannot resolve one exact replacement container");
+    }
+    let stopped = Command::new("docker")
+        .args(["exec", node.trim(), "crictl", "stop", container_id])
+        .output()
+        .context("stopping replacement container")?;
+    if !stopped.status.success() {
+        bail!(
+            "cannot stop replacement container: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+    let restart_deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        let status = kubectl(
+            &kubeconfig,
+            &context,
+            &[
+                "-n",
+                "default",
+                "exec",
+                replacement.trim(),
+                "--",
+                "curl",
+                "--fail",
+                "--silent",
+                "http://127.0.0.1:8080/status",
+            ],
+        );
+        if let Ok(status) = status {
+            let restarted: serde_json::Value = serde_json::from_str(&status)?;
+            if restarted["processSession"] != before_restart["processSession"]
+                && restarted["currentConfiguration"] == before_restart["currentConfiguration"]
+            {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= restart_deadline {
+            bail!("replacement process did not reconstruct accepted authority");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let after_restart = Command::new("kubectl")
+        .args([
+            "--kubeconfig",
+            &kubeconfig,
+            "--context",
+            &context,
+            "-n",
+            "default",
+            "exec",
+            primary.trim(),
+            "--",
+            "sh",
+            "-c",
+            "curl --silent --show-error -X PUT --data-binary after-restart -w '\\n%{http_code}' http://127.0.0.1:8080/kv/replacement-restart",
+        ])
+        .output()?;
+    let response = String::from_utf8(after_restart.stdout)?;
+    let (body, status) = response.rsplit_once('\n').unwrap_or((&response, ""));
+    if !after_restart.status.success() || status.trim() != "200" {
+        bail!(
+            "write after replacement restart failed ({status}): {body}; {}",
+            String::from_utf8_lossy(&after_restart.stderr),
+        );
+    }
+    Ok(())
+}

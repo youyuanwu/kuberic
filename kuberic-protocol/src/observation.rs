@@ -28,6 +28,8 @@ pub struct KubernetesReplicaObservation {
     pub pvc_name: String,
     pub pvc_uid: Option<PvcUid>,
     pub pod_ready: bool,
+    #[serde(default)]
+    pub peer_endpoint_ready: bool,
 }
 
 impl KubernetesReplicaObservation {

@@ -86,6 +86,28 @@ impl QuorumTracker {
         Ok(())
     }
 
+    pub fn record_durable_replica_progress(
+        &mut self,
+        identity: ReplicaIdentity,
+        lsn: Lsn,
+    ) -> Result<()> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if !authority.contains_member(&identity) {
+            return Err(RuntimeError::AuthorityMismatch(
+                "durable progress belongs to a replica outside authority".to_string(),
+            ));
+        }
+        self.progress
+            .entry(identity)
+            .and_modify(|progress| *progress = (*progress).max(lsn))
+            .or_insert(lsn);
+        self.highest_lsn = self.highest_lsn.max(lsn);
+        Ok(())
+    }
+
     pub fn acknowledge(&mut self, acknowledgement: &ReplicationAck) -> Result<()> {
         let authority = self
             .authority

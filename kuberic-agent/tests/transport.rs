@@ -1,11 +1,12 @@
 use kuberic_agent::service::SessionRegistry;
 use kuberic_agent::transport::{
-    QueuedOutbound, ReliableTransport, ReliableWindow, ResumeWindow, RoleTransportState,
+    ReliableTransport, ReliableWindow, ResumeWindow, RoleTransportState,
 };
 use kuberic_protocol::types::{
     AgentGeneration, ConfigurationId, Epoch, ProcessSessionId, ReplicaId, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRole,
 };
+use kuberic_runtime::replicator::sender::SenderOutbound;
 use kuberic_runtime_internal::transport::OutboundOperation;
 use kuberic_runtime_internal::transport::ReplicationItem;
 
@@ -139,9 +140,10 @@ fn reliable_transport_attaches_sessions_retires_acks_and_falls_back_to_copy() {
     transport
         .admit_peer(receiver.clone(), ProcessSessionId::new("secondary-session"))
         .unwrap();
-    let QueuedOutbound::Replication {
-        item: first,
-        sequence: 1,
+    let SenderOutbound::Replication {
+        sender_session,
+        receiver_session,
+        message,
         ..
     } = transport
         .queue(OutboundOperation::Replication(item(1)))
@@ -149,13 +151,17 @@ fn reliable_transport_attaches_sessions_retires_acks_and_falls_back_to_copy() {
     else {
         panic!("replication dispatch expected");
     };
-    assert_eq!(first.sender_session_id, "primary-session");
-    assert_eq!(first.receiver_session_id, "secondary-session");
+    assert_eq!(message.sequence, 1);
+    assert_eq!(sender_session.as_str(), "primary-session");
+    assert_eq!(receiver_session.as_str(), "secondary-session");
     transport
         .queue(OutboundOperation::Replication(item(2)))
         .unwrap();
     transport
-        .admit_peer(receiver.clone(), ProcessSessionId::new("secondary-session"))
+        .admit_peer(
+            receiver.clone(),
+            ProcessSessionId::new("secondary-restarted"),
+        )
         .unwrap();
     assert!(
         transport
@@ -163,9 +169,15 @@ fn reliable_transport_attaches_sessions_retires_acks_and_falls_back_to_copy() {
             .is_err()
     );
     transport.acknowledge_replication(&receiver, 1).unwrap();
-    transport
+    let SenderOutbound::Replication {
+        receiver_session, ..
+    } = transport
         .queue(OutboundOperation::Replication(item(3)))
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("replication dispatch expected");
+    };
+    assert_eq!(receiver_session.as_str(), "secondary-restarted");
     assert!(matches!(
         transport.reconnect_replication(&receiver, 1).unwrap(),
         ResumeWindow::FullCopyRequired

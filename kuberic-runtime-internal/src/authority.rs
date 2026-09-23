@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
+pub use kuberic_protocol::types::{BuildAuthority, BuildAuthorityKind};
 use kuberic_protocol::types::{
     ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, ReplicaIdentity,
     ReplicaRole, TransitionKind,
@@ -10,85 +11,22 @@ use serde::{Deserialize, Serialize};
 use crate::transport::{CopyItem, ReplicationAck, ReplicationItem};
 use crate::{ContractError, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BuildAuthorityKind {
-    Bootstrap,
-    Provisioning,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BuildAuthority {
-    pub build_id: OperationId,
-    pub kind: BuildAuthorityKind,
-    pub source: ReplicaIdentity,
-    pub target: ReplicaIdentity,
-    pub current_configuration: ConfigurationDescriptor,
-    pub replication_boundary_lsn: i64,
-}
-
-impl BuildAuthority {
-    pub fn validate(&self) -> Result<()> {
-        validate_configuration(&self.current_configuration, None)
-            .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
-        let primary = self
-            .current_configuration
-            .members
-            .iter()
-            .find(|member| {
-                member.identity.replica_id == self.current_configuration.primary_id
-                    && member.role == ReplicaRole::Primary
-            })
-            .expect("validated configuration has one primary");
-        if primary.identity != self.source {
-            return Err(ContractError::AuthorityMismatch(
-                "copy source is not the exact Current Configuration primary".to_string(),
-            ));
-        }
-        let target_member = self
-            .current_configuration
-            .members
-            .iter()
-            .find(|member| member.identity == self.target);
-        match self.kind {
-            BuildAuthorityKind::Bootstrap => {
-                if target_member.is_none_or(|member| member.role == ReplicaRole::Primary) {
-                    return Err(ContractError::AuthorityMismatch(
-                        "bootstrap copy target must be an exact non-primary genesis member"
-                            .to_string(),
-                    ));
-                }
-            }
-            BuildAuthorityKind::Provisioning => {
-                if target_member.is_some() {
-                    return Err(ContractError::AuthorityMismatch(
-                        "provisioning copy target must remain outside configuration membership"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        if self.replication_boundary_lsn < 0 {
-            return Err(ContractError::AuthorityMismatch(
-                "copy boundary must not be negative".to_string(),
-            ));
-        }
-        Ok(())
+pub fn validate_build_envelope(authority: &BuildAuthority, envelope: &CopyItem) -> Result<()> {
+    authority
+        .validate()
+        .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
+    if envelope.build_id != authority.build_id
+        || envelope.sender != authority.source
+        || envelope.receiver != authority.target
+        || envelope.epoch != authority.current_configuration.epoch
+        || envelope.current_configuration_id != authority.current_configuration.configuration_id
+        || envelope.replication_boundary_lsn != authority.replication_boundary_lsn
+    {
+        return Err(ContractError::AuthorityMismatch(
+            "copy item does not match durable build authority".to_string(),
+        ));
     }
-
-    pub fn validate_envelope(&self, envelope: &CopyItem) -> Result<()> {
-        if envelope.build_id != self.build_id
-            || envelope.sender != self.source
-            || envelope.receiver != self.target
-            || envelope.epoch != self.current_configuration.epoch
-            || envelope.current_configuration_id != self.current_configuration.configuration_id
-            || envelope.replication_boundary_lsn != self.replication_boundary_lsn
-        {
-            return Err(ContractError::AuthorityMismatch(
-                "copy item does not match durable build authority".to_string(),
-            ));
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

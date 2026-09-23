@@ -2,13 +2,16 @@
 
 use std::collections::BTreeSet;
 
-use kuberic_protocol::command::{EnsureConfiguration, InitializeAgentStore, ProtocolCommand};
+use kuberic_protocol::command::{
+    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, ProtocolCommand,
+};
 use kuberic_protocol::observation::{
     AgentBuildReport, AgentObservation, AgentReport, UninitializedAgentObservation,
 };
 use kuberic_protocol::types::{
-    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationId, ConfigurationMember,
-    EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, ProcessSessionId, PvcUid,
+    AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
+    ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId,
+    PodUid, ProcessSessionId, ProvisioningId, ProvisioningIntent, ProvisioningKind, PvcUid,
     ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
     derive_agent_generation,
 };
@@ -446,7 +449,18 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 .clone()
                 .ok_or(WireError::MissingField("execute.target"))?
                 .try_into()?;
-            if !bootstrap_configuration
+            if let Some(provisioning) = command.provisioning.clone() {
+                let provisioning = provisioning_from_proto(provisioning)?;
+                if provisioning.resource_uid.as_str() != request.resource_uid
+                    || provisioning.replica_id != target.replica_id
+                    || provisioning.instance_id != target.instance_id
+                    || provisioning.assigned_agent_generation != target.agent_generation
+                {
+                    return Err(WireError::InvalidAuthority(
+                        "initialize target differs from replacement provisioning".to_string(),
+                    ));
+                }
+            } else if !bootstrap_configuration
                 .members
                 .iter()
                 .any(|member| member.identity == target)
@@ -547,23 +561,100 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 .members
                 .iter()
                 .any(|member| member.identity == target)
+                && !previous.as_ref().is_some_and(|configuration| {
+                    configuration
+                        .members
+                        .iter()
+                        .any(|member| member.identity == target)
+                })
             {
                 return Err(WireError::InvalidAuthority(
-                    "ensure target is not an exact Current Configuration member".to_string(),
+                    "ensure target is outside Previous and Current Configuration".to_string(),
                 ));
             }
-            validate_transition_relationship(
-                transition_kind,
-                previous.as_ref(),
-                &current,
-                &EffectivePolicy {
-                    replica_set_size: policy.replica_set_size,
-                    write_quorum: policy.write_quorum,
-                    read_quorum: policy.read_quorum,
-                    failover_delay_seconds: policy.failover_delay_seconds,
-                },
-            )
-            .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+            if command.current_only {
+                if previous.is_some() || transition_kind == TransitionKind::Bootstrap {
+                    return Err(WireError::InvalidAuthority(
+                        "current-only completion must omit PC for a non-bootstrap transition"
+                            .to_string(),
+                    ));
+                }
+                if transition_kind == TransitionKind::Replacement
+                    && command.retire_build_id.is_empty()
+                {
+                    return Err(WireError::InvalidAuthority(
+                        "replacement current-only completion must retire its build".to_string(),
+                    ));
+                }
+            } else {
+                if !command.retire_build_id.is_empty() {
+                    return Err(WireError::InvalidAuthority(
+                        "build retirement requires current-only completion".to_string(),
+                    ));
+                }
+                validate_transition_relationship(
+                    transition_kind,
+                    previous.as_ref(),
+                    &current,
+                    &EffectivePolicy {
+                        replica_set_size: policy.replica_set_size,
+                        write_quorum: policy.write_quorum,
+                        read_quorum: policy.read_quorum,
+                        failover_delay_seconds: policy.failover_delay_seconds,
+                    },
+                )
+                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+            }
+            Ok(())
+        }
+        proto::execute_command_request::Command::EnsureReplicaBuild(command) => {
+            let target: ReplicaIdentity = request
+                .target
+                .clone()
+                .ok_or(WireError::MissingField("execute.target"))?
+                .try_into()?;
+            if command.operation_id.is_empty()
+                || command.expected_instance_id.is_empty()
+                || command.expected_agent_generation.is_empty()
+            {
+                return Err(WireError::MissingField("ensure_build.fence"));
+            }
+            if target.replica_id != ReplicaId::new(command.local_replica_id)
+                || target.instance_id.as_str() != command.expected_instance_id
+                || target.agent_generation.as_str() != command.expected_agent_generation
+            {
+                return Err(WireError::InvalidAuthority(
+                    "build command target differs from command fence".to_string(),
+                ));
+            }
+            let build_target: ReplicaIdentity = command
+                .target
+                .clone()
+                .ok_or(WireError::MissingField("ensure_build.target"))?
+                .try_into()?;
+            if let Some(authority) = command.authority.clone() {
+                let authority = build_authority_from_proto(authority)?;
+                if authority.build_id.as_str() != command.operation_id
+                    || authority.target != build_target
+                    || authority.target != target
+                    || command.source_session_id.is_empty()
+                {
+                    return Err(WireError::InvalidAuthority(
+                        "target build command differs from durable build authority".to_string(),
+                    ));
+                }
+            } else {
+                if build_target == target {
+                    return Err(WireError::InvalidAuthority(
+                        "source build command must target another exact replica".to_string(),
+                    ));
+                }
+                if !command.source_session_id.is_empty() {
+                    return Err(WireError::InvalidAuthority(
+                        "source build command cannot carry a peer session".to_string(),
+                    ));
+                }
+            }
             Ok(())
         }
     }
@@ -601,6 +692,10 @@ pub fn normalize_execute_request(
                         "initialize.bootstrap_configuration",
                     ))?
                     .try_into()?,
+                provisioning: command
+                    .provisioning
+                    .map(provisioning_from_proto)
+                    .transpose()?,
             }))
         }
         proto::execute_command_request::Command::EnsureConfiguration(command) => {
@@ -635,6 +730,27 @@ pub fn normalize_execute_request(
                 expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
                 transition_kind,
                 grant_write: command.grant_write,
+                current_only: command.current_only,
+                retire_build_id: (!command.retire_build_id.is_empty())
+                    .then(|| OperationId::new(command.retire_build_id)),
+            }))
+        }
+        proto::execute_command_request::Command::EnsureReplicaBuild(command) => {
+            ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
+                operation_id: OperationId::new(command.operation_id),
+                local_replica_id: ReplicaId::new(command.local_replica_id),
+                expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
+                expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
+                target: command
+                    .target
+                    .ok_or(WireError::MissingField("ensure_build.target"))?
+                    .try_into()?,
+                authority: command
+                    .authority
+                    .map(build_authority_from_proto)
+                    .transpose()?,
+                source_session_id: (!command.source_session_id.is_empty())
+                    .then(|| ProcessSessionId::new(command.source_session_id)),
             }))
         }
     };
@@ -923,6 +1039,7 @@ impl TryFrom<proto::Configuration> for ConfigurationDescriptor {
         if value.configuration_id.is_empty() {
             return Err(WireError::MissingField("configuration.configuration_id"));
         }
+
         let epoch = value
             .epoch
             .ok_or(WireError::MissingField("configuration.epoch"))?
@@ -959,6 +1076,103 @@ impl TryFrom<proto::Configuration> for ConfigurationDescriptor {
             .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
         Ok(configuration)
     }
+}
+
+impl From<BuildAuthority> for proto::BuildAuthority {
+    fn from(authority: BuildAuthority) -> Self {
+        Self {
+            build_id: authority.build_id.to_string(),
+            kind: match authority.kind {
+                BuildAuthorityKind::Bootstrap => proto::BuildAuthorityKind::Bootstrap as i32,
+                BuildAuthorityKind::Provisioning => proto::BuildAuthorityKind::Provisioning as i32,
+            },
+            source: Some(authority.source.into()),
+            target: Some(authority.target.into()),
+            current_configuration: Some(authority.current_configuration.into()),
+            replication_boundary_lsn: authority.replication_boundary_lsn,
+        }
+    }
+}
+
+impl TryFrom<proto::BuildAuthority> for BuildAuthority {
+    type Error = WireError;
+
+    fn try_from(authority: proto::BuildAuthority) -> Result<Self, Self::Error> {
+        build_authority_from_proto(authority)
+    }
+}
+
+fn build_authority_from_proto(
+    authority: proto::BuildAuthority,
+) -> Result<BuildAuthority, WireError> {
+    let kind = match proto::BuildAuthorityKind::try_from(authority.kind).map_err(|_| {
+        WireError::InvalidEnum {
+            field: "build_authority.kind",
+            value: authority.kind,
+        }
+    })? {
+        proto::BuildAuthorityKind::Bootstrap => BuildAuthorityKind::Bootstrap,
+        proto::BuildAuthorityKind::Provisioning => BuildAuthorityKind::Provisioning,
+        proto::BuildAuthorityKind::Unspecified => {
+            return Err(WireError::InvalidAuthority(
+                "build authority kind is unspecified".to_string(),
+            ));
+        }
+    };
+    let authority = BuildAuthority {
+        build_id: OperationId::new(authority.build_id),
+        kind,
+        source: authority
+            .source
+            .ok_or(WireError::MissingField("build_authority.source"))?
+            .try_into()?,
+        target: authority
+            .target
+            .ok_or(WireError::MissingField("build_authority.target"))?
+            .try_into()?,
+        current_configuration: authority
+            .current_configuration
+            .ok_or(WireError::MissingField(
+                "build_authority.current_configuration",
+            ))?
+            .try_into()?,
+        replication_boundary_lsn: authority.replication_boundary_lsn,
+    };
+    authority
+        .validate()
+        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+    Ok(authority)
+}
+
+fn provisioning_from_proto(
+    provisioning: proto::ProvisioningIntent,
+) -> Result<ProvisioningIntent, WireError> {
+    let intent = ProvisioningIntent {
+        provisioning_id: ProvisioningId::new(provisioning.provisioning_id),
+        kind: ProvisioningKind::Replacement,
+        resource_uid: ResourceUid::new(provisioning.resource_uid),
+        replaces: provisioning
+            .replaces
+            .ok_or(WireError::MissingField("provisioning.replaces"))?
+            .try_into()?,
+        replica_id: ReplicaId::new(provisioning.replica_id),
+        instance_id: ReplicaInstanceId::new(provisioning.instance_id),
+        pod_uid: PodUid::new(provisioning.pod_uid),
+        pvc_uid: PvcUid::new(provisioning.pvc_uid),
+        initialization_id: InitializationId::new(provisioning.initialization_id),
+        assigned_agent_generation: AgentGeneration::new(provisioning.assigned_agent_generation),
+        operation_id: OperationId::new(provisioning.operation_id),
+        started_at_unix_seconds: provisioning.started_at_unix_seconds,
+    };
+    if intent.provisioning_id.is_empty()
+        || intent.resource_uid.is_empty()
+        || intent.operation_id.is_empty()
+    {
+        return Err(WireError::InvalidAuthority(
+            "replacement provisioning identifiers must not be empty".to_string(),
+        ));
+    }
+    Ok(intent)
 }
 
 fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {

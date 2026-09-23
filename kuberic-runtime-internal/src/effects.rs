@@ -43,6 +43,11 @@ pub enum RuntimeEffectAction {
     SetReadStatus(AccessStatus),
     SetWriteStatus(AccessStatus),
     RefreshApplicationProgress,
+    BuildReplica {
+        build_id: OperationId,
+        target: ReplicaIdentity,
+        replication_address: String,
+    },
     RetireBuild(OperationId),
     Close,
     Abort,

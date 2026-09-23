@@ -640,7 +640,9 @@ impl BuildAuthorityStore for SqliteStore {
     }
 
     async fn admit_build(&self, authority: &BuildAuthority) -> ContractResult<()> {
-        authority.validate()?;
+        authority
+            .validate()
+            .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
         self.contract_transaction(|transaction| {
             let existing: Option<BuildAuthority> = load_json_optional(
                 transaction,

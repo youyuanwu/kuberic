@@ -291,6 +291,7 @@ pub struct ProvisioningIntent {
     pub provisioning_id: ProvisioningId,
     pub kind: ProvisioningKind,
     pub resource_uid: ResourceUid,
+    pub replaces: ReplicaIdentity,
     pub replica_id: ReplicaId,
     pub instance_id: ReplicaInstanceId,
     pub pod_uid: PodUid,
@@ -298,6 +299,66 @@ pub struct ProvisioningIntent {
     pub initialization_id: InitializationId,
     pub assigned_agent_generation: AgentGeneration,
     pub operation_id: OperationId,
+    pub started_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum BuildAuthorityKind {
+    Bootstrap,
+    Provisioning,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildAuthority {
+    pub build_id: OperationId,
+    pub kind: BuildAuthorityKind,
+    pub source: ReplicaIdentity,
+    pub target: ReplicaIdentity,
+    pub current_configuration: ConfigurationDescriptor,
+    pub replication_boundary_lsn: i64,
+}
+
+impl BuildAuthority {
+    pub fn validate(&self) -> Result<(), crate::validation::ValidationError> {
+        crate::validation::validate_configuration(&self.current_configuration, None)?;
+        let primary = self
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| {
+                member.identity.replica_id == self.current_configuration.primary_id
+                    && member.role == ReplicaRole::Primary
+            })
+            .expect("validated configuration has one primary");
+        if primary.identity != self.source {
+            return Err(crate::validation::ValidationError::BuildSourceNotPrimary);
+        }
+        let target_member = self
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == self.target);
+        match self.kind {
+            BuildAuthorityKind::Bootstrap => {
+                if target_member.is_none_or(|member| member.role == ReplicaRole::Primary) {
+                    return Err(crate::validation::ValidationError::InvalidBootstrapBuildTarget);
+                }
+            }
+            BuildAuthorityKind::Provisioning => {
+                if target_member.is_some() {
+                    return Err(
+                        crate::validation::ValidationError::ProvisioningBuildTargetInAuthority,
+                    );
+                }
+            }
+        }
+        if self.replication_boundary_lsn < 0 {
+            return Err(crate::validation::ValidationError::NegativeBuildBoundary);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -329,6 +390,8 @@ pub struct TransitionIntent {
     pub effective_policy: EffectivePolicy,
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration: ConfigurationDescriptor,
+    #[serde(default)]
+    pub build_id: Option<OperationId>,
     pub started_at_unix_seconds: i64,
 }
 
@@ -411,6 +474,54 @@ pub fn derive_transition_id(
             configuration_id.as_str(),
         ])
     ))
+}
+
+pub fn derive_provisioning_id(
+    resource_uid: &ResourceUid,
+    replacing: &ReplicaIdentity,
+) -> ProvisioningId {
+    ProvisioningId::new(format!(
+        "provisioning-{}",
+        digest_parts(&[
+            resource_uid.as_str(),
+            &replacing.replica_id.to_string(),
+            replacing.instance_id.as_str(),
+            replacing.agent_generation.as_str(),
+        ])
+    ))
+}
+
+pub fn derive_replacement_operation_id(provisioning_id: &ProvisioningId) -> OperationId {
+    OperationId::new(format!("replacement-{provisioning_id}"))
+}
+
+pub fn derive_replica_endpoint_name(
+    resource_uid: &ResourceUid,
+    identity: &ReplicaIdentity,
+) -> String {
+    format!(
+        "kr-{}",
+        &digest_parts(&[
+            resource_uid.as_str(),
+            &identity.replica_id.to_string(),
+            identity.instance_id.as_str(),
+            identity.agent_generation.as_str(),
+        ])[..24]
+    )
+}
+
+pub fn derive_replacement_resource_name(
+    resource_uid: &ResourceUid,
+    replacing: &ReplicaIdentity,
+) -> String {
+    format!(
+        "krp-{}",
+        &digest_parts(&[
+            resource_uid.as_str(),
+            &replacing.replica_id.to_string(),
+            replacing.instance_id.as_str(),
+        ])[..20]
+    )
 }
 
 pub fn duplicate_replica_ids(members: &[ConfigurationMember]) -> BTreeSet<ReplicaId> {

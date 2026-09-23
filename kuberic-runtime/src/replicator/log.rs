@@ -336,6 +336,14 @@ impl ReplicationLog {
         self.record_local_progress_inner(lsn)
     }
 
+    pub(crate) fn record_durable_replica_progress(
+        &mut self,
+        identity: ReplicaIdentity,
+        lsn: Lsn,
+    ) -> Result<()> {
+        self.quorum.record_durable_replica_progress(identity, lsn)
+    }
+
     pub(crate) fn close(&mut self) -> Result<()> {
         self.fence_client_writes_inner();
         self.queue.clear();

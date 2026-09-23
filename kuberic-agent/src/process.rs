@@ -55,6 +55,17 @@ pub struct ReplicaDiagnostics {
     pub current_progress: i64,
     pub committed_lsn: i64,
     pub write_status: String,
+    pub pending_operation: Option<String>,
+    pub builds: Vec<ReplicaBuildDiagnostics>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaBuildDiagnostics {
+    pub build_id: String,
+    pub target_instance: String,
+    pub durable_lsn: i64,
+    pub completed: bool,
 }
 
 #[derive(Clone)]
@@ -87,6 +98,26 @@ impl ReplicaHandle {
             current_progress: snapshot.current_progress,
             committed_lsn: snapshot.committed_lsn,
             write_status: format!("{:?}", snapshot.write_status),
+            pending_operation: state
+                .reconfiguration
+                .as_ref()
+                .map(|record| record.command.operation_id.to_string())
+                .or_else(|| {
+                    state
+                        .pending_effect
+                        .as_ref()
+                        .map(|pending| pending.effect.operation_id.to_string())
+                }),
+            builds: snapshot
+                .builds
+                .into_iter()
+                .map(|build| ReplicaBuildDiagnostics {
+                    build_id: build.authority.build_id.to_string(),
+                    target_instance: build.authority.target.instance_id.to_string(),
+                    durable_lsn: build.durable_lsn,
+                    completed: build.completed,
+                })
+                .collect(),
         })
     }
 }

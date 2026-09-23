@@ -73,10 +73,22 @@ pub enum ValidationError {
     InvalidReplacementMembership,
     #[error("replacement must preserve the accepted primary")]
     ReplacementPrimaryChanged,
+    #[error("build source is not the exact Current Configuration primary")]
+    BuildSourceNotPrimary,
+    #[error("bootstrap build target must be an exact non-primary genesis member")]
+    InvalidBootstrapBuildTarget,
+    #[error("provisioning build target must remain outside configuration authority")]
+    ProvisioningBuildTargetInAuthority,
+    #[error("build replication boundary must not be negative")]
+    NegativeBuildBoundary,
     #[error("provisioning target does not match resource UID")]
     ProvisioningResourceMismatch,
     #[error("provisioning target reuses the accepted exact incarnation")]
     ProvisioningReusesAcceptedIncarnation,
+    #[error("provisioning does not replace one accepted non-primary incarnation")]
+    InvalidProvisioningReplacement,
+    #[error("provisioning initialization ID does not match exact Pod/PVC identity")]
+    ProvisioningInitializationMismatch,
     #[error("replica observation key {key} does not match reported identity {reported}")]
     ReplicaObservationKeyMismatch { key: String, reported: String },
     #[error("replica observation key does not match Kubernetes Pod identity")]
@@ -153,6 +165,21 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
         {
             return Err(ValidationError::ProvisioningReusesAcceptedIncarnation);
         }
+        let topology = snapshot
+            .status
+            .topology
+            .as_ref()
+            .ok_or(ValidationError::ProvisioningWithoutTopology)?;
+        if provisioning.replica_id != provisioning.replaces.replica_id
+            || provisioning.replaces.replica_id == topology.configuration.primary_id
+            || !topology
+                .configuration
+                .members
+                .iter()
+                .any(|member| member.identity == provisioning.replaces)
+        {
+            return Err(ValidationError::InvalidProvisioningReplacement);
+        }
         if provisioning.assigned_agent_generation
             != derive_agent_generation(&provisioning.initialization_id)
         {
@@ -160,6 +187,15 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
         }
         if provisioning.instance_id.as_str() != provisioning.pod_uid.as_str() {
             return Err(ValidationError::ProvisioningInstanceMismatch);
+        }
+        if crate::types::derive_initialization_id(
+            &provisioning.resource_uid,
+            provisioning.replica_id,
+            &provisioning.pod_uid,
+            &provisioning.pvc_uid,
+        ) != provisioning.initialization_id
+        {
+            return Err(ValidationError::ProvisioningInitializationMismatch);
         }
     }
 
@@ -531,15 +567,19 @@ fn validate_report_authority(
     }
 
     if report.write_status == AccessStatus::Granted {
-        let matches_current_authority = current.or(accepted).is_some_and(|configuration| {
-            report.epoch == configuration.epoch
-                && report
-                    .current_configuration
-                    .as_ref()
-                    .is_some_and(|observed| {
-                        observed.configuration_id == configuration.configuration_id
-                    })
-        });
+        let matches_current_authority =
+            [current, accepted]
+                .into_iter()
+                .flatten()
+                .any(|configuration| {
+                    report.epoch == configuration.epoch
+                        && report
+                            .current_configuration
+                            .as_ref()
+                            .is_some_and(|observed| {
+                                observed.configuration_id == configuration.configuration_id
+                            })
+                });
         if !matches_current_authority {
             return Err(ValidationError::ConflictingReplicaConfiguration {
                 replica_id: report.identity.replica_id.value(),
@@ -591,6 +631,9 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 if transition.previous_configuration_id.is_some() {
                     return Err(ValidationError::BootstrapHasPreviousConfiguration);
                 }
+                if transition.build_id.is_some() {
+                    return Err(ValidationError::InvalidReplacementMembership);
+                }
                 if status.topology.is_some() {
                     return Err(ValidationError::BootstrapHasTopology);
                 }
@@ -621,6 +664,12 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                     &transition.current_configuration,
                     &transition.effective_policy,
                 )?;
+                if transition.kind == TransitionKind::Replacement && transition.build_id.is_none() {
+                    return Err(ValidationError::InvalidReplacementMembership);
+                }
+                if transition.kind == TransitionKind::Failover && transition.build_id.is_some() {
+                    return Err(ValidationError::FailoverMembershipChanged);
+                }
             }
         }
     }

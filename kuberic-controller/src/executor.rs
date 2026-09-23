@@ -100,6 +100,31 @@ async fn execute_change(
             api.ensure_replica_scaffolding(observation, &replica_ids)
                 .await
         }
+        KubernetesChange::EnsureReplacementScaffolding {
+            replica_id,
+            replacing,
+        } => {
+            api.ensure_replacement_scaffolding(observation, replica_id, &replacing)
+                .await
+        }
+        KubernetesChange::DeleteReplicaScaffolding {
+            pod_name,
+            pod_uid,
+            pvc_name,
+            pvc_uid,
+        } => {
+            api.delete_replica_scaffolding(
+                observation,
+                pod_name.as_deref(),
+                pod_uid.as_ref(),
+                pvc_name.as_deref(),
+                pvc_uid.as_ref(),
+            )
+            .await
+        }
+        KubernetesChange::DeleteReplicaEndpoint { identity } => {
+            api.delete_replica_endpoint(observation, &identity).await
+        }
         KubernetesChange::EnsureWriteRoutingService => {
             api.ensure_write_routing_service(observation).await
         }

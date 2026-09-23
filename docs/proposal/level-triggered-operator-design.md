@@ -801,13 +801,15 @@ policy, accept the topology, and clear the transition. A separate fenced
 command grants primary WriteStatus; routing publication follows only after the
 granted report is observed.
 
-The application supplies an authenticated gRPC dispatcher for replication and
-copy traffic. Peer addresses use the per-set headless Service, process sessions
-are discovered before enqueue, receivers admit the authenticated exact sender
-session, and acknowledgements return through the runtime quorum tracker.
-Controller-created per-set Secrets distribute the same credential used by the
-controller. Immutable local image tags and explicit `IfNotPresent` policy keep
-the KinD harness offline.
+The agent supplies the authenticated gRPC dispatcher for replication and copy
+traffic. Every exact incarnation has a derived ClusterIP Service selected by
+its Pod UID, so an old and replacement incarnation remain concurrently
+addressable until CC is accepted. Process sessions are discovered before
+enqueue, receivers admit the authenticated exact sender session, and
+acknowledgements return through the runtime quorum tracker. Controller-created
+per-set Secrets distribute the same credential used by the controller.
+Immutable local image tags and explicit `IfNotPresent` policy keep the KinD
+harness offline.
 
 The isolated KinD scenario proves a three-member accepted topology, controller
 restart, exact secondary-container restart with the Pod UID and durable agent
@@ -845,16 +847,53 @@ supplies its `StatefulServiceReplica`, its application-storage classification,
 and endpoint configuration; it no longer constructs agent or transport
 internals.
 
+Phase 7 implements same-cardinality replacement. Definitive loss of a
+non-primary Pod with surviving exact storage creates one deterministic
+out-of-authority replacement Pod/PVC pair. The controller persists the exact
+provisioning identity before initialization. The primary admits a durable
+build authority, the target opens as Idle Secondary, and copy plus the
+post-snapshot replication gap must be durably acknowledged before status can
+freeze PC/CC. Empty replication gaps are represented by an empty stream rather
+than an invalid range.
+
+The evaluator installs PC/CC on reachable non-primary members before issuing
+the primary command, waits for the privately derived CC catch-up predicate,
+then installs current-only authority. PC and CC retain fixed cardinality and
+the old incarnation remains accepted until a current-only quorum and granted
+primary WriteStatus are observed. A missing target after CC is never
+substituted in place; current-only completion may proceed with another valid
+CC quorum, after which a later serialized replacement can repair the missing
+member.
+
+Current-only completion durably retires the replacement build on source and
+target before the command becomes terminal. The controller then removes the
+old exact endpoint and UID-fenced Pod/PVC scaffolding. Cleanup-only orphan
+storage cannot be mistaken for failure of the healthy accepted replacement.
+Pre-CC target loss clears provisioning and returns to deterministic
+provisioning without creating a second authority.
+
+Retained sender windows, ACK retirement, reconnect capability, and retry
+cadence now live in `kuberic-runtime::replicator::sender`; the agent retains
+only DNS, authentication, gRPC, and process-session discovery. A changed peer
+process session preserves domain payload windows and refreshes session fences
+on demand. Replacement builds reconstruct from durable build authority and
+application state, and registered writes are re-registered and republished if
+an authority refresh closes their process-local completion channel.
+
+The replacement KinD scenario proves pre/post-replacement quorum writes,
+copy/build handoff, equal-cardinality PC/CC acceptance, old PVC retirement,
+exact replacement process restart, authority reconstruction, and another
+quorum write. The original fresh-bootstrap scenario remains a separate
+regression gate.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
 | Live process-kill reconstruction while an active configuration, replacement, or failover command is between durable stages | Adversarial suite in Phase 9 |
-| Persistent resend payloads across process sessions where full copy is not acceptable | Reliable build/replacement owner in Phase 7 |
-| Move retained per-peer sender windows and retry scheduling behind a replicator-owned reliable-sender abstraction while keeping concrete gRPC/session transport in the agent | Reliable build/replacement owner in Phase 7 |
-| Full replacement, failover, quorum-loss, and destructive-recovery orchestration | Phases 7-9 |
-| Network-level session replacement, listener shutdown, and partition acceptance tests | Phases 7 and 9 |
+| Failover, quorum-loss, and destructive-recovery orchestration | Phases 8-9 |
+| Exhaustive active-stage process-kill, listener-shutdown, and partition acceptance tests | Phase 9 |
 | Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |
 
 The current classic design treats loss of process-local role, epoch, or action

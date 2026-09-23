@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         application.clone(),
         application_storage,
         Arc::new(KubernetesDnsResolver::new(
-            config.set_name.clone(),
+            ResourceUid::new(&config.resource_uid),
             config.namespace.clone(),
         )),
     )

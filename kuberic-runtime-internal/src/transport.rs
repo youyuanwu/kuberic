@@ -63,6 +63,7 @@ pub struct CopyAck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplicaEndpoint {
+    pub build_id: OperationId,
     pub identity: ReplicaIdentity,
     pub replication_address: String,
 }

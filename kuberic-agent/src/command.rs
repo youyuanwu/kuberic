@@ -1,4 +1,4 @@
-use kuberic_protocol::command::{EnsureConfiguration, InitializeAgentStore};
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore};
 use kuberic_protocol::types::{ReplicaRole, TransitionKind};
 use kuberic_protocol::validation::validate_transition_relationship;
 use kuberic_runtime_internal::authority::AdmittedAuthority;
@@ -84,25 +84,56 @@ pub fn admit_configuration(
             "command policy differs from initialized policy".into(),
         ));
     }
-    if command.grant_write
-        && (command.transition_kind != TransitionKind::Bootstrap
-            || state.current_configuration.as_ref() != Some(&command.current_configuration)
-            || state.role != ReplicaRole::Primary)
-    {
+    let replacement_primary_grant = command.transition_kind == TransitionKind::Replacement
+        && !command.current_only
+        && state.current_configuration.as_ref() == command.previous_configuration.as_ref()
+        && command.current_configuration.primary_id == identity.replica_id
+        && command
+            .current_configuration
+            .members
+            .iter()
+            .any(|member| member.identity == *identity && member.role == ReplicaRole::Primary);
+    let installed_primary_grant = state.current_configuration.as_ref()
+        == Some(&command.current_configuration)
+        && state.role == ReplicaRole::Primary;
+    if command.grant_write && !replacement_primary_grant && !installed_primary_grant {
         return Err(AgentError::CommandRejected(
-            "bootstrap write grant requires the exact installed primary authority".into(),
+            "write grant requires the exact installed primary authority".into(),
         ));
     }
-    validate_transition_relationship(
-        command.transition_kind,
-        command.previous_configuration.as_ref(),
-        &command.current_configuration,
-        &command.effective_policy,
-    )
-    .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+    if command.current_only {
+        if command.previous_configuration.is_some()
+            || !current_only_completion
+            || command.transition_kind == TransitionKind::Bootstrap
+        {
+            return Err(AgentError::CommandRejected(
+                "current-only completion does not match durable PC/CC authority".into(),
+            ));
+        }
+        if command.transition_kind == TransitionKind::Replacement
+            && command.retire_build_id.is_none()
+        {
+            return Err(AgentError::CommandRejected(
+                "replacement current-only completion must retire its build".into(),
+            ));
+        }
+    } else {
+        if command.retire_build_id.is_some() {
+            return Err(AgentError::CommandRejected(
+                "build retirement is valid only for current-only completion".into(),
+            ));
+        }
+        validate_transition_relationship(
+            command.transition_kind,
+            command.previous_configuration.as_ref(),
+            &command.current_configuration,
+            &command.effective_policy,
+        )
+        .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+    }
     let admitted = AdmittedAuthority {
         local_identity: identity.clone(),
-        transition_kind: Some(command.transition_kind),
+        transition_kind: (!command.current_only).then_some(command.transition_kind),
         previous_configuration: command.previous_configuration.clone(),
         current_configuration: command.current_configuration.clone(),
     };
@@ -117,4 +148,51 @@ pub fn admit_configuration(
         ));
     }
     Ok(admitted)
+}
+
+pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<()> {
+    let identity = &state.identity.local_identity;
+    if command.operation_id.is_empty()
+        || command.local_replica_id != identity.replica_id
+        || command.expected_instance_id != identity.instance_id
+        || command.expected_agent_generation != identity.agent_generation
+    {
+        return Err(AgentError::CommandRejected(
+            "build command target does not match durable replica identity".into(),
+        ));
+    }
+    if let Some(authority) = &command.authority {
+        authority
+            .validate()
+            .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+        if authority.build_id != command.operation_id
+            || authority.target != command.target
+            || authority.target != *identity
+            || command.source_session_id.is_none()
+        {
+            return Err(AgentError::CommandRejected(
+                "target build command differs from admitted build authority".into(),
+            ));
+        }
+    } else {
+        if command.source_session_id.is_some() {
+            return Err(AgentError::CommandRejected(
+                "source build command cannot carry a peer session".into(),
+            ));
+        }
+        let current = state.current_configuration.as_ref().ok_or_else(|| {
+            AgentError::CommandRejected("build source has no Current Configuration".into())
+        })?;
+        let primary = current
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == current.primary_id)
+            .expect("validated configuration has primary");
+        if primary.identity != *identity || command.target.replica_id == identity.replica_id {
+            return Err(AgentError::CommandRejected(
+                "source build command must target another logical replica from the primary".into(),
+            ));
+        }
+    }
+    Ok(())
 }

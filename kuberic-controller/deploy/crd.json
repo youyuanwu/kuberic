@@ -173,12 +173,37 @@
                           "pvcUid": {
                             "type": "string"
                           },
+                          "replaces": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          },
                           "replicaId": {
                             "format": "int64",
                             "type": "integer"
                           },
                           "resourceUid": {
                             "type": "string"
+                          },
+                          "startedAtUnixSeconds": {
+                            "format": "int64",
+                            "type": "integer"
                           }
                         },
                         "required": [
@@ -190,8 +215,10 @@
                           "podUid",
                           "provisioningId",
                           "pvcUid",
+                          "replaces",
                           "replicaId",
-                          "resourceUid"
+                          "resourceUid",
+                          "startedAtUnixSeconds"
                         ],
                         "type": "object"
                       },
@@ -295,6 +322,10 @@
                         "description": "Frozen PC/CC target and policy for one active transition.",
                         "nullable": true,
                         "properties": {
+                          "buildId": {
+                            "nullable": true,
+                            "type": "string"
+                          },
                           "currentConfiguration": {
                             "description": "Canonical Current or Previous Configuration with a content-derived ID.",
                             "properties": {

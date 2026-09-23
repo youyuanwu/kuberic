@@ -9,6 +9,7 @@ use kuberic_protocol::observation::{
 };
 use kuberic_protocol::types::{
     AcceptedStatus, PodUid, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
+    derive_agent_generation, derive_initialization_id, derive_replica_endpoint_name,
 };
 
 use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL};
@@ -82,15 +83,24 @@ pub fn normalize(
                 .get(&key)
                 .cloned()
                 .unwrap_or(RawAgentObservation::Absent);
+            let pvc_uid = pvc.and_then(|pvc| pvc.uid()).map(PvcUid::new);
+            let peer_endpoint_ready =
+                pod_uid
+                    .as_ref()
+                    .zip(pvc_uid.as_ref())
+                    .is_some_and(|(pod_uid, pvc_uid)| {
+                        exact_peer_endpoint_ready(&raw, &resource_uid, replica_id, pod_uid, pvc_uid)
+                    });
             insert_replica_observation(
                 &mut replicas,
                 &mut failures,
                 key,
                 pod_uid,
-                pvc.and_then(|pvc| pvc.uid()).map(PvcUid::new),
+                pvc_uid,
                 Some(pod),
                 pvc,
                 raw_agent,
+                peer_endpoint_ready,
                 &resource_uid,
                 &previous_report_watermarks,
             );
@@ -114,6 +124,7 @@ pub fn normalize(
                 None,
                 Some(pvc),
                 RawAgentObservation::Absent,
+                false,
                 &resource_uid,
                 &previous_report_watermarks,
             );
@@ -387,6 +398,7 @@ fn insert_replica_observation(
     pod: Option<&Pod>,
     pvc: Option<&PersistentVolumeClaim>,
     raw_agent: RawAgentObservation,
+    peer_endpoint_ready: bool,
     resource_uid: &ResourceUid,
     previous: &BTreeMap<ReplicaObservationKey, ReportWatermark>,
 ) {
@@ -406,6 +418,7 @@ fn insert_replica_observation(
             pvc_name: pvc.map(ResourceExt::name_any).unwrap_or_default(),
             pvc_uid,
             pod_ready: pod.is_some_and(pod_ready),
+            peer_endpoint_ready,
         }),
         agent,
     };
@@ -415,6 +428,32 @@ fn insert_replica_observation(
             message: "multiple observations claim one exact replica incarnation".to_string(),
         });
     }
+}
+
+fn exact_peer_endpoint_ready(
+    raw: &RawObservation,
+    resource_uid: &ResourceUid,
+    replica_id: ReplicaId,
+    pod_uid: &PodUid,
+    pvc_uid: &PvcUid,
+) -> bool {
+    let initialization_id = derive_initialization_id(resource_uid, replica_id, pod_uid, pvc_uid);
+    let identity = ReplicaIdentity {
+        replica_id,
+        instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+        agent_generation: derive_agent_generation(&initialization_id),
+    };
+    let name = derive_replica_endpoint_name(resource_uid, &identity);
+    raw.services.iter().any(|service| {
+        service.name_any() == name
+            && owned_by_set(service, resource_uid)
+            && service.spec.as_ref().is_some_and(|spec| {
+                spec.selector.as_ref().is_some_and(|selector| {
+                    selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
+                }) && has_service_port(service, "control", 50051)
+                    && has_service_port(service, "replication", 50052)
+            })
+    })
 }
 
 fn pvc_for_pod<'a>(

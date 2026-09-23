@@ -55,3 +55,9 @@ impl From<kuberic_runtime_internal::ContractError> for RuntimeError {
         }
     }
 }
+
+impl From<kuberic_protocol::validation::ValidationError> for RuntimeError {
+    fn from(error: kuberic_protocol::validation::ValidationError) -> Self {
+        Self::AuthorityMismatch(error.to_string())
+    }
+}

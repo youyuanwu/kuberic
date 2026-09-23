@@ -1313,6 +1313,7 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         tokio::spawn(async move {
             control
                 .build_replica(kuberic_runtime::replicator::ReplicaInformation {
+                    build_id: OperationId::new("sf-build"),
                     identity: target,
                     replication_address: "target".into(),
                 })
@@ -1909,6 +1910,7 @@ async fn removing_a_replica_terminates_its_pending_build_wait() {
         tokio::spawn(async move {
             control
                 .build_replica(kuberic_runtime::replicator::ReplicaInformation {
+                    build_id: OperationId::new("removed-build"),
                     identity: target,
                     replication_address: "target".into(),
                 })
@@ -1943,6 +1945,7 @@ async fn bounded_outbound_build_queue_is_cancelled_by_abort() {
         builds.push(tokio::spawn(async move {
             control
                 .build_replica(kuberic_runtime::replicator::ReplicaInformation {
+                    build_id: OperationId::new(format!("bounded-build-{id}")),
                     identity: identity(id, &format!("target-{id}")),
                     replication_address: format!("target-{id}"),
                 })

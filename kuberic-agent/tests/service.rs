@@ -338,6 +338,7 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
                         )
                         .into(),
                     ),
+                    provisioning: None,
                 },
             ),
         ),
@@ -444,6 +445,7 @@ async fn fresh_storage_reports_uninitialized_and_creates_exact_bootstrap_identit
                         failover_delay_seconds: 30,
                     }),
                     bootstrap_configuration: Some(configuration.into()),
+                    provisioning: None,
                 },
             ),
         ),

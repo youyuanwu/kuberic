@@ -63,6 +63,7 @@ pub enum CoordinatorStage {
     Epoch,
     ApplicationRole,
     Activate,
+    RetireBuild,
     Complete,
 }
 

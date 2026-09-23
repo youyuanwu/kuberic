@@ -3,6 +3,8 @@ pub mod copy;
 mod queue;
 #[doc(hidden)]
 pub mod quorum;
+#[doc(hidden)]
+pub mod sender;
 pub mod stream;
 
 pub(crate) mod log;
@@ -12,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, PartitionInformation,
-    ReplicaId, ReplicaIdentity, ReplicaRole,
+    AccessStatus, ConfigurationDescriptor, Epoch, FaultType, LoadMetric, OperationId,
+    PartitionInformation, ReplicaId, ReplicaIdentity, ReplicaRole,
 };
 use kuberic_runtime_internal::RuntimeHostToken;
 use tokio::sync::{Mutex, RwLock};
@@ -104,6 +106,7 @@ pub enum ReplicaSetQuorumMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaInformation {
+    pub build_id: OperationId,
     pub identity: ReplicaIdentity,
     pub replication_address: String,
 }
@@ -551,10 +554,8 @@ impl StateReplicator for DefaultStateReplicator {
             *reservation = Some(engine.recover_replicate_write(data, id).await);
             true
         };
-        let pending = match engine
-            .begin_write(reservation.as_ref().expect("write reserved").clone())
-            .await
-        {
+        let write = reservation.as_ref().expect("write reserved").clone();
+        let mut pending = match engine.begin_write(write.clone()).await {
             Ok(pending) => pending,
             Err(
                 error @ (RuntimeError::DataLossFenced
@@ -571,21 +572,8 @@ impl StateReplicator for DefaultStateReplicator {
             }
             Err(error) => return Err(error),
         };
-        if let Err(error) = engine.publish_replication(&pending).await {
-            if matches!(
-                error,
-                RuntimeError::DataLossFenced
-                    | RuntimeError::WriteClosed(_)
-                    | RuntimeError::AuthorityMismatch(_)
-                    | RuntimeError::NotPrimary
-            ) {
-                *reservation = None;
-            }
-            return Err(error);
-        }
-        let lsn = match pending.committed().await {
-            Ok(receipt) => receipt.lsn,
-            Err(error) => {
+        let lsn = loop {
+            if let Err(error) = engine.publish_replication(&pending).await {
                 if matches!(
                     error,
                     RuntimeError::DataLossFenced
@@ -596,6 +584,24 @@ impl StateReplicator for DefaultStateReplicator {
                     *reservation = None;
                 }
                 return Err(error);
+            }
+            match pending.committed().await {
+                Ok(receipt) => break receipt.lsn,
+                Err(RuntimeError::WriteCompletionClosed) => {
+                    pending = engine.begin_write(write.clone()).await?;
+                }
+                Err(error) => {
+                    if matches!(
+                        error,
+                        RuntimeError::DataLossFenced
+                            | RuntimeError::WriteClosed(_)
+                            | RuntimeError::AuthorityMismatch(_)
+                            | RuntimeError::NotPrimary
+                    ) {
+                        *reservation = None;
+                    }
+                    return Err(error);
+                }
             }
         };
         *reservation = None;

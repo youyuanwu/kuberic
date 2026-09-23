@@ -155,6 +155,9 @@ impl DurableState for KvPersistence {
         from_lsn: i64,
         to_lsn: i64,
     ) -> Result<RetainedOperationStream> {
+        if from_lsn > to_lsn {
+            return Ok(Box::pin(stream::empty()));
+        }
         let operations = self
             .state
             .lock()
@@ -341,6 +344,8 @@ pub fn snapshot_stream(values: BTreeMap<String, String>) -> Result<SnapshotStrea
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt;
+
     use super::*;
 
     #[tokio::test]
@@ -389,6 +394,14 @@ mod tests {
         drop(store);
         let reopened = KvPersistence::open(directory.path()).unwrap();
         assert_eq!(reopened.get("key").as_deref(), Some("value"));
+    }
+
+    #[tokio::test]
+    async fn empty_replication_gap_returns_an_empty_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KvPersistence::open(directory.path()).unwrap();
+        let mut operations = store.get_replication_operations(2, 1).await.unwrap();
+        assert!(operations.next().await.is_none());
     }
 
     #[test]

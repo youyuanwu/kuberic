@@ -13,11 +13,15 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client, Resource, ResourceExt};
-use kuberic_protocol::command::{EnsureConfiguration, InitializeAgentStore, ProtocolCommand};
+use kuberic_protocol::command::{
+    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, ProtocolCommand,
+};
 use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
-    AcceptedStatus, EffectivePolicy, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ResourceUid, TransitionKind,
+    AcceptedStatus, EffectivePolicy, PodUid, ProvisioningIntent, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
+    derive_agent_generation, derive_initialization_id, derive_replacement_resource_name,
+    derive_replica_endpoint_name,
 };
 use kuberic_wire::proto;
 use tokio::sync::Mutex;
@@ -37,6 +41,11 @@ const REPLICATION_PORT: i32 = 50052;
 pub enum EffectRecord {
     EnsureReplicaSupport,
     EnsureScaffolding(Vec<ReplicaId>),
+    EnsureReplacement(ReplicaIdentity),
+    DeleteScaffolding {
+        pod_name: Option<String>,
+        pvc_name: Option<String>,
+    },
     EnsureWriteRoutingService,
     ReplaceStatus,
     RemoveWriteRouting,
@@ -78,6 +87,28 @@ pub trait ClusterApi: Send + Sync {
     ) -> Result<()>;
 
     async fn ensure_replica_support(&self, observation: &RawObservation) -> Result<()>;
+
+    async fn ensure_replacement_scaffolding(
+        &self,
+        observation: &RawObservation,
+        replica_id: ReplicaId,
+        replacing: &ReplicaIdentity,
+    ) -> Result<()>;
+
+    async fn delete_replica_scaffolding(
+        &self,
+        observation: &RawObservation,
+        pod_name: Option<&str>,
+        pod_uid: Option<&PodUid>,
+        pvc_name: Option<&str>,
+        pvc_uid: Option<&PvcUid>,
+    ) -> Result<()>;
+
+    async fn delete_replica_endpoint(
+        &self,
+        observation: &RawObservation,
+        identity: &ReplicaIdentity,
+    ) -> Result<()>;
 
     async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()>;
 
@@ -339,9 +370,160 @@ where
                     ),
                 )
                 .await?;
+                continue;
             }
+            let pod = observation
+                .pods
+                .iter()
+                .find(|pod| pod.name_any() == pod_name)
+                .expect("observed existing replica Pod");
+            ensure_exact_peer_endpoint(
+                self.client.clone(),
+                observation,
+                &namespace,
+                &uid,
+                &owner,
+                pod,
+                pvc,
+                *replica_id,
+            )
+            .await?;
         }
         ensure_write_service(self.client.clone(), observation, &namespace, &uid, &owner).await
+    }
+
+    async fn ensure_replacement_scaffolding(
+        &self,
+        observation: &RawObservation,
+        replica_id: ReplicaId,
+        replacing: &ReplicaIdentity,
+    ) -> Result<()> {
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        let uid = observation
+            .set
+            .uid()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let resource_uid = ResourceUid::new(&uid);
+        let owner = owner_reference(&observation.set)?;
+        let base = derive_replacement_resource_name(&resource_uid, replacing);
+        let pod_name = format!("{}-{base}", observation.set.name_any());
+        let pvc_name = format!("{pod_name}-data");
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), &namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
+        let pvc = observation
+            .pvcs
+            .iter()
+            .find(|pvc| pvc.name_any() == pvc_name);
+        let Some(pvc) = pvc else {
+            create_exact(
+                &pvcs,
+                &pvc_name,
+                &replica_pvc_named(&observation.set, replica_id, &uid, &owner, &pvc_name),
+            )
+            .await?;
+            return Ok(());
+        };
+        let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+        let pod = observation
+            .pods
+            .iter()
+            .find(|pod| pod.name_any() == pod_name);
+        let Some(pod) = pod else {
+            create_exact(
+                &pods,
+                &pod_name,
+                &replica_pod_named(
+                    &observation.set,
+                    replica_id,
+                    &uid,
+                    &owner,
+                    &pod_name,
+                    &pvc_name,
+                    &pvc_uid,
+                ),
+            )
+            .await?;
+            return Ok(());
+        };
+        ensure_exact_peer_endpoint(
+            self.client.clone(),
+            observation,
+            &namespace,
+            &uid,
+            &owner,
+            pod,
+            pvc,
+            replica_id,
+        )
+        .await
+    }
+
+    async fn delete_replica_scaffolding(
+        &self,
+        observation: &RawObservation,
+        pod_name: Option<&str>,
+        pod_uid: Option<&PodUid>,
+        pvc_name: Option<&str>,
+        pvc_uid: Option<&PvcUid>,
+    ) -> Result<()> {
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        if let Some(pod_uid) = pod_uid
+            && let Some(service) = observation.services.iter().find(|service| {
+                service.spec.as_ref().is_some_and(|spec| {
+                    spec.selector.as_ref().is_some_and(|selector| {
+                        selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
+                    })
+                })
+            })
+        {
+            let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
+            let service_uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+            delete_exact(&services, &service.name_any(), &service_uid).await?;
+            return Ok(());
+        }
+        if let (Some(name), Some(uid)) = (pod_name, pod_uid) {
+            let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
+            delete_exact(&pods, name, uid.as_str()).await?;
+            return Ok(());
+        }
+        if let (Some(name), Some(uid)) = (pvc_name, pvc_uid) {
+            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), &namespace);
+            delete_exact(&pvcs, name, uid.as_str()).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_replica_endpoint(
+        &self,
+        observation: &RawObservation,
+        identity: &ReplicaIdentity,
+    ) -> Result<()> {
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        let resource_uid = observation
+            .set
+            .uid()
+            .map(ResourceUid::new)
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let name = derive_replica_endpoint_name(&resource_uid, identity);
+        let Some(service) = observation
+            .services
+            .iter()
+            .find(|service| service.name_any() == name)
+        else {
+            return Ok(());
+        };
+        let uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+        let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
+        delete_exact(&services, &name, &uid).await
     }
 
     async fn ensure_replica_support(&self, observation: &RawObservation) -> Result<()> {
@@ -618,9 +800,25 @@ fn replica_pvc(
     uid: &str,
     owner: &OwnerReference,
 ) -> PersistentVolumeClaim {
+    replica_pvc_named(
+        set,
+        replica_id,
+        uid,
+        owner,
+        &format!("{}-data", replica_name(set, replica_id)),
+    )
+}
+
+fn replica_pvc_named(
+    set: &KubericSet,
+    replica_id: ReplicaId,
+    uid: &str,
+    owner: &OwnerReference,
+    name: &str,
+) -> PersistentVolumeClaim {
     PersistentVolumeClaim {
         metadata: kube::core::ObjectMeta {
-            name: Some(format!("{}-data", replica_name(set, replica_id))),
+            name: Some(name.to_string()),
             labels: Some(base_labels(set, Some(replica_id), uid)),
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
@@ -648,17 +846,38 @@ fn replica_pod(
     pvc_name: &str,
     pvc_uid: &str,
 ) -> Pod {
+    replica_pod_named(
+        set,
+        replica_id,
+        uid,
+        owner,
+        &replica_name(set, replica_id),
+        pvc_name,
+        pvc_uid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replica_pod_named(
+    set: &KubericSet,
+    replica_id: ReplicaId,
+    uid: &str,
+    owner: &OwnerReference,
+    pod_name: &str,
+    pvc_name: &str,
+    pvc_uid: &str,
+) -> Pod {
     let labels = base_labels(set, Some(replica_id), uid);
     let credential_name = agent_credential_name(set);
     Pod {
         metadata: kube::core::ObjectMeta {
-            name: Some(replica_name(set, replica_id)),
+            name: Some(pod_name.to_string()),
             labels: Some(labels),
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
         },
         spec: Some(PodSpec {
-            hostname: Some(replica_name(set, replica_id)),
+            hostname: Some(pod_name.to_string()),
             subdomain: Some(format!("{}-peer", set.name_any())),
             security_context: Some(PodSecurityContext {
                 fs_group: Some(10001),
@@ -780,6 +999,86 @@ fn replica_pod(
         }),
         ..Default::default()
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_exact_peer_endpoint(
+    client: Client,
+    observation: &RawObservation,
+    namespace: &str,
+    uid: &str,
+    owner: &OwnerReference,
+    pod: &Pod,
+    pvc: &PersistentVolumeClaim,
+    replica_id: ReplicaId,
+) -> Result<()> {
+    let pod_uid = pod.uid().ok_or(ControllerError::ObservationStale)?;
+    let pvc_uid = pvc.uid().ok_or(ControllerError::ObservationStale)?;
+    let resource_uid = ResourceUid::new(uid);
+    let initialization_id = derive_initialization_id(
+        &resource_uid,
+        replica_id,
+        &PodUid::new(&pod_uid),
+        &PvcUid::new(&pvc_uid),
+    );
+    let identity = ReplicaIdentity {
+        replica_id,
+        instance_id: ReplicaInstanceId::new(&pod_uid),
+        agent_generation: derive_agent_generation(&initialization_id),
+    };
+    if pod.labels().get(INSTANCE_LABEL).map(String::as_str) != Some(pod_uid.as_str()) {
+        patch_pod_instance(client.clone(), namespace, pod, &pod_uid).await?;
+        return Ok(());
+    }
+    let name = derive_replica_endpoint_name(&resource_uid, &identity);
+    if observation
+        .services
+        .iter()
+        .any(|service| service.name_any() == name)
+    {
+        return Ok(());
+    }
+    let services: Api<Service> = Api::namespaced(client, namespace);
+    create_exact(
+        &services,
+        &name,
+        &Service {
+            metadata: kube::core::ObjectMeta {
+                name: Some(name.clone()),
+                labels: Some(base_labels(&observation.set, Some(replica_id), uid)),
+                owner_references: Some(vec![owner.clone()]),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                selector: Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)])),
+                ports: Some(vec![
+                    ServicePort {
+                        name: Some("control".to_string()),
+                        port: CONTROL_PORT,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                CONTROL_PORT,
+                            ),
+                        ),
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        name: Some("replication".to_string()),
+                        port: REPLICATION_PORT,
+                        target_port: Some(
+                            k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                                REPLICATION_PORT,
+                            ),
+                        ),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn ensure_write_service(
@@ -1097,6 +1396,14 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
             };
             (identity, command.local_replica_id)
         }
+        ProtocolCommand::EnsureReplicaBuild(command) => {
+            let identity = ReplicaIdentity {
+                replica_id: command.local_replica_id,
+                instance_id: command.expected_instance_id.clone(),
+                agent_generation: command.expected_agent_generation.clone(),
+            };
+            (identity, command.local_replica_id)
+        }
     }
 }
 
@@ -1113,6 +1420,11 @@ fn command_request(
         }
         ProtocolCommand::EnsureConfiguration(command) => {
             proto::execute_command_request::Command::EnsureConfiguration(ensure_command(*command))
+        }
+        ProtocolCommand::EnsureReplicaBuild(command) => {
+            proto::execute_command_request::Command::EnsureReplicaBuild(ensure_build_command(
+                *command,
+            ))
         }
     };
     proto::ExecuteCommandRequest {
@@ -1134,6 +1446,7 @@ fn initialize_command(command: InitializeAgentStore) -> proto::InitializeAgentSt
         assigned_agent_generation: command.assigned_agent_generation.to_string(),
         effective_policy: Some(policy(command.effective_policy)),
         bootstrap_configuration: Some(command.bootstrap_configuration.into()),
+        provisioning: command.provisioning.map(provisioning),
     }
 }
 
@@ -1150,6 +1463,40 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
         expected_agent_generation: command.expected_agent_generation.to_string(),
         transition_kind: transition_kind(command.transition_kind) as i32,
         grant_write: command.grant_write,
+        current_only: command.current_only,
+        retire_build_id: command
+            .retire_build_id
+            .map_or_else(String::new, |build_id| build_id.to_string()),
+    }
+}
+
+fn ensure_build_command(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuildCommand {
+    proto::EnsureReplicaBuildCommand {
+        operation_id: command.operation_id.to_string(),
+        local_replica_id: command.local_replica_id.value(),
+        expected_instance_id: command.expected_instance_id.to_string(),
+        expected_agent_generation: command.expected_agent_generation.to_string(),
+        target: Some(command.target.into()),
+        authority: command.authority.map(Into::into),
+        source_session_id: command
+            .source_session_id
+            .map_or_else(String::new, |session| session.to_string()),
+    }
+}
+
+fn provisioning(provisioning: ProvisioningIntent) -> proto::ProvisioningIntent {
+    proto::ProvisioningIntent {
+        provisioning_id: provisioning.provisioning_id.to_string(),
+        resource_uid: provisioning.resource_uid.to_string(),
+        replaces: Some(provisioning.replaces.into()),
+        replica_id: provisioning.replica_id.value(),
+        instance_id: provisioning.instance_id.to_string(),
+        pod_uid: provisioning.pod_uid.to_string(),
+        pvc_uid: provisioning.pvc_uid.to_string(),
+        initialization_id: provisioning.initialization_id.to_string(),
+        assigned_agent_generation: provisioning.assigned_agent_generation.to_string(),
+        operation_id: provisioning.operation_id.to_string(),
+        started_at_unix_seconds: provisioning.started_at_unix_seconds,
     }
 }
 
@@ -1323,6 +1670,60 @@ impl ClusterApi for InMemoryClusterApi {
         Ok(())
     }
 
+    async fn ensure_replacement_scaffolding(
+        &self,
+        _observation: &RawObservation,
+        _replica_id: ReplicaId,
+        replacing: &ReplicaIdentity,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .await
+            .effects
+            .push(EffectRecord::EnsureReplacement(replacing.clone()));
+        Ok(())
+    }
+
+    async fn delete_replica_scaffolding(
+        &self,
+        _observation: &RawObservation,
+        pod_name: Option<&str>,
+        _pod_uid: Option<&PodUid>,
+        pvc_name: Option<&str>,
+        _pvc_uid: Option<&PvcUid>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if let Some(name) = pod_name {
+            state.observation.pods.retain(|pod| pod.name_any() != name);
+        } else if let Some(name) = pvc_name {
+            state.observation.pvcs.retain(|pvc| pvc.name_any() != name);
+        }
+        state.effects.push(EffectRecord::DeleteScaffolding {
+            pod_name: pod_name.map(ToString::to_string),
+            pvc_name: pvc_name.map(ToString::to_string),
+        });
+        Ok(())
+    }
+
+    async fn delete_replica_endpoint(
+        &self,
+        observation: &RawObservation,
+        identity: &ReplicaIdentity,
+    ) -> Result<()> {
+        let resource_uid = observation
+            .set
+            .uid()
+            .map(ResourceUid::new)
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let name = derive_replica_endpoint_name(&resource_uid, identity);
+        let mut state = self.state.lock().await;
+        state
+            .observation
+            .services
+            .retain(|service| service.name_any() != name);
+        Ok(())
+    }
+
     async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()> {
         if service_observation_failed(observation) {
             return Err(ControllerError::Observation(
@@ -1463,19 +1864,23 @@ async fn delete_exact<K>(api: &Api<K>, name: &str, uid: &str) -> Result<()>
 where
     K: Clone + std::fmt::Debug + serde::de::DeserializeOwned + kube::Resource<DynamicType = ()>,
 {
-    api.delete(
-        name,
-        &DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.to_string()),
+    match api
+        .delete(
+            name,
+            &DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(uid.to_string()),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .await
-    .map(|_| ())
-    .map_err(map_kube_effect_error)
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+        Err(error) => Err(map_kube_effect_error(error)),
+    }
 }
 
 #[allow(dead_code)]

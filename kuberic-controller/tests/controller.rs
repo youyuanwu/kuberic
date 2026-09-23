@@ -19,7 +19,9 @@ use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{AgentObservation, ReplicaObservationKey};
 use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::{
-    AcceptedStatus, AcceptedTopology, ReplicaId, ReplicaInstanceId, ReplicaRole,
+    AcceptedStatus, AcceptedTopology, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
+    derive_replica_endpoint_name,
 };
 use kuberic_wire::proto;
 
@@ -69,13 +71,26 @@ fn labels(replica_id: ReplicaId) -> BTreeMap<String, String> {
 }
 
 fn with_scaffolding(mut raw: RawObservation) -> RawObservation {
+    let initialization_id = derive_initialization_id(
+        &ResourceUid::new(UID),
+        ReplicaId::new(1),
+        &PodUid::new(POD_UID),
+        &PvcUid::new(PVC_UID),
+    );
+    let identity = ReplicaIdentity {
+        replica_id: ReplicaId::new(1),
+        instance_id: ReplicaInstanceId::new(POD_UID),
+        agent_generation: derive_agent_generation(&initialization_id),
+    };
+    let mut pod_labels = labels(ReplicaId::new(1));
+    pod_labels.insert(INSTANCE_LABEL.to_string(), POD_UID.to_string());
     raw.pods.push(Pod {
         metadata: kube::core::ObjectMeta {
             name: Some("db-1".to_string()),
             namespace: Some("tests".to_string()),
             uid: Some(POD_UID.to_string()),
             resource_version: Some("2".to_string()),
-            labels: Some(labels(ReplicaId::new(1))),
+            labels: Some(pod_labels),
             ..Default::default()
         },
         status: Some(PodStatus {
@@ -101,6 +116,39 @@ fn with_scaffolding(mut raw: RawObservation) -> RawObservation {
             labels: Some(labels(ReplicaId::new(1))),
             ..Default::default()
         },
+        ..Default::default()
+    });
+    raw.services.push(Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(derive_replica_endpoint_name(
+                &ResourceUid::new(UID),
+                &identity,
+            )),
+            labels: Some(BTreeMap::from([(
+                SET_UID_LABEL.to_string(),
+                UID.to_string(),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(BTreeMap::from([(
+                INSTANCE_LABEL.to_string(),
+                POD_UID.to_string(),
+            )])),
+            ports: Some(vec![
+                ServicePort {
+                    name: Some("control".to_string()),
+                    port: 50051,
+                    ..Default::default()
+                },
+                ServicePort {
+                    name: Some("replication".to_string()),
+                    port: 50052,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
         ..Default::default()
     });
     raw
@@ -645,7 +693,7 @@ async fn missing_write_service_is_recreated() {
     let mut observation = stable_observation();
     observation
         .services
-        .retain(|service| service.name_any() == "db-peer");
+        .retain(|service| !service.name_any().ends_with("-write"));
     let api = Arc::new(InMemoryClusterApi::new(observation));
     let action = Reconciler::new(api.clone(), config())
         .reconcile("tests", "db")
@@ -658,7 +706,7 @@ async fn missing_write_service_is_recreated() {
             .contains(&EffectRecord::EnsureWriteRoutingService)
     );
     let services = api.observation().await.services;
-    assert_eq!(services.len(), 2);
+    assert_eq!(services.len(), 3);
     assert!(
         services
             .iter()

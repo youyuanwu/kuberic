@@ -182,14 +182,15 @@ impl InitializationService {
             effective_policy: command.effective_policy.clone(),
             previous_configuration_id: None,
             current_configuration: command.bootstrap_configuration.clone(),
+            build_id: None,
             started_at_unix_seconds: 0,
         };
-        let identity = crate::command::admit_initialization(
-            &command,
-            &self.observed,
+        let authority = command.provisioning.as_ref().map_or(
             InitializationAuthority::Bootstrap(&transition),
-        )
-        .map_err(status_from_agent)?;
+            InitializationAuthority::Replacement,
+        );
+        let identity = crate::command::admit_initialization(&command, &self.observed, authority)
+            .map_err(status_from_agent)?;
         match SqliteStore::create_authorized(&self.database_path, AgentState::new(identity.clone()))
         {
             Ok(store) => drop(store),
@@ -495,6 +496,14 @@ where
                 })
                 .await?;
         }
+        if let Some(retained) = state.retained_result.as_ref()
+            && matches!(
+                retained.effect.action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::AdmitBuildAuthority(_)
+            )
+        {
+            self.runtime.apply_effect(retained.effect.clone()).await?;
+        }
         self.coordinator.resume_pending().await?;
         self.coordinator.resume_configuration().await?;
         Ok(())
@@ -539,7 +548,10 @@ where
         self.reporter
             .report(&self.runtime)
             .await
-            .map_err(status_from_agent)
+            .map_err(|error| match error {
+                AgentError::EffectConflict(message) => Status::unavailable(message),
+                other => status_from_agent(other),
+            })
     }
 
     async fn execute_inner(
@@ -577,6 +589,19 @@ where
             ProtocolCommand::EnsureConfiguration(command) => {
                 self.coordinator
                     .ensure_configuration(*command)
+                    .await
+                    .map_err(status_from_agent)?;
+            }
+            ProtocolCommand::EnsureReplicaBuild(command) => {
+                if let (Some(authority), Some(source_session_id)) =
+                    (&command.authority, &command.source_session_id)
+                {
+                    self.sessions
+                        .register_peer(authority.source.clone(), source_session_id.clone())
+                        .await;
+                }
+                self.coordinator
+                    .ensure_build(*command)
                     .await
                     .map_err(status_from_agent)?;
             }

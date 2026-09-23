@@ -3,8 +3,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    AgentGeneration, ConfigurationDescriptor, EffectivePolicy, Epoch, InitializationId,
-    OperationId, PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid,
+    AgentGeneration, BuildAuthority, ConfigurationDescriptor, EffectivePolicy, Epoch,
+    InitializationId, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ResourceUid,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,7 @@ pub struct InitializeAgentStore {
     pub assigned_agent_generation: AgentGeneration,
     pub effective_policy: EffectivePolicy,
     pub bootstrap_configuration: ConfigurationDescriptor,
+    pub provisioning: Option<ProvisioningIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +45,20 @@ pub struct EnsureConfiguration {
     pub expected_agent_generation: AgentGeneration,
     pub transition_kind: crate::types::TransitionKind,
     pub grant_write: bool,
+    pub current_only: bool,
+    pub retire_build_id: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureReplicaBuild {
+    pub operation_id: OperationId,
+    pub local_replica_id: ReplicaId,
+    pub expected_instance_id: ReplicaInstanceId,
+    pub expected_agent_generation: AgentGeneration,
+    pub target: ReplicaIdentity,
+    pub authority: Option<BuildAuthority>,
+    pub source_session_id: Option<crate::types::ProcessSessionId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,13 +67,16 @@ pub struct EnsureConfiguration {
 pub enum ProtocolCommand {
     InitializeAgentStore(Box<InitializeAgentStore>),
     EnsureConfiguration(Box<EnsureConfiguration>),
+    EnsureReplicaBuild(Box<EnsureReplicaBuild>),
 }
 
 impl ProtocolCommand {
     pub fn effect_class(&self) -> EffectClass {
         match self {
             Self::InitializeAgentStore(_) => EffectClass::ConvergentEnsure,
-            Self::EnsureConfiguration(_) => EffectClass::ReconfigurationAction,
+            Self::EnsureConfiguration(_) | Self::EnsureReplicaBuild(_) => {
+                EffectClass::ReconfigurationAction
+            }
         }
     }
 }
@@ -69,6 +88,19 @@ pub enum KubernetesChange {
     EnsureReplicaSupport,
     EnsureReplicaScaffolding {
         replica_ids: Vec<ReplicaId>,
+    },
+    EnsureReplacementScaffolding {
+        replica_id: ReplicaId,
+        replacing: ReplicaIdentity,
+    },
+    DeleteReplicaScaffolding {
+        pod_name: Option<String>,
+        pod_uid: Option<PodUid>,
+        pvc_name: Option<String>,
+        pvc_uid: Option<PvcUid>,
+    },
+    DeleteReplicaEndpoint {
+        identity: ReplicaIdentity,
     },
     EnsureWriteRoutingService,
     PersistStatus {

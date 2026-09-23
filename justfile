@@ -138,10 +138,14 @@ level-triggered-install: verify-kind-context
 
 # Run one explicit isolated level-triggered KinD scenario.
 level-triggered-kind-test scenario: verify-kind-context
-    test "{{ scenario }}" = "bootstrap"
-    cargo test -p kuberic-level-tests \
-        level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write \
-        -- --ignored --exact --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "{{ scenario }}" in
+      bootstrap) test_name="level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write" ;;
+      replacement) test_name="level_triggered_k8s::replacement_preserves_quorum_write_and_retires_old_incarnation" ;;
+      *) echo "unknown level-triggered scenario: {{ scenario }}" >&2; exit 2 ;;
+    esac
+    cargo test -p kuberic-level-tests "$test_name" -- --ignored --exact --nocapture
 
 # Collect level-triggered controller, resource, and replica diagnostics.
 level-triggered-diagnostics: verify-kind-context

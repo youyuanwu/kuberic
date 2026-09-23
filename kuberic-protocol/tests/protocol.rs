@@ -3,16 +3,16 @@ use std::collections::BTreeMap;
 use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, SafetyChange};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
-    AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation, ObservationFailure,
-    ObservationSnapshot, ReplicaObservation, ReplicaObservationKey, ReportWatermark,
-    RoutingObservation, UninitializedAgentObservation,
+    AgentBuildReport, AgentObservation, AgentReport, DesiredState, KubernetesReplicaObservation,
+    ObservationFailure, ObservationSnapshot, ReplicaObservation, ReplicaObservationKey,
+    ReportWatermark, RoutingObservation, UninitializedAgentObservation,
 };
 use kuberic_protocol::plan::{Plan, UnsafeReason, WaitReason};
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
-    ProcessSessionId, ProvisioningId, ProvisioningIntent, ProvisioningKind, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionIntent, TransitionKind,
+    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId,
+    ProvisioningId, ProvisioningIntent, ProvisioningKind, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionIntent, TransitionKind,
     derive_agent_generation, derive_initialization_id, derive_transition_id,
 };
 use kuberic_protocol::validation::{
@@ -90,6 +90,7 @@ fn scaffolded_snapshot() -> ObservationSnapshot {
                     pvc_name: format!("example-{id}"),
                     pvc_uid: Some(PvcUid::new(format!("pvc-uid-{id}"))),
                     pod_ready: true,
+                    peer_endpoint_ready: true,
                 }),
                 agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                     protocol_version: kuberic_protocol::PROTOCOL_VERSION,
@@ -641,7 +642,19 @@ fn bootstrap_validates_all_members_before_initializing_any_store() {
 fn provisioning_observation_can_coexist_with_accepted_incarnation() {
     let accepted = configuration();
     let mut snapshot = empty_snapshot(3);
-    let initialization_id = InitializationId::new("replacement-init");
+    let old_identity = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == ReplicaId::new(3))
+        .unwrap()
+        .identity
+        .clone();
+    let initialization_id = kuberic_protocol::types::derive_initialization_id(
+        &snapshot.resource_uid,
+        ReplicaId::new(3),
+        &PodUid::new("replacement-pod"),
+        &PvcUid::new("replacement-pvc"),
+    );
     let replacement_identity = ReplicaIdentity {
         replica_id: ReplicaId::new(3),
         instance_id: ReplicaInstanceId::new("replacement-pod"),
@@ -657,6 +670,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
             provisioning_id: ProvisioningId::new("provisioning"),
             kind: ProvisioningKind::Replacement,
             resource_uid: snapshot.resource_uid.clone(),
+            replaces: old_identity.clone(),
             replica_id: ReplicaId::new(3),
             instance_id: replacement_identity.instance_id.clone(),
             pod_uid: PodUid::new("replacement-pod"),
@@ -664,16 +678,10 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
             initialization_id,
             assigned_agent_generation: replacement_identity.agent_generation.clone(),
             operation_id: OperationId::new("replacement-operation"),
+            started_at_unix_seconds: 100,
         }),
         ..AcceptedStatus::default()
     };
-    let old_identity = accepted
-        .members
-        .iter()
-        .find(|member| member.identity.replica_id == ReplicaId::new(3))
-        .unwrap()
-        .identity
-        .clone();
     snapshot.replicas.insert(
         ReplicaObservationKey::new(old_identity.replica_id, old_identity.instance_id.clone()),
         ReplicaObservation {
@@ -775,6 +783,7 @@ fn active_transition_keeps_frozen_policy_after_spec_change() {
         effective_policy: policy.clone(),
         previous_configuration_id: None,
         current_configuration,
+        build_id: None,
         started_at_unix_seconds: 100,
     };
     let mut snapshot = empty_snapshot(5);
@@ -1114,6 +1123,7 @@ fn accepted_incarnation_missing_its_store_is_unsafe() {
                 pvc_name: "primary".to_string(),
                 pvc_uid: Some(PvcUid::new("established-pvc")),
                 pod_ready: true,
+                peer_endpoint_ready: true,
             }),
             agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
                 protocol_version: kuberic_protocol::PROTOCOL_VERSION,
@@ -1170,6 +1180,178 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
             report_sequence: 1,
         });
     }
+
+    fn verify_replacement_provisions_exact_target_builds_then_freezes_pc_cc() {
+        let accepted = configuration();
+        let replacing = accepted
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id != accepted.primary_id)
+            .unwrap()
+            .identity
+            .clone();
+        let mut snapshot = empty_snapshot(3);
+        snapshot.status = AcceptedStatus {
+            initialized: true,
+            effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+            topology: Some(AcceptedTopology {
+                configuration: accepted.clone(),
+            }),
+            ..AcceptedStatus::default()
+        };
+        snapshot.replicas.insert(
+            ReplicaObservationKey::new(
+                replacing.replica_id,
+                ReplicaInstanceId::new("orphan-old-pvc"),
+            ),
+            ReplicaObservation {
+                kubernetes: Some(KubernetesReplicaObservation {
+                    replica_id: replacing.replica_id,
+                    pod_name: String::new(),
+                    pod_uid: None,
+                    pvc_name: "old-data".to_string(),
+                    pvc_uid: Some(PvcUid::new("old-pvc")),
+                    pod_ready: false,
+                    peer_endpoint_ready: false,
+                }),
+                agent: AgentObservation::Absent,
+            },
+        );
+        assert!(matches!(
+            evaluate(&snapshot, &EvaluationConfig::default()),
+            Plan::Apply { changes }
+                if matches!(
+                    changes.as_slice(),
+                    [KubernetesChange::EnsureReplacementScaffolding { replica_id, replacing: old }]
+                        if *replica_id == replacing.replica_id && old == &replacing
+                )
+        ));
+
+        let pod_uid = PodUid::new("replacement-pod");
+        let pvc_uid = PvcUid::new("replacement-pvc");
+        let initialization_id = kuberic_protocol::types::derive_initialization_id(
+            &snapshot.resource_uid,
+            replacing.replica_id,
+            &pod_uid,
+            &pvc_uid,
+        );
+        let target = ReplicaIdentity {
+            replica_id: replacing.replica_id,
+            instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+            agent_generation: derive_agent_generation(&initialization_id),
+        };
+        snapshot.replicas.insert(
+            ReplicaObservationKey::new(target.replica_id, target.instance_id.clone()),
+            ReplicaObservation {
+                kubernetes: Some(KubernetesReplicaObservation {
+                    replica_id: target.replica_id,
+                    pod_name: "replacement".to_string(),
+                    pod_uid: Some(pod_uid.clone()),
+                    pvc_name: "replacement-data".to_string(),
+                    pvc_uid: Some(pvc_uid.clone()),
+                    pod_ready: true,
+                    peer_endpoint_ready: true,
+                }),
+                agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    resource_uid: snapshot.resource_uid.clone(),
+                    replica_id: target.replica_id,
+                    pod_uid,
+                    pvc_uid,
+                    process_session_id: ProcessSessionId::new("replacement-session"),
+                    report_sequence: 1,
+                }),
+            },
+        );
+        let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+            panic!("replacement target must be persisted outside authority");
+        };
+        let provisioning_status = changes
+            .into_iter()
+            .find_map(|change| match change {
+                KubernetesChange::PersistStatus { status } => Some(*status),
+                _ => None,
+            })
+            .expect("replacement provisioning status");
+        let provisioning = provisioning_status.provisioning.clone().unwrap();
+        assert_eq!(provisioning.replaces, replacing);
+        assert_eq!(provisioning.instance_id, target.instance_id);
+
+        snapshot.status = provisioning_status;
+        let primary = accepted
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == accepted.primary_id)
+            .unwrap()
+            .identity
+            .clone();
+        let build = AgentBuildReport {
+            build_id: provisioning.operation_id.clone(),
+            target: target.clone(),
+            last_sequence: 1,
+            durable_lsn: 5,
+            completed: true,
+        };
+        snapshot.replicas.insert(
+            ReplicaObservationKey::new(primary.replica_id, primary.instance_id.clone()),
+            ReplicaObservation {
+                kubernetes: None,
+                agent: AgentObservation::Report(Box::new(AgentReport {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    resource_uid: snapshot.resource_uid.clone(),
+                    identity: primary,
+                    process_session_id: ProcessSessionId::new("primary-session"),
+                    report_sequence: 1,
+                    role: ReplicaRole::Primary,
+                    read_status: AccessStatus::Granted,
+                    write_status: AccessStatus::Granted,
+                    healthy: true,
+                    epoch: accepted.epoch,
+                    current_configuration: Some(accepted.clone()),
+                    current_progress: 5,
+                    committed_lsn: 5,
+                    builds: vec![build.clone()],
+                    ..AgentReport::default()
+                })),
+            },
+        );
+        snapshot.replicas.insert(
+            ReplicaObservationKey::new(target.replica_id, target.instance_id.clone()),
+            ReplicaObservation {
+                kubernetes: None,
+                agent: AgentObservation::Report(Box::new(AgentReport {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    resource_uid: snapshot.resource_uid.clone(),
+                    identity: target.clone(),
+                    process_session_id: ProcessSessionId::new("target-session"),
+                    report_sequence: 2,
+                    role: ReplicaRole::IdleSecondary,
+                    write_status: AccessStatus::NotPrimary,
+                    healthy: true,
+                    builds: vec![build],
+                    ..AgentReport::default()
+                })),
+            },
+        );
+        let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+            panic!("completed build must freeze replacement PC/CC");
+        };
+        let transition = changes.into_iter().find_map(|change| match change {
+            KubernetesChange::PersistStatus { status } => status.transition,
+            _ => None,
+        });
+        let transition = transition.expect("replacement transition");
+        assert_eq!(transition.kind, TransitionKind::Replacement);
+        assert_eq!(transition.current_configuration.members.len(), 3);
+        assert!(
+            transition
+                .current_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == target)
+        );
+    }
+    verify_replacement_provisions_exact_target_builds_then_freezes_pc_cc();
 
     let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
         panic!("expected transition condition persistence");
@@ -1228,6 +1410,7 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
             effective_policy: policy,
             previous_configuration_id: Some(previous.configuration_id.clone()),
             current_configuration: current.clone(),
+            build_id: Some(OperationId::new("replacement-build")),
             started_at_unix_seconds: 100,
         }),
         ..AcceptedStatus::default()
@@ -1310,4 +1493,348 @@ fn bootstrap_report_cannot_claim_previous_configuration() {
             ..
         }
     ));
+}
+
+#[test]
+fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
+    let accepted = configuration();
+    let member = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id != accepted.primary_id)
+        .unwrap()
+        .clone();
+    let mut snapshot = empty_snapshot(3);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: accepted.clone(),
+        }),
+        ..AcceptedStatus::default()
+    };
+    snapshot.replicas.insert(
+        ReplicaObservationKey::new(
+            member.identity.replica_id,
+            member.identity.instance_id.clone(),
+        ),
+        ReplicaObservation {
+            kubernetes: Some(KubernetesReplicaObservation {
+                replica_id: member.identity.replica_id,
+                pod_name: "replacement".to_string(),
+                pod_uid: Some(PodUid::new(member.identity.instance_id.as_str())),
+                pvc_name: "replacement-data".to_string(),
+                pvc_uid: Some(PvcUid::new("replacement-pvc")),
+                pod_ready: true,
+                peer_endpoint_ready: true,
+            }),
+            agent: AgentObservation::Report(Box::new(AgentReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: snapshot.resource_uid.clone(),
+                identity: member.identity.clone(),
+                process_session_id: ProcessSessionId::new("replacement-session"),
+                report_sequence: 1,
+                role: member.role,
+                write_status: AccessStatus::NotPrimary,
+                healthy: true,
+                epoch: accepted.epoch,
+                current_configuration: Some(accepted),
+                ..AgentReport::default()
+            })),
+        },
+    );
+    snapshot.replicas.insert(
+        ReplicaObservationKey::new(
+            member.identity.replica_id,
+            ReplicaInstanceId::new("orphan-old-pvc"),
+        ),
+        ReplicaObservation {
+            kubernetes: Some(KubernetesReplicaObservation {
+                replica_id: member.identity.replica_id,
+                pod_name: String::new(),
+                pod_uid: None,
+                pvc_name: "old-data".to_string(),
+                pvc_uid: Some(PvcUid::new("old-pvc")),
+                pod_ready: false,
+                peer_endpoint_ready: false,
+            }),
+            agent: AgentObservation::Absent,
+        },
+    );
+
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Apply { changes }
+            if matches!(
+                changes.as_slice(),
+                [KubernetesChange::DeleteReplicaScaffolding { pvc_name: Some(name), .. }]
+                    if name == "old-data"
+            )
+    ));
+}
+
+#[test]
+fn replacement_target_loss_before_cc_clears_provisioning() {
+    let accepted = configuration();
+    let replacing = accepted
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id != accepted.primary_id)
+        .unwrap()
+        .identity
+        .clone();
+    let pod_uid = PodUid::new("lost-target");
+    let pvc_uid = PvcUid::new("lost-target-pvc");
+    let initialization_id = derive_initialization_id(
+        &ResourceUid::new("resource-uid"),
+        replacing.replica_id,
+        &pod_uid,
+        &pvc_uid,
+    );
+    let mut snapshot = empty_snapshot(3);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: accepted,
+        }),
+        provisioning: Some(ProvisioningIntent {
+            provisioning_id: ProvisioningId::new("lost-provisioning"),
+            kind: ProvisioningKind::Replacement,
+            resource_uid: snapshot.resource_uid.clone(),
+            replaces: replacing.clone(),
+            replica_id: replacing.replica_id,
+            instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
+            pod_uid,
+            pvc_uid,
+            initialization_id: initialization_id.clone(),
+            assigned_agent_generation: derive_agent_generation(&initialization_id),
+            operation_id: OperationId::new("lost-build"),
+            started_at_unix_seconds: 100,
+        }),
+        ..AcceptedStatus::default()
+    };
+
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Apply { changes }
+            if matches!(
+                changes.as_slice(),
+                [KubernetesChange::PersistStatus { status }]
+                    if status.provisioning.is_none() && status.transition.is_none()
+            )
+    ));
+}
+
+#[test]
+fn replacement_accepts_current_only_quorum_with_missing_target() {
+    let previous = configuration();
+    let replacing = previous
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id != previous.primary_id)
+        .unwrap()
+        .clone();
+    let target = ConfigurationMember {
+        identity: identity(
+            replacing.identity.replica_id.value(),
+            "missing-target",
+            "missing-target-generation",
+        ),
+        role: ReplicaRole::ActiveSecondary,
+    };
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(
+            previous.epoch.data_loss_number,
+            previous.epoch.configuration_number + 1,
+        ),
+        previous.primary_id,
+        previous
+            .members
+            .iter()
+            .map(|member| {
+                if member.identity == replacing.identity {
+                    target.clone()
+                } else {
+                    member.clone()
+                }
+            })
+            .collect(),
+        previous.write_quorum,
+    );
+    let transition_id = derive_transition_id(
+        &ResourceUid::new("resource"),
+        TransitionKind::Replacement,
+        &current.configuration_id,
+    );
+    let mut snapshot = empty_snapshot(3);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: previous.clone(),
+        }),
+        transition: Some(TransitionIntent {
+            transition_id: transition_id.clone(),
+            kind: TransitionKind::Replacement,
+            spec_generation: 1,
+            effective_policy: EffectivePolicy::fixed(3, 10).unwrap(),
+            previous_configuration_id: Some(previous.configuration_id.clone()),
+            current_configuration: current.clone(),
+            build_id: Some(OperationId::new("replacement-build")),
+            started_at_unix_seconds: 100,
+        }),
+        ..AcceptedStatus::default()
+    };
+    for member in current
+        .members
+        .iter()
+        .filter(|member| member.identity != target.identity)
+    {
+        snapshot.replicas.insert(
+            ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            ),
+            ReplicaObservation {
+                kubernetes: None,
+                agent: AgentObservation::Report(Box::new(AgentReport {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    resource_uid: snapshot.resource_uid.clone(),
+                    identity: member.identity.clone(),
+                    process_session_id: ProcessSessionId::new(format!(
+                        "session-{}",
+                        member.identity.replica_id
+                    )),
+                    report_sequence: 1,
+                    role: member.role,
+                    read_status: AccessStatus::Granted,
+                    write_status: if member.identity.replica_id == current.primary_id {
+                        AccessStatus::Granted
+                    } else {
+                        AccessStatus::NotPrimary
+                    },
+                    healthy: true,
+                    epoch: current.epoch,
+                    current_configuration: Some(current.clone()),
+                    retained_operation_id: Some(OperationId::new(format!(
+                        "{}:current-only:{}",
+                        transition_id, member.identity.replica_id
+                    ))),
+                    ..AgentReport::default()
+                })),
+            },
+        );
+    }
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("transition condition must be persisted");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("transition status");
+    };
+    snapshot.status = *status;
+
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Apply { changes }
+            if changes.iter().any(|change| matches!(
+                change,
+                KubernetesChange::PersistStatus { status }
+                    if status.transition.is_none()
+                        && status.topology.as_ref().is_some_and(|topology| {
+                            topology.configuration == current
+                        })
+            ))
+    ));
+}
+
+#[test]
+fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
+    let mut snapshot = scaffolded_snapshot();
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("bootstrap transition");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("bootstrap status");
+    };
+    snapshot.status = *status;
+    let old = snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .current_configuration
+        .members[1]
+        .identity
+        .clone();
+    snapshot.replicas.remove(&ReplicaObservationKey::new(
+        old.replica_id,
+        old.instance_id.clone(),
+    ));
+    snapshot.replicas.insert(
+        ReplicaObservationKey::new(old.replica_id, ReplicaInstanceId::new("orphan-genesis")),
+        ReplicaObservation {
+            kubernetes: Some(KubernetesReplicaObservation {
+                replica_id: old.replica_id,
+                pod_name: String::new(),
+                pod_uid: None,
+                pvc_name: "old-genesis-data".to_string(),
+                pvc_uid: Some(PvcUid::new("old-genesis-pvc")),
+                pod_ready: false,
+                peer_endpoint_ready: false,
+            }),
+            agent: AgentObservation::Absent,
+        },
+    );
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("transition condition persistence");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("transition status");
+    };
+    snapshot.status = *status;
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Apply { changes }
+            if matches!(
+                changes.as_slice(),
+                [KubernetesChange::EnsureReplacementScaffolding { replacing, .. }]
+                    if replacing == &old
+            )
+    ));
+
+    let pod_uid = PodUid::new("new-genesis-pod");
+    let pvc_uid = PvcUid::new("new-genesis-pvc");
+    snapshot.replicas.insert(
+        ReplicaObservationKey::new(old.replica_id, ReplicaInstanceId::new(pod_uid.as_str())),
+        ReplicaObservation {
+            kubernetes: Some(KubernetesReplicaObservation {
+                replica_id: old.replica_id,
+                pod_name: "new-genesis".to_string(),
+                pod_uid: Some(pod_uid.clone()),
+                pvc_name: "new-genesis-data".to_string(),
+                pvc_uid: Some(pvc_uid.clone()),
+                pod_ready: true,
+                peer_endpoint_ready: true,
+            }),
+            agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: snapshot.resource_uid.clone(),
+                replica_id: old.replica_id,
+                pod_uid,
+                pvc_uid,
+                process_session_id: ProcessSessionId::new("new-genesis-session"),
+                report_sequence: 1,
+            }),
+        },
+    );
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("superseded bootstrap transition");
+    };
+    let transition = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } => status.transition,
+        _ => None,
+    });
+    let transition = transition.expect("superseded transition");
+    assert_ne!(transition.current_configuration.members[1].identity, old);
 }

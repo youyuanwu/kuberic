@@ -3,13 +3,13 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{AccessStatus, OperationId, ProcessSessionId, ReplicaRole};
 use kuberic_runtime::application::OpenMode;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 
 use crate::Result;
-use crate::command::admit_configuration;
+use crate::command::{admit_build, admit_configuration};
 use crate::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use crate::state::{CoordinatorStage, ReconfigurationRecord, RetainedCommandResult};
 use crate::store::{AgentStore, BeginConfiguration};
@@ -200,7 +200,6 @@ where
                     };
                     let write_status = if authority.local_role() == ReplicaRole::Primary
                         && record.command.grant_write
-                        && authority.previous_configuration.is_none()
                     {
                         AccessStatus::Granted
                     } else if authority.local_role() == ReplicaRole::Primary {
@@ -217,6 +216,25 @@ where
                         },
                     )
                     .await?;
+                    let next = if record.command.retire_build_id.is_some() {
+                        CoordinatorStage::RetireBuild
+                    } else {
+                        CoordinatorStage::Complete
+                    };
+                    self.advance(&record, next, None).await?;
+                }
+                CoordinatorStage::RetireBuild => {
+                    let build_id = record
+                        .command
+                        .retire_build_id
+                        .clone()
+                        .expect("retire-build stage requires build ID");
+                    self.execute(
+                        &record,
+                        "retire-build",
+                        RuntimeEffectAction::RetireBuild(build_id),
+                    )
+                    .await?;
                     self.advance(&record, CoordinatorStage::Complete, None)
                         .await?;
                 }
@@ -228,6 +246,62 @@ where
                 }
             }
         }
+    }
+
+    pub async fn ensure_build(&self, command: EnsureReplicaBuild) -> Result<()> {
+        let _command = self.command_lock.lock().await;
+        let state = self.store.load_state().await?;
+        admit_build(&command, &state)?;
+        if let Some(authority) = command.authority.clone() {
+            if state.current_configuration.as_ref().is_some_and(|current| {
+                current.epoch > authority.current_configuration.epoch
+                    && current
+                        .members
+                        .iter()
+                        .any(|member| member.identity == state.identity.local_identity)
+            }) {
+                return Ok(());
+            }
+            if state.retained_result.as_ref().is_some_and(|retained| {
+                matches!(
+                    &retained.effect.action,
+                    RuntimeEffectAction::AdmitBuildAuthority(existing)
+                        if existing.as_ref() == &authority
+                )
+            }) {
+                return Ok(());
+            }
+            self.execute_standalone(
+                &command.operation_id,
+                "build-idle-replicator",
+                RuntimeEffectAction::ChangeReplicatorRole(ReplicaRole::IdleSecondary),
+            )
+            .await?;
+            self.execute_standalone(
+                &command.operation_id,
+                "build-idle-application",
+                RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::IdleSecondary),
+            )
+            .await?;
+            self.execute_standalone(
+                &command.operation_id,
+                "admit-build",
+                RuntimeEffectAction::AdmitBuildAuthority(Box::new(authority)),
+            )
+            .await?;
+        } else {
+            self.execute_standalone(
+                &command.operation_id,
+                "build-replica",
+                RuntimeEffectAction::BuildReplica {
+                    build_id: command.operation_id.clone(),
+                    target: command.target,
+                    replication_address: String::new(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn execute(
@@ -270,6 +344,33 @@ where
                 next,
                 observed_lsn,
             )
+            .await
+    }
+
+    async fn execute_standalone(
+        &self,
+        command: &OperationId,
+        stage: &str,
+        action: RuntimeEffectAction,
+    ) -> Result<RuntimeEffectResult> {
+        let state = self.store.load_state().await?;
+        let operation_id = stage_operation_id(command, stage);
+        if let Some(retained) = state.retained_result.as_ref()
+            && retained.operation_id == operation_id
+        {
+            if retained.effect.action != action {
+                return Err(crate::AgentError::EffectConflict(
+                    "retained build effect has different stage authority".into(),
+                ));
+            }
+            return self.runtime.execute(retained.effect.clone()).await;
+        }
+        self.runtime
+            .execute(RuntimeEffect {
+                operation_id,
+                sequence: state.next_effect_sequence,
+                action,
+            })
             .await
     }
 }

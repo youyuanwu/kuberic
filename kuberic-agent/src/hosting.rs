@@ -721,6 +721,22 @@ impl RuntimeHost {
             RuntimeEffectAction::ChangeApplicationRole(role) => {
                 self.change_application_role(role).await?
             }
+            RuntimeEffectAction::BuildReplica {
+                build_id,
+                target,
+                replication_address,
+            } => {
+                self.registered
+                    .get()
+                    .and_then(|registered| registered.primary.clone())
+                    .ok_or(RuntimeError::NotPrimary)?
+                    .build_replica(kuberic_runtime::replicator::ReplicaInformation {
+                        build_id,
+                        identity: target,
+                        replication_address,
+                    })
+                    .await?
+            }
             RuntimeEffectAction::Close => self.close().await?,
             RuntimeEffectAction::Abort => self.abort_action().await,
             action => {
@@ -1009,6 +1025,7 @@ impl RuntimeHost {
             RuntimeEffectAction::AdmitAuthority(_)
             | RuntimeEffectAction::AdmitBuildAuthority(_)
             | RuntimeEffectAction::WaitForCatchup
+            | RuntimeEffectAction::BuildReplica { .. }
             | RuntimeEffectAction::RetireBuild(_) => {
                 return Err(RuntimeError::Application(
                     "the selected custom replicator does not expose managed authority/build capabilities"

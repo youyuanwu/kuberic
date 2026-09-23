@@ -132,6 +132,36 @@ message InitializeAgentStoreCommand {
   string assigned_agent_generation = 7;
   EffectivePolicy effective_policy = 8;
   Configuration bootstrap_configuration = 9;
+  ProvisioningIntent provisioning = 10;
+}
+
+message ProvisioningIntent {
+  string provisioning_id = 1;
+  string resource_uid = 2;
+  ReplicaIdentity replaces = 3;
+  int64 replica_id = 4;
+  string instance_id = 5;
+  string pod_uid = 6;
+  string pvc_uid = 7;
+  string initialization_id = 8;
+  string assigned_agent_generation = 9;
+  string operation_id = 10;
+  int64 started_at_unix_seconds = 11;
+}
+
+enum BuildAuthorityKind {
+  BUILD_AUTHORITY_KIND_UNSPECIFIED = 0;
+  BUILD_AUTHORITY_KIND_BOOTSTRAP = 1;
+  BUILD_AUTHORITY_KIND_PROVISIONING = 2;
+}
+
+message BuildAuthority {
+  string build_id = 1;
+  BuildAuthorityKind kind = 2;
+  ReplicaIdentity source = 3;
+  ReplicaIdentity target = 4;
+  Configuration current_configuration = 5;
+  int64 replication_boundary_lsn = 6;
 }
 
 message EnsureConfigurationCommand {
@@ -146,6 +176,18 @@ message EnsureConfigurationCommand {
   string expected_agent_generation = 9;
   TransitionKind transition_kind = 10;
   bool grant_write = 11;
+  bool current_only = 12;
+  string retire_build_id = 13;
+}
+
+message EnsureReplicaBuildCommand {
+  string operation_id = 1;
+  int64 local_replica_id = 2;
+  string expected_instance_id = 3;
+  string expected_agent_generation = 4;
+  ReplicaIdentity target = 5;
+  BuildAuthority authority = 6;
+  string source_session_id = 7;
 }
 
 message ExecuteCommandRequest {
@@ -155,6 +197,7 @@ message ExecuteCommandRequest {
   oneof command {
     InitializeAgentStoreCommand initialize_agent_store = 10;
     EnsureConfigurationCommand ensure_configuration = 11;
+    EnsureReplicaBuildCommand ensure_replica_build = 12;
   }
 }
 

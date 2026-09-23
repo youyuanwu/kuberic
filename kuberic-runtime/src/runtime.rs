@@ -601,6 +601,7 @@ impl DefaultReplicatorInner {
             .removed_replicas
             .remove(&replica.identity.replica_id);
         self.send_outbound(OutboundOperation::Build(ReplicaEndpoint {
+            build_id: replica.build_id,
             identity: replica.identity.clone(),
             replication_address: replica.replication_address.clone(),
         }))
@@ -1078,15 +1079,17 @@ impl DefaultReplicatorInner {
         drop(guard);
         let operations_result = async {
             let mut operations = BTreeMap::new();
-            let mut stream = self
-                .storage()
-                .await?
-                .get_replication_operations(boundary + 1, current_highest)
-                .await?;
-            while let Some(operation) = stream.next().await {
-                let operation = operation?;
-                if operation.lsn > boundary && operation.lsn <= current_highest {
-                    insert_copy_operation(&mut operations, operation)?;
+            if current_highest > boundary {
+                let mut stream = self
+                    .storage()
+                    .await?
+                    .get_replication_operations(boundary + 1, current_highest)
+                    .await?;
+                while let Some(operation) = stream.next().await {
+                    let operation = operation?;
+                    if operation.lsn > boundary && operation.lsn <= current_highest {
+                        insert_copy_operation(&mut operations, operation)?;
+                    }
                 }
             }
             for operation in retained
@@ -1518,7 +1521,7 @@ impl DefaultReplicatorInner {
             ));
         }
         authority.validate()?;
-        authority.validate_envelope(&envelope)?;
+        kuberic_runtime_internal::authority::validate_build_envelope(&authority, &envelope)?;
         let replicator_epoch = self.replicator.lock().await.epoch();
         if replicator_epoch != Epoch::default() && replicator_epoch != envelope.epoch {
             return Err(RuntimeError::AuthorityMismatch(
@@ -1979,6 +1982,7 @@ impl DefaultReplicatorInner {
             | RuntimeEffectAction::ChangeReplicatorRole(_)
             | RuntimeEffectAction::UpdateEpoch
             | RuntimeEffectAction::ChangeApplicationRole(_)
+            | RuntimeEffectAction::BuildReplica { .. }
             | RuntimeEffectAction::Close
             | RuntimeEffectAction::Abort => {
                 return Err(RuntimeError::Application(
@@ -2252,6 +2256,36 @@ impl DefaultReplicatorInner {
             .await
             .admit_authority(authority.clone(), progress)?;
         if authority.local_role() == ReplicaRole::Primary {
+            let completed_builds = self
+                .state
+                .read()
+                .await
+                .outbound_builds
+                .values()
+                .filter(|build| {
+                    build.progress.completed
+                        && authority
+                            .current_configuration
+                            .members
+                            .iter()
+                            .any(|member| {
+                                member.identity == build.progress.authority.target
+                                    && build_handoff_matches(&build.progress.authority, authority)
+                            })
+                })
+                .map(|build| {
+                    (
+                        build.progress.authority.target.clone(),
+                        build.progress.durable_lsn,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut replicator = self.replicator.lock().await;
+            for (identity, progress) in completed_builds {
+                replicator.record_durable_replica_progress(identity, progress)?;
+            }
+        }
+        if authority.local_role() == ReplicaRole::Primary {
             let primary = self.primary.read().await.clone().ok_or_else(|| {
                 RuntimeError::Application("primary role requires IFabricPrimaryReplicator".into())
             })?;
@@ -2434,6 +2468,7 @@ impl ManagedReplicator for DefaultReplicatorInner {
                 | RuntimeEffectAction::ChangeReplicatorRole(_)
                 | RuntimeEffectAction::UpdateEpoch
                 | RuntimeEffectAction::ChangeApplicationRole(_)
+                | RuntimeEffectAction::BuildReplica { .. }
                 | RuntimeEffectAction::Close
                 | RuntimeEffectAction::Abort
         ) {

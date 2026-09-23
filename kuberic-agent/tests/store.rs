@@ -65,6 +65,7 @@ fn bootstrap_fixture() -> (
         assigned_agent_generation: local.agent_generation.clone(),
         effective_policy: policy.clone(),
         bootstrap_configuration: current.clone(),
+        provisioning: None,
     };
     let observed = ObservedStorageIdentity {
         resource_uid: command.resource_uid.clone(),
@@ -79,6 +80,7 @@ fn bootstrap_fixture() -> (
         effective_policy: policy,
         previous_configuration_id: None,
         current_configuration: current,
+        build_id: None,
         started_at_unix_seconds: 1,
     };
     (command, observed, transition)
@@ -129,6 +131,11 @@ fn fresh_replacement_store_requires_matching_provisioning_intent() {
         provisioning_id: ProvisioningId::new("provisioning-1"),
         kind: ProvisioningKind::Replacement,
         resource_uid: command.resource_uid.clone(),
+        replaces: ReplicaIdentity {
+            replica_id: command.local_replica_id,
+            instance_id: ReplicaInstanceId::new("old-pod"),
+            agent_generation: AgentGeneration::new("old-generation"),
+        },
         replica_id: command.local_replica_id,
         instance_id: command.expected_instance_id.clone(),
         pod_uid: command.expected_pod_uid.clone(),
@@ -136,6 +143,7 @@ fn fresh_replacement_store_requires_matching_provisioning_intent() {
         initialization_id: command.initialization_id.clone(),
         assigned_agent_generation: command.assigned_agent_generation.clone(),
         operation_id: OperationId::new("replace-1"),
+        started_at_unix_seconds: 1,
     };
     authorize_initialization(
         &command,

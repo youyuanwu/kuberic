@@ -1,5 +1,15 @@
 use bytes::Bytes;
-use kuberic_protocol::types::{ProcessSessionId, ReplicaId, ReplicaIdentity, ReplicaRole};
+use futures::{StreamExt, stream};
+use kuberic_protocol::command::EnsureReplicaBuild;
+use kuberic_protocol::types::{
+    ProcessSessionId, ReplicaId, ReplicaIdentity, ResourceUid, derive_replica_endpoint_name,
+};
+use kuberic_runtime::replicator::copy::{BuildConfiguration, PrepareCopyRequest};
+use kuberic_runtime::replicator::sender::SenderOutbound;
+pub use kuberic_runtime::replicator::sender::{
+    ReliableSender as ReliableTransport, ReliableWindow, ResumeWindow, RetainedMessage,
+    RoleTransportState,
+};
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
 use kuberic_runtime_internal::transport::{
     CopyAck, CopyItem, OutboundOperation, ReplicaEndpoint, ReplicationAck, ReplicationItem,
@@ -8,7 +18,7 @@ use kuberic_wire::{
     normalize_copy_ack, normalize_copy_item, normalize_replication_ack, normalize_replication_item,
     proto,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::hosting::PodRuntime;
 use crate::service::SessionRegistry;
@@ -19,167 +29,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 use tokio_stream::iter;
 use tonic::Request;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetainedMessage<T> {
-    pub sequence: u64,
-    pub payload: T,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResumeWindow<T> {
-    Retained(Vec<RetainedMessage<T>>),
-    FullCopyRequired,
-}
-
-#[derive(Debug)]
-pub struct ReliableWindow<T> {
-    capacity: usize,
-    next_sequence: u64,
-    acknowledged_sequence: u64,
-    retained: BTreeMap<u64, T>,
-    cancelled: bool,
-    ever_enqueued: bool,
-}
-
-impl<T: Clone> ReliableWindow<T> {
-    pub fn new(capacity: usize) -> Result<Self> {
-        if capacity == 0 {
-            return Err(AgentError::Backpressure(
-                "reliable send window capacity must be positive".into(),
-            ));
-        }
-
-        Ok(Self {
-            capacity,
-            next_sequence: 1,
-            acknowledged_sequence: 0,
-            retained: BTreeMap::new(),
-            cancelled: false,
-            ever_enqueued: false,
-        })
-    }
-
-    pub fn enqueue(&mut self, payload: T) -> Result<RetainedMessage<T>> {
-        if self.cancelled {
-            return Err(AgentError::SessionRejected(
-                "reliable send window is cancelled".into(),
-            ));
-        }
-        if self.retained.len() >= self.capacity {
-            return Err(AgentError::Backpressure(
-                "reliable send window is full".into(),
-            ));
-        }
-        let sequence = self.next_sequence;
-        self.next_sequence += 1;
-        self.ever_enqueued = true;
-        self.retained.insert(sequence, payload.clone());
-        Ok(RetainedMessage { sequence, payload })
-    }
-
-    pub fn acknowledge_through(&mut self, sequence: u64) -> Result<()> {
-        if sequence < self.acknowledged_sequence || sequence >= self.next_sequence {
-            return Err(AgentError::SessionRejected(
-                "acknowledgement is outside the retained send window".into(),
-            ));
-        }
-        self.acknowledged_sequence = sequence;
-        self.retained.retain(|retained, _| *retained > sequence);
-        Ok(())
-    }
-
-    pub fn reconnect_from(&self, sequence: u64) -> ResumeWindow<T> {
-        if self.cancelled {
-            return ResumeWindow::FullCopyRequired;
-        }
-        if sequence <= self.acknowledged_sequence {
-            return ResumeWindow::Retained(
-                self.retained
-                    .iter()
-                    .map(|(sequence, payload)| RetainedMessage {
-                        sequence: *sequence,
-                        payload: payload.clone(),
-                    })
-                    .collect(),
-            );
-        }
-        let first = self
-            .retained
-            .first_key_value()
-            .map(|(sequence, _)| *sequence);
-        if first.is_some_and(|first| sequence < first) || sequence >= self.next_sequence {
-            return ResumeWindow::FullCopyRequired;
-        }
-        ResumeWindow::Retained(
-            self.retained
-                .range(sequence..)
-                .map(|(sequence, payload)| RetainedMessage {
-                    sequence: *sequence,
-                    payload: payload.clone(),
-                })
-                .collect(),
-        )
-    }
-
-    pub fn retained(&self) -> Vec<RetainedMessage<T>> {
-        self.retained
-            .iter()
-            .map(|(sequence, payload)| RetainedMessage {
-                sequence: *sequence,
-                payload: payload.clone(),
-            })
-            .collect()
-    }
-
-    pub fn cancel(&mut self) {
-        self.cancelled = true;
-        self.retained.clear();
-    }
-}
-
-impl ReliableWindow<ReplicationItem> {
-    pub fn catch_up_capability(&self) -> Option<i64> {
-        self.retained.values().map(|item| item.lsn).min()
-    }
-
-    pub fn reconnect_from_lsn(&self, lsn: i64) -> ResumeWindow<ReplicationItem> {
-        if self.cancelled {
-            return ResumeWindow::FullCopyRequired;
-        }
-        let Some(first_lsn) = self.catch_up_capability() else {
-            return if self.ever_enqueued || lsn > 0 {
-                ResumeWindow::FullCopyRequired
-            } else {
-                ResumeWindow::Retained(Vec::new())
-            };
-        };
-        if lsn < first_lsn {
-            return ResumeWindow::FullCopyRequired;
-        }
-        ResumeWindow::Retained(
-            self.retained
-                .iter()
-                .filter(|(_, item)| item.lsn >= lsn)
-                .map(|(sequence, payload)| RetainedMessage {
-                    sequence: *sequence,
-                    payload: payload.clone(),
-                })
-                .collect(),
-        )
-    }
-}
-
-#[derive(Debug)]
-pub enum RoleTransportState {
-    None,
-    Primary {
-        sessions: BTreeMap<ReplicaIdentity, ReliableWindow<ReplicationItem>>,
-    },
-    Secondary {
-        source: ReplicaIdentity,
-    },
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuedOutbound {
@@ -197,21 +46,13 @@ pub enum QueuedOutbound {
     Remove(ReplicaId),
 }
 
-struct PeerWindows {
-    session: ProcessSessionId,
-    replication: ReliableWindow<ReplicationItem>,
-    copy: ReliableWindow<CopyItem>,
-}
-
-pub struct ReliableTransport {
-    local_session: ProcessSessionId,
-    capacity: usize,
-    peers: BTreeMap<ReplicaIdentity, PeerWindows>,
-}
-
 #[async_trait]
 pub trait OutboundDispatcher: Send + Sync {
     async fn dispatch(&self, outbound: QueuedOutbound) -> Result<()>;
+
+    async fn refresh_peer(&self, _receiver: &ReplicaIdentity) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait ReplicaEndpointResolver: Send + Sync {
@@ -222,24 +63,22 @@ pub trait ReplicaEndpointResolver: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct KubernetesDnsResolver {
-    set_name: Arc<str>,
+    resource_uid: ResourceUid,
     namespace: Arc<str>,
 }
 
 impl KubernetesDnsResolver {
-    pub fn new(set_name: impl Into<Arc<str>>, namespace: impl Into<Arc<str>>) -> Self {
+    pub fn new(resource_uid: ResourceUid, namespace: impl Into<Arc<str>>) -> Self {
         Self {
-            set_name: set_name.into(),
+            resource_uid,
             namespace: namespace.into(),
         }
     }
 
     fn host(&self, identity: &ReplicaIdentity) -> String {
         format!(
-            "{}-{}.{}-peer.{}.svc",
-            self.set_name,
-            identity.replica_id.value(),
-            self.set_name,
+            "{}.{}.svc",
+            derive_replica_endpoint_name(&self.resource_uid, identity),
             self.namespace
         )
     }
@@ -262,6 +101,8 @@ pub struct GrpcOutboundDispatcher<R> {
     resource_uid: Arc<str>,
     bearer_token: Arc<str>,
     deadline: std::time::Duration,
+    build_locks: Mutex<BTreeMap<kuberic_protocol::types::OperationId, Arc<Mutex<()>>>>,
+    completed_builds: Mutex<BTreeSet<kuberic_protocol::types::OperationId>>,
 }
 
 impl<R> GrpcOutboundDispatcher<R>
@@ -289,6 +130,8 @@ where
             resource_uid: resource_uid.into(),
             bearer_token,
             deadline,
+            build_locks: Mutex::new(BTreeMap::new()),
+            completed_builds: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -332,6 +175,145 @@ where
         }
         Ok(ProcessSessionId::new(report.process_session_id))
     }
+
+    async fn dispatch_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
+        let build_lock = {
+            let mut locks = self.build_locks.lock().await;
+            locks
+                .entry(endpoint.build_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _build = build_lock.lock().await;
+        if self
+            .completed_builds
+            .lock()
+            .await
+            .contains(&endpoint.build_id)
+        {
+            return Ok(());
+        }
+        let snapshot = self.runtime.snapshot().await;
+        if snapshot.builds.iter().any(|build| {
+            build.authority.build_id == endpoint.build_id
+                && build.authority.target == endpoint.identity
+                && build.completed
+        }) {
+            return Ok(());
+        }
+        let source_session_id = self.transport.lock().await.local_session().clone();
+        let authority = self
+            .runtime
+            .authorize_build(
+                endpoint.build_id.clone(),
+                endpoint.identity.clone(),
+                BuildConfiguration::Current,
+            )
+            .await?;
+        let target_session = self.peer_session(&endpoint.identity).await?;
+        self.transport
+            .lock()
+            .await
+            .admit_peer(endpoint.identity.clone(), target_session)?;
+        let target_command = EnsureReplicaBuild {
+            operation_id: endpoint.build_id.clone(),
+            local_replica_id: endpoint.identity.replica_id,
+            expected_instance_id: endpoint.identity.instance_id.clone(),
+            expected_agent_generation: endpoint.identity.agent_generation.clone(),
+            target: endpoint.identity.clone(),
+            authority: Some(authority),
+            source_session_id: Some(source_session_id),
+        };
+        let control_endpoint = self.resolver.control_endpoint(&endpoint.identity);
+        let mut control = tokio::time::timeout(
+            self.deadline,
+            proto::agent_control_client::AgentControlClient::connect(control_endpoint),
+        )
+        .await
+        .map_err(|_| AgentError::SessionRejected("build target connection timed out".into()))?
+        .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
+        let mut request = Request::new(proto::ExecuteCommandRequest {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: self.resource_uid.to_string(),
+            target: Some(endpoint.identity.clone().into()),
+            command: Some(proto::execute_command_request::Command::EnsureReplicaBuild(
+                ensure_build_to_proto(target_command),
+            )),
+        });
+        add_bearer_token(&mut request, &self.bearer_token)?;
+        let response = tokio::time::timeout(self.deadline, control.execute(request))
+            .await
+            .map_err(|_| AgentError::SessionRejected("build target admission timed out".into()))?
+            .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+            .into_inner();
+        let report = response.observation.ok_or_else(|| {
+            AgentError::SessionRejected("build target admission omitted its report".into())
+        })?;
+        kuberic_wire::validate_agent_status_report(&report)
+            .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
+
+        let build_id = endpoint.build_id.clone();
+        let mut prepared = self
+            .runtime
+            .data_plane()
+            .prepare_copy(PrepareCopyRequest {
+                build_id: build_id.clone(),
+                target: endpoint.identity.clone(),
+                configuration: BuildConfiguration::Current,
+                copy_context: Box::pin(stream::empty()),
+            })
+            .await?;
+        while let Some(item) = prepared.items.next().await {
+            self.dispatch_copy(endpoint.identity.clone(), item?, false)
+                .await?;
+        }
+        self.completed_builds.lock().await.insert(build_id);
+        Ok(())
+    }
+
+    async fn dispatch_copy(
+        &self,
+        receiver: ReplicaIdentity,
+        mut item: proto::CopyItem,
+        retire_window: bool,
+    ) -> Result<()> {
+        item.sender_session_id = self.transport.lock().await.local_session().to_string();
+        item.receiver_session_id = self.peer_session(&receiver).await?.to_string();
+        let endpoint = self.resolver.replication_endpoint(&receiver);
+        let mut client = tokio::time::timeout(
+            self.deadline,
+            proto::replication_data_client::ReplicationDataClient::connect(endpoint),
+        )
+        .await
+        .map_err(|_| AgentError::SessionRejected("copy connection timed out".into()))?
+        .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
+        let mut request = Request::new(iter([item]));
+        add_bearer_token(&mut request, &self.bearer_token)?;
+        let mut acknowledgements = tokio::time::timeout(self.deadline, client.build(request))
+            .await
+            .map_err(|_| AgentError::SessionRejected("copy request timed out".into()))?
+            .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+            .into_inner();
+        let acknowledgement = tokio::time::timeout(self.deadline, acknowledgements.message())
+            .await
+            .map_err(|_| AgentError::SessionRejected("copy acknowledgement timed out".into()))?
+            .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+            .ok_or_else(|| {
+                AgentError::SessionRejected("copy peer returned no acknowledgement".into())
+            })?;
+        let sequence = acknowledgement.sequence;
+        self.runtime
+            .data_plane()
+            .accept_copy_acknowledgement(acknowledgement)
+            .await?;
+        if retire_window {
+            self.transport
+                .lock()
+                .await
+                .acknowledge_copy(&receiver, sequence)?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -339,6 +321,15 @@ impl<R> OutboundDispatcher for GrpcOutboundDispatcher<R>
 where
     R: ReplicaEndpointResolver + 'static,
 {
+    async fn refresh_peer(&self, receiver: &ReplicaIdentity) -> Result<()> {
+        let session = self.peer_session(receiver).await?;
+        self.transport
+            .lock()
+            .await
+            .admit_peer(receiver.clone(), session)?;
+        Ok(())
+    }
+
     async fn dispatch(&self, outbound: QueuedOutbound) -> Result<()> {
         match outbound {
             QueuedOutbound::Replication {
@@ -390,63 +381,16 @@ where
                     .lock()
                     .await
                     .acknowledge_replication(&receiver, applied_lsn)
+                    .map_err(AgentError::from)
             }
             QueuedOutbound::Copy {
                 receiver,
                 sequence: _,
-                mut item,
-            } => {
-                item.receiver_session_id = self.peer_session(&receiver).await?.to_string();
-                let endpoint = self.resolver.replication_endpoint(&receiver);
-                let mut client = tokio::time::timeout(
-                    self.deadline,
-                    proto::replication_data_client::ReplicationDataClient::connect(endpoint),
-                )
-                .await
-                .map_err(|_| AgentError::SessionRejected("copy connection timed out".into()))?
-                .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
-                let mut request = Request::new(iter([item]));
-                add_bearer_token(&mut request, &self.bearer_token)?;
-                let mut acknowledgements =
-                    tokio::time::timeout(self.deadline, client.build(request))
-                        .await
-                        .map_err(|_| AgentError::SessionRejected("copy request timed out".into()))?
-                        .map_err(|error| AgentError::SessionRejected(error.to_string()))?
-                        .into_inner();
-                let acknowledgement =
-                    tokio::time::timeout(self.deadline, acknowledgements.message())
-                        .await
-                        .map_err(|_| {
-                            AgentError::SessionRejected("copy acknowledgement timed out".into())
-                        })?
-                        .map_err(|error| AgentError::SessionRejected(error.to_string()))?
-                        .ok_or_else(|| {
-                            AgentError::SessionRejected(
-                                "copy peer returned no acknowledgement".into(),
-                            )
-                        })?;
-                let sequence = acknowledgement.sequence;
-                self.runtime
-                    .data_plane()
-                    .accept_copy_acknowledgement(acknowledgement)
-                    .await?;
-                self.transport
-                    .lock()
-                    .await
-                    .acknowledge_copy(&receiver, sequence)
-            }
-            QueuedOutbound::Build(_) => Err(AgentError::CommandRejected(
-                "replica build orchestration requires an admitted build authority".into(),
-            )),
+                item,
+            } => self.dispatch_copy(receiver, item, true).await,
+            QueuedOutbound::Build(endpoint) => self.dispatch_build(endpoint).await,
             QueuedOutbound::Remove(replica_id) => {
-                let receiver = self
-                    .transport
-                    .lock()
-                    .await
-                    .peers
-                    .keys()
-                    .find(|identity| identity.replica_id == replica_id)
-                    .cloned();
+                let receiver = self.transport.lock().await.peer_for_replica(replica_id);
                 if let Some(receiver) = receiver {
                     self.transport.lock().await.retire_peer(&receiver);
                 }
@@ -462,6 +406,20 @@ fn add_bearer_token<T>(request: &mut Request<T>, token: &str) -> Result<()> {
         .map_err(|error| AgentError::CommandRejected(format!("invalid bearer token: {error}")))?;
     request.metadata_mut().insert("authorization", value);
     Ok(())
+}
+
+fn ensure_build_to_proto(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuildCommand {
+    proto::EnsureReplicaBuildCommand {
+        operation_id: command.operation_id.to_string(),
+        local_replica_id: command.local_replica_id.value(),
+        expected_instance_id: command.expected_instance_id.to_string(),
+        expected_agent_generation: command.expected_agent_generation.to_string(),
+        target: Some(command.target.into()),
+        authority: command.authority.map(Into::into),
+        source_session_id: command
+            .source_session_id
+            .map_or_else(String::new, |session| session.to_string()),
+    }
 }
 
 pub async fn run_outbound<D: OutboundDispatcher + 'static>(
@@ -507,16 +465,30 @@ async fn deliver_outbound<D: OutboundDispatcher>(
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let queued = loop {
-        match transport.lock().await.queue(outbound.clone()) {
-            Ok(queued) => break queued,
-            Err(AgentError::SessionRejected(_) | AgentError::Backpressure(_)) => {
+        let (queued, retry_delay) = {
+            let mut sender = transport.lock().await;
+            (sender.queue(outbound.clone()), sender.retry_delay())
+        };
+        match queued {
+            Ok(queued) => break sender_outbound_to_queued(queued),
+            Err(RuntimeError::ReconfigurationPending) => {
+                if let Some(receiver) = domain_outbound_receiver(&outbound) {
+                    let _ = dispatcher.refresh_peer(receiver).await;
+                }
                 let mut retry_shutdown = shutdown.clone();
                 tokio::select! {
                     _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    _ = tokio::time::sleep(retry_delay) => {}
                 }
             }
-            Err(error) => return Err(error),
+            Err(RuntimeError::QueueFull) => {
+                let mut retry_shutdown = shutdown.clone();
+                tokio::select! {
+                    _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+            }
+            Err(error) => return Err(AgentError::Runtime(error)),
         }
     };
     loop {
@@ -528,12 +500,16 @@ async fn deliver_outbound<D: OutboundDispatcher>(
         };
         match result {
             Ok(()) => return Ok(()),
-            Err(AgentError::SessionRejected(_) | AgentError::Backpressure(_)) => {
-                tracing::warn!("outbound peer unavailable; retaining message for retry");
+            Err(error @ (AgentError::SessionRejected(_) | AgentError::Backpressure(_))) => {
+                tracing::warn!(%error, "outbound peer unavailable; retaining message for retry");
+                if let Some(receiver) = queued_outbound_receiver(&queued) {
+                    let _ = dispatcher.refresh_peer(receiver).await;
+                }
+                let retry_delay = transport.lock().await.retry_delay();
                 let mut retry_shutdown = shutdown.clone();
                 tokio::select! {
                     _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    _ = tokio::time::sleep(retry_delay) => {}
                 }
             }
             Err(error) => return Err(error),
@@ -596,165 +572,57 @@ async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
-impl ReliableTransport {
-    pub fn new(local_session: ProcessSessionId, capacity: usize) -> Result<Self> {
-        ReliableWindow::<ReplicationItem>::new(capacity)?;
-        Ok(Self {
-            local_session,
-            capacity,
-            peers: BTreeMap::new(),
-        })
-    }
-
-    pub fn admit_peer(
-        &mut self,
-        identity: ReplicaIdentity,
-        session: ProcessSessionId,
-    ) -> Result<()> {
-        if self
-            .peers
-            .get(&identity)
-            .is_some_and(|peer| peer.session == session)
-        {
-            return Ok(());
-        }
-        self.peers.insert(
-            identity,
-            PeerWindows {
-                session,
-                replication: ReliableWindow::new(self.capacity)?,
-                copy: ReliableWindow::new(self.capacity)?,
-            },
-        );
-        Ok(())
-    }
-
-    pub fn queue(&mut self, outbound: OutboundOperation) -> Result<QueuedOutbound> {
-        match outbound {
-            OutboundOperation::Replication(item) => {
-                let receiver = item.receiver.clone();
-                let peer = self.peers.get_mut(&receiver).ok_or_else(|| {
-                    AgentError::SessionRejected("replication peer is not admitted".into())
-                })?;
-                let retained = peer.replication.enqueue(item)?;
-                Ok(QueuedOutbound::Replication {
-                    receiver,
-                    sequence: retained.sequence,
-                    item: replication_to_session_proto(
-                        retained.payload,
-                        self.local_session.as_str(),
-                        peer.session.as_str(),
-                    ),
-                })
-            }
-            OutboundOperation::Copy(item) => {
-                let receiver = item.receiver.clone();
-                let peer = self.peers.get_mut(&receiver).ok_or_else(|| {
-                    AgentError::SessionRejected("copy peer is not admitted".into())
-                })?;
-                let retained = peer.copy.enqueue(item)?;
-                Ok(QueuedOutbound::Copy {
-                    receiver,
-                    sequence: retained.sequence,
-                    item: copy_to_session_proto(
-                        retained.payload,
-                        self.local_session.as_str(),
-                        peer.session.as_str(),
-                    ),
-                })
-            }
-            OutboundOperation::Build(replica) => Ok(QueuedOutbound::Build(replica)),
-            OutboundOperation::Remove(replica_id) => Ok(QueuedOutbound::Remove(replica_id)),
-        }
-    }
-
-    pub fn acknowledge_replication(
-        &mut self,
-        receiver: &ReplicaIdentity,
-        applied_lsn: i64,
-    ) -> Result<()> {
-        let peer = self.peers.get_mut(receiver).ok_or_else(|| {
-            AgentError::SessionRejected("replication peer is not admitted".into())
-        })?;
-        if let Some(sequence) = peer
-            .replication
-            .retained
-            .iter()
-            .filter(|(_, item)| item.lsn <= applied_lsn)
-            .map(|(sequence, _)| *sequence)
-            .max()
-        {
-            peer.replication.acknowledge_through(sequence)?;
-        }
-        Ok(())
-    }
-
-    pub fn acknowledge_copy(
-        &mut self,
-        receiver: &ReplicaIdentity,
-        item_sequence: u64,
-    ) -> Result<()> {
-        let peer = self
-            .peers
-            .get_mut(receiver)
-            .ok_or_else(|| AgentError::SessionRejected("copy peer is not admitted".into()))?;
-        if let Some(sequence) = peer
-            .copy
-            .retained
-            .iter()
-            .filter(|(_, item)| item.sequence <= item_sequence)
-            .map(|(sequence, _)| *sequence)
-            .max()
-        {
-            peer.copy.acknowledge_through(sequence)?;
-        }
-        Ok(())
-    }
-
-    pub fn reconnect_replication(
-        &self,
-        receiver: &ReplicaIdentity,
-        from_lsn: i64,
-    ) -> Result<ResumeWindow<ReplicationItem>> {
-        self.peers
-            .get(receiver)
-            .ok_or_else(|| AgentError::SessionRejected("replication peer is not admitted".into()))
-            .map(|peer| peer.replication.reconnect_from_lsn(from_lsn))
-    }
-
-    pub fn retire_peer(&mut self, receiver: &ReplicaIdentity) {
-        if let Some(mut peer) = self.peers.remove(receiver) {
-            peer.replication.cancel();
-            peer.copy.cancel();
-        }
+fn sender_outbound_to_queued(outbound: SenderOutbound) -> QueuedOutbound {
+    match outbound {
+        SenderOutbound::Replication {
+            receiver,
+            sender_session,
+            receiver_session,
+            message,
+        } => QueuedOutbound::Replication {
+            receiver,
+            sequence: message.sequence,
+            item: replication_to_session_proto(
+                message.payload,
+                sender_session.as_str(),
+                receiver_session.as_str(),
+            ),
+        },
+        SenderOutbound::Copy {
+            receiver,
+            sender_session,
+            receiver_session,
+            message,
+        } => QueuedOutbound::Copy {
+            receiver,
+            sequence: message.sequence,
+            item: copy_to_session_proto(
+                message.payload,
+                sender_session.as_str(),
+                receiver_session.as_str(),
+            ),
+        },
+        SenderOutbound::Build(endpoint) => QueuedOutbound::Build(endpoint),
+        SenderOutbound::Remove(replica_id) => QueuedOutbound::Remove(replica_id),
     }
 }
 
-impl RoleTransportState {
-    pub fn transition(&mut self, role: ReplicaRole, source: Option<ReplicaIdentity>) -> Result<()> {
-        for window in match self {
-            Self::Primary { sessions } => Some(sessions.values_mut()),
-            _ => None,
+fn domain_outbound_receiver(outbound: &OutboundOperation) -> Option<&ReplicaIdentity> {
+    match outbound {
+        OutboundOperation::Replication(item) => Some(&item.receiver),
+        OutboundOperation::Copy(item) => Some(&item.receiver),
+        OutboundOperation::Build(endpoint) => Some(&endpoint.identity),
+        OutboundOperation::Remove(_) => None,
+    }
+}
+
+fn queued_outbound_receiver(outbound: &QueuedOutbound) -> Option<&ReplicaIdentity> {
+    match outbound {
+        QueuedOutbound::Replication { receiver, .. } | QueuedOutbound::Copy { receiver, .. } => {
+            Some(receiver)
         }
-        .into_iter()
-        .flatten()
-        {
-            window.cancel();
-        }
-        *self = match role {
-            ReplicaRole::Primary => Self::Primary {
-                sessions: BTreeMap::new(),
-            },
-            ReplicaRole::ActiveSecondary | ReplicaRole::IdleSecondary => Self::Secondary {
-                source: source.ok_or_else(|| {
-                    AgentError::SessionRejected(
-                        "secondary transport requires an exact primary source".into(),
-                    )
-                })?,
-            },
-            ReplicaRole::None => Self::None,
-        };
-        Ok(())
+        QueuedOutbound::Build(endpoint) => Some(&endpoint.identity),
+        QueuedOutbound::Remove(_) => None,
     }
 }
 

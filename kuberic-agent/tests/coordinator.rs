@@ -8,11 +8,12 @@ use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_agent::store::AgentStore;
 use kuberic_agent::{AgentError, Result};
-use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{
-    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
-    Epoch, InitializationId, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
+    AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
+    ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
+    ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    ResourceUid, TransitionKind,
 };
 use kuberic_runtime::RuntimeError;
 use kuberic_runtime_internal::effects::{
@@ -67,6 +68,8 @@ impl RuntimeEffectExecutor for FakeRuntime {
             RuntimeEffectAction::ChangeReplicatorRole(_) => "replicator-role",
             RuntimeEffectAction::UpdateEpoch => "epoch",
             RuntimeEffectAction::ChangeApplicationRole(_) => "application-role",
+            RuntimeEffectAction::AdmitBuildAuthority(_) => "admit-build",
+            RuntimeEffectAction::BuildReplica { .. } => "build-replica",
             action => panic!("unexpected coordinator action {action:?}"),
         };
         self.calls.lock().unwrap().push(stage);
@@ -110,6 +113,37 @@ impl RuntimeEffectExecutor for FakeRuntime {
             RuntimeEffectAction::ChangeApplicationRole(role) => {
                 state.role = role;
                 state.role_transition = None;
+            }
+            RuntimeEffectAction::AdmitBuildAuthority(authority) => {
+                state
+                    .builds
+                    .push(kuberic_runtime_internal::effects::BuildPostcondition {
+                        authority: *authority,
+                        last_sequence: 0,
+                        durable_lsn: 0,
+                        completed: false,
+                    });
+            }
+            RuntimeEffectAction::BuildReplica {
+                build_id, target, ..
+            } => {
+                let current_progress = state.current_progress;
+                state
+                    .builds
+                    .push(kuberic_runtime_internal::effects::BuildPostcondition {
+                        authority: BuildAuthority {
+                            build_id,
+                            kind: BuildAuthorityKind::Provisioning,
+                            source: identity(),
+                            target,
+                            current_configuration: command("build-authority", Epoch::new(0, 1))
+                                .current_configuration,
+                            replication_boundary_lsn: current_progress,
+                        },
+                        last_sequence: 1,
+                        durable_lsn: current_progress,
+                        completed: true,
+                    });
             }
             _ => unreachable!(),
         }
@@ -165,6 +199,8 @@ fn command(operation_id: &str, epoch: Epoch) -> EnsureConfiguration {
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Bootstrap,
         grant_write: false,
+        current_only: false,
+        retire_build_id: None,
     }
 }
 
@@ -180,6 +216,55 @@ fn store() -> (tempfile::TempDir, Arc<SqliteStore>) {
     let path = SqliteStore::metadata_database_path(directory.path());
     let store = SqliteStore::create_authorized(path, AgentState::new(storage_identity())).unwrap();
     (directory, Arc::new(store))
+}
+
+#[tokio::test]
+async fn replacement_build_target_is_admitted_as_idle_secondary() {
+    let (_directory, store) = store();
+    let runtime = Arc::new(FakeRuntime::new());
+    let coordinator = Coordinator::new(store.clone(), runtime);
+    let target = identity();
+    let source = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("source-pod"),
+        agent_generation: AgentGeneration::new("source-generation"),
+    };
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![ConfigurationMember {
+            identity: source.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        1,
+    );
+    coordinator
+        .ensure_build(EnsureReplicaBuild {
+            operation_id: OperationId::new("replacement-build"),
+            local_replica_id: target.replica_id,
+            expected_instance_id: target.instance_id.clone(),
+            expected_agent_generation: target.agent_generation.clone(),
+            target: target.clone(),
+            authority: Some(BuildAuthority {
+                build_id: OperationId::new("replacement-build"),
+                kind: BuildAuthorityKind::Provisioning,
+                source,
+                target,
+                current_configuration: current,
+                replication_boundary_lsn: 7,
+            }),
+            source_session_id: Some(ProcessSessionId::new("source-session")),
+        })
+        .await
+        .unwrap();
+    let state = store.load_state().await.unwrap();
+    assert_eq!(state.role, ReplicaRole::IdleSecondary);
+    assert!(state.retained_result.is_some_and(|result| {
+        matches!(
+            result.effect.action,
+            RuntimeEffectAction::AdmitBuildAuthority(_)
+        )
+    }));
 }
 
 #[tokio::test]
@@ -422,6 +507,8 @@ fn same_epoch_new_operation_cannot_replace_durable_membership() {
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Bootstrap,
         grant_write: false,
+        current_only: false,
+        retire_build_id: None,
     };
     assert!(matches!(
         admit_configuration(&command, &state),
