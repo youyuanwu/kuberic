@@ -884,11 +884,50 @@ async fn ensure_peer_service(
     owner: &OwnerReference,
 ) -> Result<()> {
     let name = format!("{}-peer", observation.set.name_any());
-    if observation
+    if let Some(existing) = observation
         .services
         .iter()
-        .any(|service| service.name_any() == name)
+        .find(|service| service.name_any() == name)
     {
+        if existing.labels().get(SET_UID_LABEL).map(String::as_str) != Some(uid) {
+            return Err(ControllerError::Effect(format!(
+                "Service {name} is not owned by this KubericSet"
+            )));
+        }
+        let ready = existing.spec.as_ref().is_some_and(|spec| {
+            spec.cluster_ip.as_deref() == Some("None")
+                && spec.publish_not_ready_addresses == Some(true)
+                && spec.selector.as_ref().is_some_and(|selector| {
+                    selector.get(SET_UID_LABEL).map(String::as_str) == Some(uid)
+                })
+                && spec.ports.as_ref().is_some_and(|ports| {
+                    [("control", CONTROL_PORT), ("replication", REPLICATION_PORT)]
+                        .into_iter()
+                        .all(|(name, port)| {
+                            ports.iter().any(|candidate| {
+                                candidate.name.as_deref() == Some(name) && candidate.port == port
+                            })
+                        })
+                })
+        });
+        if ready {
+            return Ok(());
+        }
+        let services: Api<Service> = Api::namespaced(client, namespace);
+        services
+            .delete(
+                &name,
+                &DeleteParams {
+                    preconditions: Some(Preconditions {
+                        uid: existing.uid(),
+                        resource_version: existing.resource_version(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_kube_effect_error)?;
         return Ok(());
     }
     let services: Api<Service> = Api::namespaced(client, namespace);
@@ -1242,6 +1281,7 @@ impl ClusterApi for InMemoryClusterApi {
                 spec: Some(ServiceSpec {
                     cluster_ip: Some("None".to_string()),
                     publish_not_ready_addresses: Some(true),
+                    selector: Some(BTreeMap::from([(SET_UID_LABEL.to_string(), uid.clone())])),
                     ports: Some(vec![
                         ServicePort {
                             name: Some("control".to_string()),

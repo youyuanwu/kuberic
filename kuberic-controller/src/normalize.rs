@@ -164,6 +164,10 @@ fn supporting_resources_ready(raw: &RawObservation, resource_uid: &ResourceUid) 
             && service.spec.as_ref().is_some_and(|spec| {
                 spec.cluster_ip.as_deref() == Some("None")
                     && spec.publish_not_ready_addresses == Some(true)
+                    && spec.selector.as_ref().is_some_and(|selector| {
+                        selector.get(SET_UID_LABEL).map(String::as_str)
+                            == Some(resource_uid.as_str())
+                    })
                     && has_service_port(service, "control", 50051)
                     && has_service_port(service, "replication", 50052)
             })

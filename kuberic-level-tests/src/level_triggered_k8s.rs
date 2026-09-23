@@ -77,6 +77,45 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
         &context,
         &[
             "-n",
+            "default",
+            "delete",
+            "service/kvstore2-peer",
+            "secret/kvstore2-agent-credentials",
+            "--ignore-not-found=true",
+        ],
+    )?;
+    let support_deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let peer = kubectl(
+            &kubeconfig,
+            &context,
+            &["-n", "default", "get", "service", "kvstore2-peer"],
+        );
+        let credentials = kubectl(
+            &kubeconfig,
+            &context,
+            &[
+                "-n",
+                "default",
+                "get",
+                "secret",
+                "kvstore2-agent-credentials",
+            ],
+        );
+        if peer.is_ok() && credentials.is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= support_deadline {
+            bail!("controller did not reconverge peer Service and credentials");
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
             "kuberic-system",
             "rollout",
             "restart",

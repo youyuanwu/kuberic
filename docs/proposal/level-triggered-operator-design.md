@@ -815,12 +815,34 @@ generation preserved, and a quorum-replicated write. Cluster-dependent tests
 remain ignored by default and require the owned `KUBECONFIG`,
 `KUBE_CONTEXT`, and `KIND_CLUSTER_NAME` tuple.
 
+Post-review hardening resumes the enclosing durable configuration command
+after reconstructing any pending runtime effect. Bootstrap topology acceptance
+requires the exact terminal install operation, no pending operation, and zero
+application progress on every member. Fresh metadata is not sufficient by
+itself: surviving application files produce unsafe storage, and established
+metadata must match the process's resource, replica, Pod, and PVC identity
+before runtime reconstruction.
+
+The KV provider publishes new in-memory state only after the candidate state
+is durably written and synced. Failed persistence therefore cannot be reused
+as `verify_applied` or progress evidence. The public state replicator also
+releases a newly reserved request when a different durable pending operation
+owns recovery, allowing the original write to resume.
+
+Outbound replication is independently retried per peer. One unavailable
+secondary cannot block delivery to another quorum member or terminate the
+primary. Re-observing the same peer process session preserves its retained
+window. Peer discovery and session admission are agent-owned, while the
+application supplies only deployment endpoint configuration. The controller
+observes and independently reconverges the peer Service and credential Secret
+in bootstrap, transition, and stable states.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
-| Process-kill reconstruction during replacement/failover and active non-bootstrap commands | Adversarial suite in Phase 9 |
+| Live process-kill reconstruction while an active configuration, replacement, or failover command is between durable stages | Adversarial suite in Phase 9 |
 | Persistent resend payloads across process sessions where full copy is not acceptable | Reliable build/replacement owner in Phase 7 |
 | Full replacement, failover, quorum-loss, and destructive-recovery orchestration | Phases 7-9 |
 | Network-level session replacement, listener shutdown, and partition acceptance tests | Phases 7 and 9 |

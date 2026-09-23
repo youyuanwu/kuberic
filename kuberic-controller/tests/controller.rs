@@ -146,6 +146,10 @@ fn peer_service() -> Service {
         spec: Some(ServiceSpec {
             cluster_ip: Some("None".to_string()),
             publish_not_ready_addresses: Some(true),
+            selector: Some(BTreeMap::from([(
+                SET_UID_LABEL.to_string(),
+                UID.to_string(),
+            )])),
             ports: Some(vec![
                 ServicePort {
                     name: Some("control".to_string()),
