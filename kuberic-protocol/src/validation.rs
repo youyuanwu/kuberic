@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::observation::{AgentObservation, ObservationSnapshot, ReplicaObservationKey};
 use crate::types::{
     AcceptedStatus, AccessStatus, ConfigurationDescriptor, EffectivePolicy, Epoch, ReplicaId,
-    ReplicaIdentity, ReplicaRole, TransitionKind, derive_agent_generation, duplicate_replica_ids,
+    ReplicaIdentity, ReplicaRole, TransitionKind, duplicate_replica_ids,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -26,10 +26,6 @@ pub enum ValidationError {
     ProvisioningAndTransition,
     #[error("provisioning intent requires initialized accepted topology")]
     ProvisioningWithoutTopology,
-    #[error("provisioning intent has inconsistent assigned durable generation")]
-    ProvisioningGenerationMismatch,
-    #[error("provisioning instance ID must equal the exact Pod UID")]
-    ProvisioningInstanceMismatch,
     #[error("configuration ID {actual} does not match canonical ID {expected}")]
     ConfigurationIdMismatch { actual: String, expected: String },
     #[error("configuration must contain at least one member")]
@@ -81,14 +77,10 @@ pub enum ValidationError {
     ProvisioningBuildTargetInAuthority,
     #[error("build replication boundary must not be negative")]
     NegativeBuildBoundary,
-    #[error("provisioning target does not match resource UID")]
-    ProvisioningResourceMismatch,
     #[error("provisioning target reuses the accepted exact incarnation")]
     ProvisioningReusesAcceptedIncarnation,
     #[error("provisioning does not replace one accepted non-primary incarnation")]
     InvalidProvisioningReplacement,
-    #[error("provisioning initialization ID does not match exact Pod/PVC identity")]
-    ProvisioningInitializationMismatch,
     #[error("replica observation key {key} does not match reported identity {reported}")]
     ReplicaObservationKeyMismatch { key: String, reported: String },
     #[error("replica observation key does not match Kubernetes Pod identity")]
@@ -154,13 +146,11 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
     validate_status(&snapshot.status)?;
 
     if let Some(provisioning) = &snapshot.status.provisioning {
-        if provisioning.resource_uid != snapshot.resource_uid {
-            return Err(ValidationError::ProvisioningResourceMismatch);
-        }
+        let target = provisioning.target_identity(&snapshot.resource_uid);
         if let Some(topology) = &snapshot.status.topology
             && topology.configuration.members.iter().any(|member| {
-                member.identity.replica_id == provisioning.replica_id
-                    && member.identity.instance_id == provisioning.instance_id
+                member.identity.replica_id == target.replica_id
+                    && member.identity.instance_id == target.instance_id
             })
         {
             return Err(ValidationError::ProvisioningReusesAcceptedIncarnation);
@@ -170,8 +160,7 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
             .topology
             .as_ref()
             .ok_or(ValidationError::ProvisioningWithoutTopology)?;
-        if provisioning.replica_id != provisioning.replaces.replica_id
-            || provisioning.replaces.replica_id == topology.configuration.primary_id
+        if provisioning.replaces.replica_id == topology.configuration.primary_id
             || !topology
                 .configuration
                 .members
@@ -179,23 +168,6 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                 .any(|member| member.identity == provisioning.replaces)
         {
             return Err(ValidationError::InvalidProvisioningReplacement);
-        }
-        if provisioning.assigned_agent_generation
-            != derive_agent_generation(&provisioning.initialization_id)
-        {
-            return Err(ValidationError::ProvisioningGenerationMismatch);
-        }
-        if provisioning.instance_id.as_str() != provisioning.pod_uid.as_str() {
-            return Err(ValidationError::ProvisioningInstanceMismatch);
-        }
-        if crate::types::derive_initialization_id(
-            &provisioning.resource_uid,
-            provisioning.replica_id,
-            &provisioning.pod_uid,
-            &provisioning.pvc_uid,
-        ) != provisioning.initialization_id
-        {
-            return Err(ValidationError::ProvisioningInitializationMismatch);
         }
     }
 
@@ -267,8 +239,8 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
                     ));
                 }
                 if let Some(provisioning) = snapshot.status.provisioning.as_ref()
-                    && provisioning.replica_id == key.replica_id
-                    && provisioning.instance_id == key.instance_id
+                    && provisioning.replica_id() == key.replica_id
+                    && provisioning.instance_id() == key.instance_id
                     && (provisioning.pod_uid != report.pod_uid
                         || provisioning.pvc_uid != report.pvc_uid)
                 {
@@ -411,11 +383,10 @@ fn validate_report_authority(
     snapshot: &ObservationSnapshot,
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
-    let provisioning = snapshot.status.provisioning.as_ref().is_some_and(|intent| {
-        intent.replica_id == report.identity.replica_id
-            && intent.instance_id == report.identity.instance_id
-            && intent.assigned_agent_generation == report.identity.agent_generation
-    });
+    let provisioning =
+        snapshot.status.provisioning.as_ref().is_some_and(|intent| {
+            intent.target_identity(&snapshot.resource_uid) == report.identity
+        });
     if provisioning {
         if !matches!(report.role, ReplicaRole::None | ReplicaRole::IdleSecondary)
             || report.write_status == AccessStatus::Granted

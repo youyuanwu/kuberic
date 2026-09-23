@@ -12,9 +12,9 @@ use kuberic_agent::store::AgentStore;
 use kuberic_protocol::command::InitializeAgentStore;
 use kuberic_protocol::types::{
     AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy, Epoch,
-    OperationId, PodUid, ProvisioningId, ProvisioningIntent, ProvisioningKind, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionId, TransitionIntent,
-    TransitionKind, derive_agent_generation, derive_initialization_id,
+    OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaRole, ResourceUid, TransitionId, TransitionIntent, TransitionKind,
+    derive_agent_generation, derive_initialization_id,
 };
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
@@ -81,7 +81,6 @@ fn bootstrap_fixture() -> (
         previous_configuration_id: None,
         current_configuration: current,
         build_id: None,
-        started_at_unix_seconds: 1,
     };
     (command, observed, transition)
 }
@@ -128,22 +127,14 @@ fn fresh_bootstrap_store_requires_exact_persisted_authority() {
 fn fresh_replacement_store_requires_matching_provisioning_intent() {
     let (command, observed, _) = bootstrap_fixture();
     let provisioning = ProvisioningIntent {
-        provisioning_id: ProvisioningId::new("provisioning-1"),
-        kind: ProvisioningKind::Replacement,
-        resource_uid: command.resource_uid.clone(),
         replaces: ReplicaIdentity {
             replica_id: command.local_replica_id,
             instance_id: ReplicaInstanceId::new("old-pod"),
             agent_generation: AgentGeneration::new("old-generation"),
         },
-        replica_id: command.local_replica_id,
-        instance_id: command.expected_instance_id.clone(),
         pod_uid: command.expected_pod_uid.clone(),
         pvc_uid: command.expected_pvc_uid.clone(),
-        initialization_id: command.initialization_id.clone(),
-        assigned_agent_generation: command.assigned_agent_generation.clone(),
         operation_id: OperationId::new("replace-1"),
-        started_at_unix_seconds: 1,
     };
     authorize_initialization(
         &command,

@@ -52,8 +52,8 @@ fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
             ],
         )?;
         let value: serde_json::Value = serde_json::from_str(&status)?;
-        let authority = &value["status"]["authority"];
-        let members = authority["topology"]["configuration"]["members"]
+        let authority = &value["status"];
+        let members = authority["topology"]["members"]
             .as_array()
             .map_or(0, Vec::len);
         let ready = authority["conditions"]
@@ -319,14 +319,14 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             ],
         )?;
         let value: serde_json::Value = serde_json::from_str(&status)?;
-        let ready = value["status"]["authority"]["conditions"]
+        let ready = value["status"]["conditions"]
             .as_array()
             .is_some_and(|conditions| {
                 conditions
                     .iter()
                     .any(|condition| condition["type"] == "Ready" && condition["status"] == "true")
             });
-        let member = value["status"]["authority"]["topology"]["configuration"]["members"]
+        let member = value["status"]["topology"]["members"]
             .as_array()
             .and_then(|members| {
                 members
@@ -426,14 +426,14 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             ],
         )?;
         let value: serde_json::Value = serde_json::from_str(&status)?;
-        let ready = value["status"]["authority"]["conditions"]
+        let ready = value["status"]["conditions"]
             .as_array()
             .is_some_and(|conditions| {
                 conditions
                     .iter()
                     .any(|condition| condition["type"] == "Ready" && condition["status"] == "true")
             });
-        let replacement = value["status"]["authority"]["topology"]["configuration"]["members"]
+        let replacement = value["status"]["topology"]["members"]
             .as_array()
             .and_then(|members| {
                 members

@@ -136,17 +136,11 @@ message InitializeAgentStoreCommand {
 }
 
 message ProvisioningIntent {
-  string provisioning_id = 1;
-  string resource_uid = 2;
+  reserved 1, 2, 4, 5, 8, 9, 11;
   ReplicaIdentity replaces = 3;
-  int64 replica_id = 4;
-  string instance_id = 5;
   string pod_uid = 6;
   string pvc_uid = 7;
-  string initialization_id = 8;
-  string assigned_agent_generation = 9;
   string operation_id = 10;
-  int64 started_at_unix_seconds = 11;
 }
 
 enum BuildAuthorityKind {

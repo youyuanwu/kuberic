@@ -248,7 +248,7 @@ fn authority_replica_ids(status: &AcceptedStatus) -> BTreeSet<ReplicaId> {
                 .flat_map(|transition| &transition.current_configuration.members),
         )
         .map(|member| member.identity.replica_id)
-        .chain(status.provisioning.iter().map(|intent| intent.replica_id))
+        .chain(status.provisioning.iter().map(|intent| intent.replica_id()))
         .collect()
 }
 
@@ -417,6 +417,7 @@ fn insert_replica_observation(
             pod_uid,
             pvc_name: pvc.map(ResourceExt::name_any).unwrap_or_default(),
             pvc_uid,
+            image: pod.and_then(application_image),
             pod_ready: pod.is_some_and(pod_ready),
             peer_endpoint_ready,
         }),
@@ -428,6 +429,16 @@ fn insert_replica_observation(
             message: "multiple observations claim one exact replica incarnation".to_string(),
         });
     }
+}
+
+fn application_image(pod: &Pod) -> Option<String> {
+    pod.spec
+        .as_ref()?
+        .containers
+        .iter()
+        .find(|container| container.name == "application")?
+        .image
+        .clone()
 }
 
 fn exact_peer_endpoint_ready(

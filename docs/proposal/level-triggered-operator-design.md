@@ -257,8 +257,8 @@ Examples include:
 - operation ID;
 - operation kind;
 - target replica and exact incarnation;
-- provisioning ID and exact PVC UID for a fresh agent store;
-- start time or failover-delay timestamp.
+- exact Pod/PVC identity for a fresh agent store;
+- a persisted failure-observation timestamp when failover delay applies.
 
 ### Fail Closed
 
@@ -309,7 +309,7 @@ metadata:
 spec:
   replicas: 3
   image: example:v1
-  failoverDelay: 10
+  failoverDelaySeconds: 10
 status:
   initialized: true
   observedGeneration: 4
@@ -320,23 +320,33 @@ status:
       configurationNumber: 8
     primaryId: 2
     members:
-      - id: 1
-        instanceId: "..."
-      - id: 2
-        instanceId: "..."
-      - id: 3
-        instanceId: "..."
+      - identity:
+          replicaId: 1
+          instanceId: "..."
+          agentGeneration: "..."
+        role: activeSecondary
+      - identity:
+          replicaId: 2
+          instanceId: "..."
+          agentGeneration: "..."
+        role: primary
+      - identity:
+          replicaId: 3
+          instanceId: "..."
+          agentGeneration: "..."
+        role: activeSecondary
     writeQuorum: 2
   provisioning:
-    id: "..."
-    kind: Replacement
-    replicaId: 3
-    instanceId: "..."
+    replaces:
+      replicaId: 3
+      instanceId: "old-pod-uid"
+      agentGeneration: "old-generation"
+    podUid: "new-pod-uid"
     pvcUid: "..."
     operationId: "..."
   transition:
-    id: "..."
-    kind: Failover
+    transitionId: "..."
+    kind: failover
     specGeneration: 4
     effectivePolicy:
       replicaSetSize: 3
@@ -351,19 +361,24 @@ status:
         configurationNumber: 9
       primaryId: 2
       members:
-        - id: 1
-          instanceId: "..."
-          role: Secondary
-        - id: 2
-          instanceId: "..."
-          role: Primary
-        - id: 3
-          instanceId: "..."
-          role: Secondary
-    startedAt: "..."
+        - identity:
+            replicaId: 1
+            instanceId: "..."
+            agentGeneration: "..."
+          role: activeSecondary
+        - identity:
+            replicaId: 2
+            instanceId: "..."
+            agentGeneration: "..."
+          role: primary
+        - identity:
+            replicaId: 3
+            instanceId: "..."
+            agentGeneration: "..."
+          role: activeSecondary
   conditions:
     - type: Ready
-      status: "True"
+      status: "true"
       reason: Stable
 ```
 
@@ -445,10 +460,16 @@ The following invariants apply:
 15. A changed `spec.replicas` value does not authorize Kubernetes deletion,
     creation, or replication membership changes.
 16. `status.provisioning` never grants role, membership, quorum, or write
-    authority. Its resource UID, Pod UID, PVC UID, logical replica ID, and
-    initialization ID must match the `InitializeAgentStore` command.
+    authority. Its old exact identity, new Pod UID, new PVC UID, and operation
+    ID are persisted. The resource UID, logical replica ID, initialization ID,
+    and durable generation are derived and must match the
+    `InitializeAgentStore` command.
 17. At most one provisioning intent exists, and no unrelated membership
     transition begins while it is active.
+18. `status.observedGeneration` advances only after the accepted exact
+    incarnations report the requested image and the requested fixed policy
+    matches the frozen effective policy. Unsupported image, replica-count, or
+    failover-delay drift remains visible without mutating authority.
 
 ### Initialization Authority
 

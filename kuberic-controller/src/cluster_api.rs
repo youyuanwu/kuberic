@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -335,6 +335,7 @@ where
         )
         .await?;
         ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await?;
+        let image = effective_replica_image(observation)?;
         for replica_id in replica_ids {
             let pod_name = replica_name(&observation.set, *replica_id);
             let pvc_name = format!("{pod_name}-data");
@@ -367,6 +368,7 @@ where
                         &owner,
                         &pvc_name,
                         &pvc_uid,
+                        &image,
                     ),
                 )
                 .await?;
@@ -408,6 +410,7 @@ where
             .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
         let resource_uid = ResourceUid::new(&uid);
         let owner = owner_reference(&observation.set)?;
+        let image = effective_replica_image(observation)?;
         let base = derive_replacement_resource_name(&resource_uid, replacing);
         let pod_name = format!("{}-{base}", observation.set.name_any());
         let pvc_name = format!("{pod_name}-data");
@@ -443,6 +446,7 @@ where
                     &pod_name,
                     &pvc_name,
                     &pvc_uid,
+                    &image,
                 ),
             )
             .await?;
@@ -845,6 +849,7 @@ fn replica_pod(
     owner: &OwnerReference,
     pvc_name: &str,
     pvc_uid: &str,
+    image: &str,
 ) -> Pod {
     replica_pod_named(
         set,
@@ -854,6 +859,7 @@ fn replica_pod(
         &replica_name(set, replica_id),
         pvc_name,
         pvc_uid,
+        image,
     )
 }
 
@@ -866,6 +872,7 @@ fn replica_pod_named(
     pod_name: &str,
     pvc_name: &str,
     pvc_uid: &str,
+    image: &str,
 ) -> Pod {
     let labels = base_labels(set, Some(replica_id), uid);
     let credential_name = agent_credential_name(set);
@@ -887,7 +894,7 @@ fn replica_pod_named(
             }),
             containers: vec![Container {
                 name: "application".to_string(),
-                image: Some(set.spec.image.clone()),
+                image: Some(image.to_string()),
                 image_pull_policy: Some("IfNotPresent".to_string()),
                 ports: Some(vec![
                     ContainerPort {
@@ -998,6 +1005,62 @@ fn replica_pod_named(
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+fn effective_replica_image(observation: &RawObservation) -> Result<String> {
+    let authority = observation
+        .set
+        .status
+        .as_ref()
+        .map(|status| &status.authority);
+    let identities = authority
+        .and_then(|authority| {
+            authority
+                .transition
+                .as_ref()
+                .map(|transition| &transition.current_configuration.members)
+                .or_else(|| {
+                    authority
+                        .topology
+                        .as_ref()
+                        .map(|topology| &topology.configuration.members)
+                })
+        })
+        .into_iter()
+        .flatten()
+        .map(|member| &member.identity)
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        return Ok(observation.set.spec.image.clone());
+    }
+
+    let images = observation
+        .pods
+        .iter()
+        .filter(|pod| {
+            pod.uid().is_some_and(|uid| {
+                identities
+                    .iter()
+                    .any(|identity| identity.instance_id.as_str() == uid)
+            })
+        })
+        .filter_map(|pod| {
+            pod.spec
+                .as_ref()?
+                .containers
+                .iter()
+                .find(|container| container.name == "application")?
+                .image
+                .clone()
+        })
+        .collect::<BTreeSet<_>>();
+    match images.len() {
+        1 => Ok(images.into_iter().next().expect("one image")),
+        0 => Err(ControllerError::ObservationStale),
+        _ => Err(ControllerError::Effect(
+            "accepted replica incarnations run inconsistent images".to_string(),
+        )),
     }
 }
 
@@ -1486,17 +1549,10 @@ fn ensure_build_command(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuil
 
 fn provisioning(provisioning: ProvisioningIntent) -> proto::ProvisioningIntent {
     proto::ProvisioningIntent {
-        provisioning_id: provisioning.provisioning_id.to_string(),
-        resource_uid: provisioning.resource_uid.to_string(),
         replaces: Some(provisioning.replaces.into()),
-        replica_id: provisioning.replica_id.value(),
-        instance_id: provisioning.instance_id.to_string(),
         pod_uid: provisioning.pod_uid.to_string(),
         pvc_uid: provisioning.pvc_uid.to_string(),
-        initialization_id: provisioning.initialization_id.to_string(),
-        assigned_agent_generation: provisioning.assigned_agent_generation.to_string(),
         operation_id: provisioning.operation_id.to_string(),
-        started_at_unix_seconds: provisioning.started_at_unix_seconds,
     }
 }
 

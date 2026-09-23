@@ -27,6 +27,8 @@ pub struct KubernetesReplicaObservation {
     pub pod_uid: Option<PodUid>,
     pub pvc_name: String,
     pub pvc_uid: Option<PvcUid>,
+    #[serde(default)]
+    pub image: Option<String>,
     pub pod_ready: bool,
     #[serde(default)]
     pub peer_endpoint_ready: bool,

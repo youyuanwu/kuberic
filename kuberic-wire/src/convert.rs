@@ -11,9 +11,8 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId,
-    PodUid, ProcessSessionId, ProvisioningId, ProvisioningIntent, ProvisioningKind, PvcUid,
-    ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
-    derive_agent_generation,
+    PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind, derive_agent_generation,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
 use thiserror::Error;
@@ -451,11 +450,8 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 .try_into()?;
             if let Some(provisioning) = command.provisioning.clone() {
                 let provisioning = provisioning_from_proto(provisioning)?;
-                if provisioning.resource_uid.as_str() != request.resource_uid
-                    || provisioning.replica_id != target.replica_id
-                    || provisioning.instance_id != target.instance_id
-                    || provisioning.assigned_agent_generation != target.agent_generation
-                {
+                let resource_uid = ResourceUid::new(&request.resource_uid);
+                if provisioning.target_identity(&resource_uid) != target {
                     return Err(WireError::InvalidAuthority(
                         "initialize target differs from replacement provisioning".to_string(),
                     ));
@@ -1148,25 +1144,19 @@ fn provisioning_from_proto(
     provisioning: proto::ProvisioningIntent,
 ) -> Result<ProvisioningIntent, WireError> {
     let intent = ProvisioningIntent {
-        provisioning_id: ProvisioningId::new(provisioning.provisioning_id),
-        kind: ProvisioningKind::Replacement,
-        resource_uid: ResourceUid::new(provisioning.resource_uid),
         replaces: provisioning
             .replaces
             .ok_or(WireError::MissingField("provisioning.replaces"))?
             .try_into()?,
-        replica_id: ReplicaId::new(provisioning.replica_id),
-        instance_id: ReplicaInstanceId::new(provisioning.instance_id),
         pod_uid: PodUid::new(provisioning.pod_uid),
         pvc_uid: PvcUid::new(provisioning.pvc_uid),
-        initialization_id: InitializationId::new(provisioning.initialization_id),
-        assigned_agent_generation: AgentGeneration::new(provisioning.assigned_agent_generation),
         operation_id: OperationId::new(provisioning.operation_id),
-        started_at_unix_seconds: provisioning.started_at_unix_seconds,
     };
-    if intent.provisioning_id.is_empty()
-        || intent.resource_uid.is_empty()
-        || intent.operation_id.is_empty()
+    if intent.operation_id.is_empty()
+        || intent.pod_uid.is_empty()
+        || intent.pvc_uid.is_empty()
+        || intent.replaces.instance_id.is_empty()
+        || intent.replaces.agent_generation.is_empty()
     {
         return Err(WireError::InvalidAuthority(
             "replacement provisioning identifiers must not be empty".to_string(),

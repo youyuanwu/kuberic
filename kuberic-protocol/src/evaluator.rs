@@ -8,10 +8,10 @@ use crate::observation::{AgentObservation, ObservationSnapshot};
 use crate::plan::{Plan, UnsafeReason, WaitReason};
 use crate::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, ConditionStatus, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, ProvisioningIntent, ProvisioningKind,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, StatusCondition, TransitionIntent,
-    TransitionKind, derive_agent_generation, derive_initialization_id, derive_provisioning_id,
-    derive_replacement_operation_id, derive_transition_id,
+    ConfigurationMember, EffectivePolicy, Epoch, OperationId, ProvisioningIntent, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, StatusCondition, TransitionIntent, TransitionKind,
+    derive_agent_generation, derive_initialization_id, derive_replacement_operation_id,
+    derive_transition_id,
 };
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
@@ -91,15 +91,16 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         .as_ref()
         .expect("validated initialized status has topology");
     let configuration = &topology.configuration;
-    let frozen_size = configuration.members.len() as u32;
     let mut status = clear_evaluator_conditions(snapshot.status.clone());
-    let unsupported = snapshot.desired.replicas != frozen_size;
-    if unsupported {
-        status = status.with_condition(unsupported_replica_count_condition(
-            snapshot.desired.replicas,
-            frozen_size,
-        ));
-    } else {
+    let policy = snapshot
+        .status
+        .effective_policy
+        .as_ref()
+        .expect("validated initialized status has effective policy");
+    let (spec_fully_observed, unsupported) = desired_spec_state(snapshot, configuration, policy);
+    if let Some(condition) = unsupported {
+        status = status.with_condition(condition);
+    } else if spec_fully_observed {
         status.observed_generation = snapshot.desired.generation;
     }
 
@@ -153,7 +154,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 })
                 && matches!(observation.agent, AgentObservation::Uninitialized(_))
         });
-        let Some((key, observation)) = candidate else {
+        let Some((_key, observation)) = candidate else {
             return Plan::Apply {
                 changes: vec![KubernetesChange::EnsureReplacementScaffolding {
                     replica_id: failed.identity.replica_id,
@@ -173,31 +174,16 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
             .pvc_uid
             .clone()
             .expect("replacement candidate has PVC UID");
-        let initialization_id = derive_initialization_id(
-            &snapshot.resource_uid,
-            failed.identity.replica_id,
-            &pod_uid,
-            &pvc_uid,
-        );
-        let provisioning_id = derive_provisioning_id(&snapshot.resource_uid, &failed.identity);
         let mut replacement_status = waiting_status(
             status,
             "ReplacementProvisioning",
             "Persisting one exact replacement outside authority",
         );
         replacement_status.provisioning = Some(ProvisioningIntent {
-            provisioning_id: provisioning_id.clone(),
-            kind: ProvisioningKind::Replacement,
-            resource_uid: snapshot.resource_uid.clone(),
             replaces: failed.identity.clone(),
-            replica_id: failed.identity.replica_id,
-            instance_id: key.instance_id.clone(),
             pod_uid,
             pvc_uid,
-            initialization_id: initialization_id.clone(),
-            assigned_agent_generation: derive_agent_generation(&initialization_id),
-            operation_id: derive_replacement_operation_id(&provisioning_id),
-            started_at_unix_seconds: snapshot.now_unix_seconds,
+            operation_id: derive_replacement_operation_id(&snapshot.resource_uid, &failed.identity),
         });
         return Plan::Apply {
             changes: vec![KubernetesChange::PersistStatus {
@@ -421,6 +407,18 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
             requeue_after_seconds: config.wait_requeue_seconds,
         };
     }
+    if let Some(stale) = snapshot.replicas.values().find_map(|observation| {
+        observation.kubernetes.as_ref().filter(|kubernetes| {
+            kubernetes
+                .image
+                .as_deref()
+                .is_some_and(|image| image != snapshot.desired.image)
+        })
+    }) {
+        return Plan::Apply {
+            changes: vec![delete_scaffolding_change(stale)],
+        };
+    }
 
     let primary_id = snapshot
         .intended_replica_ids()
@@ -470,7 +468,6 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
         previous_configuration_id: None,
         current_configuration,
         build_id: None,
-        started_at_unix_seconds: snapshot.now_unix_seconds,
     };
     let mut status = snapshot.status.clone();
     status.transition = Some(transition);
@@ -491,11 +488,13 @@ fn evaluate_transition(
     config: &EvaluationConfig,
 ) -> Plan {
     let mut status = transition_status(snapshot.status.clone());
-    if snapshot.desired.replicas != transition.effective_policy.replica_set_size {
-        status = status.with_condition(unsupported_replica_count_condition(
-            snapshot.desired.replicas,
-            transition.effective_policy.replica_set_size,
-        ));
+    let (_, unsupported) = desired_spec_state(
+        snapshot,
+        &transition.current_configuration,
+        &transition.effective_policy,
+    );
+    if let Some(condition) = unsupported {
+        status = status.with_condition(condition);
     }
     if status != snapshot.status {
         return Plan::Apply {
@@ -654,7 +653,6 @@ fn evaluate_transition(
             previous_configuration_id: None,
             current_configuration: current,
             build_id: None,
-            started_at_unix_seconds: snapshot.now_unix_seconds,
         });
         superseded = waiting_status(
             superseded,
@@ -766,11 +764,7 @@ fn evaluate_provisioning(
         "ProvisioningInProgress",
         "An exact replacement remains outside authority",
     );
-    let target_identity = ReplicaIdentity {
-        replica_id: provisioning.replica_id,
-        instance_id: provisioning.instance_id.clone(),
-        agent_generation: provisioning.assigned_agent_generation.clone(),
-    };
+    let target_identity = provisioning.target_identity(&snapshot.resource_uid);
     let Some(observation) = snapshot.observation_for_identity(&target_identity) else {
         status.provisioning = None;
         return Plan::Apply {
@@ -782,13 +776,14 @@ fn evaluate_provisioning(
     match &observation.agent {
         AgentObservation::Uninitialized(report) => Plan::Execute {
             command: ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {
-                initialization_id: provisioning.initialization_id.clone(),
-                resource_uid: provisioning.resource_uid.clone(),
-                local_replica_id: provisioning.replica_id,
-                expected_instance_id: provisioning.instance_id.clone(),
+                initialization_id: provisioning.initialization_id(&snapshot.resource_uid),
+                resource_uid: snapshot.resource_uid.clone(),
+                local_replica_id: provisioning.replica_id(),
+                expected_instance_id: provisioning.instance_id(),
                 expected_pod_uid: report.pod_uid.clone(),
                 expected_pvc_uid: report.pvc_uid.clone(),
-                assigned_agent_generation: provisioning.assigned_agent_generation.clone(),
+                assigned_agent_generation: provisioning
+                    .assigned_agent_generation(&snapshot.resource_uid),
                 effective_policy: snapshot
                     .status
                     .effective_policy
@@ -892,12 +887,11 @@ fn evaluate_provisioning(
                     &current.configuration_id,
                 ),
                 kind: TransitionKind::Replacement,
-                spec_generation: snapshot.desired.generation,
+                spec_generation: snapshot.status.observed_generation,
                 effective_policy: policy,
                 previous_configuration_id: Some(topology.configuration_id.clone()),
                 current_configuration: current,
                 build_id: Some(provisioning.operation_id.clone()),
-                started_at_unix_seconds: snapshot.now_unix_seconds,
             });
             transition_status = waiting_status(
                 transition_status,
@@ -1404,6 +1398,61 @@ fn unsupported_replica_count_condition(requested: u32, frozen: u32) -> StatusCon
             "requested replica count {requested} differs from frozen replica-set size {frozen}"
         ),
     }
+}
+
+fn desired_spec_state(
+    snapshot: &ObservationSnapshot,
+    configuration: &ConfigurationDescriptor,
+    policy: &EffectivePolicy,
+) -> (bool, Option<StatusCondition>) {
+    let mut differences = Vec::new();
+    if snapshot.desired.replicas != policy.replica_set_size {
+        differences.push(format!(
+            "requested replica count {} differs from frozen replica-set size {}",
+            snapshot.desired.replicas, policy.replica_set_size
+        ));
+    }
+    if snapshot.desired.failover_delay_seconds != policy.failover_delay_seconds {
+        differences.push(format!(
+            "requested failover delay {} differs from frozen delay {}",
+            snapshot.desired.failover_delay_seconds, policy.failover_delay_seconds
+        ));
+    }
+
+    let mut observed_images = 0_usize;
+    for member in &configuration.members {
+        let Some(image) = snapshot
+            .observation_for_identity(&member.identity)
+            .and_then(|observation| observation.kubernetes.as_ref())
+            .and_then(|kubernetes| kubernetes.image.as_deref())
+        else {
+            continue;
+        };
+        observed_images += 1;
+        if image != snapshot.desired.image {
+            differences.push(format!(
+                "replica {} runs image {image} instead of requested image {}",
+                member.identity.replica_id, snapshot.desired.image
+            ));
+        }
+    }
+
+    if differences.is_empty() {
+        return (observed_images == configuration.members.len(), None);
+    }
+
+    let condition =
+        if differences.len() == 1 && snapshot.desired.replicas != policy.replica_set_size {
+            unsupported_replica_count_condition(snapshot.desired.replicas, policy.replica_set_size)
+        } else {
+            StatusCondition {
+                type_: "UnsupportedSpec".to_string(),
+                status: ConditionStatus::True,
+                reason: "SpecDriftUnsupported".to_string(),
+                message: differences.join("; "),
+            }
+        };
+    (false, Some(condition))
 }
 
 fn waiting_status(status: AcceptedStatus, reason: &str, message: &str) -> AcceptedStatus {

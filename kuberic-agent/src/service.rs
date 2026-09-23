@@ -183,7 +183,6 @@ impl InitializationService {
             previous_configuration_id: None,
             current_configuration: command.bootstrap_configuration.clone(),
             build_id: None,
-            started_at_unix_seconds: 0,
         };
         let authority = command.provisioning.as_ref().map_or(
             InitializationAuthority::Bootstrap(&transition),

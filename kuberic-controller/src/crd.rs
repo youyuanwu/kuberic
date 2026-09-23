@@ -22,7 +22,7 @@ pub const CONTROL_ADDRESS_ANNOTATION: &str = "operator.kuberic.io/control-addres
     namespaced,
     status = "KubericSetStatus",
     printcolumn = r#"{"name":"Replicas","type":"integer","jsonPath":".spec.replicas"}"#,
-    printcolumn = r#"{"name":"Initialized","type":"boolean","jsonPath":".status.authority.initialized"}"#,
+    printcolumn = r#"{"name":"Initialized","type":"boolean","jsonPath":".status.initialized"}"#,
     printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
@@ -38,6 +38,7 @@ pub struct KubericSetSpec {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KubericSetStatus {
+    #[serde(flatten)]
     pub authority: AcceptedStatus,
 }
 
@@ -68,11 +69,30 @@ mod tests {
             ["properties"]["replicas"];
         assert_eq!(replicas["minimum"].as_f64(), Some(1.0));
 
-        let authority = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
-            ["properties"]["authority"];
-        let required = authority["required"].as_array().unwrap();
+        let status =
+            &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"];
+        let required = status["required"].as_array().unwrap();
         assert!(required.iter().any(|value| value == "initialized"));
         assert!(required.iter().any(|value| value == "observedGeneration"));
+        assert!(status["properties"].get("authority").is_none());
+        let topology = &status["properties"]["topology"];
+        assert!(topology["properties"].get("configuration").is_none());
+        assert!(topology["properties"].get("members").is_some());
+        let provisioning = &status["properties"]["provisioning"]["properties"];
+        assert_eq!(
+            provisioning
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["operationId", "podUid", "pvcUid", "replaces"])
+        );
+        assert!(
+            status["properties"]["transition"]["properties"]
+                .get("startedAtUnixSeconds")
+                .is_none()
+        );
     }
 
     #[test]
@@ -82,7 +102,7 @@ mod tests {
             "kind": "KubericSet",
             "metadata": {"name": "db"},
             "spec": {"replicas": 3, "image": "example/db:latest"},
-            "status": {"authority": {"initialized": "yes"}}
+            "status": {"initialized": "yes"}
         });
         assert!(serde_json::from_value::<KubericSet>(value).is_err());
     }

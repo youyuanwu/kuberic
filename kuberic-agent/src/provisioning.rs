@@ -94,13 +94,14 @@ pub fn authorize_initialization(
             }
         }
         InitializationAuthority::Replacement(provisioning) => {
-            if provisioning.resource_uid != command.resource_uid
-                || provisioning.replica_id != command.local_replica_id
-                || provisioning.instance_id != command.expected_instance_id
+            if provisioning.replica_id() != command.local_replica_id
+                || provisioning.instance_id() != command.expected_instance_id
                 || provisioning.pod_uid != command.expected_pod_uid
                 || provisioning.pvc_uid != command.expected_pvc_uid
-                || provisioning.initialization_id != command.initialization_id
-                || provisioning.assigned_agent_generation != command.assigned_agent_generation
+                || provisioning.initialization_id(&command.resource_uid)
+                    != command.initialization_id
+                || provisioning.assigned_agent_generation(&command.resource_uid)
+                    != command.assigned_agent_generation
             {
                 return Err(AgentError::InitializationNotAuthorized(
                     "command does not match persisted replacement provisioning".into(),

@@ -11,9 +11,9 @@ use kuberic_protocol::plan::{Plan, UnsafeReason, WaitReason};
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, OperationId, PodUid, ProcessSessionId,
-    ProvisioningId, ProvisioningIntent, ProvisioningKind, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionIntent, TransitionKind,
-    derive_agent_generation, derive_initialization_id, derive_transition_id,
+    ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    ResourceUid, TransitionIntent, TransitionKind, derive_agent_generation,
+    derive_initialization_id, derive_transition_id,
 };
 use kuberic_protocol::validation::{
     ValidationError, validate_configuration, validate_transition_relationship,
@@ -89,6 +89,7 @@ fn scaffolded_snapshot() -> ObservationSnapshot {
                     pod_uid: Some(PodUid::new(format!("pod-uid-{id}"))),
                     pvc_name: format!("example-{id}"),
                     pvc_uid: Some(PvcUid::new(format!("pvc-uid-{id}"))),
+                    image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
                 }),
@@ -119,7 +120,16 @@ fn attest_stable_topology(
                 member.identity.instance_id.clone(),
             ),
             ReplicaObservation {
-                kubernetes: None,
+                kubernetes: Some(KubernetesReplicaObservation {
+                    replica_id: member.identity.replica_id,
+                    pod_name: format!("pod-{}", member.identity.replica_id),
+                    pod_uid: Some(PodUid::new(member.identity.instance_id.as_str())),
+                    pvc_name: format!("pvc-{}", member.identity.replica_id),
+                    pvc_uid: Some(PvcUid::new(format!("pvc-{}", member.identity.replica_id))),
+                    image: Some("example:v1".to_string()),
+                    pod_ready: true,
+                    peer_endpoint_ready: true,
+                }),
                 agent: AgentObservation::Report(Box::new(AgentReport {
                     protocol_version: kuberic_protocol::PROTOCOL_VERSION,
                     resource_uid: snapshot.resource_uid.clone(),
@@ -172,6 +182,29 @@ fn configuration_id_is_canonical_across_member_order() {
 
     assert_eq!(first.configuration_id, second.configuration_id);
     assert_eq!(first.members, second.members);
+}
+
+#[test]
+fn bootstrap_recreates_fresh_scaffolding_with_drifted_image() {
+    let mut snapshot = scaffolded_snapshot();
+    snapshot
+        .replicas
+        .values_mut()
+        .next()
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap()
+        .image = Some("example:old".to_string());
+
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Apply { changes }
+            if matches!(
+                changes.first(),
+                Some(KubernetesChange::DeleteReplicaScaffolding { .. })
+            )
+    ));
 }
 
 #[test]
@@ -667,18 +700,10 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
             configuration: accepted.clone(),
         }),
         provisioning: Some(ProvisioningIntent {
-            provisioning_id: ProvisioningId::new("provisioning"),
-            kind: ProvisioningKind::Replacement,
-            resource_uid: snapshot.resource_uid.clone(),
             replaces: old_identity.clone(),
-            replica_id: ReplicaId::new(3),
-            instance_id: replacement_identity.instance_id.clone(),
             pod_uid: PodUid::new("replacement-pod"),
             pvc_uid: PvcUid::new("replacement-pvc"),
-            initialization_id,
-            assigned_agent_generation: replacement_identity.agent_generation.clone(),
             operation_id: OperationId::new("replacement-operation"),
-            started_at_unix_seconds: 100,
         }),
         ..AcceptedStatus::default()
     };
@@ -784,7 +809,6 @@ fn active_transition_keeps_frozen_policy_after_spec_change() {
         previous_configuration_id: None,
         current_configuration,
         build_id: None,
-        started_at_unix_seconds: 100,
     };
     let mut snapshot = empty_snapshot(5);
     snapshot.status.transition = Some(transition);
@@ -833,6 +857,38 @@ fn stable_topology_does_not_apply_unsupported_scale_request() {
             .reason,
         "ReplicaCountImmutable"
     );
+}
+
+#[test]
+fn stable_topology_does_not_observe_unapplied_image_or_policy_drift() {
+    let configuration = configuration();
+    let mut snapshot = empty_snapshot(3);
+    snapshot.desired.generation = 2;
+    snapshot.desired.image = "example:v2".to_string();
+    snapshot.desired.failover_delay_seconds = 20;
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        observed_generation: 1,
+        effective_policy: Some(EffectivePolicy::fixed(3, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: configuration.clone(),
+        }),
+        ..AcceptedStatus::default()
+    };
+    attest_stable_topology(&mut snapshot, &configuration);
+
+    let Plan::Stable { status, .. } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("expected unsupported spec projection");
+    };
+    assert_eq!(status.observed_generation, 1);
+    let unsupported = status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "UnsupportedSpec")
+        .expect("unsupported spec condition");
+    assert_eq!(unsupported.reason, "SpecDriftUnsupported");
+    assert!(unsupported.message.contains("failover delay"));
+    assert!(unsupported.message.contains("example:v2"));
 }
 
 #[test]
@@ -1122,6 +1178,7 @@ fn accepted_incarnation_missing_its_store_is_unsafe() {
                 pod_uid: Some(PodUid::new(primary.instance_id.as_str())),
                 pvc_name: "primary".to_string(),
                 pvc_uid: Some(PvcUid::new("established-pvc")),
+                image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
             }),
@@ -1211,6 +1268,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
                     pod_uid: None,
                     pvc_name: "old-data".to_string(),
                     pvc_uid: Some(PvcUid::new("old-pvc")),
+                    image: Some("example:v1".to_string()),
                     pod_ready: false,
                     peer_endpoint_ready: false,
                 }),
@@ -1249,6 +1307,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
                     pod_uid: Some(pod_uid.clone()),
                     pvc_name: "replacement-data".to_string(),
                     pvc_uid: Some(pvc_uid.clone()),
+                    image: Some("example:v1".to_string()),
                     pod_ready: true,
                     peer_endpoint_ready: true,
                 }),
@@ -1275,7 +1334,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
             .expect("replacement provisioning status");
         let provisioning = provisioning_status.provisioning.clone().unwrap();
         assert_eq!(provisioning.replaces, replacing);
-        assert_eq!(provisioning.instance_id, target.instance_id);
+        assert_eq!(provisioning.instance_id(), target.instance_id);
 
         snapshot.status = provisioning_status;
         let primary = accepted
@@ -1411,7 +1470,6 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
             previous_configuration_id: Some(previous.configuration_id.clone()),
             current_configuration: current.clone(),
             build_id: Some(OperationId::new("replacement-build")),
-            started_at_unix_seconds: 100,
         }),
         ..AcceptedStatus::default()
     };
@@ -1525,6 +1583,7 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
                 pod_uid: Some(PodUid::new(member.identity.instance_id.as_str())),
                 pvc_name: "replacement-data".to_string(),
                 pvc_uid: Some(PvcUid::new("replacement-pvc")),
+                image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
             }),
@@ -1555,6 +1614,7 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
                 pod_uid: None,
                 pvc_name: "old-data".to_string(),
                 pvc_uid: Some(PvcUid::new("old-pvc")),
+                image: Some("example:v1".to_string()),
                 pod_ready: false,
                 peer_endpoint_ready: false,
             }),
@@ -1585,12 +1645,6 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
         .clone();
     let pod_uid = PodUid::new("lost-target");
     let pvc_uid = PvcUid::new("lost-target-pvc");
-    let initialization_id = derive_initialization_id(
-        &ResourceUid::new("resource-uid"),
-        replacing.replica_id,
-        &pod_uid,
-        &pvc_uid,
-    );
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
@@ -1599,18 +1653,10 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            provisioning_id: ProvisioningId::new("lost-provisioning"),
-            kind: ProvisioningKind::Replacement,
-            resource_uid: snapshot.resource_uid.clone(),
             replaces: replacing.clone(),
-            replica_id: replacing.replica_id,
-            instance_id: ReplicaInstanceId::new(pod_uid.as_str()),
             pod_uid,
             pvc_uid,
-            initialization_id: initialization_id.clone(),
-            assigned_agent_generation: derive_agent_generation(&initialization_id),
             operation_id: OperationId::new("lost-build"),
-            started_at_unix_seconds: 100,
         }),
         ..AcceptedStatus::default()
     };
@@ -1682,7 +1728,6 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             previous_configuration_id: Some(previous.configuration_id.clone()),
             current_configuration: current.clone(),
             build_id: Some(OperationId::new("replacement-build")),
-            started_at_unix_seconds: 100,
         }),
         ..AcceptedStatus::default()
     };
@@ -1780,6 +1825,7 @@ fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
                 pod_uid: None,
                 pvc_name: "old-genesis-data".to_string(),
                 pvc_uid: Some(PvcUid::new("old-genesis-pvc")),
+                image: Some("example:v1".to_string()),
                 pod_ready: false,
                 peer_endpoint_ready: false,
             }),
@@ -1814,6 +1860,7 @@ fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
                 pod_uid: Some(pod_uid.clone()),
                 pvc_name: "new-genesis-data".to_string(),
                 pvc_uid: Some(pvc_uid.clone()),
+                image: Some("example:v1".to_string()),
                 pod_ready: true,
                 peer_endpoint_ready: true,
             }),

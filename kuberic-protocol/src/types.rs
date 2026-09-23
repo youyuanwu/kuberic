@@ -56,7 +56,6 @@ string_id!(AgentGeneration);
 string_id!(ProcessSessionId);
 string_id!(ConfigurationId);
 string_id!(TransitionId);
-string_id!(ProvisioningId);
 string_id!(InitializationId);
 string_id!(OperationId);
 
@@ -274,32 +273,49 @@ impl EffectivePolicy {
 #[serde(rename_all = "camelCase")]
 /// Last quorum-attested configuration accepted by the operator.
 pub struct AcceptedTopology {
+    #[serde(flatten)]
     pub configuration: ConfigurationDescriptor,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-/// Supported out-of-authority provisioning operation.
-pub enum ProvisioningKind {
-    Replacement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Compact intent for one fresh replica that has not entered PC or CC.
 pub struct ProvisioningIntent {
-    pub provisioning_id: ProvisioningId,
-    pub kind: ProvisioningKind,
-    pub resource_uid: ResourceUid,
     pub replaces: ReplicaIdentity,
-    pub replica_id: ReplicaId,
-    pub instance_id: ReplicaInstanceId,
     pub pod_uid: PodUid,
     pub pvc_uid: PvcUid,
-    pub initialization_id: InitializationId,
-    pub assigned_agent_generation: AgentGeneration,
     pub operation_id: OperationId,
-    pub started_at_unix_seconds: i64,
+}
+
+impl ProvisioningIntent {
+    pub fn replica_id(&self) -> ReplicaId {
+        self.replaces.replica_id
+    }
+
+    pub fn instance_id(&self) -> ReplicaInstanceId {
+        ReplicaInstanceId::new(self.pod_uid.as_str())
+    }
+
+    pub fn initialization_id(&self, resource_uid: &ResourceUid) -> InitializationId {
+        derive_initialization_id(
+            resource_uid,
+            self.replica_id(),
+            &self.pod_uid,
+            &self.pvc_uid,
+        )
+    }
+
+    pub fn assigned_agent_generation(&self, resource_uid: &ResourceUid) -> AgentGeneration {
+        derive_agent_generation(&self.initialization_id(resource_uid))
+    }
+
+    pub fn target_identity(&self, resource_uid: &ResourceUid) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: self.replica_id(),
+            instance_id: self.instance_id(),
+            agent_generation: self.assigned_agent_generation(resource_uid),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -392,7 +408,6 @@ pub struct TransitionIntent {
     pub current_configuration: ConfigurationDescriptor,
     #[serde(default)]
     pub build_id: Option<OperationId>,
-    pub started_at_unix_seconds: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -476,12 +491,12 @@ pub fn derive_transition_id(
     ))
 }
 
-pub fn derive_provisioning_id(
+pub fn derive_replacement_operation_id(
     resource_uid: &ResourceUid,
     replacing: &ReplicaIdentity,
-) -> ProvisioningId {
-    ProvisioningId::new(format!(
-        "provisioning-{}",
+) -> OperationId {
+    OperationId::new(format!(
+        "replacement-provisioning-{}",
         digest_parts(&[
             resource_uid.as_str(),
             &replacing.replica_id.to_string(),
@@ -489,10 +504,6 @@ pub fn derive_provisioning_id(
             replacing.agent_generation.as_str(),
         ])
     ))
-}
-
-pub fn derive_replacement_operation_id(provisioning_id: &ProvisioningId) -> OperationId {
-    OperationId::new(format!("replacement-{provisioning_id}"))
 }
 
 pub fn derive_replica_endpoint_name(
