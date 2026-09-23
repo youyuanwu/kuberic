@@ -69,6 +69,7 @@ fn empty_snapshot(replicas: u32) -> ObservationSnapshot {
         replicas: BTreeMap::new(),
         previous_report_watermarks: BTreeMap::new(),
         durable_storage_evidence: false,
+        supporting_resources_ready: true,
         routing: RoutingObservation::default(),
         observation_failures: Vec::new(),
         now_unix_seconds: 100,
@@ -276,6 +277,17 @@ fn missing_scaffolding_produces_apply() {
             }],
         }
     );
+}
+
+#[test]
+fn missing_replica_support_converges_before_authority_changes() {
+    let mut snapshot = scaffolded_snapshot();
+    snapshot.supporting_resources_ready = false;
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Apply { changes }
+            if changes == vec![KubernetesChange::EnsureReplicaSupport]
+    ));
 }
 
 #[test]

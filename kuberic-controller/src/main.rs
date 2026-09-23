@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
 use kube::Api;
 use kube::ResourceExt;
 use kube::runtime::controller::{Action, Controller};
@@ -52,11 +52,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sets = Api::<KubericSet>::all(client.clone());
     let pods = Api::<Pod>::all(client.clone());
     let pvcs = Api::<PersistentVolumeClaim>::all(client.clone());
-    let services = Api::<Service>::all(client);
+    let services = Api::<Service>::all(client.clone());
+    let secrets = Api::<Secret>::all(client);
     Controller::new(sets, watcher::Config::default())
         .owns(pods, watcher::Config::default())
         .owns(pvcs, watcher::Config::default())
         .owns(services, watcher::Config::default())
+        .owns(secrets, watcher::Config::default())
         .run(
             move |set: Arc<KubericSet>, _| {
                 let reconciler = reconciler.clone();

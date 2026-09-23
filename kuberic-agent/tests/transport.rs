@@ -154,6 +154,9 @@ fn reliable_transport_attaches_sessions_retires_acks_and_falls_back_to_copy() {
     transport
         .queue(OutboundOperation::Replication(item(2)))
         .unwrap();
+    transport
+        .admit_peer(receiver.clone(), ProcessSessionId::new("secondary-session"))
+        .unwrap();
     assert!(
         transport
             .queue(OutboundOperation::Replication(item(3)))

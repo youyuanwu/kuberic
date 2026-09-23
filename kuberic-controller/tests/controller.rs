@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
     PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Pod, PodCondition, PodSpec,
-    PodStatus, Service, ServiceSpec, Volume,
+    PodStatus, Secret, Service, ServicePort, ServiceSpec, Volume,
 };
+use kube::ResourceExt;
 use kuberic_controller::ControllerError;
 use kuberic_controller::cluster_api::{EffectRecord, InMemoryClusterApi};
 use kuberic_controller::crd::{
@@ -52,7 +53,8 @@ fn raw(replicas: u32) -> RawObservation {
         set,
         pods: Vec::new(),
         pvcs: Vec::new(),
-        services: Vec::new(),
+        services: vec![peer_service()],
+        secrets: vec![credential_secret()],
         agents: BTreeMap::new(),
         failures: Vec::new(),
         now_unix_seconds: 100,
@@ -131,6 +133,55 @@ fn write_service(instance: &str) -> Service {
     }
 }
 
+fn peer_service() -> Service {
+    Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some("db-peer".to_string()),
+            labels: Some(BTreeMap::from([(
+                SET_UID_LABEL.to_string(),
+                UID.to_string(),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            cluster_ip: Some("None".to_string()),
+            publish_not_ready_addresses: Some(true),
+            ports: Some(vec![
+                ServicePort {
+                    name: Some("control".to_string()),
+                    port: 50051,
+                    ..Default::default()
+                },
+                ServicePort {
+                    name: Some("replication".to_string()),
+                    port: 50052,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn credential_secret() -> Secret {
+    Secret {
+        metadata: kube::core::ObjectMeta {
+            name: Some("db-agent-credentials".to_string()),
+            labels: Some(BTreeMap::from([(
+                SET_UID_LABEL.to_string(),
+                UID.to_string(),
+            )])),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            "bearer-token".to_string(),
+            k8s_openapi::ByteString(b"token".to_vec()),
+        )])),
+        ..Default::default()
+    }
+}
+
 fn fresh_bootstrap_observation() -> RawObservation {
     let mut observation = with_scaffolding(raw(1));
     observation.services.push(write_service("disabled"));
@@ -143,7 +194,11 @@ fn fresh_bootstrap_observation() -> RawObservation {
 
 fn bootstrap_status(raw: &RawObservation) -> AcceptedStatus {
     let mut candidate = raw.clone();
-    if candidate.services.is_empty() {
+    if !candidate
+        .services
+        .iter()
+        .any(|service| service.name_any() == "db-write")
+    {
         candidate.services.push(write_service("disabled"));
     }
     candidate.agents.insert(
@@ -584,7 +639,9 @@ async fn unresolved_routing_is_fenced_before_ready() {
 #[tokio::test]
 async fn missing_write_service_is_recreated() {
     let mut observation = stable_observation();
-    observation.services.clear();
+    observation
+        .services
+        .retain(|service| service.name_any() == "db-peer");
     let api = Arc::new(InMemoryClusterApi::new(observation));
     let action = Reconciler::new(api.clone(), config())
         .reconcile("tests", "db")
@@ -596,7 +653,44 @@ async fn missing_write_service_is_recreated() {
             .await
             .contains(&EffectRecord::EnsureWriteRoutingService)
     );
-    assert_eq!(api.observation().await.services.len(), 1);
+    let services = api.observation().await.services;
+    assert_eq!(services.len(), 2);
+    assert!(
+        services
+            .iter()
+            .any(|service| service.name_any() == "db-write")
+    );
+}
+
+#[tokio::test]
+async fn stable_state_recreates_missing_replica_support() {
+    let mut missing_peer = stable_observation();
+    missing_peer
+        .services
+        .retain(|service| service.name_any() != "db-peer");
+    let peer_api = Arc::new(InMemoryClusterApi::new(missing_peer));
+    let action = Reconciler::new(peer_api.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap();
+    assert_eq!(action.kind, ReconcileKind::Applied);
+    assert!(matches!(
+        peer_api.effects().await.as_slice(),
+        [EffectRecord::EnsureReplicaSupport]
+    ));
+
+    let mut missing_secret = stable_observation();
+    missing_secret.secrets.clear();
+    let secret_api = Arc::new(InMemoryClusterApi::new(missing_secret));
+    let action = Reconciler::new(secret_api.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap();
+    assert_eq!(action.kind, ReconcileKind::Applied);
+    assert!(matches!(
+        secret_api.effects().await.as_slice(),
+        [EffectRecord::EnsureReplicaSupport]
+    ));
 }
 
 #[tokio::test]

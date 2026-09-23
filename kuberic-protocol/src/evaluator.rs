@@ -61,6 +61,11 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
             requeue_after_seconds: config.wait_requeue_seconds,
         };
     }
+    if !snapshot.supporting_resources_ready {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::EnsureReplicaSupport],
+        };
+    }
 
     if let Some(transition) = &snapshot.status.transition {
         return evaluate_transition(snapshot, transition, config);

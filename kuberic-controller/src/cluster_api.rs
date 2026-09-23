@@ -35,6 +35,7 @@ const REPLICATION_PORT: i32 = 50052;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
+    EnsureReplicaSupport,
     EnsureScaffolding(Vec<ReplicaId>),
     EnsureWriteRoutingService,
     ReplaceStatus,
@@ -75,6 +76,8 @@ pub trait ClusterApi: Send + Sync {
         observation: &RawObservation,
         replica_ids: &[ReplicaId],
     ) -> Result<()>;
+
+    async fn ensure_replica_support(&self, observation: &RawObservation) -> Result<()>;
 
     async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()>;
 
@@ -217,16 +220,19 @@ where
         let pods_api: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let pvcs_api: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
         let services_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let secrets_api: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
         let params = ListParams::default().labels(&selector);
-        let (pods_result, pvcs_result, services_result) = tokio::join!(
+        let (pods_result, pvcs_result, services_result, secrets_result) = tokio::join!(
             pods_api.list(&params),
             pvcs_api.list(&params),
-            services_api.list(&params)
+            services_api.list(&params),
+            secrets_api.list(&params)
         );
         let mut failures = Vec::new();
         let pods = list_or_failure(pods_result, "pods", &mut failures);
         let pvcs = list_or_failure(pvcs_result, "pvcs", &mut failures);
         let services = list_or_failure(services_result, "services", &mut failures);
+        let secrets = list_or_failure(secrets_result, "secrets", &mut failures);
         let resource_uid = ResourceUid::new(uid);
         let agent_requests = pods
             .iter()
@@ -262,6 +268,7 @@ where
             pods,
             pvcs,
             services,
+            secrets,
             agents,
             failures,
             now_unix_seconds: SystemTime::now()
@@ -335,6 +342,28 @@ where
             }
         }
         ensure_write_service(self.client.clone(), observation, &namespace, &uid, &owner).await
+    }
+
+    async fn ensure_replica_support(&self, observation: &RawObservation) -> Result<()> {
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        let uid = observation
+            .set
+            .uid()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let owner = owner_reference(&observation.set)?;
+        ensure_agent_credentials(
+            self.client.clone(),
+            observation,
+            &namespace,
+            &uid,
+            &owner,
+            &self.bearer_token,
+        )
+        .await?;
+        ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await
     }
 
     async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()> {
@@ -1188,6 +1217,69 @@ impl ClusterApi for InMemoryClusterApi {
             .await
             .effects
             .push(EffectRecord::EnsureScaffolding(replica_ids.to_vec()));
+        Ok(())
+    }
+
+    async fn ensure_replica_support(&self, observation: &RawObservation) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let uid = observation
+            .set
+            .uid()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let peer_name = format!("{}-peer", observation.set.name_any());
+        if !state
+            .observation
+            .services
+            .iter()
+            .any(|service| service.name_any() == peer_name)
+        {
+            state.observation.services.push(Service {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(peer_name),
+                    labels: Some(BTreeMap::from([(SET_UID_LABEL.to_string(), uid.clone())])),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    cluster_ip: Some("None".to_string()),
+                    publish_not_ready_addresses: Some(true),
+                    ports: Some(vec![
+                        ServicePort {
+                            name: Some("control".to_string()),
+                            port: CONTROL_PORT,
+                            ..Default::default()
+                        },
+                        ServicePort {
+                            name: Some("replication".to_string()),
+                            port: REPLICATION_PORT,
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        let credential_name = format!("{}-agent-credentials", observation.set.name_any());
+        if !state
+            .observation
+            .secrets
+            .iter()
+            .any(|secret| secret.name_any() == credential_name)
+        {
+            state.observation.secrets.push(Secret {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(credential_name),
+                    labels: Some(BTreeMap::from([(SET_UID_LABEL.to_string(), uid)])),
+                    ..Default::default()
+                },
+                data: Some(BTreeMap::from([(
+                    "bearer-token".to_string(),
+                    k8s_openapi::ByteString(b"test-token".to_vec()),
+                )])),
+                ..Default::default()
+            });
+        }
+        state.effects.push(EffectRecord::EnsureReplicaSupport);
         Ok(())
     }
 

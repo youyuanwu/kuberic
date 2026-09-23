@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Service};
 use kube::ResourceExt;
 use kuberic_protocol::observation::{
     AgentObservation, DesiredState, KubernetesReplicaObservation, ObservationFailure,
@@ -133,6 +133,7 @@ pub fn normalize(
     }
 
     let routing = normalize_routing(&raw, &replicas, &resource_uid, &mut failures);
+    let supporting_resources_ready = supporting_resources_ready(&raw, &resource_uid);
     Ok(ObservationSnapshot {
         resource_uid,
         resource_version,
@@ -146,10 +147,50 @@ pub fn normalize(
         replicas,
         previous_report_watermarks,
         durable_storage_evidence: false,
+        supporting_resources_ready,
         routing,
         observation_failures: failures,
         now_unix_seconds: raw.now_unix_seconds,
     })
+}
+
+fn supporting_resources_ready(raw: &RawObservation, resource_uid: &ResourceUid) -> bool {
+    let set_name = raw.set.name_any();
+    let peer_name = format!("{set_name}-peer");
+    let credential_name = format!("{set_name}-agent-credentials");
+    raw.services.iter().any(|service| {
+        service.name_any() == peer_name
+            && owned_by_set(service, resource_uid)
+            && service.spec.as_ref().is_some_and(|spec| {
+                spec.cluster_ip.as_deref() == Some("None")
+                    && spec.publish_not_ready_addresses == Some(true)
+                    && has_service_port(service, "control", 50051)
+                    && has_service_port(service, "replication", 50052)
+            })
+    }) && raw.secrets.iter().any(|secret| {
+        secret.name_any() == credential_name
+            && owned_by_set(secret, resource_uid)
+            && secret.data.as_ref().is_some_and(|data| {
+                data.get("bearer-token")
+                    .is_some_and(|value| !value.0.is_empty())
+            })
+    })
+}
+
+fn owned_by_set<K: ResourceExt>(resource: &K, resource_uid: &ResourceUid) -> bool {
+    resource.labels().get(SET_UID_LABEL).map(String::as_str) == Some(resource_uid.as_str())
+}
+
+fn has_service_port(service: &Service, name: &str, port: i32) -> bool {
+    service
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.ports.as_ref())
+        .is_some_and(|ports| {
+            ports
+                .iter()
+                .any(|candidate| candidate.name.as_deref() == Some(name) && candidate.port == port)
+        })
 }
 
 pub fn report_watermarks(

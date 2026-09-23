@@ -11,6 +11,8 @@ use kuberic_wire::{
 use std::collections::BTreeMap;
 
 use crate::hosting::PodRuntime;
+use crate::service::SessionRegistry;
+use crate::store::AgentStore;
 use crate::{AgentError, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -462,39 +464,121 @@ fn add_bearer_token<T>(request: &mut Request<T>, token: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_outbound<D: OutboundDispatcher>(
+pub async fn run_outbound<D: OutboundDispatcher + 'static>(
     runtime: Arc<PodRuntime>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let data_plane = runtime.data_plane();
+    let mut deliveries = tokio::task::JoinSet::new();
     loop {
         let mut receive_shutdown = shutdown.clone();
         tokio::select! {
-            _ = wait_for_shutdown_signal(&mut receive_shutdown) => return Ok(()),
+            _ = wait_for_shutdown_signal(&mut receive_shutdown) => {
+                deliveries.abort_all();
+                return Ok(());
+            },
+            completed = deliveries.join_next(), if !deliveries.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%error, "outbound delivery task failed");
+                }
+            }
             outbound = data_plane.next_domain_outbound() => {
                 let Some(outbound) = outbound else {
+                    deliveries.abort_all();
                     return Ok(());
                 };
-                let queued = loop {
-                    match transport.lock().await.queue(outbound.clone()) {
-                        Ok(queued) => break queued,
-                        Err(AgentError::SessionRejected(_)) => {
-                            let mut retry_shutdown = shutdown.clone();
-                            tokio::select! {
-                                _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                            }
-                        }
-                        Err(error) => return Err(error),
-                    }
-                };
-                let mut dispatch_shutdown = shutdown.clone();
+                deliveries.spawn(deliver_outbound(
+                    transport.clone(),
+                    dispatcher.clone(),
+                    outbound,
+                    shutdown.clone(),
+                ));
+            }
+        }
+    }
+}
+
+async fn deliver_outbound<D: OutboundDispatcher>(
+    transport: Arc<Mutex<ReliableTransport>>,
+    dispatcher: Arc<D>,
+    outbound: OutboundOperation,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let queued = loop {
+        match transport.lock().await.queue(outbound.clone()) {
+            Ok(queued) => break queued,
+            Err(AgentError::SessionRejected(_) | AgentError::Backpressure(_)) => {
+                let mut retry_shutdown = shutdown.clone();
                 tokio::select! {
-                    biased;
-                    _ = wait_for_shutdown_signal(&mut dispatch_shutdown) => return Ok(()),
-                    result = dispatcher.dispatch(queued) => result?,
+                    _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    loop {
+        let mut dispatch_shutdown = shutdown.clone();
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_shutdown_signal(&mut dispatch_shutdown) => return Ok(()),
+            result = dispatcher.dispatch(queued.clone()) => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(AgentError::SessionRejected(_) | AgentError::Backpressure(_)) => {
+                tracing::warn!("outbound peer unavailable; retaining message for retry");
+                let mut retry_shutdown = shutdown.clone();
+                tokio::select! {
+                    _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub async fn run_peer_discovery<S, R>(
+    local: ReplicaIdentity,
+    store: Arc<S>,
+    transport: Arc<Mutex<ReliableTransport>>,
+    dispatcher: Arc<GrpcOutboundDispatcher<R>>,
+    sessions: Arc<SessionRegistry>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()>
+where
+    S: AgentStore + 'static,
+    R: ReplicaEndpointResolver + 'static,
+{
+    loop {
+        if *shutdown.borrow_and_update() {
+            return Ok(());
+        }
+        if let Some(configuration) = store.load_state().await?.current_configuration {
+            for member in configuration
+                .members
+                .into_iter()
+                .filter(|member| member.identity != local)
+            {
+                if let Ok(session) = dispatcher.peer_session(&member.identity).await {
+                    sessions
+                        .register_peer(member.identity.clone(), session.clone())
+                        .await;
+                    transport
+                        .lock()
+                        .await
+                        .admit_peer(member.identity, session)?;
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow_and_update() {
+                    return Ok(());
                 }
             }
         }
@@ -527,6 +611,13 @@ impl ReliableTransport {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
+        if self
+            .peers
+            .get(&identity)
+            .is_some_and(|peer| peer.session == session)
+        {
+            return Ok(());
+        }
         self.peers.insert(
             identity,
             PeerWindows {
@@ -828,5 +919,107 @@ pub fn copy_ack_to_proto(acknowledgement: CopyAck) -> proto::CopyAck {
         snapshot_chunk: acknowledgement.snapshot_chunk,
         sender_session_id: String::new(),
         receiver_session_id: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuberic_protocol::types::{AgentGeneration, ConfigurationId, Epoch, ReplicaInstanceId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FlakyDispatcher {
+        failed_peer_attempts: AtomicUsize,
+        delivered: tokio::sync::mpsc::UnboundedSender<ReplicaId>,
+    }
+
+    #[async_trait]
+    impl OutboundDispatcher for FlakyDispatcher {
+        async fn dispatch(&self, outbound: QueuedOutbound) -> Result<()> {
+            let receiver = match outbound {
+                QueuedOutbound::Replication { receiver, .. }
+                | QueuedOutbound::Copy { receiver, .. } => receiver,
+                QueuedOutbound::Build(endpoint) => endpoint.identity,
+                QueuedOutbound::Remove(replica_id) => {
+                    self.delivered.send(replica_id).unwrap();
+                    return Ok(());
+                }
+            };
+            if receiver.replica_id == ReplicaId::new(2)
+                && self.failed_peer_attempts.fetch_add(1, Ordering::SeqCst) < 2
+            {
+                return Err(AgentError::SessionRejected(
+                    "injected unavailable peer".into(),
+                ));
+            }
+            self.delivered.send(receiver.replica_id).unwrap();
+            Ok(())
+        }
+    }
+
+    fn identity(replica_id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: ReplicaId::new(replica_id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
+        }
+    }
+
+    fn outbound(receiver: ReplicaIdentity) -> OutboundOperation {
+        OutboundOperation::Replication(ReplicationItem {
+            sender: identity(1),
+            receiver,
+            epoch: Epoch::new(0, 1),
+            previous_configuration_id: None,
+            current_configuration_id: ConfigurationId::new("configuration"),
+            lsn: 1,
+            committed_lsn: 0,
+            data: Bytes::from_static(b"value"),
+        })
+    }
+
+    #[tokio::test]
+    async fn unavailable_peer_does_not_block_another_peer_delivery() {
+        let transport = Arc::new(Mutex::new(
+            ReliableTransport::new(ProcessSessionId::new("primary-session"), 8).unwrap(),
+        ));
+        for replica_id in [2, 3] {
+            transport
+                .lock()
+                .await
+                .admit_peer(
+                    identity(replica_id),
+                    ProcessSessionId::new(format!("session-{replica_id}")),
+                )
+                .unwrap();
+        }
+        let (delivered, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dispatcher = Arc::new(FlakyDispatcher {
+            failed_peer_attempts: AtomicUsize::new(0),
+            delivered,
+        });
+        let (_shutdown, shutdown) = watch::channel(false);
+        let unavailable = tokio::spawn(deliver_outbound(
+            transport.clone(),
+            dispatcher.clone(),
+            outbound(identity(2)),
+            shutdown.clone(),
+        ));
+        let available = tokio::spawn(deliver_outbound(
+            transport,
+            dispatcher,
+            outbound(identity(3)),
+            shutdown,
+        ));
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), delivered_rx.recv())
+                .await
+                .unwrap(),
+            Some(ReplicaId::new(3))
+        );
+        available.await.unwrap().unwrap();
+        unavailable.await.unwrap().unwrap();
+        assert_eq!(delivered_rx.recv().await, Some(ReplicaId::new(2)));
     }
 }

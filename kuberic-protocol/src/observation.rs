@@ -208,6 +208,7 @@ pub struct ObservationSnapshot {
     pub replicas: BTreeMap<ReplicaObservationKey, ReplicaObservation>,
     pub previous_report_watermarks: BTreeMap<ReplicaObservationKey, ReportWatermark>,
     pub durable_storage_evidence: bool,
+    pub supporting_resources_ready: bool,
     pub routing: RoutingObservation,
     pub observation_failures: Vec<ObservationFailure>,
     pub now_unix_seconds: i64,

@@ -17,11 +17,12 @@ use axum::routing::{get, put};
 use clap::Parser;
 use kuberic_agent::hosting::PodRuntime;
 use kuberic_agent::provisioning::{ObservedStorageIdentity, validate_established_identity};
-use kuberic_agent::service::{AgentService, InitializationService, SessionRegistry};
+use kuberic_agent::service::{AgentService, InitializationService};
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::store::AgentStore;
 use kuberic_agent::transport::{
     GrpcOutboundDispatcher, KubernetesDnsResolver, ReliableTransport, run_outbound,
+    run_peer_discovery,
 };
 use kuberic_protocol::types::{PodUid, PvcUid, ReplicaId, ReplicaInstanceId, ResourceUid};
 use tokio::sync::{Mutex, watch};
@@ -158,7 +159,7 @@ async fn main() -> Result<()> {
         dispatcher.clone(),
         shutdown_rx.clone(),
     ));
-    let peer_task = tokio::spawn(discover_peers(
+    let peer_task = tokio::spawn(run_peer_discovery(
         identity.local_identity,
         store.clone(),
         transport.clone(),
@@ -193,46 +194,6 @@ async fn main() -> Result<()> {
 
     shutdown_tx.send_replace(true);
     Ok(())
-}
-
-async fn discover_peers(
-    local: kuberic_protocol::types::ReplicaIdentity,
-    store: Arc<SqliteStore>,
-    transport: Arc<Mutex<ReliableTransport>>,
-    dispatcher: Arc<GrpcOutboundDispatcher<KubernetesDnsResolver>>,
-    sessions: Arc<SessionRegistry>,
-    mut shutdown: watch::Receiver<bool>,
-) -> kuberic_agent::Result<()> {
-    loop {
-        if *shutdown.borrow_and_update() {
-            return Ok(());
-        }
-        if let Some(configuration) = store.load_state().await?.current_configuration {
-            for member in configuration
-                .members
-                .into_iter()
-                .filter(|member| member.identity != local)
-            {
-                if let Ok(session) = dispatcher.peer_session(&member.identity).await {
-                    sessions
-                        .register_peer(member.identity.clone(), session.clone())
-                        .await;
-                    transport
-                        .lock()
-                        .await
-                        .admit_peer(member.identity, session)?;
-                }
-            }
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow_and_update() {
-                    return Ok(());
-                }
-            }
-        }
-    }
 }
 
 fn observed_storage_identity(config: &Config) -> ObservedStorageIdentity {

@@ -66,6 +66,7 @@ impl ProtocolCommand {
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// Idempotent Kubernetes or status convergence performed by the controller.
 pub enum KubernetesChange {
+    EnsureReplicaSupport,
     EnsureReplicaScaffolding {
         replica_ids: Vec<ReplicaId>,
     },
