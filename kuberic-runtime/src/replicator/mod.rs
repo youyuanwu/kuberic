@@ -539,16 +539,18 @@ impl StateReplicator for DefaultStateReplicator {
         engine.require_write_access().await?;
         let mut reservation = self.pending.lock().await;
         engine.require_write_access().await?;
-        if let Some(write) = reservation.as_ref() {
+        let created_reservation = if let Some(write) = reservation.as_ref() {
             if write.data != data {
                 return Err(RuntimeError::LocalWritePending(
                     write.operation_id.to_string(),
                 ));
             }
+            false
         } else {
             let id = self.next_operation.fetch_add(1, Ordering::Relaxed);
             *reservation = Some(engine.recover_replicate_write(data, id).await);
-        }
+            true
+        };
         let pending = match engine
             .begin_write(reservation.as_ref().expect("write reserved").clone())
             .await
@@ -560,6 +562,10 @@ impl StateReplicator for DefaultStateReplicator {
                 | RuntimeError::AuthorityMismatch(_)
                 | RuntimeError::NotPrimary),
             ) => {
+                *reservation = None;
+                return Err(error);
+            }
+            Err(error @ RuntimeError::LocalWritePending(_)) if created_reservation => {
                 *reservation = None;
                 return Err(error);
             }

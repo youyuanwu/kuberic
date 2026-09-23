@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -39,6 +41,8 @@ pub struct KvPersistence {
     root: PathBuf,
     state_path: PathBuf,
     state: Mutex<PersistedState>,
+    #[cfg(test)]
+    fail_next_persist: AtomicBool,
 }
 
 impl KvPersistence {
@@ -76,6 +80,8 @@ impl KvPersistence {
             root,
             state_path,
             state: Mutex::new(state),
+            #[cfg(test)]
+            fail_next_persist: AtomicBool::new(false),
         })
     }
 
@@ -100,11 +106,20 @@ impl KvPersistence {
                 "application epoch regressed".into(),
             ));
         }
-        state.epoch = epoch;
-        self.persist(&state)
+        let mut candidate = state.clone();
+        candidate.epoch = epoch;
+        self.persist(&candidate)?;
+        *state = candidate;
+        Ok(())
     }
 
     fn persist(&self, state: &PersistedState) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_persist.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::Application(
+                "injected persistence failure".into(),
+            ));
+        }
         let temporary = self.state_path.with_extension("json.tmp");
         let bytes = serde_json::to_vec(state)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
@@ -223,11 +238,13 @@ impl DurableState for KvPersistence {
                 .map_err(|error| RuntimeError::Application(error.to_string()))?
         };
         let mut state = self.state.lock().unwrap();
-        state.values = values;
-        state.operations.clear();
-        state.applied_lsn = up_to_lsn;
-        state.committed_lsn = committed_lsn;
-        self.persist(&state)?;
+        let mut candidate = state.clone();
+        candidate.values = values;
+        candidate.operations.clear();
+        candidate.applied_lsn = up_to_lsn;
+        candidate.committed_lsn = committed_lsn;
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(DurableApplicationProgress {
             applied_lsn: up_to_lsn,
             committed_lsn,
@@ -250,21 +267,23 @@ impl DurableState for KvPersistence {
                 "LSN was reused with different application data".into(),
             ));
         }
+        let mut candidate = state.clone();
         match mutation {
             Mutation::Put { key, value } => {
-                state.values.insert(key, value);
+                candidate.values.insert(key, value);
             }
         }
-        state.operations.insert(
+        candidate.operations.insert(
             operation.lsn,
             OperationRecord {
                 committed_lsn: operation.committed_lsn,
                 data: operation.data.to_vec(),
             },
         );
-        state.applied_lsn = state.applied_lsn.max(operation.lsn);
-        state.committed_lsn = state.committed_lsn.max(operation.committed_lsn);
-        self.persist(&state)?;
+        candidate.applied_lsn = candidate.applied_lsn.max(operation.lsn);
+        candidate.committed_lsn = candidate.committed_lsn.max(operation.committed_lsn);
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(DurableApplicationProgress {
             applied_lsn: state.applied_lsn,
             committed_lsn: state.committed_lsn,
@@ -298,8 +317,10 @@ impl DurableState for KvPersistence {
                 "cannot commit beyond applied progress".into(),
             ));
         }
-        state.committed_lsn = state.committed_lsn.max(committed_lsn);
-        self.persist(&state)?;
+        let mut candidate = state.clone();
+        candidate.committed_lsn = candidate.committed_lsn.max(committed_lsn);
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(DurableApplicationProgress {
             applied_lsn: state.applied_lsn,
             committed_lsn: state.committed_lsn,
@@ -340,6 +361,34 @@ mod tests {
         let reopened = KvPersistence::open(directory.path()).unwrap();
         assert_eq!(reopened.get("key").as_deref(), Some("value"));
         assert_eq!(reopened.durable_progress().await.unwrap().committed_lsn, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_does_not_publish_in_memory_durability() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KvPersistence::open(directory.path()).unwrap();
+        let operation = Operation {
+            lsn: 1,
+            committed_lsn: 0,
+            data: KvPersistence::encode_put("key".into(), "value".into()).unwrap(),
+        };
+        store.fail_next_persist.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            store.apply(operation.clone()).await,
+            Err(RuntimeError::Application(_))
+        ));
+        assert_eq!(store.get("key"), None);
+        assert_eq!(
+            store.durable_progress().await.unwrap(),
+            DurableApplicationProgress::default()
+        );
+        assert!(!store.verify_applied(&operation).await.unwrap());
+
+        store.apply(operation.clone()).await.unwrap();
+        assert!(store.verify_applied(&operation).await.unwrap());
+        drop(store);
+        let reopened = KvPersistence::open(directory.path()).unwrap();
+        assert_eq!(reopened.get("key").as_deref(), Some("value"));
     }
 
     #[test]

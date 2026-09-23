@@ -1249,6 +1249,59 @@ async fn state_replicator_retries_failed_and_cancelled_operations_without_losing
 }
 
 #[tokio::test]
+async fn restarted_state_replicator_does_not_poison_retry_with_a_different_write() {
+    let local = identity(1, "primary");
+    let store = Arc::new(MemoryAuthorityStore::default());
+    store.local_writes.lock().unwrap().insert(
+        OperationId::new("sf:old-session:1"),
+        DurableLocalWrite {
+            operation_id: OperationId::new("sf:old-session:1"),
+            lsn: 1,
+            data: Bytes::from_static(b"pending-a"),
+            phase: kuberic_runtime_internal::authority::LocalWritePhase::Registered,
+        },
+    );
+    let application = Arc::new(TestApplication::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        application.clone(),
+        store.clone(),
+    ));
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority(local.clone(), vec![local]))),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    let state = application
+        .state_replicator
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+
+    assert!(matches!(
+        state.replicate(Bytes::from_static(b"different-b")).await,
+        Err(RuntimeError::LocalWritePending(_))
+    ));
+    assert_eq!(
+        state
+            .replicate(Bytes::from_static(b"pending-a"))
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced() {
     let primary = identity(1, "primary");
     let replacement = identity(2, "replacement");
