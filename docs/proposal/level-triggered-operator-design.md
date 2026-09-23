@@ -837,6 +837,14 @@ application supplies only deployment endpoint configuration. The controller
 observes and independently reconverges the peer Service and credential Secret
 in bootstrap, transition, and stable states.
 
+`ReplicaHost` is the reusable process boundary. It owns fresh/existing agent
+metadata, exact process identity validation, `PodRuntime`, `AgentService`,
+process sessions, authenticated peer transport, discovery, readiness,
+reconstruction, shutdown, and replica diagnostics. A stateful application
+supplies its `StatefulServiceReplica`, its application-storage classification,
+and endpoint configuration; it no longer constructs agent or transport
+internals.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
@@ -844,6 +852,7 @@ end-to-end Service Fabric equivalence claim:
 |---|---|
 | Live process-kill reconstruction while an active configuration, replacement, or failover command is between durable stages | Adversarial suite in Phase 9 |
 | Persistent resend payloads across process sessions where full copy is not acceptable | Reliable build/replacement owner in Phase 7 |
+| Move retained per-peer sender windows and retry scheduling behind a replicator-owned reliable-sender abstraction while keeping concrete gRPC/session transport in the agent | Reliable build/replacement owner in Phase 7 |
 | Full replacement, failover, quorum-loss, and destructive-recovery orchestration | Phases 7-9 |
 | Network-level session replacement, listener shutdown, and partition acceptance tests | Phases 7 and 9 |
 | Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |

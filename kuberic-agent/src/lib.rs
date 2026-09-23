@@ -5,6 +5,7 @@ mod error;
 pub mod command;
 pub mod coordinator;
 pub mod hosting;
+pub mod process;
 pub mod provisioning;
 pub mod recovery;
 pub mod report;
