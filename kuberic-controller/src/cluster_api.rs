@@ -13,9 +13,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client, Resource, ResourceExt};
 use kuberic_protocol::command::{EnsureConfiguration, InitializeAgentStore, ProtocolCommand};
+use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
-    AcceptedStatus, EffectivePolicy, ReplicaId, ReplicaIdentity, ReplicaRole, ResourceUid,
-    TransitionKind,
+    AcceptedStatus, EffectivePolicy, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
+    ResourceUid, TransitionKind,
 };
 use kuberic_wire::proto;
 use tokio::sync::Mutex;
@@ -34,6 +35,7 @@ const REPLICATION_PORT: i32 = 50052;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
     EnsureScaffolding(Vec<ReplicaId>),
+    EnsureWriteRoutingService,
     ReplaceStatus,
     RemoveWriteRouting,
     PublishWriteRouting(ReplicaIdentity),
@@ -72,6 +74,8 @@ pub trait ClusterApi: Send + Sync {
         observation: &RawObservation,
         replica_ids: &[ReplicaId],
     ) -> Result<()>;
+
+    async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()>;
 
     async fn replace_status(
         &self,
@@ -238,8 +242,11 @@ where
             .map(|(replica_id, pod)| {
                 let resource_uid = resource_uid.clone();
                 async move {
+                    let instance_id = pod.uid().map(ReplicaInstanceId::new).unwrap_or_else(|| {
+                        ReplicaInstanceId::new(format!("missing-pod-uid-{}", pod.name_any()))
+                    });
                     (
-                        replica_id,
+                        ReplicaObservationKey::new(replica_id, instance_id),
                         self.observe_agent(&pod, &resource_uid, replica_id).await,
                     )
                 }
@@ -310,6 +317,24 @@ where
         ensure_write_service(self.client.clone(), observation, &namespace, &uid, &owner).await
     }
 
+    async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()> {
+        if service_observation_failed(observation) {
+            return Err(ControllerError::Observation(
+                "cannot converge write routing after Service observation failed".to_string(),
+            ));
+        }
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        let uid = observation
+            .set
+            .uid()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let owner = owner_reference(&observation.set)?;
+        ensure_write_service(self.client.clone(), observation, &namespace, &uid, &owner).await
+    }
+
     async fn replace_status(
         &self,
         observation: &RawObservation,
@@ -331,6 +356,11 @@ where
     }
 
     async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()> {
+        if service_observation_failed(observation) {
+            return Err(ControllerError::Observation(
+                "cannot confirm write routing absence after Service observation failed".to_string(),
+            ));
+        }
         let service_name = format!("{}-write", observation.set.name_any());
         if !observation
             .services
@@ -478,6 +508,13 @@ where
             Vec::new()
         }
     }
+}
+
+fn service_observation_failed(observation: &RawObservation) -> bool {
+    observation
+        .failures
+        .iter()
+        .any(|failure| failure.source == "services")
 }
 
 async fn create_exact<K>(api: &Api<K>, name: &str, object: &K) -> Result<()>
@@ -934,6 +971,45 @@ impl ClusterApi for InMemoryClusterApi {
         Ok(())
     }
 
+    async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()> {
+        if service_observation_failed(observation) {
+            return Err(ControllerError::Observation(
+                "cannot converge write routing after Service observation failed".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().await;
+        let service_name = format!("{}-write", observation.set.name_any());
+        if !state
+            .observation
+            .services
+            .iter()
+            .any(|service| service.name_any() == service_name)
+        {
+            state.observation.services.push(Service {
+                metadata: kube::core::ObjectMeta {
+                    name: Some(service_name),
+                    uid: Some("in-memory-write-service".to_string()),
+                    resource_version: Some("1".to_string()),
+                    labels: observation
+                        .set
+                        .uid()
+                        .map(|uid| BTreeMap::from([(SET_UID_LABEL.to_string(), uid)])),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    selector: Some(BTreeMap::from([(
+                        INSTANCE_LABEL.to_string(),
+                        "disabled".to_string(),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        state.effects.push(EffectRecord::EnsureWriteRoutingService);
+        Ok(())
+    }
+
     async fn replace_status(
         &self,
         observation: &RawObservation,
@@ -961,12 +1037,26 @@ impl ClusterApi for InMemoryClusterApi {
         Ok(())
     }
 
-    async fn remove_write_routing(&self, _observation: &RawObservation) -> Result<()> {
-        self.state
-            .lock()
-            .await
-            .effects
-            .push(EffectRecord::RemoveWriteRouting);
+    async fn remove_write_routing(&self, observation: &RawObservation) -> Result<()> {
+        if service_observation_failed(observation) {
+            return Err(ControllerError::Observation(
+                "cannot confirm write routing absence after Service observation failed".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().await;
+        if let Some(service) = state
+            .observation
+            .services
+            .iter_mut()
+            .find(|service| service.name_any().ends_with("-write"))
+            && let Some(spec) = service.spec.as_mut()
+        {
+            spec.selector = Some(BTreeMap::from([(
+                INSTANCE_LABEL.to_string(),
+                "disabled".to_string(),
+            )]));
+        }
+        state.effects.push(EffectRecord::RemoveWriteRouting);
         Ok(())
     }
 
@@ -975,9 +1065,28 @@ impl ClusterApi for InMemoryClusterApi {
         _observation: &RawObservation,
         primary: &ReplicaIdentity,
     ) -> Result<()> {
-        self.state
-            .lock()
-            .await
+        let mut state = self.state.lock().await;
+        let pod = state
+            .observation
+            .pods
+            .iter_mut()
+            .find(|pod| pod.uid().as_deref() == Some(primary.instance_id.as_str()))
+            .ok_or(ControllerError::ObservationStale)?;
+        pod.metadata
+            .labels
+            .get_or_insert_default()
+            .insert(INSTANCE_LABEL.to_string(), primary.instance_id.to_string());
+        let service = state
+            .observation
+            .services
+            .iter_mut()
+            .find(|service| service.name_any().ends_with("-write"))
+            .ok_or(ControllerError::ObservationStale)?;
+        service.spec.get_or_insert_default().selector = Some(BTreeMap::from([(
+            INSTANCE_LABEL.to_string(),
+            primary.instance_id.to_string(),
+        )]));
+        state
             .effects
             .push(EffectRecord::PublishWriteRouting(primary.clone()));
         Ok(())

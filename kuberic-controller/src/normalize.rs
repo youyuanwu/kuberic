@@ -11,7 +11,7 @@ use kuberic_protocol::types::{
     AcceptedStatus, PodUid, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
 };
 
-use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL, STORAGE_STATE_ANNOTATION};
+use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL};
 use crate::observation::{RawAgentObservation, RawObservation};
 use crate::{ControllerError, Result};
 
@@ -60,52 +60,76 @@ pub fn normalize(
     collect_labeled_replica_ids(&raw.pvcs, &mut replica_ids, &mut failures, "PVC");
 
     let mut replicas = BTreeMap::new();
-    let mut durable_storage_evidence = false;
     for replica_id in replica_ids {
         let pods = matching_objects(&raw.pods, &resource_uid, replica_id);
         let pvcs = matching_objects(&raw.pvcs, &resource_uid, replica_id);
-        if pods.len() > 1 {
-            failures.push(ObservationFailure {
-                source: format!("replica/{replica_id}/pods"),
-                message: "multiple owned Pods claim one logical replica".to_string(),
-            });
-        }
-        if pvcs.len() > 1 {
-            failures.push(ObservationFailure {
-                source: format!("replica/{replica_id}/pvcs"),
-                message: "multiple owned PVCs claim one logical replica".to_string(),
-            });
-        }
-        let pod = (pods.len() == 1).then(|| pods[0]);
-        let pvc = (pvcs.len() == 1).then(|| pvcs[0]);
-        durable_storage_evidence |= pvc.is_some_and(established_storage);
-
-        let pod_uid = pod.and_then(|pod| pod.uid()).map(PodUid::new);
-        let pvc_uid = pvc.and_then(|pvc| pvc.uid()).map(PvcUid::new);
-        let kubernetes = (pod.is_some() || pvc.is_some()).then(|| KubernetesReplicaObservation {
-            replica_id,
-            pod_name: pod.map(ResourceExt::name_any).unwrap_or_default(),
-            pod_uid: pod_uid.clone(),
-            pvc_name: pvc.map(ResourceExt::name_any).unwrap_or_default(),
-            pvc_uid: pvc_uid.clone(),
-            pod_ready: pod.is_some_and(pod_ready),
-        });
-        let agent = normalize_agent(
-            raw.agents
-                .get(&replica_id)
+        let mut used_pvcs = BTreeSet::new();
+        for pod in pods {
+            let pod_uid = pod.uid().map(PodUid::new);
+            let instance_id = pod_uid
+                .as_ref()
+                .map(|uid| ReplicaInstanceId::new(uid.as_str()))
+                .unwrap_or_else(|| {
+                    ReplicaInstanceId::new(format!("missing-pod-uid-{}", pod.name_any()))
+                });
+            let key = ReplicaObservationKey::new(replica_id, instance_id);
+            let pvc = pvc_for_pod(pod, &pvcs);
+            if let Some(pvc) = pvc {
+                used_pvcs.insert(pvc.name_any());
+            }
+            let raw_agent = raw
+                .agents
+                .get(&key)
                 .cloned()
-                .unwrap_or(RawAgentObservation::Absent),
-            &resource_uid,
-            replica_id,
-            pod_uid.as_ref(),
-            pvc_uid.as_ref(),
-            &previous_report_watermarks,
-        );
-        let instance_id = observation_instance_id(&agent, pod_uid.as_ref(), replica_id);
-        replicas.insert(
-            ReplicaObservationKey::new(replica_id, instance_id),
-            ReplicaObservation { kubernetes, agent },
-        );
+                .unwrap_or(RawAgentObservation::Absent);
+            insert_replica_observation(
+                &mut replicas,
+                &mut failures,
+                key,
+                pod_uid,
+                pvc.and_then(|pvc| pvc.uid()).map(PvcUid::new),
+                Some(pod),
+                pvc,
+                raw_agent,
+                &resource_uid,
+                &previous_report_watermarks,
+            );
+        }
+        for pvc in pvcs
+            .into_iter()
+            .filter(|pvc| !used_pvcs.contains(&pvc.name_any()))
+        {
+            let pvc_uid = pvc.uid().map(PvcUid::new);
+            let pvc_identity = pvc_uid
+                .as_ref()
+                .map(|uid| uid.as_str().to_string())
+                .unwrap_or_else(|| pvc.name_any());
+            let instance_id = ReplicaInstanceId::new(format!("orphan-pvc-{pvc_identity}"));
+            insert_replica_observation(
+                &mut replicas,
+                &mut failures,
+                ReplicaObservationKey::new(replica_id, instance_id),
+                None,
+                pvc_uid,
+                None,
+                Some(pvc),
+                RawAgentObservation::Absent,
+                &resource_uid,
+                &previous_report_watermarks,
+            );
+        }
+        if !replicas.keys().any(|key| key.replica_id == replica_id) {
+            replicas.insert(
+                ReplicaObservationKey::new(
+                    replica_id,
+                    ReplicaInstanceId::new(format!("missing-{replica_id}")),
+                ),
+                ReplicaObservation {
+                    kubernetes: None,
+                    agent: AgentObservation::Absent,
+                },
+            );
+        }
     }
 
     let routing = normalize_routing(&raw, &replicas, &resource_uid, &mut failures);
@@ -121,7 +145,7 @@ pub fn normalize(
         status,
         replicas,
         previous_report_watermarks,
-        durable_storage_evidence,
+        durable_storage_evidence: false,
         routing,
         observation_failures: failures,
         now_unix_seconds: raw.now_unix_seconds,
@@ -308,26 +332,65 @@ fn normalize_agent(
     observation
 }
 
-fn observation_instance_id(
-    agent: &AgentObservation,
-    pod_uid: Option<&PodUid>,
-    replica_id: ReplicaId,
-) -> ReplicaInstanceId {
-    match agent {
-        AgentObservation::Uninitialized(report) => ReplicaInstanceId::new(report.pod_uid.as_str()),
-        AgentObservation::Report(report) => report.identity.instance_id.clone(),
-        AgentObservation::Absent
-        | AgentObservation::Unreachable { .. }
-        | AgentObservation::Invalid { .. } => pod_uid
-            .map(|uid| ReplicaInstanceId::new(uid.as_str()))
-            .unwrap_or_else(|| ReplicaInstanceId::new(format!("missing-{replica_id}"))),
+#[allow(clippy::too_many_arguments)]
+fn insert_replica_observation(
+    replicas: &mut BTreeMap<ReplicaObservationKey, ReplicaObservation>,
+    failures: &mut Vec<ObservationFailure>,
+    key: ReplicaObservationKey,
+    pod_uid: Option<PodUid>,
+    pvc_uid: Option<PvcUid>,
+    pod: Option<&Pod>,
+    pvc: Option<&PersistentVolumeClaim>,
+    raw_agent: RawAgentObservation,
+    resource_uid: &ResourceUid,
+    previous: &BTreeMap<ReplicaObservationKey, ReportWatermark>,
+) {
+    let agent = normalize_agent(
+        raw_agent,
+        resource_uid,
+        key.replica_id,
+        pod_uid.as_ref(),
+        pvc_uid.as_ref(),
+        previous,
+    );
+    let observation = ReplicaObservation {
+        kubernetes: (pod.is_some() || pvc.is_some()).then(|| KubernetesReplicaObservation {
+            replica_id: key.replica_id,
+            pod_name: pod.map(ResourceExt::name_any).unwrap_or_default(),
+            pod_uid,
+            pvc_name: pvc.map(ResourceExt::name_any).unwrap_or_default(),
+            pvc_uid,
+            pod_ready: pod.is_some_and(pod_ready),
+        }),
+        agent,
+    };
+    if replicas.insert(key.clone(), observation).is_some() {
+        failures.push(ObservationFailure {
+            source: format!("replica/{}@{}", key.replica_id, key.instance_id),
+            message: "multiple observations claim one exact replica incarnation".to_string(),
+        });
     }
 }
 
-fn established_storage(pvc: &PersistentVolumeClaim) -> bool {
-    pvc.annotations()
-        .get(STORAGE_STATE_ANNOTATION)
-        .is_some_and(|value| value == "initialized")
+fn pvc_for_pod<'a>(
+    pod: &Pod,
+    pvcs: &[&'a PersistentVolumeClaim],
+) -> Option<&'a PersistentVolumeClaim> {
+    let claimed = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.volumes.as_ref())
+        .and_then(|volumes| {
+            volumes.iter().find_map(|volume| {
+                volume
+                    .persistent_volume_claim
+                    .as_ref()
+                    .map(|claim| claim.claim_name.as_str())
+            })
+        });
+    let fallback = format!("{}-data", pod.name_any());
+    let expected = claimed.unwrap_or(&fallback);
+    pvcs.iter().copied().find(|pvc| pvc.name_any() == expected)
 }
 
 fn pod_ready(pod: &Pod) -> bool {
@@ -360,8 +423,15 @@ fn normalize_routing(
             source: "routing".to_string(),
             message: "multiple write Services claim the KubericSet".to_string(),
         });
-        return RoutingObservation::default();
+        return RoutingObservation {
+            service_present: true,
+            unresolved_write_target: true,
+            write_target: None,
+        };
     }
+    let Some(_service) = write_services.first() else {
+        return RoutingObservation::default();
+    };
     let Some(instance) = write_services
         .first()
         .and_then(|service| service.spec.as_ref())
@@ -369,13 +439,27 @@ fn normalize_routing(
         .and_then(|selector| selector.get(INSTANCE_LABEL))
         .filter(|instance| instance.as_str() != "disabled")
     else {
-        return RoutingObservation::default();
+        return RoutingObservation {
+            service_present: true,
+            unresolved_write_target: false,
+            write_target: None,
+        };
     };
     let matches = replicas
         .values()
         .filter_map(|observation| match &observation.agent {
             AgentObservation::Report(report)
-                if report.identity.instance_id.as_str() == instance.as_str() =>
+                if report.identity.instance_id.as_str() == instance.as_str()
+                    && observation.kubernetes.as_ref().is_some_and(|kubernetes| {
+                        kubernetes.pod_uid.as_ref().is_some_and(|uid| {
+                            uid.as_str() == instance
+                                && raw.pods.iter().any(|pod| {
+                                    pod.uid().as_deref() == Some(uid.as_str())
+                                        && pod.labels().get(INSTANCE_LABEL).map(String::as_str)
+                                            == Some(instance.as_str())
+                                })
+                        })
+                    }) =>
             {
                 Some(report.identity.clone())
             }
@@ -384,13 +468,15 @@ fn normalize_routing(
         .collect::<Vec<ReplicaIdentity>>();
     if matches.len() == 1 {
         RoutingObservation {
+            service_present: true,
+            unresolved_write_target: false,
             write_target: matches.into_iter().next(),
         }
     } else {
-        failures.push(ObservationFailure {
-            source: "routing".to_string(),
-            message: "write Service selector does not identify one observed replica".to_string(),
-        });
-        RoutingObservation::default()
+        RoutingObservation {
+            service_present: true,
+            unresolved_write_target: true,
+            write_target: None,
+        }
     }
 }

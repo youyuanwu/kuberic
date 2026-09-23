@@ -769,6 +769,20 @@ agent command. Stable, waiting, and recoverable unsafe states all have bounded
 re-observation intervals; agent startup `Unavailable` is a wait rather than
 permission to issue another authority command.
 
+Controller evidence is monotonic across effect failures: a missing, invalid,
+or unreachable report cannot erase the last accepted process-session
+watermark. Raw collection preserves every Pod incarnation for a logical
+replica, allowing accepted and out-of-authority replacement evidence to
+coexist without last-writer-wins loss. Never-initialized authority requires an
+explicit `Uninitialized` report from every exact Pod/PVC pair; unavailable or
+absent metadata is unknown storage, not proof that genesis is safe.
+
+Write routing has an independently observed Service-existence postcondition.
+Missing Services are recreated, unresolved selectors are fenced before
+publication, and `Ready` requires the Service selector to match the exact
+label on the attested primary Pod. A failed Service-list observation cannot be
+treated as confirmed routing absence.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 

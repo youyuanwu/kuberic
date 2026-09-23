@@ -90,10 +90,19 @@ fn scaffolded_snapshot() -> ObservationSnapshot {
                     pvc_uid: Some(PvcUid::new(format!("pvc-uid-{id}"))),
                     pod_ready: true,
                 }),
-                agent: AgentObservation::Absent,
+                agent: AgentObservation::Uninitialized(UninitializedAgentObservation {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    resource_uid: snapshot.resource_uid.clone(),
+                    replica_id,
+                    pod_uid: PodUid::new(format!("pod-uid-{id}")),
+                    pvc_uid: PvcUid::new(format!("pvc-uid-{id}")),
+                    process_session_id: ProcessSessionId::new(format!("session-{id}")),
+                    report_sequence: 1,
+                }),
             },
         );
     }
+    snapshot.routing.service_present = true;
     snapshot
 }
 
@@ -141,6 +150,8 @@ fn attest_stable_topology(
         .iter()
         .find(|member| member.identity.replica_id == configuration.primary_id)
         .map(|member| member.identity.clone());
+    snapshot.routing.service_present = true;
+    snapshot.routing.unresolved_write_target = false;
 }
 
 #[test]

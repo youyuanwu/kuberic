@@ -162,6 +162,26 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         };
     }
 
+    if !snapshot.routing.service_present {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::EnsureWriteRoutingService],
+        };
+    }
+    if snapshot.routing.unresolved_write_target {
+        return Plan::Apply {
+            changes: vec![
+                KubernetesChange::RemoveWriteRouting,
+                KubernetesChange::PersistStatus {
+                    status: Box::new(waiting_status(
+                        status,
+                        "RoutingFencePending",
+                        "Removing unresolved write routing",
+                    )),
+                },
+            ],
+        };
+    }
+
     match &snapshot.routing.write_target {
         Some(target) if target == &primary.identity => {}
         Some(_) => {
@@ -229,6 +249,33 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
             changes: vec![KubernetesChange::EnsureReplicaScaffolding {
                 replica_ids: snapshot.intended_replica_ids(),
             }],
+        };
+    }
+    if !snapshot.routing.service_present {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::EnsureWriteRoutingService],
+        };
+    }
+    if snapshot
+        .intended_replica_ids()
+        .into_iter()
+        .any(|replica_id| {
+            !matches!(
+                snapshot
+                    .scaffolding_observation_for(replica_id)
+                    .map(|observation| &observation.agent),
+                Some(AgentObservation::Uninitialized(_))
+            )
+        })
+    {
+        return Plan::Wait {
+            reason: WaitReason::AwaitingAgentInitialization,
+            status: waiting_status(
+                snapshot.status.clone(),
+                "AwaitingFreshStorageEvidence",
+                "Every intended replica must explicitly report uninitialized storage",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
         };
     }
 

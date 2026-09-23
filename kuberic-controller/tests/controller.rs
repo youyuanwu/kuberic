@@ -3,19 +3,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
-    PersistentVolumeClaim, Pod, PodCondition, PodStatus, Service, ServiceSpec,
+    PersistentVolumeClaim, PersistentVolumeClaimVolumeSource, Pod, PodCondition, PodSpec,
+    PodStatus, Service, ServiceSpec, Volume,
 };
+use kuberic_controller::ControllerError;
 use kuberic_controller::cluster_api::{EffectRecord, InMemoryClusterApi};
 use kuberic_controller::crd::{
     INSTANCE_LABEL, KubericSet, KubericSetSpec, KubericSetStatus, REPLICA_ID_LABEL, SET_UID_LABEL,
 };
 use kuberic_controller::normalize::normalize;
-use kuberic_controller::observation::{RawAgentObservation, RawObservation};
+use kuberic_controller::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
 use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
-use kuberic_protocol::observation::AgentObservation;
+use kuberic_protocol::observation::{AgentObservation, ReplicaObservationKey};
 use kuberic_protocol::plan::Plan;
-use kuberic_protocol::types::{AcceptedStatus, AcceptedTopology, ReplicaId, ReplicaRole};
+use kuberic_protocol::types::{
+    AcceptedStatus, AcceptedTopology, ReplicaId, ReplicaInstanceId, ReplicaRole,
+};
 use kuberic_wire::proto;
 
 const UID: &str = "set-uid";
@@ -100,8 +104,53 @@ fn with_scaffolding(mut raw: RawObservation) -> RawObservation {
     raw
 }
 
+fn replica_key(pod_uid: &str) -> ReplicaObservationKey {
+    ReplicaObservationKey::new(ReplicaId::new(1), ReplicaInstanceId::new(pod_uid))
+}
+
+fn write_service(instance: &str) -> Service {
+    Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some("db-write".to_string()),
+            uid: Some("service-uid".to_string()),
+            resource_version: Some("4".to_string()),
+            labels: Some(BTreeMap::from([(
+                SET_UID_LABEL.to_string(),
+                UID.to_string(),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(BTreeMap::from([(
+                INSTANCE_LABEL.to_string(),
+                instance.to_string(),
+            )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn fresh_bootstrap_observation() -> RawObservation {
+    let mut observation = with_scaffolding(raw(1));
+    observation.services.push(write_service("disabled"));
+    observation.agents.insert(
+        replica_key(POD_UID),
+        RawAgentObservation::Report(Box::new(uninitialized_report())),
+    );
+    observation
+}
+
 fn bootstrap_status(raw: &RawObservation) -> AcceptedStatus {
-    let snapshot = normalize(raw.clone(), BTreeMap::new()).unwrap();
+    let mut candidate = raw.clone();
+    if candidate.services.is_empty() {
+        candidate.services.push(write_service("disabled"));
+    }
+    candidate.agents.insert(
+        replica_key(POD_UID),
+        RawAgentObservation::Report(Box::new(uninitialized_report())),
+    );
+    let snapshot = normalize(candidate, BTreeMap::new()).unwrap();
     let Plan::Apply { changes } = evaluate(&snapshot, &config()) else {
         panic!("complete scaffolding must persist bootstrap intent");
     };
@@ -155,6 +204,45 @@ fn initialized_report(
     }
 }
 
+fn stable_observation() -> RawObservation {
+    let scaffold = with_scaffolding(raw(1));
+    let transition = bootstrap_status(&scaffold)
+        .transition
+        .expect("bootstrap transition");
+    let configuration = transition.current_configuration;
+    let identity = configuration.members[0].identity.clone();
+    let mut stable = scaffold;
+    stable
+        .pods
+        .first_mut()
+        .unwrap()
+        .metadata
+        .labels
+        .get_or_insert_default()
+        .insert(INSTANCE_LABEL.to_string(), POD_UID.to_string());
+    stable.set.status = Some(KubericSetStatus {
+        authority: AcceptedStatus {
+            initialized: true,
+            observed_generation: 1,
+            topology: Some(AcceptedTopology {
+                configuration: configuration.clone(),
+            }),
+            ..Default::default()
+        },
+    });
+    stable.agents.insert(
+        replica_key(POD_UID),
+        RawAgentObservation::Report(Box::new(initialized_report(
+            identity.clone(),
+            configuration,
+        ))),
+    );
+    stable
+        .services
+        .push(write_service(identity.instance_id.as_str()));
+    stable
+}
+
 #[test]
 fn normalization_distinguishes_missing_and_unreachable_agents() {
     let missing = normalize(raw(1), BTreeMap::new()).unwrap();
@@ -165,7 +253,7 @@ fn normalization_distinguishes_missing_and_unreachable_agents() {
 
     let mut unreachable = with_scaffolding(raw(1));
     unreachable.agents.insert(
-        ReplicaId::new(1),
+        replica_key(POD_UID),
         RawAgentObservation::Unavailable {
             message: "reconstructing".to_string(),
         },
@@ -179,7 +267,7 @@ fn normalization_distinguishes_missing_and_unreachable_agents() {
 
 #[tokio::test]
 async fn status_conflict_reobserves_without_dispatching_authority() {
-    let api = Arc::new(InMemoryClusterApi::new(with_scaffolding(raw(1))));
+    let api = Arc::new(InMemoryClusterApi::new(fresh_bootstrap_observation()));
     api.conflict_next_status().await;
     let reconciler = Reconciler::new(api.clone(), config());
     let action = reconciler.reconcile("tests", "db").await.unwrap();
@@ -208,21 +296,18 @@ async fn overlapping_reconciles_are_serialized_per_resource() {
 
 #[tokio::test]
 async fn each_execute_requires_a_fresh_full_observation() {
-    let mut observation = with_scaffolding(raw(1));
+    let mut observation = fresh_bootstrap_observation();
     observation.set.status = Some(KubericSetStatus {
         authority: bootstrap_status(&observation),
     });
-    observation.agents.insert(
-        ReplicaId::new(1),
-        RawAgentObservation::Report(Box::new(uninitialized_report())),
-    );
     let api = Arc::new(InMemoryClusterApi::new(observation));
     let reconciler = Reconciler::new(api.clone(), config());
 
     let status_update = reconciler.reconcile("tests", "db").await.unwrap();
     assert_eq!(status_update.kind, ReconcileKind::Applied);
     let mut refreshed = api.observation().await;
-    let RawAgentObservation::Report(report) = refreshed.agents.get_mut(&ReplicaId::new(1)).unwrap()
+    let RawAgentObservation::Report(report) =
+        refreshed.agents.get_mut(&replica_key(POD_UID)).unwrap()
     else {
         panic!("uninitialized report");
     };
@@ -242,7 +327,8 @@ async fn each_execute_requires_a_fresh_full_observation() {
     );
 
     let mut refreshed = api.observation().await;
-    let RawAgentObservation::Report(report) = refreshed.agents.get_mut(&ReplicaId::new(1)).unwrap()
+    let RawAgentObservation::Report(report) =
+        refreshed.agents.get_mut(&replica_key(POD_UID)).unwrap()
     else {
         panic!("uninitialized report");
     };
@@ -267,7 +353,7 @@ async fn startup_unavailable_is_a_bounded_wait() {
         authority: bootstrap_status(&observation),
     });
     observation.agents.insert(
-        ReplicaId::new(1),
+        replica_key(POD_UID),
         RawAgentObservation::Unavailable {
             message: "runtime reconstruction in progress".to_string(),
         },
@@ -283,52 +369,22 @@ async fn startup_unavailable_is_a_bounded_wait() {
 
 #[tokio::test]
 async fn stable_and_unsafe_states_use_bounded_reobservation() {
-    let scaffold = with_scaffolding(raw(1));
-    let transition = bootstrap_status(&scaffold)
-        .transition
-        .expect("bootstrap transition");
-    let configuration = transition.current_configuration;
-    let identity = configuration.members[0].identity.clone();
-    assert_eq!(configuration.members[0].role, ReplicaRole::Primary);
-
-    let mut stable = scaffold;
-    stable.set.status = Some(KubericSetStatus {
-        authority: AcceptedStatus {
-            initialized: true,
-            observed_generation: 1,
-            topology: Some(AcceptedTopology {
-                configuration: configuration.clone(),
-            }),
-            ..Default::default()
-        },
-    });
-    stable.agents.insert(
-        ReplicaId::new(1),
-        RawAgentObservation::Report(Box::new(initialized_report(
-            identity.clone(),
-            configuration,
-        ))),
+    let stable = stable_observation();
+    assert_eq!(
+        stable
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members[0]
+            .role,
+        ReplicaRole::Primary
     );
-    stable.services.push(Service {
-        metadata: kube::core::ObjectMeta {
-            name: Some("db-write".to_string()),
-            uid: Some("service-uid".to_string()),
-            resource_version: Some("4".to_string()),
-            labels: Some(BTreeMap::from([(
-                SET_UID_LABEL.to_string(),
-                UID.to_string(),
-            )])),
-            ..Default::default()
-        },
-        spec: Some(ServiceSpec {
-            selector: Some(BTreeMap::from([(
-                INSTANCE_LABEL.to_string(),
-                identity.instance_id.to_string(),
-            )])),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
     let stable_api = Arc::new(InMemoryClusterApi::new(stable));
     let stable_action = Reconciler::new(stable_api, config())
         .reconcile("tests", "db")
@@ -372,4 +428,188 @@ fn exact_pod_uid_is_preserved_as_the_replica_instance() {
     assert!(snapshot.routing.write_target.is_none());
     assert!(snapshot.has_complete_scaffolding());
     assert_eq!(observation.agent, AgentObservation::Absent);
+}
+
+#[tokio::test]
+async fn bootstrap_waits_for_explicit_uninitialized_storage_evidence() {
+    let mut observation = with_scaffolding(raw(1));
+    observation.services.push(write_service("disabled"));
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    let action = Reconciler::new(api.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap();
+    assert_eq!(action.kind, ReconcileKind::Waiting);
+    assert_eq!(action.requeue_after, Duration::from_secs(3));
+    assert!(
+        api.observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .transition
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn stale_report_watermark_survives_repeated_rejection() {
+    let mut observation = fresh_bootstrap_observation();
+    observation.set.status = Some(KubericSetStatus {
+        authority: bootstrap_status(&observation),
+    });
+    let RawAgentObservation::Report(report) =
+        observation.agents.get_mut(&replica_key(POD_UID)).unwrap()
+    else {
+        panic!("uninitialized report");
+    };
+    report.report_sequence = 5;
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    api.conflict_next_status().await;
+    let reconciler = Reconciler::new(api.clone(), config());
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::ObservationStale
+    );
+
+    let mut stale = api.observation().await;
+    let RawAgentObservation::Report(report) = stale.agents.get_mut(&replica_key(POD_UID)).unwrap()
+    else {
+        panic!("uninitialized report");
+    };
+    report.report_sequence = 4;
+    api.set_observation(stale).await;
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Unsafe
+    );
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Unsafe
+    );
+    assert!(
+        api.effects()
+            .await
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::Execute(_)))
+    );
+}
+
+#[test]
+fn normalization_preserves_simultaneous_replica_incarnations() {
+    let mut observation = with_scaffolding(raw(1));
+    let second_uid = "pod-uid-2";
+    let second_pvc_uid = "pvc-uid-2";
+    observation.pods.push(Pod {
+        metadata: kube::core::ObjectMeta {
+            name: Some("db-1-replacement".to_string()),
+            uid: Some(second_uid.to_string()),
+            labels: Some(labels(ReplicaId::new(1))),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: Vec::new(),
+            volumes: Some(vec![Volume {
+                name: "data".to_string(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: "db-1-replacement-data".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    observation.pvcs.push(PersistentVolumeClaim {
+        metadata: kube::core::ObjectMeta {
+            name: Some("db-1-replacement-data".to_string()),
+            uid: Some(second_pvc_uid.to_string()),
+            labels: Some(labels(ReplicaId::new(1))),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    observation.agents.insert(
+        replica_key(POD_UID),
+        RawAgentObservation::Unavailable {
+            message: "old".to_string(),
+        },
+    );
+    observation.agents.insert(
+        replica_key(second_uid),
+        RawAgentObservation::Unavailable {
+            message: "replacement".to_string(),
+        },
+    );
+
+    let snapshot = normalize(observation, BTreeMap::new()).unwrap();
+    let keys = snapshot
+        .replicas
+        .keys()
+        .filter(|key| key.replica_id == ReplicaId::new(1))
+        .map(|key| key.instance_id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec![POD_UID.to_string(), second_uid.to_string()]);
+    assert!(snapshot.observation_failures.is_empty());
+}
+
+#[tokio::test]
+async fn unresolved_routing_is_fenced_before_ready() {
+    let mut observation = stable_observation();
+    observation
+        .pods
+        .first_mut()
+        .unwrap()
+        .metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .remove(INSTANCE_LABEL);
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    let action = Reconciler::new(api.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap();
+    assert_eq!(action.kind, ReconcileKind::Applied);
+    assert!(
+        api.effects()
+            .await
+            .contains(&EffectRecord::RemoveWriteRouting)
+    );
+}
+
+#[tokio::test]
+async fn missing_write_service_is_recreated() {
+    let mut observation = stable_observation();
+    observation.services.clear();
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    let action = Reconciler::new(api.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap();
+    assert_eq!(action.kind, ReconcileKind::Applied);
+    assert!(
+        api.effects()
+            .await
+            .contains(&EffectRecord::EnsureWriteRoutingService)
+    );
+    assert_eq!(api.observation().await.services.len(), 1);
+}
+
+#[tokio::test]
+async fn failed_service_observation_cannot_claim_routing_removal() {
+    let mut observation = raw(0);
+    observation.failures.push(RawObservationFailure {
+        source: "services".to_string(),
+        message: "forbidden".to_string(),
+    });
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    let error = Reconciler::new(api.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ControllerError::Observation(_)));
+    assert!(api.effects().await.is_empty());
 }

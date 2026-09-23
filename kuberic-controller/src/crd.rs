@@ -9,7 +9,6 @@ pub const CONTROLLER_NAME: &str = "kuberic-controller";
 pub const SET_UID_LABEL: &str = "operator.kuberic.io/set-uid";
 pub const REPLICA_ID_LABEL: &str = "operator.kuberic.io/replica-id";
 pub const INSTANCE_LABEL: &str = "operator.kuberic.io/instance";
-pub const STORAGE_STATE_ANNOTATION: &str = "operator.kuberic.io/storage-state";
 pub const CONTROL_ADDRESS_ANNOTATION: &str = "operator.kuberic.io/control-address";
 
 #[derive(CustomResource, Serialize, Deserialize, Debug, PartialEq, Clone, JsonSchema)]
@@ -113,5 +112,6 @@ mod tests {
             assert!(!manifest.contains("apiGroups:\n      - kuberic.io"));
             assert!(!manifest.contains("kuberic-operator"));
         }
+        assert!(include_str!("../Dockerfile").contains("protobuf-compiler"));
     }
 }

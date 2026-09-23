@@ -48,8 +48,12 @@ impl Reconciler {
             .get(&key)
             .cloned()
             .unwrap_or_default();
-        let snapshot = normalize(raw.clone(), previous)?;
-        let next_watermarks = report_watermarks(&snapshot);
+        let snapshot = normalize(raw.clone(), previous.clone())?;
+        let next_watermarks = merge_watermarks(previous, report_watermarks(&snapshot));
+        self.watermarks
+            .lock()
+            .await
+            .insert(key.clone(), next_watermarks);
         let plan = evaluate(&snapshot, &self.evaluation);
         let outcome = match execute_plan(self.api.as_ref(), &raw, &snapshot, plan).await {
             Ok(outcome) => outcome,
@@ -67,9 +71,21 @@ impl Reconciler {
             }
             Err(error) => return Err(error),
         };
-        self.watermarks.lock().await.insert(key, next_watermarks);
         Ok(action(outcome))
     }
+}
+
+fn merge_watermarks(mut previous: Watermarks, observed: Watermarks) -> Watermarks {
+    for (key, watermark) in observed {
+        let replace = previous.get(&key).is_none_or(|existing| {
+            existing.process_session_id != watermark.process_session_id
+                || watermark.report_sequence > existing.report_sequence
+        });
+        if replace {
+            previous.insert(key, watermark);
+        }
+    }
+    previous
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

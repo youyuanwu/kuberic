@@ -99,6 +99,9 @@ async fn execute_change(
             api.ensure_replica_scaffolding(observation, &replica_ids)
                 .await
         }
+        KubernetesChange::EnsureWriteRoutingService => {
+            api.ensure_write_routing_service(observation).await
+        }
         KubernetesChange::PersistStatus { status } => {
             api.replace_status(observation, &status).await
         }

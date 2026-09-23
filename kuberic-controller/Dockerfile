@@ -1,4 +1,7 @@
 FROM rust:1.85-bookworm AS build
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --locked --release -p kuberic-controller --bin kuberic-controller

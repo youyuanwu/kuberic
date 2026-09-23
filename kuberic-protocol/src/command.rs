@@ -67,6 +67,7 @@ pub enum KubernetesChange {
     EnsureReplicaScaffolding {
         replica_ids: Vec<ReplicaId>,
     },
+    EnsureWriteRoutingService,
     PersistStatus {
         status: Box<crate::types::AcceptedStatus>,
     },

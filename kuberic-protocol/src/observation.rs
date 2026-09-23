@@ -190,6 +190,10 @@ pub struct ReportWatermark {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingObservation {
+    #[serde(default)]
+    pub service_present: bool,
+    #[serde(default)]
+    pub unresolved_write_target: bool,
     pub write_target: Option<ReplicaIdentity>,
 }
 
@@ -229,6 +233,19 @@ impl ObservationSnapshot {
             .iter()
             .filter(|(key, _)| key.replica_id == replica_id)
             .filter_map(|(_, observation)| observation.kubernetes.as_ref());
+        let first = matching.next()?;
+        matching.next().is_none().then_some(first)
+    }
+
+    pub fn scaffolding_observation_for(
+        &self,
+        replica_id: ReplicaId,
+    ) -> Option<&ReplicaObservation> {
+        let mut matching = self
+            .replicas
+            .iter()
+            .filter(|(key, _)| key.replica_id == replica_id)
+            .filter_map(|(_, observation)| observation.kubernetes.as_ref().map(|_| observation));
         let first = matching.next()?;
         matching.next().is_none().then_some(first)
     }
