@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{Stream, StreamExt};
 use kuberic_protocol::command::ProtocolCommand;
@@ -11,7 +12,7 @@ use kuberic_protocol::types::{ProcessSessionId, ReplicaIdentity};
 use kuberic_runtime::application::OpenMode;
 use kuberic_wire::{normalize_execute_request, proto};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{OwnedRwLockReadGuard, RwLock, watch};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
@@ -19,6 +20,7 @@ use crate::coordinator::Coordinator;
 use crate::hosting::{PodRuntime, RuntimeDataPlane};
 use crate::report::AgentReporter;
 use crate::runtime_adapter::RuntimeEffectExecutor;
+use crate::state::{AgentState, CoordinatorStage};
 use crate::store::AgentStore;
 use crate::{AgentError, Result};
 
@@ -26,14 +28,18 @@ const AUTHORIZATION_HEADER: &str = "authorization";
 
 pub struct SessionRegistry {
     local_session: ProcessSessionId,
-    peers: RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>,
+    peers: Arc<RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>>,
+}
+
+pub struct SessionLease {
+    _peers: OwnedRwLockReadGuard<BTreeMap<ReplicaIdentity, ProcessSessionId>>,
 }
 
 impl SessionRegistry {
     pub fn new(local_session: ProcessSessionId) -> Self {
         Self {
             local_session,
-            peers: RwLock::new(BTreeMap::new()),
+            peers: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -50,13 +56,13 @@ impl SessionRegistry {
         sender: &ReplicaIdentity,
         sender_session: &str,
         receiver_session: &str,
-    ) -> std::result::Result<(), Status> {
+    ) -> std::result::Result<SessionLease, Status> {
         if receiver_session != self.local_session.as_str() {
             return Err(Status::failed_precondition(
                 "replication targets a retired receiver session",
             ));
         }
-        let peers = self.peers.read().await;
+        let peers = self.peers.clone().read_owned().await;
         let expected = peers
             .get(sender)
             .ok_or_else(|| Status::failed_precondition("sender session has not been admitted"))?;
@@ -65,7 +71,7 @@ impl SessionRegistry {
                 "replication originates from a retired sender session",
             ));
         }
-        Ok(())
+        Ok(SessionLease { _peers: peers })
     }
 }
 
@@ -77,6 +83,7 @@ pub struct AgentService<S, E> {
     reporter: Arc<AgentReporter<S>>,
     sessions: Arc<SessionRegistry>,
     bearer_token: Arc<str>,
+    ready_state: Arc<AtomicBool>,
 }
 
 impl<S, E> Clone for AgentService<S, E> {
@@ -89,6 +96,7 @@ impl<S, E> Clone for AgentService<S, E> {
             reporter: self.reporter.clone(),
             sessions: self.sessions.clone(),
             bearer_token: self.bearer_token.clone(),
+            ready_state: self.ready_state.clone(),
         }
     }
 }
@@ -120,6 +128,7 @@ where
             reporter,
             sessions,
             bearer_token,
+            ready_state: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -136,38 +145,116 @@ where
     ) -> Result<()> {
         let control_listener = TcpListener::bind(control_address).await?;
         let replication_listener = TcpListener::bind(replication_address).await?;
-        self.coordinator
-            .open_runtime(OpenMode::Existing, self.sessions.local_session())
-            .await?;
-        ready.send_replace(true);
 
         let control_service = self.clone();
         let peer_service = self.clone();
-        let replication_service = self;
+        let replication_service = self.clone();
+        let mut control_shutdown = shutdown.clone();
         let mut replication_shutdown = shutdown.clone();
-        let control = tonic::transport::Server::builder()
-            .add_service(proto::agent_control_server::AgentControlServer::new(
-                control_service,
-            ))
-            .add_service(proto::replica_peer_server::ReplicaPeerServer::new(
-                peer_service,
-            ))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(control_listener), async move {
-                let _ = shutdown.wait_for(|stopped| *stopped).await;
-            });
-        let replication = tonic::transport::Server::builder()
-            .add_service(proto::replication_data_server::ReplicationDataServer::new(
-                replication_service,
-            ))
-            .serve_with_incoming_shutdown(
-                TcpListenerStream::new(replication_listener),
-                async move {
-                    let _ = replication_shutdown.wait_for(|stopped| *stopped).await;
-                },
-            );
-        tokio::try_join!(control, replication)
-            .map(|_| ())
-            .map_err(|error| AgentError::CommandRejected(error.to_string()))
+        let mut control = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(proto::agent_control_server::AgentControlServer::new(
+                    control_service,
+                ))
+                .add_service(proto::replica_peer_server::ReplicaPeerServer::new(
+                    peer_service,
+                ))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(control_listener),
+                    async move {
+                        wait_for_shutdown(&mut control_shutdown).await;
+                    },
+                )
+                .await
+        });
+        let mut replication = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(proto::replication_data_server::ReplicationDataServer::new(
+                    replication_service,
+                ))
+                .serve_with_incoming_shutdown(
+                    TcpListenerStream::new(replication_listener),
+                    async move {
+                        wait_for_shutdown(&mut replication_shutdown).await;
+                    },
+                )
+                .await
+        });
+
+        let startup = self.reconstruct_runtime();
+        tokio::pin!(startup);
+        let startup_result = tokio::select! {
+            result = &mut startup => result,
+            _ = wait_for_shutdown(&mut shutdown) => {
+                Err(AgentError::Runtime(kuberic_runtime::RuntimeError::OperationCancelled))
+            }
+        };
+        if let Err(error) = startup_result {
+            self.runtime.abort();
+            control.abort();
+            replication.abort();
+            return Err(error);
+        }
+
+        self.ready_state.store(true, Ordering::Release);
+        ready.send_replace(true);
+        let result = tokio::select! {
+            result = &mut control => {
+                replication.abort();
+                flatten_server_result(result)
+            }
+            result = &mut replication => {
+                control.abort();
+                flatten_server_result(result)
+            }
+            _ = wait_for_shutdown(&mut shutdown) => {
+                let results = tokio::join!(&mut control, &mut replication);
+                flatten_server_result(results.0).and_then(|_| flatten_server_result(results.1))
+            }
+        };
+        self.ready_state.store(false, Ordering::Release);
+        ready.send_replace(false);
+        self.runtime.abort();
+        result
+    }
+
+    async fn reconstruct_runtime(&self) -> Result<()> {
+        let state = self.store.load_state().await?;
+        let transition = startup_transition(&state);
+        self.runtime
+            .reconstruct(
+                OpenMode::Existing,
+                state.role,
+                state.read_status,
+                state.write_status,
+                transition,
+            )
+            .await?;
+        if let Some(pending) = state.pending_effect.as_ref()
+            && matches!(
+                pending.effect.action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::Open(_)
+            )
+        {
+            self.store.mark_effect_applied(&pending.effect).await?;
+            self.store
+                .complete_effect(&kuberic_runtime_internal::effects::RuntimeEffectResult {
+                    operation_id: pending.effect.operation_id.clone(),
+                    sequence: pending.effect.sequence,
+                    postcondition: self.runtime.snapshot().await.into(),
+                })
+                .await?;
+        }
+        self.coordinator.resume_pending().await?;
+        Ok(())
+    }
+
+    fn require_ready(&self) -> std::result::Result<(), Status> {
+        if self.ready_state.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Status::unavailable("agent runtime is not ready"))
+        }
     }
 
     fn authorize<T>(&self, request: &Request<T>) -> std::result::Result<(), Status> {
@@ -255,6 +342,64 @@ where
     }
 }
 
+fn startup_transition(
+    state: &AgentState,
+) -> Option<(kuberic_protocol::types::ReplicaRole, bool, bool)> {
+    let record = state.reconfiguration.as_ref()?;
+    let target_role = record
+        .command
+        .current_configuration
+        .members
+        .iter()
+        .find(|member| member.identity == state.identity.local_identity)
+        .map(|member| member.role)?;
+    if let Some(retained) = state.retained_result.as_ref() {
+        match &retained.effect.action {
+            kuberic_runtime_internal::effects::RuntimeEffectAction::ChangeReplicatorRole(role)
+                if *role == target_role =>
+            {
+                return Some((target_role, false, false));
+            }
+            kuberic_runtime_internal::effects::RuntimeEffectAction::UpdateEpoch => {
+                return Some((target_role, true, false));
+            }
+            kuberic_runtime_internal::effects::RuntimeEffectAction::ChangeApplicationRole(role)
+                if *role == target_role =>
+            {
+                return Some((target_role, true, true));
+            }
+            _ => {}
+        }
+    }
+    match record.stage {
+        CoordinatorStage::Epoch => Some((target_role, false, false)),
+        CoordinatorStage::ApplicationRole => Some((target_role, true, false)),
+        _ => None,
+    }
+}
+
+fn flatten_server_result(
+    result: std::result::Result<
+        std::result::Result<(), tonic::transport::Error>,
+        tokio::task::JoinError,
+    >,
+) -> Result<()> {
+    result
+        .map_err(|error| AgentError::CommandRejected(error.to_string()))?
+        .map_err(|error| AgentError::CommandRejected(error.to_string()))
+}
+
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl<S, E> proto::agent_control_server::AgentControl for AgentService<S, E>
 where
@@ -276,6 +421,7 @@ where
         request: Request<proto::ExecuteCommandRequest>,
     ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
         self.authorize(&request)?;
+        self.require_ready()?;
         Ok(Response::new(
             self.execute_inner(request.into_inner()).await?,
         ))
@@ -303,6 +449,7 @@ where
         request: Request<proto::ExecuteCommandRequest>,
     ) -> std::result::Result<Response<proto::ExecuteCommandResponse>, Status> {
         self.authorize(&request)?;
+        self.require_ready()?;
         Ok(Response::new(
             self.execute_inner(request.into_inner()).await?,
         ))
@@ -328,6 +475,7 @@ where
         request: Request<tonic::Streaming<proto::ReplicationItem>>,
     ) -> std::result::Result<Response<Self::ReplicateStream>, Status> {
         self.authorize(&request)?;
+        self.require_ready()?;
         let mut incoming = request.into_inner();
         let data_plane = self.data_plane.clone();
         let sessions = self.sessions.clone();
@@ -344,7 +492,7 @@ where
                         .map_err(|error: kuberic_wire::WireError| {
                             Status::invalid_argument(error.to_string())
                         })?;
-                    sessions
+                    let _lease = sessions
                         .validate_peer(
                             &sender_identity,
                             &item.sender_session_id,
@@ -378,6 +526,7 @@ where
         request: Request<tonic::Streaming<proto::CopyItem>>,
     ) -> std::result::Result<Response<Self::BuildStream>, Status> {
         self.authorize(&request)?;
+        self.require_ready()?;
         let mut incoming = request.into_inner();
         let data_plane = self.data_plane.clone();
         let sessions = self.sessions.clone();
@@ -394,7 +543,7 @@ where
                         .map_err(|error: kuberic_wire::WireError| {
                             Status::invalid_argument(error.to_string())
                         })?;
-                    sessions
+                    let _lease = sessions
                         .validate_peer(
                             &sender_identity,
                             &item.sender_session_id,

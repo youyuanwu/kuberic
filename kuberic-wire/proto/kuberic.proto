@@ -119,6 +119,7 @@ message AgentStatusReport {
   string pending_operation_id = 27;
   string retained_operation_id = 28;
   repeated BuildStatus builds = 29;
+  Epoch deactivation_epoch = 30;
 }
 
 message InitializeAgentStoreCommand {

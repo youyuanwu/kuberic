@@ -737,6 +737,27 @@ rejects retired sender or receiver sessions, and exposes bounded reliable send
 windows with reconnect, cancellation, truthful retained-range capability, and
 full-copy fallback.
 
+Phase 4 hardening rejects unequal same-epoch authority under a new operation
+ID while permitting only exact current-only completion of an admitted PC/CC
+transition. Changed authority cannot restore access during admission; primary
+read activation waits for local catch-up. Managed catch-up releases the
+progress lock so ACKs can complete it, and matching commands are serialized
+and revalidated at durable stage boundaries.
+
+Serving starts fail-closed listeners before reconstructing live hosting from
+durable authority, role, access, pending effect, and retained stage evidence.
+Readiness is revoked and the runtime is aborted on shutdown. Session
+replacement holds an owned delivery lease, so it cannot return while an
+old-session mutation remains in flight.
+
+Reliable windows require full copy when retained history is absent or
+cancelled. Older duplicate replication returns a cumulative received
+watermark compatible with applied progress. Reports retry until durable
+authority and repeated live snapshots agree, and deactivation retains its own
+epoch. Build selection is admitted by the agent before source execution; the
+engine cannot manufacture build permission. Returned copy-stream drop
+propagates cancellation into provider iteration and removes the build.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
@@ -744,9 +765,11 @@ end-to-end Service Fabric equivalence claim:
 |---|---|
 | Controller selection, dispatch, bounded re-observation, and routing fences | Level-triggered controller in Phase 5 |
 | Concrete outbound gRPC peer dialing and deployment credential distribution | Bootstrap vertical slice in Phase 6 |
+| True process-kill reconstruction with a live provider and active command | Bootstrap and adversarial suites in Phases 6 and 9 |
 | Persistent resend payloads across process sessions where full copy is not acceptable | Reliable build/replacement owner in Phase 7 |
 | Full replacement, failover, quorum-loss, and destructive-recovery orchestration | Phases 7-9 |
-| Cross-operation transport crash and partition acceptance tests | Phases 7 and 9 |
+| Network-level session replacement, listener shutdown, and partition acceptance tests | Phases 7 and 9 |
+| Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |
 
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and

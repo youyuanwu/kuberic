@@ -137,11 +137,15 @@ server. It consumes narrow `ReplicaAuthorityStore`,
 only the mutation authority they require.
 
 Replica builds use separate exact-target authority outside quorum membership.
+The agent admits immutable build authority before source copy execution; the
+replication engine consumes but does not create that permission.
 Copy context remains a multi-item operation-data stream. `prepare_copy` returns
 a bounded stream that incrementally carries snapshot chunks, the captured copy
 boundary, and subsequent live replication without holding the global runtime
 effect lock across provider enumeration. Durable duplicate snapshot chunks are
 verified and acknowledged without redelivery to the application.
+Dropping the returned copy stream cancels provider iteration and removes the
+generation-scoped build.
 
 ## Deferred Service Fabric completion contracts
 

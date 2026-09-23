@@ -1,6 +1,7 @@
 //! Durable replica-local reconfiguration coordinator.
 
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{AccessStatus, OperationId, ProcessSessionId, ReplicaRole};
@@ -16,6 +17,7 @@ use crate::store::{AgentStore, BeginConfiguration};
 pub struct Coordinator<S, E> {
     store: Arc<S>,
     runtime: RuntimeAdapter<S, E>,
+    command_lock: Mutex<()>,
 }
 
 impl<S, E> Coordinator<S, E>
@@ -27,6 +29,7 @@ where
         Self {
             runtime: RuntimeAdapter::new(store.clone(), executor),
             store,
+            command_lock: Mutex::new(()),
         }
     }
 
@@ -49,10 +52,15 @@ where
             .await
     }
 
+    pub async fn resume_pending(&self) -> Result<Option<RuntimeEffectResult>> {
+        self.runtime.resume_pending().await
+    }
+
     pub async fn ensure_configuration(
         &self,
         command: EnsureConfiguration,
     ) -> Result<RetainedCommandResult> {
+        let _command = self.command_lock.lock().await;
         let durable = self.store.load_state().await?;
         let authority = admit_configuration(&command, &durable)?;
         match self.store.begin_configuration(&command).await? {
@@ -62,10 +70,17 @@ where
 
         loop {
             let state = self.store.load_state().await?;
-            let record = state
-                .reconfiguration
-                .clone()
-                .expect("begin_configuration installed a durable record");
+            let record = if let Some(record) = state.reconfiguration.clone() {
+                record
+            } else if let Some(retained) = state.retained_command
+                && retained.command.operation_id == command.operation_id
+            {
+                return Ok(retained);
+            } else {
+                return Err(crate::AgentError::EffectConflict(
+                    "configuration ownership changed while the command was executing".into(),
+                ));
+            };
             match record.stage {
                 CoordinatorStage::AdmitAuthority => {
                     self.execute(
@@ -95,20 +110,25 @@ where
                             RuntimeEffectAction::RefreshApplicationProgress,
                         )
                         .await?;
-                    self.advance(
-                        &record,
-                        CoordinatorStage::Catchup,
-                        Some(result.postcondition.current_progress),
-                    )
-                    .await?;
+                    let next = if state.role == ReplicaRole::Primary
+                        && authority.local_role() != ReplicaRole::Primary
+                    {
+                        CoordinatorStage::Catchup
+                    } else {
+                        CoordinatorStage::Deactivate
+                    };
+                    self.advance(&record, next, Some(result.postcondition.current_progress))
+                        .await?;
                 }
                 CoordinatorStage::Catchup => {
-                    if state.role == ReplicaRole::Primary {
-                        self.execute(&record, "catchup", RuntimeEffectAction::WaitForCatchup)
-                            .await?;
-                    }
-                    self.advance(&record, CoordinatorStage::Deactivate, None)
+                    self.execute(&record, "catchup", RuntimeEffectAction::WaitForCatchup)
                         .await?;
+                    let next = if authority.local_role() == ReplicaRole::Primary {
+                        CoordinatorStage::Activate
+                    } else {
+                        CoordinatorStage::Deactivate
+                    };
+                    self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::Deactivate => {
                     self.execute(
@@ -147,8 +167,12 @@ where
                         RuntimeEffectAction::ChangeApplicationRole(authority.local_role()),
                     )
                     .await?;
-                    self.advance(&record, CoordinatorStage::Activate, None)
-                        .await?;
+                    let next = if authority.local_role() == ReplicaRole::Primary {
+                        CoordinatorStage::Catchup
+                    } else {
+                        CoordinatorStage::Activate
+                    };
+                    self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::Activate => {
                     let read_status = if matches!(

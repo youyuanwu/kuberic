@@ -323,6 +323,32 @@ struct CountingReplicator {
     counts: CountingFactory,
 }
 
+struct PausingFactory {
+    storage: std::sync::Weak<TestApplication>,
+    captured: Arc<Mutex<Option<Arc<dyn Replicator>>>>,
+    created: Arc<Notify>,
+    resume: Arc<Notify>,
+}
+
+#[async_trait]
+impl ReplicatorFactory for PausingFactory {
+    async fn create_replicator(
+        &self,
+        context: ReplicatorFactoryContext,
+        provider: Arc<dyn StateProvider>,
+        settings: ReplicatorSettings,
+    ) -> Result<ReplicatorInterfaces> {
+        let interfaces =
+            DefaultReplicatorFactory::new(self.storage.upgrade().ok_or(RuntimeError::Closed)?)
+                .create_replicator(context, provider, settings)
+                .await?;
+        *self.captured.lock().unwrap() = Some(interfaces.replicator());
+        self.created.notify_one();
+        self.resume.notified().await;
+        Ok(interfaces)
+    }
+}
+
 #[async_trait]
 impl ReplicatorFactory for CountingFactory {
     async fn create_replicator(
@@ -920,6 +946,20 @@ async fn copy_through_final(prepared: &mut PreparedCopy) -> Vec<proto::CopyItem>
     }
 }
 
+async fn prepare_copy_authorized(
+    runtime: &PodRuntime,
+    request: PrepareCopyRequest,
+) -> Result<PreparedCopy> {
+    runtime
+        .authorize_build(
+            request.build_id.clone(),
+            request.target.clone(),
+            request.configuration.clone(),
+        )
+        .await?;
+    runtime.data_plane().prepare_copy(request).await
+}
+
 async fn open_primary(
     application: Arc<TestApplication>,
     members: Vec<ReplicaIdentity>,
@@ -1230,16 +1270,17 @@ async fn primary_control_build_waits_for_service_copy_ack_and_removal_is_fenced(
         source.data_plane().next_outbound().await,
         Some(OutboundReplication::Build(_))
     ));
-    let mut prepared = source
-        .data_plane()
-        .prepare_copy(PrepareCopyRequest {
+    let mut prepared = prepare_copy_authorized(
+        &source,
+        PrepareCopyRequest {
             build_id: OperationId::new("sf-build"),
             target: replacement.clone(),
             configuration: BuildConfiguration::Current,
             copy_context: empty_copy_context(),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let target_app = Arc::new(TestApplication::default());
     target_app.manual_streams.store(true, Ordering::SeqCst);
     let target = Arc::new(PodRuntime::new(
@@ -1384,6 +1425,36 @@ async fn failed_or_cancelled_service_open_aborts_created_interfaces() {
                 .any(|event| event == "service.abort")
         );
     }
+}
+
+#[tokio::test]
+async fn cancelled_factory_creation_aborts_pending_managed_replicator() {
+    let application = Arc::new(TestApplication::default());
+    let captured = Arc::new(Mutex::new(None));
+    let created = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    *application.factory.lock().unwrap() = Some(Arc::new(PausingFactory {
+        storage: Arc::downgrade(&application),
+        captured: captured.clone(),
+        created: created.clone(),
+        resume,
+    }));
+    let runtime = Arc::new(PodRuntime::new(
+        identity(1, "cancelled-factory"),
+        application,
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    let open_runtime = runtime.clone();
+    let open = tokio::spawn(async move {
+        open_runtime
+            .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+            .await
+    });
+    created.notified().await;
+    open.abort();
+    assert!(matches!(open.await, Err(error) if error.is_cancelled()));
+    let control = captured.lock().unwrap().clone().unwrap();
+    assert!(matches!(control.open().await, Err(RuntimeError::Closed)));
 }
 
 #[tokio::test]
@@ -1566,6 +1637,110 @@ async fn primary_promotion_retries_epoch_stage_before_application_role() {
             "service.change_role",
         ]
     );
+}
+
+#[tokio::test]
+async fn newer_primary_authority_stays_write_closed_until_epoch_stage_completes() {
+    let local = identity(1, "same-primary-new-epoch");
+    let application = Arc::new(TestApplication::default());
+    let runtime = open_primary(application.clone(), vec![local.clone()]).await;
+    let newer = AdmittedAuthority {
+        local_identity: local.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            local.replica_id,
+            vec![ConfigurationMember {
+                identity: local,
+                role: ReplicaRole::Primary,
+            }],
+            1,
+        ),
+    };
+    runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::AdmitAuthority(Box::new(newer)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+    assert!(matches!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("blocked-before-epoch"),
+                data: Bytes::from_static(b"blocked"),
+            })
+            .await,
+        Err(RuntimeError::WriteClosed(
+            AccessStatus::ReconfigurationPending
+        ))
+    ));
+    runtime
+        .apply_effect(effect(
+            6,
+            RuntimeEffectAction::ChangeReplicatorRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    application.pause_update_epoch.store(true, Ordering::SeqCst);
+    let epoch_runtime = runtime.clone();
+    let update = tokio::spawn(async move {
+        epoch_runtime
+            .apply_effect(effect(7, RuntimeEffectAction::UpdateEpoch))
+            .await
+    });
+    application.update_epoch_notify.notified().await;
+    assert!(matches!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("blocked-during-epoch"),
+                data: Bytes::from_static(b"blocked"),
+            })
+            .await,
+        Err(RuntimeError::WriteClosed(
+            AccessStatus::ReconfigurationPending
+        ))
+    ));
+    application
+        .pause_update_epoch
+        .store(false, Ordering::SeqCst);
+    application.resume_update_epoch_notify.notify_waiters();
+    update.await.unwrap().unwrap();
+    runtime
+        .apply_effect(effect(
+            8,
+            RuntimeEffectAction::ChangeApplicationRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            9,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ))
+        .await
+        .unwrap();
+    runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("allowed-after-epoch"),
+            data: Bytes::from_static(b"allowed"),
+        })
+        .await
+        .unwrap()
+        .committed()
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2232,6 +2407,12 @@ async fn partition_contract_reports_independent_access_load_and_fault() {
             .await
             .is_err()
     );
+    runtime
+        .apply_effect(effect(2, RuntimeEffectAction::Close))
+        .await
+        .unwrap();
+    assert!(partition.report_load(Vec::new()).await.is_err());
+    assert!(partition.report_fault(FaultType::Permanent).await.is_err());
 }
 
 #[tokio::test]
@@ -2550,7 +2731,7 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
         Err(RuntimeError::InvalidReplication(_))
     ));
 
-    let mut committed = retry_item(&retry, local);
+    let mut committed = retry_item(&retry, local.clone());
     committed.lsn = 2;
     committed.committed_lsn = 1;
     committed.data = b"next".to_vec();
@@ -2569,6 +2750,19 @@ async fn receiver_ack_requires_durable_authority_and_application_acceptance() {
         application.durable_progress().await.unwrap().committed_lsn,
         1
     );
+    let older = retry_item(&retry, local);
+    let acknowledgement = runtime
+        .data_plane()
+        .receive_replication(older)
+        .await
+        .unwrap()
+        .applied()
+        .await
+        .unwrap();
+    assert_eq!(acknowledgement.received_lsn, 2);
+    assert_eq!(acknowledgement.applied_lsn, 2);
+    kuberic_wire::validate_replication_ack(&acknowledgement).unwrap();
+    assert_eq!(application.applied.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -3474,16 +3668,17 @@ async fn exact_target_copy_closes_the_replication_gap_before_completion() {
         .committed()
         .await
         .unwrap();
-    let mut prepared = source_runtime
-        .data_plane()
-        .prepare_copy(PrepareCopyRequest {
+    let mut prepared = prepare_copy_authorized(
+        &source_runtime,
+        PrepareCopyRequest {
             build_id: OperationId::new("build"),
             target: target.clone(),
             configuration: BuildConfiguration::Current,
             copy_context: empty_copy_context(),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(prepared.authority.replication_boundary_lsn, 1);
     let items = copy_through_final(&mut prepared).await;
     assert_eq!(items.len(), 3);
@@ -3646,9 +3841,9 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
         .pause_copy_enumeration
         .store(true, Ordering::SeqCst);
     let runtime = open_primary(application.clone(), vec![identity(1, "source")]).await;
-    let mut prepared = runtime
-        .data_plane()
-        .prepare_copy(PrepareCopyRequest {
+    let mut prepared = prepare_copy_authorized(
+        &runtime,
+        PrepareCopyRequest {
             build_id: OperationId::new("streaming-copy"),
             target: identity(1, "replacement"),
             configuration: BuildConfiguration::Current,
@@ -3656,9 +3851,10 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
                 Ok(Bytes::from_static(b"context-1")),
                 Ok(Bytes::from_static(b"context-2")),
             ])),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     application.copy_enumeration_notify.notified().await;
     let pending = timeout(
         Duration::from_secs(1),
@@ -3691,6 +3887,27 @@ async fn copy_context_and_snapshot_stream_without_blocking_primary_writes() {
     assert_eq!(live.lsn, 2);
     assert!(!live.snapshot_chunk);
     assert!(!live.final_item);
+}
+
+#[tokio::test]
+async fn source_copy_requires_agent_admitted_build_authority() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![identity(1, "unauthorized-copy-source")],
+    )
+    .await;
+    assert!(matches!(
+        runtime
+            .data_plane()
+            .prepare_copy(PrepareCopyRequest {
+                build_id: OperationId::new("unauthorized-copy"),
+                target: identity(1, "unauthorized-copy-target"),
+                configuration: BuildConfiguration::Current,
+                copy_context: empty_copy_context(),
+            })
+            .await,
+        Err(RuntimeError::AuthorityNotAdmitted)
+    ));
 }
 
 #[tokio::test]
@@ -3739,15 +3956,16 @@ async fn retained_gap_enumeration_does_not_block_primary_writes() {
     let cancelled_build_id = build_id.clone();
     let cancelled_target = target.clone();
     let cancelled = tokio::spawn(async move {
-        cancelled_runtime
-            .data_plane()
-            .prepare_copy(PrepareCopyRequest {
+        prepare_copy_authorized(
+            &cancelled_runtime,
+            PrepareCopyRequest {
                 build_id: cancelled_build_id,
                 target: cancelled_target,
                 configuration: BuildConfiguration::Current,
                 copy_context: empty_copy_context(),
-            })
-            .await
+            },
+        )
+        .await
     });
     application.retained_enumeration_notify.notified().await;
     cancelled.abort();
@@ -3757,15 +3975,16 @@ async fn retained_gap_enumeration_does_not_block_primary_writes() {
 
     let runtime_for_copy = runtime.clone();
     let prepare = tokio::spawn(async move {
-        runtime_for_copy
-            .data_plane()
-            .prepare_copy(PrepareCopyRequest {
+        prepare_copy_authorized(
+            &runtime_for_copy,
+            PrepareCopyRequest {
                 build_id,
                 target,
                 configuration: BuildConfiguration::Current,
                 copy_context: empty_copy_context(),
-            })
-            .await
+            },
+        )
+        .await
     });
     application.retained_enumeration_notify.notified().await;
     let pending = timeout(
@@ -3790,6 +4009,40 @@ async fn retained_gap_enumeration_does_not_block_primary_writes() {
     let _snapshot = copy_through_final(&mut prepared).await;
     assert_eq!(next_copy_item(&mut prepared).await.lsn, 1);
     assert_eq!(next_copy_item(&mut prepared).await.lsn, 2);
+}
+
+#[tokio::test]
+async fn dropping_returned_copy_stream_cancels_paused_provider_and_releases_build() {
+    let application = Arc::new(TestApplication::default());
+    application.seed_operation(1, Bytes::from_static(b"seed"));
+    application
+        .pause_copy_enumeration
+        .store(true, Ordering::SeqCst);
+    let runtime = open_primary(application.clone(), vec![identity(1, "copy-cancel")]).await;
+    let request = || PrepareCopyRequest {
+        build_id: OperationId::new("cancel-returned-copy"),
+        target: identity(1, "copy-cancel-target"),
+        configuration: BuildConfiguration::Current,
+        copy_context: empty_copy_context(),
+    };
+    let prepared = prepare_copy_authorized(&runtime, request()).await.unwrap();
+    application.copy_enumeration_notify.notified().await;
+    drop(prepared);
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.snapshot().await.builds.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    application
+        .pause_copy_enumeration
+        .store(false, Ordering::SeqCst);
+    application.resume_copy_enumeration_notify.notify_waiters();
+    let _retry = prepare_copy_authorized(&runtime, request()).await.unwrap();
 }
 
 #[tokio::test]
@@ -3825,16 +4078,17 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         ))
         .await
         .unwrap();
-    let mut prepared = source_runtime
-        .data_plane()
-        .prepare_copy(PrepareCopyRequest {
+    let mut prepared = prepare_copy_authorized(
+        &source_runtime,
+        PrepareCopyRequest {
             build_id: OperationId::new("handoff-build"),
             target: replacement.clone(),
             configuration: BuildConfiguration::Current,
             copy_context: empty_copy_context(),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let items = copy_through_final(&mut prepared).await;
 
     let target_application = Arc::new(TestApplication::default());
@@ -4029,6 +4283,13 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         ))
         .await
         .unwrap();
+    source_runtime
+        .apply_effect(effect(
+            7,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        ))
+        .await
+        .unwrap();
     let pending = source_runtime
         .data_plane()
         .begin_write(ClientWrite {
@@ -4103,16 +4364,17 @@ async fn bootstrap_primary_builds_full_genesis_members_before_configuration_admi
         .await
         .unwrap();
 
-    let mut prepared = runtime
-        .data_plane()
-        .prepare_copy(PrepareCopyRequest {
+    let mut prepared = prepare_copy_authorized(
+        &runtime,
+        PrepareCopyRequest {
             build_id: OperationId::new("bootstrap-secondary"),
             target: secondary,
             configuration: BuildConfiguration::Bootstrap(genesis),
             copy_context: empty_copy_context(),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(prepared.authority.kind, BuildAuthorityKind::Bootstrap);
     assert_eq!(prepared.authority.replication_boundary_lsn, 0);
     let items = copy_through_final(&mut prepared).await;
@@ -4159,9 +4421,7 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         configuration: BuildConfiguration::Current,
         copy_context: empty_copy_context(),
     };
-    let mut first = runtime
-        .data_plane()
-        .prepare_copy(request(target.clone()))
+    let mut first = prepare_copy_authorized(&runtime, request(target.clone()))
         .await
         .unwrap();
     assert_eq!(first.authority.replication_boundary_lsn, 0);
@@ -4181,18 +4441,12 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
     assert_eq!(live.lsn, 1);
     assert!(!live.final_item);
     assert!(matches!(
-        runtime
-            .data_plane()
-            .prepare_copy(request(target.clone()))
-            .await,
+        prepare_copy_authorized(&runtime, request(target.clone())).await,
         Err(RuntimeError::ReconfigurationPending)
     ));
 
     assert!(matches!(
-        runtime
-            .data_plane()
-            .prepare_copy(request(identity(2, "different-target")))
-            .await,
+        prepare_copy_authorized(&runtime, request(identity(2, "different-target"))).await,
         Err(RuntimeError::AuthorityMismatch(_))
     ));
 
@@ -4215,9 +4469,7 @@ async fn build_identity_is_immutable_and_recoverable_on_source_restart() {
         ))
         .await
         .unwrap();
-    let mut resumed = restarted
-        .data_plane()
-        .prepare_copy(request(target))
+    let mut resumed = prepare_copy_authorized(&restarted, request(target))
         .await
         .unwrap();
     assert_eq!(resumed.authority.replication_boundary_lsn, 0);
@@ -4271,16 +4523,17 @@ async fn retrying_accepted_write_does_not_overwrite_build_final_sequence() {
         runtime.data_plane().begin_write(write.clone()).await,
         Err(RuntimeError::Application(_))
     ));
-    let mut prepared = runtime
-        .data_plane()
-        .prepare_copy(PrepareCopyRequest {
+    let mut prepared = prepare_copy_authorized(
+        &runtime,
+        PrepareCopyRequest {
             build_id: OperationId::new("final-sequence"),
             target,
             configuration: BuildConfiguration::Current,
             copy_context: empty_copy_context(),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let final_item = copy_through_final(&mut prepared)
         .await
         .into_iter()
@@ -4355,16 +4608,17 @@ async fn copy_receiver_recovers_sequence_and_final_completion_after_restart() {
         .committed()
         .await
         .unwrap();
-    let mut prepared = source_runtime
-        .data_plane()
-        .prepare_copy(PrepareCopyRequest {
+    let mut prepared = prepare_copy_authorized(
+        &source_runtime,
+        PrepareCopyRequest {
             build_id: OperationId::new("restartable-build"),
             target: target.clone(),
             configuration: BuildConfiguration::Current,
             copy_context: empty_copy_context(),
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let items = copy_through_final(&mut prepared).await;
 
     let application = Arc::new(TestApplication::default());
@@ -4545,6 +4799,18 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
     let waiting = runtime.snapshot().await;
     assert_eq!(waiting.catch_up_boundary, Some(10));
     assert!(!waiting.catch_up_complete);
+    assert!(matches!(
+        runtime
+            .apply_effect(effect(
+                5,
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::ReconfigurationPending,
+                },
+            ))
+            .await,
+        Err(RuntimeError::ReconfigurationPending)
+    ));
     let pending_after_configuration = runtime
         .data_plane()
         .begin_write(ClientWrite {
@@ -4554,17 +4820,40 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
         .await
         .unwrap();
 
-    runtime
+    let runtime_for_wait = Arc::new(runtime);
+    let wait_runtime = runtime_for_wait.clone();
+    let managed_wait = tokio::spawn(async move {
+        wait_runtime
+            .apply_effect(effect(5, RuntimeEffectAction::WaitForCatchup))
+            .await
+    });
+    tokio::task::yield_now().await;
+    runtime_for_wait
         .data_plane()
         .accept_acknowledgement(acknowledgement(&admitted, secondary, 10))
         .await
         .unwrap();
-    let complete = runtime.snapshot().await;
+    timeout(Duration::from_secs(1), managed_wait)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let complete = runtime_for_wait.snapshot().await;
     assert_eq!(complete.current_configuration_quorum_progress, 10);
     assert!(complete.catch_up_complete);
+    runtime_for_wait
+        .apply_effect(effect(
+            6,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::ReconfigurationPending,
+            },
+        ))
+        .await
+        .unwrap();
     timeout(
         Duration::from_secs(1),
-        runtime
+        runtime_for_wait
             .primary_replicator()
             .await
             .unwrap()

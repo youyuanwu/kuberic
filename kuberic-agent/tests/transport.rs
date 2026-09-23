@@ -57,6 +57,16 @@ fn reliable_window_preserves_order_backpressure_reconnect_and_cancellation() {
     window.cancel();
     assert!(window.retained().is_empty());
     assert!(window.enqueue(item(4)).is_err());
+    assert!(matches!(
+        window.reconnect_from_lsn(2),
+        ResumeWindow::FullCopyRequired
+    ));
+    assert!(matches!(
+        ReliableWindow::<ReplicationItem>::new(2)
+            .unwrap()
+            .reconnect_from_lsn(1),
+        ResumeWindow::FullCopyRequired
+    ));
 }
 
 #[test]
@@ -82,19 +92,40 @@ async fn session_registry_rejects_retired_sender_and_receiver_sessions() {
     registry
         .register_peer(sender.clone(), ProcessSessionId::new("sender-current"))
         .await;
-    registry
+    let lease = registry
         .validate_peer(&sender, "sender-current", "receiver-current")
         .await
         .unwrap();
+    let registry = std::sync::Arc::new(registry);
+    let replacement_registry = registry.clone();
+    let replacement_sender = sender.clone();
+    let replacement = tokio::spawn(async move {
+        replacement_registry
+            .register_peer(
+                replacement_sender,
+                ProcessSessionId::new("sender-replacement"),
+            )
+            .await;
+    });
+    tokio::task::yield_now().await;
+    assert!(!replacement.is_finished());
+    drop(lease);
+    replacement.await.unwrap();
     assert!(
         registry
-            .validate_peer(&sender, "sender-retired", "receiver-current")
+            .validate_peer(&sender, "sender-current", "receiver-current")
             .await
             .is_err()
     );
+    drop(
+        registry
+            .validate_peer(&sender, "sender-replacement", "receiver-current")
+            .await
+            .unwrap(),
+    );
     assert!(
         registry
-            .validate_peer(&sender, "sender-current", "receiver-retired")
+            .validate_peer(&sender, "sender-replacement", "receiver-retired")
             .await
             .is_err()
     );

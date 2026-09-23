@@ -24,3 +24,5 @@ sender and receiver process-session IDs; the agent rejects retired sessions
 before runtime mutation. Agent reports include independent read/write access,
 quorum/catch-up progress, deactivation evidence, load/fault reports, and
 pending or retained command identity.
+Deactivation evidence carries its own epoch with the LSN so later
+configurations cannot relabel historical evidence.

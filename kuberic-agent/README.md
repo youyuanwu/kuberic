@@ -35,6 +35,22 @@ sessions, stale-session rejection, protobuf conversion, and bounded reliable
 send windows. Missing retained replication payloads explicitly require full
 copy rather than overstating catch-up capability.
 
+Authority replacement requires a newer epoch, except for the exact
+Previous/Current-to-current-only completion of one admitted transition.
+Changed primary authority remains access-closed until provider epoch and
+catch-up postconditions complete. Catch-up waits permit ACK progress, and
+matching commands are serialized and revalidated at each durable stage.
+
+Serving starts fail-closed listeners before reconstructing live hosting from
+durable authority, role, access, pending effects, and retained stage evidence.
+Session replacement holds a delivery lease through runtime mutation. Shutdown
+revokes readiness and aborts the owned runtime and workers.
+
+Build authorization is admitted by the agent before source copy execution.
+Dropping a returned copy stream cancels blocked provider iteration and releases
+the build. Reports retry until durable authority and live progress form one
+compatible snapshot and carry deactivation epoch with its LSN.
+
 The Phase 5 controller remains responsible for selecting configurations,
 re-observing command postconditions, routing fences, and distributing
 deployment authentication material. Concrete outbound peer dialing is wired

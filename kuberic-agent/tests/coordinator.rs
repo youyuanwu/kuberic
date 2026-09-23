@@ -267,6 +267,7 @@ async fn coordinator_resumes_from_durable_stage_without_repeating_completed_effe
             "epoch",
             "epoch",
             "application-role",
+            "catchup",
             "access",
         ]
     );
@@ -292,6 +293,97 @@ async fn coordinator_observes_completed_effect_before_stage_advance() {
         .ensure_configuration(command)
         .await
         .unwrap();
+    assert_eq!(
+        runtime
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|stage| **stage == "admit")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn same_epoch_new_operation_cannot_replace_durable_membership() {
+    let local = identity();
+    let policy = EffectivePolicy::fixed(3, 30).unwrap();
+    let member = |id: i64, instance: &str, role: ReplicaRole| ConfigurationMember {
+        identity: ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(instance),
+            agent_generation: AgentGeneration::new(format!("generation-{instance}")),
+        },
+        role,
+    };
+    let existing = ConfigurationDescriptor::new(
+        Epoch::new(0, 5),
+        local.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::Primary,
+            },
+            member(2, "secondary", ReplicaRole::ActiveSecondary),
+            member(3, "old", ReplicaRole::ActiveSecondary),
+        ],
+        policy.write_quorum,
+    );
+    let conflicting = ConfigurationDescriptor::new(
+        existing.epoch,
+        local.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::Primary,
+            },
+            member(2, "secondary", ReplicaRole::ActiveSecondary),
+            member(3, "replacement", ReplicaRole::ActiveSecondary),
+        ],
+        policy.write_quorum,
+    );
+    let mut state = AgentState::new(StorageIdentity {
+        effective_policy: policy.clone(),
+        ..storage_identity()
+    });
+    state.highest_epoch = existing.epoch;
+    state.current_configuration = Some(existing);
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new("conflicting-same-epoch"),
+        previous_configuration: None,
+        current_configuration: conflicting,
+        previous_epoch: None,
+        current_epoch: Epoch::new(0, 5),
+        effective_policy: policy,
+        local_replica_id: local.replica_id,
+        expected_instance_id: local.instance_id,
+        expected_agent_generation: local.agent_generation,
+        transition_kind: TransitionKind::Bootstrap,
+    };
+    assert!(matches!(
+        admit_configuration(&command, &state),
+        Err(AgentError::CommandRejected(_))
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_matching_commands_coalesce_without_panicking() {
+    let (_directory, store) = store();
+    let runtime = Arc::new(FakeRuntime::new());
+    let coordinator = Arc::new(Coordinator::new(store, runtime.clone()));
+    let command = command("concurrent-command", Epoch::new(0, 1));
+    let first_coordinator = coordinator.clone();
+    let first_command = command.clone();
+    let first =
+        tokio::spawn(async move { first_coordinator.ensure_configuration(first_command).await });
+    let second_coordinator = coordinator.clone();
+    let second =
+        tokio::spawn(async move { second_coordinator.ensure_configuration(command).await });
+    assert_eq!(
+        first.await.unwrap().unwrap(),
+        second.await.unwrap().unwrap()
+    );
     assert_eq!(
         runtime
             .calls

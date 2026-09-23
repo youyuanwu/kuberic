@@ -76,6 +76,8 @@ pub struct AgentReport {
     #[serde(default)]
     pub deactivated_lsn: Option<i64>,
     #[serde(default)]
+    pub deactivation_epoch: Option<Epoch>,
+    #[serde(default)]
     pub load_metrics: Vec<LoadMetric>,
     #[serde(default)]
     pub reported_fault: Option<FaultType>,
@@ -127,6 +129,7 @@ impl Default for AgentReport {
             catch_up_boundary: None,
             catch_up_complete: false,
             deactivated_lsn: None,
+            deactivation_epoch: None,
             load_metrics: Vec::new(),
             reported_fault: None,
             pending_operation_id: None,

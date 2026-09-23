@@ -17,7 +17,9 @@ use kuberic_runtime::application::{
 use kuberic_runtime::internal::{
     PendingReplication as RuntimePendingReplication, PendingWrite as RuntimePendingWrite,
 };
-use kuberic_runtime::replicator::copy::{PrepareCopyRequest, PreparedCopy as RuntimePreparedCopy};
+use kuberic_runtime::replicator::copy::{
+    BuildConfiguration, PrepareCopyRequest, PreparedCopy as RuntimePreparedCopy,
+};
 use kuberic_runtime::replicator::{
     DefaultReplicatorDependencies, ManagedReplicator, PartitionAccessView, PrimaryReplicator,
     Replicator, ReplicatorCreationReservation, ReplicatorFactoryContext, ReplicatorInterfaces,
@@ -26,8 +28,8 @@ use kuberic_runtime::replicator::{
 use kuberic_runtime::{Result, RuntimeError};
 use kuberic_runtime_internal::RuntimeHostToken;
 use kuberic_runtime_internal::authority::{
-    AuthorityStore, BuildAuthorityStore, BuildProgressStore, LocalWriteJournal,
-    ReplicaAuthorityStore, ReplicationProgressStore,
+    AuthorityStore, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
+    LocalWriteJournal, ReplicaAuthorityStore, ReplicationProgressStore,
 };
 use kuberic_runtime_internal::effects::{
     RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
@@ -216,6 +218,109 @@ impl PodRuntime {
         self.host.managed()?.restore_authority().await
     }
 
+    pub async fn authorize_build(
+        &self,
+        build_id: kuberic_protocol::types::OperationId,
+        target: ReplicaIdentity,
+        configuration: BuildConfiguration,
+    ) -> Result<BuildAuthority> {
+        if let Some(existing) = self
+            .host
+            .default_dependencies
+            .build_authority_store
+            .load_build(&build_id)
+            .await?
+        {
+            return Ok(existing);
+        }
+        let snapshot = self.snapshot().await;
+        let (kind, current_configuration) = match configuration {
+            BuildConfiguration::Current => (
+                BuildAuthorityKind::Provisioning,
+                snapshot
+                    .authority
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?
+                    .current_configuration,
+            ),
+            BuildConfiguration::Bootstrap(configuration) => {
+                (BuildAuthorityKind::Bootstrap, configuration)
+            }
+        };
+        let authority = BuildAuthority {
+            build_id,
+            kind,
+            source: self.host.identity.clone(),
+            target,
+            current_configuration,
+            replication_boundary_lsn: snapshot.current_progress,
+        };
+        authority.validate()?;
+        self.host
+            .default_dependencies
+            .build_authority_store
+            .admit_build(&authority)
+            .await?;
+        Ok(authority)
+    }
+
+    pub async fn reconstruct(
+        &self,
+        mode: OpenMode,
+        role: ReplicaRole,
+        read_status: AccessStatus,
+        write_status: AccessStatus,
+        transition: Option<(ReplicaRole, bool, bool)>,
+    ) -> Result<()> {
+        let has_transition = transition.is_some();
+        if !self.host.snapshot().await.open {
+            self.host.open(mode).await?;
+        }
+        if self.host.managed().is_ok() {
+            self.restore_authority().await?;
+        }
+        if let Some((target_role, epoch_completed, application_completed)) = transition {
+            self.host.change_replicator_role(target_role).await?;
+            if target_role == ReplicaRole::Primary && epoch_completed {
+                self.host.update_epoch().await?;
+            }
+            if application_completed {
+                self.host.change_application_role(target_role).await?;
+            }
+        } else if role != ReplicaRole::None {
+            self.host.change_replicator_role(role).await?;
+            if role == ReplicaRole::Primary {
+                self.host.update_epoch().await?;
+            }
+            self.host.change_application_role(role).await?;
+        }
+        let (read_status, write_status) = if has_transition {
+            (
+                AccessStatus::ReconfigurationPending,
+                AccessStatus::ReconfigurationPending,
+            )
+        } else {
+            (read_status, write_status)
+        };
+        if let Ok(managed) = self.host.managed() {
+            managed
+                .execute_action(RuntimeEffectAction::SetAccessStatus {
+                    read: read_status,
+                    write: write_status,
+                })
+                .await?;
+            self.host.sync_access_projection(managed.as_ref()).await;
+        } else {
+            let mut state = self.host.state.write().await;
+            state.fallback_snapshot.read_status = read_status;
+            state.fallback_snapshot.write_status = write_status;
+        }
+        Ok(())
+    }
+
+    pub fn abort(&self) {
+        self.host.abort();
+    }
+
     pub async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         self.host.apply_effect(effect).await
     }
@@ -396,6 +501,10 @@ impl PartitionAccessView for HostAccessView {
 
     async fn report_load(&self, metrics: Vec<LoadMetric>) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let _effect = host.effect_lock.lock().await;
+        if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
         let mut names = std::collections::BTreeSet::new();
         if metrics.iter().any(|metric| {
             metric.name.is_empty() || metric.value < 0 || !names.insert(metric.name.clone())
@@ -413,6 +522,10 @@ impl PartitionAccessView for HostAccessView {
 
     async fn report_fault(&self, fault: FaultType) -> Result<()> {
         let host = self.host.upgrade().ok_or(RuntimeError::Closed)?;
+        let _effect = host.effect_lock.lock().await;
+        if host.closed.load(Ordering::Acquire) || host.aborted.load(Ordering::Acquire) {
+            return Err(RuntimeError::Closed);
+        }
         host.state.write().await.reported_fault = Some(fault);
         Ok(())
     }
@@ -441,7 +554,9 @@ impl ReplicatorRegistration for RuntimeHost {
             if let Ok(mut pending) = self.pending_managed.lock()
                 && pending.as_ref().is_some_and(|(id, _)| *id == reservation.0)
             {
-                *pending = None;
+                if let Some((_, managed)) = pending.take() {
+                    managed.abort();
+                }
             }
             let _ = self.replicator_creation.compare_exchange(
                 REPLICATOR_CREATION_RESERVED,
@@ -560,6 +675,10 @@ impl RuntimeHost {
         }
         if let Some(registered) = self.registered.get() {
             registered.control.abort();
+        } else if let Ok(mut pending) = self.pending_managed.lock()
+            && let Some((_, managed)) = pending.take()
+        {
+            managed.abort();
         }
         self.application.abort();
     }

@@ -33,10 +33,11 @@ if cargo check --manifest-path "$fixture/Cargo.toml" --quiet >"$fixture_output" 
 fi
 
 if ! grep -q 'managed_replicator' "$fixture_output" ||
-    ! grep -q 'no associated function or constant named `new`' "$fixture_output"; then
+    ! grep -q 'no associated function or constant named `new`' "$fixture_output" ||
+    ! grep -q 'RuntimeHostToken: Default' "$fixture_output"; then
     cat "$fixture_output" >&2
     echo "The external fixture failed for an unexpected reason." >&2
     exit 1
 fi
 
-echo "kuberic-runtime documented API matches the allowlist and agent capabilities are unreachable."
+echo "kuberic-runtime documented API matches the allowlist; tested managed and host-construction paths are unreachable."

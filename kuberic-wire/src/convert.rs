@@ -159,6 +159,7 @@ pub fn normalize_agent_status_report(
                 || report.catch_up_boundary.is_some()
                 || report.catch_up_complete
                 || report.deactivated_lsn.is_some()
+                || report.deactivation_epoch.is_some()
                 || !report.load_metrics.is_empty()
                 || report.reported_fault != proto::FaultType::Unknown as i32
                 || !report.pending_operation_id.is_empty()
@@ -274,6 +275,11 @@ pub fn normalize_agent_status_report(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if report.deactivated_lsn.is_some() != report.deactivation_epoch.is_some() {
+                return Err(WireError::InvalidAuthority(
+                    "deactivation LSN and epoch must be reported together".into(),
+                ));
+            }
             let previous_configuration = report
                 .previous_configuration
                 .map(ConfigurationDescriptor::try_from)
@@ -310,6 +316,7 @@ pub fn normalize_agent_status_report(
                 catch_up_boundary: report.catch_up_boundary,
                 catch_up_complete: report.catch_up_complete,
                 deactivated_lsn: report.deactivated_lsn,
+                deactivation_epoch: report.deactivation_epoch.map(Into::into),
                 load_metrics,
                 reported_fault,
                 pending_operation_id: (!report.pending_operation_id.is_empty())
@@ -331,6 +338,7 @@ pub fn normalize_agent_status_report(
                 || report.read_status != proto::AccessStatus::Unknown as i32
                 || report.write_status != proto::AccessStatus::Unknown as i32
                 || !report.builds.is_empty()
+                || report.deactivation_epoch.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "unsafe storage report contains untrusted authority".to_string(),

@@ -98,3 +98,23 @@ pub struct RuntimeEffectResult {
     pub sequence: u64,
     pub postcondition: RuntimePostcondition,
 }
+
+impl From<RuntimeSnapshot> for RuntimePostcondition {
+    fn from(snapshot: RuntimeSnapshot) -> Self {
+        Self {
+            open: snapshot.open,
+            role: snapshot.role,
+            role_transition: snapshot.role_transition,
+            read_status: snapshot.read_status,
+            write_status: snapshot.write_status,
+            authority: snapshot.authority,
+            current_progress: snapshot.current_progress,
+            verified_replication_lsn: snapshot.verified_replication_lsn,
+            committed_lsn: snapshot.committed_lsn,
+            current_configuration_quorum_progress: snapshot.current_configuration_quorum_progress,
+            catch_up_boundary: snapshot.catch_up_boundary,
+            catch_up_complete: snapshot.catch_up_complete,
+            builds: snapshot.builds,
+        }
+    }
+}

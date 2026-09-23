@@ -359,6 +359,17 @@ fn initialized_status_rejects_unknown_enums_and_malformed_configuration() {
         })
     ));
 
+    let mut deactivation = report.clone();
+    deactivation.role = proto::ReplicaRole::Primary as i32;
+    deactivation.write_status = proto::AccessStatus::Granted as i32;
+    deactivation.deactivated_lsn = Some(7);
+    assert!(matches!(
+        validate_agent_status_report(&deactivation),
+        Err(WireError::InvalidAuthority(_))
+    ));
+    deactivation.deactivation_epoch = deactivation.epoch;
+    assert!(validate_agent_status_report(&deactivation).is_ok());
+
     let mut malformed = report;
     malformed.role = proto::ReplicaRole::Primary as i32;
     malformed

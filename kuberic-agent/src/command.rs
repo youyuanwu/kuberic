@@ -56,6 +56,29 @@ pub fn admit_configuration(
             "command epoch regresses durable authority".into(),
         ));
     }
+    let current_only_completion = command.current_epoch == state.highest_epoch
+        && state.current_configuration.as_ref() == Some(&command.current_configuration)
+        && state.previous_configuration.is_some()
+        && command.previous_configuration.is_none();
+    if command.current_epoch == state.highest_epoch
+        && !current_only_completion
+        && state
+            .current_configuration
+            .as_ref()
+            .is_some_and(|current| current != &command.current_configuration)
+    {
+        return Err(AgentError::CommandRejected(
+            "same-epoch command conflicts with durable Current Configuration".into(),
+        ));
+    }
+    if command.current_epoch == state.highest_epoch
+        && !current_only_completion
+        && state.previous_configuration != command.previous_configuration
+    {
+        return Err(AgentError::CommandRejected(
+            "same-epoch command conflicts with durable Previous Configuration".into(),
+        ));
+    }
     if command.effective_policy != state.identity.effective_policy {
         return Err(AgentError::CommandRejected(
             "command policy differs from initialized policy".into(),

@@ -7,6 +7,7 @@ use kuberic_agent::hosting::PodRuntime;
 use kuberic_agent::service::AgentService;
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+use kuberic_agent::store::AgentStore;
 use kuberic_protocol::types::{
     EffectivePolicy, PodUid, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
     derive_agent_generation, derive_initialization_id,
@@ -20,6 +21,7 @@ use kuberic_runtime::replicator::{
     ReplicatorSettings, StateReplicator,
 };
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
+use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction};
 use kuberic_wire::proto;
 use tempfile::tempdir;
 use tokio::sync::watch;
@@ -228,6 +230,16 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
         }),
         store.clone(),
     ));
+    store
+        .begin_effect(&RuntimeEffect {
+            operation_id: kuberic_protocol::types::OperationId::new("pending-before-service-start"),
+            sequence: 1,
+            action: RuntimeEffectAction::SetReadStatus(
+                kuberic_protocol::types::AccessStatus::NotPrimary,
+            ),
+        })
+        .await
+        .unwrap();
     assert!(
         AgentService::new(
             store.clone(),
@@ -240,13 +252,19 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
     let control_address = free_address();
     let replication_address = free_address();
     assert_ne!(control_address, replication_address);
-    let service =
-        AgentService::new(store, runtime.clone(), runtime, Arc::<str>::from("secret")).unwrap();
+    let service = AgentService::new(
+        store.clone(),
+        runtime.clone(),
+        runtime.clone(),
+        Arc::<str>::from("secret"),
+    )
+    .unwrap();
     let (ready_tx, mut ready_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server =
         tokio::spawn(service.serve(control_address, replication_address, ready_tx, shutdown_rx));
     ready_rx.wait_for(|ready| *ready).await.unwrap();
+    assert!(store.load_state().await.unwrap().pending_effect.is_none());
 
     let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
         "http://{control_address}"
@@ -318,4 +336,6 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
 
     shutdown_tx.send_replace(true);
     server.await.unwrap().unwrap();
+    assert!(!*ready_rx.borrow());
+    assert!(!runtime.snapshot().await.open);
 }

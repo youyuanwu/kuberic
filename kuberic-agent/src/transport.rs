@@ -35,6 +35,7 @@ pub struct ReliableWindow<T> {
     acknowledged_sequence: u64,
     retained: BTreeMap<u64, T>,
     cancelled: bool,
+    ever_enqueued: bool,
 }
 
 impl<T: Clone> ReliableWindow<T> {
@@ -51,6 +52,7 @@ impl<T: Clone> ReliableWindow<T> {
             acknowledged_sequence: 0,
             retained: BTreeMap::new(),
             cancelled: false,
+            ever_enqueued: false,
         })
     }
 
@@ -67,6 +69,7 @@ impl<T: Clone> ReliableWindow<T> {
         }
         let sequence = self.next_sequence;
         self.next_sequence += 1;
+        self.ever_enqueued = true;
         self.retained.insert(sequence, payload.clone());
         Ok(RetainedMessage { sequence, payload })
     }
@@ -83,6 +86,9 @@ impl<T: Clone> ReliableWindow<T> {
     }
 
     pub fn reconnect_from(&self, sequence: u64) -> ResumeWindow<T> {
+        if self.cancelled {
+            return ResumeWindow::FullCopyRequired;
+        }
         if sequence <= self.acknowledged_sequence {
             return ResumeWindow::Retained(
                 self.retained
@@ -134,8 +140,15 @@ impl ReliableWindow<ReplicationItem> {
     }
 
     pub fn reconnect_from_lsn(&self, lsn: i64) -> ResumeWindow<ReplicationItem> {
+        if self.cancelled {
+            return ResumeWindow::FullCopyRequired;
+        }
         let Some(first_lsn) = self.catch_up_capability() else {
-            return ResumeWindow::Retained(Vec::new());
+            return if self.ever_enqueued || lsn > 0 {
+                ResumeWindow::FullCopyRequired
+            } else {
+                ResumeWindow::Retained(Vec::new())
+            };
         };
         if lsn < first_lsn {
             return ResumeWindow::FullCopyRequired;
@@ -201,18 +214,24 @@ pub async fn run_outbound<D: OutboundDispatcher>(
     runtime: Arc<PodRuntime>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let data_plane = runtime.data_plane();
     loop {
+        let mut receive_shutdown = shutdown.clone();
         tokio::select! {
-            _ = shutdown.wait_for(|stopped| *stopped) => return Ok(()),
+            _ = receive_shutdown.wait_for(|stopped| *stopped) => return Ok(()),
             outbound = data_plane.next_domain_outbound() => {
                 let Some(outbound) = outbound else {
                     return Ok(());
                 };
                 let queued = transport.lock().await.queue(outbound)?;
-                dispatcher.dispatch(queued).await?;
+                let mut dispatch_shutdown = shutdown.clone();
+                tokio::select! {
+                    biased;
+                    _ = dispatch_shutdown.wait_for(|stopped| *stopped) => return Ok(()),
+                    result = dispatcher.dispatch(queued) => result?,
+                }
             }
         }
     }

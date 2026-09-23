@@ -136,6 +136,14 @@ pub struct AdmittedAuthority {
 }
 
 impl AdmittedAuthority {
+    pub fn is_current_only_completion_of(&self, existing: &Self) -> bool {
+        self.local_identity == existing.local_identity
+            && self.current_configuration == existing.current_configuration
+            && existing.previous_configuration.is_some()
+            && self.previous_configuration.is_none()
+            && self.transition_kind.is_none()
+    }
+
     pub fn fence(&self) -> AuthorityFence {
         AuthorityFence {
             epoch: self.current_configuration.epoch,

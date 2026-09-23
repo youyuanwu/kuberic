@@ -21,14 +21,9 @@ pub struct RuntimeHostToken {
     _private: (),
 }
 
+#[allow(clippy::new_without_default)]
 impl RuntimeHostToken {
     pub fn new() -> Self {
         Self { _private: () }
-    }
-}
-
-impl Default for RuntimeHostToken {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -423,6 +423,14 @@ impl ReplicaAuthorityStore for SqliteStore {
                         "replica authority epoch regressed".into(),
                     ));
                 }
+                if authority.current_configuration.epoch == existing.current_configuration.epoch
+                    && existing != *authority
+                    && !authority.is_current_only_completion_of(&existing)
+                {
+                    return Err(ContractError::AuthorityMismatch(
+                        "replica authority changed without a newer epoch".into(),
+                    ));
+                }
             }
             let json = contract_json(authority)?;
             transaction

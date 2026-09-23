@@ -27,7 +27,7 @@ use crate::authority::{
 use crate::effects::{BuildPostcondition, RuntimeEffectAction, RuntimeSnapshot};
 use crate::engine::DurableState;
 use crate::replicator::copy::{
-    BuildConfiguration, BuildProgress, PrepareCopyRequest, PreparedCopy,
+    BuildConfiguration, BuildProgress, CopyItemStream, PrepareCopyRequest, PreparedCopy,
 };
 use crate::replicator::log::{PreparedWrite, ReplicationLog};
 use crate::replicator::stream::{OperationCompletion, OperationMetadata, ServiceStreams};
@@ -1003,10 +1003,12 @@ impl DefaultReplicatorInner {
         drop(replicator);
         let application_progress = self.storage().await?.durable_progress().await?;
         let current_highest = replicator_progress.max(application_progress.applied_lsn);
-        let existing = self.build_authority_store.load_build(&build_id).await?;
-        let boundary = existing.as_ref().map_or(current_highest, |authority| {
-            authority.replication_boundary_lsn
-        });
+        let existing = self
+            .build_authority_store
+            .load_build(&build_id)
+            .await?
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let boundary = existing.replication_boundary_lsn;
         if current_highest < boundary {
             return Err(RuntimeError::Application(
                 "application progress regressed below the copy boundary".to_string(),
@@ -1021,17 +1023,12 @@ impl DefaultReplicatorInner {
             replication_boundary_lsn: boundary,
         };
         candidate.validate()?;
-        let build_authority = if let Some(existing) = existing {
-            if existing != candidate {
-                return Err(RuntimeError::AuthorityMismatch(
-                    "build ID is already bound to different immutable authority".to_string(),
-                ));
-            }
-            existing
-        } else {
-            self.build_authority_store.admit_build(&candidate).await?;
-            candidate
-        };
+        if existing != candidate {
+            return Err(RuntimeError::AuthorityMismatch(
+                "build ID is bound to different immutable authority".to_string(),
+            ));
+        }
+        let build_authority = existing;
         let build_progress = self
             .build_progress_store
             .load_build_progress(&build_authority.build_id)
@@ -1058,6 +1055,7 @@ impl DefaultReplicatorInner {
             return Err(RuntimeError::ReconfigurationPending);
         }
         let (stream_tx, stream_rx) = mpsc::channel(64);
+        let (copy_cancel_tx, copy_cancel_rx) = watch::channel(false);
         self.state.write().await.outbound_builds.insert(
             build_authority.build_id.clone(),
             OutboundBuild {
@@ -1182,18 +1180,18 @@ impl DefaultReplicatorInner {
                     operations,
                     stream_tx,
                     prepare_generation,
+                    copy_cancel_rx,
                 )
                 .await;
         });
-        let items = Box::pin(futures::stream::unfold(stream_rx, |mut receiver| async {
-            receiver.recv().await.map(|item| (item, receiver))
-        }));
+        let items = Box::pin(CopyItemStream::new(stream_rx, copy_cancel_tx));
         Ok(PreparedCopy {
             authority: build_authority,
             items,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn produce_copy_stream(
         &self,
         authority: BuildAuthority,
@@ -1202,6 +1200,7 @@ impl DefaultReplicatorInner {
         initial_operations: BTreeMap<i64, Operation>,
         sender: mpsc::Sender<Result<CopyItem>>,
         generation: u64,
+        cancellation: watch::Receiver<bool>,
     ) {
         let result = self
             .produce_copy_stream_inner(
@@ -1211,6 +1210,7 @@ impl DefaultReplicatorInner {
                 initial_operations,
                 &sender,
                 generation,
+                cancellation,
             )
             .await;
         if let Err(error) = result {
@@ -1223,10 +1223,12 @@ impl DefaultReplicatorInner {
                 state.outbound_builds.remove(&authority.build_id);
             }
             drop(state);
+            self.changed.notify_waiters();
             let _ = sender.send(Err(error)).await;
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn produce_copy_stream_inner(
         &self,
         authority: &BuildAuthority,
@@ -1235,17 +1237,23 @@ impl DefaultReplicatorInner {
         initial_operations: BTreeMap<i64, Operation>,
         sender: &mpsc::Sender<Result<CopyItem>>,
         generation: u64,
+        mut cancellation: watch::Receiver<bool>,
     ) -> Result<()> {
         let mut sequence = 1;
-        while let Some(chunk) = copy_stream.next().await {
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = cancellation.changed() => return Err(RuntimeError::OperationCancelled),
+                chunk = copy_stream.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             self.check_delivery_generation(generation)?;
             let item = copy_snapshot_item(authority, sequence, chunk?);
             self.record_emitted_copy_item(authority, &item, generation)
                 .await?;
-            sender
-                .send(Ok(item))
-                .await
-                .map_err(|_| RuntimeError::OperationCancelled)?;
+            send_copy_item(sender, item, &mut cancellation).await?;
             sequence += 1;
         }
 
@@ -1273,13 +1281,10 @@ impl DefaultReplicatorInner {
                 },
             );
         }
-        sender
-            .send(Ok(final_item))
-            .await
-            .map_err(|_| RuntimeError::OperationCancelled)?;
+        send_copy_item(sender, final_item, &mut cancellation).await?;
 
         for operation in initial_operations.into_values() {
-            self.emit_copy_operation(authority, operation, sender, generation)
+            self.emit_copy_operation(authority, operation, sender, generation, &mut cancellation)
                 .await?;
         }
         loop {
@@ -1305,8 +1310,14 @@ impl DefaultReplicatorInner {
                 break;
             }
             for operation in pending.into_values() {
-                self.emit_copy_operation(authority, operation, sender, generation)
-                    .await?;
+                self.emit_copy_operation(
+                    authority,
+                    operation,
+                    sender,
+                    generation,
+                    &mut cancellation,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -1346,6 +1357,7 @@ impl DefaultReplicatorInner {
         operation: Operation,
         sender: &mpsc::Sender<Result<CopyItem>>,
         generation: u64,
+        cancellation: &mut watch::Receiver<bool>,
     ) -> Result<()> {
         self.check_delivery_generation(generation)?;
         let item = {
@@ -1372,10 +1384,7 @@ impl DefaultReplicatorInner {
             );
             item
         };
-        sender
-            .send(Ok(item))
-            .await
-            .map_err(|_| RuntimeError::OperationCancelled)
+        send_copy_item(sender, item, cancellation).await
     }
 
     pub async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()> {
@@ -1805,7 +1814,7 @@ impl DefaultReplicatorInner {
             epoch: envelope.epoch,
             previous_configuration_id: envelope.previous_configuration_id.clone(),
             current_configuration_id: envelope.current_configuration_id.clone(),
-            received_lsn: envelope.lsn,
+            received_lsn: envelope.lsn.max(received_applied_lsn),
             applied_lsn: received_applied_lsn,
             committed_lsn: application_progress.committed_lsn.min(received_applied_lsn),
         };
@@ -1896,7 +1905,7 @@ impl DefaultReplicatorInner {
             epoch: envelope.epoch,
             previous_configuration_id: envelope.previous_configuration_id,
             current_configuration_id: envelope.current_configuration_id,
-            received_lsn: envelope.lsn,
+            received_lsn: envelope.lsn.max(replication_progress.verified_lsn),
             applied_lsn: replication_progress.verified_lsn,
             committed_lsn: acknowledged_committed_lsn,
         })
@@ -1998,11 +2007,35 @@ impl DefaultReplicatorInner {
                         "authority epoch cannot regress".into(),
                     ));
                 }
-                let prior_write_status = self.state.read().await.write_status;
+                let prior_access = {
+                    let state = self.state.read().await;
+                    (state.read_status, state.write_status)
+                };
                 let authority_changed =
                     self.state.read().await.authority.as_ref() != Some(&authority);
-                self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
                 if authority_changed {
+                    if self
+                        .state
+                        .read()
+                        .await
+                        .authority
+                        .as_ref()
+                        .is_some_and(|existing| {
+                            existing.current_configuration.epoch
+                                == authority.current_configuration.epoch
+                                && existing != &authority
+                                && !authority.is_current_only_completion_of(existing)
+                        })
+                    {
+                        return Err(RuntimeError::AuthorityMismatch(
+                            "authority changed without a newer epoch".into(),
+                        ));
+                    }
+                    {
+                        let mut state = self.state.write().await;
+                        state.read_status = AccessStatus::ReconfigurationPending;
+                        state.write_status = AccessStatus::ReconfigurationPending;
+                    }
                     self.fence_generation.fetch_add(1, Ordering::AcqRel);
                     self.replicator.lock().await.fence_client_writes();
                     self.changed.notify_waiters();
@@ -2038,8 +2071,9 @@ impl DefaultReplicatorInner {
                     .load_replication_progress_with_handoff(&authority)
                     .await?;
                 let mut state = self.state.write().await;
-                if authority.local_role() == ReplicaRole::Primary {
-                    state.write_status = prior_write_status;
+                if !authority_changed {
+                    state.read_status = prior_access.0;
+                    state.write_status = prior_access.1;
                 }
                 state.authority = Some(authority);
                 state.replication_progress = Some(replication_progress);
@@ -2124,6 +2158,8 @@ impl DefaultReplicatorInner {
                         "read access requires an open Primary or Active Secondary".into(),
                     ));
                 }
+                let primary_read =
+                    read == AccessStatus::Granted && state.role == ReplicaRole::Primary;
                 if write == AccessStatus::Granted {
                     if !state.open || state.role != ReplicaRole::Primary {
                         return Err(RuntimeError::NotPrimary);
@@ -2132,13 +2168,16 @@ impl DefaultReplicatorInner {
                         .authority
                         .as_ref()
                         .ok_or(RuntimeError::AuthorityNotAdmitted)?;
-                    if authority.primary_identity() != &self.identity
-                        || authority.previous_configuration.is_some()
-                    {
+                    if authority.primary_identity() != &self.identity {
                         return Err(RuntimeError::ReconfigurationPending);
                     }
                 }
                 drop(state);
+                let replicator = self.replicator.lock().await;
+                if primary_read && !replicator.catch_up_complete() {
+                    return Err(RuntimeError::ReconfigurationPending);
+                }
+                drop(replicator);
                 let mut state = self.state.write().await;
                 state.read_status = read;
                 state.write_status = write;
@@ -2402,6 +2441,12 @@ impl ManagedReplicator for DefaultReplicatorInner {
                 "application lifecycle actions belong to the hosting runtime".into(),
             ));
         }
+        if matches!(action, RuntimeEffectAction::WaitForCatchup) {
+            self.check_aborted()?;
+            self.execute_action(action).await?;
+            self.changed.notify_waiters();
+            return Ok(());
+        }
         let _guard = self.effect_lock.lock().await;
         self.check_aborted()?;
         self.execute_action(action).await?;
@@ -2444,6 +2489,10 @@ impl ManagedReplicator for DefaultReplicatorInner {
     async fn next_outbound(&self) -> Option<OutboundOperation> {
         self.outbound_rx.lock().await.recv().await
     }
+
+    fn abort(&self) {
+        self.control_abort();
+    }
 }
 
 fn validate_durable_ack(
@@ -2483,6 +2532,18 @@ fn insert_copy_operation(
     }
     operations.insert(operation.lsn, operation);
     Ok(())
+}
+
+async fn send_copy_item(
+    sender: &mpsc::Sender<Result<CopyItem>>,
+    item: CopyItem,
+    cancellation: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.changed() => Err(RuntimeError::OperationCancelled),
+        result = sender.send(Ok(item)) => result.map_err(|_| RuntimeError::OperationCancelled),
+    }
 }
 
 fn copy_snapshot_item(authority: &BuildAuthority, sequence: u64, data: Bytes) -> CopyItem {

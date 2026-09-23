@@ -93,6 +93,7 @@ pub trait ManagedReplicator: Send + Sync {
     async fn receive_copy_item(&self, item: CopyItem) -> Result<CopyAck>;
     async fn receive_replication(&self, item: ReplicationItem) -> Result<PendingReplication>;
     async fn next_outbound(&self) -> Option<OutboundOperation>;
+    fn abort(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
