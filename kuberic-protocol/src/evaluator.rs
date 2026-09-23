@@ -446,7 +446,12 @@ fn evaluate_transition(
                     && report.epoch == transition.current_configuration.epoch
                     && report.previous_configuration.is_none()
                     && report.current_configuration.as_ref()
-                        == Some(&transition.current_configuration);
+                        == Some(&transition.current_configuration)
+                    && report.current_progress == 0
+                    && report.committed_lsn == 0
+                    && report.pending_operation_id.is_none()
+                    && report.retained_operation_id.as_ref()
+                        == Some(&bootstrap_install_operation_id(transition, member));
                 if matches {
                     installed += 1;
                     continue;
@@ -457,10 +462,7 @@ fn evaluate_transition(
                             &transition.current_configuration,
                             member,
                             &transition.effective_policy,
-                            OperationId::new(format!(
-                                "{}:install:{}",
-                                transition.transition_id, member.identity.replica_id
-                            )),
+                            bootstrap_install_operation_id(transition, member),
                             false,
                         ),
                     )),
@@ -494,6 +496,16 @@ fn evaluate_transition(
         status,
         requeue_after_seconds: config.wait_requeue_seconds,
     }
+}
+
+fn bootstrap_install_operation_id(
+    transition: &TransitionIntent,
+    member: &ConfigurationMember,
+) -> OperationId {
+    OperationId::new(format!(
+        "{}:install:{}",
+        transition.transition_id, member.identity.replica_id
+    ))
 }
 
 fn bootstrap_initialization_command(

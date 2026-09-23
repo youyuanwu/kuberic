@@ -372,6 +372,7 @@ async fn fresh_storage_reports_uninitialized_and_creates_exact_bootstrap_identit
         path.clone(),
         "token",
         initialized_tx,
+        true,
     )
     .unwrap();
     let (ready_tx, mut ready_rx) = watch::channel(false);

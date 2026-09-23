@@ -119,3 +119,22 @@ pub fn authorize_initialization(
         effective_policy: command.effective_policy.clone(),
     })
 }
+
+pub fn validate_established_identity(
+    identity: &StorageIdentity,
+    observed: &ObservedStorageIdentity,
+    replica_id: kuberic_protocol::types::ReplicaId,
+) -> Result<()> {
+    if identity.resource_uid != observed.resource_uid
+        || identity.pod_uid != observed.pod_uid
+        || identity.pvc_uid != observed.pvc_uid
+        || identity.local_identity.replica_id != replica_id
+        || identity.local_identity.instance_id != observed.instance_id
+    {
+        return Err(AgentError::IdentityMismatch(
+            "established resource, Pod, PVC, or replica incarnation differs from this process"
+                .into(),
+        ));
+    }
+    Ok(())
+}

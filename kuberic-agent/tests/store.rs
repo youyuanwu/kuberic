@@ -4,7 +4,7 @@ use bytes::Bytes;
 use kuberic_agent::AgentError;
 use kuberic_agent::provisioning::{
     InitializationAuthority, ObservedStorageIdentity, StorePresence, authorize_initialization,
-    inspect_store,
+    inspect_store, validate_established_identity,
 };
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION};
@@ -233,6 +233,7 @@ fn established_store_rejects_identity_schema_and_corruption_mismatches() {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection.pragma_update(None, "user_version", 99).unwrap();
     }
+
     assert!(matches!(
         SqliteStore::open_existing(&path, Some(&storage_identity)),
         Err(AgentError::SchemaMismatch {
@@ -245,6 +246,28 @@ fn established_store_rejects_identity_schema_and_corruption_mismatches() {
     assert!(matches!(
         SqliteStore::open_existing(&path, Some(&storage_identity)),
         Err(AgentError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn established_identity_requires_the_same_observed_pod_and_pvc() {
+    let (command, observed, transition) = bootstrap_fixture();
+    let identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    validate_established_identity(&identity, &observed, ReplicaId::new(1)).unwrap();
+
+    let mismatched = ObservedStorageIdentity {
+        pod_uid: PodUid::new("replacement-pod"),
+        instance_id: ReplicaInstanceId::new("replacement-pod"),
+        ..observed
+    };
+    assert!(matches!(
+        validate_established_identity(&identity, &mismatched, ReplicaId::new(1)),
+        Err(AgentError::IdentityMismatch(_))
     ));
 }
 

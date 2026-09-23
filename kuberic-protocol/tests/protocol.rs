@@ -462,6 +462,10 @@ fn bootstrap_installs_full_genesis_accepts_topology_then_grants_writes() {
         };
         report.epoch = transition.current_configuration.epoch;
         report.current_configuration = Some(transition.current_configuration.clone());
+        report.retained_operation_id = Some(OperationId::new(format!(
+            "{}:install:{}",
+            transition.transition_id, member.identity.replica_id
+        )));
         snapshot
             .replicas
             .get_mut(&ReplicaObservationKey::new(

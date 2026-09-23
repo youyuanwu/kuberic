@@ -317,6 +317,55 @@ async fn bootstrap_observes_effect_complete_before_stage_advance() {
     );
 }
 
+#[tokio::test]
+async fn bootstrap_resumes_the_enclosing_configuration_after_restart() {
+    let (directory, store) = store();
+    let runtime = Arc::new(FakeRuntime::new());
+    runtime.fail_once("access");
+    let command = command("resume-configuration", Epoch::new(0, 1));
+    let coordinator = Coordinator::new(store.clone(), runtime.clone());
+    assert!(
+        coordinator
+            .ensure_configuration(command.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_state()
+            .await
+            .unwrap()
+            .reconfiguration
+            .unwrap()
+            .stage,
+        kuberic_agent::state::CoordinatorStage::Activate
+    );
+    drop(coordinator);
+    drop(store);
+
+    let reopened = Arc::new(
+        SqliteStore::open_existing(
+            SqliteStore::metadata_database_path(directory.path()),
+            Some(&storage_identity()),
+        )
+        .unwrap(),
+    );
+    let resumed = Coordinator::new(reopened.clone(), runtime);
+    let result = resumed.resume_configuration().await.unwrap().unwrap();
+    assert_eq!(result.command, command);
+    let state = reopened.load_state().await.unwrap();
+    assert!(state.reconfiguration.is_none());
+    assert_eq!(
+        state
+            .retained_command
+            .unwrap()
+            .command
+            .operation_id
+            .as_str(),
+        "resume-configuration"
+    );
+}
+
 #[test]
 fn same_epoch_new_operation_cannot_replace_durable_membership() {
     let local = identity();

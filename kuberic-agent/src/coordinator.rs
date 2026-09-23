@@ -56,6 +56,19 @@ where
         self.runtime.resume_pending().await
     }
 
+    pub async fn resume_configuration(&self) -> Result<Option<RetainedCommandResult>> {
+        let command = self
+            .store
+            .load_state()
+            .await?
+            .reconfiguration
+            .map(|record| record.command);
+        match command {
+            Some(command) => self.ensure_configuration(command).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub async fn ensure_configuration(
         &self,
         command: EnsureConfiguration,

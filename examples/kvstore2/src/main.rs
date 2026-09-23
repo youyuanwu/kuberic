@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, put};
 use clap::Parser;
 use kuberic_agent::hosting::PodRuntime;
-use kuberic_agent::provisioning::ObservedStorageIdentity;
+use kuberic_agent::provisioning::{ObservedStorageIdentity, validate_established_identity};
 use kuberic_agent::service::{AgentService, InitializationService, SessionRegistry};
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::store::AgentStore;
@@ -81,8 +81,14 @@ async fn main() -> Result<()> {
         anyhow::bail!("KUBERIC_REPLICA_ID must be positive");
     }
     let database_path = SqliteStore::metadata_database_path(&config.data_root);
+    let application_path = config.data_root.join("application");
     if !database_path.is_file() {
-        serve_initialization(&config, database_path.clone()).await?;
+        serve_initialization(
+            &config,
+            database_path.clone(),
+            KvPersistence::is_fresh_empty(&application_path)?,
+        )
+        .await?;
     }
 
     let store = Arc::new(
@@ -90,7 +96,12 @@ async fn main() -> Result<()> {
             .context("opening durable Kuberic metadata")?,
     );
     let identity = store.identity().await?;
-    let persistence = Arc::new(KvPersistence::open(config.data_root.join("application"))?);
+    validate_established_identity(
+        &identity,
+        &observed_storage_identity(&config),
+        ReplicaId::new(config.replica_id),
+    )?;
+    let persistence = Arc::new(KvPersistence::open(application_path)?);
     let application = Arc::new(KvService::new(
         persistence,
         format!("http://{}:50052", config.pod_ip),
@@ -224,13 +235,21 @@ async fn discover_peers(
     }
 }
 
-async fn serve_initialization(config: &Config, database_path: PathBuf) -> Result<()> {
-    let observed = ObservedStorageIdentity {
+fn observed_storage_identity(config: &Config) -> ObservedStorageIdentity {
+    ObservedStorageIdentity {
         resource_uid: ResourceUid::new(&config.resource_uid),
         pod_uid: PodUid::new(&config.pod_uid),
         pvc_uid: PvcUid::new(&config.pvc_uid),
         instance_id: ReplicaInstanceId::new(&config.pod_uid),
-    };
+    }
+}
+
+async fn serve_initialization(
+    config: &Config,
+    database_path: PathBuf,
+    fresh_application_state: bool,
+) -> Result<()> {
+    let observed = observed_storage_identity(config);
     let (initialized_tx, mut initialized_rx) = watch::channel(false);
     let service = InitializationService::new(
         observed,
@@ -238,6 +257,7 @@ async fn serve_initialization(config: &Config, database_path: PathBuf) -> Result
         database_path,
         config.bearer_token.clone(),
         initialized_tx,
+        fresh_application_state,
     )?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (ready_tx, _) = watch::channel(false);

@@ -42,6 +42,22 @@ pub struct KvPersistence {
 }
 
 impl KvPersistence {
+    pub fn is_fresh_empty(root: impl AsRef<Path>) -> Result<bool> {
+        let root = root.as_ref();
+        if !root.exists() {
+            return Ok(true);
+        }
+        if !root.is_dir() {
+            return Err(RuntimeError::Application(
+                "application data root is not a directory".into(),
+            ));
+        }
+        Ok(std::fs::read_dir(root)
+            .map_err(|error| RuntimeError::Application(error.to_string()))?
+            .next()
+            .is_none())
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)
@@ -324,5 +340,16 @@ mod tests {
         let reopened = KvPersistence::open(directory.path()).unwrap();
         assert_eq!(reopened.get("key").as_deref(), Some("value"));
         assert_eq!(reopened.durable_progress().await.unwrap().committed_lsn, 1);
+    }
+
+    #[test]
+    fn fresh_empty_proof_rejects_surviving_application_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = directory.path().join("application");
+        assert!(KvPersistence::is_fresh_empty(&application).unwrap());
+        std::fs::create_dir_all(&application).unwrap();
+        assert!(KvPersistence::is_fresh_empty(&application).unwrap());
+        std::fs::write(application.join("state.json"), b"{}").unwrap();
+        assert!(!KvPersistence::is_fresh_empty(&application).unwrap());
     }
 }

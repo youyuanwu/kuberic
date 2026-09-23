@@ -40,6 +40,7 @@ pub struct InitializationService {
     bearer_token: Arc<str>,
     session: Arc<ProcessSession>,
     initialized: watch::Sender<bool>,
+    fresh_application_state: bool,
 }
 
 impl InitializationService {
@@ -49,6 +50,7 @@ impl InitializationService {
         database_path: PathBuf,
         bearer_token: impl Into<Arc<str>>,
         initialized: watch::Sender<bool>,
+        fresh_application_state: bool,
     ) -> Result<Self> {
         let bearer_token = bearer_token.into();
         if bearer_token.is_empty() {
@@ -63,6 +65,7 @@ impl InitializationService {
             bearer_token,
             session: Arc::new(ProcessSession::new()),
             initialized,
+            fresh_application_state,
         })
     }
 
@@ -95,6 +98,22 @@ impl InitializationService {
     }
 
     fn report(&self) -> proto::AgentStatusReport {
+        if !self.fresh_application_state {
+            return proto::AgentStatusReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: self.observed.resource_uid.to_string(),
+                process_session_id: self.session.id().to_string(),
+                report_sequence: self.session.next_report_sequence(),
+                storage_state: proto::AgentStorageState::Unsafe as i32,
+                pod_uid: self.observed.pod_uid.to_string(),
+                pvc_uid: self.observed.pvc_uid.to_string(),
+                storage_error: "application state exists without matching Kuberic agent metadata"
+                    .to_string(),
+                healthy: false,
+                replica_id: self.replica_id.value(),
+                ..Default::default()
+            };
+        }
         proto::AgentStatusReport {
             protocol_version: kuberic_protocol::PROTOCOL_VERSION,
             resource_uid: self.observed.resource_uid.to_string(),
@@ -131,6 +150,11 @@ impl InitializationService {
         &self,
         request: proto::ExecuteCommandRequest,
     ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
+        if !self.fresh_application_state {
+            return Err(Status::failed_precondition(
+                "application state is not fresh and empty",
+            ));
+        }
         let envelope = normalize_execute_request(request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let ProtocolCommand::InitializeAgentStore(command) = envelope.command else {
@@ -192,6 +216,7 @@ impl Clone for InitializationService {
             bearer_token: self.bearer_token.clone(),
             session: self.session.clone(),
             initialized: self.initialized.clone(),
+            fresh_application_state: self.fresh_application_state,
         }
     }
 }
@@ -471,6 +496,7 @@ where
                 .await?;
         }
         self.coordinator.resume_pending().await?;
+        self.coordinator.resume_configuration().await?;
         Ok(())
     }
 
@@ -822,5 +848,38 @@ fn status_from_runtime(error: kuberic_runtime::RuntimeError) -> Status {
         | RuntimeError::WriteClosed(_) => Status::failed_precondition(error.to_string()),
         RuntimeError::Closed | RuntimeError::NotOpen => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kuberic_protocol::types::{PodUid, PvcUid, ReplicaInstanceId, ResourceUid};
+
+    #[test]
+    fn uninitialized_report_is_unsafe_when_application_state_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initialized, _) = watch::channel(false);
+        let service = InitializationService::new(
+            ObservedStorageIdentity {
+                resource_uid: ResourceUid::new("resource"),
+                pod_uid: PodUid::new("pod"),
+                pvc_uid: PvcUid::new("pvc"),
+                instance_id: ReplicaInstanceId::new("pod"),
+            },
+            ReplicaId::new(1),
+            SqliteStore::metadata_database_path(directory.path()),
+            "token",
+            initialized,
+            false,
+        )
+        .unwrap();
+
+        let report = service.report();
+        assert_eq!(
+            report.storage_state,
+            proto::AgentStorageState::Unsafe as i32
+        );
+        assert!(report.storage_error.contains("application state exists"));
     }
 }
