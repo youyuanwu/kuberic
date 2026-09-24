@@ -1012,6 +1012,14 @@ fn public_trait_method_sets_match_sf_v1_com_divisions() {
         replication.contains("#[doc(hidden)]\npub trait ManagedReplicator"),
         "the cross-crate managed bridge must remain hidden from generated user documentation"
     );
+    assert!(
+        !replication.contains("record_durable_peer_progress"),
+        "raw peer status must not cross the managed bridge into quorum credit"
+    );
+    assert!(
+        !include_str!("../src/transport.rs").contains(".record_durable_peer_progress("),
+        "peer discovery may use reported progress for repair, never commit quorum credit"
+    );
     assert!(!replication.contains("fn managed_replicator("));
     assert!(!replication.contains("ReplicatorInterfaces::new"));
     for internal_module in ["authority", "effects", "runtime"] {
@@ -1376,6 +1384,57 @@ async fn cold_primary_replays_retained_history_to_a_lagging_current_peer() {
     );
     assert_eq!(item.lsn, 1);
     assert_eq!(item.data, b"one");
+}
+
+#[tokio::test]
+async fn peer_repair_status_does_not_grant_commit_quorum() {
+    let primary = identity(1, "primary");
+    let returned = identity(2, "returned");
+    let acknowledged = identity(3, "acknowledged");
+    let fourth = identity(4, "fourth");
+    let fifth = identity(5, "fifth");
+    let members = vec![
+        primary.clone(),
+        returned.clone(),
+        acknowledged.clone(),
+        fourth.clone(),
+        fifth,
+    ];
+    let admitted = authority(primary, members.clone());
+    let application = Arc::new(TestApplication::default());
+    application.seed_progress(100);
+    let runtime = open_primary(application, members).await;
+
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("post-failover-101"),
+            data: Bytes::from_static(b"new-101"),
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending.lsn, 101);
+
+    runtime.repair_peer(returned, 120).await.unwrap();
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&admitted, acknowledged, 101))
+        .await
+        .unwrap();
+
+    let committed = tokio::spawn(pending.committed());
+    tokio::task::yield_now().await;
+    assert!(
+        !committed.is_finished(),
+        "raw repair progress must not provide the third quorum vote"
+    );
+
+    runtime
+        .data_plane()
+        .accept_acknowledgement(acknowledgement(&admitted, fourth, 101))
+        .await
+        .unwrap();
+    assert_eq!(committed.await.unwrap().unwrap().committed_lsn, 101);
 }
 
 #[tokio::test]

@@ -86,7 +86,7 @@ impl QuorumTracker {
         Ok(())
     }
 
-    pub fn record_durable_replica_progress(
+    pub fn record_build_handoff_progress(
         &mut self,
         identity: ReplicaIdentity,
         lsn: Lsn,

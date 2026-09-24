@@ -715,6 +715,10 @@ authority/build applied progress, which precedes an applied peer ACK; quorum
 readiness precedes application commit and retry-record completion, which
 precede client success. A receive-only ACK may precede application acceptance
 and never grants quorum credit.
+Agent status `currentProgress` is observation and retained-history repair input,
+not certified replication progress. It MUST NOT grant catch-up or client-commit
+quorum credit. Only an authority-bound applied replication ACK or a completed
+build handoff may advance another replica's quorum slot.
 Transport remains caller-supplied, including build request dispatch and ACK
 delivery. Waiting for a build or catch-up quorum requires observed completion,
 not successful enqueueing.
@@ -947,7 +951,10 @@ removed before a newer epoch is allocated. `status.quorumLoss` separately
 records loss of the accepted configuration's write quorum; the surviving
 primary publishes `NoWriteQuorum`, fences pending writes, and restores
 `Granted` automatically when the same configuration quorum returns without
-changing the data-loss number.
+changing the data-loss number. Kuberic does not implement SF-style elapsed-time
+replica dropping or destructive data-loss recovery. Persistent quorum loss
+therefore remains write-closed unless the same quorum returns or separately
+validated permanent-fault evidence authorizes an exact replacement.
 
 Failover first preserves the accepted PC and any outstanding replacement CC,
 including its build authority. PC and CC read quorum must remain observable
@@ -987,6 +994,7 @@ end-to-end Service Fabric equivalence claim:
 | Live process-kill reconstruction while an active configuration, replacement, or failover command is between durable stages | Adversarial suite in Phase 9 |
 | Destructive data-loss recovery, PC/CC abandonment, and non-intersecting authority recovery | Explicitly unsupported; requires separate design |
 | Exhaustive active-stage process-kill, listener-shutdown, and partition acceptance tests | Phase 9 |
+| Delayed status reports, old-tail repair hints, and delayed ACKs across current-only completion, restart, and partition healing | Phase 9 |
 | Power-loss proof for provider sync contracts and delayed old bootstrap/build commands | Phase 9 |
 | Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |
 

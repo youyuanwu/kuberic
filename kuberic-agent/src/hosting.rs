@@ -362,17 +362,6 @@ impl PodRuntime {
             .await
     }
 
-    pub async fn record_durable_peer_progress(
-        &self,
-        identity: ReplicaIdentity,
-        progress: i64,
-    ) -> Result<()> {
-        self.host
-            .managed()?
-            .record_durable_peer_progress(identity, progress)
-            .await
-    }
-
     pub async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
         self.host.managed()?.cancel_outbound_build(build_id).await
     }

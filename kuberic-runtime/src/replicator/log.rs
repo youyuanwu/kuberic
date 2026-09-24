@@ -336,12 +336,12 @@ impl ReplicationLog {
         self.record_local_progress_inner(lsn)
     }
 
-    pub(crate) fn record_durable_replica_progress(
+    pub(crate) fn record_build_handoff_progress(
         &mut self,
         identity: ReplicaIdentity,
         lsn: Lsn,
     ) -> Result<()> {
-        self.quorum.record_durable_replica_progress(identity, lsn)
+        self.quorum.record_build_handoff_progress(identity, lsn)
     }
 
     pub(crate) fn close(&mut self) -> Result<()> {

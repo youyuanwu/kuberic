@@ -2447,7 +2447,7 @@ impl DefaultReplicatorInner {
                 .collect::<Vec<_>>();
             let mut replicator = self.replicator.lock().await;
             for (identity, progress) in completed_builds {
-                replicator.record_durable_replica_progress(identity, progress)?;
+                replicator.record_build_handoff_progress(identity, progress)?;
             }
         }
         if authority.local_role() == ReplicaRole::Primary {
@@ -2672,19 +2672,6 @@ impl ManagedReplicator for DefaultReplicatorInner {
 
     async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
         self.accept_acknowledgement(acknowledgement).await
-    }
-
-    async fn record_durable_peer_progress(
-        &self,
-        identity: ReplicaIdentity,
-        progress: Lsn,
-    ) -> Result<()> {
-        self.replicator
-            .lock()
-            .await
-            .record_durable_replica_progress(identity, progress)?;
-        self.changed.notify_waiters();
-        Ok(())
     }
 
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {

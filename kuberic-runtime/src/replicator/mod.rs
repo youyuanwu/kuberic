@@ -92,11 +92,6 @@ pub trait ManagedReplicator: Send + Sync {
     async fn snapshot(&self) -> RuntimeSnapshot;
     async fn begin_write(&self, write: ClientWrite) -> Result<PendingWrite>;
     async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()>;
-    async fn record_durable_peer_progress(
-        &self,
-        identity: ReplicaIdentity,
-        progress: Lsn,
-    ) -> Result<()>;
     async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()>;
     async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy>;
     async fn accept_copy_acknowledgement(&self, acknowledgement: CopyAck) -> Result<()>;

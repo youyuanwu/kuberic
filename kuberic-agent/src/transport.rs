@@ -573,13 +573,6 @@ where
                     if report.epoch == configuration.epoch
                         && report.current_configuration.as_ref() == Some(&configuration)
                         && report.previous_configuration == state.previous_configuration
-                        && runtime
-                            .record_durable_peer_progress(
-                                report.identity.clone(),
-                                report.current_progress,
-                            )
-                            .await
-                            .is_ok()
                     {
                         let _ = runtime
                             .repair_peer(report.identity, report.current_progress)
