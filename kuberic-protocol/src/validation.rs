@@ -20,6 +20,8 @@ pub enum ValidationError {
     InitializedWithoutPolicy,
     #[error("never-initialized status contains a frozen effective policy")]
     PolicyBeforeInitialization,
+    #[error("active transition effective policy differs from frozen status policy")]
+    TransitionPolicyMismatch,
     #[error("never-initialized status contains an accepted topology")]
     TopologyBeforeInitialization,
     #[error("status cannot contain provisioning and a PC/CC transition simultaneously")]
@@ -344,6 +346,13 @@ fn validate_report_internal(
             report.identity.replica_id.value(),
         ));
     }
+    if report.verified_replication_lsn.is_some_and(|verified| {
+        verified < 0 || verified > report.current_progress || report.current_configuration.is_none()
+    }) {
+        return Err(ValidationError::InvalidReplicaReportAuthority(
+            report.identity.replica_id.value(),
+        ));
+    }
     if let (Some(previous), Some(current)) = (
         report.previous_configuration.as_ref(),
         report.current_configuration.as_ref(),
@@ -632,6 +641,14 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         return Err(ValidationError::QuorumLossMismatch);
     }
     if let Some(transition) = &status.transition {
+        if status
+            .effective_policy
+            .as_ref()
+            .is_some_and(|policy| policy != &transition.effective_policy)
+            || (transition.kind != TransitionKind::Bootstrap && status.effective_policy.is_none())
+        {
+            return Err(ValidationError::TransitionPolicyMismatch);
+        }
         validate_policy(&transition.effective_policy)?;
         validate_configuration(
             &transition.current_configuration,

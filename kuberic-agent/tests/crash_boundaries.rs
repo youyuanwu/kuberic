@@ -6,12 +6,16 @@ use async_trait::async_trait;
 use kuberic_agent::recovery::{RecoveryDecision, inspect_recovery, recover_pending};
 use kuberic_agent::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use kuberic_agent::sqlite_store::SqliteStore;
-use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
-use kuberic_agent::store::{AgentStore, BeginEffect};
+use kuberic_agent::state::{
+    AgentState, CoordinatorStage, EffectStage, SCHEMA_VERSION, StorageIdentity,
+};
+use kuberic_agent::store::{AgentStore, BeginConfiguration, BeginEffect};
 use kuberic_agent::{AgentError, Result};
+use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
-    AccessStatus, AgentGeneration, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
-    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+    AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
+    Epoch, InitializationId, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
 };
 use kuberic_runtime_internal::effects::{
     OpenMode, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
@@ -53,6 +57,36 @@ fn effect() -> RuntimeEffect {
         operation_id: OperationId::new("effect-1"),
         sequence: 1,
         action: RuntimeEffectAction::Open(OpenMode::Existing),
+    }
+}
+
+fn configuration_command() -> EnsureConfiguration {
+    let local = storage_identity().local_identity;
+    let effective_policy = EffectivePolicy::fixed(1, 30).unwrap();
+    let current_configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        local.replica_id,
+        vec![ConfigurationMember {
+            identity: local.clone(),
+            role: ReplicaRole::Primary,
+        }],
+        effective_policy.write_quorum,
+    );
+    EnsureConfiguration {
+        operation_id: OperationId::new("configuration-1"),
+        previous_configuration: None,
+        current_configuration,
+        previous_epoch: None,
+        current_epoch: Epoch::new(0, 1),
+        effective_policy,
+        local_replica_id: local.replica_id,
+        expected_instance_id: local.instance_id,
+        expected_agent_generation: local.agent_generation,
+        transition_kind: TransitionKind::Bootstrap,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only: false,
+        retire_build_ids: Vec::new(),
     }
 }
 
@@ -239,6 +273,64 @@ fn sqlite_commits_survive_process_termination_without_destructors() {
 }
 
 #[test]
+fn configuration_boundaries_survive_process_termination_without_destructors() {
+    for boundary in [
+        "pending-effect",
+        "effect-complete-before-stage-advance",
+        "enclosing-command",
+        "terminal-command",
+    ] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "crash_boundary_writer_process"])
+            .env("KUBERIC_CRASH_WRITER_PATH", &path)
+            .env("KUBERIC_CRASH_BOUNDARY", boundary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed at {boundary}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let reopened = SqliteStore::open_existing(&path, Some(&storage_identity())).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let state = runtime.block_on(reopened.load_state()).unwrap();
+        match boundary {
+            "pending-effect" => {
+                assert_eq!(
+                    state.pending_effect.unwrap().stage,
+                    EffectStage::IntentCommitted
+                );
+            }
+            "effect-complete-before-stage-advance" => {
+                assert_eq!(
+                    state.reconfiguration.unwrap().stage,
+                    CoordinatorStage::AdmitAuthority
+                );
+                assert_eq!(state.retained_result.unwrap().result, result());
+            }
+            "enclosing-command" => {
+                assert_eq!(
+                    state.reconfiguration.unwrap().stage,
+                    CoordinatorStage::AdmitAuthority
+                );
+                assert!(state.retained_command.is_none());
+            }
+            "terminal-command" => {
+                assert!(state.reconfiguration.is_none());
+                assert_eq!(
+                    state.retained_command.unwrap().command,
+                    configuration_command()
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 #[ignore = "helper process for sqlite_commits_survive_process_termination_without_destructors"]
 fn crash_writer_process() {
     let Ok(path) = env::var("KUBERIC_CRASH_WRITER_PATH") else {
@@ -247,5 +339,68 @@ fn crash_writer_process() {
     let store = SqliteStore::create_authorized(path, AgentState::new(storage_identity())).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(store.begin_effect(&effect())).unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "helper process for configuration_boundaries_survive_process_termination_without_destructors"]
+fn crash_boundary_writer_process() {
+    let (Ok(path), Ok(boundary)) = (
+        env::var("KUBERIC_CRASH_WRITER_PATH"),
+        env::var("KUBERIC_CRASH_BOUNDARY"),
+    ) else {
+        return;
+    };
+    let store = SqliteStore::create_authorized(path, AgentState::new(storage_identity())).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        match boundary.as_str() {
+            "pending-effect" => {
+                assert_eq!(
+                    store.begin_effect(&effect()).await.unwrap(),
+                    BeginEffect::Execute(effect())
+                );
+            }
+            "effect-complete-before-stage-advance" => {
+                assert!(matches!(
+                    store
+                        .begin_configuration(&configuration_command())
+                        .await
+                        .unwrap(),
+                    BeginConfiguration::Execute(_)
+                ));
+                store.begin_effect(&effect()).await.unwrap();
+                store.mark_effect_applied(&effect()).await.unwrap();
+                store.complete_effect(&result()).await.unwrap();
+            }
+            "enclosing-command" => {
+                assert!(matches!(
+                    store
+                        .begin_configuration(&configuration_command())
+                        .await
+                        .unwrap(),
+                    BeginConfiguration::Execute(_)
+                ));
+            }
+            "terminal-command" => {
+                let command = configuration_command();
+                store.begin_configuration(&command).await.unwrap();
+                store
+                    .advance_configuration(
+                        &command.operation_id,
+                        CoordinatorStage::AdmitAuthority,
+                        CoordinatorStage::Complete,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .complete_configuration(&command.operation_id)
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("unknown crash boundary {boundary}"),
+        }
+    });
     std::process::exit(0);
 }

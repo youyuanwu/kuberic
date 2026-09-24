@@ -141,6 +141,14 @@ fn uninitialized_status_requires_pod_and_pvc_without_durable_identity() {
         validate_agent_status_report(&contradictory),
         Err(WireError::InvalidAuthority(_))
     ));
+
+    let mut certified = contradictory;
+    certified.role = proto::ReplicaRole::Unknown as i32;
+    certified.verified_replication_lsn = Some(1);
+    assert!(matches!(
+        validate_agent_status_report(&certified),
+        Err(WireError::InvalidAuthority(_))
+    ));
 }
 
 #[test]
@@ -391,6 +399,16 @@ fn initialized_status_rejects_unknown_enums_and_malformed_configuration() {
             field: "agent_status.write_status",
             ..
         })
+    ));
+
+    let mut certified = report.clone();
+    certified.role = proto::ReplicaRole::Primary as i32;
+    certified.verified_replication_lsn = Some(10);
+    assert!(validate_agent_status_report(&certified).is_ok());
+    certified.verified_replication_lsn = Some(11);
+    assert!(matches!(
+        validate_agent_status_report(&certified),
+        Err(WireError::InvalidAuthority(_))
     ));
 
     let mut deactivation = report.clone();

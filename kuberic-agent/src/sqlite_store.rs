@@ -16,6 +16,7 @@ use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 use kuberic_runtime_internal::{ContractError, Result as ContractResult};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 
+use crate::command::is_access_only_configuration;
 use crate::state::{
     AgentState, CoordinatorStage, DeactivationState, EffectStage, PendingEffect,
     ReconfigurationRecord, RetainedCommandResult, RetainedResult, SCHEMA_VERSION, StorageIdentity,
@@ -260,7 +261,11 @@ impl AgentStore for SqliteStore {
             }
             let record = ReconfigurationRecord {
                 command: command.clone(),
-                stage: CoordinatorStage::AdmitAuthority,
+                stage: if is_access_only_configuration(command, &state) {
+                    CoordinatorStage::Activate
+                } else {
+                    CoordinatorStage::AdmitAuthority
+                },
                 observed_lsn: None,
             };
             state.reconfiguration = Some(record.clone());

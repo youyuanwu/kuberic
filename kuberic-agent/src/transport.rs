@@ -574,6 +574,31 @@ where
                         && report.current_configuration.as_ref() == Some(&configuration)
                         && report.previous_configuration == state.previous_configuration
                     {
+                        if let Some(verified_lsn) = report.verified_replication_lsn
+                            && configuration.members.iter().any(|member| {
+                                member.identity == local
+                                    && member.role == kuberic_protocol::types::ReplicaRole::Primary
+                            })
+                        {
+                            let _ = runtime
+                                .data_plane()
+                                .accept_acknowledgement(replication_ack_to_proto(ReplicationAck {
+                                    sender: local.clone(),
+                                    receiver: report.identity.clone(),
+                                    epoch: report.epoch,
+                                    previous_configuration_id: report
+                                        .previous_configuration
+                                        .as_ref()
+                                        .map(|previous| previous.configuration_id.clone()),
+                                    current_configuration_id: configuration
+                                        .configuration_id
+                                        .clone(),
+                                    received_lsn: verified_lsn,
+                                    applied_lsn: verified_lsn,
+                                    committed_lsn: report.committed_lsn.min(verified_lsn),
+                                }))
+                                .await;
+                        }
                         let _ = runtime
                             .repair_peer(report.identity, report.current_progress)
                             .await;

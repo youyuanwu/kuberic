@@ -69,6 +69,8 @@ pub struct AgentReport {
     pub previous_configuration: Option<ConfigurationDescriptor>,
     pub current_configuration: Option<ConfigurationDescriptor>,
     pub current_progress: i64,
+    #[serde(default)]
+    pub verified_replication_lsn: Option<i64>,
     pub committed_lsn: i64,
     pub catch_up_capability: Option<i64>,
     #[serde(default)]
@@ -127,6 +129,7 @@ impl Default for AgentReport {
             previous_configuration: None,
             current_configuration: None,
             current_progress: 0,
+            verified_replication_lsn: None,
             committed_lsn: 0,
             catch_up_capability: None,
             current_configuration_quorum_progress: 0,

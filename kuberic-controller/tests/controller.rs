@@ -455,6 +455,58 @@ async fn each_execute_requires_a_fresh_full_observation() {
 }
 
 #[tokio::test]
+async fn ambiguous_execute_is_reobserved_and_replayed_with_identical_authority() {
+    let mut observation = fresh_bootstrap_observation();
+    observation.set.status = Some(KubericSetStatus {
+        authority: bootstrap_status(&observation),
+    });
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    let reconciler = Reconciler::new(api.clone(), config());
+
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Applied
+    );
+    let mut refreshed = api.observation().await;
+    let RawAgentObservation::Report(report) =
+        refreshed.agents.get_mut(&replica_key(POD_UID)).unwrap()
+    else {
+        panic!("uninitialized report");
+    };
+    report.report_sequence += 1;
+    api.set_observation(refreshed).await;
+    api.unavailable_next_execute().await;
+    let ambiguous = reconciler.reconcile("tests", "db").await.unwrap();
+    assert_eq!(ambiguous.kind, ReconcileKind::Waiting);
+    assert_eq!(ambiguous.requeue_after, Duration::from_secs(3));
+
+    let mut refreshed = api.observation().await;
+    let RawAgentObservation::Report(report) =
+        refreshed.agents.get_mut(&replica_key(POD_UID)).unwrap()
+    else {
+        panic!("uninitialized report");
+    };
+    report.report_sequence += 1;
+    api.set_observation(refreshed).await;
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Executed
+    );
+
+    let executions = api
+        .effects()
+        .await
+        .into_iter()
+        .filter_map(|effect| match effect {
+            EffectRecord::Execute(command) => Some(command),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(executions.len(), 2);
+    assert_eq!(executions[0], executions[1]);
+}
+
+#[tokio::test]
 async fn startup_unavailable_is_a_bounded_wait() {
     let mut observation = with_scaffolding(raw(1));
     observation.set.status = Some(KubericSetStatus {
@@ -601,6 +653,67 @@ async fn stale_report_watermark_survives_repeated_rejection() {
             .await
             .iter()
             .all(|effect| !matches!(effect, EffectRecord::Execute(_)))
+    );
+}
+
+#[tokio::test]
+async fn new_process_session_accepts_a_fresh_sequence_without_losing_authority() {
+    let observation = stable_observation();
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    let reconciler = Reconciler::new(api.clone(), config());
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Stable
+    );
+
+    let mut restarted = api.observation().await;
+    let RawAgentObservation::Report(report) =
+        restarted.agents.get_mut(&replica_key(POD_UID)).unwrap()
+    else {
+        panic!("initialized report");
+    };
+    report.process_session_id = "restarted-session".to_string();
+    report.report_sequence = 1;
+    api.set_observation(restarted).await;
+
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Stable
+    );
+    assert!(
+        api.effects()
+            .await
+            .iter()
+            .all(|effect| !matches!(effect, EffectRecord::RemoveWriteRouting))
+    );
+}
+
+#[tokio::test]
+async fn bounded_resync_heals_changes_without_a_watch_event() {
+    let api = Arc::new(InMemoryClusterApi::new(stable_observation()));
+    let reconciler = Reconciler::new(api.clone(), config());
+    let stable = reconciler.reconcile("tests", "db").await.unwrap();
+    assert_eq!(stable.kind, ReconcileKind::Stable);
+    assert_eq!(stable.requeue_after, Duration::from_secs(11));
+
+    let mut drifted = api.observation().await;
+    drifted
+        .services
+        .retain(|service| service.name_any() != "db-peer");
+    for observation in drifted.agents.values_mut() {
+        if let RawAgentObservation::Report(report) = observation {
+            report.report_sequence += 1;
+        }
+    }
+    api.set_observation(drifted).await;
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::Applied
+    );
+    assert!(
+        api.effects()
+            .await
+            .contains(&EffectRecord::EnsureReplicaSupport)
     );
 }
 

@@ -19,6 +19,9 @@ Protocol version 2 adds explicit primary access targets
 (`ReconfigurationPending`, `NoWriteQuorum`, or `Granted`), multiple build
 retirements for carried replacement/failover repair, the election-safe LSN,
 and failover build authority.
+Protocol version 3 adds the authority-bound `verifiedReplicationLsn`
+certificate used to close failover catch-up without treating raw application
+progress as quorum credit.
 
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.

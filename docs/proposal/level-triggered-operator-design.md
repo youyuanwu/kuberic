@@ -717,8 +717,12 @@ precede client success. A receive-only ACK may precede application acceptance
 and never grants quorum credit.
 Agent status `currentProgress` is observation and retained-history repair input,
 not certified replication progress. It MUST NOT grant catch-up or client-commit
-quorum credit. Only an authority-bound applied replication ACK or a completed
-build handoff may advance another replica's quorum slot.
+quorum credit. `verifiedReplicationLsn` is a separate durable certificate bound
+to the report's exact identity, process session, epoch, and PC/CC authority.
+The agent accepts it only from the authenticated live peer session, and the
+replicator revalidates the authority before granting progress credit. Only an
+authority-bound applied replication ACK, verified-progress certificate, or
+completed build handoff may advance another replica's quorum slot.
 Transport remains caller-supplied, including build request dispatch and ACK
 delivery. Waiting for a build or catch-up quorum requires observed completion,
 not successful enqueueing.
@@ -980,22 +984,27 @@ before status accepts and publishes the new topology. A returned stale former
 primary is admitted only as evidence for an exact newer-epoch correction; its
 old epoch cannot receive quorum credit.
 
-The level-triggered control protocol is version 2. `EnsureConfiguration`
+The level-triggered control protocol is version 3. `EnsureConfiguration`
 carries the intended primary access state rather than a write-grant boolean,
 allowing `ReconfigurationPending`, `NoWriteQuorum`, and `Granted` to remain
 distinct durable postconditions. Current-only completion can retire every
 build authority carried by replacement plus failover repair.
+
+Phase 9 adds generated authority traces, process-termination persistence
+boundaries, ambiguous-command replay, bounded no-watch resynchronization, and
+a fresh-cluster adversarial matrix. The live matrix composes replacement,
+quorum loss and healing, controller restart, one-replica network isolation,
+replica process reconstruction, failover, and stale former-primary direct
+access. Every client probe has a fixed timeout, and failure deadlines are
+bounded so the matrix fails with diagnostics rather than hanging. Scheduled
+CI runs the complete matrix twice on separate fresh clusters.
 
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
-| Live process-kill reconstruction while an active configuration, replacement, or failover command is between durable stages | Adversarial suite in Phase 9 |
 | Destructive data-loss recovery, PC/CC abandonment, and non-intersecting authority recovery | Explicitly unsupported; requires separate design |
-| Exhaustive active-stage process-kill, listener-shutdown, and partition acceptance tests | Phase 9 |
-| Delayed status reports, old-tail repair hints, and delayed ACKs across current-only completion, restart, and partition healing | Phase 9 |
-| Power-loss proof for provider sync contracts and delayed old bootstrap/build commands | Phase 9 |
 | Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |
 
 The current classic design treats loss of process-local role, epoch, or action

@@ -32,6 +32,25 @@ pub fn admit_persisted_configuration(
     admit_configuration_with_replay(command, state, true)
 }
 
+pub(crate) fn is_access_only_configuration(
+    command: &EnsureConfiguration,
+    state: &AgentState,
+) -> bool {
+    !command.current_only
+        && command.previous_configuration.is_none()
+        && state.previous_configuration.is_none()
+        && state.current_configuration.as_ref() == Some(&command.current_configuration)
+        && command.current_epoch == state.highest_epoch
+        && command.failover_safe_lsn.is_none()
+        && command.retire_build_ids.is_empty()
+        && command
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity == state.identity.local_identity)
+            .is_some_and(|member| member.role == state.role)
+}
+
 fn admit_configuration_with_replay(
     command: &EnsureConfiguration,
     state: &AgentState,
@@ -176,7 +195,8 @@ fn admit_configuration_with_replay(
     }
     let admitted = AdmittedAuthority {
         local_identity: identity.clone(),
-        transition_kind: (!command.current_only).then_some(command.transition_kind),
+        transition_kind: (!command.current_only && !is_access_only_configuration(command, state))
+            .then_some(command.transition_kind),
         previous_configuration: command.previous_configuration.clone(),
         current_configuration: command.current_configuration.clone(),
     };

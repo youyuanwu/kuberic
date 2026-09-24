@@ -155,6 +155,7 @@ pub fn normalize_agent_status_report(
                 || report.read_status != proto::AccessStatus::Unknown as i32
                 || report.write_status != proto::AccessStatus::Unknown as i32
                 || report.current_progress != 0
+                || report.verified_replication_lsn.is_some()
                 || report.committed_lsn != 0
                 || report.catch_up_capability.is_some()
                 || report.current_configuration_quorum_progress != 0
@@ -217,6 +218,15 @@ pub fn normalize_agent_status_report(
                     value: report.read_status,
                 })
                 .and_then(access_status_from_proto)?;
+            if report.verified_replication_lsn.is_some_and(|verified| {
+                verified < 0
+                    || verified > report.current_progress
+                    || report.current_configuration.is_none()
+            }) {
+                return Err(WireError::InvalidAuthority(
+                    "verified replication progress is outside reported authority".to_string(),
+                ));
+            }
             let reported_fault =
                 match proto::FaultType::try_from(report.reported_fault).map_err(|_| {
                     WireError::InvalidEnum {
@@ -312,6 +322,7 @@ pub fn normalize_agent_status_report(
                 previous_configuration,
                 current_configuration,
                 current_progress: report.current_progress,
+                verified_replication_lsn: report.verified_replication_lsn,
                 committed_lsn: report.committed_lsn,
                 catch_up_capability: report.catch_up_capability,
                 current_configuration_quorum_progress: report.current_configuration_quorum_progress,

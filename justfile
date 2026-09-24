@@ -140,12 +140,25 @@ level-triggered-install: verify-kind-context
 level-triggered-kind-test *scenarios: verify-kind-context
     #!/usr/bin/env bash
     set -euo pipefail
-    for scenario in {{ scenarios }}; do
+    requested=({{ scenarios }})
+    if [[ ${#requested[@]} -eq 0 ]]; then
+      requested=(all)
+    fi
+    expanded=()
+    for scenario in "${requested[@]}"; do
+      if [[ "$scenario" == "all" ]]; then
+        expanded+=(replacement quorum-loss adversarial)
+      else
+        expanded+=("$scenario")
+      fi
+    done
+    for scenario in "${expanded[@]}"; do
       case "$scenario" in
         bootstrap) test_name="level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write" ;;
         replacement) test_name="level_triggered_k8s::replacement_preserves_quorum_write_and_retires_old_incarnation" ;;
         failover) test_name="level_triggered_k8s::failover_fences_old_primary_and_preserves_committed_data" ;;
         quorum-loss) test_name="level_triggered_k8s::quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change" ;;
+        adversarial) test_name="level_triggered_k8s::adversarial_restart_partition_and_healing_preserve_single_writer" ;;
         *) echo "unknown level-triggered scenario: $scenario" >&2; exit 2 ;;
       esac
       cargo test -p kuberic-level-tests "$test_name" -- --ignored --exact --nocapture
@@ -156,6 +169,10 @@ level-triggered-diagnostics: verify-kind-context
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n kuberic-system logs deployment/kuberic-controller --all-containers --tail=-1 || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
-        -n default get kubericsets,pods,pvc,services -o wide || true
+        -n default get kubericset kvstore2 -o yaml || true
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default get pods,pvc,services -o wide || true
+    kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
+        -n default get events --sort-by=.lastTimestamp || true
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         -n default logs -l operator.kuberic.io/set-name=kvstore2 --all-containers --tail=-1 || true

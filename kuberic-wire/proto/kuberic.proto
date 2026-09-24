@@ -120,6 +120,7 @@ message AgentStatusReport {
   string retained_operation_id = 28;
   repeated BuildStatus builds = 29;
   Epoch deactivation_epoch = 30;
+  optional int64 verified_replication_lsn = 31;
 }
 
 message InitializeAgentStoreCommand {

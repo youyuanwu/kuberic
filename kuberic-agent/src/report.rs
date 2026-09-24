@@ -92,6 +92,7 @@ fn build_report(
         previous_configuration: state.previous_configuration.map(Into::into),
         current_configuration: state.current_configuration.map(Into::into),
         current_progress: snapshot.current_progress,
+        verified_replication_lsn: snapshot.verified_replication_lsn,
         committed_lsn: snapshot.committed_lsn,
         catch_up_capability,
         storage_state: proto::AgentStorageState::Initialized as i32,

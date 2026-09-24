@@ -286,19 +286,33 @@ async fn coordinator_converges_duplicates_and_retains_terminal_result() {
         .ensure_configuration(command.clone())
         .await
         .unwrap();
+    let transition_calls = runtime.calls.lock().unwrap().len();
     let grant = grant_command("configuration-1-grant", Epoch::new(0, 1));
     let first = coordinator
         .ensure_configuration(grant.clone())
         .await
         .unwrap();
+    assert_eq!(
+        &runtime.calls.lock().unwrap()[transition_calls..],
+        ["access"],
+        "same-authority access changes must not re-admit or catch up authority"
+    );
     let calls = runtime.calls.lock().unwrap().clone();
     let duplicate = coordinator.ensure_configuration(grant).await.unwrap();
     assert_eq!(duplicate, first);
     assert_eq!(*runtime.calls.lock().unwrap(), calls);
+
+    let no_quorum = EnsureConfiguration {
+        operation_id: OperationId::new("configuration-1-no-quorum"),
+        primary_write_status: AccessStatus::NoWriteQuorum,
+        ..grant_command("unused", Epoch::new(0, 1))
+    };
+    coordinator.ensure_configuration(no_quorum).await.unwrap();
+    assert_eq!(runtime.calls.lock().unwrap().last(), Some(&"access"));
     let state = store.load_state().await.unwrap();
     assert!(state.reconfiguration.is_none());
     assert_eq!(state.read_status, AccessStatus::Granted);
-    assert_eq!(state.write_status, AccessStatus::Granted);
+    assert_eq!(state.write_status, AccessStatus::NoWriteQuorum);
 }
 
 #[tokio::test]

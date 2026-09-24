@@ -1605,6 +1605,7 @@ struct InMemoryState {
     active_observations: usize,
     max_active_observations: usize,
     observation_delay: Duration,
+    unavailable_next_execute: bool,
 }
 
 impl InMemoryClusterApi {
@@ -1618,6 +1619,7 @@ impl InMemoryClusterApi {
                 active_observations: 0,
                 max_active_observations: 0,
                 observation_delay: Duration::ZERO,
+                unavailable_next_execute: false,
             })),
         }
     }
@@ -1632,6 +1634,10 @@ impl InMemoryClusterApi {
 
     pub async fn set_observation_delay(&self, delay: Duration) {
         self.state.lock().await.observation_delay = delay;
+    }
+
+    pub async fn unavailable_next_execute(&self) {
+        self.state.lock().await.unavailable_next_execute = true;
     }
 
     pub async fn effects(&self) -> Vec<EffectRecord> {
@@ -1925,11 +1931,14 @@ impl ClusterApi for InMemoryClusterApi {
         _observation: &RawObservation,
         command: &ProtocolCommand,
     ) -> Result<()> {
-        self.state
-            .lock()
-            .await
-            .effects
-            .push(EffectRecord::Execute(command.clone()));
+        let mut state = self.state.lock().await;
+        state.effects.push(EffectRecord::Execute(command.clone()));
+        if state.unavailable_next_execute {
+            state.unavailable_next_execute = false;
+            return Err(ControllerError::AgentUnavailable(
+                "ambiguous command result after dispatch".to_string(),
+            ));
+        }
         Ok(())
     }
 }
