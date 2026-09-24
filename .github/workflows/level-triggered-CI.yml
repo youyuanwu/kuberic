@@ -68,6 +68,7 @@ jobs:
         run: |
           scripts/check_level_triggered_scope.sh origin/main
           scripts/check_level_triggered_dependencies.sh
+          scripts/check_level_triggered_documentation.sh
 
   bootstrap-kind:
     name: Three-member bootstrap

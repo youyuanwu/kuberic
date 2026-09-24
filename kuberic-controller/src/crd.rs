@@ -139,6 +139,10 @@ mod tests {
     fn deploy_assets_are_isolated_from_the_classic_operator() {
         let crd: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(include_str!("../deploy/crd.json")).unwrap();
+        let generated = serde_json::to_value(KubericSet::crd()).unwrap();
+        let checked_in: serde_json::Value =
+            serde_json::from_str(include_str!("../deploy/crd.json")).unwrap();
+        assert_eq!(checked_in, generated);
         assert_eq!(crd["spec"]["group"].as_str(), Some("operator.kuberic.io"));
         assert_eq!(
             crd["spec"]["versions"][0]["name"].as_str(),

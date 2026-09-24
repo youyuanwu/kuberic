@@ -1494,6 +1494,8 @@ dependencies = [
  "futures",
  "kuberic-protocol",
  "kuberic-runtime-internal",
+ "quote",
+ "syn 2.0.118",
  "thiserror 2.0.20",
  "tokio",
  "uuid",

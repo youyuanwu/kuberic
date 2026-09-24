@@ -60,3 +60,24 @@ The controller remains responsible for selecting configurations,
 re-observing command postconditions, routing fences, and distributing
 deployment authentication material. Concrete outbound peer dialing is wired
 through the agent's `OutboundDispatcher` contract.
+
+## Storage and recovery contract
+
+`ReplicaHost` places metadata at
+`<data-root>/.kuberic/agent.sqlite3`; application state remains under an
+application-owned sibling directory. SQLite uses WAL, `synchronous=FULL`,
+foreign keys, disabled automatic WAL checkpoints, and a five-second busy
+timeout. The agent is the single writer.
+
+The PVC filesystem must provide durable fsync and directory-entry semantics
+and SQLite WAL locking/shared memory. Opening an established store validates
+integrity, exact storage identity, and the exact schema version. The current
+migration hook is idempotent only for that version; it is not an older-schema
+upgrade path.
+
+Crash-boundary environment variables exist only in the test executable.
+Production agent and application binaries expose no fault-injection mode.
+
+See the
+[level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
+for identity semantics, deployment, diagnostics, and unsupported recovery.

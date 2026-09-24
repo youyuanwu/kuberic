@@ -17,3 +17,7 @@ kuberic-runtime-internal = { path = "../kuberic-runtime-internal" }
 thiserror.workspace = true
 tokio.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+quote = "1"
+syn = { version = "2", features = ["full"] }

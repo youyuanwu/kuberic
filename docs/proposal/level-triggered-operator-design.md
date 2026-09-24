@@ -1,13 +1,15 @@
 # Level-Triggered Kuberic Operator
 
-> **Status:** Proposal
+> **Status:** Implemented MVP; retained as the historical design proposal
 >
-> **Scope:** A future Kuberic operator and replica-agent contract. This proposal
+> **Scope:** The independent operator and replica-agent contract. This design
 > does not change the existing `kuberic.io/v1` operator or CRD.
 >
-> This document specifies architecture, authority, and safety behavior only. It
-> does not define an implementation roadmap, migration sequence, or phased
-> delivery plan.
+> The as-built operational contract, deployment commands, supported behavior,
+> and limitations are documented in the
+> [level-triggered operator guide](../features/kuberic/level-triggered-operator.md).
+> This document preserves the design rationale and does not define a migration
+> from classic v1.
 
 ## Summary
 
@@ -999,13 +1001,17 @@ access. Every client probe has a fixed timeout, and failure deadlines are
 bounded so the matrix fails with diagnostics rather than hanging. Scheduled
 CI runs the complete matrix twice on separate fresh clusters.
 
-The following contracts remain assigned to later phases and block an
-end-to-end Service Fabric equivalence claim:
+The following contract blocks an end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
 | Destructive data-loss recovery, PC/CC abandonment, and non-intersecting authority recovery | Explicitly unsupported; requires separate design |
-| Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |
+
+Phase 10 added an exhaustive source-public signature inventory, including
+private-module and `#[doc(hidden)]` declarations, plus adversarial compile-fail
+fixtures for agent-owned runtime capabilities. The operational guide records
+the remaining cross-crate hidden surface and does not treat rustdoc visibility
+as access control.
 
 The current classic design treats loss of process-local role, epoch, or action
 correlation under the same Pod UID as a stale replica requiring removal and

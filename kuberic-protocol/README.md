@@ -27,3 +27,18 @@ Configuration JSON omits duplicated `primaryId`, derives it from the unique
 `Primary` member, and flattens each member's exact identity fields beside its
 role. Legacy nested-member and explicit-primary JSON remains readable for
 durable metadata compatibility.
+
+## Integration boundary
+
+The controller is the only owner of desired-cluster evaluation. Agents and
+runtimes may validate canonical protocol values, but they do not select a new
+configuration or infer authority from Kubernetes readiness, routing, or raw
+application progress.
+
+The supported evaluator contract is fixed-cardinality bootstrap,
+same-cardinality replacement, ordinary failover, and non-destructive quorum
+loss/recovery. Scaling, planned switchover, timed replica dropping, destructive
+data-loss recovery, and mixed-version negotiation remain fail-closed.
+
+See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
+for the complete operational contract.

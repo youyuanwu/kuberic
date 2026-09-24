@@ -34,3 +34,17 @@ quorum/catch-up progress, deactivation evidence, load/fault reports, and
 pending or retained command identity.
 Deactivation evidence carries its own epoch with the LSN so later
 configurations cannot relabel historical evidence.
+
+## Integration boundary
+
+This crate does not negotiate or downgrade versions. Protocol version 3 is an
+exact coordinated-deployment boundary; incompatible controller, agent, or
+replica peers are rejected. Authentication, DNS resolution, retry policy, and
+session registration are agent-owned transport concerns around these schemas.
+
+Raw `currentProgress` is application/repair evidence. Only applied
+authority-bound acknowledgements, validated `verifiedReplicationLsn`
+certificates, and completed build handoffs may become remote quorum credit.
+
+See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
+for deployment and failure behavior.

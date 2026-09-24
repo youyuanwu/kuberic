@@ -153,20 +153,36 @@ verified and acknowledged without redelivery to the application.
 Dropping the returned copy stream cancels provider iteration and removes the
 generation-scoped build.
 
-## Deferred Service Fabric completion contracts
+## Public API boundary
 
-This crate provides data-plane primitives, not end-to-end SF failover. Later
-owners must provide:
+The intended application surface is the documented service, state-provider,
+partition, replicator-factory, replicator, and operation-stream API. Some
+cross-crate host signatures are `pub` and `#[doc(hidden)]` because
+`kuberic-agent` is a separate crate; hidden documentation is not treated as
+access control.
 
-- the controller/FM owner that selects and dispatches durable desired
-  configurations;
-- concrete outbound gRPC peer dialing and deployment-level authentication
-  material around the agent's reliable dispatch abstraction;
+`scripts/check_runtime_public_api.sh` reviews both generated rustdoc and an
+exhaustive source-level inventory of public signatures. Compile-fail fixtures
+prove that safe external application code cannot obtain the managed
+replicator, construct a host partition, inject authority stores, register a
+managed runtime directly, or access the private authority module.
+
+Applications must persist copy and replication operations before
+acknowledging them. A received transport item is not quorum evidence; only the
+applied acknowledgement may contribute to commit.
+
+## Remaining Service Fabric completion contracts
+
+The independent controller and agent provide fixed-cardinality bootstrap,
+replacement, ordinary failover, and quorum-loss ownership. The remaining
+deferred contracts are:
+
 - persistent resend payloads across process sessions where incremental
   reconnect is required instead of full-copy fallback;
 - operation-specific mappings for removal, cancellation, backpressure, and
   transient reconfiguration outcomes beyond the current tonic status mapping;
 - destructive data-loss recovery and its external fencing provider.
 
-Until those owners are implemented, the crate is an SF-aligned runtime
-foundation rather than a deployable SF-equivalent failover system.
+See the
+[level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
+for the supported operational contract and fail-closed limitations.
