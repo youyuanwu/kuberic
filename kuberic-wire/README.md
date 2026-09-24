@@ -15,6 +15,11 @@ epoch, configuration identity, protocol version, and replication progress.
 Unknown versions, enum values, missing fields, and contradictory authority are
 rejected rather than defaulted.
 
+Protocol version 2 adds explicit primary access targets
+(`ReconfigurationPending`, `NoWriteQuorum`, or `Granted`), multiple build
+retirements for carried replacement/failover repair, the election-safe LSN,
+and failover build authority.
+
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.
 

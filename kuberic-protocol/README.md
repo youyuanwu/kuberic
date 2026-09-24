@@ -14,6 +14,11 @@ It intentionally has no Kubernetes, gRPC, async runtime, or filesystem
 dependencies. Controllers and agents exchange these canonical types through
 transport adapters such as `kuberic-wire`.
 
-The current evaluator covers Phase 1 behavior: initialization authority,
-Kubernetes scaffolding, bootstrap intent, fresh-store initialization, stable
-evidence, unsupported replica-count changes, waiting, and unsafe states.
+The evaluator covers write-closed bootstrap, same-cardinality replacement,
+ordinary failover, and quorum loss. Failover persists exact failure timing,
+fences routing before newer authority, requires PC and outstanding-CC read
+quorum, selects from epoch-fenced deactivation/progress evidence, authorizes
+only the elected safe prefix under the new fence, performs retained-history or
+full-copy repair, and accepts only current-only quorum evidence. Quorum loss
+publishes `NoWriteQuorum` without changing the data-loss epoch and restores
+access when the same configuration quorum returns.

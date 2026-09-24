@@ -8,10 +8,11 @@ use crate::observation::{AgentObservation, ObservationSnapshot};
 use crate::plan::{Plan, UnsafeReason, WaitReason};
 use crate::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, ConditionStatus, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, ProvisioningIntent, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, StatusCondition, TransitionIntent, TransitionKind,
-    derive_agent_generation, derive_initialization_id, derive_replacement_operation_id,
-    derive_transition_id,
+    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PrimaryFailureObservation,
+    ProvisioningIntent, QuorumLossObservation, ReplicaIdentity, ReplicaInstanceId,
+    ReplicaRepairIntent, ReplicaRole, StatusCondition, TransitionIntent, TransitionKind,
+    derive_agent_generation, derive_failover_repair_operation_id, derive_initialization_id,
+    derive_replacement_operation_id, derive_transition_id,
 };
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
@@ -104,6 +105,10 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         status.observed_generation = snapshot.desired.generation;
     }
 
+    if let Some(plan) = maybe_begin_stable_failover(snapshot, status.clone(), config) {
+        return plan;
+    }
+
     if configuration.members.iter().any(|member| {
         snapshot
             .observation_for_identity(&member.identity)
@@ -119,6 +124,43 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                     .collect(),
             }],
         };
+    }
+
+    if let Some((member, report)) = configuration.members.iter().find_map(|member| {
+        if member.role == ReplicaRole::Primary {
+            return None;
+        }
+        let report = snapshot
+            .observation_for_identity(&member.identity)
+            .and_then(|observation| match &observation.agent {
+                AgentObservation::Report(report) => Some(report.as_ref()),
+                _ => None,
+            })?;
+        (report.epoch < configuration.epoch
+            && (report.role == ReplicaRole::Primary
+                || report.write_status == AccessStatus::Granted))
+            .then_some((member, report))
+    }) {
+        if let Some(previous) = report.current_configuration.as_ref() {
+            return Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(
+                    failover_configuration_command(
+                        previous,
+                        configuration,
+                        member,
+                        policy,
+                        OperationId::new(format!(
+                            "accepted-correction:{}:{}",
+                            configuration.configuration_id, member.identity.replica_id
+                        )),
+                        Some(report.current_progress),
+                        AccessStatus::ReconfigurationPending,
+                        false,
+                        Vec::new(),
+                    ),
+                )),
+            };
+        }
     }
 
     if let Some(failed) = configuration.members.iter().find(|member| {
@@ -223,33 +265,12 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         .find(|member| member.identity.replica_id == configuration.primary_id)
         .expect("validated configuration has primary member");
     let mut attested_members = 0_u32;
-    let mut primary_attested = false;
-    let mut primary_authority_attested = false;
+    let mut primary_report = None;
     for member in &configuration.members {
-        let Some(observation) = snapshot.observation_for_identity(&member.identity) else {
-            return Plan::Wait {
-                reason: WaitReason::AwaitingStableEvidence,
-                status: waiting_status(
-                    status,
-                    "ReplicaEvidenceMissing",
-                    "Accepted topology is not fully observed",
-                ),
-                requeue_after_seconds: config.wait_requeue_seconds,
-            };
-        };
-        let AgentObservation::Report(report) = &observation.agent else {
-            return Plan::Wait {
-                reason: WaitReason::AwaitingStableEvidence,
-                status: waiting_status(
-                    status,
-                    "ReplicaEvidenceMissing",
-                    "Accepted member has no initialized report",
-                ),
-                requeue_after_seconds: config.wait_requeue_seconds,
-            };
+        let Some(report) = healthy_report(snapshot, &member.identity) else {
+            continue;
         };
         let authority_matches = report.identity == member.identity
-            && report.healthy
             && report.role == member.role
             && report.epoch == configuration.epoch
             && report
@@ -261,44 +282,94 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         }
 
         if member.identity == primary.identity {
-            primary_authority_attested = authority_matches && report.role == ReplicaRole::Primary;
-            primary_attested =
-                primary_authority_attested && report.write_status == AccessStatus::Granted;
+            primary_report = authority_matches.then_some(report);
         }
     }
 
-    if primary_authority_attested
-        && attested_members == configuration.members.len() as u32
-        && !primary_attested
-    {
+    let Some(primary_report) = primary_report else {
+        return Plan::Wait {
+            reason: WaitReason::AwaitingStableEvidence,
+            status: waiting_status(
+                status,
+                "PrimaryAuthorityUnproven",
+                "The accepted primary has not attested its exact authority",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        };
+    };
+    if attested_members < configuration.write_quorum {
+        let marker_matches = status.quorum_loss.as_ref().is_some_and(|observation| {
+            observation.configuration_id == configuration.configuration_id
+        });
+        if !marker_matches {
+            status.quorum_loss = Some(QuorumLossObservation {
+                configuration_id: configuration.configuration_id.clone(),
+                started_at_unix_seconds: snapshot.now_unix_seconds,
+            });
+            return Plan::Apply {
+                changes: vec![KubernetesChange::PersistStatus {
+                    status: Box::new(waiting_status(
+                        status,
+                        "NoWriteQuorum",
+                        "Current Configuration write quorum is unavailable",
+                    )),
+                }],
+            };
+        }
+        if primary_report.write_status != AccessStatus::NoWriteQuorum {
+            return Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(
+                    ensure_configuration_command(
+                        configuration,
+                        primary,
+                        policy,
+                        OperationId::new(format!(
+                            "availability:{}:no-write-quorum",
+                            configuration.configuration_id
+                        )),
+                        AccessStatus::NoWriteQuorum,
+                        false,
+                    ),
+                )),
+            };
+        }
+        return Plan::Wait {
+            reason: WaitReason::QuorumLoss,
+            status: waiting_status(
+                status,
+                "NoWriteQuorum",
+                "Writes remain closed until Current Configuration quorum returns",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        };
+    }
+
+    if primary_report.write_status != AccessStatus::Granted {
         return Plan::Execute {
             command: ProtocolCommand::EnsureConfiguration(Box::new(ensure_configuration_command(
                 configuration,
                 primary,
-                snapshot
-                    .status
-                    .effective_policy
-                    .as_ref()
-                    .expect("validated stable status has policy"),
+                policy,
                 OperationId::new(format!(
-                    "bootstrap:{}:grant-write",
+                    "availability:{}:grant-write",
                     configuration.configuration_id
                 )),
-                true,
+                AccessStatus::Granted,
                 false,
             ))),
         };
     }
 
-    if !primary_attested || attested_members < configuration.write_quorum {
-        return Plan::Wait {
-            reason: WaitReason::AwaitingStableEvidence,
-            status: waiting_status(
-                status,
-                "WriteAuthorityUnproven",
-                "Primary WriteStatus or Current Configuration quorum is not proven",
-            ),
-            requeue_after_seconds: config.wait_requeue_seconds,
+    if status.quorum_loss.is_some() {
+        status.quorum_loss = None;
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(waiting_status(
+                    status,
+                    "WriteQuorumRestored",
+                    "Current Configuration quorum returned and writes are restored",
+                )),
+            }],
         };
     }
 
@@ -360,6 +431,173 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         status,
         requeue_after_seconds: config.stable_resync_seconds,
     }
+}
+
+fn maybe_begin_stable_failover(
+    snapshot: &ObservationSnapshot,
+    mut status: AcceptedStatus,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    let accepted = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .expect("initialized status has accepted topology")
+        .configuration;
+    let primary = configuration_primary(accepted);
+    if !replica_failed(snapshot, &primary.identity) {
+        if status.primary_failure.is_some() {
+            status.primary_failure = None;
+            return Some(Plan::Apply {
+                changes: vec![KubernetesChange::PersistStatus {
+                    status: Box::new(waiting_status(
+                        status,
+                        "PrimaryRecovered",
+                        "The accepted primary recovered before failover authority was allocated",
+                    )),
+                }],
+            });
+        }
+        return None;
+    }
+
+    if status
+        .primary_failure
+        .as_ref()
+        .is_none_or(|failure| failure.primary != primary.identity)
+    {
+        status.primary_failure = Some(PrimaryFailureObservation {
+            primary: primary.identity.clone(),
+            started_at_unix_seconds: snapshot.now_unix_seconds,
+        });
+        status.quorum_loss = None;
+        let mut changes = Vec::new();
+        if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+            changes.push(KubernetesChange::RemoveWriteRouting);
+        }
+        changes.push(KubernetesChange::PersistStatus {
+            status: Box::new(waiting_status(
+                status,
+                "PrimaryFailureObserved",
+                "Persisted exact primary failure observation and fenced write routing",
+            )),
+        });
+        return Some(Plan::Apply { changes });
+    }
+
+    if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+        return Some(Plan::Apply {
+            changes: vec![
+                KubernetesChange::RemoveWriteRouting,
+                KubernetesChange::PersistStatus {
+                    status: Box::new(waiting_status(
+                        status,
+                        "RoutingFencePending",
+                        "Removing routing to the failed primary before failover",
+                    )),
+                },
+            ],
+        });
+    }
+
+    let policy = snapshot
+        .status
+        .effective_policy
+        .as_ref()
+        .expect("initialized status has policy");
+    let failure = status
+        .primary_failure
+        .as_ref()
+        .expect("matching primary failure observation exists");
+    let delay = i64::try_from(policy.failover_delay_seconds).unwrap_or(i64::MAX);
+    if snapshot.now_unix_seconds < failure.started_at_unix_seconds.saturating_add(delay) {
+        return Some(Plan::Wait {
+            reason: WaitReason::FailoverDelay,
+            status: waiting_status(
+                status,
+                "FailoverDelay",
+                "Waiting for the frozen primary-failure delay",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        });
+    }
+
+    let reports = available_union_reports(snapshot, accepted, accepted);
+    if !configuration_read_quorum(accepted, &reports, policy.read_quorum) {
+        if configuration_cannot_regain_read_quorum(snapshot, accepted, policy.read_quorum) {
+            return Some(unsafe_plan(
+                status,
+                UnsafeReason::ContradictoryReplicaEvidence(
+                    "ordinary recovery would require abandoning accepted configuration quorum"
+                        .to_string(),
+                ),
+                config,
+            ));
+        }
+        if status
+            .quorum_loss
+            .as_ref()
+            .is_none_or(|quorum_loss| quorum_loss.configuration_id != accepted.configuration_id)
+        {
+            status.quorum_loss = Some(QuorumLossObservation {
+                configuration_id: accepted.configuration_id.clone(),
+                started_at_unix_seconds: snapshot.now_unix_seconds,
+            });
+            return Some(Plan::Apply {
+                changes: vec![KubernetesChange::PersistStatus {
+                    status: Box::new(waiting_status(
+                        status,
+                        "FailoverReadQuorumUnavailable",
+                        "Failover remains write-closed until Current Configuration read quorum is observed",
+                    )),
+                }],
+            });
+        }
+        return Some(Plan::Wait {
+            reason: WaitReason::QuorumLoss,
+            status: waiting_status(
+                status,
+                "FailoverReadQuorumUnavailable",
+                "Failover remains write-closed until Current Configuration read quorum is observed",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        });
+    }
+
+    let candidate = select_failover_candidate(accepted, &reports)?;
+    let current = configuration_with_primary(
+        accepted,
+        &candidate.identity,
+        Epoch::new(
+            accepted.epoch.data_loss_number,
+            accepted.epoch.configuration_number + 1,
+        ),
+    );
+    status.transition = Some(TransitionIntent {
+        transition_id: derive_transition_id(
+            &snapshot.resource_uid,
+            TransitionKind::Failover,
+            &current.configuration_id,
+        ),
+        kind: TransitionKind::Failover,
+        spec_generation: snapshot.status.observed_generation,
+        effective_policy: policy.clone(),
+        previous_configuration_id: Some(accepted.configuration_id.clone()),
+        current_configuration: current,
+        election_lsn: Some(candidate.current_progress),
+        build_id: None,
+        repair: None,
+    });
+    status.quorum_loss = None;
+    Some(Plan::Apply {
+        changes: vec![KubernetesChange::PersistStatus {
+            status: Box::new(waiting_status(
+                status,
+                "FailoverIntentPersisted",
+                "Persisted a newer write-closed failover epoch with a provisional coordinator",
+            )),
+        }],
+    })
 }
 
 fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
@@ -478,7 +716,9 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
         effective_policy: policy,
         previous_configuration_id: None,
         current_configuration,
+        election_lsn: None,
         build_id: None,
+        repair: None,
     };
     let mut status = snapshot.status.clone();
     status.transition = Some(transition);
@@ -516,24 +756,544 @@ fn evaluate_transition(
     }
 
     if transition.kind == TransitionKind::Replacement {
+        if let Some(plan) = maybe_begin_failover(snapshot, Some(transition), status.clone(), config)
+        {
+            return plan;
+        }
         return evaluate_replacement_transition(snapshot, transition, status, config);
     }
-    if transition.kind != TransitionKind::Bootstrap {
-        return Plan::Wait {
-            reason: if snapshot.desired.replicas != transition.effective_policy.replica_set_size {
-                WaitReason::UnsupportedSpecDuringTransition
-            } else {
-                WaitReason::ActiveTransition
-            },
-            status,
-            requeue_after_seconds: config.wait_requeue_seconds,
-        };
+    if transition.kind == TransitionKind::Failover {
+        return evaluate_failover_transition(snapshot, transition, status, config);
     }
 
     if let Some(plan) =
         evaluate_bootstrap_supersession(snapshot, transition, status.clone(), config)
     {
         return plan;
+    }
+
+    fn maybe_begin_failover(
+        snapshot: &ObservationSnapshot,
+        active_transition: Option<&TransitionIntent>,
+        mut status: AcceptedStatus,
+        config: &EvaluationConfig,
+    ) -> Option<Plan> {
+        let accepted = &snapshot
+            .status
+            .topology
+            .as_ref()
+            .expect("initialized status has accepted topology")
+            .configuration;
+        let basis = active_transition
+            .map(|transition| &transition.current_configuration)
+            .unwrap_or(accepted);
+        let primary = configuration_primary(basis);
+        if !replica_failed(snapshot, &primary.identity) {
+            if status.primary_failure.is_some() {
+                status.primary_failure = None;
+                return Some(Plan::Apply {
+                    changes: vec![KubernetesChange::PersistStatus {
+                        status: Box::new(waiting_status(
+                            status,
+                            "PrimaryRecovered",
+                            "The accepted primary recovered before failover authority was allocated",
+                        )),
+                    }],
+                });
+            }
+            return None;
+        }
+
+        let accepted_primary = configuration_primary(accepted);
+        let failure_matches = status
+            .primary_failure
+            .as_ref()
+            .is_some_and(|failure| failure.primary == accepted_primary.identity);
+        if !failure_matches {
+            status.primary_failure = Some(PrimaryFailureObservation {
+                primary: accepted_primary.identity.clone(),
+                started_at_unix_seconds: snapshot.now_unix_seconds,
+            });
+            status.quorum_loss = None;
+            let mut changes = Vec::new();
+            if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+                changes.push(KubernetesChange::RemoveWriteRouting);
+            }
+            changes.push(KubernetesChange::PersistStatus {
+                status: Box::new(waiting_status(
+                    status,
+                    "PrimaryFailureObserved",
+                    "Persisted exact primary failure observation and fenced write routing",
+                )),
+            });
+            return Some(Plan::Apply { changes });
+        }
+
+        if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+            return Some(Plan::Apply {
+                changes: vec![
+                    KubernetesChange::RemoveWriteRouting,
+                    KubernetesChange::PersistStatus {
+                        status: Box::new(waiting_status(
+                            status,
+                            "RoutingFencePending",
+                            "Removing routing to the failed primary before failover",
+                        )),
+                    },
+                ],
+            });
+        }
+
+        let failure = status
+            .primary_failure
+            .as_ref()
+            .expect("matching primary failure observation exists");
+        let delay_elapsed = snapshot.now_unix_seconds
+            >= failure.started_at_unix_seconds.saturating_add(
+                i64::try_from(
+                    snapshot
+                        .status
+                        .effective_policy
+                        .as_ref()
+                        .expect("initialized status has policy")
+                        .failover_delay_seconds,
+                )
+                .unwrap_or(i64::MAX),
+            );
+        if !delay_elapsed {
+            return Some(Plan::Wait {
+                reason: WaitReason::FailoverDelay,
+                status: waiting_status(
+                    status,
+                    "FailoverDelay",
+                    "Waiting for the frozen primary-failure delay",
+                ),
+                requeue_after_seconds: config.wait_requeue_seconds,
+            });
+        }
+
+        let policy = snapshot
+            .status
+            .effective_policy
+            .as_ref()
+            .expect("initialized status has policy");
+        let reports = available_union_reports(snapshot, accepted, basis);
+        if !configuration_read_quorum(accepted, &reports, policy.read_quorum)
+            || !configuration_read_quorum(basis, &reports, policy.read_quorum)
+        {
+            if configuration_cannot_regain_read_quorum(snapshot, accepted, policy.read_quorum)
+                || configuration_cannot_regain_read_quorum(snapshot, basis, policy.read_quorum)
+            {
+                return Some(unsafe_plan(
+                    status,
+                    UnsafeReason::ContradictoryReplicaEvidence(
+                        "ordinary recovery would require abandoning PC or outstanding CC quorum"
+                            .to_string(),
+                    ),
+                    config,
+                ));
+            }
+            if status
+                .quorum_loss
+                .as_ref()
+                .is_none_or(|quorum_loss| quorum_loss.configuration_id != accepted.configuration_id)
+            {
+                status.quorum_loss = Some(QuorumLossObservation {
+                    configuration_id: accepted.configuration_id.clone(),
+                    started_at_unix_seconds: snapshot.now_unix_seconds,
+                });
+                return Some(Plan::Apply {
+                    changes: vec![KubernetesChange::PersistStatus {
+                        status: Box::new(waiting_status(
+                            status,
+                            "FailoverReadQuorumUnavailable",
+                            "Failover remains write-closed until PC and outstanding CC read quorum are observed",
+                        )),
+                    }],
+                });
+            }
+            return Some(Plan::Wait {
+                reason: WaitReason::QuorumLoss,
+                status: waiting_status(
+                    status,
+                    "FailoverReadQuorumUnavailable",
+                    "Failover remains write-closed until PC and outstanding CC read quorum are observed",
+                ),
+                requeue_after_seconds: config.wait_requeue_seconds,
+            });
+        }
+
+        let candidate = select_failover_candidate(basis, &reports)?;
+        let next_epoch = Epoch::new(
+            basis.epoch.data_loss_number,
+            basis
+                .epoch
+                .configuration_number
+                .max(accepted.epoch.configuration_number)
+                + 1,
+        );
+        let current = configuration_with_primary(basis, &candidate.identity, next_epoch);
+        status.transition = Some(TransitionIntent {
+            transition_id: derive_transition_id(
+                &snapshot.resource_uid,
+                TransitionKind::Failover,
+                &current.configuration_id,
+            ),
+            kind: TransitionKind::Failover,
+            spec_generation: active_transition
+                .map_or(snapshot.status.observed_generation, |transition| {
+                    transition.spec_generation
+                }),
+            effective_policy: policy.clone(),
+            previous_configuration_id: Some(accepted.configuration_id.clone()),
+            current_configuration: current,
+            election_lsn: Some(candidate.current_progress),
+            build_id: active_transition.and_then(|transition| transition.build_id.clone()),
+            repair: None,
+        });
+        status.quorum_loss = None;
+        Some(Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(waiting_status(
+                    status,
+                    "FailoverIntentPersisted",
+                    "Persisted a newer write-closed failover epoch with a provisional coordinator",
+                )),
+            }],
+        })
+    }
+
+    fn evaluate_failover_transition(
+        snapshot: &ObservationSnapshot,
+        transition: &TransitionIntent,
+        mut status: AcceptedStatus,
+        config: &EvaluationConfig,
+    ) -> Plan {
+        let previous = &snapshot
+            .status
+            .topology
+            .as_ref()
+            .expect("validated failover has accepted topology")
+            .configuration;
+        let current = &transition.current_configuration;
+        let primary = configuration_primary(current);
+
+        if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+            return Plan::Apply {
+                changes: vec![
+                    KubernetesChange::RemoveWriteRouting,
+                    KubernetesChange::PersistStatus {
+                        status: Box::new(waiting_status(
+                            status,
+                            "RoutingFencePending",
+                            "Write routing remains fenced throughout failover",
+                        )),
+                    },
+                ],
+            };
+        }
+
+        let current_only_started = current.members.iter().any(|member| {
+            healthy_report(snapshot, &member.identity).is_some_and(|report| {
+                report.epoch == current.epoch
+                    && report.previous_configuration.is_none()
+                    && report.current_configuration.as_ref() == Some(current)
+            })
+        });
+        let union = configuration_union(previous, current);
+        if !current_only_started {
+            for member in union
+                .iter()
+                .filter(|member| member.identity != primary.identity)
+                .chain(std::iter::once(primary))
+            {
+                let Some(report) = healthy_report(snapshot, &member.identity) else {
+                    continue;
+                };
+                let installed = report.epoch == current.epoch
+                    && report.previous_configuration.as_ref() == Some(previous)
+                    && report.current_configuration.as_ref() == Some(current);
+                if !installed {
+                    if report.pending_operation_id.is_some() {
+                        continue;
+                    }
+                    return Plan::Execute {
+                        command: ProtocolCommand::EnsureConfiguration(Box::new(
+                            failover_configuration_command(
+                                previous,
+                                current,
+                                member,
+                                &transition.effective_policy,
+                                failover_install_operation_id(transition, member),
+                                transition.election_lsn,
+                                AccessStatus::ReconfigurationPending,
+                                false,
+                                Vec::new(),
+                            ),
+                        )),
+                    };
+                }
+            }
+        }
+
+        let pc_cc_reports = union
+            .iter()
+            .filter_map(|member| {
+                let report = healthy_report(snapshot, &member.identity)?;
+                (report.epoch == current.epoch
+                    && report.previous_configuration.as_ref() == Some(previous)
+                    && report.current_configuration.as_ref() == Some(current))
+                .then_some(report)
+            })
+            .collect::<Vec<_>>();
+        if !current_only_started
+            && (!configuration_read_quorum(
+                previous,
+                &pc_cc_reports,
+                transition.effective_policy.read_quorum,
+            ) || !configuration_read_quorum(
+                current,
+                &pc_cc_reports,
+                transition.effective_policy.read_quorum,
+            ))
+        {
+            return Plan::Wait {
+                reason: WaitReason::QuorumLoss,
+                status: waiting_status(
+                    status,
+                    "ElectionEpochReadQuorumPending",
+                    "Eligible replicas must accept the election epoch before candidate selection",
+                ),
+                requeue_after_seconds: config.wait_requeue_seconds,
+            };
+        }
+
+        if !current_only_started {
+            let election_reports = pc_cc_reports
+                .iter()
+                .copied()
+                .filter(|report| {
+                    current
+                        .members
+                        .iter()
+                        .any(|member| member.identity == report.identity)
+                        && report.deactivation_epoch == Some(current.epoch)
+                        && status
+                            .primary_failure
+                            .as_ref()
+                            .is_none_or(|failure| failure.primary != report.identity)
+                })
+                .collect::<Vec<_>>();
+            let Some(candidate) = select_failover_candidate(current, &election_reports) else {
+                return Plan::Wait {
+                    reason: WaitReason::AwaitingStableEvidence,
+                    status: waiting_status(
+                        status,
+                        "ElectionProgressPending",
+                        "Waiting for epoch-fenced progress and deactivation evidence",
+                    ),
+                    requeue_after_seconds: config.wait_requeue_seconds,
+                };
+            };
+            let primary_report = pc_cc_reports
+                .iter()
+                .copied()
+                .find(|report| report.identity == primary.identity);
+            if candidate.identity != primary.identity
+                && primary_report.is_none_or(|report| report.write_status != AccessStatus::Granted)
+            {
+                let corrected = configuration_with_primary(
+                    current,
+                    &candidate.identity,
+                    Epoch::new(
+                        current.epoch.data_loss_number,
+                        current.epoch.configuration_number + 1,
+                    ),
+                );
+                status.transition = Some(TransitionIntent {
+                    transition_id: derive_transition_id(
+                        &snapshot.resource_uid,
+                        TransitionKind::Failover,
+                        &corrected.configuration_id,
+                    ),
+                    kind: TransitionKind::Failover,
+                    spec_generation: transition.spec_generation,
+                    effective_policy: transition.effective_policy.clone(),
+                    previous_configuration_id: transition.previous_configuration_id.clone(),
+                    current_configuration: corrected,
+                    election_lsn: Some(candidate.current_progress),
+                    build_id: transition.build_id.clone(),
+                    repair: None,
+                });
+                return Plan::Apply {
+                    changes: vec![KubernetesChange::PersistStatus {
+                        status: Box::new(waiting_status(
+                            status,
+                            "FailoverCandidateCorrected",
+                            "Allocated a newer epoch for the authoritative progress winner",
+                        )),
+                    }],
+                };
+            }
+
+            let Some(primary_report) = primary_report else {
+                return Plan::Wait {
+                    reason: WaitReason::AwaitingStableEvidence,
+                    status: waiting_status(
+                        status,
+                        "PrimaryElectionEvidencePending",
+                        "The selected primary has not completed its write-closed election command",
+                    ),
+                    requeue_after_seconds: config.wait_requeue_seconds,
+                };
+            };
+            if let Some(plan) = evaluate_failover_repair(
+                snapshot,
+                transition,
+                previous,
+                current,
+                primary,
+                primary_report,
+                &pc_cc_reports,
+                status.clone(),
+                config,
+            ) {
+                return plan;
+            }
+
+            if primary_report.write_status != AccessStatus::Granted
+                || !primary_report.catch_up_complete
+            {
+                return Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(Box::new(
+                        failover_configuration_command(
+                            previous,
+                            current,
+                            primary,
+                            &transition.effective_policy,
+                            OperationId::new(format!(
+                                "{}:grant-write:{}",
+                                transition.transition_id, primary.identity.replica_id
+                            )),
+                            transition.election_lsn,
+                            AccessStatus::Granted,
+                            false,
+                            Vec::new(),
+                        ),
+                    )),
+                };
+            }
+            if !configuration_deactivation_quorum(
+                previous,
+                &pc_cc_reports,
+                transition.effective_policy.read_quorum,
+                current.epoch,
+            ) || !configuration_deactivation_quorum(
+                current,
+                &pc_cc_reports,
+                transition.effective_policy.read_quorum,
+                current.epoch,
+            ) {
+                return Plan::Wait {
+                    reason: WaitReason::ActiveTransition,
+                    status: waiting_status(
+                        status,
+                        "DeactivationQuorumPending",
+                        "Waiting for PC and CC deactivation evidence before current-only activation",
+                    ),
+                    requeue_after_seconds: config.wait_requeue_seconds,
+                };
+            }
+        }
+
+        let retire_build_ids = transition
+            .build_id
+            .iter()
+            .chain(transition.repair.iter().map(|repair| &repair.operation_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for member in &current.members {
+            let Some(report) = healthy_report(snapshot, &member.identity) else {
+                continue;
+            };
+            let operation_id = failover_current_only_operation_id(transition, member);
+            let installed = report.epoch == current.epoch
+                && report.previous_configuration.is_none()
+                && report.current_configuration.as_ref() == Some(current)
+                && report.pending_operation_id.is_none()
+                && report.retained_operation_id.as_ref() == Some(&operation_id);
+            if !installed {
+                return Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(Box::new(
+                        failover_configuration_command(
+                            previous,
+                            current,
+                            member,
+                            &transition.effective_policy,
+                            operation_id,
+                            transition.election_lsn,
+                            if member.identity == primary.identity {
+                                AccessStatus::Granted
+                            } else {
+                                AccessStatus::ReconfigurationPending
+                            },
+                            true,
+                            retire_build_ids.clone(),
+                        ),
+                    )),
+                };
+            }
+        }
+
+        let current_only_reports = current
+            .members
+            .iter()
+            .filter_map(|member| {
+                let report = healthy_report(snapshot, &member.identity)?;
+                (report.epoch == current.epoch
+                    && report.previous_configuration.is_none()
+                    && report.current_configuration.as_ref() == Some(current))
+                .then_some(report)
+            })
+            .collect::<Vec<_>>();
+        let primary_ready = current_only_reports.iter().any(|report| {
+            report.identity == primary.identity && report.write_status == AccessStatus::Granted
+        });
+        if primary_ready && configuration_report_quorum(current, &current_only_reports) {
+            let retired = previous.members.iter().find(|previous_member| {
+                current.members.iter().all(|current_member| {
+                    current_member.identity.replica_id != previous_member.identity.replica_id
+                        || current_member.identity != previous_member.identity
+                })
+            });
+            let mut accepted = clear_evaluator_conditions(snapshot.status.clone());
+            accepted.observed_generation = transition.spec_generation;
+            accepted.topology = Some(AcceptedTopology {
+                configuration: current.clone(),
+            });
+            accepted.transition = None;
+            accepted.primary_failure = None;
+            accepted.quorum_loss = None;
+            accepted = accepted.with_condition(progressing_condition(
+                "FailoverTopologyAccepted",
+                "Accepted the epoch-fenced failover topology",
+            ));
+            let mut changes = vec![KubernetesChange::PersistStatus {
+                status: Box::new(accepted),
+            }];
+            if let Some(retired) = retired {
+                changes.push(KubernetesChange::DeleteReplicaEndpoint {
+                    identity: retired.identity.clone(),
+                });
+            }
+            return Plan::Apply { changes };
+        }
+
+        Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            status,
+            requeue_after_seconds: config.wait_requeue_seconds,
+        }
     }
 
     for member in &transition.current_configuration.members {
@@ -666,7 +1426,9 @@ fn evaluate_transition(
             effective_policy: transition.effective_policy.clone(),
             previous_configuration_id: None,
             current_configuration: current,
+            election_lsn: None,
             build_id: None,
+            repair: None,
         });
         superseded = waiting_status(
             superseded,
@@ -732,7 +1494,7 @@ fn evaluate_transition(
                             member,
                             &transition.effective_policy,
                             bootstrap_install_operation_id(transition, member),
-                            false,
+                            AccessStatus::ReconfigurationPending,
                             false,
                         ),
                     )),
@@ -905,7 +1667,9 @@ fn evaluate_provisioning(
                 effective_policy: policy,
                 previous_configuration_id: Some(topology.configuration_id.clone()),
                 current_configuration: current,
+                election_lsn: None,
                 build_id: Some(provisioning.operation_id.clone()),
+                repair: None,
             });
             transition_status = waiting_status(
                 transition_status,
@@ -1168,6 +1932,368 @@ fn configuration_report_quorum(
         >= configuration.write_quorum as usize
 }
 
+#[allow(clippy::too_many_arguments)]
+fn evaluate_failover_repair(
+    snapshot: &ObservationSnapshot,
+    transition: &TransitionIntent,
+    previous: &ConfigurationDescriptor,
+    current: &ConfigurationDescriptor,
+    primary: &ConfigurationMember,
+    primary_report: &crate::observation::AgentReport,
+    reports: &[&crate::observation::AgentReport],
+    mut status: AcceptedStatus,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    let retained_from = primary_report.catch_up_capability?;
+    let repair = transition.repair.clone().or_else(|| {
+        current
+            .members
+            .iter()
+            .filter(|member| member.identity != primary.identity)
+            .filter_map(|member| {
+                reports
+                    .iter()
+                    .copied()
+                    .find(|report| report.identity == member.identity)
+                    .filter(|report| report.current_progress.saturating_add(1) < retained_from)
+                    .map(|_| ReplicaRepairIntent {
+                        operation_id: derive_failover_repair_operation_id(
+                            &snapshot.resource_uid,
+                            &transition.transition_id,
+                            &member.identity,
+                        ),
+                        target: member.identity.clone(),
+                    })
+            })
+            .next()
+    });
+    let repair = repair?;
+    if transition.repair.is_none() {
+        let mut updated = transition.clone();
+        updated.repair = Some(repair);
+        status.transition = Some(updated);
+        return Some(Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(waiting_status(
+                    status,
+                    "FailoverFullCopyAuthorized",
+                    "Persisted exact full-copy authority for a configured lagging member",
+                )),
+            }],
+        });
+    }
+
+    let target_report = reports
+        .iter()
+        .copied()
+        .find(|report| report.identity == repair.target);
+    let source_complete = primary_report.builds.iter().any(|build| {
+        build.build_id == repair.operation_id
+            && build.target == repair.target
+            && build.completed
+            && build.durable_lsn >= primary_report.current_progress
+    });
+    let target_complete = target_report.is_some_and(|report| {
+        report.builds.iter().any(|build| {
+            build.build_id == repair.operation_id
+                && build.target == repair.target
+                && build.completed
+        })
+    });
+    if !source_complete || !target_complete {
+        return Some(Plan::Execute {
+            command: ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
+                operation_id: repair.operation_id,
+                local_replica_id: primary.identity.replica_id,
+                expected_instance_id: primary.identity.instance_id.clone(),
+                expected_agent_generation: primary.identity.agent_generation.clone(),
+                target: repair.target,
+                authority: None,
+                source_session_id: None,
+            })),
+        });
+    }
+
+    let target = current
+        .members
+        .iter()
+        .find(|member| member.identity == repair.target)
+        .expect("validated failover repair target belongs to Current Configuration");
+    let restored = target_report.is_some_and(|report| {
+        report.role == target.role
+            && report.current_progress >= primary_report.current_progress
+            && report.epoch == current.epoch
+            && report.previous_configuration.as_ref() == Some(previous)
+            && report.current_configuration.as_ref() == Some(current)
+    });
+    if !restored {
+        return Some(Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(Box::new(
+                failover_configuration_command(
+                    previous,
+                    current,
+                    target,
+                    &transition.effective_policy,
+                    OperationId::new(format!(
+                        "{}:post-copy:{}",
+                        transition.transition_id, target.identity.replica_id
+                    )),
+                    transition.election_lsn,
+                    AccessStatus::ReconfigurationPending,
+                    false,
+                    Vec::new(),
+                ),
+            )),
+        });
+    }
+    let _ = config;
+    None
+}
+
+fn replica_failed(snapshot: &ObservationSnapshot, identity: &ReplicaIdentity) -> bool {
+    let Some(observation) = snapshot.observation_for_identity(identity) else {
+        return true;
+    };
+    let agent_healthy = matches!(
+        &observation.agent,
+        AgentObservation::Report(report)
+            if report.healthy && report.reported_fault != Some(crate::types::FaultType::Permanent)
+    );
+    if agent_healthy {
+        return observation
+            .kubernetes
+            .as_ref()
+            .is_some_and(|kubernetes| !kubernetes.pod_ready);
+    }
+    true
+}
+
+fn healthy_report<'a>(
+    snapshot: &'a ObservationSnapshot,
+    identity: &ReplicaIdentity,
+) -> Option<&'a crate::observation::AgentReport> {
+    let observation = snapshot.observation_for_identity(identity)?;
+    if !observation
+        .kubernetes
+        .as_ref()
+        .is_some_and(|kubernetes| kubernetes.pod_ready && kubernetes.peer_endpoint_ready)
+    {
+        return None;
+    }
+    let AgentObservation::Report(report) = &observation.agent else {
+        return None;
+    };
+    (report.healthy && report.reported_fault != Some(crate::types::FaultType::Permanent))
+        .then_some(report.as_ref())
+}
+
+fn configuration_primary(configuration: &ConfigurationDescriptor) -> &ConfigurationMember {
+    configuration
+        .members
+        .iter()
+        .find(|member| {
+            member.identity.replica_id == configuration.primary_id
+                && member.role == ReplicaRole::Primary
+        })
+        .expect("validated configuration has one primary")
+}
+
+fn configuration_union(
+    previous: &ConfigurationDescriptor,
+    current: &ConfigurationDescriptor,
+) -> Vec<ConfigurationMember> {
+    previous
+        .members
+        .iter()
+        .chain(&current.members)
+        .fold(Vec::new(), |mut members, member| {
+            if !members
+                .iter()
+                .any(|existing: &ConfigurationMember| existing.identity == member.identity)
+            {
+                members.push(member.clone());
+            }
+            members
+        })
+}
+
+fn available_union_reports<'a>(
+    snapshot: &'a ObservationSnapshot,
+    previous: &ConfigurationDescriptor,
+    current: &ConfigurationDescriptor,
+) -> Vec<&'a crate::observation::AgentReport> {
+    configuration_union(previous, current)
+        .iter()
+        .filter_map(|member| healthy_report(snapshot, &member.identity))
+        .collect()
+}
+
+fn configuration_read_quorum(
+    configuration: &ConfigurationDescriptor,
+    reports: &[&crate::observation::AgentReport],
+    read_quorum: u32,
+) -> bool {
+    configuration
+        .members
+        .iter()
+        .filter(|member| {
+            reports
+                .iter()
+                .any(|report| report.identity == member.identity)
+        })
+        .count()
+        >= read_quorum as usize
+}
+
+fn configuration_cannot_regain_read_quorum(
+    snapshot: &ObservationSnapshot,
+    configuration: &ConfigurationDescriptor,
+    read_quorum: u32,
+) -> bool {
+    configuration
+        .members
+        .iter()
+        .filter(|member| {
+            !snapshot
+                .observation_for_identity(&member.identity)
+                .is_some_and(|observation| {
+                    matches!(
+                        &observation.agent,
+                        AgentObservation::Report(report)
+                            if report.reported_fault
+                                == Some(crate::types::FaultType::Permanent)
+                    )
+                })
+        })
+        .count()
+        < read_quorum as usize
+}
+
+fn configuration_deactivation_quorum(
+    configuration: &ConfigurationDescriptor,
+    reports: &[&crate::observation::AgentReport],
+    read_quorum: u32,
+    epoch: Epoch,
+) -> bool {
+    configuration
+        .members
+        .iter()
+        .filter(|member| {
+            reports.iter().any(|report| {
+                report.identity == member.identity
+                    && report.deactivation_epoch == Some(epoch)
+                    && report.deactivated_lsn.is_some()
+            })
+        })
+        .count()
+        >= read_quorum as usize
+}
+
+fn select_failover_candidate<'a>(
+    configuration: &ConfigurationDescriptor,
+    reports: &[&'a crate::observation::AgentReport],
+) -> Option<&'a crate::observation::AgentReport> {
+    reports
+        .iter()
+        .copied()
+        .filter(|report| {
+            configuration
+                .members
+                .iter()
+                .any(|member| member.identity == report.identity)
+                && report.write_status != AccessStatus::Granted
+                && (report.role != ReplicaRole::Primary
+                    || report.identity.replica_id == configuration.primary_id)
+        })
+        .max_by(|left, right| {
+            left.deactivation_epoch
+                .unwrap_or_default()
+                .cmp(&right.deactivation_epoch.unwrap_or_default())
+                .then_with(|| {
+                    left.deactivated_lsn
+                        .unwrap_or_default()
+                        .cmp(&right.deactivated_lsn.unwrap_or_default())
+                })
+                .then_with(|| left.current_progress.cmp(&right.current_progress))
+                .then_with(|| left.committed_lsn.cmp(&right.committed_lsn))
+                .then_with(|| right.identity.replica_id.cmp(&left.identity.replica_id))
+        })
+}
+
+fn configuration_with_primary(
+    configuration: &ConfigurationDescriptor,
+    primary: &ReplicaIdentity,
+    epoch: Epoch,
+) -> ConfigurationDescriptor {
+    ConfigurationDescriptor::new(
+        epoch,
+        primary.replica_id,
+        configuration
+            .members
+            .iter()
+            .map(|member| ConfigurationMember {
+                identity: member.identity.clone(),
+                role: if member.identity == *primary {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        configuration.write_quorum,
+    )
+}
+
+fn failover_install_operation_id(
+    transition: &TransitionIntent,
+    member: &ConfigurationMember,
+) -> OperationId {
+    OperationId::new(format!(
+        "{}:election:{}",
+        transition.transition_id, member.identity.replica_id
+    ))
+}
+
+fn failover_current_only_operation_id(
+    transition: &TransitionIntent,
+    member: &ConfigurationMember,
+) -> OperationId {
+    OperationId::new(format!(
+        "{}:current-only:{}",
+        transition.transition_id, member.identity.replica_id
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn failover_configuration_command(
+    previous: &ConfigurationDescriptor,
+    current: &ConfigurationDescriptor,
+    member: &ConfigurationMember,
+    policy: &EffectivePolicy,
+    operation_id: OperationId,
+    failover_safe_lsn: Option<i64>,
+    primary_write_status: AccessStatus,
+    current_only: bool,
+    retire_build_ids: Vec<OperationId>,
+) -> EnsureConfiguration {
+    EnsureConfiguration {
+        operation_id,
+        previous_configuration: (!current_only).then(|| previous.clone()),
+        current_configuration: current.clone(),
+        previous_epoch: (!current_only).then_some(previous.epoch),
+        current_epoch: current.epoch,
+        effective_policy: policy.clone(),
+        local_replica_id: member.identity.replica_id,
+        expected_instance_id: member.identity.instance_id.clone(),
+        expected_agent_generation: member.identity.agent_generation.clone(),
+        transition_kind: TransitionKind::Failover,
+        failover_safe_lsn,
+        primary_write_status,
+        current_only,
+        retire_build_ids,
+    }
+}
+
 fn replacement_install_operation_id(
     transition: &TransitionIntent,
     member: &ConfigurationMember,
@@ -1210,9 +2336,14 @@ fn replacement_configuration_command(
         expected_instance_id: member.identity.instance_id.clone(),
         expected_agent_generation: member.identity.agent_generation.clone(),
         transition_kind: TransitionKind::Replacement,
-        grant_write,
+        failover_safe_lsn: None,
+        primary_write_status: if grant_write {
+            AccessStatus::Granted
+        } else {
+            AccessStatus::ReconfigurationPending
+        },
         current_only,
-        retire_build_id,
+        retire_build_ids: retire_build_id.into_iter().collect(),
     }
 }
 
@@ -1302,7 +2433,7 @@ fn ensure_configuration_command(
     member: &ConfigurationMember,
     policy: &EffectivePolicy,
     operation_id: OperationId,
-    grant_write: bool,
+    primary_write_status: AccessStatus,
     current_only: bool,
 ) -> EnsureConfiguration {
     EnsureConfiguration {
@@ -1316,9 +2447,10 @@ fn ensure_configuration_command(
         expected_instance_id: member.identity.instance_id.clone(),
         expected_agent_generation: member.identity.agent_generation.clone(),
         transition_kind: TransitionKind::Bootstrap,
-        grant_write,
+        failover_safe_lsn: None,
+        primary_write_status,
         current_only,
-        retire_build_id: None,
+        retire_build_ids: Vec::new(),
     }
 }
 

@@ -32,6 +32,136 @@ fn kubectl(kubeconfig: &str, context: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
+fn set_status(kubeconfig: &str, context: &str) -> Result<serde_json::Value> {
+    let status = kubectl(
+        kubeconfig,
+        context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "kubericset",
+            "kvstore2",
+            "-o",
+            "json",
+        ],
+    )?;
+    Ok(serde_json::from_str(&status)?)
+}
+
+fn status_ready(value: &serde_json::Value) -> bool {
+    value["status"]["conditions"]
+        .as_array()
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition["type"] == "Ready" && condition["status"] == "true")
+        })
+}
+
+fn pod_for_replica(kubeconfig: &str, context: &str, replica_id: i64) -> Result<String> {
+    Ok(kubectl(
+        kubeconfig,
+        context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            "-l",
+            &format!("operator.kuberic.io/replica-id={replica_id}"),
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+    )?
+    .trim()
+    .to_string())
+}
+
+fn stop_replica_process(kubeconfig: &str, context: &str, replica_id: i64) -> Result<()> {
+    let pod = pod_for_replica(kubeconfig, context, replica_id)?;
+    let node = kubectl(
+        kubeconfig,
+        context,
+        &[
+            "-n",
+            "default",
+            "get",
+            "pod",
+            &pod,
+            "-o",
+            "jsonpath={.spec.nodeName}",
+        ],
+    )?;
+    let container = Command::new("docker")
+        .args([
+            "exec",
+            node.trim(),
+            "crictl",
+            "ps",
+            "--label",
+            &format!("io.kubernetes.pod.name={pod}"),
+            "-q",
+        ])
+        .output()
+        .context("resolving exact replica container")?;
+    if !container.status.success() {
+        bail!(
+            "cannot resolve replica {replica_id} container: {}",
+            String::from_utf8_lossy(&container.stderr)
+        );
+    }
+    let container_id = String::from_utf8(container.stdout)?;
+    let Some(container_id) = container_id.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(());
+    };
+    let stopped = Command::new("docker")
+        .args(["exec", node.trim(), "crictl", "stop", container_id.trim()])
+        .output()
+        .context("stopping exact replica container")?;
+    if !stopped.status.success() {
+        bail!(
+            "cannot stop replica {replica_id} container: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+    }
+    Ok(())
+}
+
+fn put_from_replica(
+    kubeconfig: &str,
+    context: &str,
+    replica_id: i64,
+    key: &str,
+    value: &str,
+) -> Result<u16> {
+    let pod = pod_for_replica(kubeconfig, context, replica_id)?;
+    let response = kubectl(
+        kubeconfig,
+        context,
+        &[
+            "-n",
+            "default",
+            "exec",
+            &pod,
+            "--",
+            "curl",
+            "--silent",
+            "--show-error",
+            "-X",
+            "PUT",
+            "--data-binary",
+            value,
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("http://127.0.0.1:8080/kv/{key}"),
+        ],
+    )?;
+    Ok(response.trim().parse()?)
+}
+
 #[test]
 #[ignore = "requires an explicitly owned isolated KinD cluster"]
 fn bootstrap_reaches_three_member_topology_and_quorum_write() -> Result<()> {
@@ -625,6 +755,159 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             "write after replacement restart failed ({status}): {body}; {}",
             String::from_utf8_lossy(&after_restart.stderr),
         );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
+    let (kubeconfig, context, _) = cluster_args()?;
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let (old_primary, old_epoch) = loop {
+        let value = set_status(&kubeconfig, &context)?;
+        if status_ready(&value) {
+            let primary = value["status"]["topology"]["primaryId"]
+                .as_i64()
+                .context("ready topology omitted primaryId")?;
+            let epoch = value["status"]["topology"]["epoch"]["configurationNumber"]
+                .as_i64()
+                .context("ready topology omitted configuration epoch")?;
+            break (primary, epoch);
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            bail!("bootstrap did not become ready before failover");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    if put_from_replica(
+        &kubeconfig,
+        &context,
+        old_primary,
+        "failover",
+        "before-failover",
+    )? != 200
+    {
+        bail!("pre-failover quorum write failed");
+    }
+
+    let failover_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let new_primary = loop {
+        stop_replica_process(&kubeconfig, &context, old_primary)?;
+        let value = set_status(&kubeconfig, &context)?;
+        let primary = value["status"]["topology"]["primaryId"].as_i64();
+        let epoch = value["status"]["topology"]["epoch"]["configurationNumber"].as_i64();
+        if status_ready(&value)
+            && primary.is_some_and(|primary| primary != old_primary)
+            && epoch.is_some_and(|epoch| epoch > old_epoch)
+        {
+            break primary.unwrap();
+        }
+        if std::time::Instant::now() >= failover_deadline {
+            bail!("ordinary failover did not select and publish a newer primary");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+
+    let pod = pod_for_replica(&kubeconfig, &context, new_primary)?;
+    let value = kubectl(
+        &kubeconfig,
+        &context,
+        &[
+            "-n",
+            "default",
+            "exec",
+            &pod,
+            "--",
+            "curl",
+            "--fail",
+            "--silent",
+            "http://127.0.0.1:8080/kv/failover",
+        ],
+    )?;
+    if value.trim() != "before-failover" {
+        bail!("committed value was not preserved across failover: {value}");
+    }
+    if put_from_replica(
+        &kubeconfig,
+        &context,
+        new_primary,
+        "failover",
+        "after-failover",
+    )? != 200
+    {
+        bail!("post-failover quorum write failed");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an explicitly owned isolated KinD cluster"]
+fn quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change() -> Result<()> {
+    let (kubeconfig, context, _) = cluster_args()?;
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let (primary, data_loss_number) = loop {
+        let value = set_status(&kubeconfig, &context)?;
+        if status_ready(&value) {
+            break (
+                value["status"]["topology"]["primaryId"]
+                    .as_i64()
+                    .context("ready topology omitted primaryId")?,
+                value["status"]["topology"]["epoch"]["dataLossNumber"]
+                    .as_i64()
+                    .context("ready topology omitted data-loss epoch")?,
+            );
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            bail!("bootstrap did not become ready before quorum-loss test");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    let secondaries = [1_i64, 2, 3]
+        .into_iter()
+        .filter(|replica_id| *replica_id != primary)
+        .collect::<Vec<_>>();
+    let loss_deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        for secondary in &secondaries {
+            stop_replica_process(&kubeconfig, &context, *secondary)?;
+        }
+        let value = set_status(&kubeconfig, &context)?;
+        let no_quorum = value["status"]["conditions"]
+            .as_array()
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
+                    condition["reason"] == "NoWriteQuorum" && condition["status"] != "false"
+                })
+            });
+        if no_quorum {
+            break;
+        }
+        if std::time::Instant::now() >= loss_deadline {
+            bail!("quorum loss did not close primary write access");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if put_from_replica(&kubeconfig, &context, primary, "quorum-loss", "must-fail")? != 503 {
+        bail!("write unexpectedly succeeded without Current Configuration quorum");
+    }
+
+    let recovery_deadline = std::time::Instant::now() + Duration::from_secs(240);
+    loop {
+        let value = set_status(&kubeconfig, &context)?;
+        if status_ready(&value)
+            && value["status"]["topology"]["epoch"]["dataLossNumber"].as_i64()
+                == Some(data_loss_number)
+        {
+            break;
+        }
+        if std::time::Instant::now() >= recovery_deadline {
+            bail!("returning quorum did not restore writes without data loss");
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    if put_from_replica(&kubeconfig, &context, primary, "quorum-loss", "recovered")? != 200 {
+        bail!("write did not recover after quorum returned");
     }
     Ok(())
 }

@@ -80,7 +80,9 @@ fn bootstrap_fixture() -> (
         effective_policy: policy,
         previous_configuration_id: None,
         current_configuration: current,
+        election_lsn: None,
         build_id: None,
+        repair: None,
     };
     (command, observed, transition)
 }

@@ -93,6 +93,18 @@ mod tests {
                 .get("startedAtUnixSeconds")
                 .is_none()
         );
+        assert!(status["properties"].get("primaryFailure").is_some());
+        assert!(status["properties"].get("quorumLoss").is_some());
+        assert!(
+            status["properties"]["transition"]["properties"]
+                .get("repair")
+                .is_some()
+        );
+        assert!(
+            status["properties"]["transition"]["properties"]
+                .get("electionLsn")
+                .is_some()
+        );
     }
 
     #[test]

@@ -1108,10 +1108,14 @@ impl DefaultReplicatorInner {
                 if authority.primary_identity() != &self.identity {
                     return Err(RuntimeError::NotPrimary);
                 }
-                (
-                    BuildAuthorityKind::Provisioning,
-                    authority.current_configuration,
-                )
+                let kind = if authority.transition_kind
+                    == Some(kuberic_protocol::types::TransitionKind::Failover)
+                {
+                    BuildAuthorityKind::Failover
+                } else {
+                    BuildAuthorityKind::Provisioning
+                };
+                (kind, authority.current_configuration)
             }
             BuildConfiguration::Bootstrap(configuration) => {
                 if state.write_status == AccessStatus::Granted {
@@ -2208,6 +2212,38 @@ impl DefaultReplicatorInner {
                 state.authority = Some(authority);
                 state.replication_progress = Some(replication_progress);
             }
+            RuntimeEffectAction::AuthorizeFailoverPrefix(safe_lsn) => {
+                if safe_lsn < 0 {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "failover-safe LSN must not be negative".into(),
+                    ));
+                }
+                let (authority, mut progress) = {
+                    let state = self.state.read().await;
+                    (
+                        state
+                            .authority
+                            .clone()
+                            .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                        state
+                            .replication_progress
+                            .clone()
+                            .ok_or(RuntimeError::AuthorityNotAdmitted)?,
+                    )
+                };
+                let durable = self.storage().await?.durable_progress().await?;
+                progress.verified_lsn =
+                    progress.verified_lsn.max(durable.applied_lsn.min(safe_lsn));
+                if progress.fence != authority.fence() {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "failover-safe prefix belongs to another authority fence".into(),
+                    ));
+                }
+                self.replication_progress_store
+                    .record_replication_progress(&progress)
+                    .await?;
+                self.state.write().await.replication_progress = Some(progress);
+            }
             RuntimeEffectAction::AdmitBuildAuthority(authority) => {
                 let authority = *authority;
                 authority.validate()?;
@@ -2308,6 +2344,9 @@ impl DefaultReplicatorInner {
                     return Err(RuntimeError::ReconfigurationPending);
                 }
                 drop(replicator);
+                if write != AccessStatus::Granted {
+                    self.replicator.lock().await.fence_client_writes();
+                }
                 let mut state = self.state.write().await;
                 state.read_status = read;
                 state.write_status = write;
@@ -2813,6 +2852,12 @@ fn build_handoff_matches(build: &BuildAuthority, authority: &AdmittedAuthority) 
                 .is_some_and(|previous| {
                     previous.configuration_id == build.current_configuration.configuration_id
                 })
+        }
+        BuildAuthorityKind::Failover => {
+            authority.transition_kind == Some(kuberic_protocol::types::TransitionKind::Failover)
+                && authority.previous_configuration.is_some()
+                && authority.current_configuration.configuration_id
+                    == build.current_configuration.configuration_id
         }
     }
 }

@@ -689,6 +689,48 @@ async fn unresolved_routing_is_fenced_before_ready() {
 }
 
 #[tokio::test]
+async fn primary_failure_fences_routing_before_persisting_failover_timing() {
+    let mut observation = stable_observation();
+    observation.pods[0].status.as_mut().unwrap().conditions = Some(vec![PodCondition {
+        last_probe_time: None,
+        last_transition_time: None,
+        message: None,
+        reason: None,
+        status: "False".to_string(),
+        type_: "Ready".to_string(),
+    }]);
+    observation.agents.insert(
+        replica_key(POD_UID),
+        RawAgentObservation::Unavailable {
+            message: "primary unavailable".to_string(),
+        },
+    );
+    let api = Arc::new(InMemoryClusterApi::new(observation));
+    let action = Reconciler::new(api.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap();
+    assert_eq!(action.kind, ReconcileKind::Applied);
+    assert_eq!(
+        api.effects().await.as_slice(),
+        [
+            EffectRecord::RemoveWriteRouting,
+            EffectRecord::ReplaceStatus
+        ]
+    );
+    assert!(
+        api.observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .primary_failure
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn missing_write_service_is_recreated() {
     let mut observation = stable_observation();
     observation

@@ -96,6 +96,8 @@ jobs:
         run: just level-triggered-install
       - name: Run bootstrap scenario
         run: just level-triggered-kind-test bootstrap
+      - name: Run failover scenario
+        run: just level-triggered-kind-test failover
       - name: Collect diagnostics
         if: failure()
         run: just level-triggered-diagnostics

@@ -938,14 +938,52 @@ operation under restored valid primary authority without requiring the
 original client future. Ordinary KV reads consume the independent partition
 ReadStatus and return a retryable denial unless access is Granted.
 
+Phase 8 implements non-destructive ordinary failover and quorum loss.
+`status.primaryFailure` binds the first failure observation to the exact
+accepted primary and persists the frozen-delay start time. Write routing is
+removed before a newer epoch is allocated. `status.quorumLoss` separately
+records loss of the accepted configuration's write quorum; the surviving
+primary publishes `NoWriteQuorum`, fences pending writes, and restores
+`Granted` automatically when the same configuration quorum returns without
+changing the data-loss number.
+
+Failover first preserves the accepted PC and any outstanding replacement CC,
+including its build authority. PC and CC read quorum must remain observable
+before the evaluator persists a newer write-closed election epoch. Reachable
+members durably accept that epoch before their progress is eligible. The
+agent's failover path changes the replicator role and updates the primary
+epoch before GetLSN, then retains exact deactivation epoch and LSN evidence.
+Candidate selection filters and orders this epoch-fenced evidence; changing a
+provisional candidate allocates another configuration epoch rather than
+rewriting same-epoch authority. The transition persists the selected
+`electionLsn`. Each replica durably authorizes only
+`min(localAppliedLsn, electionLsn)` under the new fence, preventing arbitrary
+old suffix credit while allowing the next contiguous operation after
+failover.
+
+The selected runtime Primary remains write-closed while retained-history
+repair runs. If a configured reachable member is behind the selected
+primary's retained range, the transition persists one exact
+`status.transition.repair` authority and performs a full-copy build under the
+failover configuration. PC/CC deactivation quorum, CC catch-up, current-only
+installation, granted primary WriteStatus, and a current quorum are required
+before status accepts and publishes the new topology. A returned stale former
+primary is admitted only as evidence for an exact newer-epoch correction; its
+old epoch cannot receive quorum credit.
+
+The level-triggered control protocol is version 2. `EnsureConfiguration`
+carries the intended primary access state rather than a write-grant boolean,
+allowing `ReconfigurationPending`, `NoWriteQuorum`, and `Granted` to remain
+distinct durable postconditions. Current-only completion can retire every
+build authority carried by replacement plus failover repair.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
 | Contract | Required owner and phase |
 |---|---|
 | Live process-kill reconstruction while an active configuration, replacement, or failover command is between durable stages | Adversarial suite in Phase 9 |
-| Failover, quorum-loss, and destructive-recovery orchestration | Phases 8-9 |
-| Full-copy authorization for a present lagging member when retained primary history cannot close its missing prefix | Phase 8 retained-range/fallback work |
+| Destructive data-loss recovery, PC/CC abandonment, and non-intersecting authority recovery | Explicitly unsupported; requires separate design |
 | Exhaustive active-stage process-kill, listener-shutdown, and partition acceptance tests | Phase 9 |
 | Power-loss proof for provider sync contracts and delayed old bootstrap/build commands | Phase 9 |
 | Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |

@@ -44,9 +44,11 @@ pub struct EnsureConfiguration {
     pub expected_instance_id: ReplicaInstanceId,
     pub expected_agent_generation: AgentGeneration,
     pub transition_kind: crate::types::TransitionKind,
-    pub grant_write: bool,
+    pub failover_safe_lsn: Option<i64>,
+    pub primary_write_status: crate::types::AccessStatus,
     pub current_only: bool,
-    pub retire_build_id: Option<OperationId>,
+    #[serde(default)]
+    pub retire_build_ids: Vec<OperationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -182,7 +182,9 @@ impl InitializationService {
             effective_policy: command.effective_policy.clone(),
             previous_configuration_id: None,
             current_configuration: command.bootstrap_configuration.clone(),
+            election_lsn: None,
             build_id: None,
+            repair: None,
         };
         let authority = command.provisioning.as_ref().map_or(
             InitializationAuthority::Bootstrap(&transition),

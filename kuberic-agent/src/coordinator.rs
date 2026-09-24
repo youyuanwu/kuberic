@@ -114,6 +114,27 @@ where
                         RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
                     )
                     .await?;
+                    let next = if record.command.transition_kind
+                        == kuberic_protocol::types::TransitionKind::Failover
+                    {
+                        CoordinatorStage::FailoverPrefix
+                    } else {
+                        CoordinatorStage::Demote
+                    };
+                    self.advance(&record, next, None).await?;
+                }
+                CoordinatorStage::FailoverPrefix => {
+                    self.execute(
+                        &record,
+                        "failover-prefix",
+                        RuntimeEffectAction::AuthorizeFailoverPrefix(
+                            record
+                                .command
+                                .failover_safe_lsn
+                                .expect("admitted failover command has a safe LSN"),
+                        ),
+                    )
+                    .await?;
                     self.advance(&record, CoordinatorStage::Demote, None)
                         .await?;
                 }
@@ -124,8 +145,14 @@ where
                         RuntimeEffectAction::SetReadStatus(AccessStatus::ReconfigurationPending),
                     )
                     .await?;
-                    self.advance(&record, CoordinatorStage::GetLsn, None)
-                        .await?;
+                    let next = if record.command.transition_kind
+                        == kuberic_protocol::types::TransitionKind::Failover
+                    {
+                        CoordinatorStage::ReplicatorRole
+                    } else {
+                        CoordinatorStage::GetLsn
+                    };
+                    self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::GetLsn => {
                     let result = self
@@ -135,7 +162,17 @@ where
                             RuntimeEffectAction::RefreshApplicationProgress,
                         )
                         .await?;
-                    let next = if state.role == ReplicaRole::Primary
+                    let next = if record.command.transition_kind
+                        == kuberic_protocol::types::TransitionKind::Failover
+                    {
+                        if authority.local_role() == ReplicaRole::Primary
+                            && record.command.primary_write_status == AccessStatus::Granted
+                        {
+                            CoordinatorStage::Catchup
+                        } else {
+                            CoordinatorStage::Deactivate
+                        }
+                    } else if state.role == ReplicaRole::Primary
                         && authority.local_role() != ReplicaRole::Primary
                     {
                         CoordinatorStage::Catchup
@@ -148,7 +185,11 @@ where
                 CoordinatorStage::Catchup => {
                     self.execute(&record, "catchup", RuntimeEffectAction::WaitForCatchup)
                         .await?;
-                    let next = if authority.local_role() == ReplicaRole::Primary {
+                    let next = if record.command.transition_kind
+                        == kuberic_protocol::types::TransitionKind::Failover
+                    {
+                        CoordinatorStage::Deactivate
+                    } else if authority.local_role() == ReplicaRole::Primary {
                         CoordinatorStage::Activate
                     } else {
                         CoordinatorStage::Deactivate
@@ -162,8 +203,14 @@ where
                         RuntimeEffectAction::SetWriteStatus(AccessStatus::ReconfigurationPending),
                     )
                     .await?;
-                    self.advance(&record, CoordinatorStage::ReplicatorRole, None)
-                        .await?;
+                    let next = if record.command.transition_kind
+                        == kuberic_protocol::types::TransitionKind::Failover
+                    {
+                        CoordinatorStage::Activate
+                    } else {
+                        CoordinatorStage::ReplicatorRole
+                    };
+                    self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::ReplicatorRole => {
                     self.execute(
@@ -192,8 +239,12 @@ where
                         RuntimeEffectAction::ChangeApplicationRole(authority.local_role()),
                     )
                     .await?;
-                    let next = if authority.local_role() == ReplicaRole::Primary
-                        && record.command.grant_write
+                    let next = if record.command.transition_kind
+                        == kuberic_protocol::types::TransitionKind::Failover
+                    {
+                        CoordinatorStage::GetLsn
+                    } else if authority.local_role() == ReplicaRole::Primary
+                        && record.command.primary_write_status == AccessStatus::Granted
                     {
                         CoordinatorStage::Catchup
                     } else {
@@ -202,7 +253,14 @@ where
                     self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::Activate => {
-                    let read_status = if matches!(
+                    let provisional_failover_primary = authority.local_role()
+                        == ReplicaRole::Primary
+                        && record.command.transition_kind
+                            == kuberic_protocol::types::TransitionKind::Failover
+                        && record.command.primary_write_status != AccessStatus::Granted;
+                    let read_status = if provisional_failover_primary {
+                        AccessStatus::ReconfigurationPending
+                    } else if matches!(
                         authority.local_role(),
                         ReplicaRole::Primary | ReplicaRole::ActiveSecondary
                     ) {
@@ -210,12 +268,8 @@ where
                     } else {
                         AccessStatus::NotPrimary
                     };
-                    let write_status = if authority.local_role() == ReplicaRole::Primary
-                        && record.command.grant_write
-                    {
-                        AccessStatus::Granted
-                    } else if authority.local_role() == ReplicaRole::Primary {
-                        AccessStatus::ReconfigurationPending
+                    let write_status = if authority.local_role() == ReplicaRole::Primary {
+                        record.command.primary_write_status
                     } else {
                         AccessStatus::NotPrimary
                     };
@@ -228,7 +282,7 @@ where
                         },
                     )
                     .await?;
-                    let next = if record.command.retire_build_id.is_some() {
+                    let next = if !record.command.retire_build_ids.is_empty() {
                         CoordinatorStage::RetireBuild
                     } else {
                         CoordinatorStage::Complete
@@ -236,17 +290,14 @@ where
                     self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::RetireBuild => {
-                    let build_id = record
-                        .command
-                        .retire_build_id
-                        .clone()
-                        .expect("retire-build stage requires build ID");
-                    self.execute(
-                        &record,
-                        "retire-build",
-                        RuntimeEffectAction::RetireBuild(build_id),
-                    )
-                    .await?;
+                    for (index, build_id) in record.command.retire_build_ids.iter().enumerate() {
+                        self.execute(
+                            &record,
+                            &format!("retire-build-{index}"),
+                            RuntimeEffectAction::RetireBuild(build_id.clone()),
+                        )
+                        .await?;
+                    }
                     self.advance(&record, CoordinatorStage::Complete, None)
                         .await?;
                 }

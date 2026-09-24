@@ -61,6 +61,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         let stage = match &effect.action {
             RuntimeEffectAction::AdmitAuthority(_) => "admit",
+            RuntimeEffectAction::AuthorizeFailoverPrefix(_) => "failover-prefix",
             RuntimeEffectAction::SetReadStatus(_) => "read",
             RuntimeEffectAction::SetAccessStatus { .. } => "access",
             RuntimeEffectAction::RefreshApplicationProgress => "get-lsn",
@@ -87,6 +88,9 @@ impl RuntimeEffectExecutor for FakeRuntime {
                 state.authority = Some(*authority);
                 state.read_status = AccessStatus::ReconfigurationPending;
                 state.write_status = AccessStatus::ReconfigurationPending;
+            }
+            RuntimeEffectAction::AuthorizeFailoverPrefix(lsn) => {
+                state.verified_replication_lsn = Some(lsn);
             }
             RuntimeEffectAction::SetReadStatus(status) => state.read_status = status,
             RuntimeEffectAction::SetAccessStatus { read, write } => {
@@ -201,15 +205,16 @@ fn command(operation_id: &str, epoch: Epoch) -> EnsureConfiguration {
         expected_instance_id: local.instance_id,
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Bootstrap,
-        grant_write: false,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
-        retire_build_id: None,
+        retire_build_ids: Vec::new(),
     }
 }
 
 fn grant_command(operation_id: &str, epoch: Epoch) -> EnsureConfiguration {
     EnsureConfiguration {
-        grant_write: true,
+        primary_write_status: AccessStatus::Granted,
         ..command(operation_id, epoch)
     }
 }
@@ -294,6 +299,129 @@ async fn coordinator_converges_duplicates_and_retains_terminal_result() {
     assert!(state.reconfiguration.is_none());
     assert_eq!(state.read_status, AccessStatus::Granted);
     assert_eq!(state.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let local = identity();
+    let second = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: AgentGeneration::new("generation-2"),
+    };
+    let third = ReplicaIdentity {
+        replica_id: ReplicaId::new(3),
+        instance_id: ReplicaInstanceId::new("pod-3"),
+        agent_generation: AgentGeneration::new("generation-3"),
+    };
+    let policy = EffectivePolicy::fixed(3, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        second.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: second.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: third.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        local.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: second,
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: third,
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        policy.write_quorum,
+    );
+    let mut durable = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("resource-1"),
+        pod_uid: PodUid::new("pod-1"),
+        pvc_uid: PvcUid::new("pvc-1"),
+        initialization_id: InitializationId::new("init-1"),
+        local_identity: local.clone(),
+        effective_policy: policy.clone(),
+    });
+    durable.highest_epoch = previous.epoch;
+    durable.current_configuration = Some(previous.clone());
+    durable.role = ReplicaRole::ActiveSecondary;
+    durable.read_status = AccessStatus::Granted;
+    durable.write_status = AccessStatus::NotPrimary;
+    let store = Arc::new(SqliteStore::create_authorized(path, durable).unwrap());
+    let runtime = Arc::new(FakeRuntime::new());
+    {
+        let mut state = runtime.state.lock().unwrap();
+        state.role = ReplicaRole::ActiveSecondary;
+        state.read_status = AccessStatus::Granted;
+        state.write_status = AccessStatus::NotPrimary;
+        state.authority = Some(AdmittedAuthority {
+            local_identity: local.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: previous.clone(),
+        });
+    }
+    let coordinator = Coordinator::new(store.clone(), runtime.clone());
+    coordinator
+        .ensure_configuration(EnsureConfiguration {
+            operation_id: OperationId::new("failover-no-quorum"),
+            previous_configuration: Some(previous.clone()),
+            current_configuration: current.clone(),
+            previous_epoch: Some(previous.epoch),
+            current_epoch: current.epoch,
+            effective_policy: policy,
+            local_replica_id: local.replica_id,
+            expected_instance_id: local.instance_id,
+            expected_agent_generation: local.agent_generation,
+            transition_kind: TransitionKind::Failover,
+            failover_safe_lsn: Some(7),
+            primary_write_status: AccessStatus::NoWriteQuorum,
+            current_only: false,
+            retire_build_ids: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let calls = runtime.calls.lock().unwrap().clone();
+    let admit = calls.iter().position(|stage| *stage == "admit").unwrap();
+    let prefix = calls
+        .iter()
+        .position(|stage| *stage == "failover-prefix")
+        .unwrap();
+    let epoch = calls.iter().position(|stage| *stage == "epoch").unwrap();
+    let get_lsn = calls.iter().position(|stage| *stage == "get-lsn").unwrap();
+    assert!(admit < prefix && prefix < epoch && epoch < get_lsn);
+    let state = store.load_state().await.unwrap();
+    assert_eq!(state.highest_epoch, current.epoch);
+    assert_eq!(state.role, ReplicaRole::Primary);
+    assert_eq!(state.read_status, AccessStatus::ReconfigurationPending);
+    assert_eq!(state.write_status, AccessStatus::NoWriteQuorum);
+    assert_eq!(
+        state.deactivation.as_ref().map(|value| value.epoch),
+        Some(current.epoch)
+    );
 }
 
 #[tokio::test]
@@ -530,9 +658,10 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
         expected_instance_id: local.instance_id,
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Replacement,
-        grant_write: false,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: true,
-        retire_build_id: Some(OperationId::new("replacement-build")),
+        retire_build_ids: vec![OperationId::new("replacement-build")],
     };
     runtime.fail_once("read");
     let coordinator = Coordinator::new(store.clone(), runtime.clone());
@@ -610,9 +739,10 @@ fn same_epoch_new_operation_cannot_replace_durable_membership() {
         expected_instance_id: local.instance_id,
         expected_agent_generation: local.agent_generation,
         transition_kind: TransitionKind::Bootstrap,
-        grant_write: false,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
-        retire_build_id: None,
+        retire_build_ids: Vec::new(),
     };
     assert!(matches!(
         admit_configuration(&command, &state),

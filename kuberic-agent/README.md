@@ -40,6 +40,11 @@ Previous/Current-to-current-only completion of one admitted transition.
 Changed primary authority remains access-closed until provider epoch and
 catch-up postconditions complete. Catch-up waits permit ACK progress, and
 matching commands are serialized and revalidated at each durable stage.
+Failover commands update the selected primary epoch before GetLSN, retain
+deactivation epoch/LSN evidence, durably authorize only the elected safe
+prefix under the new fence, and can publish `NoWriteQuorum` independently from
+role. Configured lagging members may receive an explicitly authorized
+full-copy build before current-only completion.
 
 Serving starts fail-closed listeners before reconstructing live hosting from
 durable authority, role, access, pending effects, and retained stage evidence.
@@ -51,8 +56,7 @@ Dropping a returned copy stream cancels blocked provider iteration and releases
 the build. Reports retry until durable authority and live progress form one
 compatible snapshot and carry deactivation epoch with its LSN.
 
-The Phase 5 controller remains responsible for selecting configurations,
+The controller remains responsible for selecting configurations,
 re-observing command postconditions, routing fences, and distributing
 deployment authentication material. Concrete outbound peer dialing is wired
-through the agent's `OutboundDispatcher` contract by the later vertical-slice
-phase.
+through the agent's `OutboundDispatcher` contract.

@@ -1525,11 +1525,30 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
         expected_instance_id: command.expected_instance_id.to_string(),
         expected_agent_generation: command.expected_agent_generation.to_string(),
         transition_kind: transition_kind(command.transition_kind) as i32,
-        grant_write: command.grant_write,
+        grant_write: command.primary_write_status == kuberic_protocol::types::AccessStatus::Granted,
         current_only: command.current_only,
         retire_build_id: command
-            .retire_build_id
-            .map_or_else(String::new, |build_id| build_id.to_string()),
+            .retire_build_ids
+            .first()
+            .map_or_else(String::new, ToString::to_string),
+        primary_write_status: match command.primary_write_status {
+            kuberic_protocol::types::AccessStatus::Granted => proto::AccessStatus::Granted as i32,
+            kuberic_protocol::types::AccessStatus::ReconfigurationPending => {
+                proto::AccessStatus::ReconfigurationPending as i32
+            }
+            kuberic_protocol::types::AccessStatus::NotPrimary => {
+                proto::AccessStatus::NotPrimary as i32
+            }
+            kuberic_protocol::types::AccessStatus::NoWriteQuorum => {
+                proto::AccessStatus::NoWriteQuorum as i32
+            }
+        },
+        retire_build_ids: command
+            .retire_build_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        failover_safe_lsn: command.failover_safe_lsn,
     }
 }
 

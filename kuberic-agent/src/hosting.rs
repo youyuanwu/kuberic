@@ -235,13 +235,19 @@ impl PodRuntime {
         }
         let snapshot = self.snapshot().await;
         let (kind, current_configuration) = match configuration {
-            BuildConfiguration::Current => (
-                BuildAuthorityKind::Provisioning,
-                snapshot
+            BuildConfiguration::Current => {
+                let authority = snapshot
                     .authority
-                    .ok_or(RuntimeError::AuthorityNotAdmitted)?
-                    .current_configuration,
-            ),
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let kind = if authority.transition_kind
+                    == Some(kuberic_protocol::types::TransitionKind::Failover)
+                {
+                    BuildAuthorityKind::Failover
+                } else {
+                    BuildAuthorityKind::Provisioning
+                };
+                (kind, authority.current_configuration)
+            }
             BuildConfiguration::Bootstrap(configuration) => {
                 (BuildAuthorityKind::Bootstrap, configuration)
             }
@@ -1045,6 +1051,7 @@ impl RuntimeHost {
                 state.fallback_snapshot.committed_lsn = committed;
             }
             RuntimeEffectAction::AdmitAuthority(_)
+            | RuntimeEffectAction::AuthorizeFailoverPrefix(_)
             | RuntimeEffectAction::AdmitBuildAuthority(_)
             | RuntimeEffectAction::WaitForCatchup
             | RuntimeEffectAction::BuildReplica { .. }

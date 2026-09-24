@@ -14,6 +14,8 @@ pub enum WaitReason {
     AwaitingStableEvidence,
     AwaitingAgentInitialization,
     UnsupportedSpecDuringTransition,
+    FailoverDelay,
+    QuorumLoss,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

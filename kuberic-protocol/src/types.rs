@@ -323,6 +323,7 @@ impl ProvisioningIntent {
 pub enum BuildAuthorityKind {
     Bootstrap,
     Provisioning,
+    Failover,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -357,7 +358,7 @@ impl BuildAuthority {
             .iter()
             .find(|member| member.identity == self.target);
         match self.kind {
-            BuildAuthorityKind::Bootstrap => {
+            BuildAuthorityKind::Bootstrap | BuildAuthorityKind::Failover => {
                 if target_member.is_none_or(|member| member.role == ReplicaRole::Primary) {
                     return Err(crate::validation::ValidationError::InvalidBootstrapBuildTarget);
                 }
@@ -407,7 +408,32 @@ pub struct TransitionIntent {
     pub previous_configuration_id: Option<ConfigurationId>,
     pub current_configuration: ConfigurationDescriptor,
     #[serde(default)]
+    pub election_lsn: Option<i64>,
+    #[serde(default)]
     pub build_id: Option<OperationId>,
+    #[serde(default)]
+    pub repair: Option<ReplicaRepairIntent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaRepairIntent {
+    pub operation_id: OperationId,
+    pub target: ReplicaIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimaryFailureObservation {
+    pub primary: ReplicaIdentity,
+    pub started_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct QuorumLossObservation {
+    pub configuration_id: ConfigurationId,
+    pub started_at_unix_seconds: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -438,6 +464,10 @@ pub struct AcceptedStatus {
     pub topology: Option<AcceptedTopology>,
     pub provisioning: Option<ProvisioningIntent>,
     pub transition: Option<TransitionIntent>,
+    #[serde(default)]
+    pub primary_failure: Option<PrimaryFailureObservation>,
+    #[serde(default)]
+    pub quorum_loss: Option<QuorumLossObservation>,
     pub conditions: Vec<StatusCondition>,
 }
 
@@ -502,6 +532,23 @@ pub fn derive_replacement_operation_id(
             &replacing.replica_id.to_string(),
             replacing.instance_id.as_str(),
             replacing.agent_generation.as_str(),
+        ])
+    ))
+}
+
+pub fn derive_failover_repair_operation_id(
+    resource_uid: &ResourceUid,
+    transition_id: &TransitionId,
+    target: &ReplicaIdentity,
+) -> OperationId {
+    OperationId::new(format!(
+        "failover-repair-{}",
+        digest_parts(&[
+            resource_uid.as_str(),
+            transition_id.as_str(),
+            &target.replica_id.to_string(),
+            target.instance_id.as_str(),
+            target.agent_generation.as_str(),
         ])
     ))
 }

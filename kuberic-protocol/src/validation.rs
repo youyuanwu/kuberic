@@ -65,6 +65,12 @@ pub enum ValidationError {
     TransitionLogicalMembershipChanged,
     #[error("failover must preserve exact membership")]
     FailoverMembershipChanged,
+    #[error("failover carrying replacement membership must retain its build authority")]
+    FailoverReplacementWithoutBuild,
+    #[error("failover repair target must be an exact non-primary Current Configuration member")]
+    InvalidFailoverRepairTarget,
+    #[error("failover requires a non-negative election-safe LSN")]
+    InvalidFailoverElectionLsn,
     #[error("replacement must change exactly one non-primary incarnation")]
     InvalidReplacementMembership,
     #[error("replacement must preserve the accepted primary")]
@@ -136,6 +142,10 @@ pub enum ValidationError {
     BootstrapReportHasPreviousConfiguration(i64),
     #[error("replica {0} reports a Previous Configuration that differs from frozen authority")]
     ReportedPreviousConfigurationMismatch(i64),
+    #[error("primary failure observation does not match the accepted primary")]
+    PrimaryFailureMismatch,
+    #[error("quorum-loss observation does not match the accepted configuration")]
+    QuorumLossMismatch,
 }
 
 /// Validates accepted status and every observed exact replica incarnation.
@@ -521,11 +531,7 @@ fn validate_report_authority(
             .iter()
             .find(|member| member.identity == report.identity)
             .expect("accepted exact identity has a member");
-        if snapshot.status.transition.is_none()
-            && accepted_member.role != ReplicaRole::Primary
-            && report.role != ReplicaRole::Primary
-            && report.write_status != AccessStatus::Granted
-        {
+        if snapshot.status.transition.is_none() && accepted_member.role != ReplicaRole::Primary {
             return Ok(());
         }
         return Err(ValidationError::StaleReplicaEpoch {
@@ -603,6 +609,28 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     if let Some(topology) = &status.topology {
         validate_configuration(&topology.configuration, status.effective_policy.as_ref())?;
     }
+    if let Some(failure) = &status.primary_failure {
+        let primary =
+            status
+                .topology
+                .as_ref()
+                .and_then(|topology| {
+                    topology.configuration.members.iter().find(|member| {
+                        member.identity.replica_id == topology.configuration.primary_id
+                    })
+                })
+                .ok_or(ValidationError::PrimaryFailureMismatch)?;
+        if failure.primary != primary.identity {
+            return Err(ValidationError::PrimaryFailureMismatch);
+        }
+    }
+    if let Some(quorum_loss) = &status.quorum_loss
+        && status.topology.as_ref().is_none_or(|topology| {
+            topology.configuration.configuration_id != quorum_loss.configuration_id
+        })
+    {
+        return Err(ValidationError::QuorumLossMismatch);
+    }
     if let Some(transition) = &status.transition {
         validate_policy(&transition.effective_policy)?;
         validate_configuration(
@@ -616,6 +644,12 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 }
                 if transition.build_id.is_some() {
                     return Err(ValidationError::InvalidReplacementMembership);
+                }
+                if transition.repair.is_some() {
+                    return Err(ValidationError::InvalidFailoverRepairTarget);
+                }
+                if transition.election_lsn.is_some() {
+                    return Err(ValidationError::InvalidFailoverElectionLsn);
                 }
                 if status.topology.is_some() {
                     return Err(ValidationError::BootstrapHasTopology);
@@ -650,8 +684,37 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 if transition.kind == TransitionKind::Replacement && transition.build_id.is_none() {
                     return Err(ValidationError::InvalidReplacementMembership);
                 }
-                if transition.kind == TransitionKind::Failover && transition.build_id.is_some() {
-                    return Err(ValidationError::FailoverMembershipChanged);
+                if transition.kind == TransitionKind::Replacement && transition.repair.is_some() {
+                    return Err(ValidationError::InvalidFailoverRepairTarget);
+                }
+                if transition.kind == TransitionKind::Replacement
+                    && transition.election_lsn.is_some()
+                {
+                    return Err(ValidationError::InvalidFailoverElectionLsn);
+                }
+                if transition.kind == TransitionKind::Failover {
+                    if transition.election_lsn.is_none_or(|lsn| lsn < 0) {
+                        return Err(ValidationError::InvalidFailoverElectionLsn);
+                    }
+                    let exact_membership_changed = exact_identities(&topology.configuration)
+                        != exact_identities(&transition.current_configuration);
+                    if exact_membership_changed && transition.build_id.is_none() {
+                        return Err(ValidationError::FailoverReplacementWithoutBuild);
+                    }
+                    if let Some(repair) = &transition.repair {
+                        let valid_target =
+                            transition
+                                .current_configuration
+                                .members
+                                .iter()
+                                .any(|member| {
+                                    member.identity == repair.target
+                                        && member.role != ReplicaRole::Primary
+                                });
+                        if !valid_target {
+                            return Err(ValidationError::InvalidFailoverRepairTarget);
+                        }
+                    }
                 }
             }
         }
@@ -711,10 +774,13 @@ pub fn validate_transition_relationship(
                 .iter()
                 .map(|member| member.identity.clone())
                 .collect::<BTreeSet<_>>();
-            if previous_identities != current_identities {
+            if previous_identities != current_identities
+                && !valid_single_non_primary_incarnation_change(previous, current)
+            {
                 return Err(ValidationError::FailoverMembershipChanged);
             }
         }
+
         TransitionKind::Replacement => {
             if current.primary_id != previous.primary_id {
                 return Err(ValidationError::ReplacementPrimaryChanged);
@@ -741,6 +807,34 @@ pub fn validate_transition_relationship(
         }
     }
     Ok(())
+}
+
+fn exact_identities(configuration: &ConfigurationDescriptor) -> BTreeSet<ReplicaIdentity> {
+    configuration
+        .members
+        .iter()
+        .map(|member| member.identity.clone())
+        .collect()
+}
+
+fn valid_single_non_primary_incarnation_change(
+    previous: &ConfigurationDescriptor,
+    current: &ConfigurationDescriptor,
+) -> bool {
+    let changed = previous
+        .members
+        .iter()
+        .filter(|previous_member| {
+            current
+                .members
+                .iter()
+                .find(|current_member| {
+                    current_member.identity.replica_id == previous_member.identity.replica_id
+                })
+                .is_none_or(|current_member| current_member.identity != previous_member.identity)
+        })
+        .collect::<Vec<_>>();
+    changed.len() == 1 && changed[0].identity.replica_id != previous.primary_id
 }
 
 /// Validates one canonical configuration independently.

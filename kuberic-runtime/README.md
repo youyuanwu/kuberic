@@ -60,6 +60,12 @@ Services can observe `partition.get_write_status()`; custom factories receive
 the same access gate through `ReplicatorFactoryContext::write_status`.
 Custom implementations must honor that gate rather than infer write access
 from the Primary role.
+The built-in engine fences pending writes whenever access changes away from
+`Granted`, including `NoWriteQuorum`, while preserving the admitted epoch and
+configuration so returning quorum can restore access non-destructively.
+During failover it records only the controller-selected election-safe prefix
+under the new authority fence; a replica cannot reuse an arbitrary
+previous-epoch suffix as verified progress.
 
 `ReplicatorFactoryContext` exposes stable identity and partition-access
 capabilities, not a concrete runtime or default-engine pointer. Application

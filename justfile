@@ -136,16 +136,20 @@ level-triggered-install: verify-kind-context
     kubectl --kubeconfig "{{ kubeconfig }}" --context "{{ cluster_context }}" \
         apply -f examples/kvstore2/deploy/sample.yaml
 
-# Run one explicit isolated level-triggered KinD scenario.
-level-triggered-kind-test scenario: verify-kind-context
+# Run one or more explicit isolated level-triggered KinD scenarios.
+level-triggered-kind-test *scenarios: verify-kind-context
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{ scenario }}" in
-      bootstrap) test_name="level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write" ;;
-      replacement) test_name="level_triggered_k8s::replacement_preserves_quorum_write_and_retires_old_incarnation" ;;
-      *) echo "unknown level-triggered scenario: {{ scenario }}" >&2; exit 2 ;;
-    esac
-    cargo test -p kuberic-level-tests "$test_name" -- --ignored --exact --nocapture
+    for scenario in {{ scenarios }}; do
+      case "$scenario" in
+        bootstrap) test_name="level_triggered_k8s::bootstrap_reaches_three_member_topology_and_quorum_write" ;;
+        replacement) test_name="level_triggered_k8s::replacement_preserves_quorum_write_and_retires_old_incarnation" ;;
+        failover) test_name="level_triggered_k8s::failover_fences_old_primary_and_preserves_committed_data" ;;
+        quorum-loss) test_name="level_triggered_k8s::quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change" ;;
+        *) echo "unknown level-triggered scenario: $scenario" >&2; exit 2 ;;
+      esac
+      cargo test -p kuberic-level-tests "$test_name" -- --ignored --exact --nocapture
+    done
 
 # Collect level-triggered controller, resource, and replica diagnostics.
 level-triggered-diagnostics: verify-kind-context

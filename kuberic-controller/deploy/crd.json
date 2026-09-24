@@ -139,6 +139,41 @@
                     "minimum": 0.0,
                     "type": "integer"
                   },
+                  "primaryFailure": {
+                    "nullable": true,
+                    "properties": {
+                      "primary": {
+                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                        "properties": {
+                          "agentGeneration": {
+                            "type": "string"
+                          },
+                          "instanceId": {
+                            "type": "string"
+                          },
+                          "replicaId": {
+                            "format": "int64",
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "agentGeneration",
+                          "instanceId",
+                          "replicaId"
+                        ],
+                        "type": "object"
+                      },
+                      "startedAtUnixSeconds": {
+                        "format": "int64",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "primary",
+                      "startedAtUnixSeconds"
+                    ],
+                    "type": "object"
+                  },
                   "provisioning": {
                     "description": "Compact intent for one fresh replica that has not entered PC or CC.",
                     "nullable": true,
@@ -179,6 +214,23 @@
                       "podUid",
                       "pvcUid",
                       "replaces"
+                    ],
+                    "type": "object"
+                  },
+                  "quorumLoss": {
+                    "nullable": true,
+                    "properties": {
+                      "configurationId": {
+                        "type": "string"
+                      },
+                      "startedAtUnixSeconds": {
+                        "format": "int64",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "configurationId",
+                      "startedAtUnixSeconds"
                     ],
                     "type": "object"
                   },
@@ -395,6 +447,11 @@
                         ],
                         "type": "object"
                       },
+                      "electionLsn": {
+                        "format": "int64",
+                        "nullable": true,
+                        "type": "integer"
+                      },
                       "kind": {
                         "description": "Supported authority-changing transition.",
                         "enum": [
@@ -407,6 +464,40 @@
                       "previousConfigurationId": {
                         "nullable": true,
                         "type": "string"
+                      },
+                      "repair": {
+                        "nullable": true,
+                        "properties": {
+                          "operationId": {
+                            "type": "string"
+                          },
+                          "target": {
+                            "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                            "properties": {
+                              "agentGeneration": {
+                                "type": "string"
+                              },
+                              "instanceId": {
+                                "type": "string"
+                              },
+                              "replicaId": {
+                                "format": "int64",
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "agentGeneration",
+                              "instanceId",
+                              "replicaId"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "operationId",
+                          "target"
+                        ],
+                        "type": "object"
                       },
                       "specGeneration": {
                         "format": "uint64",

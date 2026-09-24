@@ -147,6 +147,7 @@ enum BuildAuthorityKind {
   BUILD_AUTHORITY_KIND_UNSPECIFIED = 0;
   BUILD_AUTHORITY_KIND_BOOTSTRAP = 1;
   BUILD_AUTHORITY_KIND_PROVISIONING = 2;
+  BUILD_AUTHORITY_KIND_FAILOVER = 3;
 }
 
 message BuildAuthority {
@@ -172,6 +173,9 @@ message EnsureConfigurationCommand {
   bool grant_write = 11;
   bool current_only = 12;
   string retire_build_id = 13;
+  AccessStatus primary_write_status = 14;
+  repeated string retire_build_ids = 15;
+  optional int64 failover_safe_lsn = 16;
 }
 
 message EnsureReplicaBuildCommand {

@@ -30,6 +30,7 @@ pub struct RuntimeEffect {
 pub enum RuntimeEffectAction {
     Open(OpenMode),
     AdmitAuthority(Box<AdmittedAuthority>),
+    AuthorizeFailoverPrefix(i64),
     AdmitBuildAuthority(Box<BuildAuthority>),
     ChangeRole(ReplicaRole),
     ChangeReplicatorRole(ReplicaRole),

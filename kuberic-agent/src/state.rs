@@ -55,6 +55,7 @@ pub struct RetainedResult {
 #[serde(rename_all = "camelCase")]
 pub enum CoordinatorStage {
     AdmitAuthority,
+    FailoverPrefix,
     Demote,
     GetLsn,
     Catchup,

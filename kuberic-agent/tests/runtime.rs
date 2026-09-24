@@ -2485,6 +2485,27 @@ async fn direct_writes_require_primary_role_and_explicit_write_grant() {
         1
     );
     assert_eq!(pending.committed().await.unwrap().committed_lsn, 1);
+
+    runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::NoWriteQuorum,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("no-quorum"),
+                data: Bytes::from_static(b"no-quorum"),
+            })
+            .await,
+        Err(RuntimeError::WriteClosed(AccessStatus::NoWriteQuorum))
+    ));
 }
 
 #[tokio::test]
@@ -3131,6 +3152,11 @@ async fn failover_does_not_inherit_previous_primary_verification_credit() {
         .await
         .unwrap();
     assert_eq!(runtime.snapshot().await.verified_replication_lsn, Some(0));
+    runtime
+        .apply_effect(effect(3, RuntimeEffectAction::AuthorizeFailoverPrefix(1)))
+        .await
+        .unwrap();
+    assert_eq!(runtime.snapshot().await.verified_replication_lsn, Some(1));
 }
 
 fn retry_item(

@@ -107,8 +107,25 @@ fn admit_configuration_with_replay(
             "command policy differs from initialized policy".into(),
         ));
     }
-    let replacement_primary_grant = command.transition_kind == TransitionKind::Replacement
-        && !command.current_only
+    match command.transition_kind {
+        TransitionKind::Failover if command.failover_safe_lsn.is_none_or(|lsn| lsn < 0) => {
+            return Err(AgentError::CommandRejected(
+                "failover command requires a non-negative election-safe LSN".into(),
+            ));
+        }
+        TransitionKind::Bootstrap | TransitionKind::Replacement
+            if command.failover_safe_lsn.is_some() =>
+        {
+            return Err(AgentError::CommandRejected(
+                "only failover authority can carry an election-safe LSN".into(),
+            ));
+        }
+        _ => {}
+    }
+    let transition_primary_grant = matches!(
+        command.transition_kind,
+        TransitionKind::Replacement | TransitionKind::Failover
+    ) && !command.current_only
         && state.current_configuration.as_ref() == command.previous_configuration.as_ref()
         && command.current_configuration.primary_id == identity.replica_id
         && command
@@ -119,7 +136,10 @@ fn admit_configuration_with_replay(
     let installed_primary_grant = state.current_configuration.as_ref()
         == Some(&command.current_configuration)
         && state.role == ReplicaRole::Primary;
-    if command.grant_write && !replacement_primary_grant && !installed_primary_grant {
+    if command.primary_write_status == kuberic_protocol::types::AccessStatus::Granted
+        && !transition_primary_grant
+        && !installed_primary_grant
+    {
         return Err(AgentError::CommandRejected(
             "write grant requires the exact installed primary authority".into(),
         ));
@@ -134,14 +154,14 @@ fn admit_configuration_with_replay(
             ));
         }
         if command.transition_kind == TransitionKind::Replacement
-            && command.retire_build_id.is_none()
+            && command.retire_build_ids.is_empty()
         {
             return Err(AgentError::CommandRejected(
                 "replacement current-only completion must retire its build".into(),
             ));
         }
     } else {
-        if command.retire_build_id.is_some() {
+        if !command.retire_build_ids.is_empty() {
             return Err(AgentError::CommandRejected(
                 "build retirement is valid only for current-only completion".into(),
             ));

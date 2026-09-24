@@ -577,13 +577,14 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 }
                 if transition_kind == TransitionKind::Replacement
                     && command.retire_build_id.is_empty()
+                    && command.retire_build_ids.is_empty()
                 {
                     return Err(WireError::InvalidAuthority(
                         "replacement current-only completion must retire its build".to_string(),
                     ));
                 }
             } else {
-                if !command.retire_build_id.is_empty() {
+                if !command.retire_build_id.is_empty() || !command.retire_build_ids.is_empty() {
                     return Err(WireError::InvalidAuthority(
                         "build retirement requires current-only completion".to_string(),
                     ));
@@ -725,10 +726,36 @@ pub fn normalize_execute_request(
                 expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
                 expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
                 transition_kind,
-                grant_write: command.grant_write,
+                failover_safe_lsn: command.failover_safe_lsn,
+                primary_write_status: if command.primary_write_status
+                    == proto::AccessStatus::Unknown as i32
+                {
+                    if command.grant_write {
+                        AccessStatus::Granted
+                    } else {
+                        AccessStatus::ReconfigurationPending
+                    }
+                } else {
+                    proto::AccessStatus::try_from(command.primary_write_status)
+                        .map_err(|_| WireError::InvalidEnum {
+                            field: "ensure.primary_write_status",
+                            value: command.primary_write_status,
+                        })
+                        .and_then(access_status_from_proto)?
+                },
                 current_only: command.current_only,
-                retire_build_id: (!command.retire_build_id.is_empty())
-                    .then(|| OperationId::new(command.retire_build_id)),
+                retire_build_ids: if command.retire_build_ids.is_empty() {
+                    (!command.retire_build_id.is_empty())
+                        .then(|| OperationId::new(command.retire_build_id))
+                        .into_iter()
+                        .collect()
+                } else {
+                    command
+                        .retire_build_ids
+                        .into_iter()
+                        .map(OperationId::new)
+                        .collect()
+                },
             }))
         }
         proto::execute_command_request::Command::EnsureReplicaBuild(command) => {
@@ -1081,6 +1108,7 @@ impl From<BuildAuthority> for proto::BuildAuthority {
             kind: match authority.kind {
                 BuildAuthorityKind::Bootstrap => proto::BuildAuthorityKind::Bootstrap as i32,
                 BuildAuthorityKind::Provisioning => proto::BuildAuthorityKind::Provisioning as i32,
+                BuildAuthorityKind::Failover => proto::BuildAuthorityKind::Failover as i32,
             },
             source: Some(authority.source.into()),
             target: Some(authority.target.into()),
@@ -1109,6 +1137,7 @@ fn build_authority_from_proto(
     })? {
         proto::BuildAuthorityKind::Bootstrap => BuildAuthorityKind::Bootstrap,
         proto::BuildAuthorityKind::Provisioning => BuildAuthorityKind::Provisioning,
+        proto::BuildAuthorityKind::Failover => BuildAuthorityKind::Failover,
         proto::BuildAuthorityKind::Unspecified => {
             return Err(WireError::InvalidAuthority(
                 "build authority kind is unspecified".to_string(),
