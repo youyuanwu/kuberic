@@ -622,6 +622,8 @@ pub fn derive_transition_id(
 pub fn derive_replacement_operation_id(
     resource_uid: &ResourceUid,
     replacing: &ReplicaIdentity,
+    pod_uid: &PodUid,
+    pvc_uid: &PvcUid,
 ) -> OperationId {
     OperationId::new(format!(
         "replacement-provisioning-{}",
@@ -630,6 +632,8 @@ pub fn derive_replacement_operation_id(
             &replacing.replica_id.to_string(),
             replacing.instance_id.as_str(),
             replacing.agent_generation.as_str(),
+            pod_uid.as_str(),
+            pvc_uid.as_str(),
         ])
     ))
 }

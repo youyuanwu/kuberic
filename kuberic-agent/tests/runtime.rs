@@ -987,6 +987,36 @@ async fn open_primary(
     runtime
 }
 
+#[tokio::test]
+async fn existing_build_id_rejects_a_different_exact_target() {
+    let runtime = open_primary(
+        Arc::new(TestApplication::default()),
+        vec![
+            identity(1, "primary"),
+            identity(2, "secondary-2"),
+            identity(3, "secondary-3"),
+        ],
+    )
+    .await;
+    let build_id = OperationId::new("target-bound-build");
+    let first = identity(4, "replacement-4");
+    runtime
+        .authorize_build(build_id.clone(), first.clone(), BuildConfiguration::Current)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        runtime
+            .authorize_build(
+                build_id,
+                identity(5, "replacement-5"),
+                BuildConfiguration::Current,
+            )
+            .await,
+        Err(RuntimeError::AuthorityMismatch(_))
+    ));
+}
+
 #[test]
 fn public_trait_method_sets_match_sf_v1_com_divisions() {
     fn methods(source: &str, name: &str) -> Vec<String> {

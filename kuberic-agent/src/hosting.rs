@@ -224,15 +224,6 @@ impl PodRuntime {
         target: ReplicaIdentity,
         configuration: BuildConfiguration,
     ) -> Result<BuildAuthority> {
-        if let Some(existing) = self
-            .host
-            .default_dependencies
-            .build_authority_store
-            .load_build(&build_id)
-            .await?
-        {
-            return Ok(existing);
-        }
         let snapshot = self.snapshot().await;
         let (kind, current_configuration) = match configuration {
             BuildConfiguration::Current => {
@@ -252,6 +243,24 @@ impl PodRuntime {
                 (BuildAuthorityKind::Bootstrap, configuration)
             }
         };
+        if let Some(existing) = self
+            .host
+            .default_dependencies
+            .build_authority_store
+            .load_build(&build_id)
+            .await?
+        {
+            if existing.kind != kind
+                || existing.source != self.host.identity
+                || existing.target != target
+                || existing.current_configuration != current_configuration
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "build ID is already bound to different exact authority".into(),
+                ));
+            }
+            return Ok(existing);
+        }
         let authority = BuildAuthority {
             build_id,
             kind,
@@ -332,6 +341,14 @@ impl PodRuntime {
 
     pub async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         self.host.apply_effect(effect).await
+    }
+
+    pub async fn cancel_configuration_work(&self) -> Result<()> {
+        if let Ok(managed) = self.host.managed() {
+            managed.cancel_configuration_work().await
+        } else {
+            Ok(())
+        }
     }
 
     pub fn data_plane(&self) -> RuntimeDataPlane {

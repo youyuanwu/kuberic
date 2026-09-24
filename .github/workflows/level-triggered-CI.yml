@@ -71,7 +71,7 @@ jobs:
           scripts/check_level_triggered_documentation.sh
 
   bootstrap-kind:
-    name: Three-member bootstrap
+    name: PR live smoke
     needs: targeted
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -104,6 +104,8 @@ jobs:
         run: just level-triggered-install
       - name: Run bootstrap scenario
         run: just level-triggered-kind-test bootstrap
+      - name: Run replacement scenario
+        run: just level-triggered-kind-test replacement
       - name: Run failover scenario
         run: just level-triggered-kind-test failover
       - name: Collect diagnostics

@@ -1,10 +1,10 @@
 //! Durable replica-local reconfiguration coordinator.
 
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
-use kuberic_protocol::types::{AccessStatus, OperationId, ProcessSessionId, ReplicaRole};
+use kuberic_protocol::types::{AccessStatus, Epoch, OperationId, ProcessSessionId, ReplicaRole};
 use kuberic_runtime::application::OpenMode;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 
@@ -18,6 +18,7 @@ pub struct Coordinator<S, E> {
     store: Arc<S>,
     runtime: RuntimeAdapter<S, E>,
     command_lock: Mutex<()>,
+    supersession_epoch: watch::Sender<Epoch>,
 }
 
 impl<S, E> Coordinator<S, E>
@@ -26,10 +27,12 @@ where
     E: RuntimeEffectExecutor,
 {
     pub fn new(store: Arc<S>, executor: Arc<E>) -> Self {
+        let (supersession_epoch, _) = watch::channel(Epoch::default());
         Self {
             runtime: RuntimeAdapter::new(store.clone(), executor),
             store,
             command_lock: Mutex::new(()),
+            supersession_epoch,
         }
     }
 
@@ -73,7 +76,32 @@ where
         &self,
         command: EnsureConfiguration,
     ) -> Result<RetainedCommandResult> {
+        let observed = self.store.load_state().await?;
+        if let Some(pending) = observed.reconfiguration.as_ref()
+            && pending.command != command
+        {
+            admit_configuration(&command, &observed)?;
+            if command.current_epoch <= pending.command.current_epoch {
+                return Err(crate::AgentError::EffectConflict(
+                    "a same-or-newer configuration command is pending".into(),
+                ));
+            }
+            self.supersession_epoch.send_if_modified(|epoch| {
+                if command.current_epoch > *epoch {
+                    *epoch = command.current_epoch;
+                    true
+                } else {
+                    false
+                }
+            });
+            self.runtime.cancel_configuration_work().await?;
+        }
         let _command = self.command_lock.lock().await;
+        if self.is_superseded(&command) {
+            return Err(crate::AgentError::Runtime(
+                kuberic_runtime::RuntimeError::OperationCancelled,
+            ));
+        }
         let durable = self.store.load_state().await?;
         let persisted_exact = durable
             .reconfiguration
@@ -90,7 +118,9 @@ where
         };
         match self.store.begin_configuration(&command).await? {
             BeginConfiguration::Completed(result) => return Ok(result),
-            BeginConfiguration::Execute(_) | BeginConfiguration::Pending(_) => {}
+            BeginConfiguration::Execute(_)
+            | BeginConfiguration::Pending(_)
+            | BeginConfiguration::Superseded(_) => {}
         }
 
         loop {
@@ -106,6 +136,11 @@ where
                     "configuration ownership changed while the command was executing".into(),
                 ));
             };
+            if self.is_superseded(&record.command) {
+                return Err(crate::AgentError::Runtime(
+                    kuberic_runtime::RuntimeError::OperationCancelled,
+                ));
+            }
             match record.stage {
                 CoordinatorStage::AdmitAuthority => {
                     self.execute(
@@ -309,6 +344,10 @@ where
                 }
             }
         }
+    }
+
+    fn is_superseded(&self, command: &EnsureConfiguration) -> bool {
+        *self.supersession_epoch.borrow() > command.current_epoch
     }
 
     pub async fn ensure_build(&self, command: EnsureReplicaBuild) -> Result<()> {

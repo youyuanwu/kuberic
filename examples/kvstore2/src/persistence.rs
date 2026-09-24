@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::ops::Bound::{Excluded, Included};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
@@ -26,6 +27,10 @@ pub enum Mutation {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedState {
     values: BTreeMap<String, String>,
+    #[serde(default)]
+    base_values: BTreeMap<String, String>,
+    #[serde(default)]
+    base_lsn: i64,
     operations: BTreeMap<i64, OperationRecord>,
     applied_lsn: i64,
     committed_lsn: i64,
@@ -92,10 +97,16 @@ impl KvPersistence {
 
     pub fn snapshot_at(&self, up_to_lsn: i64) -> Result<BTreeMap<String, String>> {
         let state = self.state.lock().unwrap();
-        let mut values = BTreeMap::new();
+        if up_to_lsn < state.base_lsn {
+            return Err(RuntimeError::Application(format!(
+                "snapshot boundary {up_to_lsn} predates retained base {}",
+                state.base_lsn
+            )));
+        }
+        let mut values = state.base_values.clone();
         for record in state
             .operations
-            .range(..=up_to_lsn)
+            .range((Excluded(state.base_lsn), Included(up_to_lsn)))
             .map(|(_, record)| record)
         {
             match serde_json::from_slice::<Mutation>(&record.data)
@@ -162,6 +173,13 @@ impl KvPersistence {
             .join(build_id.as_str())
             .join(format!("{sequence:020}.chunk"))
     }
+
+    fn copy_chunk_staging_path(&self, build_id: &OperationId, sequence: u64) -> PathBuf {
+        self.root
+            .join("copy")
+            .join(build_id.as_str())
+            .join(format!("{sequence:020}.chunk.tmp"))
+    }
 }
 
 #[async_trait]
@@ -198,37 +216,41 @@ impl DurableState for KvPersistence {
         chunk: CopyChunk,
     ) -> Result<()> {
         let path = self.copy_chunk_path(build_id, sequence);
+        let staging = self.copy_chunk_staging_path(build_id, sequence);
         let parent = path
             .parent()
             .ok_or_else(|| RuntimeError::Application("copy chunk path has no parent".into()))?;
         std::fs::create_dir_all(parent)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(&chunk.data)
-                    .map_err(|error| RuntimeError::Application(error.to_string()))?;
-                file.sync_all()
-                    .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        if path.is_file() {
+            if std::fs::read(&path).map_err(|error| RuntimeError::Application(error.to_string()))?
+                != chunk.data
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "copy sequence was reused with different bytes".into(),
+                ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if std::fs::read(&path)
-                    .map_err(|error| RuntimeError::Application(error.to_string()))?
-                    == chunk.data
-                {
-                    std::fs::File::open(&path)
-                        .and_then(|file| file.sync_all())
-                        .map_err(|error| RuntimeError::Application(error.to_string()))?;
-                } else {
-                    return Err(RuntimeError::AuthorityMismatch(
-                        "copy sequence was reused with different bytes".into(),
-                    ));
-                }
+            std::fs::File::open(&path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        } else {
+            match std::fs::remove_file(&staging) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(RuntimeError::Application(error.to_string())),
             }
-            Err(error) => return Err(RuntimeError::Application(error.to_string())),
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging)
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            file.write_all(&chunk.data)
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            file.sync_all()
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            drop(file);
+            std::fs::rename(&staging, &path)
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
         }
         let mut directory = Some(parent);
         while let Some(path) = directory {
@@ -266,6 +288,12 @@ impl DurableState for KvPersistence {
             .map_err(|error| RuntimeError::Application(error.to_string()))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
+        paths.retain(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "chunk")
+        });
         paths.sort_by_key(|entry| entry.file_name());
         let mut bytes = Vec::new();
         for entry in paths {
@@ -282,7 +310,9 @@ impl DurableState for KvPersistence {
         };
         let mut state = self.state.lock().unwrap();
         let mut candidate = state.clone();
-        candidate.values = values;
+        candidate.values = values.clone();
+        candidate.base_values = values;
+        candidate.base_lsn = up_to_lsn;
         candidate.operations.clear();
         candidate.applied_lsn = up_to_lsn;
         candidate.committed_lsn = committed_lsn;
@@ -473,6 +503,101 @@ mod tests {
             store.snapshot_at(2).unwrap().get("key").map(String::as_str),
             Some("new")
         );
+    }
+
+    #[tokio::test]
+    async fn copied_baseline_survives_reopen_and_later_copy() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let first = KvPersistence::open(first_directory.path()).unwrap();
+        let first_build = OperationId::new("first-copy");
+        first
+            .apply_copy_chunk(
+                &first_build,
+                0,
+                CopyChunk {
+                    data: Bytes::from(
+                        serde_json::to_vec(&BTreeMap::from([(
+                            "copied".to_string(),
+                            "baseline".to_string(),
+                        )]))
+                        .unwrap(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        first.finish_copy(&first_build, 7, 7).await.unwrap();
+        first
+            .apply(Operation {
+                lsn: 8,
+                committed_lsn: 7,
+                data: KvPersistence::encode_put("later".into(), "value".into()).unwrap(),
+            })
+            .await
+            .unwrap();
+        first.commit(8).await.unwrap();
+
+        assert_eq!(
+            first.snapshot_at(7).unwrap(),
+            BTreeMap::from([("copied".to_string(), "baseline".to_string())])
+        );
+        let expected = BTreeMap::from([
+            ("copied".to_string(), "baseline".to_string()),
+            ("later".to_string(), "value".to_string()),
+        ]);
+        assert_eq!(first.snapshot_at(8).unwrap(), expected);
+        drop(first);
+
+        let reopened = KvPersistence::open(first_directory.path()).unwrap();
+        assert_eq!(reopened.snapshot_at(8).unwrap(), expected);
+
+        let second_directory = tempfile::tempdir().unwrap();
+        let second = KvPersistence::open(second_directory.path()).unwrap();
+        let second_build = OperationId::new("second-copy");
+        second
+            .apply_copy_chunk(
+                &second_build,
+                0,
+                CopyChunk {
+                    data: Bytes::from(serde_json::to_vec(&expected).unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+        second.finish_copy(&second_build, 8, 8).await.unwrap();
+        assert_eq!(second.snapshot_at(8).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn incomplete_staging_chunk_is_replaced_and_not_installed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KvPersistence::open(directory.path()).unwrap();
+        let build = OperationId::new("interrupted-copy");
+        let staging = store.copy_chunk_staging_path(&build, 0);
+        std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        std::fs::write(&staging, b"partial").unwrap();
+
+        let expected = BTreeMap::from([("key".to_string(), "value".to_string())]);
+        let bytes = serde_json::to_vec(&expected).unwrap();
+        store
+            .apply_copy_chunk(
+                &build,
+                0,
+                CopyChunk {
+                    data: Bytes::from(bytes.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read(store.copy_chunk_path(&build, 0)).unwrap(),
+            bytes
+        );
+
+        std::fs::write(store.copy_chunk_staging_path(&build, 1), b"ignored").unwrap();
+        store.finish_copy(&build, 4, 4).await.unwrap();
+        assert_eq!(store.snapshot_at(4).unwrap(), expected);
     }
 
     #[test]

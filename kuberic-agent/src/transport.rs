@@ -438,46 +438,151 @@ pub async fn run_outbound<D: OutboundDispatcher + 'static>(
     dispatcher: Arc<D>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    const MAX_CONCURRENT_DELIVERIES: usize = 64;
     let data_plane = runtime.data_plane();
-    let mut deliveries = tokio::task::JoinSet::new();
+    let mut workers = BTreeMap::new();
+    let mut worker_tasks = tokio::task::JoinSet::new();
     loop {
         let mut receive_shutdown = shutdown.clone();
         tokio::select! {
             _ = wait_for_shutdown_signal(&mut receive_shutdown) => {
-                deliveries.abort_all();
+                worker_tasks.abort_all();
                 return Ok(());
             },
-            completed = deliveries.join_next(), if !deliveries.is_empty() => {
+            completed = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    tracing::warn!(%error, "outbound delivery task failed");
+                    tracing::warn!(%error, "outbound peer worker failed");
                 }
             }
-            outbound = data_plane.next_domain_outbound(),
-                if deliveries.len() < MAX_CONCURRENT_DELIVERIES =>
-            {
+            outbound = data_plane.next_domain_outbound() => {
                 let Some(outbound) = outbound else {
                     let mut retry_shutdown = shutdown.clone();
                     tokio::select! {
                         _ = wait_for_shutdown_signal(&mut retry_shutdown) => {
-                            deliveries.abort_all();
+                            worker_tasks.abort_all();
                             return Ok(());
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                     }
                     continue;
                 };
-                deliveries.spawn(deliver_outbound(
-                    transport.clone(),
-                    dispatcher.clone(),
-                    outbound,
-                    shutdown.clone(),
-                ));
+                let receiver = domain_outbound_receiver(&outbound).cloned();
+                let queued = {
+                    let mut sender = transport.lock().await;
+                    sender.queue(outbound)
+                };
+                let queued = match queued {
+                    Ok(queued) => sender_outbound_to_queued(queued),
+                    Err(RuntimeError::QueueFull | RuntimeError::ReconfigurationPending) => {
+                        tracing::warn!(
+                            ?receiver,
+                            "outbound peer backlog unavailable; deferring to peer repair"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(AgentError::Runtime(error)),
+                };
+                let key = queued_outbound_receiver(&queued).cloned();
+                let sender = workers.entry(key).or_insert_with(|| {
+                    spawn_delivery_worker(
+                        &mut worker_tasks,
+                        Some(runtime.clone()),
+                        transport.clone(),
+                        dispatcher.clone(),
+                        shutdown.clone(),
+                    )
+                });
+                if sender.send(queued.clone()).is_err() {
+                    let replacement = spawn_delivery_worker(
+                        &mut worker_tasks,
+                        Some(runtime.clone()),
+                        transport.clone(),
+                        dispatcher.clone(),
+                        shutdown.clone(),
+                    );
+                    replacement.send(queued).map_err(|_| {
+                        AgentError::Backpressure("outbound peer worker stopped".into())
+                    })?;
+                    *sender = replacement;
+                }
             }
         }
     }
 }
 
+fn spawn_delivery_worker<D: OutboundDispatcher + 'static>(
+    tasks: &mut tokio::task::JoinSet<()>,
+    runtime: Option<Arc<PodRuntime>>,
+    transport: Arc<Mutex<ReliableTransport>>,
+    dispatcher: Arc<D>,
+    shutdown: watch::Receiver<bool>,
+) -> tokio::sync::mpsc::UnboundedSender<QueuedOutbound> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    tasks.spawn(async move {
+        while let Some(outbound) = receiver.recv().await {
+            if let Err(error) = dispatch_queued_with_retry(
+                runtime.as_deref(),
+                transport.clone(),
+                dispatcher.clone(),
+                outbound,
+                shutdown.clone(),
+            )
+            .await
+            {
+                tracing::warn!(%error, "outbound delivery failed");
+                if matches!(error, AgentError::Runtime(RuntimeError::OperationCancelled)) {
+                    break;
+                }
+            }
+        }
+    });
+    sender
+}
+
+async fn dispatch_queued_with_retry<D: OutboundDispatcher>(
+    runtime: Option<&PodRuntime>,
+    transport: Arc<Mutex<ReliableTransport>>,
+    dispatcher: Arc<D>,
+    queued: QueuedOutbound,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    loop {
+        if let Some(runtime) = runtime
+            && !queued_matches_runtime_authority(runtime, &queued).await
+        {
+            if let Some(receiver) = queued_outbound_receiver(&queued) {
+                transport.lock().await.retire_peer(receiver);
+            }
+            return Err(AgentError::Runtime(RuntimeError::OperationCancelled));
+        }
+        let mut dispatch_shutdown = shutdown.clone();
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_shutdown_signal(&mut dispatch_shutdown) => return Ok(()),
+            result = dispatcher.dispatch(queued.clone()) => result,
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error @ (AgentError::SessionRejected(_) | AgentError::Backpressure(_))) => {
+                if matches!(queued, QueuedOutbound::Build(_)) {
+                    return Err(error);
+                }
+                tracing::warn!(%error, "outbound peer unavailable; retaining message for retry");
+                if let Some(receiver) = queued_outbound_receiver(&queued) {
+                    let _ = dispatcher.refresh_peer(receiver).await;
+                }
+                let retry_delay = transport.lock().await.retry_delay();
+                let mut retry_shutdown = shutdown.clone();
+                tokio::select! {
+                    _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
 async fn deliver_outbound<D: OutboundDispatcher>(
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<D>,
@@ -511,29 +616,34 @@ async fn deliver_outbound<D: OutboundDispatcher>(
             Err(error) => return Err(AgentError::Runtime(error)),
         }
     };
-    loop {
-        let mut dispatch_shutdown = shutdown.clone();
-        let result = tokio::select! {
-            biased;
-            _ = wait_for_shutdown_signal(&mut dispatch_shutdown) => return Ok(()),
-            result = dispatcher.dispatch(queued.clone()) => result,
-        };
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error @ (AgentError::SessionRejected(_) | AgentError::Backpressure(_))) => {
-                tracing::warn!(%error, "outbound peer unavailable; retaining message for retry");
-                if let Some(receiver) = queued_outbound_receiver(&queued) {
-                    let _ = dispatcher.refresh_peer(receiver).await;
-                }
-                let retry_delay = transport.lock().await.retry_delay();
-                let mut retry_shutdown = shutdown.clone();
-                tokio::select! {
-                    _ = wait_for_shutdown_signal(&mut retry_shutdown) => return Ok(()),
-                    _ = tokio::time::sleep(retry_delay) => {}
-                }
-            }
-            Err(error) => return Err(error),
-        }
+    dispatch_queued_with_retry(None, transport, dispatcher, queued, shutdown).await
+}
+
+async fn queued_matches_runtime_authority(runtime: &PodRuntime, queued: &QueuedOutbound) -> bool {
+    let snapshot = runtime.snapshot().await;
+    let Some(authority) = snapshot.authority else {
+        return !matches!(
+            queued,
+            QueuedOutbound::Replication { .. } | QueuedOutbound::Copy { .. }
+        );
+    };
+    match queued {
+        QueuedOutbound::Replication { item, .. } => normalize_replication_item(item.clone())
+            .is_ok_and(|item| {
+                item.epoch == authority.current_configuration.epoch
+                    && item.current_configuration_id
+                        == authority.current_configuration.configuration_id
+                    && item.previous_configuration_id
+                        == authority
+                            .previous_configuration
+                            .as_ref()
+                            .map(|previous| previous.configuration_id.clone())
+            }),
+        QueuedOutbound::Copy { item, .. } => normalize_copy_item(item.clone()).is_ok_and(|item| {
+            item.epoch == authority.current_configuration.epoch
+                && item.current_configuration_id == authority.current_configuration.configuration_id
+        }),
+        QueuedOutbound::Build(_) | QueuedOutbound::Remove(_) => true,
     }
 }
 
@@ -854,6 +964,7 @@ mod tests {
 
     struct FlakyDispatcher {
         failed_peer_attempts: AtomicUsize,
+        failures_before_success: usize,
         delivered: tokio::sync::mpsc::UnboundedSender<ReplicaId>,
     }
 
@@ -870,7 +981,8 @@ mod tests {
                 }
             };
             if receiver.replica_id == ReplicaId::new(2)
-                && self.failed_peer_attempts.fetch_add(1, Ordering::SeqCst) < 2
+                && self.failed_peer_attempts.fetch_add(1, Ordering::SeqCst)
+                    < self.failures_before_success
             {
                 return Err(AgentError::SessionRejected(
                     "injected unavailable peer".into(),
@@ -920,6 +1032,7 @@ mod tests {
         let (delivered, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
         let dispatcher = Arc::new(FlakyDispatcher {
             failed_peer_attempts: AtomicUsize::new(0),
+            failures_before_success: 2,
             delivered,
         });
         let (_shutdown, shutdown) = watch::channel(false);
@@ -945,5 +1058,65 @@ mod tests {
         available.await.unwrap().unwrap();
         unavailable.await.unwrap().unwrap();
         assert_eq!(delivered_rx.recv().await, Some(ReplicaId::new(2)));
+    }
+
+    #[tokio::test]
+    async fn sustained_unavailable_peer_does_not_exhaust_healthy_delivery() {
+        let transport = Arc::new(Mutex::new(
+            ReliableTransport::new(ProcessSessionId::new("primary-session"), 128).unwrap(),
+        ));
+        for replica_id in [2, 3] {
+            transport
+                .lock()
+                .await
+                .admit_peer(
+                    identity(replica_id),
+                    ProcessSessionId::new(format!("session-{replica_id}")),
+                )
+                .unwrap();
+        }
+        let (delivered, mut delivered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dispatcher = Arc::new(FlakyDispatcher {
+            failed_peer_attempts: AtomicUsize::new(0),
+            failures_before_success: usize::MAX,
+            delivered,
+        });
+        let (stop, shutdown) = watch::channel(false);
+        let mut tasks = tokio::task::JoinSet::new();
+        let blocked = spawn_delivery_worker(
+            &mut tasks,
+            None,
+            transport.clone(),
+            dispatcher.clone(),
+            shutdown.clone(),
+        );
+        let healthy =
+            spawn_delivery_worker(&mut tasks, None, transport.clone(), dispatcher, shutdown);
+
+        for _ in 0..65 {
+            let queued = transport
+                .lock()
+                .await
+                .queue(outbound(identity(2)))
+                .map(sender_outbound_to_queued)
+                .unwrap();
+            blocked.send(queued).unwrap();
+        }
+        let queued = transport
+            .lock()
+            .await
+            .queue(outbound(identity(3)))
+            .map(sender_outbound_to_queued)
+            .unwrap();
+        healthy.send(queued).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), delivered_rx.recv())
+                .await
+                .unwrap(),
+            Some(ReplicaId::new(3))
+        );
+        stop.send_replace(true);
+        tasks.abort_all();
     }
 }

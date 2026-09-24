@@ -163,6 +163,43 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         }
     }
 
+    if let Some((member, report, previous)) = configuration.members.iter().find_map(|member| {
+        if member.role == ReplicaRole::Primary {
+            return None;
+        }
+        let report = snapshot
+            .observation_for_identity(&member.identity)
+            .and_then(|observation| match &observation.agent {
+                AgentObservation::Report(report) => Some(report.as_ref()),
+                _ => None,
+            })?;
+        let previous = report.previous_configuration.as_ref()?;
+        (report.identity == member.identity
+            && report.role == member.role
+            && report.epoch == configuration.epoch
+            && report.current_configuration.as_ref() == Some(configuration))
+        .then_some((member, report, previous))
+    }) {
+        return Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(Box::new(
+                failover_configuration_command(
+                    previous,
+                    configuration,
+                    member,
+                    policy,
+                    OperationId::new(format!(
+                        "accepted-current-only:{}:{}",
+                        configuration.configuration_id, member.identity.replica_id
+                    )),
+                    Some(report.current_progress),
+                    AccessStatus::ReconfigurationPending,
+                    true,
+                    Vec::new(),
+                ),
+            )),
+        };
+    }
+
     if let Some(failed) = configuration.members.iter().find(|member| {
         if member.identity.replica_id == configuration.primary_id {
             return false;
@@ -234,9 +271,14 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         );
         replacement_status.provisioning = Some(ProvisioningIntent {
             replaces: failed.identity.clone(),
+            operation_id: derive_replacement_operation_id(
+                &snapshot.resource_uid,
+                &failed.identity,
+                &pod_uid,
+                &pvc_uid,
+            ),
             pod_uid,
             pvc_uid,
-            operation_id: derive_replacement_operation_id(&snapshot.resource_uid, &failed.identity),
         });
         return Plan::Apply {
             changes: vec![KubernetesChange::PersistStatus {
@@ -273,6 +315,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         let authority_matches = report.identity == member.identity
             && report.role == member.role
             && report.epoch == configuration.epoch
+            && report.previous_configuration.is_none()
             && report
                 .current_configuration
                 .as_ref()
@@ -1153,7 +1196,6 @@ fn evaluate_transition(
                 primary_report,
                 &pc_cc_reports,
                 status.clone(),
-                config,
             ) {
                 return plan;
             }
@@ -1206,8 +1248,20 @@ fn evaluate_transition(
         let retire_build_ids = transition
             .build_id
             .iter()
-            .chain(transition.repair.iter().map(|repair| &repair.operation_id))
             .cloned()
+            .chain(
+                current
+                    .members
+                    .iter()
+                    .filter(|member| member.identity != primary.identity)
+                    .map(|member| {
+                        derive_failover_repair_operation_id(
+                            &snapshot.resource_uid,
+                            &transition.transition_id,
+                            &member.identity,
+                        )
+                    }),
+            )
             .collect::<Vec<_>>();
         for member in &current.members {
             let Some(report) = healthy_report(snapshot, &member.identity) else {
@@ -1538,12 +1592,62 @@ fn evaluate_provisioning(
         "An exact replacement remains outside authority",
     );
     let target_identity = provisioning.target_identity(&snapshot.resource_uid);
+    let topology = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .expect("validated provisioning has topology")
+        .configuration;
+    let source = topology
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == topology.primary_id)
+        .expect("validated topology has primary");
+    if replica_failed(snapshot, &source.identity) {
+        status.provisioning = None;
+        status.primary_failure = Some(PrimaryFailureObservation {
+            primary: source.identity.clone(),
+            started_at_unix_seconds: snapshot
+                .status
+                .primary_failure
+                .as_ref()
+                .filter(|failure| failure.primary == source.identity)
+                .map_or(snapshot.now_unix_seconds, |failure| {
+                    failure.started_at_unix_seconds
+                }),
+        });
+        let mut changes = vec![KubernetesChange::DeleteReplicaScaffolding {
+            pod_name: None,
+            pod_uid: Some(provisioning.pod_uid.clone()),
+            pvc_name: None,
+            pvc_uid: Some(provisioning.pvc_uid.clone()),
+        }];
+        if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+            changes.push(KubernetesChange::RemoveWriteRouting);
+        }
+        changes.push(KubernetesChange::PersistStatus {
+            status: Box::new(waiting_status(
+                status,
+                "ProvisioningAbandonedForFailover",
+                "Abandoned the unaccepted replacement attempt and fenced the failed primary",
+            )),
+        });
+        return Plan::Apply { changes };
+    }
     let Some(observation) = snapshot.observation_for_identity(&target_identity) else {
         status.provisioning = None;
         return Plan::Apply {
-            changes: vec![KubernetesChange::PersistStatus {
-                status: Box::new(status),
-            }],
+            changes: vec![
+                KubernetesChange::DeleteReplicaScaffolding {
+                    pod_name: None,
+                    pod_uid: Some(provisioning.pod_uid.clone()),
+                    pvc_name: None,
+                    pvc_uid: Some(provisioning.pvc_uid.clone()),
+                },
+                KubernetesChange::PersistStatus {
+                    status: Box::new(status),
+                },
+            ],
         };
     };
     match &observation.agent {
@@ -1573,17 +1677,6 @@ fn evaluate_provisioning(
             })),
         },
         AgentObservation::Report(target_report) => {
-            let topology = &snapshot
-                .status
-                .topology
-                .as_ref()
-                .expect("validated provisioning has topology")
-                .configuration;
-            let source = topology
-                .members
-                .iter()
-                .find(|member| member.identity.replica_id == topology.primary_id)
-                .expect("validated topology has primary");
             let Some(source_observation) = snapshot.observation_for_identity(&source.identity)
             else {
                 return Plan::Wait {
@@ -1939,7 +2032,6 @@ fn evaluate_failover_repair(
     primary_report: &crate::observation::AgentReport,
     reports: &[&crate::observation::AgentReport],
     mut status: AcceptedStatus,
-    config: &EvaluationConfig,
 ) -> Option<Plan> {
     let retained_from = primary_report.catch_up_capability?;
     let repair = transition.repair.clone().or_else(|| {
@@ -2043,8 +2135,18 @@ fn evaluate_failover_repair(
             )),
         });
     }
-    let _ = config;
-    None
+    let mut updated = transition.clone();
+    updated.repair = None;
+    status.transition = Some(updated);
+    Some(Plan::Apply {
+        changes: vec![KubernetesChange::PersistStatus {
+            status: Box::new(waiting_status(
+                status,
+                "FailoverFullCopyCompleted",
+                "Completed one exact repair and will evaluate any remaining lagging members",
+            )),
+        }],
+    })
 }
 
 fn replica_failed(snapshot: &ObservationSnapshot, identity: &ReplicaIdentity) -> bool {

@@ -235,6 +235,21 @@ impl AgentStore for SqliteStore {
         })
     }
 
+    async fn cancel_effect(&self, effect: &RuntimeEffect) -> Result<()> {
+        self.with_transaction(|transaction| {
+            let mut state = load_state_from_connection(transaction)?;
+            let pending = state.pending_effect.take().ok_or_else(|| {
+                AgentError::EffectConflict("runtime effect has no durable intent".into())
+            })?;
+            if pending.effect != *effect {
+                return Err(AgentError::EffectConflict(
+                    "cancelled runtime effect does not match durable intent".into(),
+                ));
+            }
+            write_agent_state(transaction, &state)
+        })
+    }
+
     async fn begin_configuration(
         &self,
         command: &EnsureConfiguration,
@@ -253,9 +268,31 @@ impl AgentStore for SqliteStore {
             }
             if let Some(pending) = state.reconfiguration.as_ref() {
                 if pending.command != *command {
-                    return Err(AgentError::EffectConflict(
-                        "another configuration command is pending".into(),
-                    ));
+                    if command.current_epoch <= pending.command.current_epoch {
+                        return Err(AgentError::EffectConflict(
+                            "another configuration command is pending".into(),
+                        ));
+                    }
+                    if let Some(effect) = state.pending_effect.as_ref()
+                        && !effect
+                            .effect
+                            .operation_id
+                            .as_str()
+                            .starts_with(&format!("{}:", pending.command.operation_id.as_str()))
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "pending runtime effect is not owned by the superseded command".into(),
+                        ));
+                    }
+                    state.pending_effect = None;
+                    let record = ReconfigurationRecord {
+                        command: command.clone(),
+                        stage: CoordinatorStage::AdmitAuthority,
+                        observed_lsn: None,
+                    };
+                    state.reconfiguration = Some(record.clone());
+                    write_agent_state(transaction, &state)?;
+                    return Ok(BeginConfiguration::Superseded(record));
                 }
                 return Ok(BeginConfiguration::Pending(pending.clone()));
             }

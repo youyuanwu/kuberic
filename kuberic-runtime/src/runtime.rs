@@ -659,6 +659,7 @@ impl DefaultReplicatorInner {
 
     pub(crate) async fn wait_for_quorum(&self, mode: ReplicaSetQuorumMode) -> Result<()> {
         self.require_primary().await?;
+        let configuration_generation = self.fence_generation.load(Ordering::Acquire);
         let fence = self
             .state
             .read()
@@ -671,6 +672,9 @@ impl DefaultReplicatorInner {
         loop {
             let changed = self.changed.notified();
             self.require_primary().await?;
+            if self.fence_generation.load(Ordering::Acquire) != configuration_generation {
+                return Err(RuntimeError::OperationCancelled);
+            }
             if self
                 .state
                 .read()
@@ -2616,6 +2620,14 @@ impl ManagedReplicator for DefaultReplicatorInner {
     async fn fence_writes(&self) -> Result<()> {
         self.check_aborted()?;
         self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
+        self.replicator.lock().await.fence_client_writes();
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn cancel_configuration_work(&self) -> Result<()> {
+        self.check_aborted()?;
+        self.fence_generation.fetch_add(1, Ordering::AcqRel);
         self.replicator.lock().await.fence_client_writes();
         self.changed.notify_waiters();
         Ok(())

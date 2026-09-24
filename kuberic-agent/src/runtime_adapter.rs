@@ -12,12 +12,20 @@ use crate::{AgentError, Result};
 #[async_trait]
 pub trait RuntimeEffectExecutor: Send + Sync {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult>;
+
+    async fn cancel_configuration_work(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl RuntimeEffectExecutor for PodRuntime {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         Ok(self.apply_effect(effect).await?)
+    }
+
+    async fn cancel_configuration_work(&self) -> Result<()> {
+        Ok(PodRuntime::cancel_configuration_work(self).await?)
     }
 }
 
@@ -43,7 +51,19 @@ where
         match self.store.begin_effect(&effect).await? {
             BeginEffect::Completed(result) => Ok(*result),
             BeginEffect::Execute(effect) | BeginEffect::Pending(effect) => {
-                let result = self.executor.apply_runtime_effect(effect.clone()).await?;
+                let result = match self.executor.apply_runtime_effect(effect.clone()).await {
+                    Ok(result) => result,
+                    Err(
+                        error @ AgentError::Runtime(
+                            kuberic_runtime::RuntimeError::OperationCancelled
+                            | kuberic_runtime::RuntimeError::ReplicaRemoved(_),
+                        ),
+                    ) => {
+                        self.store.cancel_effect(&effect).await?;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
                 require_matching_result(&effect, &result)?;
                 self.store.mark_effect_applied(&effect).await?;
                 self.store.complete_effect(&result).await?;
@@ -58,6 +78,10 @@ where
             return Ok(state.retained_result.map(|retained| retained.result));
         };
         self.execute(pending.effect).await.map(Some)
+    }
+
+    pub async fn cancel_configuration_work(&self) -> Result<()> {
+        self.executor.cancel_configuration_work().await
     }
 }
 

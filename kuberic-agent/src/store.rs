@@ -22,6 +22,7 @@ pub enum BeginEffect {
 pub enum BeginConfiguration {
     Execute(ReconfigurationRecord),
     Pending(ReconfigurationRecord),
+    Superseded(ReconfigurationRecord),
     Completed(RetainedCommandResult),
 }
 
@@ -36,6 +37,8 @@ pub trait AgentStore: Send + Sync {
     async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()>;
 
     async fn complete_effect(&self, result: &RuntimeEffectResult) -> Result<()>;
+
+    async fn cancel_effect(&self, effect: &RuntimeEffect) -> Result<()>;
 
     async fn begin_configuration(
         &self,

@@ -238,6 +238,7 @@ public-path hidden trait crate::replicator::ManagedReplicator::async fn accept_a
 public-path hidden trait crate::replicator::ManagedReplicator::async fn accept_copy_acknowledgement (& self , acknowledgement : CopyAck) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn attach_interfaces (& self , control : Arc < dyn Replicator > , primary : Option < Arc < dyn PrimaryReplicator > > ,) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn begin_write (& self , write : ClientWrite) -> Result < PendingWrite >
+public-path hidden trait crate::replicator::ManagedReplicator::async fn cancel_configuration_work (& self) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn cancel_outbound_build (& self , build_id : & OperationId) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn complete_open (& self , replication_address : String) -> Result < () >
 public-path hidden trait crate::replicator::ManagedReplicator::async fn execute_action (& self , action : RuntimeEffectAction) -> Result < () >

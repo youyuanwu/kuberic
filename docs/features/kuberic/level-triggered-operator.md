@@ -134,6 +134,13 @@ The following remain fail-closed and require separate design:
 - mixed-version protocol negotiation;
 - publication of the controller and `kvstore2` images as release artifacts.
 
+The current generated model validates authority observations and single-writer
+admissibility, while the live matrix exercises bounded sequential writes
+through restart, partition, replacement, and failover. A stateful model of
+successful writes across delayed/reordered effects and concurrent retained
+client connections is deferred validation work; it is not evidence for
+loosening any fencing invariant.
+
 Quorum loss does not advance the data-loss number and does not call an
 application data-loss callback. Unsupported evidence produces `Wait` or
 `Unsafe`, never success-shaped recovery.

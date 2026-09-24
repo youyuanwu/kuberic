@@ -6,7 +6,7 @@ use kuberic_agent::coordinator::Coordinator;
 use kuberic_agent::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
-use kuberic_agent::store::AgentStore;
+use kuberic_agent::store::{AgentStore, BeginConfiguration};
 use kuberic_agent::{AgentError, Result};
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
 use kuberic_protocol::types::{
@@ -545,6 +545,36 @@ async fn bootstrap_observes_effect_complete_before_stage_advance() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn newer_epoch_supersedes_pending_command_and_its_wait_effect() {
+    let (_directory, store) = store();
+    let old = grant_command("old-command", Epoch::new(0, 1));
+    assert!(matches!(
+        store.begin_configuration(&old).await.unwrap(),
+        BeginConfiguration::Execute(_)
+    ));
+    store
+        .begin_effect(&RuntimeEffect {
+            operation_id: OperationId::new("old-command:catchup"),
+            sequence: 1,
+            action: RuntimeEffectAction::WaitForCatchup,
+        })
+        .await
+        .unwrap();
+
+    let newer = grant_command("new-command", Epoch::new(0, 2));
+    assert!(matches!(
+        store.begin_configuration(&newer).await.unwrap(),
+        BeginConfiguration::Superseded(_)
+    ));
+    let state = store.load_state().await.unwrap();
+    assert_eq!(
+        state.reconfiguration.as_ref().map(|record| &record.command),
+        Some(&newer)
+    );
+    assert!(state.pending_effect.is_none());
 }
 
 #[tokio::test]

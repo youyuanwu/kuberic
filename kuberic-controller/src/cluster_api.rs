@@ -337,6 +337,64 @@ where
         ensure_peer_service(self.client.clone(), observation, &namespace, &uid, &owner).await?;
         let image = effective_replica_image(observation)?;
         for replica_id in replica_ids {
+            let configured_identity = observation
+                .set
+                .status
+                .as_ref()
+                .and_then(|status| {
+                    status
+                        .authority
+                        .transition
+                        .as_ref()
+                        .map(|transition| &transition.current_configuration)
+                        .or_else(|| {
+                            status
+                                .authority
+                                .topology
+                                .as_ref()
+                                .map(|topology| &topology.configuration)
+                        })
+                })
+                .and_then(|configuration| {
+                    configuration
+                        .members
+                        .iter()
+                        .find(|member| member.identity.replica_id == *replica_id)
+                })
+                .map(|member| &member.identity);
+            if let Some(identity) = configured_identity
+                && let Some(pod) = observation
+                    .pods
+                    .iter()
+                    .find(|pod| pod.uid().as_deref() == Some(identity.instance_id.as_str()))
+            {
+                let pvc_name = pod.spec.as_ref().and_then(|spec| {
+                    spec.volumes
+                        .as_ref()?
+                        .iter()
+                        .find(|volume| volume.name == "data")?
+                        .persistent_volume_claim
+                        .as_ref()
+                        .map(|claim| claim.claim_name.as_str())
+                });
+                let pvc = pvc_name
+                    .and_then(|name| observation.pvcs.iter().find(|pvc| pvc.name_any() == name));
+                let Some(pvc) = pvc else {
+                    return Err(ControllerError::ObservationStale);
+                };
+                ensure_exact_peer_endpoint(
+                    self.client.clone(),
+                    observation,
+                    &namespace,
+                    &uid,
+                    &owner,
+                    pod,
+                    pvc,
+                    *replica_id,
+                )
+                .await?;
+                continue;
+            }
             let pod_name = replica_name(&observation.set, *replica_id);
             let pvc_name = format!("{pod_name}-data");
             let pvc = observation
@@ -489,14 +547,30 @@ where
             let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
             let service_uid = service.uid().ok_or(ControllerError::ObservationStale)?;
             delete_exact(&services, &service.name_any(), &service_uid).await?;
-            return Ok(());
         }
-        if let (Some(name), Some(uid)) = (pod_name, pod_uid) {
+        let pod = pod_uid.and_then(|uid| {
+            observation
+                .pods
+                .iter()
+                .find(|pod| pod.uid().as_deref() == Some(uid.as_str()))
+        });
+        let pod_name = pod_name
+            .map(str::to_string)
+            .or_else(|| pod.map(ResourceExt::name_any));
+        if let (Some(name), Some(uid)) = (pod_name.as_deref(), pod_uid) {
             let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
             delete_exact(&pods, name, uid.as_str()).await?;
-            return Ok(());
         }
-        if let (Some(name), Some(uid)) = (pvc_name, pvc_uid) {
+        let pvc = pvc_uid.and_then(|uid| {
+            observation
+                .pvcs
+                .iter()
+                .find(|pvc| pvc.uid().as_deref() == Some(uid.as_str()))
+        });
+        let pvc_name = pvc_name
+            .map(str::to_string)
+            .or_else(|| pvc.map(ResourceExt::name_any));
+        if let (Some(name), Some(uid)) = (pvc_name.as_deref(), pvc_uid) {
             let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), &namespace);
             delete_exact(&pvcs, name, uid.as_str()).await?;
         }

@@ -450,6 +450,12 @@ where
 
         self.ready_state.store(true, Ordering::Release);
         ready.send_replace(true);
+        let recovery_coordinator = self.coordinator.clone();
+        let recovery_task = tokio::spawn(async move {
+            if let Err(error) = recovery_coordinator.resume_configuration().await {
+                tracing::warn!(%error, "background configuration recovery stopped");
+            }
+        });
         let result = tokio::select! {
             result = &mut control => {
                 replication.abort();
@@ -466,6 +472,7 @@ where
         };
         self.ready_state.store(false, Ordering::Release);
         ready.send_replace(false);
+        recovery_task.abort();
         self.runtime.abort();
         result
     }
@@ -505,8 +512,15 @@ where
         {
             self.runtime.apply_effect(retained.effect.clone()).await?;
         }
-        self.coordinator.resume_pending().await?;
-        self.coordinator.resume_configuration().await?;
+        let pending_catchup = state.pending_effect.as_ref().is_some_and(|pending| {
+            matches!(
+                pending.effect.action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::WaitForCatchup
+            )
+        });
+        if !pending_catchup {
+            self.coordinator.resume_pending().await?;
+        }
         Ok(())
     }
 

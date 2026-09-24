@@ -1808,6 +1808,10 @@ operations remain fail-closed:
 - planned switchover and its public request API;
 - applying new spec changes during an active reconfiguration; they are
   evaluated after the current PC/CC transition becomes stable;
+- stateful successful-write trace generation across delayed effects and
+  concurrent retained client connections; current model validation covers
+  authority observations and the live matrix covers bounded sequential
+  histories;
 - more than one unresolved reconfiguration; exactly one PC and one outstanding
   CC are supported;
 - mixed-version protocol negotiation; incompatible versions return `Unsafe`;
