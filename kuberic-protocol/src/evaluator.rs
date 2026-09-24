@@ -304,7 +304,6 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         if !marker_matches {
             status.quorum_loss = Some(QuorumLossObservation {
                 configuration_id: configuration.configuration_id.clone(),
-                started_at_unix_seconds: snapshot.now_unix_seconds,
             });
             return Plan::Apply {
                 changes: vec![KubernetesChange::PersistStatus {
@@ -541,7 +540,6 @@ fn maybe_begin_stable_failover(
         {
             status.quorum_loss = Some(QuorumLossObservation {
                 configuration_id: accepted.configuration_id.clone(),
-                started_at_unix_seconds: snapshot.now_unix_seconds,
             });
             return Some(Plan::Apply {
                 changes: vec![KubernetesChange::PersistStatus {
@@ -900,7 +898,6 @@ fn evaluate_transition(
             {
                 status.quorum_loss = Some(QuorumLossObservation {
                     configuration_id: accepted.configuration_id.clone(),
-                    started_at_unix_seconds: snapshot.now_unix_seconds,
                 });
                 return Some(Plan::Apply {
                     changes: vec![KubernetesChange::PersistStatus {

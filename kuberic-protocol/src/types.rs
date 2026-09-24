@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 macro_rules! string_id {
@@ -173,22 +174,120 @@ pub struct ReplicaIdentity {
     pub agent_generation: AgentGeneration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigurationMember {
+    #[serde(flatten)]
     pub identity: ReplicaIdentity,
     pub role: ReplicaRole,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for ConfigurationMember {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct FlatMember {
+            replica_id: ReplicaId,
+            instance_id: ReplicaInstanceId,
+            agent_generation: AgentGeneration,
+            role: ReplicaRole,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyMember {
+            identity: ReplicaIdentity,
+            role: ReplicaRole,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WireMember {
+            Flat(FlatMember),
+            Legacy(LegacyMember),
+        }
+
+        Ok(match WireMember::deserialize(deserializer)? {
+            WireMember::Flat(FlatMember {
+                replica_id,
+                instance_id,
+                agent_generation,
+                role,
+            }) => Self {
+                identity: ReplicaIdentity {
+                    replica_id,
+                    instance_id,
+                    agent_generation,
+                },
+                role,
+            },
+            WireMember::Legacy(LegacyMember { identity, role }) => Self { identity, role },
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Canonical Current or Previous Configuration with a content-derived ID.
 pub struct ConfigurationDescriptor {
     pub configuration_id: ConfigurationId,
     pub epoch: Epoch,
+    #[serde(skip_serializing)]
+    #[schemars(skip)]
     pub primary_id: ReplicaId,
     pub members: Vec<ConfigurationMember>,
     pub write_quorum: u32,
+}
+
+impl<'de> Deserialize<'de> for ConfigurationDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireConfiguration {
+            configuration_id: ConfigurationId,
+            epoch: Epoch,
+            #[serde(default)]
+            primary_id: Option<ReplicaId>,
+            members: Vec<ConfigurationMember>,
+            write_quorum: u32,
+        }
+
+        let wire = WireConfiguration::deserialize(deserializer)?;
+        let mut primaries = wire
+            .members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::Primary);
+        let primary_id = primaries
+            .next()
+            .map(|member| member.identity.replica_id)
+            .ok_or_else(|| D::Error::custom("configuration has no Primary member"))?;
+        if primaries.next().is_some() {
+            return Err(D::Error::custom(
+                "configuration has multiple Primary members",
+            ));
+        }
+        if wire
+            .primary_id
+            .is_some_and(|serialized| serialized != primary_id)
+        {
+            return Err(D::Error::custom(
+                "serialized primaryId differs from the Primary member",
+            ));
+        }
+        Ok(Self {
+            configuration_id: wire.configuration_id,
+            epoch: wire.epoch,
+            primary_id,
+            members: wire.members,
+            write_quorum: wire.write_quorum,
+        })
+    }
 }
 
 impl ConfigurationDescriptor {
@@ -433,7 +532,6 @@ pub struct PrimaryFailureObservation {
 #[serde(rename_all = "camelCase")]
 pub struct QuorumLossObservation {
     pub configuration_id: ConfigurationId,
-    pub started_at_unix_seconds: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

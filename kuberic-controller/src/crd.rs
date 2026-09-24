@@ -78,6 +78,12 @@ mod tests {
         let topology = &status["properties"]["topology"];
         assert!(topology["properties"].get("configuration").is_none());
         assert!(topology["properties"].get("members").is_some());
+        assert!(topology["properties"].get("primaryId").is_none());
+        let member = &topology["properties"]["members"]["items"];
+        assert!(member["properties"].get("identity").is_none());
+        assert!(member["properties"].get("replicaId").is_some());
+        assert!(member["properties"].get("instanceId").is_some());
+        assert!(member["properties"].get("agentGeneration").is_some());
         let provisioning = &status["properties"]["provisioning"]["properties"];
         assert_eq!(
             provisioning
@@ -96,6 +102,11 @@ mod tests {
         assert!(status["properties"].get("primaryFailure").is_some());
         assert!(status["properties"].get("quorumLoss").is_some());
         assert!(
+            status["properties"]["quorumLoss"]["properties"]
+                .get("startedAtUnixSeconds")
+                .is_none()
+        );
+        assert!(
             status["properties"]["transition"]["properties"]
                 .get("repair")
                 .is_some()
@@ -104,6 +115,11 @@ mod tests {
             status["properties"]["transition"]["properties"]
                 .get("electionLsn")
                 .is_some()
+        );
+        assert!(
+            status["properties"]["transition"]["properties"]["currentConfiguration"]["properties"]
+                .get("primaryId")
+                .is_none()
         );
     }
 

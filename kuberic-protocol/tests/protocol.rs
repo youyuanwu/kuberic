@@ -185,6 +185,39 @@ fn configuration_id_is_canonical_across_member_order() {
 }
 
 #[test]
+fn configuration_json_derives_primary_and_flattens_member_identity() {
+    let configuration = configuration();
+    let value = serde_json::to_value(&configuration).unwrap();
+    assert!(value.get("primaryId").is_none());
+    let member = &value["members"][0];
+    assert!(member.get("identity").is_none());
+    assert_eq!(member["replicaId"], 1);
+    assert!(member.get("instanceId").is_some());
+    assert!(member.get("agentGeneration").is_some());
+    assert_eq!(
+        serde_json::from_value::<ConfigurationDescriptor>(value).unwrap(),
+        configuration
+    );
+
+    let mut legacy = serde_json::json!({
+        "configurationId": configuration.configuration_id,
+        "epoch": configuration.epoch,
+        "primaryId": configuration.primary_id,
+        "members": configuration.members.iter().map(|member| serde_json::json!({
+            "identity": member.identity,
+            "role": member.role,
+        })).collect::<Vec<_>>(),
+        "writeQuorum": configuration.write_quorum,
+    });
+    assert_eq!(
+        serde_json::from_value::<ConfigurationDescriptor>(legacy.clone()).unwrap(),
+        configuration
+    );
+    legacy["primaryId"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<ConfigurationDescriptor>(legacy).is_err());
+}
+
+#[test]
 fn bootstrap_recreates_fresh_scaffolding_with_drifted_image() {
     let mut snapshot = scaffolded_snapshot();
     snapshot

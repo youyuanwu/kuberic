@@ -22,3 +22,8 @@ only the elected safe prefix under the new fence, performs retained-history or
 full-copy repair, and accepts only current-only quorum evidence. Quorum loss
 publishes `NoWriteQuorum` without changing the data-loss epoch and restores
 access when the same configuration quorum returns.
+
+Configuration JSON omits duplicated `primaryId`, derives it from the unique
+`Primary` member, and flattens each member's exact identity fields beside its
+role. Legacy nested-member and explicit-primary JSON remains readable for
+durable metadata compatibility.

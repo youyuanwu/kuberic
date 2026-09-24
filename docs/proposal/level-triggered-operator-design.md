@@ -318,22 +318,18 @@ status:
     epoch:
       dataLossNumber: 1
       configurationNumber: 8
-    primaryId: 2
     members:
-      - identity:
-          replicaId: 1
-          instanceId: "..."
-          agentGeneration: "..."
+      - replicaId: 1
+        instanceId: "..."
+        agentGeneration: "..."
         role: activeSecondary
-      - identity:
-          replicaId: 2
-          instanceId: "..."
-          agentGeneration: "..."
+      - replicaId: 2
+        instanceId: "..."
+        agentGeneration: "..."
         role: primary
-      - identity:
-          replicaId: 3
-          instanceId: "..."
-          agentGeneration: "..."
+      - replicaId: 3
+        instanceId: "..."
+        agentGeneration: "..."
         role: activeSecondary
     writeQuorum: 2
   provisioning:
@@ -359,22 +355,18 @@ status:
       epoch:
         dataLossNumber: 1
         configurationNumber: 9
-      primaryId: 2
       members:
-        - identity:
-            replicaId: 1
-            instanceId: "..."
-            agentGeneration: "..."
+        - replicaId: 1
+          instanceId: "..."
+          agentGeneration: "..."
           role: activeSecondary
-        - identity:
-            replicaId: 2
-            instanceId: "..."
-            agentGeneration: "..."
+        - replicaId: 2
+          instanceId: "..."
+          agentGeneration: "..."
           role: primary
-        - identity:
-            replicaId: 3
-            instanceId: "..."
-            agentGeneration: "..."
+        - replicaId: 3
+          instanceId: "..."
+          agentGeneration: "..."
           role: activeSecondary
   conditions:
     - type: Ready
@@ -391,6 +383,8 @@ The following do not belong in the public status:
 - loop indexes over members;
 - serialized intermediate observations;
 - generic workflow history.
+- a duplicated `primaryId` beside the uniquely validated `Primary` member;
+- an `identity` wrapper around configuration-member identity fields.
 
 `status.transition` is optional. Steady state has no transition. Before
 bootstrap, Kubernetes scaffolding derives from `spec.replicas`; afterward it
@@ -406,6 +400,14 @@ incarnation enters an outstanding CC and after any old work is proven unable to
 complete. Bootstrap uses its persisted Bootstrap transition directly instead
 of a separate provisioning marker. Beginning the replacement PC/CC transition
 atomically clears the matching provisioning intent.
+
+Configuration members expose `replicaId`, `instanceId`, `agentGeneration`, and
+`role` directly. The public CRD derives the primary from the single member with
+role `primary`; it does not persist a duplicate `primaryId`. Canonical runtime
+types may retain that derived value internally and the protobuf compatibility
+field remains populated. Deserialization accepts the former nested-member and
+explicit-primary JSON shapes so existing durable agent metadata remains
+readable, while all new status serialization uses the compact shape.
 
 Transition ownership is asymmetric:
 
@@ -1532,7 +1534,8 @@ Quorum loss and data loss remain distinct:
 
 1. If Current Configuration write quorum is unavailable, set
     `WriteStatus = NoWriteQuorum` and block writes.
-2. Record when quorum loss began and continue bounded re-observation.
+2. Persist a configuration-bound quorum-loss marker and continue bounded
+   re-observation.
 3. If quorum returns, resume without changing the data-loss epoch.
 4. If recovery would require abandoning PC or outstanding CC quorum, report
     `Unsafe` and remain write-closed.

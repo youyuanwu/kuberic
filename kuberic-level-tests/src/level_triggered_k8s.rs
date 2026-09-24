@@ -59,6 +59,14 @@ fn status_ready(value: &serde_json::Value) -> bool {
         })
 }
 
+fn topology_primary_id(value: &serde_json::Value) -> Option<i64> {
+    value["status"]["topology"]["members"]
+        .as_array()?
+        .iter()
+        .find(|member| member["role"] == "primary")?["replicaId"]
+        .as_i64()
+}
+
 fn pod_for_replica(kubeconfig: &str, context: &str, replica_id: i64) -> Result<String> {
     Ok(kubectl(
         kubeconfig,
@@ -461,12 +469,9 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             .and_then(|members| {
                 members
                     .iter()
-                    .find(|member| member["identity"]["replicaId"].as_i64() == Some(2))
+                    .find(|member| member["replicaId"].as_i64() == Some(2))
             });
-        if ready
-            && let Some(instance) =
-                member.and_then(|member| member["identity"]["instanceId"].as_str())
-        {
+        if ready && let Some(instance) = member.and_then(|member| member["instanceId"].as_str()) {
             break instance.to_string();
         }
         if std::time::Instant::now() >= deadline {
@@ -568,9 +573,9 @@ fn replacement_preserves_quorum_write_and_retires_old_incarnation() -> Result<()
             .and_then(|members| {
                 members
                     .iter()
-                    .find(|member| member["identity"]["replicaId"].as_i64() == Some(2))
+                    .find(|member| member["replicaId"].as_i64() == Some(2))
             })
-            .and_then(|member| member["identity"]["instanceId"].as_str());
+            .and_then(|member| member["instanceId"].as_str());
         if ready && replacement.is_some_and(|instance| instance != old_instance) {
             break;
         }
@@ -767,9 +772,8 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
     let (old_primary, old_epoch) = loop {
         let value = set_status(&kubeconfig, &context)?;
         if status_ready(&value) {
-            let primary = value["status"]["topology"]["primaryId"]
-                .as_i64()
-                .context("ready topology omitted primaryId")?;
+            let primary =
+                topology_primary_id(&value).context("ready topology omitted a Primary member")?;
             let epoch = value["status"]["topology"]["epoch"]["configurationNumber"]
                 .as_i64()
                 .context("ready topology omitted configuration epoch")?;
@@ -795,7 +799,7 @@ fn failover_fences_old_primary_and_preserves_committed_data() -> Result<()> {
     let new_primary = loop {
         stop_replica_process(&kubeconfig, &context, old_primary)?;
         let value = set_status(&kubeconfig, &context)?;
-        let primary = value["status"]["topology"]["primaryId"].as_i64();
+        let primary = topology_primary_id(&value);
         let epoch = value["status"]["topology"]["epoch"]["configurationNumber"].as_i64();
         if status_ready(&value)
             && primary.is_some_and(|primary| primary != old_primary)
@@ -850,9 +854,7 @@ fn quorum_loss_closes_writes_and_recovers_without_data_loss_epoch_change() -> Re
         let value = set_status(&kubeconfig, &context)?;
         if status_ready(&value) {
             break (
-                value["status"]["topology"]["primaryId"]
-                    .as_i64()
-                    .context("ready topology omitted primaryId")?,
+                topology_primary_id(&value).context("ready topology omitted a Primary member")?,
                 value["status"]["topology"]["epoch"]["dataLossNumber"]
                     .as_i64()
                     .context("ready topology omitted data-loss epoch")?,
