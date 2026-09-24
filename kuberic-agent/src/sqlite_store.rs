@@ -581,7 +581,10 @@ impl LocalWriteJournal for SqliteStore {
                 [write.operation_id.as_str()],
             )?;
             if let Some(existing) = existing {
-                if existing.lsn != write.lsn || existing.data != write.data {
+                if existing.lsn != write.lsn
+                    || existing.committed_lsn != write.committed_lsn
+                    || existing.data != write.data
+                {
                     return Err(ContractError::AuthorityMismatch(
                         "local write identity or payload changed".into(),
                     ));

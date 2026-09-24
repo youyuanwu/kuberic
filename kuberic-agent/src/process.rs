@@ -244,6 +244,21 @@ where
             ready,
             shutdown_rx.clone(),
         ));
+        let mut outbound_task = tokio::spawn(run_outbound(
+            runtime.clone(),
+            transport.clone(),
+            dispatcher.clone(),
+            shutdown_rx.clone(),
+        ));
+        let mut peer_task = tokio::spawn(run_peer_discovery(
+            identity.local_identity,
+            runtime.clone(),
+            store.clone(),
+            transport,
+            dispatcher,
+            sessions,
+            shutdown_rx,
+        ));
         tokio::select! {
             result = &mut agent_task => {
                 result
@@ -252,27 +267,26 @@ where
                     "agent service stopped before becoming ready".into(),
                 ));
             }
+            result = &mut outbound_task => {
+                result
+                    .map_err(|error| AgentError::CommandRejected(error.to_string()))??;
+                return Err(AgentError::CommandRejected(
+                    "outbound progress stopped before agent readiness".into(),
+                ));
+            }
+            result = &mut peer_task => {
+                result
+                    .map_err(|error| AgentError::CommandRejected(error.to_string()))??;
+                return Err(AgentError::CommandRejected(
+                    "peer discovery stopped before agent readiness".into(),
+                ));
+            }
             result = ready_rx.wait_for(|ready| *ready) => {
                 result.map_err(|_| {
                     AgentError::CommandRejected("agent readiness channel closed".into())
                 })?;
             }
         }
-
-        let outbound_task = tokio::spawn(run_outbound(
-            runtime.clone(),
-            transport.clone(),
-            dispatcher.clone(),
-            shutdown_rx.clone(),
-        ));
-        let peer_task = tokio::spawn(run_peer_discovery(
-            identity.local_identity,
-            store.clone(),
-            transport,
-            dispatcher,
-            sessions,
-            shutdown_rx,
-        ));
         let supervisor_shutdown = shutdown.clone();
         let completion = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();

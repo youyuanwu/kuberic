@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
@@ -89,8 +90,23 @@ impl KvPersistence {
         self.state.lock().unwrap().values.get(key).cloned()
     }
 
-    pub fn snapshot(&self) -> BTreeMap<String, String> {
-        self.state.lock().unwrap().values.clone()
+    pub fn snapshot_at(&self, up_to_lsn: i64) -> Result<BTreeMap<String, String>> {
+        let state = self.state.lock().unwrap();
+        let mut values = BTreeMap::new();
+        for record in state
+            .operations
+            .range(..=up_to_lsn)
+            .map(|(_, record)| record)
+        {
+            match serde_json::from_slice::<Mutation>(&record.data)
+                .map_err(|error| RuntimeError::Application(error.to_string()))?
+            {
+                Mutation::Put { key, value } => {
+                    values.insert(key, value);
+                }
+            }
+        }
+        Ok(values)
     }
 
     pub fn encode_put(key: String, value: String) -> Result<Bytes> {
@@ -187,20 +203,44 @@ impl DurableState for KvPersistence {
             .ok_or_else(|| RuntimeError::Application("copy chunk path has no parent".into()))?;
         std::fs::create_dir_all(parent)
             .map_err(|error| RuntimeError::Application(error.to_string()))?;
-        if path.is_file() {
-            return if std::fs::read(&path)
-                .map_err(|error| RuntimeError::Application(error.to_string()))?
-                == chunk.data
-            {
-                Ok(())
-            } else {
-                Err(RuntimeError::AuthorityMismatch(
-                    "copy sequence was reused with different bytes".into(),
-                ))
-            };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(&chunk.data)
+                    .map_err(|error| RuntimeError::Application(error.to_string()))?;
+                file.sync_all()
+                    .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&path)
+                    .map_err(|error| RuntimeError::Application(error.to_string()))?
+                    == chunk.data
+                {
+                    std::fs::File::open(&path)
+                        .and_then(|file| file.sync_all())
+                        .map_err(|error| RuntimeError::Application(error.to_string()))?;
+                } else {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "copy sequence was reused with different bytes".into(),
+                    ));
+                }
+            }
+            Err(error) => return Err(RuntimeError::Application(error.to_string())),
         }
-        std::fs::write(path, chunk.data)
-            .map_err(|error| RuntimeError::Application(error.to_string()))
+        let mut directory = Some(parent);
+        while let Some(path) = directory {
+            std::fs::File::open(path)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| RuntimeError::Application(error.to_string()))?;
+            if path == self.root {
+                break;
+            }
+            directory = path.parent();
+        }
+        Ok(())
     }
 
     async fn verify_copy_chunk(
@@ -402,6 +442,37 @@ mod tests {
         let store = KvPersistence::open(directory.path()).unwrap();
         let mut operations = store.get_replication_operations(2, 1).await.unwrap();
         assert!(operations.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_at_reconstructs_the_frozen_build_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = KvPersistence::open(directory.path()).unwrap();
+        store
+            .apply(Operation {
+                lsn: 1,
+                committed_lsn: 0,
+                data: KvPersistence::encode_put("key".into(), "old".into()).unwrap(),
+            })
+            .await
+            .unwrap();
+        store
+            .apply(Operation {
+                lsn: 2,
+                committed_lsn: 1,
+                data: KvPersistence::encode_put("key".into(), "new".into()).unwrap(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.snapshot_at(1).unwrap().get("key").map(String::as_str),
+            Some("old")
+        );
+        assert_eq!(
+            store.snapshot_at(2).unwrap().get("key").map(String::as_str),
+            Some("new")
+        );
     }
 
     #[test]

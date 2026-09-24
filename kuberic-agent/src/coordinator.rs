@@ -9,7 +9,7 @@ use kuberic_runtime::application::OpenMode;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 
 use crate::Result;
-use crate::command::{admit_build, admit_configuration};
+use crate::command::{admit_build, admit_configuration, admit_persisted_configuration};
 use crate::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use crate::state::{CoordinatorStage, ReconfigurationRecord, RetainedCommandResult};
 use crate::store::{AgentStore, BeginConfiguration};
@@ -75,7 +75,19 @@ where
     ) -> Result<RetainedCommandResult> {
         let _command = self.command_lock.lock().await;
         let durable = self.store.load_state().await?;
-        let authority = admit_configuration(&command, &durable)?;
+        let persisted_exact = durable
+            .reconfiguration
+            .as_ref()
+            .is_some_and(|record| record.command.operation_id == command.operation_id)
+            || durable
+                .retained_command
+                .as_ref()
+                .is_some_and(|retained| retained.command.operation_id == command.operation_id);
+        let authority = if persisted_exact {
+            admit_persisted_configuration(&command, &durable)?
+        } else {
+            admit_configuration(&command, &durable)?
+        };
         match self.store.begin_configuration(&command).await? {
             BeginConfiguration::Completed(result) => return Ok(result),
             BeginConfiguration::Execute(_) | BeginConfiguration::Pending(_) => {}

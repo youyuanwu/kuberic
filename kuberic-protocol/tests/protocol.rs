@@ -1779,17 +1779,84 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
     };
     snapshot.status = *status;
 
+    snapshot.replicas.insert(
+        ReplicaObservationKey::new(
+            target.identity.replica_id,
+            target.identity.instance_id.clone(),
+        ),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Report(Box::new(AgentReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: snapshot.resource_uid.clone(),
+                identity: target.identity.clone(),
+                process_session_id: ProcessSessionId::new("returned-target"),
+                report_sequence: 1,
+                role: ReplicaRole::IdleSecondary,
+                healthy: true,
+                ..AgentReport::default()
+            })),
+        },
+    );
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(command)
+        } if command.local_replica_id == target.identity.replica_id
+            && !command.current_only
+            && command.previous_configuration.as_ref() == Some(&previous)
+            && command.current_configuration == current
+    ));
+    snapshot.replicas.remove(&ReplicaObservationKey::new(
+        target.identity.replica_id,
+        target.identity.instance_id.clone(),
+    ));
+
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("missing target quorum must accept Current Configuration");
+    };
+    let accepted = changes.into_iter().find_map(|change| match change {
+        KubernetesChange::PersistStatus { status } if status.transition.is_none() => Some(*status),
+        _ => None,
+    });
+    let accepted = accepted.expect("accepted replacement topology");
+    snapshot.status = accepted;
+    snapshot.replicas.insert(
+        ReplicaObservationKey::new(
+            target.identity.replica_id,
+            target.identity.instance_id.clone(),
+        ),
+        ReplicaObservation {
+            kubernetes: Some(KubernetesReplicaObservation {
+                replica_id: target.identity.replica_id,
+                pod_name: "returned-target".to_string(),
+                pod_uid: Some(PodUid::new(target.identity.instance_id.as_str())),
+                pvc_name: "returned-target-data".to_string(),
+                pvc_uid: Some(PvcUid::new("returned-target-pvc")),
+                image: Some("example:v1".to_string()),
+                pod_ready: true,
+                peer_endpoint_ready: true,
+            }),
+            agent: AgentObservation::Report(Box::new(AgentReport {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: snapshot.resource_uid.clone(),
+                identity: target.identity.clone(),
+                process_session_id: ProcessSessionId::new("returned-target"),
+                report_sequence: 2,
+                role: ReplicaRole::IdleSecondary,
+                healthy: true,
+                ..AgentReport::default()
+            })),
+        },
+    );
     assert!(matches!(
         evaluate(&snapshot, &EvaluationConfig::default()),
         Plan::Apply { changes }
-            if changes.iter().any(|change| matches!(
-                change,
-                KubernetesChange::PersistStatus { status }
-                    if status.transition.is_none()
-                        && status.topology.as_ref().is_some_and(|topology| {
-                            topology.configuration == current
-                        })
-            ))
+            if matches!(
+                changes.as_slice(),
+                [KubernetesChange::EnsureReplacementScaffolding { replacing, .. }]
+                    if replacing == &target.identity
+            )
     ));
 }
 
@@ -1884,4 +1951,5 @@ fn bootstrap_replacement_supersedes_only_a_never_installed_incarnation() {
     });
     let transition = transition.expect("superseded transition");
     assert_ne!(transition.current_configuration.members[1].identity, old);
+    assert_eq!(transition.current_configuration.epoch, Epoch::new(0, 2));
 }

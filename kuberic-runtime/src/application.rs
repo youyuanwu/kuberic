@@ -77,6 +77,8 @@ pub trait StateProvider: Send + Sync {
 
     async fn get_copy_context(&self) -> Result<OperationDataStream>;
 
+    /// Returns copy bytes frozen at `up_to_lsn`. Repeating an authorized build
+    /// at the same boundary must reproduce identical ordered bytes.
     async fn get_copy_state(
         &self,
         up_to_lsn: Lsn,

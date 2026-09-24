@@ -177,6 +177,7 @@ async fn sqlite_store_reopens_with_identity_authority_and_progress() {
     let write = DurableLocalWrite {
         operation_id: OperationId::new("write-1"),
         lsn: 8,
+        committed_lsn: 7,
         data: Bytes::from_static(b"value"),
         phase: LocalWritePhase::Registered,
     };

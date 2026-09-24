@@ -16,6 +16,7 @@ use kuberic_protocol::types::{
     ResourceUid, TransitionKind,
 };
 use kuberic_runtime::RuntimeError;
+use kuberic_runtime_internal::authority::AdmittedAuthority;
 use kuberic_runtime_internal::effects::{
     RoleTransition, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
 };
@@ -70,6 +71,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
             RuntimeEffectAction::ChangeApplicationRole(_) => "application-role",
             RuntimeEffectAction::AdmitBuildAuthority(_) => "admit-build",
             RuntimeEffectAction::BuildReplica { .. } => "build-replica",
+            RuntimeEffectAction::RetireBuild(_) => "retire-build",
             action => panic!("unexpected coordinator action {action:?}"),
         };
         self.calls.lock().unwrap().push(stage);
@@ -145,6 +147,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
                         completed: true,
                     });
             }
+            RuntimeEffectAction::RetireBuild(_) => {}
             _ => unreachable!(),
         }
         Ok(RuntimeEffectResult {
@@ -449,6 +452,107 @@ async fn bootstrap_resumes_the_enclosing_configuration_after_restart() {
             .as_str(),
         "resume-configuration"
     );
+}
+
+#[tokio::test]
+async fn current_only_replay_resumes_after_durable_pc_removal() {
+    let directory = tempdir().unwrap();
+    let local = identity();
+    let policy = EffectivePolicy::fixed(3, 30).unwrap();
+    let secondary = |id: i64, instance: &str| ConfigurationMember {
+        identity: ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(instance),
+            agent_generation: AgentGeneration::new(format!("generation-{instance}")),
+        },
+        role: ReplicaRole::ActiveSecondary,
+    };
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        local.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::Primary,
+            },
+            secondary(2, "secondary"),
+            secondary(3, "old"),
+        ],
+        policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        local.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: local.clone(),
+                role: ReplicaRole::Primary,
+            },
+            secondary(2, "secondary"),
+            secondary(3, "replacement"),
+        ],
+        policy.write_quorum,
+    );
+    let mut state = AgentState::new(StorageIdentity {
+        effective_policy: policy.clone(),
+        ..storage_identity()
+    });
+    state.role = ReplicaRole::Primary;
+    state.highest_epoch = current.epoch;
+    state.previous_configuration = Some(previous.clone());
+    state.current_configuration = Some(current.clone());
+    let store = Arc::new(
+        SqliteStore::create_authorized(
+            SqliteStore::metadata_database_path(directory.path()),
+            state,
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(FakeRuntime::new());
+    {
+        let mut runtime_state = runtime.state.lock().unwrap();
+        runtime_state.role = ReplicaRole::Primary;
+        runtime_state.authority = Some(AdmittedAuthority {
+            local_identity: local.clone(),
+            transition_kind: Some(TransitionKind::Replacement),
+            previous_configuration: Some(previous),
+            current_configuration: current.clone(),
+        });
+    }
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new("replacement-current-only"),
+        previous_configuration: None,
+        current_configuration: current.clone(),
+        previous_epoch: None,
+        current_epoch: current.epoch,
+        effective_policy: policy,
+        local_replica_id: local.replica_id,
+        expected_instance_id: local.instance_id,
+        expected_agent_generation: local.agent_generation,
+        transition_kind: TransitionKind::Replacement,
+        grant_write: false,
+        current_only: true,
+        retire_build_id: Some(OperationId::new("replacement-build")),
+    };
+    runtime.fail_once("read");
+    let coordinator = Coordinator::new(store.clone(), runtime.clone());
+    assert!(
+        coordinator
+            .ensure_configuration(command.clone())
+            .await
+            .is_err()
+    );
+    let interrupted = store.load_state().await.unwrap();
+    assert!(interrupted.previous_configuration.is_none());
+    assert!(interrupted.reconfiguration.is_some());
+
+    coordinator
+        .ensure_configuration(command.clone())
+        .await
+        .unwrap();
+    let calls = runtime.calls.lock().unwrap().clone();
+    coordinator.ensure_configuration(command).await.unwrap();
+    assert_eq!(*runtime.calls.lock().unwrap(), calls);
 }
 
 #[test]

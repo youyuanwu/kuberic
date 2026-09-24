@@ -907,6 +907,37 @@ exact replacement process restart, authority reconstruction, and another
 quorum write. The original fresh-bootstrap scenario remains a separate
 regression gate.
 
+The post-Phase-7 SF alignment review tightened supported recovery paths.
+Exact pending current-only commands are classified before fresh admission, so
+their own durable PC-removal postcondition cannot invalidate replay. Internal
+outbound and discovery workers start before peer-dependent reconstruction,
+while external command/data admission and application readiness remain
+closed. Exact peer reports under the installed fence supply truthful durable
+progress; a cold primary replays retained operations to a lagging current
+member rather than waiting for a new client write.
+
+A replacement member returning before acceptance first receives its missing
+PC/CC installation before current-only completion. If it returns behind after
+acceptance, the controller treats the non-primary lag as a serialized
+same-cardinality replacement instead of withdrawing usable-quorum routing.
+Bootstrap incarnation supersession allocates a newer configuration epoch, so
+surviving partial installation at the old write-closed epoch can converge
+without weakening same-epoch conflict rejection.
+
+Build retries retain the same durable build authority but cancel abandoned
+process-local streams before retry. Providers must reproduce identical ordered
+copy bytes for the same captured boundary; `kvstore2` reconstructs that
+snapshot from retained operations. Copy chunks and directory entries are
+synced before durable acknowledgement, final-copy completion is insufficient
+until the replication gap reaches current source progress, and payload-bearing
+delivery tasks are bounded.
+
+The durable local-write journal includes the original committed watermark.
+Restart reconstruction verifies and republishes the exact registered
+operation under restored valid primary authority without requiring the
+original client future. Ordinary KV reads consume the independent partition
+ReadStatus and return a retryable denial unless access is Granted.
+
 The following contracts remain assigned to later phases and block an
 end-to-end Service Fabric equivalence claim:
 
@@ -914,7 +945,9 @@ end-to-end Service Fabric equivalence claim:
 |---|---|
 | Live process-kill reconstruction while an active configuration, replacement, or failover command is between durable stages | Adversarial suite in Phase 9 |
 | Failover, quorum-loss, and destructive-recovery orchestration | Phases 8-9 |
+| Full-copy authorization for a present lagging member when retained primary history cannot close its missing prefix | Phase 8 retained-range/fallback work |
 | Exhaustive active-stage process-kill, listener-shutdown, and partition acceptance tests | Phase 9 |
+| Power-loss proof for provider sync contracts and delayed old bootstrap/build commands | Phase 9 |
 | Exhaustive source-public API inventory beyond reviewed application paths | Documentation/coexistence assessment in Phase 10 |
 
 The current classic design treats loss of process-local role, epoch, or action

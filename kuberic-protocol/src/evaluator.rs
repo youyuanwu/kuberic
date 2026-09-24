@@ -134,6 +134,17 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                         if report.reported_fault == Some(crate::types::FaultType::Permanent)
                 )
             });
+        let authorized_lag = snapshot
+            .observation_for_identity(&member.identity)
+            .is_some_and(|observation| {
+                matches!(
+                    &observation.agent,
+                    AgentObservation::Report(report)
+                        if report.role != ReplicaRole::Primary
+                            && report.write_status != AccessStatus::Granted
+                            && report.epoch < configuration.epoch
+                )
+            });
         let accepted_incarnation_missing = snapshot
             .observation_for_identity(&member.identity)
             .and_then(|observation| observation.kubernetes.as_ref())
@@ -144,7 +155,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                     kubernetes.pod_uid.is_none() && kubernetes.pvc_uid.is_some()
                 })
         });
-        permanent_fault || (accepted_incarnation_missing && orphaned_storage)
+        permanent_fault || authorized_lag || (accepted_incarnation_missing && orphaned_storage)
     }) {
         let candidate = snapshot.replicas.iter().find(|(key, observation)| {
             key.replica_id == failed.identity.replica_id
@@ -635,7 +646,10 @@ fn evaluate_transition(
             })
             .collect();
         let current = ConfigurationDescriptor::new(
-            transition.current_configuration.epoch,
+            Epoch::new(
+                transition.current_configuration.epoch.data_loss_number,
+                transition.current_configuration.epoch.configuration_number + 1,
+            ),
             transition.current_configuration.primary_id,
             members,
             transition.current_configuration.write_quorum,
@@ -1037,10 +1051,30 @@ fn evaluate_replacement_transition(
         let AgentObservation::Report(report) = &observation.agent else {
             continue;
         };
-        let operation_id = replacement_current_only_operation_id(transition, member);
-        let installed = report.epoch == current.epoch
+        let has_outstanding_authority = report.epoch == current.epoch
+            && report.previous_configuration.as_ref() == Some(previous)
+            && report.current_configuration.as_ref() == Some(current);
+        let has_current_only_authority = report.epoch == current.epoch
             && report.previous_configuration.is_none()
-            && report.current_configuration.as_ref() == Some(current)
+            && report.current_configuration.as_ref() == Some(current);
+        if !has_outstanding_authority && !has_current_only_authority {
+            return Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(
+                    replacement_configuration_command(
+                        previous,
+                        current,
+                        member,
+                        &transition.effective_policy,
+                        replacement_install_operation_id(transition, member),
+                        member.identity == primary.identity,
+                        false,
+                        None,
+                    ),
+                )),
+            };
+        }
+        let operation_id = replacement_current_only_operation_id(transition, member);
+        let installed = has_current_only_authority
             && report.pending_operation_id.is_none()
             && report.retained_operation_id.as_ref() == Some(&operation_id);
         if !installed {

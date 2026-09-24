@@ -153,8 +153,9 @@ async fn get_value(
 ) -> std::result::Result<String, StatusCode> {
     state
         .application
-        .persistence()
         .get(&key)
+        .await
+        .map_err(|error| runtime_http_error(error).0)?
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -172,7 +173,8 @@ async fn get_status(
 fn runtime_http_error(error: kuberic_runtime::RuntimeError) -> (StatusCode, String) {
     let status = match error {
         kuberic_runtime::RuntimeError::NotPrimary
-        | kuberic_runtime::RuntimeError::WriteClosed(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | kuberic_runtime::RuntimeError::WriteClosed(_)
+        | kuberic_runtime::RuntimeError::ReadClosed(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, error.to_string())

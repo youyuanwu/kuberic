@@ -39,7 +39,7 @@ impl StateProvider for KvStateProvider {
 
     async fn get_copy_state(
         &self,
-        _up_to_lsn: i64,
+        up_to_lsn: i64,
         mut copy_context: OperationDataStream,
     ) -> Result<OperationDataStream> {
         use futures::StreamExt;
@@ -48,7 +48,7 @@ impl StateProvider for KvStateProvider {
                 "kvstore2 does not use a copy context".into(),
             ));
         }
-        snapshot_stream(self.persistence.snapshot())
+        snapshot_stream(self.persistence.snapshot_at(up_to_lsn)?)
     }
 
     async fn on_data_loss(&self) -> Result<bool> {

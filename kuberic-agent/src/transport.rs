@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use kuberic_protocol::command::EnsureReplicaBuild;
+use kuberic_protocol::observation::{AgentObservation, AgentReport};
 use kuberic_protocol::types::{
     ProcessSessionId, ReplicaId, ReplicaIdentity, ResourceUid, derive_replica_endpoint_name,
 };
@@ -136,6 +137,10 @@ where
     }
 
     pub async fn peer_session(&self, receiver: &ReplicaIdentity) -> Result<ProcessSessionId> {
+        Ok(self.peer_report(receiver).await?.process_session_id)
+    }
+
+    pub async fn peer_report(&self, receiver: &ReplicaIdentity) -> Result<AgentReport> {
         let endpoint = self.resolver.control_endpoint(receiver);
         let mut client = tokio::time::timeout(
             self.deadline,
@@ -156,24 +161,19 @@ where
             .map_err(|_| AgentError::SessionRejected("peer status request timed out".into()))?
             .map_err(|error| AgentError::SessionRejected(error.to_string()))?
             .into_inner();
-        kuberic_wire::validate_agent_status_report(&report)
-            .map_err(|error| AgentError::SessionRejected(error.to_string()))?;
-        let observed = report
-            .identity
-            .clone()
-            .ok_or_else(|| AgentError::SessionRejected("peer is not initialized".into()))?;
-        let observed: ReplicaIdentity =
-            observed
-                .try_into()
-                .map_err(|error: kuberic_wire::WireError| {
-                    AgentError::SessionRejected(error.to_string())
-                })?;
-        if observed != *receiver {
+        let AgentObservation::Report(report) = kuberic_wire::normalize_agent_status_report(report)
+            .map_err(|error| AgentError::SessionRejected(error.to_string()))?
+        else {
+            return Err(AgentError::SessionRejected(
+                "peer is not initialized".into(),
+            ));
+        };
+        if report.identity != *receiver {
             return Err(AgentError::SessionRejected(
                 "peer status returned another exact identity".into(),
             ));
         }
-        Ok(ProcessSessionId::new(report.process_session_id))
+        Ok(*report)
     }
 
     async fn dispatch_build(&self, endpoint: ReplicaEndpoint) -> Result<()> {
@@ -185,6 +185,15 @@ where
                 .clone()
         };
         let _build = build_lock.lock().await;
+        let build_id = endpoint.build_id.clone();
+        let result = self.dispatch_build_locked(endpoint).await;
+        if result.is_err() {
+            let _ = self.runtime.cancel_outbound_build(&build_id).await;
+        }
+        result
+    }
+
+    async fn dispatch_build_locked(&self, endpoint: ReplicaEndpoint) -> Result<()> {
         if self
             .completed_builds
             .lock()
@@ -198,6 +207,7 @@ where
             build.authority.build_id == endpoint.build_id
                 && build.authority.target == endpoint.identity
                 && build.completed
+                && build.durable_lsn >= snapshot.current_progress
         }) {
             return Ok(());
         }
@@ -428,6 +438,7 @@ pub async fn run_outbound<D: OutboundDispatcher + 'static>(
     dispatcher: Arc<D>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    const MAX_CONCURRENT_DELIVERIES: usize = 64;
     let data_plane = runtime.data_plane();
     let mut deliveries = tokio::task::JoinSet::new();
     loop {
@@ -442,10 +453,19 @@ pub async fn run_outbound<D: OutboundDispatcher + 'static>(
                     tracing::warn!(%error, "outbound delivery task failed");
                 }
             }
-            outbound = data_plane.next_domain_outbound() => {
+            outbound = data_plane.next_domain_outbound(),
+                if deliveries.len() < MAX_CONCURRENT_DELIVERIES =>
+            {
                 let Some(outbound) = outbound else {
-                    deliveries.abort_all();
-                    return Ok(());
+                    let mut retry_shutdown = shutdown.clone();
+                    tokio::select! {
+                        _ = wait_for_shutdown_signal(&mut retry_shutdown) => {
+                            deliveries.abort_all();
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                    }
+                    continue;
                 };
                 deliveries.spawn(deliver_outbound(
                     transport.clone(),
@@ -519,6 +539,7 @@ async fn deliver_outbound<D: OutboundDispatcher>(
 
 pub async fn run_peer_discovery<S, R>(
     local: ReplicaIdentity,
+    runtime: Arc<PodRuntime>,
     store: Arc<S>,
     transport: Arc<Mutex<ReliableTransport>>,
     dispatcher: Arc<GrpcOutboundDispatcher<R>>,
@@ -533,20 +554,37 @@ where
         if *shutdown.borrow_and_update() {
             return Ok(());
         }
-        if let Some(configuration) = store.load_state().await?.current_configuration {
+        let state = store.load_state().await?;
+        if let Some(configuration) = state.current_configuration {
             for member in configuration
                 .members
-                .into_iter()
+                .iter()
                 .filter(|member| member.identity != local)
             {
-                if let Ok(session) = dispatcher.peer_session(&member.identity).await {
+                if let Ok(report) = dispatcher.peer_report(&member.identity).await {
+                    let session = report.process_session_id.clone();
                     sessions
                         .register_peer(member.identity.clone(), session.clone())
                         .await;
                     transport
                         .lock()
                         .await
-                        .admit_peer(member.identity, session)?;
+                        .admit_peer(member.identity.clone(), session)?;
+                    if report.epoch == configuration.epoch
+                        && report.current_configuration.as_ref() == Some(&configuration)
+                        && report.previous_configuration == state.previous_configuration
+                        && runtime
+                            .record_durable_peer_progress(
+                                report.identity.clone(),
+                                report.current_progress,
+                            )
+                            .await
+                            .is_ok()
+                    {
+                        let _ = runtime
+                            .repair_peer(report.identity, report.current_progress)
+                            .await;
+                    }
                 }
             }
         }

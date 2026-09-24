@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use kuberic_protocol::types::{
-    AccessStatus, Epoch, FaultType, LoadMetric, PartitionId, PartitionInformation, ReplicaIdentity,
-    ReplicaRole,
+    AccessStatus, Epoch, FaultType, LoadMetric, OperationId, PartitionId, PartitionInformation,
+    ReplicaIdentity, ReplicaRole,
 };
 use kuberic_runtime::application::{
     ClientWrite, OpenContext, OpenMode, StateProvider, StatefulServiceReplica, WriteReceipt,
@@ -309,6 +309,9 @@ impl PodRuntime {
                 })
                 .await?;
             self.host.sync_access_projection(managed.as_ref()).await;
+            if write_status == AccessStatus::Granted {
+                managed.recover_pending_writes().await?;
+            }
         } else {
             let mut state = self.host.state.write().await;
             state.fallback_snapshot.read_status = read_status;
@@ -351,6 +354,25 @@ impl PodRuntime {
             .control
             .catch_up_capability()
             .await
+    }
+
+    pub async fn record_durable_peer_progress(
+        &self,
+        identity: ReplicaIdentity,
+        progress: i64,
+    ) -> Result<()> {
+        self.host
+            .managed()?
+            .record_durable_peer_progress(identity, progress)
+            .await
+    }
+
+    pub async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
+        self.host.managed()?.cancel_outbound_build(build_id).await
+    }
+
+    pub async fn repair_peer(&self, identity: ReplicaIdentity, progress: i64) -> Result<()> {
+        self.host.managed()?.repair_peer(identity, progress).await
     }
 
     pub async fn partition_report(&self) -> PartitionReportSnapshot {

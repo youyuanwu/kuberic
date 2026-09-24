@@ -16,8 +16,8 @@ use kuberic_runtime_internal::transport::{
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot, watch};
 
 use crate::application::{
-    ClientWrite, DurableApplicationAck, DurableApplicationProgress, Operation, OperationDataStream,
-    StateProvider, WriteReceipt,
+    ClientWrite, DurableApplicationAck, DurableApplicationProgress, Lsn, Operation,
+    OperationDataStream, StateProvider, WriteReceipt,
 };
 use crate::authority::{
     AdmittedAuthority, BuildAuthority, BuildAuthorityKind, BuildAuthorityStore, BuildProgressStore,
@@ -55,6 +55,7 @@ struct RuntimeState {
     outbound_builds: BTreeMap<OperationId, OutboundBuild>,
     removed_replicas: BTreeSet<ReplicaId>,
     local_writes: BTreeMap<OperationId, DurableLocalWrite>,
+    peer_repair_targets: BTreeMap<ReplicaIdentity, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +229,7 @@ impl DefaultReplicatorInner {
                 outbound_builds: BTreeMap::new(),
                 removed_replicas: BTreeSet::new(),
                 local_writes: BTreeMap::new(),
+                peer_repair_targets: BTreeMap::new(),
             }),
             effect_lock: Mutex::new(()),
             copy_prepare_lock: Mutex::new(()),
@@ -256,6 +258,126 @@ impl DefaultReplicatorInner {
         } else {
             Ok(())
         }
+    }
+
+    async fn recover_pending_local_writes(&self) -> Result<()> {
+        let writes = self
+            .state
+            .read()
+            .await
+            .local_writes
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for durable in writes {
+            let write = ClientWrite {
+                operation_id: durable.operation_id.clone(),
+                data: durable.data.clone(),
+            };
+            let mut pending = self.begin_write(write.clone()).await?;
+            loop {
+                self.publish_replication(&pending).await?;
+                match pending.committed().await {
+                    Ok(_) => break,
+                    Err(RuntimeError::WriteCompletionClosed) => {
+                        pending = self.begin_write(write.clone()).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn repair_peer_from_history(
+        &self,
+        identity: ReplicaIdentity,
+        peer_progress: i64,
+    ) -> Result<()> {
+        self.require_primary().await?;
+        let (authority, current_progress) = {
+            let mut state = self.state.write().await;
+            let authority = state
+                .authority
+                .clone()
+                .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+            if !authority
+                .current_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == identity)
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "peer repair target is outside Current Configuration".into(),
+                ));
+            }
+            if peer_progress >= state.current_progress {
+                state.peer_repair_targets.remove(&identity);
+                return Ok(());
+            }
+            if state
+                .peer_repair_targets
+                .get(&identity)
+                .is_some_and(|target| *target >= state.current_progress)
+            {
+                return Ok(());
+            }
+            let current_progress = state.current_progress;
+            state
+                .peer_repair_targets
+                .insert(identity.clone(), current_progress);
+            (authority, current_progress)
+        };
+
+        let result = async {
+            let mut operations = self
+                .storage()
+                .await?
+                .get_replication_operations(peer_progress + 1, current_progress)
+                .await?;
+            let mut expected = peer_progress + 1;
+            while let Some(operation) = operations.next().await {
+                let operation = operation?;
+                if operation.lsn != expected {
+                    return Err(RuntimeError::InvalidReplication(
+                        "retained history cannot repair the peer contiguously".into(),
+                    ));
+                }
+                expected += 1;
+                self.send_outbound(OutboundOperation::Replication(ReplicationItem {
+                    sender: self.identity.clone(),
+                    receiver: identity.clone(),
+                    epoch: authority.current_configuration.epoch,
+                    previous_configuration_id: authority
+                        .previous_configuration
+                        .as_ref()
+                        .map(|configuration| configuration.configuration_id.clone()),
+                    current_configuration_id: authority
+                        .current_configuration
+                        .configuration_id
+                        .clone(),
+                    lsn: operation.lsn,
+                    committed_lsn: operation.committed_lsn,
+                    data: operation.data,
+                }))
+                .await?;
+            }
+            if expected != current_progress + 1 {
+                return Err(RuntimeError::InvalidReplication(
+                    "retained history is unavailable; full copy is required".into(),
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.state
+                .write()
+                .await
+                .peer_repair_targets
+                .remove(&identity);
+        }
+        result
     }
 
     fn check_delivery_generation(&self, generation: u64) -> Result<()> {
@@ -800,10 +922,14 @@ impl DefaultReplicatorInner {
             }
             existing
         } else {
-            let lsn = self.replicator.lock().await.reserve_write(&write)?;
+            let mut replicator = self.replicator.lock().await;
+            let committed_lsn = replicator.committed_lsn();
+            let lsn = replicator.reserve_write(&write)?;
+            drop(replicator);
             let reserved = DurableLocalWrite {
                 operation_id: write.operation_id.clone(),
                 lsn,
+                committed_lsn,
                 data: write.data.clone(),
                 phase: LocalWritePhase::Reserved,
             };
@@ -818,7 +944,7 @@ impl DefaultReplicatorInner {
             reserved
         };
         let lsn = durable_write.lsn;
-        let committed_lsn = self.replicator.lock().await.committed_lsn();
+        let committed_lsn = durable_write.committed_lsn;
         let operation = Operation {
             lsn,
             committed_lsn,
@@ -2460,6 +2586,14 @@ impl ManagedReplicator for DefaultReplicatorInner {
         self.restore_authority().await
     }
 
+    async fn recover_pending_writes(&self) -> Result<()> {
+        self.recover_pending_local_writes().await
+    }
+
+    async fn repair_peer(&self, identity: ReplicaIdentity, progress: Lsn) -> Result<()> {
+        self.repair_peer_from_history(identity, progress).await
+    }
+
     async fn execute_action(&self, action: RuntimeEffectAction) -> Result<()> {
         if matches!(
             action,
@@ -2499,6 +2633,25 @@ impl ManagedReplicator for DefaultReplicatorInner {
 
     async fn accept_acknowledgement(&self, acknowledgement: ReplicationAck) -> Result<()> {
         self.accept_acknowledgement(acknowledgement).await
+    }
+
+    async fn record_durable_peer_progress(
+        &self,
+        identity: ReplicaIdentity,
+        progress: Lsn,
+    ) -> Result<()> {
+        self.replicator
+            .lock()
+            .await
+            .record_durable_replica_progress(identity, progress)?;
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    async fn cancel_outbound_build(&self, build_id: &OperationId) -> Result<()> {
+        self.state.write().await.outbound_builds.remove(build_id);
+        self.changed.notify_waiters();
+        Ok(())
     }
 
     async fn prepare_copy(&self, request: PrepareCopyRequest) -> Result<PreparedCopy> {

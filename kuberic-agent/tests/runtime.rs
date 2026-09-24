@@ -1257,6 +1257,7 @@ async fn restarted_state_replicator_does_not_poison_retry_with_a_different_write
         DurableLocalWrite {
             operation_id: OperationId::new("sf:old-session:1"),
             lsn: 1,
+            committed_lsn: 0,
             data: Bytes::from_static(b"pending-a"),
             phase: kuberic_runtime_internal::authority::LocalWritePhase::Registered,
         },
@@ -1299,6 +1300,82 @@ async fn restarted_state_replicator_does_not_poison_retry_with_a_different_write
             .unwrap(),
         1
     );
+}
+
+#[tokio::test]
+async fn reconstruction_republishes_the_original_registered_write_without_a_client() {
+    let local = identity(1, "primary");
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let admitted = authority(local.clone(), vec![local.clone()]);
+    *store.authority.lock().unwrap() = Some(admitted);
+    store.local_writes.lock().unwrap().insert(
+        OperationId::new("sf:old-session:3"),
+        DurableLocalWrite {
+            operation_id: OperationId::new("sf:old-session:3"),
+            lsn: 3,
+            committed_lsn: 2,
+            data: Bytes::from_static(b"pending-three"),
+            phase: kuberic_runtime_internal::authority::LocalWritePhase::Registered,
+        },
+    );
+    let application = Arc::new(TestApplication::default());
+    application.applied.lock().unwrap().insert(
+        3,
+        Operation {
+            lsn: 3,
+            committed_lsn: 2,
+            data: Bytes::from_static(b"pending-three"),
+        },
+    );
+    *application.progress.lock().unwrap() = DurableApplicationProgress {
+        applied_lsn: 3,
+        committed_lsn: 2,
+    };
+    let runtime = PodRuntime::new(local, application, store.clone());
+    runtime
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            AccessStatus::Granted,
+            AccessStatus::Granted,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.snapshot().await.committed_lsn, 3);
+    assert_eq!(
+        store
+            .local_writes
+            .lock()
+            .unwrap()
+            .get(&OperationId::new("sf:old-session:3"))
+            .unwrap()
+            .phase,
+        kuberic_runtime_internal::authority::LocalWritePhase::Committed
+    );
+}
+
+#[tokio::test]
+async fn cold_primary_replays_retained_history_to_a_lagging_current_peer() {
+    let primary = identity(1, "primary");
+    let secondary = identity(2, "secondary");
+    let application = Arc::new(TestApplication::default());
+    application.seed_operation(1, Bytes::from_static(b"one"));
+    let runtime = open_primary(application, vec![primary.clone(), secondary.clone()]).await;
+
+    runtime.repair_peer(secondary.clone(), 0).await.unwrap();
+    let OutboundReplication::Replication(item) =
+        runtime.data_plane().next_outbound().await.unwrap()
+    else {
+        panic!("expected retained replication repair");
+    };
+    assert_eq!(
+        item.receiver.as_ref().map(|identity| identity.replica_id),
+        Some(secondary.replica_id.value())
+    );
+    assert_eq!(item.lsn, 1);
+    assert_eq!(item.data, b"one");
 }
 
 #[tokio::test]

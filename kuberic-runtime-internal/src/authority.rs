@@ -61,6 +61,8 @@ pub enum LocalWritePhase {
 pub struct DurableLocalWrite {
     pub operation_id: OperationId,
     pub lsn: i64,
+    #[serde(default)]
+    pub committed_lsn: i64,
     pub data: Bytes,
     pub phase: LocalWritePhase,
 }

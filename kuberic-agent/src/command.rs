@@ -22,6 +22,21 @@ pub fn admit_configuration(
     command: &EnsureConfiguration,
     state: &AgentState,
 ) -> Result<AdmittedAuthority> {
+    admit_configuration_with_replay(command, state, false)
+}
+
+pub fn admit_persisted_configuration(
+    command: &EnsureConfiguration,
+    state: &AgentState,
+) -> Result<AdmittedAuthority> {
+    admit_configuration_with_replay(command, state, true)
+}
+
+fn admit_configuration_with_replay(
+    command: &EnsureConfiguration,
+    state: &AgentState,
+    persisted_exact_replay: bool,
+) -> Result<AdmittedAuthority> {
     if command.operation_id.is_empty() {
         return Err(AgentError::CommandRejected(
             "operation ID must not be empty".into(),
@@ -60,8 +75,15 @@ pub fn admit_configuration(
         && state.current_configuration.as_ref() == Some(&command.current_configuration)
         && state.previous_configuration.is_some()
         && command.previous_configuration.is_none();
+    let completed_current_only_replay = persisted_exact_replay
+        && command.current_only
+        && command.current_epoch == state.highest_epoch
+        && state.current_configuration.as_ref() == Some(&command.current_configuration)
+        && state.previous_configuration.is_none()
+        && command.previous_configuration.is_none();
     if command.current_epoch == state.highest_epoch
         && !current_only_completion
+        && !completed_current_only_replay
         && state
             .current_configuration
             .as_ref()
@@ -73,6 +95,7 @@ pub fn admit_configuration(
     }
     if command.current_epoch == state.highest_epoch
         && !current_only_completion
+        && !completed_current_only_replay
         && state.previous_configuration != command.previous_configuration
     {
         return Err(AgentError::CommandRejected(
@@ -103,7 +126,7 @@ pub fn admit_configuration(
     }
     if command.current_only {
         if command.previous_configuration.is_some()
-            || !current_only_completion
+            || (!current_only_completion && !completed_current_only_replay)
             || command.transition_kind == TransitionKind::Bootstrap
         {
             return Err(AgentError::CommandRejected(

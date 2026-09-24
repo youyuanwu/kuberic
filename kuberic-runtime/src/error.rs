@@ -19,6 +19,8 @@ pub enum RuntimeError {
     QueueFull,
     #[error("writes are closed with status {0:?}")]
     WriteClosed(AccessStatus),
+    #[error("reads are closed with status {0:?}")]
+    ReadClosed(AccessStatus),
     #[error("durable authority has not been admitted")]
     AuthorityNotAdmitted,
     #[error("authority mismatch: {0}")]

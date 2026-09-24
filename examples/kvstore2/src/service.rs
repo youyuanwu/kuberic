@@ -6,6 +6,7 @@ use kuberic_runtime::application::{OpenContext, RoleChange, StatefulServiceRepli
 use kuberic_runtime::replicator::stream::{OperationMetadata, OperationStream};
 use kuberic_runtime::replicator::{
     DefaultReplicatorFactory, Replicator, ReplicatorSettings, StateReplicator,
+    StatefulServicePartition,
 };
 use kuberic_runtime::{Result, RuntimeError};
 use tokio::sync::RwLock;
@@ -17,6 +18,7 @@ pub struct KvService {
     provider: Arc<KvStateProvider>,
     replication_address: String,
     state_replicator: RwLock<Option<Arc<dyn StateReplicator>>>,
+    partition: RwLock<Option<StatefulServicePartition>>,
     role: Mutex<ReplicaRole>,
 }
 
@@ -26,6 +28,7 @@ impl KvService {
             provider: Arc::new(KvStateProvider::new(persistence)),
             replication_address,
             state_replicator: RwLock::new(None),
+            partition: RwLock::new(None),
             role: Mutex::new(ReplicaRole::None),
         }
     }
@@ -44,11 +47,32 @@ impl KvService {
             .replicate(data)
             .await
     }
+
+    pub async fn get(&self, key: &str) -> Result<Option<String>> {
+        let partition = self
+            .partition
+            .read()
+            .await
+            .clone()
+            .ok_or(RuntimeError::NotOpen)?;
+        let status = partition.get_read_status().await?;
+        require_read_access(status)?;
+        Ok(self.persistence().get(key))
+    }
+}
+
+fn require_read_access(status: kuberic_protocol::types::AccessStatus) -> Result<()> {
+    if status == kuberic_protocol::types::AccessStatus::Granted {
+        Ok(())
+    } else {
+        Err(RuntimeError::ReadClosed(status))
+    }
 }
 
 #[async_trait]
 impl StatefulServiceReplica for KvService {
     async fn open(self: Arc<Self>, context: OpenContext) -> Result<Arc<dyn Replicator>> {
+        *self.partition.write().await = Some(context.partition.clone());
         let interfaces = context
             .partition
             .with_factory(Arc::new(DefaultReplicatorFactory::new(
@@ -83,11 +107,15 @@ impl StatefulServiceReplica for KvService {
 
     async fn close(&self) -> Result<()> {
         self.state_replicator.write().await.take();
+        self.partition.write().await.take();
         *self.role.lock().unwrap() = ReplicaRole::None;
         Ok(())
     }
 
     fn abort(&self) {
+        if let Ok(mut partition) = self.partition.try_write() {
+            partition.take();
+        }
         if let Ok(mut role) = self.role.lock() {
             *role = ReplicaRole::None;
         }
@@ -107,6 +135,7 @@ async fn consume_stream(persistence: Arc<KvPersistence>, mut stream: OperationSt
                     })
                     .await
             }
+
             OperationMetadata::Copy { build_id, sequence } => {
                 match persistence
                     .apply_copy_chunk(

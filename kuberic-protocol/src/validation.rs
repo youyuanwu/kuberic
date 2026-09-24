@@ -516,6 +516,18 @@ fn validate_report_authority(
         && accepted_exact
         && report.epoch < accepted.epoch
     {
+        let accepted_member = accepted
+            .members
+            .iter()
+            .find(|member| member.identity == report.identity)
+            .expect("accepted exact identity has a member");
+        if snapshot.status.transition.is_none()
+            && accepted_member.role != ReplicaRole::Primary
+            && report.role != ReplicaRole::Primary
+            && report.write_status != AccessStatus::Granted
+        {
+            return Ok(());
+        }
         return Err(ValidationError::StaleReplicaEpoch {
             replica_id: report.identity.replica_id.value(),
             observed: report.epoch,

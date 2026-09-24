@@ -23,6 +23,8 @@ pub trait DurableState: Send + Sync {
         from_lsn: Lsn,
         to_lsn: Lsn,
     ) -> Result<RetainedOperationStream>;
+    /// Returns only after the chunk and required directory entries are durable.
+    /// An exact retry must verify identical bytes for the same build sequence.
     async fn apply_copy_chunk(
         &self,
         build_id: &OperationId,
