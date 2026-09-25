@@ -18,8 +18,8 @@ dependencies. Controllers and agents exchange these canonical types through
 transport adapters such as `kuberic-wire`.
 
 The evaluator covers write-closed bootstrap, same-cardinality replacement,
-ordinary failover, planned switchover, and quorum loss. Failover persists exact
-failure timing, fences routing before newer authority, requires PC and
+ordinary failover, planned switchover, secondary scale-down, and quorum loss.
+Failover persists exact failure timing, fences routing before newer authority, requires PC and
 outstanding-CC read quorum, selects from epoch-fenced deactivation/progress evidence, authorizes
 only the elected safe prefix under the new fence, performs retained-history or
 full-copy repair, and accepts only current-only quorum evidence. Quorum loss
@@ -38,14 +38,16 @@ runtimes may validate canonical protocol values, but they do not select a new
 configuration or infer authority from Kubernetes readiness, routing, or raw
 application progress.
 
-The supported evaluator contract is fixed-cardinality bootstrap,
-same-cardinality replacement, ordinary failover, planned switchover, and
-non-destructive quorum loss/recovery. Scaling, timed replica dropping,
-destructive data-loss recovery, and mixed-version negotiation remain fail-closed.
+The supported evaluator contract is full-set bootstrap,
+same-cardinality replacement, ordinary failover, planned switchover,
+secondary-only scale-down, and non-destructive quorum loss/recovery. Scale-up,
+primary removal, timed replica dropping, destructive data-loss recovery, and
+mixed-version negotiation remain fail-closed.
 
 Protocol 6 defines secondary scale-down, with pure evaluation available behind
-`EvaluationConfig::enable_secondary_scale_down` (default **false**). Its typed
-intent removes exactly the highest logical-ID committed secondary, preserves
+`EvaluationConfig::enable_secondary_scale_down` (library default **false**,
+enabled by the production controller). Its typed intent removes exactly the
+highest logical-ID committed secondary, preserves
 the exact primary and retained members, and validates previous/reduced majority
 policies independently (including 2→1). Preparation freezes a durable
 write-closed primary boundary; admission carries retained previous-read-quorum
@@ -54,9 +56,9 @@ evidence including the unchanged primary. The removed member supplies no reduced
 credit. Cleanup freezes Pod, PVC, and endpoint names and UIDs, or explicit
 authoritative exact-name absence, separately from accepted topology.
 
-Production reconciliation rejects these active contracts without emitting
-removal commands. Protocol tests explicitly enable the capability. The pure
-evaluator freezes intent before preparation, persists PC read evidence before
+Lowering `spec.replicas` requests sequential single-secondary removal; the desired
+count is target and minimum, down to one. Increasing accepted membership is unsupported.
+The evaluator freezes intent before preparation, persists PC read evidence before
 reduced PC/CC dispatch, freezes reduced write evidence before current-only
 dispatch, and atomically accepts reduced topology/policy with a cleanup receipt.
 Each command uses one freshly observed exact session; target availability never
@@ -67,18 +69,19 @@ Post-commit local receipt publication (`AcceptSecondaryRemovalCommit`), stable
 write grant, routing, retirement, and resource cleanup are separate decisions.
 The local publication command binds one retained identity and the immutable
 commit evidence; it bridges the runtime's existing accepted-receipt gate rather
-than treating current-only admission as permission to write. Its transport,
-agent dispatch, and normalized report population are deliberately not implemented
-in this phase. Controller integration must implement those together with exact
-resource observation and execution before enabling the capability.
+than treating current-only admission as permission to write. Commands and reports
+are wired through the controller, wire adapter, and durable agent execution;
+the controller performs exact-resource observation and deletion.
 
 `SecondaryScaleDownResourceObservation` requires authoritative exact-name
-lookups and a proven Pod/mounted-PVC mapping. Controller normalization currently
-supplies none. `DeleteScaleDownResource` carries frozen name/UID and fresh resource
-version and is explicitly rejected by the production executor. Endpoint cleanup
+lookups and a proven Pod/mounted-PVC mapping. `DeleteScaleDownResource` carries
+frozen name/UID and fresh resource version. Endpoint cleanup
 precedes exact Pod fencing; PVC cleanup requires authoritative Pod-UID absence.
 Same-name replacement UIDs are never adopted or deleted, including after the
 cleanup obligation is cleared. Unknown extra resources do not confer deletion authority.
+The target never contributes reduced quorum credit; after commit, exact Pod
+deletion and observed absence substitute for an unavailable local retirement
+reply. Cleanup permanently deletes the frozen PVC and serializes new operations.
 Existing status JSON defaults the optional fields to absent; absence never
 supplies scale-down authority.
 
@@ -141,7 +144,8 @@ UID/resourceVersion-fenced, and preserves PVCs. The terminal unsafe receipt is
 published only after that proof; it never starts ordinary failover or replacement.
 
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
-for the complete operational contract.
+and [secondary scale-down](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
+for usage, target/minimum risks, and the protocol-6/schema-2 fresh-deployment contract.
 
 Replacement admission durably records `pendingReplacementCleanup` **before**
 creating replacement scaffolding or provisioning. Authoritative exact-name GETs

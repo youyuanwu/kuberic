@@ -15,3 +15,12 @@ replaces the former single-set NodePort setup. Run
 `just prepare-external-dependencies` once before creating or installing the
 cluster; subsequent installation uses only the verified local manifests and
 Helm charts.
+
+For the independent `operator.kuberic.io/v1alpha1` stack, follow the
+[level-triggered deployment and testing guide](features/kuberic/level-triggered-operator.md#local-deployment).
+Use fresh protocol-6/schema-2 storage and an owned cluster. The live
+`just level-triggered-kind-test scale-down` and `scale-down-adversarial`
+selectors exercise secondary removal; `all` runs the seven-scenario matrix
+from fresh bootstrap. Standalone failover needs a separate fresh cluster.
+See [tests and diagnostics](features/kuberic/level-triggered-operator.md#tests-and-diagnostics)
+for CI tiers, measurements, and cleanup.

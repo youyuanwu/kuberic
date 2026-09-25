@@ -1,7 +1,8 @@
 # Kuberic v1 Retirement Plan
 
-> **Status:** In progress — Workstream 1 implemented and validated; broader
-> retirement remains proposed.
+> **Status:** In progress — Workstream 1 implemented and validated; Workstream 2
+> partially complete (secondary scale-down implemented and validated). Scale-up,
+> primary-removal behavior, and broader retirement remain outstanding.
 >
 > **Goal:** Make the level-triggered stack the default Kuberic implementation,
 > deprecate the classic v1 stack, and eventually remove it.
@@ -25,7 +26,8 @@ available or destructive recovery path.
 The work should proceed in this order:
 
 1. Add planned switchover to v2 — implemented and validated.
-2. Add scale-up and scale-down to v2.
+2. Add scale-up and scale-down to v2 — secondary scale-down complete; scale-up
+   and primary-removal behavior remain.
 3. Add a v2 SQLite application.
 4. Move the PostgreSQL application to v2.
 5. Publish and make v2 deployment assets the default.
@@ -78,6 +80,8 @@ The level-triggered stack already supports:
 - ordinary primary failover;
 - explicit named-target planned switchover with durable handoff, restoration,
   newer-epoch compensation, and terminal write-closed Unsafe outcomes;
+- deterministic secondary-only scale-down to a target/minimum as low as one,
+  sequential reductions, and exact post-commit Pod/PVC/endpoint cleanup;
 - retained-history repair and full-copy fallback;
 - explicit quorum-loss write blocking and non-destructive recovery;
 - restart recovery for the controller, replica agent, runtime, and
@@ -85,14 +89,14 @@ The level-triggered stack already supports:
 - bounded level-triggered reconciliation and stale-command fencing;
 - the `kvstore2` conformance application;
 - isolated KinD bootstrap, replacement, failover, quorum-loss, healthy
-  switchover, and adversarial restart/target-loss test scenarios.
+  switchover, secondary scale-down, and adversarial restart/target-loss scenarios.
 
 The principal retirement gaps are:
 
 | Area | Classic v1 | Level-triggered v2 | Retirement disposition |
 |---|---|---|---|
 | Planned switchover | Supported | Explicit named-target request supported and validated | Workstream 1 complete |
-| Scale up/down | Supported | Fixed cardinality | Implement after switchover |
+| Scale up/down | Supported | Secondary-only scale-down implemented/validated; no scale-up or primary removal | Workstream 2 partially complete |
 | KVStore | Supported | `kvstore2` supported | Make v2 the default |
 | SQLite | Supported | Not ported | Add a v2 application |
 | PostgreSQL | Depends on `kuberic-core` and `kuberic-operator` | Not ported | Move to v2 before deprecation |
@@ -101,7 +105,7 @@ The principal retirement gaps are:
 | Data migration | Existing data remains in v1 | No import path | No migration required |
 | Image publication | Published | Local/CI only | Publish before deprecation |
 | Node maintenance | `NodeMaintenanceRequest` orchestration | Not supported | Deferred; not a retirement blocker |
-| Storage and PVC policy | Configurable size and retention | Fixed v2 policy | Deferred; document the fixed behavior |
+| Storage and PVC policy | Configurable size and retention | Fixed policy; removed v2 replica PVCs are permanently deleted | Configurable retention deferred |
 | Automatic rolling upgrades | Not supported | Not supported | Deferred |
 
 ## Workstream 1: Planned Switchover
@@ -114,8 +118,9 @@ describes the as-built request and operational contract.
   acceptance freezes exact source/target identities, membership, and policy.
   An active request cannot be cancelled or retargeted. Identical active or
   latest-receipted requests are idempotent; status retains only the latest receipt.
-- Protocol version 5 fences each control dispatch to the observed process
-  session and preparations to the accepted spec generation with durable
+- Exact protocol 6 retains the process-session dispatch fences introduced in
+  version 4 and the generation-bound preparation/retirement added in version 5.
+  Preparations bind the accepted spec generation with durable
   retirement high-water marks. Durable preparation closes source writes and records a handoff
   certificate; target catch-up must use authority-verified progress.
 - Write-closed PC/CC and current-only convergence precede accepted topology,
@@ -139,18 +144,47 @@ healthy 4.2/4.3 s and adversarial 44.5/48.8 s; the strict retained-session
 rejection adversarial rerun took 45.2 s. All owned clusters and kubeconfigs were
 cleaned. These are scenario timings, not outage guarantees.
 
-This completes only Workstream 1, not v1 retirement. Scaling is next, followed
-by SQLite, PostgreSQL, distribution, deprecation, and separately approved
-removal. Automatic target selection, cancellation/retargeting, node maintenance,
+This completes only Workstream 1, not v1 retirement. Workstream 2 is partially
+complete as described below, followed by SQLite, PostgreSQL, distribution,
+deprecation, and separately approved removal. Automatic target selection,
+cancellation/retargeting, node maintenance,
 rolling upgrades, destructive recovery, and data migration/import remain
 unsupported or deferred.
 
 ## Workstream 2: Scale Up and Scale Down
 
-Scaling should generalize the existing replacement, copy, and PC/CC machinery
-rather than introduce an independent membership protocol.
+**Partially complete.** The
+[secondary-scale-down guide](../features/kuberic/level-triggered-operator.md#secondary-scale-down)
+describes the implemented and validated subset. It extends existing PC/CC
+authority rather than adding an independent membership protocol:
 
-Scale-up must:
+- Lowering `spec.replicas` selects one highest logical-ID committed secondary
+  at a time, preserving the exact primary and retained identities. Desired
+  count is both target and minimum, down to one; there is no independent minimum.
+- Durable write closure and a verified primary boundary precede retained
+  previous-read-quorum evidence, write-closed reduced PC/CC, and fresh reduced
+  current-only write-quorum evidence. Ordinary replication still requires both
+  PC and CC write quorums when PC exists.
+- Accepted reduced topology/policy and cleanup are published atomically.
+  Separate local acceptance, write grant, and routing restore service.
+  Endpoint→Pod→PVC deletion is exact-UID/resource-version fenced; unavailable
+  targets can use post-commit exact Pod deletion instead of a retirement reply.
+  PVC deletion is permanent and waits for authoritative Pod absence.
+- Schema-2 retirement-started/tombstone recovery prevents application Open
+  after retirement begins. Protocol 6/store schema 2 require fresh deployment,
+  without migration or mixed-version support.
+- Active removal cannot be cancelled or retargeted. Cleanup serializes later
+  removals and other authority work. Primary loss or missing evidence waits
+  fail-closed; singleton operation deliberately has no redundancy.
+
+Validation covers healthy 3→2, 2→1 and singleton restart, sequential 5→2,
+unavailable-target 3→1, exact deletion races, durable process crashes, and
+retained-client/session fencing. Two original seven-scenario matrices completed
+in 18m16s/16m29s; the final post-fix matrix passed in 927.942s command wall time
+(959.565s full lifecycle), plus separate failover in 18.71s. The guide records
+per-scenario results. These measurements are not outage guarantees.
+
+**Outstanding scale-up** must:
 
 - provision a fresh exact Pod/PVC incarnation;
 - build it from copy plus replication-gap closure;
@@ -158,13 +192,16 @@ Scale-up must:
 - update quorum policy only as part of accepted membership authority;
 - recover safely from target loss and abandoned build attempts.
 
-Scale-down must:
+**Outstanding primary-removal behavior** must:
 
-- select and durably identify the exact member to remove;
-- move the primary first when the selected member is primary;
-- preserve write quorum through an intersecting PC/CC transition;
-- revoke the removed member before deleting routing, Pod, and PVC resources;
-- reject scaling below the supported minimum.
+- define selection and durable authority for removing a primary;
+- move primary authority first through an approved safe transition;
+- compose that movement with removal, recovery, and exact cleanup.
+
+The secondary-only feature does not implement those behaviors, explicit
+user-selected removal, or full scaling parity. It does not establish v1
+retirement readiness; application ports, distribution, deprecation, and the
+separately approved removal gates still apply.
 
 Only one authority-changing membership command may be issued from one
 observation. Reconciliation must remain level-triggered and restart-safe.

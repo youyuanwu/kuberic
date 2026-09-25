@@ -81,24 +81,31 @@ immutable. Admitted PC/CC policies are separate durable authority; a reduced
 policy does not rewrite initialization replay or Pod/PVC validation.
 
 The agent executes `PrepareSecondaryRemoval`, write-closed dual-policy
-`EnsureConfiguration`, and `RetireReplica` through durable command/effect
-intent. Preparation preserves the verified boundary and its original
+`EnsureConfiguration`, `AcceptSecondaryRemovalCommit`, and `RetireReplica`
+through durable command/effect intent. Preparation preserves the verified boundary and its original
 session/sequence; exact duplicates return retained evidence even after a
 process restart. Current-only completion retains the full frozen evidence
 after PC disappears. Operation mutation and unrelated authority work are
 rejected while removal is pending. Accepted current-only evidence is separately
 persisted before write regrant; coordination alone never grants reduced writes.
 
-Retirement closes application and replication access before persisting its
-tombstone. Restart consults the tombstone before application `Open`, and the
-control plane continues reporting role None and the exact terminal receipt
-under a fresh process session. Excluded peers cannot regain sessions through
+Retirement validates and persists an exact `retirement-started` record before
+revoking access, fencing traffic, driving role None, and closing hosting.
+Finalization atomically persists the tombstone, removes active authority, and
+clears the started record. Restart checks both lifecycle records before
+application `Open`: a started retirement is finalized with **zero Open calls**
+because process termination already closed the prior host. Failed finalization
+stays closed. The control plane continues reporting role None and the exact
+terminal receipt under a fresh process session. Excluded peers cannot regain sessions through
 delayed discovery. Pending removal preparation reconstructs access closed and
 resolves interrupted local writes under their original operation identities
 without waiting for an unavailable old write quorum.
 
-These are local execution contracts only. Controller/evaluator scale-down
-admission and Kubernetes cleanup are not enabled.
+Frozen certificates survive retained-peer restart but do not reinstate
+obsolete-session credit; acceptance revalidates current-session progress.
+Controller admission and exact Kubernetes cleanup are enabled; these local
+contracts never select the target or authorize arbitrary Pod/PVC deletion.
+Use a fresh coordinated protocol-6/schema-2 deployment, not a rolling upgrade.
 
 Crash-boundary environment variables exist only in the test executable.
 Production agent and application binaries expose no fault-injection mode.

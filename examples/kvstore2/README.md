@@ -21,15 +21,26 @@ be briefly interrupted; reconnect through the write Service and retry ambiguous
 writes only according to application idempotence. A retained former-primary
 client cannot commit while its write authority is revoked.
 
+Lowering `spec.replicas` supports secondary-only 3→2 and 2→1, or sequential
+larger reductions, preserving the primary and acknowledged values. Desired
+count is target and minimum; a singleton has no redundancy. Scale-down
+permanently deletes the removed replica's PVC, Pod, and peer endpoint after
+authority commit. Scale-up, primary removal, and cancellation are unsupported.
+Expect HTTP 503/disconnects during convergence, with no interruption-duration
+guarantee. Protocol 6 / store schema 2 require fresh deployment, not data migration.
+
 After installing into an explicitly owned KinD cluster, run:
 
 ```bash
 just level-triggered-kind-test switchover
 just level-triggered-kind-test switchover-adversarial
+just level-triggered-kind-test scale-down
+just level-triggered-kind-test scale-down-adversarial
 ```
 
 This example is local/CI-only. See the
 [level-triggered operator guide](../../docs/features/kuberic/level-triggered-operator.md)
 for KinD deployment, the
 [request example and outcomes](../../docs/features/kuberic/level-triggered-operator.md#planned-switchover),
+[scale-down examples and cleanup](../../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down),
 and diagnostics.

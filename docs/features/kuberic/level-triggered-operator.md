@@ -70,8 +70,10 @@ grant replica authority.
 Raw application progress is repair evidence only. Protocol version 3
 introduced a separate authority-bound `verifiedReplicationLsn`; protocol
 version 4 additionally binds control commands to the exact observed target
-process session. Version 5 adds accepted-spec-generation fencing for preparation
-and retirement; all level-triggered components must use that exact version.
+process session. Version 5 added accepted-spec-generation fencing for preparation
+and retirement. **Protocol version 6** adds secondary removal, independent
+previous/reduced policies, and durable preparation, acceptance, and retirement
+evidence; all level-triggered components must use that exact version.
 The current primary revalidates the progress certificate
 before it can contribute remote quorum credit.
 
@@ -90,9 +92,9 @@ spec:
   failoverDelaySeconds: 10
 ```
 
-`spec.replicas` must be positive. The implemented operations preserve fixed
-cardinality; changing the replica count after initialization is not a
-supported scaling API. `spec.image` selects the application image.
+`spec.replicas` must be positive. Lowering it after initialization requests
+[secondary scale-down](#secondary-scale-down); increasing accepted membership
+is unsupported. `spec.image` selects the application image.
 `spec.failoverDelaySeconds` defaults to 30.
 
 Status is controller-owned durable authority. Users must not author or repair
@@ -101,10 +103,16 @@ it manually. Important projections include:
 - `initialized` and `observedGeneration`;
 - `effectivePolicy`, frozen while authority is active;
 - the last quorum-attested `topology`;
-- at most one compact `transition` and one fresh `provisioning` intent;
+- at most one active `transition` or fresh `provisioning` intent;
 - `primaryFailure` and same-configuration `quorumLoss`;
 - `transition.switchover` for a frozen active request and handoff;
 - `lastSwitchover` for the latest terminal receipt (not a history);
+- `transition.secondaryScaleDown` and `transition.secondaryRemovalEvidence`
+  for one frozen removal and its authority evidence;
+- `secondaryScaleDownCleanup` after reduced membership commits, then
+  `lastSecondaryRemoval` for bounded retained-member convergence, not deletion;
+- `pendingReplacementCleanup`, moved unchanged to `lastReplacement` at
+  replacement acceptance, for one exact cleanup obligation;
 - conditions describing waiting or unsafe observations.
 
 The checked-in CRD is generated from the Rust type and verified byte-for-byte
@@ -122,6 +130,8 @@ The implemented contract supports:
 - epoch-fenced ordinary primary failover with election-safe progress;
 - explicit named-target planned switchover with durable write handoff,
   original-authority restoration, and evidence-gated newer-epoch compensation;
+- deterministic secondary scale-down, including 3→2, 2→1, sequential 5→2,
+  and unavailable-target removal with sufficient old-read/new-write evidence;
 - retained-history repair or full-copy fallback during supported failover;
 - quorum-loss detection, `NoWriteQuorum`, and non-destructive write recovery
   when the same configuration quorum returns;
@@ -136,7 +146,8 @@ The following remain fail-closed and require separate design:
   recovery;
 - automatic switchover target selection, cancellation/retargeting of active
   requests, and node-maintenance orchestration;
-- scale-up or scale-down;
+- scale-up, primary removal, explicitly selected removal targets, or
+  cancellation/retargeting of an active removal;
 - timed dropping of unavailable replicas;
 - PVC authority rebinding to a new Pod UID;
 - automatic rolling image/spec upgrades;
@@ -147,12 +158,153 @@ The generated model validates authority observations, single-writer
 admissibility, and switchover recovery traces. Runtime race and subprocess
 crash tests cover the handoff's durable boundaries; the live matrix exercises
 bounded writes and retained TCP clients through restart, partition, replacement,
-failover, and switchover. A broader concurrent successful-write history
-generator remains deferred; the focused handoff tests do not claim that scope.
+failover, switchover, and scale-down. Scale-down also has a focused successful-write
+oracle and generated interruption traces. A broader arbitrary concurrent
+successful-write history generator remains deferred.
 
 Quorum loss does not advance the data-loss number and does not call an
 application data-loss callback. Unsupported evidence produces `Wait` or
 `Unsafe`, never success-shaped recovery.
+
+## Secondary Scale-Down
+
+Lower only `spec.replicas` on an initialized set. The desired count is both the
+**target and minimum**, with a floor of **one**, following the selected Service
+Fabric target/minimum semantics. There is no independent `minReplicas` or quorum
+setting. The controller selects the **highest logical-ID committed secondary**,
+not the highest Pod name or the highest reachable member. The exact primary,
+retained incarnations, and data-loss number stay unchanged.
+
+For an existing three-member `kvstore2`, preserve its image and other settings:
+
+```bash
+# 3 -> 2: remove one committed secondary.
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+  patch kubericsets.operator.kuberic.io kvstore2 --type=merge \
+  -p '{"spec":{"replicas":2}}'
+```
+
+The corresponding desired-state sample is:
+
+```yaml
+apiVersion: operator.kuberic.io/v1alpha1
+kind: KubericSet
+metadata:
+  name: kvstore2
+spec:
+  replicas: 2
+  image: localhost/kvstore2:level-triggered-v1
+  failoverDelaySeconds: 10
+```
+
+Wait for accepted two-member topology, completed cleanup, and Ready before
+requesting a singleton:
+
+```bash
+# 2 -> 1: deliberately give up redundancy.
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+  patch kubericsets.operator.kuberic.io kvstore2 --type=merge \
+  -p '{"spec":{"replicas":1}}'
+kubectl --kubeconfig "$KUBECONFIG" --context "$KUBE_CONTEXT" \
+  get kubericsets.operator.kuberic.io kvstore2 -o yaml
+```
+
+A successful patch is not removal completion; an old Ready condition can remain
+visible until reconciliation. Inspect accepted topology, `observedGeneration`,
+active intent, cleanup, and conditions together.
+
+| Request or condition | Behavior |
+|---|---|
+| Lower positive count | One frozen highest-ID secondary removal at a time |
+| 5→2 | 5→4, 4→3, 3→2, each committing and cleaning up before the next |
+| Count equals accepted membership | No new removal |
+| Unavailable selected secondary | Same target; proceed only with required retained evidence |
+| Missing primary or insufficient evidence | Wait fail-closed; no alternate target or automatic failover inside the frozen removal |
+| Count below one | Rejected |
+| Scale-up, primary/explicit-target removal | Unsupported |
+| Changed desired count during removal | Queued for fresh evaluation after cleanup; not cancellation or retargeting |
+
+**Target=min risk:** lowering the desired count also lowers the minimum,
+including permission to remove an unavailable secondary when safe evidence
+exists. A two-member set needs both members for ordinary write quorum; a
+singleton has no replica redundancy or alternate failover primary. Scale-up
+cannot currently restore redundancy after a completed reduction.
+
+### Authority and cleanup
+
+Removal freezes the desired generation/count, exact primary/target, full PC/CC,
+independent policies, and endpoint/Pod/PVC identities. Routing is removed first;
+durable primary preparation closes client access and records a verified boundary
+covering acknowledged writes. Retained members must supply a previous-configuration
+read quorum under accepted authority. Write-closed PC/CC convergence then needs
+the reduced configuration's write quorum, including the unchanged primary,
+through that boundary. Fresh completed current-only write-quorum evidence
+precedes atomic publication of reduced topology, policy, and cleanup.
+
+This old-read/new-write rule permits 2→1 with the primary alone. It does not
+weaken ordinary PC/CC replication's dual-write-quorum rule: removal permits no
+PC/CC client writes. Local commit acceptance, write regrant, and exact-primary
+routing follow separately and can restore service while cleanup remains pending.
+
+Only after membership commit does cleanup delete the frozen peer endpoint,
+retire the exact target, delete its Pod, and finally delete its PVC. Reachable
+retirement proves role `None`, closed application, and fenced client/peer access.
+An unreachable target is **not** proven retired: post-commit deletion of its
+exact Pod supplies the final local fence. Authoritative exact-name observation
+must prove that Pod UID absent before PVC deletion. Deletes use frozen UIDs and
+fresh resource versions; label-list omission or RPC failure is not absence.
+Same-name/different-UID resources are preserved, including after cleanup ends.
+
+> **Permanent PVC deletion:** scale-down deletes the removed replica's PVC.
+> There is no retention option, storage import, or recovery path for that
+> removed storage. This differs from classic v1 scale-down.
+
+During convergence, `status.transition.kind` is `secondaryScaleDown`.
+After commit, `status.topology` and `effectivePolicy` are reduced while
+`secondaryScaleDownCleanup` retains the immutable evidence and retirement
+obligation. Cleanup waits normally show `Ready=unknown`, `Progressing=true`;
+routed writes can already be available. Completion replaces cleanup with
+`lastSecondaryRemoval`, a single retained convergence proof, **not** deletion
+authority or a history. A late retained member can delay the next reduction
+until its authority settles.
+
+| Condition reason | Inspect or wait for |
+|---|---|
+| `ScaleDownPreparationPending` | Exact primary's durable write closure |
+| `ScaleDownPreviousReadQuorumUnavailable` | Retained accepted-epoch read evidence |
+| `ScaleDownReducedWriteQuorumUnavailable`, `ScaleDownReducedCatchUpPending` | Reduced quorum and verified prepared prefix |
+| `ScaleDownCurrentOnlyQuorumUnavailable` | Completed current-only evidence |
+| `ScaleDownPrimaryUnavailable` | Recovery of the frozen exact primary |
+| `ScaleDownRetirementPending` | Target-local retirement after commit |
+| `ScaleDownExactPodFencePending`, `ScaleDownExactPodAbsenceRequired` | Exact Pod fence or authoritative absence |
+| `ScaleDownCleanupPending` | Endpoint/Pod/PVC reads, finalizers, and deletion retries |
+| `ScaleDownRetainedMemberPending` | Late retained-member convergence before the next removal |
+| `ScaleUpUnsupported`, `SpecDriftUnsupported` | Unsupported desired changes, not accepted policy |
+
+No next removal, provisioning, replacement, failover, or switchover starts
+while cleanup remains. Existing authority work finishes first; stable primary
+safety handling and a fresh explicit switchover take precedence over admitting
+a removal. Replacement similarly freezes `pendingReplacementCleanup` before
+provisioning and moves it to `lastReplacement` at commit; exact cleanup completes
+before another operation can overwrite that obligation.
+
+### Availability and restart
+
+Writes may return HTTP 503 and connections may close. Reconnect through the write
+Service with bounded backoff; a lost reply remains ambiguous and requires
+application-level idempotence. There is no zero-downtime or maximum interruption
+guarantee. RPC deadlines, requeue intervals, and `failoverDelaySeconds` are not
+scale-down deadlines. A frozen-primary failure deliberately blocks progress
+rather than changing this operation into failover or primary removal.
+
+Protocol 6 and agent store schema 2 require a **fresh coordinated deployment**;
+protocol 5 and schema 1 are rejected, with no migration or mixed-version mode.
+Schema 2 separates immutable initialization provenance from admitted policies.
+Retirement-started and terminal tombstone records both prevent application Open
+on restart: a fresh process finishes interrupted retirement without reopening
+the removed application, then reports the exact receipt. Frozen quorum proof
+does not restore stale session credit; current-session verified progress is
+required after retained-peer restart.
 
 ## Planned Switchover
 
@@ -302,7 +454,9 @@ application acceptance can grant quorum credit.
 
 The agent database is created only through authorized initialization. Opening
 an established replica requires matching resource, Pod, PVC, replica,
-generation, initialization, policy, and schema identity. Missing metadata,
+generation, initialization provenance (including its original policy), and schema identity.
+Admitted policy may evolve through an authorized reduction without changing that
+provenance. Missing metadata,
 identity drift, corruption, or an incompatible schema fails closed.
 
 SQLite runs in WAL mode with `synchronous=FULL`, foreign keys enabled,
@@ -313,10 +467,10 @@ semantics. Filesystems that cannot provide those semantics, including
 unsupported network-filesystem arrangements, are not valid production
 storage.
 
-The current schema accepts only its exact version. The migration hook records
+The current schema is **2** and accepts only its exact version. The migration hook records
 an idempotent current-version migration; it does not upgrade older schemas.
-Future schema changes require an explicit, crash-safe migration before mixed
-data can be opened.
+Schema 1 is rejected without conversion. Use a fresh deployment for protocol 6 /
+schema 2; no rolling upgrade or existing-data migration is provided.
 
 Crash injection is test-only. `KUBERIC_CRASH_WRITER_PATH` and
 `KUBERIC_CRASH_BOUNDARY` are consumed only by the
@@ -409,19 +563,59 @@ just level-triggered-kind-test quorum-loss
 just level-triggered-kind-test adversarial
 just level-triggered-kind-test switchover
 just level-triggered-kind-test switchover-adversarial
+just level-triggered-kind-test scale-down
+just level-triggered-kind-test scale-down-adversarial
 ```
 
 The bounded full matrix expands to replacement, quorum loss, the composed
-adversarial restart/partition/failover scenario, and both switchover scenarios:
+adversarial restart/partition/failover scenario, both switchover scenarios, and
+both scale-down scenarios (seven tests, in that order):
 
 ```bash
 just level-triggered-kind-test all
 ```
 
-The PR workflow separately runs bootstrap, replacement, failover, and healthy
-switchover smoke tests. Scheduled
+Start `all` from fresh bootstrap: replacement assumes the original primary.
+Standalone `failover` is not included in `all`; run it on a separate fresh
+cluster rather than prepending it to that matrix.
+
+The [PR workflow](../../../.github/workflows/level-triggered-CI.yml) separately
+runs bootstrap, replacement, failover, healthy switchover, and healthy scale-down
+smoke tests. Targeted tests run serially. Scheduled
 and manually dispatched full CI runs the matrix twice on separate fresh
 clusters.
+
+`scale-down` covers healthy 3→2→1, singleton process restarts and new writes,
+plus a separate five-member set reduced sequentially to two. It checks every
+acknowledged value, exact retained identity, unchanged primary/data-loss number,
+intermediate topology, Service writes, and endpoint/Pod/PVC cleanup.
+`scale-down-adversarial` covers reachable retirement with retained direct
+clients, controller/primary/target restarts, ambiguous replies and old-session
+rejection, unavailable-target sequential 3→1 (including 2→1), exact post-commit
+Pod fencing, ownership-label loss, already-absent Pods, and preservation of a
+same-name/different-UID endpoint.
+
+Recorded secondary-scale-down validation used two original full seven-scenario
+fresh-cluster lifecycles of **18m16s / 16m29s**. Healthy scale-down measured
+**320.74s / 322.67s** and adversarial scale-down **427.95s / 433.17s**.
+After retained-peer acceptance and replacement-cleanup fixes, the final full
+matrix at `09bbc7e` passed in **927.942s command wall time / 959.565s lifecycle**
+(including cluster setup and teardown):
+
+| Scenario | Final test duration |
+|---|---:|
+| replacement | 56.95s |
+| quorum-loss | 41.24s |
+| adversarial | 22.83s |
+| switchover | 4.45s |
+| switchover-adversarial | 47.12s |
+| scale-down | 323.06s |
+| scale-down-adversarial | 431.01s |
+| supplemental failover (separate fresh cluster) | 18.71s |
+
+These are test measurements, **not outage guarantees** or production SLOs.
+Earlier matrices do not certify the subsequent fixes; the final rerun does.
+All owned clusters, kubeconfigs, and ownership receipts were removed.
 
 `switchover` submits an explicit request ID and logical target to a stable
 three-member `kvstore2`. It watches routing and receipts, keeps direct TCP
@@ -467,6 +661,15 @@ resource YAML retains Pod/PVC UIDs and exact Service selectors:
 ```bash
 just level-triggered-diagnostics
 ```
+
+For scale-down, preserve the full transition/evidence, cleanup receipt or
+`lastSecondaryRemoval`, conditions, exact resource UIDs, deletion timestamps,
+finalizers, and current/previous replica logs. `/status` is a compact runtime
+view; authenticated agent reports additionally carry `preparedSecondaryRemoval`,
+`acceptedSecondaryRemoval`, and `retiredReplica`.
+For replacement cleanup also retain `pendingReplacementCleanup`/`lastReplacement`.
+Compare exact-name objects with frozen UIDs; a label-filtered list cannot prove
+absence. Do not remove finalizers or edit status merely to force progress.
 
 Each replica also exposes `GET /status`, including its exact identity, durable
 generation, process session, role, epoch, PC/CC IDs, progress, committed LSN,
@@ -522,7 +725,8 @@ scripts/check_level_triggered_documentation.sh
 ```
 
 Classic v1 remains the documented path for existing `kuberic.io/v1` resources,
-scaling, and the SQLite/PostgreSQL examples. V2 now supports its own explicit
-planned switchover; no v1 conversion, data import, or classic-path removal is
-implied. The [retirement plan](../../proposal/v1-retirement-plan.md) keeps scaling,
+scale-up, and the SQLite/PostgreSQL examples. V2 supports explicit planned
+switchover and secondary-only scale-down; no v1 conversion, data import, or
+classic-path removal is implied. The [retirement plan](../../proposal/v1-retirement-plan.md)
+keeps remaining scaling,
 application ports, distribution, deprecation, and removal as separate workstreams.

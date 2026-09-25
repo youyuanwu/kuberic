@@ -100,7 +100,10 @@ contracts, not additions to the SF-shaped application traits. Agent schema-2
 storage persists preparation, accepted-current-only, and retirement evidence.
 Recovery revalidates accepted evidence before restoring previously granted
 access; preparation and current-only coordination by themselves stay closed.
-Controller scale-down admission remains disabled.
+The controller enables secondary scale-down; the application still receives no
+managed authority setters. See the
+[scale-down guide](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
+for target=min semantics, permanent PVC deletion, and availability limits.
 
 `ReplicatorFactoryContext` exposes stable identity and partition-access
 capabilities, not a concrete runtime or default-engine pointer. Application
@@ -208,8 +211,9 @@ applied acknowledgement may contribute to commit.
 
 ## Remaining Service Fabric completion contracts
 
-The independent controller and agent provide fixed-cardinality bootstrap,
-replacement, ordinary failover, and quorum-loss ownership. The remaining
+The independent controller and agent provide full-set bootstrap,
+replacement, ordinary failover, planned switchover, secondary scale-down, and
+quorum-loss ownership. The remaining
 deferred contracts are:
 
 - persistent resend payloads across process sessions where incremental
