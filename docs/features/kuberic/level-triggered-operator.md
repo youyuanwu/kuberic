@@ -270,21 +270,54 @@ just level-triggered-kind-test failover
 just level-triggered-kind-test replacement
 just level-triggered-kind-test quorum-loss
 just level-triggered-kind-test adversarial
+just level-triggered-kind-test switchover
+just level-triggered-kind-test switchover-adversarial
 ```
 
-The bounded full matrix expands to replacement, quorum loss, and the composed
-adversarial restart/partition/failover scenario:
+The bounded full matrix expands to replacement, quorum loss, the composed
+adversarial restart/partition/failover scenario, and both switchover scenarios:
 
 ```bash
 just level-triggered-kind-test all
 ```
 
-The PR workflow separately runs bootstrap and failover smoke tests. Scheduled
+The PR workflow separately runs bootstrap, replacement, failover, and healthy
+switchover smoke tests. Scheduled
 and manually dispatched full CI runs the matrix twice on separate fresh
 clusters.
 
+`switchover` submits an explicit request ID and logical target to a stable
+three-member `kvstore2`. It watches routing and receipts, keeps direct TCP
+clients pinned to exact Pods, preserves every acknowledged test value, and
+checks current-only authority, a single write grant, Service writes, and
+former-primary rejection. It reports elapsed time and enforces a 270-second
+after-ready scenario budget. Retained-client connect, write, and read operations
+retry transient `WouldBlock`/EAGAIN without replaying partial HTTP messages or
+extending that deadline; timeouts and other I/O or protocol errors still fail.
+Each response is bounded by `Content-Length` or chunked framing (including
+trailers), never by keep-alive connection closure. The same socket is reused for
+former-primary checks; a deleted target must explicitly reject or disconnect,
+not merely time out. Before submitting the request, the harness waits for each
+exact secondary's durable applied progress to cover the primary's acknowledged
+prefix. Secondary committed-LSN watermarks can lag until another replication
+item arrives and are not a setup barrier.
+
+`switchover-adversarial` runs three separately bounded subcases: controller
+and target-process restart during a durable handoff; exact target deletion
+before authority admission with original-authority restoration; and deletion
+after source demotion with strictly newer compensation. Replication-only
+partitions hold the boundaries without blocking control reports. The latter
+case deliberately retains two exact survivors and their handoff evidence, so
+an Unsafe receipt is a failure rather than an acceptable replacement for
+compensation. Each subcase heals its exact network rules and waits for
+three-member recovery before the next starts. No cluster is created by a test;
+even direct `cargo test --ignored --exact` invocation requires the matching
+ownership receipt and explicit context.
+
 On failure, collect the CR, resource state, events, controller logs, and all
-replica logs:
+replica logs, including previous-container logs and live agent/runtime `/status`
+evidence. The full CR includes the request, frozen handoff, and retained receipt;
+resource YAML retains Pod/PVC UIDs and exact Service selectors:
 
 ```bash
 just level-triggered-diagnostics
