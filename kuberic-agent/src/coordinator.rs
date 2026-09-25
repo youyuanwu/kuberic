@@ -356,12 +356,14 @@ where
                     self.advance(&record, next, None).await?;
                 }
                 CoordinatorStage::Activate => {
-                    let provisional_failover_primary = authority.local_role()
-                        == ReplicaRole::Primary
-                        && record.command.transition_kind
-                            == kuberic_protocol::types::TransitionKind::Failover
+                    let provisional_primary = authority.local_role() == ReplicaRole::Primary
+                        && matches!(
+                            record.command.transition_kind,
+                            kuberic_protocol::types::TransitionKind::Failover
+                                | kuberic_protocol::types::TransitionKind::PlannedSwitchover
+                        )
                         && record.command.primary_write_status != AccessStatus::Granted;
-                    let read_status = if provisional_failover_primary {
+                    let read_status = if provisional_primary {
                         AccessStatus::ReconfigurationPending
                     } else if matches!(
                         authority.local_role(),

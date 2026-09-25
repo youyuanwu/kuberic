@@ -5785,6 +5785,33 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         restarted_target.snapshot().await.verified_replication_lsn,
         Some(7)
     );
+    restarted_target
+        .apply_effect(effect(
+            1,
+            RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                local_identity: target.clone(),
+                transition_kind: None,
+                previous_configuration: None,
+                current_configuration: requested.clone(),
+                switchover_handoff: Some(handoff.clone()),
+            })),
+        ))
+        .await
+        .unwrap();
+    let current_only_target = restarted_target.snapshot().await;
+    assert!(
+        current_only_target
+            .authority
+            .as_ref()
+            .unwrap()
+            .previous_configuration
+            .is_none()
+    );
+    assert_eq!(current_only_target.verified_replication_lsn, Some(7));
+    assert_eq!(
+        current_only_target.read_status,
+        AccessStatus::ReconfigurationPending
+    );
 
     let compensation = ConfigurationDescriptor::new(
         Epoch::new(0, 3),
@@ -5795,7 +5822,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
                 role: ReplicaRole::Primary,
             },
             ConfigurationMember {
-                identity: target,
+                identity: target.clone(),
                 role: ReplicaRole::ActiveSecondary,
             },
             ConfigurationMember {

@@ -694,6 +694,9 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
         let installed = store.load_state().await.unwrap();
         assert_eq!(installed.role, role);
         assert_ne!(installed.write_status, AccessStatus::Granted);
+        if role == ReplicaRole::Primary {
+            assert_eq!(installed.read_status, AccessStatus::ReconfigurationPending);
+        }
         assert_eq!(
             installed.prepared_switchover,
             is_source.then(|| handoff.clone())
@@ -707,6 +710,9 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
         assert!(completed.reconfiguration.is_none());
         assert!(completed.prepared_switchover.is_none());
         assert_ne!(completed.write_status, AccessStatus::Granted);
+        if role == ReplicaRole::Primary {
+            assert_eq!(completed.read_status, AccessStatus::ReconfigurationPending);
+        }
         assert_eq!(*runtime.calls.lock().unwrap(), expected);
         assert_eq!(
             completed.retained_command.as_ref().unwrap().command,
