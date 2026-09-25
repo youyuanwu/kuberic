@@ -4,10 +4,11 @@ use kuberic_protocol::types::{
 };
 use kuberic_wire::convert::WireError;
 use kuberic_wire::{
-    ensure_supported_version, normalize_execute_request, proto, validate_agent_status_report,
-    validate_copy_ack, validate_copy_item, validate_execute_request, validate_replication_ack,
-    validate_replication_item,
+    ensure_supported_version, normalize_agent_status_report, normalize_execute_request, proto,
+    validate_agent_status_report, validate_copy_ack, validate_copy_item, validate_execute_request,
+    validate_replication_ack, validate_replication_item,
 };
+use prost::Message;
 
 fn configuration() -> ConfigurationDescriptor {
     ConfigurationDescriptor::new(
@@ -285,7 +286,21 @@ fn planned_switchover_preparation_round_trip_preserves_exact_authority() {
         )),
     };
 
-    let envelope = normalize_execute_request(request).unwrap();
+    let mut wrong_source = request.clone();
+    let Some(proto::execute_command_request::Command::PrepareSwitchover(command)) =
+        wrong_source.command.as_mut()
+    else {
+        unreachable!()
+    };
+    command.source.as_mut().unwrap().agent_generation = "other-generation".to_string();
+    assert!(matches!(
+        validate_execute_request(&wrong_source),
+        Err(WireError::InvalidAuthority(_))
+    ));
+
+    let encoded = request.encode_to_vec();
+    let decoded = proto::ExecuteCommandRequest::decode(encoded.as_slice()).unwrap();
+    let envelope = normalize_execute_request(decoded).unwrap();
     assert_eq!(envelope.target, source);
     assert_eq!(envelope.expected_process_session_id.as_str(), "session-1");
     match envelope.command {
@@ -365,7 +380,37 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
         ),
     };
 
-    let envelope = normalize_execute_request(request).unwrap();
+    let mut wrong_start = request.clone();
+    let Some(proto::execute_command_request::Command::EnsureConfiguration(command)) =
+        wrong_start.command.as_mut()
+    else {
+        unreachable!()
+    };
+    command
+        .switchover_handoff
+        .as_mut()
+        .unwrap()
+        .starting_configuration_id = "unrelated".to_string();
+    assert!(matches!(
+        validate_execute_request(&wrong_start),
+        Err(WireError::InvalidAuthority(_))
+    ));
+
+    let mut empty_retirement = request.clone();
+    let Some(proto::execute_command_request::Command::EnsureConfiguration(command)) =
+        empty_retirement.command.as_mut()
+    else {
+        unreachable!()
+    };
+    command.retire_switchover_preparation_ids = vec![String::new()];
+    assert!(matches!(
+        validate_execute_request(&empty_retirement),
+        Err(WireError::InvalidAuthority(_))
+    ));
+
+    let encoded = request.encode_to_vec();
+    let decoded = proto::ExecuteCommandRequest::decode(encoded.as_slice()).unwrap();
+    let envelope = normalize_execute_request(decoded).unwrap();
     match envelope.command {
         kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(command) => {
             assert_eq!(
@@ -583,6 +628,59 @@ fn initialized_status_rejects_unknown_enums_and_malformed_configuration() {
         validate_agent_status_report(&malformed),
         Err(WireError::InvalidAuthority(_))
     ));
+}
+
+#[test]
+fn prepared_switchover_report_survives_protobuf_round_trip() {
+    let configuration = configuration();
+    let source = configuration.members[0].identity.clone();
+    let target = configuration.members[1].identity.clone();
+    let report = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource".to_string(),
+        identity: Some(source.clone().into()),
+        process_session_id: "session-1".to_string(),
+        report_sequence: 1,
+        role: proto::ReplicaRole::Primary as i32,
+        write_status: proto::AccessStatus::Granted as i32,
+        epoch: Some(configuration.epoch.into()),
+        current_configuration: Some(configuration.clone().into()),
+        current_progress: 12,
+        verified_replication_lsn: Some(12),
+        committed_lsn: 12,
+        catch_up_capability: Some(12),
+        storage_state: proto::AgentStorageState::Initialized as i32,
+        pod_uid: source.instance_id.to_string(),
+        pvc_uid: "pvc-1".to_string(),
+        healthy: true,
+        replica_id: source.replica_id.value(),
+        read_status: proto::AccessStatus::Granted as i32,
+        prepared_switchover: Some(proto::SwitchoverHandoff {
+            preparation_operation_id: "prepare-1".to_string(),
+            request_id: "request-1".to_string(),
+            source: Some(source.into()),
+            target: Some(target.into()),
+            starting_configuration_id: configuration.configuration_id.to_string(),
+            handoff_lsn: 12,
+        }),
+        ..Default::default()
+    };
+
+    let encoded = report.encode_to_vec();
+    let decoded = proto::AgentStatusReport::decode(encoded.as_slice()).unwrap();
+    let observation = normalize_agent_status_report(decoded).unwrap();
+    let kuberic_protocol::observation::AgentObservation::Report(report) = observation else {
+        panic!("expected initialized report");
+    };
+    assert_eq!(
+        report
+            .prepared_switchover
+            .as_ref()
+            .unwrap()
+            .preparation_operation_id
+            .as_str(),
+        "prepare-1"
+    );
 }
 
 #[test]

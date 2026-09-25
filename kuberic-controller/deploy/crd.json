@@ -640,6 +640,79 @@
                           "requestId": {
                             "type": "string"
                           },
+                          "requestedConfiguration": {
+                            "description": "Canonical Current or Previous Configuration with a content-derived ID.",
+                            "properties": {
+                              "configurationId": {
+                                "type": "string"
+                              },
+                              "epoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
+                              "members": {
+                                "items": {
+                                  "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                                  "properties": {
+                                    "agentGeneration": {
+                                      "type": "string"
+                                    },
+                                    "instanceId": {
+                                      "type": "string"
+                                    },
+                                    "replicaId": {
+                                      "format": "int64",
+                                      "type": "integer"
+                                    },
+                                    "role": {
+                                      "description": "Runtime role of one exact replica incarnation.",
+                                      "enum": [
+                                        "primary",
+                                        "activeSecondary",
+                                        "idleSecondary",
+                                        "none"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "agentGeneration",
+                                    "instanceId",
+                                    "replicaId",
+                                    "role"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "writeQuorum": {
+                                "format": "uint32",
+                                "minimum": 0.0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "configurationId",
+                              "epoch",
+                              "members",
+                              "writeQuorum"
+                            ],
+                            "type": "object"
+                          },
                           "resolution": {
                             "enum": [
                               "requestedTarget",
@@ -692,6 +765,7 @@
                         },
                         "required": [
                           "requestId",
+                          "requestedConfiguration",
                           "resolution",
                           "source",
                           "target"

@@ -366,6 +366,226 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
 }
 
 #[tokio::test]
+async fn restarted_agent_rejects_old_session_commands_without_mutating_store() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let storage_identity = StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("resource-1"),
+        pod_uid: PodUid::new("pod-1"),
+        pvc_uid: PvcUid::new("pvc-1"),
+        initialization_id: derive_initialization_id(
+            &ResourceUid::new("resource-1"),
+            ReplicaId::new(1),
+            &PodUid::new("pod-1"),
+            &PvcUid::new("pvc-1"),
+        ),
+        local_identity: identity(),
+        effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+    };
+    let store = Arc::new(
+        SqliteStore::create_authorized(path, AgentState::new(storage_identity.clone())).unwrap(),
+    );
+    let application = || {
+        Arc::new(NoopApplication {
+            streams: Mutex::new(Vec::new()),
+        })
+    };
+    let runtime = Arc::new(PodRuntime::new_for_partition(
+        kuberic_protocol::types::PartitionInformation {
+            partition_id: kuberic_protocol::types::PartitionId::new("partition-1"),
+        },
+        identity(),
+        application(),
+        store.clone(),
+    ));
+    let first_control = free_address();
+    let first_replication = free_address();
+    let first_service = AgentService::new(
+        store.clone(),
+        runtime.clone(),
+        runtime,
+        Arc::<str>::from("token"),
+    )
+    .unwrap();
+    let (first_ready_tx, mut first_ready_rx) = watch::channel(false);
+    let (first_shutdown_tx, first_shutdown_rx) = watch::channel(false);
+    let first_server = tokio::spawn(first_service.serve(
+        first_control,
+        first_replication,
+        first_ready_tx,
+        first_shutdown_rx,
+    ));
+    first_ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let mut first_client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{first_control}"))
+            .await
+            .unwrap();
+    let mut first_status = Request::new(proto::GetAgentStatusRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-1".to_string(),
+        replica_id: 1,
+        expected_instance_id: "pod-1".to_string(),
+    });
+    first_status.metadata_mut().insert(
+        "authorization",
+        format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    let old_session = first_client
+        .get_status(first_status)
+        .await
+        .unwrap()
+        .into_inner()
+        .process_session_id;
+    first_shutdown_tx.send_replace(true);
+    first_server.await.unwrap().unwrap();
+
+    let runtime = Arc::new(PodRuntime::new_for_partition(
+        kuberic_protocol::types::PartitionInformation {
+            partition_id: kuberic_protocol::types::PartitionId::new("partition-1"),
+        },
+        identity(),
+        application(),
+        store.clone(),
+    ));
+    let control = free_address();
+    let replication = free_address();
+    let service = AgentService::new(
+        store.clone(),
+        runtime.clone(),
+        runtime,
+        Arc::<str>::from("token"),
+    )
+    .unwrap();
+    let (ready_tx, mut ready_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(control, replication, ready_tx, shutdown_rx));
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    let mut status = Request::new(proto::GetAgentStatusRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-1".to_string(),
+        replica_id: 1,
+        expected_instance_id: "pod-1".to_string(),
+    });
+    status.metadata_mut().insert(
+        "authorization",
+        format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    let new_session = client
+        .get_status(status)
+        .await
+        .unwrap()
+        .into_inner()
+        .process_session_id;
+    assert_ne!(old_session, new_session);
+
+    let configuration = kuberic_protocol::types::ConfigurationDescriptor::new(
+        kuberic_protocol::types::Epoch::new(0, 1),
+        ReplicaId::new(1),
+        vec![kuberic_protocol::types::ConfigurationMember {
+            identity: identity(),
+            role: kuberic_protocol::types::ReplicaRole::Primary,
+        }],
+        1,
+    );
+    let initialize_command = || proto::InitializeAgentStoreCommand {
+        initialization_id: storage_identity.initialization_id.to_string(),
+        resource_uid: "resource-1".to_string(),
+        local_replica_id: 1,
+        expected_instance_id: "pod-1".to_string(),
+        expected_pod_uid: "pod-1".to_string(),
+        expected_pvc_uid: "pvc-1".to_string(),
+        assigned_agent_generation: identity().agent_generation.to_string(),
+        effective_policy: Some(proto::EffectivePolicy {
+            replica_set_size: 1,
+            write_quorum: 1,
+            read_quorum: 1,
+            failover_delay_seconds: 30,
+        }),
+        bootstrap_configuration: Some(configuration.clone().into()),
+        provisioning: None,
+    };
+    let request = |session: &str, command| {
+        let mut request = Request::new(proto::ExecuteCommandRequest {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: "resource-1".to_string(),
+            target: Some(identity().into()),
+            expected_process_session_id: session.to_string(),
+            command: Some(command),
+        });
+        request.metadata_mut().insert(
+            "authorization",
+            format!("{} {}", "Bearer", "token").parse().unwrap(),
+        );
+        request
+    };
+    let state_before = store.load_state().await.unwrap();
+    let stale_commands = vec![
+        proto::execute_command_request::Command::InitializeAgentStore(initialize_command()),
+        proto::execute_command_request::Command::EnsureConfiguration(Box::new(
+            proto::EnsureConfigurationCommand {
+                operation_id: "configuration-1".to_string(),
+                current_configuration: Some(configuration.clone().into()),
+                current_epoch: Some(configuration.epoch.into()),
+                effective_policy: Some(proto::EffectivePolicy {
+                    replica_set_size: 1,
+                    write_quorum: 1,
+                    read_quorum: 1,
+                    failover_delay_seconds: 30,
+                }),
+                local_replica_id: 1,
+                expected_instance_id: "pod-1".to_string(),
+                expected_agent_generation: identity().agent_generation.to_string(),
+                transition_kind: proto::TransitionKind::Bootstrap as i32,
+                primary_write_status: proto::AccessStatus::ReconfigurationPending as i32,
+                ..Default::default()
+            },
+        )),
+        proto::execute_command_request::Command::EnsureReplicaBuild(
+            proto::EnsureReplicaBuildCommand {
+                operation_id: "build-1".to_string(),
+                local_replica_id: 1,
+                expected_instance_id: "pod-1".to_string(),
+                expected_agent_generation: identity().agent_generation.to_string(),
+                target: Some(proto::ReplicaIdentity {
+                    replica_id: 2,
+                    instance_id: "pod-2".to_string(),
+                    agent_generation: "generation-2".to_string(),
+                }),
+                authority: None,
+                source_session_id: String::new(),
+            },
+        ),
+    ];
+    for command in stale_commands {
+        assert_eq!(
+            client
+                .execute(request(&old_session, command))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(store.load_state().await.unwrap(), state_before);
+    }
+
+    client
+        .execute(request(
+            &new_session,
+            proto::execute_command_request::Command::InitializeAgentStore(initialize_command()),
+        ))
+        .await
+        .unwrap();
+
+    shutdown_tx.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn fresh_storage_reports_uninitialized_and_creates_exact_bootstrap_identity() {
     let directory = tempdir().unwrap();
     let path = SqliteStore::metadata_database_path(directory.path());

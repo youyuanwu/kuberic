@@ -2120,10 +2120,12 @@ fn role_label(role: ReplicaRole) -> &'static str {
 mod tests {
     use super::*;
     use crate::crd::KubericSetSpec;
-    use kuberic_protocol::command::PrepareSwitchover;
+    use kuberic_protocol::command::{
+        EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
+    };
     use kuberic_protocol::types::{
-        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId,
-        SwitchoverRequestId,
+        AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember,
+        EffectivePolicy, Epoch, InitializationId, OperationId, PodUid, PvcUid, SwitchoverRequestId,
     };
 
     fn identity(replica_id: i64) -> ReplicaIdentity {
@@ -2192,9 +2194,9 @@ mod tests {
                 local_replica_id: source.replica_id,
                 expected_instance_id: source.instance_id.clone(),
                 expected_agent_generation: source.agent_generation.clone(),
-                source,
-                target,
-                current_configuration: configuration,
+                source: source.clone(),
+                target: target.clone(),
+                current_configuration: configuration.clone(),
             })),
         );
         assert_eq!(request.expected_process_session_id, "session-1");
@@ -2204,5 +2206,66 @@ mod tests {
                 _
             ))
         ));
+
+        let policy = EffectivePolicy::fixed(2, 30).unwrap();
+        let existing_commands = vec![
+            (
+                ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {
+                    initialization_id: InitializationId::new("init-1"),
+                    resource_uid: ResourceUid::new("resource"),
+                    local_replica_id: source.replica_id,
+                    expected_instance_id: source.instance_id.clone(),
+                    expected_pod_uid: PodUid::new(source.instance_id.as_str()),
+                    expected_pvc_uid: PvcUid::new("pvc-1"),
+                    assigned_agent_generation: source.agent_generation.clone(),
+                    effective_policy: policy.clone(),
+                    bootstrap_configuration: configuration.clone(),
+                    provisioning: None,
+                })),
+                source.clone(),
+            ),
+            (
+                ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
+                    operation_id: OperationId::new("configuration-1"),
+                    previous_configuration: None,
+                    current_configuration: configuration.clone(),
+                    previous_epoch: None,
+                    current_epoch: configuration.epoch,
+                    effective_policy: policy,
+                    local_replica_id: source.replica_id,
+                    expected_instance_id: source.instance_id.clone(),
+                    expected_agent_generation: source.agent_generation.clone(),
+                    transition_kind: TransitionKind::Bootstrap,
+                    failover_safe_lsn: None,
+                    primary_write_status: AccessStatus::ReconfigurationPending,
+                    current_only: false,
+                    retire_build_ids: Vec::new(),
+                    switchover_handoff: None,
+                    retire_switchover_preparation_ids: Vec::new(),
+                })),
+                source.clone(),
+            ),
+            (
+                ProtocolCommand::EnsureReplicaBuild(Box::new(EnsureReplicaBuild {
+                    operation_id: OperationId::new("build-1"),
+                    local_replica_id: source.replica_id,
+                    expected_instance_id: source.instance_id.clone(),
+                    expected_agent_generation: source.agent_generation.clone(),
+                    target,
+                    authority: None,
+                    source_session_id: None,
+                })),
+                source,
+            ),
+        ];
+        for (command, target) in existing_commands {
+            let request = command_request(
+                "resource".to_string(),
+                target,
+                "session-current".to_string(),
+                command,
+            );
+            assert_eq!(request.expected_process_session_id, "session-current");
+        }
     }
 }

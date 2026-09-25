@@ -530,6 +530,7 @@ pub struct PlannedSwitchoverIntent {
     pub request_id: SwitchoverRequestId,
     pub source: ReplicaIdentity,
     pub target: ReplicaIdentity,
+    pub requested_configuration: ConfigurationDescriptor,
     pub resolution: PlannedSwitchoverResolution,
     #[serde(default)]
     pub handoff: Option<SwitchoverHandoff>,

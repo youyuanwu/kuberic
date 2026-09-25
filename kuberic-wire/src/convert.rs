@@ -644,9 +644,44 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         "ensure_configuration.switchover_handoff",
                     ))
                     .and_then(switchover_handoff_from_proto)?;
-                if handoff.handoff_lsn < 0 {
+                let current_contains_handoff_members = current
+                    .members
+                    .iter()
+                    .any(|member| member.identity == handoff.source)
+                    && current
+                        .members
+                        .iter()
+                        .any(|member| member.identity == handoff.target);
+                let previous_matches_handoff = previous.as_ref().is_none_or(|configuration| {
+                    configuration.configuration_id == handoff.starting_configuration_id
+                        && configuration.members.iter().any(|member| {
+                            member.identity == handoff.source && member.role == ReplicaRole::Primary
+                        })
+                        && configuration.members.iter().any(|member| {
+                            member.identity == handoff.target && member.role != ReplicaRole::Primary
+                        })
+                });
+                let retirement_ids = command
+                    .retire_switchover_preparation_ids
+                    .iter()
+                    .collect::<BTreeSet<_>>();
+                if !current_contains_handoff_members
+                    || !previous_matches_handoff
+                    || retirement_ids.len() != command.retire_switchover_preparation_ids.len()
+                    || command
+                        .retire_switchover_preparation_ids
+                        .iter()
+                        .any(String::is_empty)
+                    || (command.current_only
+                        && (command.retire_switchover_preparation_ids.len() != 1
+                            || command.retire_switchover_preparation_ids[0]
+                                != handoff.preparation_operation_id.as_str()))
+                    || (!command.current_only
+                        && !command.retire_switchover_preparation_ids.is_empty())
+                {
                     return Err(WireError::InvalidAuthority(
-                        "planned switchover handoff LSN must be nonnegative".to_string(),
+                        "planned switchover handoff or retirement differs from authority"
+                            .to_string(),
                     ));
                 }
             } else if command.switchover_handoff.is_some()
@@ -700,11 +735,16 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     "prepare_switchover.current_configuration",
                 ))?
                 .try_into()?;
+            let current_primary = current
+                .members
+                .iter()
+                .find(|member| member.identity.replica_id == current.primary_id)
+                .expect("validated configuration has one primary");
             if source != envelope_target
                 || source.replica_id != ReplicaId::new(command.local_replica_id)
                 || source.instance_id.as_str() != command.expected_instance_id
                 || source.agent_generation.as_str() != command.expected_agent_generation
-                || source.replica_id != current.primary_id
+                || source != current_primary.identity
                 || target.replica_id == current.primary_id
                 || !current
                     .members

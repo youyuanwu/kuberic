@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore};
 use kuberic_protocol::types::{ReplicaRole, TransitionKind};
 use kuberic_protocol::validation::validate_transition_relationship;
@@ -216,15 +218,27 @@ fn admit_configuration_with_replay(
                 "planned switchover authority requires a handoff certificate".into(),
             )
         })?;
-        if command
+        let starting_configuration = command
             .previous_configuration
             .as_ref()
-            .is_some_and(|configuration| configuration.primary_id != handoff.source.replica_id)
-            || !command
-                .current_configuration
-                .members
-                .iter()
-                .any(|member| member.identity == handoff.source)
+            .or(state.previous_configuration.as_ref());
+        let retirement_ids = command
+            .retire_switchover_preparation_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if starting_configuration.is_none_or(|configuration| {
+            configuration.configuration_id != handoff.starting_configuration_id
+                || !configuration.members.iter().any(|member| {
+                    member.identity == handoff.source && member.role == ReplicaRole::Primary
+                })
+                || !configuration.members.iter().any(|member| {
+                    member.identity == handoff.target && member.role != ReplicaRole::Primary
+                })
+        }) || !command
+            .current_configuration
+            .members
+            .iter()
+            .any(|member| member.identity == handoff.source)
             || !command
                 .current_configuration
                 .members
@@ -232,6 +246,15 @@ fn admit_configuration_with_replay(
                 .any(|member| member.identity == handoff.target)
             || (command.current_configuration.primary_id != handoff.source.replica_id
                 && command.current_configuration.primary_id != handoff.target.replica_id)
+            || retirement_ids.len() != command.retire_switchover_preparation_ids.len()
+            || command
+                .retire_switchover_preparation_ids
+                .iter()
+                .any(|operation_id| operation_id.is_empty())
+            || (command.current_only
+                && (command.retire_switchover_preparation_ids.len() != 1
+                    || command.retire_switchover_preparation_ids[0]
+                        != handoff.preparation_operation_id))
         {
             return Err(AgentError::CommandRejected(
                 "planned switchover handoff differs from configuration authority".into(),

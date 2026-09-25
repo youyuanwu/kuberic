@@ -446,7 +446,7 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
             spec_generation: 2,
             effective_policy: EffectivePolicy::fixed(3, 10).unwrap(),
             previous_configuration_id: Some(previous.configuration_id.clone()),
-            current_configuration: current,
+            current_configuration: current.clone(),
             election_lsn: None,
             build_id: None,
             repair: None,
@@ -454,6 +454,7 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
                 request_id: request_id.clone(),
                 source,
                 target: target.clone(),
+                requested_configuration: current.clone(),
                 resolution: PlannedSwitchoverResolution::RequestedTarget,
                 handoff: Some(handoff),
             }),
@@ -469,6 +470,34 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
     };
 
     assert!(validate_status(&status).is_ok());
+
+    let mut same_epoch_compensation = status.clone();
+    let transition = same_epoch_compensation.transition.as_mut().unwrap();
+    transition.switchover.as_mut().unwrap().resolution =
+        PlannedSwitchoverResolution::CompensatingOldPrimary;
+    transition.current_configuration = ConfigurationDescriptor::new(
+        transition.current_configuration.epoch,
+        previous.primary_id,
+        previous.members.clone(),
+        previous.write_quorum,
+    );
+    assert!(matches!(
+        validate_status(&same_epoch_compensation),
+        Err(ValidationError::TransitionEpochNotNewer)
+    ));
+
+    let mut malformed_receipt = status;
+    malformed_receipt.last_switchover = Some(PlannedSwitchoverReceipt {
+        request_id: SwitchoverRequestId::new("request-malformed"),
+        requested_target_replica_id: ReplicaId::new(2),
+        accepted_target: Some(identity(2, "pod-2", "generation-2")),
+        resulting_primary: Some(identity(-1, "", "")),
+        outcome: PlannedSwitchoverOutcome::OldPrimaryCompensated,
+    });
+    assert!(matches!(
+        validate_status(&malformed_receipt),
+        Err(ValidationError::InvalidSwitchoverReceipt)
+    ));
 }
 
 #[test]

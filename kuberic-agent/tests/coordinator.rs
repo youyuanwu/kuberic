@@ -13,7 +13,7 @@ use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
     ProcessSessionId, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole,
-    ResourceUid, TransitionKind,
+    ResourceUid, SwitchoverHandoff, SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::RuntimeError;
 use kuberic_runtime_internal::authority::AdmittedAuthority;
@@ -226,6 +226,117 @@ fn store() -> (tempfile::TempDir, Arc<SqliteStore>) {
     let path = SqliteStore::metadata_database_path(directory.path());
     let store = SqliteStore::create_authorized(path, AgentState::new(storage_identity())).unwrap();
     (directory, Arc::new(store))
+}
+
+#[test]
+fn planned_switchover_admission_binds_starting_authority_and_retirement() {
+    let source = identity();
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: AgentGeneration::new("generation-2"),
+    };
+    let third = ReplicaIdentity {
+        replica_id: ReplicaId::new(3),
+        instance_id: ReplicaInstanceId::new("pod-3"),
+        agent_generation: AgentGeneration::new("generation-3"),
+    };
+    let policy = EffectivePolicy::fixed(3, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: third.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        target.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: third,
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        policy.write_quorum,
+    );
+    let handoff = SwitchoverHandoff {
+        preparation_operation_id: OperationId::new("prepare-1"),
+        request_id: SwitchoverRequestId::new("request-1"),
+        source: source.clone(),
+        target,
+        starting_configuration_id: previous.configuration_id.clone(),
+        handoff_lsn: 7,
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        effective_policy: policy.clone(),
+        ..storage_identity()
+    });
+    state.highest_epoch = previous.epoch;
+    state.current_configuration = Some(previous.clone());
+    state.role = ReplicaRole::Primary;
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new("install-1"),
+        previous_configuration: Some(previous.clone()),
+        current_configuration: current.clone(),
+        previous_epoch: Some(previous.epoch),
+        current_epoch: current.epoch,
+        effective_policy: policy.clone(),
+        local_replica_id: source.replica_id,
+        expected_instance_id: source.instance_id.clone(),
+        expected_agent_generation: source.agent_generation.clone(),
+        transition_kind: TransitionKind::PlannedSwitchover,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only: false,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: Some(handoff.clone()),
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    assert!(admit_configuration(&command, &state).is_ok());
+
+    let mut wrong_start = command.clone();
+    wrong_start
+        .switchover_handoff
+        .as_mut()
+        .unwrap()
+        .starting_configuration_id = kuberic_protocol::types::ConfigurationId::new("unrelated");
+    assert!(admit_configuration(&wrong_start, &state).is_err());
+
+    state.highest_epoch = current.epoch;
+    state.previous_configuration = Some(previous);
+    state.current_configuration = Some(current.clone());
+    state.role = ReplicaRole::ActiveSecondary;
+    let mut current_only = command;
+    current_only.operation_id = OperationId::new("current-only-1");
+    current_only.previous_configuration = None;
+    current_only.previous_epoch = None;
+    current_only.current_only = true;
+    current_only.current_configuration = current;
+    current_only.retire_switchover_preparation_ids = vec![OperationId::new("")];
+    assert!(admit_configuration(&current_only, &state).is_err());
+    current_only.retire_switchover_preparation_ids = vec![handoff.preparation_operation_id.clone()];
+    assert!(admit_configuration(&current_only, &state).is_ok());
 }
 
 #[tokio::test]
