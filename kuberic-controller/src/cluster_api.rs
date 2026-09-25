@@ -1799,6 +1799,7 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
     proto::EnsureConfigurationCommand {
         previous_policy: command.previous_policy.map(Into::into),
         secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(Into::into),
         operation_id: command.operation_id.to_string(),
         previous_configuration: command.previous_configuration.map(Into::into),
         current_configuration: Some(command.current_configuration.into()),
@@ -1871,8 +1872,24 @@ fn ensure_build_command(command: EnsureReplicaBuild) -> proto::EnsureReplicaBuil
 }
 
 fn provisioning(provisioning: ProvisioningIntent) -> proto::ProvisioningIntent {
+    use proto::provisioning_intent::Purpose;
     proto::ProvisioningIntent {
-        replaces: Some(provisioning.replaces.into()),
+        purpose: Some(match provisioning.purpose.kind {
+            kuberic_protocol::types::ProvisioningKind::Replacement => Purpose::Replaces(
+                provisioning
+                    .purpose
+                    .replaces
+                    .expect("validated replacement provisioning")
+                    .into(),
+            ),
+            kuberic_protocol::types::ProvisioningKind::ScaleUp => Purpose::ScaleUp(
+                provisioning
+                    .purpose
+                    .scale_up
+                    .expect("validated scale-up provisioning")
+                    .into(),
+            ),
+        }),
         pod_uid: provisioning.pod_uid.to_string(),
         pvc_uid: provisioning.pvc_uid.to_string(),
         operation_id: provisioning.operation_id.to_string(),
@@ -1895,6 +1912,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::Failover => proto::TransitionKind::Failover,
         TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
         TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
+        TransitionKind::ScaleUp => proto::TransitionKind::ScaleUp,
     }
 }
 
@@ -2977,6 +2995,7 @@ mod tests {
                 ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: OperationId::new("configuration-1"),
                     previous_configuration: None,
                     current_configuration: configuration.clone(),

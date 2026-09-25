@@ -5,6 +5,7 @@
 
 pub mod convert;
 mod scale_down;
+mod scale_up;
 
 pub mod proto {
     tonic::include_proto!("kuberic.level.v1");

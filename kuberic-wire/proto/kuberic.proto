@@ -37,6 +37,7 @@ enum TransitionKind {
   TRANSITION_KIND_FAILOVER = 3;
   TRANSITION_KIND_PLANNED_SWITCHOVER = 4;
   TRANSITION_KIND_SECONDARY_SCALE_DOWN = 5;
+  TRANSITION_KIND_SCALE_UP = 6;
 }
 
 enum FaultType {
@@ -161,10 +162,23 @@ message InitializeAgentStoreCommand {
 
 message ProvisioningIntent {
   reserved 1, 2, 4, 5, 8, 9, 11;
-  ReplicaIdentity replaces = 3;
+  oneof purpose {
+    ReplicaIdentity replaces = 3;
+    ScaleUpProvisioning scale_up = 12;
+  }
   string pod_uid = 6;
   string pvc_uid = 7;
   string operation_id = 10;
+}
+
+message ScaleUpProvisioning {
+  string resource_uid = 1;
+  uint64 spec_generation = 2;
+  uint32 desired_replicas = 3;
+  Configuration previous_configuration = 4;
+  EffectivePolicy previous_policy = 5;
+  EffectivePolicy current_policy = 6;
+  int64 target_replica_id = 7;
 }
 
 enum BuildAuthorityKind {
@@ -204,6 +218,51 @@ message EnsureConfigurationCommand {
   repeated SwitchoverPreparationId retire_switchover_preparation_ids = 18;
   EffectivePolicy previous_policy = 19;
   SecondaryRemovalEvidence secondary_removal_evidence = 20;
+  ScaleUpConfigurationEvidence scale_up_evidence = 21;
+}
+
+message ScaleUpIntent {
+  string operation_id = 1;
+  string resource_uid = 2;
+  uint64 spec_generation = 3;
+  uint32 desired_replicas = 4;
+  Configuration previous_configuration = 5;
+  Configuration current_configuration = 6;
+  EffectivePolicy previous_policy = 7;
+  EffectivePolicy current_policy = 8;
+  ReplicaIdentity primary = 9;
+  ReplicaIdentity target = 10;
+  string build_id = 11;
+  int64 snapshot_boundary_lsn = 12;
+  int64 catch_up_boundary_lsn = 13;
+}
+
+message ScaleUpWitness {
+  string resource_uid = 1;
+  ReplicaIdentity identity = 2;
+  string process_session_id = 3;
+  uint64 report_sequence = 4;
+  Epoch epoch = 5;
+  string previous_configuration_id = 6;
+  string current_configuration_id = 7;
+  int64 verified_replication_lsn = 8;
+  AccessStatus write_status = 9;
+  string pending_operation_id = 10;
+  string retained_operation_id = 11;
+  ReplicaRole role = 12;
+}
+
+message ScaleUpFailoverEvidence {
+  ScaleUpIntent intent = 1;
+  repeated ScaleUpWitness previous_read_quorum = 2;
+  repeated ScaleUpWitness current_read_quorum = 3;
+}
+
+message ScaleUpConfigurationEvidence {
+  oneof evidence {
+    ScaleUpIntent admission = 1;
+    ScaleUpFailoverEvidence failover = 2;
+  }
 }
 
 message CleanupResourceIdentity {

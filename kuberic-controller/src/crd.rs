@@ -132,6 +132,60 @@ mod tests {
     }
 
     #[test]
+    fn scale_up_status_schema_is_typed_and_zero_boundaries_are_allowed() {
+        let schema = serde_json::to_value(KubericSet::crd()).unwrap();
+        let status = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["status"]
+            ["properties"];
+        let transition = &status["transition"]["properties"];
+        assert!(
+            transition["kind"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("scaleUp"))
+        );
+        let intent = &transition["scaleUp"]["properties"];
+        for field in [
+            "operationId",
+            "resourceUid",
+            "specGeneration",
+            "desiredReplicas",
+            "previousConfiguration",
+            "currentConfiguration",
+            "previousPolicy",
+            "currentPolicy",
+            "primary",
+            "target",
+            "buildId",
+            "snapshotBoundaryLsn",
+            "catchUpBoundaryLsn",
+        ] {
+            assert!(intent.get(field).is_some(), "{field}");
+        }
+        assert_eq!(intent["snapshotBoundaryLsn"]["minimum"], 0.0);
+        assert_eq!(intent["catchUpBoundaryLsn"]["minimum"], 0.0);
+        assert!(status.get("scaleUpCleanup").is_some());
+        assert!(status.get("lastScaleUp").is_some());
+
+        let provisioning = &status["provisioning"]["properties"]["purpose"]["properties"];
+        assert_eq!(
+            provisioning["kind"]["enum"],
+            json!(["replacement", "scaleUp"])
+        );
+        assert!(
+            provisioning["scaleUp"]["properties"]
+                .get("targetReplicaId")
+                .is_some()
+        );
+
+        let generated = serde_json::to_vec(&KubericSet::crd()).unwrap();
+        assert!(
+            generated.len() < 350_000,
+            "generated CRD unexpectedly grew to {} bytes",
+            generated.len()
+        );
+    }
+
+    #[test]
     fn crd_uses_only_the_level_triggered_api_group() {
         let crd = KubericSet::crd();
         assert_eq!(crd.spec.group, API_GROUP);
@@ -174,8 +228,12 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<std::collections::BTreeSet<_>>(),
-            std::collections::BTreeSet::from(["operationId", "podUid", "pvcUid", "replaces"])
+            std::collections::BTreeSet::from(["operationId", "podUid", "purpose", "pvcUid"])
         );
+        let purpose = &provisioning["purpose"]["properties"];
+        assert_eq!(purpose["kind"]["enum"], json!(["replacement", "scaleUp"]));
+        assert!(purpose.get("replaces").is_some());
+        assert!(purpose.get("scaleUp").is_some());
         assert!(
             status["properties"]["transition"]["properties"]
                 .get("startedAtUnixSeconds")

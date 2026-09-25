@@ -291,6 +291,7 @@ fn switchover_recovery_fixture(boundary: &str) -> (AgentState, EnsureConfigurati
     let command = EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id: OperationId::new(format!("recover-{boundary}")),
         previous_configuration: (!current_only && !restoring).then(|| previous.clone()),
         previous_epoch: (!current_only && !restoring).then_some(previous.epoch),
@@ -650,6 +651,7 @@ fn configuration_command() -> EnsureConfiguration {
     EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id: OperationId::new("configuration-1"),
         previous_configuration: None,
         current_configuration,
@@ -691,6 +693,7 @@ fn real_configuration_command() -> EnsureConfiguration {
     EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id: OperationId::new("real-runtime-configuration"),
         previous_configuration: None,
         current_configuration,
@@ -1626,6 +1629,7 @@ fn local_write_recovery_writer_process() {
                 let restore = EnsureConfiguration {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: OperationId::new("reused-restoration"),
                     previous_configuration: None,
                     previous_epoch: None,
@@ -1683,6 +1687,7 @@ fn local_write_recovery_writer_process() {
         let restore = EnsureConfiguration {
             previous_policy: None,
             secondary_removal_evidence: None,
+            scale_up_evidence: None,
             operation_id: OperationId::new("recover-source"),
             previous_configuration: None,
             previous_epoch: None,

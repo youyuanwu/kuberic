@@ -1634,6 +1634,8 @@ fn evaluator_scale_down_existing_transitions_and_provisioning_serialize() {
             switchover: None,
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
         });
         snapshots.push(model.snapshot);
     }
@@ -1649,7 +1651,7 @@ fn evaluator_scale_down_existing_transitions_and_provisioning_serialize() {
         .identity
         .clone();
     model.snapshot.status.provisioning = Some(ProvisioningIntent {
-        replaces: replacing,
+        purpose: ProvisioningPurpose::replacement(replacing),
         operation_id: OperationId::new("existing-provisioning"),
         pod_uid: PodUid::new("new-pod"),
         pvc_uid: PvcUid::new("new-pvc"),
@@ -1775,9 +1777,9 @@ use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverIntent,
     PlannedSwitchoverOutcome, PlannedSwitchoverReceipt, PlannedSwitchoverRequest,
-    PlannedSwitchoverResolution, PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole, ResourceUid,
-    SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind,
+    PlannedSwitchoverResolution, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
+    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole,
+    ResourceUid, SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind,
     derive_agent_generation, derive_initialization_id, derive_switchover_preparation_operation_id,
     derive_transition_id,
 };
@@ -1868,7 +1870,7 @@ fn replacement_provenance_binds_ids_status_and_legacy_json_without_granting_clea
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: old.clone(),
+            purpose: ProvisioningPurpose::replacement(old.clone()),
             pod_uid: PodUid::new("new-pod"),
             pvc_uid: PvcUid::new("new-pvc"),
             operation_id: OperationId::new("unused"),
@@ -1908,8 +1910,8 @@ fn replacement_provenance_binds_ids_status_and_legacy_json_without_granting_clea
                 }
             }
             7 => {
-                changed.status.provisioning.as_mut().unwrap().replaces =
-                    identity(3, "other", "other")
+                changed.status.provisioning.as_mut().unwrap().purpose =
+                    ProvisioningPurpose::replacement(identity(3, "other", "other"))
             }
             _ => changed.status.last_replacement = Some(receipt.clone()),
         }
@@ -2946,6 +2948,8 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &resource_uid,
                 TransitionKind::PlannedSwitchover,
@@ -4601,7 +4605,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
             configuration: accepted.clone(),
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: old_identity.clone(),
+            purpose: ProvisioningPurpose::replacement(old_identity.clone()),
             pod_uid: PodUid::new("replacement-pod"),
             pvc_uid: PvcUid::new("replacement-pvc"),
             operation_id: OperationId::new("replacement-operation"),
@@ -4732,6 +4736,8 @@ fn active_transition_keeps_frozen_policy_after_spec_change() {
     let transition = TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
         transition_id: derive_transition_id(
             &ResourceUid::new("resource-uid"),
             TransitionKind::Bootstrap,
@@ -5007,6 +5013,8 @@ fn failover_corrects_provisional_candidate_with_a_newer_epoch() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5274,6 +5282,8 @@ fn failover_authorizes_full_copy_when_primary_history_cannot_repair_a_member() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5432,6 +5442,8 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5582,6 +5594,8 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -5710,6 +5724,8 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -6371,7 +6387,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
             })
             .expect("replacement provisioning status");
         let provisioning = provisioning_status.provisioning.clone().unwrap();
-        assert_eq!(provisioning.replaces, replacing);
+        assert_eq!(provisioning.replacement(), Some(&replacing));
         assert_eq!(provisioning.instance_id(), target.instance_id);
 
         snapshot.status = provisioning_status;
@@ -6499,6 +6515,8 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -6798,7 +6816,7 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: replacing.clone(),
+            purpose: ProvisioningPurpose::replacement(replacing.clone()),
             pod_uid,
             pvc_uid,
             operation_id: OperationId::new("lost-build"),
@@ -6904,7 +6922,7 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: replacing.clone(),
+            purpose: ProvisioningPurpose::replacement(replacing.clone()),
             pod_uid: PodUid::new("abandoned-target"),
             pvc_uid: PvcUid::new("abandoned-target-pvc"),
             operation_id: OperationId::new("abandoned-build"),
@@ -6999,6 +7017,8 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Replacement,
             spec_generation: 1,

@@ -258,6 +258,7 @@ async fn secondary_removal_rpc_replay() {
                         effective_policy: Some(cmd.effective_policy.into()),
                         previous_policy: cmd.previous_policy.map(Into::into),
                         secondary_removal_evidence: cmd.secondary_removal_evidence.map(Into::into),
+                        scale_up_evidence: cmd.scale_up_evidence.map(Into::into),
                         local_replica_id: cmd.local_replica_id.value(),
                         expected_instance_id: cmd.expected_instance_id.to_string(),
                         expected_agent_generation: cmd.expected_agent_generation.to_string(),

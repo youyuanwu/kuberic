@@ -28,6 +28,7 @@ fn removal_ensure(
         effective_policy: Some(command.effective_policy.into()),
         previous_policy: command.previous_policy.map(Into::into),
         secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
+        scale_up_evidence: command.scale_up_evidence.map(Into::into),
         local_replica_id: command.local_replica_id.value(),
         expected_instance_id: command.expected_instance_id.to_string(),
         expected_agent_generation: command.expected_agent_generation.to_string(),
@@ -240,7 +241,7 @@ fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
         match mutation {
             0 => request.protocol_version = 5,
             1 => request.protocol_version = 0,
-            2 => request.protocol_version = 7,
+            2 => request.protocol_version = 8,
             3 => request.expected_process_session_id.clear(),
             4 => request.target = None,
             5 => request.resource_uid = "other-resource".into(),
@@ -791,6 +792,7 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
                 proto::EnsureConfigurationCommand {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: "install-1".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),
@@ -1237,6 +1239,7 @@ fn ensure_request_rejects_previous_configuration_outside_frozen_policy() {
                 proto::EnsureConfigurationCommand {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: "operation".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),
@@ -1296,6 +1299,7 @@ fn ensure_request_rejects_regressing_pc_cc_relationship() {
                 proto::EnsureConfigurationCommand {
                     previous_policy: None,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     operation_id: "operation".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),

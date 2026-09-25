@@ -12,9 +12,9 @@ use kuberic_protocol::observation::{
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationId, ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId,
-    PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff, SwitchoverRequestId,
-    TransitionKind, derive_agent_generation,
+    PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose, PvcUid, ReplicaId,
+    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
+    SwitchoverRequestId, TransitionKind, derive_agent_generation,
 };
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
 use thiserror::Error;
@@ -684,7 +684,17 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     .intent;
                 return validate_removal_envelope(request, &intent.resource_uid, &target);
             }
+            if transition_kind == TransitionKind::ScaleUp || command.scale_up_evidence.is_some() {
+                let normalized = crate::scale_up::configuration_from_proto((**command).clone())?;
+                let intent = normalized
+                    .scale_up_evidence
+                    .as_ref()
+                    .expect("validated evidence")
+                    .intent();
+                return validate_removal_envelope(request, &intent.resource_uid, &target);
+            }
             if command.secondary_removal_evidence.is_some()
+                || command.scale_up_evidence.is_some()
                 || command
                     .previous_policy
                     .as_ref()
@@ -988,6 +998,12 @@ pub fn normalize_execute_request(
                 ProtocolCommand::EnsureConfiguration(Box::new(
                     crate::scale_down::configuration_from_proto(command)?,
                 ))
+            } else if command.transition_kind == proto::TransitionKind::ScaleUp as i32
+                || command.scale_up_evidence.is_some()
+            {
+                ProtocolCommand::EnsureConfiguration(Box::new(
+                    crate::scale_up::configuration_from_proto(command)?,
+                ))
             } else {
                 let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
                     .map_err(|_| WireError::InvalidEnum {
@@ -1017,6 +1033,7 @@ pub fn normalize_execute_request(
                     )?,
                     previous_policy: command.previous_policy.map(policy_from_proto).transpose()?,
                     secondary_removal_evidence: None,
+                    scale_up_evidence: None,
                     local_replica_id: ReplicaId::new(command.local_replica_id),
                     expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
                     expected_agent_generation: AgentGeneration::new(
@@ -1576,28 +1593,36 @@ fn build_authority_from_proto(
     Ok(authority)
 }
 
-fn provisioning_from_proto(
+pub(crate) fn provisioning_from_proto(
     provisioning: proto::ProvisioningIntent,
 ) -> Result<ProvisioningIntent, WireError> {
+    use proto::provisioning_intent::Purpose;
     let intent = ProvisioningIntent {
-        replaces: provisioning
-            .replaces
-            .ok_or(WireError::MissingField("provisioning.replaces"))?
-            .try_into()?,
+        purpose: match provisioning
+            .purpose
+            .ok_or(WireError::MissingField("provisioning.purpose"))?
+        {
+            Purpose::Replaces(replaces) => ProvisioningPurpose::replacement(replaces.try_into()?),
+            Purpose::ScaleUp(scale_up) => ProvisioningPurpose::scale_up(scale_up.try_into()?),
+        },
         pod_uid: PodUid::new(provisioning.pod_uid),
         pvc_uid: PvcUid::new(provisioning.pvc_uid),
         operation_id: OperationId::new(provisioning.operation_id),
     };
-    if intent.operation_id.is_empty()
-        || intent.pod_uid.is_empty()
-        || intent.pvc_uid.is_empty()
-        || intent.replaces.instance_id.is_empty()
-        || intent.replaces.agent_generation.is_empty()
+    if intent.operation_id.is_empty() || intent.pod_uid.is_empty() || intent.pvc_uid.is_empty() {
+        return Err(WireError::InvalidAuthority(
+            "provisioning identifiers must not be empty".to_string(),
+        ));
+    }
+    if let Some(replaces) = intent.replacement()
+        && (replaces.instance_id.is_empty() || replaces.agent_generation.is_empty())
     {
         return Err(WireError::InvalidAuthority(
             "replacement provisioning identifiers must not be empty".to_string(),
         ));
     }
+    kuberic_protocol::validation::validate_scale_up_provisioning(&intent)
+        .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
     Ok(intent)
 }
 
@@ -1607,6 +1632,15 @@ pub(crate) fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
         ReplicaRole::ActiveSecondary => proto::ReplicaRole::ActiveSecondary,
         ReplicaRole::IdleSecondary => proto::ReplicaRole::IdleSecondary,
         ReplicaRole::None => proto::ReplicaRole::None,
+    }
+}
+
+pub(crate) fn access_status_to_proto(status: AccessStatus) -> proto::AccessStatus {
+    match status {
+        AccessStatus::Granted => proto::AccessStatus::Granted,
+        AccessStatus::ReconfigurationPending => proto::AccessStatus::ReconfigurationPending,
+        AccessStatus::NotPrimary => proto::AccessStatus::NotPrimary,
+        AccessStatus::NoWriteQuorum => proto::AccessStatus::NoWriteQuorum,
     }
 }
 
@@ -1634,6 +1668,7 @@ fn transition_kind_from_proto(kind: proto::TransitionKind) -> Result<TransitionK
         proto::TransitionKind::Failover => Ok(TransitionKind::Failover),
         proto::TransitionKind::PlannedSwitchover => Ok(TransitionKind::PlannedSwitchover),
         proto::TransitionKind::SecondaryScaleDown => Ok(TransitionKind::SecondaryScaleDown),
+        proto::TransitionKind::ScaleUp => Ok(TransitionKind::ScaleUp),
     }
 }
 

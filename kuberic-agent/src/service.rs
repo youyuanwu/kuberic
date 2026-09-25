@@ -179,6 +179,8 @@ impl InitializationService {
         let transition = TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &command.resource_uid,
                 TransitionKind::Bootstrap,

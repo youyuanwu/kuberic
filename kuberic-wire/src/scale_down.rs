@@ -222,6 +222,7 @@ pub(crate) fn configuration_from_proto(
             )?
             .try_into()?,
         ),
+        scale_up_evidence: None,
         local_replica_id: ReplicaId::new(value.local_replica_id),
         expected_instance_id: ReplicaInstanceId::new(value.expected_instance_id),
         expected_agent_generation: AgentGeneration::new(value.expected_agent_generation),

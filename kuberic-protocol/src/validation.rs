@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use crate::scale_down::*;
+pub use crate::scale_up::*;
 use thiserror::Error;
 
 use crate::observation::{AgentObservation, ObservationSnapshot, ReplicaObservationKey};
@@ -13,6 +14,8 @@ use crate::types::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
+    #[error("invalid scale-up authority: {0}")]
+    InvalidScaleUp(&'static str),
     #[error("invalid secondary scale-down authority: {0}")]
     InvalidSecondaryScaleDown(&'static str),
     #[error("desired replica count must be greater than zero")]
@@ -255,8 +258,27 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
             "completed removal resource UID mismatch",
         ));
     }
+    if snapshot
+        .status
+        .scale_up_cleanup
+        .as_ref()
+        .is_some_and(|cleanup| {
+            cleanup
+                .provisioning
+                .scale_up()
+                .is_none_or(|scale_up| scale_up.resource_uid != snapshot.resource_uid)
+        })
+        || snapshot
+            .status
+            .last_scale_up
+            .as_ref()
+            .is_some_and(|receipt| receipt.intent.resource_uid != snapshot.resource_uid)
+    {
+        return Err(ValidationError::InvalidScaleUp("resource UID mismatch"));
+    }
 
     if let Some(provisioning) = &snapshot.status.provisioning {
+        validate_scale_up_provisioning(provisioning)?;
         let target = provisioning.target_identity(&snapshot.resource_uid);
         if let Some(topology) = &snapshot.status.topology
             && topology.configuration.members.iter().any(|member| {
@@ -271,14 +293,36 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
             .topology
             .as_ref()
             .ok_or(ValidationError::ProvisioningWithoutTopology)?;
-        if provisioning.replaces.replica_id == topology.configuration.primary_id
-            || !topology
-                .configuration
-                .members
-                .iter()
-                .any(|member| member.identity == provisioning.replaces)
-        {
-            return Err(ValidationError::InvalidProvisioningReplacement);
+        match provisioning.purpose.kind {
+            crate::types::ProvisioningKind::Replacement => {
+                let replaces = provisioning
+                    .replacement()
+                    .ok_or(ValidationError::InvalidProvisioningReplacement)?;
+                if replaces.replica_id == topology.configuration.primary_id
+                    || !topology
+                        .configuration
+                        .members
+                        .iter()
+                        .any(|member| member.identity == *replaces)
+                {
+                    return Err(ValidationError::InvalidProvisioningReplacement);
+                }
+            }
+            crate::types::ProvisioningKind::ScaleUp => {
+                let scale_up = provisioning
+                    .scale_up()
+                    .ok_or(ValidationError::InvalidScaleUp(
+                        "missing scale-up provisioning payload",
+                    ))?;
+                if scale_up.resource_uid != snapshot.resource_uid
+                    || scale_up.previous_configuration != topology.configuration
+                    || snapshot.status.effective_policy.as_ref() != Some(&scale_up.previous_policy)
+                {
+                    return Err(ValidationError::InvalidScaleUp(
+                        "provisioning differs from accepted authority",
+                    ));
+                }
+            }
         }
     }
 
@@ -973,9 +1017,10 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         let configuration = &topology.configuration;
         if status.last_replacement.is_some()
             || status.secondary_scale_down_cleanup.is_some()
+            || status.scale_up_cleanup.is_some()
             || !configuration.members.iter().any(|m| m.identity == cleanup.target)
             || status.provisioning.as_ref().is_some_and(|p| {
-                p.replaces != cleanup.target
+                p.replacement() != Some(&cleanup.target)
                     || p.pod_uid.as_str() == cleanup.target.instance_id.as_str()
                     || matches!(&cleanup.resources.pvc, crate::types::CleanupResourceIdentity::Present { uid, .. } if uid == p.pvc_uid.as_str())
                     || p.operation_id != cleanup.provisioning_operation_id(&p.pod_uid, &p.pvc_uid)
@@ -997,6 +1042,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
             || status.provisioning.is_some()
             || status.transition.is_some()
             || status.secondary_scale_down_cleanup.is_some()
+            || status.scale_up_cleanup.is_some()
             || status.topology.as_ref().is_none_or(|topology| {
                 !topology.configuration.members.iter().any(|member| {
                     member.identity.replica_id == cleanup.target.replica_id
@@ -1047,12 +1093,51 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
             ));
         }
     }
+    if let Some(cleanup) = &status.scale_up_cleanup {
+        validate_scale_up_cleanup(cleanup)?;
+        let scale_up = cleanup
+            .provisioning
+            .scale_up()
+            .ok_or(ValidationError::InvalidScaleUp(
+                "cleanup requires scale-up provisioning",
+            ))?;
+        if status.provisioning.is_some()
+            || status.transition.is_some()
+            || status.secondary_scale_down_cleanup.is_some()
+            || status.pending_replacement_cleanup.is_some()
+            || status.last_replacement.is_some()
+            || status
+                .topology
+                .as_ref()
+                .is_none_or(|topology| topology.configuration != scale_up.previous_configuration)
+            || status.effective_policy.as_ref() != Some(&scale_up.previous_policy)
+        {
+            return Err(ValidationError::InvalidScaleUp(
+                "cleanup must bind uncommitted accepted authority",
+            ));
+        }
+    }
+    if let Some(receipt) = &status.last_scale_up {
+        validate_scale_up_receipt(receipt)?;
+        if status.topology.as_ref().is_none_or(|topology| {
+            topology.configuration.epoch < receipt.intent.current_configuration.epoch
+                || (topology.configuration.epoch == receipt.intent.current_configuration.epoch
+                    && (topology.configuration != receipt.intent.current_configuration
+                        || status.effective_policy.as_ref()
+                            != Some(&receipt.intent.current_policy)))
+        }) {
+            return Err(ValidationError::InvalidScaleUp(
+                "completed scale-up must bind accepted or superseded authority",
+            ));
+        }
+    }
     if let Some(cleanup) = &status.secondary_scale_down_cleanup {
         validate_secondary_scale_down_cleanup(cleanup)?;
         let intent = &cleanup.evidence.preparation.intent;
         if status.transition.is_some()
             || status.provisioning.is_some()
             || status.primary_failure.is_some()
+            || status.scale_up_cleanup.is_some()
             || status
                 .topology
                 .as_ref()
@@ -1089,6 +1174,23 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
     if status.provisioning.is_some() && (!status.initialized || status.topology.is_none()) {
         return Err(ValidationError::ProvisioningWithoutTopology);
     }
+    if let Some(provisioning) = &status.provisioning {
+        validate_scale_up_provisioning(provisioning)?;
+        if let Some(scale_up) = provisioning.scale_up() {
+            if status
+                .topology
+                .as_ref()
+                .map(|topology| &topology.configuration)
+                != Some(&scale_up.previous_configuration)
+                || status.effective_policy.as_ref() != Some(&scale_up.previous_policy)
+                || status.scale_up_cleanup.is_some()
+            {
+                return Err(ValidationError::InvalidScaleUp(
+                    "provisioning differs from accepted authority",
+                ));
+            }
+        }
+    }
     if let Some(topology) = &status.topology {
         validate_configuration(&topology.configuration, status.effective_policy.as_ref())?;
     }
@@ -1115,6 +1217,46 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         return Err(ValidationError::QuorumLossMismatch);
     }
     if let Some(transition) = &status.transition {
+        if transition.kind == TransitionKind::ScaleUp {
+            let intent = transition
+                .scale_up
+                .as_ref()
+                .ok_or(ValidationError::InvalidScaleUp(
+                    "missing frozen scale-up intent",
+                ))?;
+            validate_scale_up(intent)?;
+            if status
+                .topology
+                .as_ref()
+                .map(|topology| &topology.configuration)
+                != Some(&intent.previous_configuration)
+                || status.effective_policy.as_ref() != Some(&intent.previous_policy)
+                || transition.effective_policy != intent.current_policy
+                || transition.current_configuration != intent.current_configuration
+                || transition.previous_configuration_id.as_ref()
+                    != Some(&intent.previous_configuration.configuration_id)
+                || transition.spec_generation != intent.spec_generation
+                || transition.transition_id
+                    != crate::types::derive_transition_id(
+                        &intent.resource_uid,
+                        TransitionKind::ScaleUp,
+                        &intent.current_configuration.configuration_id,
+                    )
+                || transition.build_id.as_ref() != Some(&intent.build_id)
+                || transition.scale_up_failover.is_some()
+                || transition.switchover.is_some()
+                || transition.secondary_scale_down.is_some()
+                || transition.secondary_removal_evidence.is_some()
+                || transition.repair.is_some()
+                || transition.election_lsn.is_some()
+                || status.primary_failure.is_some()
+            {
+                return Err(ValidationError::InvalidScaleUp(
+                    "transition differs from immutable intent",
+                ));
+            }
+            return Ok(());
+        }
         if transition.kind == TransitionKind::SecondaryScaleDown {
             let intent = transition.secondary_scale_down.as_ref().ok_or(
                 ValidationError::InvalidSecondaryScaleDown("missing frozen intent"),
@@ -1157,11 +1299,53 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
             }
             return Ok(());
         }
+        if transition.kind == TransitionKind::Failover
+            && let Some(evidence) = &transition.scale_up_failover
+        {
+            validate_scale_up_failover_transition(
+                evidence,
+                &transition.current_configuration,
+                &transition.effective_policy,
+            )?;
+            let intent = &evidence.intent;
+            if status
+                .topology
+                .as_ref()
+                .map(|topology| &topology.configuration)
+                != Some(&intent.previous_configuration)
+                || status.effective_policy.as_ref() != Some(&intent.previous_policy)
+                || transition.previous_configuration_id.as_ref()
+                    != Some(&intent.previous_configuration.configuration_id)
+                || transition.spec_generation != intent.spec_generation
+                || transition.transition_id
+                    != crate::types::derive_transition_id(
+                        &intent.resource_uid,
+                        TransitionKind::Failover,
+                        &transition.current_configuration.configuration_id,
+                    )
+                || transition.build_id.as_ref() != Some(&intent.build_id)
+                || transition.scale_up.is_some()
+                || transition.switchover.is_some()
+                || transition.secondary_scale_down.is_some()
+                || transition.secondary_removal_evidence.is_some()
+                || transition.election_lsn.is_none_or(|lsn| lsn < 0)
+            {
+                return Err(ValidationError::InvalidScaleUp(
+                    "failover transition differs from carried scale-up authority",
+                ));
+            }
+            return Ok(());
+        }
         if transition.secondary_scale_down.is_some()
             || transition.secondary_removal_evidence.is_some()
         {
             return Err(ValidationError::InvalidSecondaryScaleDown(
                 "unexpected removal authority",
+            ));
+        }
+        if transition.scale_up.is_some() || transition.scale_up_failover.is_some() {
+            return Err(ValidationError::InvalidScaleUp(
+                "unexpected scale-up authority",
             ));
         }
         if status
@@ -1178,6 +1362,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
             Some(&transition.effective_policy),
         )?;
         match transition.kind {
+            TransitionKind::ScaleUp => unreachable!("validated independently above"),
             TransitionKind::SecondaryScaleDown => unreachable!("validated independently above"),
             TransitionKind::Bootstrap => {
                 if transition.switchover.is_some() {
@@ -1399,6 +1584,11 @@ pub fn validate_transition_relationship(
             "requires explicit dual-policy removal intent",
         ));
     }
+    if kind == TransitionKind::ScaleUp {
+        return Err(ValidationError::InvalidScaleUp(
+            "requires explicit dual-policy scale-up intent",
+        ));
+    }
     validate_policy(policy)?;
     validate_configuration(current, Some(policy))?;
     if kind == TransitionKind::Bootstrap {
@@ -1432,6 +1622,7 @@ pub fn validate_transition_relationship(
     }
 
     match kind {
+        TransitionKind::ScaleUp => unreachable!("requires typed authority above"),
         TransitionKind::SecondaryScaleDown => unreachable!("requires typed authority above"),
         TransitionKind::Bootstrap => unreachable!("bootstrap returned above"),
         TransitionKind::Failover => {

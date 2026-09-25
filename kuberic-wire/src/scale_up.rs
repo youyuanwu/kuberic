@@ -1,0 +1,487 @@
+use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::types::*;
+use kuberic_protocol::validation::{
+    ValidationError, validate_scale_up_configuration, validate_scale_up_failover_evidence,
+};
+
+use crate::convert::{WireError, access_status_from_proto, policy_from_proto, role_from_proto};
+use crate::proto;
+
+fn required<T>(value: Option<T>, name: &'static str) -> Result<T, WireError> {
+    value.ok_or(WireError::MissingField(name))
+}
+
+fn authority(error: ValidationError) -> WireError {
+    WireError::InvalidAuthority(error.to_string())
+}
+
+impl From<ScaleUpProvisioning> for proto::ScaleUpProvisioning {
+    fn from(value: ScaleUpProvisioning) -> Self {
+        Self {
+            resource_uid: value.resource_uid.to_string(),
+            spec_generation: value.spec_generation,
+            desired_replicas: value.desired_replicas,
+            previous_configuration: Some(value.previous_configuration.into()),
+            previous_policy: Some(value.previous_policy.into()),
+            current_policy: Some(value.current_policy.into()),
+            target_replica_id: value.target_replica_id.value(),
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpProvisioning> for ScaleUpProvisioning {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpProvisioning) -> Result<Self, Self::Error> {
+        Ok(Self {
+            resource_uid: ResourceUid::new(value.resource_uid),
+            spec_generation: value.spec_generation,
+            desired_replicas: value.desired_replicas,
+            previous_configuration: required(
+                value.previous_configuration,
+                "scale_up_provisioning.previous_configuration",
+            )?
+            .try_into()?,
+            previous_policy: policy_from_proto(required(
+                value.previous_policy,
+                "scale_up_provisioning.previous_policy",
+            )?)?,
+            current_policy: policy_from_proto(required(
+                value.current_policy,
+                "scale_up_provisioning.current_policy",
+            )?)?,
+            target_replica_id: ReplicaId::new(value.target_replica_id),
+        })
+    }
+}
+
+impl From<ScaleUpIntent> for proto::ScaleUpIntent {
+    fn from(value: ScaleUpIntent) -> Self {
+        Self {
+            operation_id: value.operation_id.to_string(),
+            resource_uid: value.resource_uid.to_string(),
+            spec_generation: value.spec_generation,
+            desired_replicas: value.desired_replicas,
+            previous_configuration: Some(value.previous_configuration.into()),
+            current_configuration: Some(value.current_configuration.into()),
+            previous_policy: Some(value.previous_policy.into()),
+            current_policy: Some(value.current_policy.into()),
+            primary: Some(value.primary.into()),
+            target: Some(value.target.into()),
+            build_id: value.build_id.to_string(),
+            snapshot_boundary_lsn: value.snapshot_boundary_lsn,
+            catch_up_boundary_lsn: value.catch_up_boundary_lsn,
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpIntent> for ScaleUpIntent {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpIntent) -> Result<Self, Self::Error> {
+        let intent = Self {
+            operation_id: OperationId::new(value.operation_id),
+            resource_uid: ResourceUid::new(value.resource_uid),
+            spec_generation: value.spec_generation,
+            desired_replicas: value.desired_replicas,
+            previous_configuration: required(
+                value.previous_configuration,
+                "scale_up.previous_configuration",
+            )?
+            .try_into()?,
+            current_configuration: required(
+                value.current_configuration,
+                "scale_up.current_configuration",
+            )?
+            .try_into()?,
+            previous_policy: policy_from_proto(required(
+                value.previous_policy,
+                "scale_up.previous_policy",
+            )?)?,
+            current_policy: policy_from_proto(required(
+                value.current_policy,
+                "scale_up.current_policy",
+            )?)?,
+            primary: required(value.primary, "scale_up.primary")?.try_into()?,
+            target: required(value.target, "scale_up.target")?.try_into()?,
+            build_id: OperationId::new(value.build_id),
+            snapshot_boundary_lsn: value.snapshot_boundary_lsn,
+            catch_up_boundary_lsn: value.catch_up_boundary_lsn,
+        };
+        kuberic_protocol::validation::validate_scale_up(&intent).map_err(authority)?;
+        Ok(intent)
+    }
+}
+
+impl From<ScaleUpWitness> for proto::ScaleUpWitness {
+    fn from(value: ScaleUpWitness) -> Self {
+        Self {
+            resource_uid: value.resource_uid.to_string(),
+            identity: Some(value.identity.into()),
+            process_session_id: value.process_session_id.to_string(),
+            report_sequence: value.report_sequence,
+            epoch: Some(value.epoch.into()),
+            previous_configuration_id: value
+                .previous_configuration_id
+                .map_or_else(String::new, |id| id.to_string()),
+            current_configuration_id: value.current_configuration_id.to_string(),
+            verified_replication_lsn: value.verified_replication_lsn,
+            write_status: crate::convert::access_status_to_proto(value.write_status) as i32,
+            pending_operation_id: value
+                .pending_operation_id
+                .map_or_else(String::new, |id| id.to_string()),
+            retained_operation_id: value
+                .retained_operation_id
+                .map_or_else(String::new, |id| id.to_string()),
+            role: crate::convert::role_to_proto(value.role) as i32,
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpWitness> for ScaleUpWitness {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpWitness) -> Result<Self, Self::Error> {
+        Ok(Self {
+            resource_uid: ResourceUid::new(value.resource_uid),
+            identity: required(value.identity, "scale_up_witness.identity")?.try_into()?,
+            role: role_from_proto(proto::ReplicaRole::try_from(value.role).map_err(|_| {
+                WireError::InvalidEnum {
+                    field: "scale_up_witness.role",
+                    value: value.role,
+                }
+            })?)?,
+            process_session_id: ProcessSessionId::new(value.process_session_id),
+            report_sequence: value.report_sequence,
+            epoch: required(value.epoch, "scale_up_witness.epoch")?.into(),
+            previous_configuration_id: (!value.previous_configuration_id.is_empty())
+                .then(|| ConfigurationId::new(value.previous_configuration_id)),
+            current_configuration_id: ConfigurationId::new(value.current_configuration_id),
+            verified_replication_lsn: value.verified_replication_lsn,
+            write_status: access_status_from_proto(
+                proto::AccessStatus::try_from(value.write_status).map_err(|_| {
+                    WireError::InvalidEnum {
+                        field: "scale_up_witness.write_status",
+                        value: value.write_status,
+                    }
+                })?,
+            )?,
+            pending_operation_id: (!value.pending_operation_id.is_empty())
+                .then(|| OperationId::new(value.pending_operation_id)),
+            retained_operation_id: (!value.retained_operation_id.is_empty())
+                .then(|| OperationId::new(value.retained_operation_id)),
+        })
+    }
+}
+
+impl From<ScaleUpFailoverEvidence> for proto::ScaleUpFailoverEvidence {
+    fn from(value: ScaleUpFailoverEvidence) -> Self {
+        Self {
+            intent: Some(value.intent.into()),
+            previous_read_quorum: value
+                .previous_read_quorum
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            current_read_quorum: value
+                .current_read_quorum
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpFailoverEvidence> for ScaleUpFailoverEvidence {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpFailoverEvidence) -> Result<Self, Self::Error> {
+        let evidence = Self {
+            intent: required(value.intent, "scale_up_failover.intent")?.try_into()?,
+            previous_read_quorum: value
+                .previous_read_quorum
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            current_read_quorum: value
+                .current_read_quorum
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        };
+        validate_scale_up_failover_evidence(&evidence).map_err(authority)?;
+        Ok(evidence)
+    }
+}
+
+impl From<ScaleUpConfigurationEvidence> for proto::ScaleUpConfigurationEvidence {
+    fn from(value: ScaleUpConfigurationEvidence) -> Self {
+        use proto::scale_up_configuration_evidence::Evidence;
+        Self {
+            evidence: Some(match value {
+                ScaleUpConfigurationEvidence::Admission { intent } => {
+                    Evidence::Admission(intent.into())
+                }
+                ScaleUpConfigurationEvidence::Failover { evidence } => {
+                    Evidence::Failover(evidence.into())
+                }
+            }),
+        }
+    }
+}
+
+impl TryFrom<proto::ScaleUpConfigurationEvidence> for ScaleUpConfigurationEvidence {
+    type Error = WireError;
+
+    fn try_from(value: proto::ScaleUpConfigurationEvidence) -> Result<Self, Self::Error> {
+        use proto::scale_up_configuration_evidence::Evidence;
+        match required(value.evidence, "scale_up_evidence.evidence")? {
+            Evidence::Admission(intent) => Ok(Self::Admission {
+                intent: intent.try_into()?,
+            }),
+            Evidence::Failover(evidence) => Ok(Self::Failover {
+                evidence: evidence.try_into()?,
+            }),
+        }
+    }
+}
+
+pub(crate) fn configuration_from_proto(
+    value: proto::EnsureConfigurationCommand,
+) -> Result<EnsureConfiguration, WireError> {
+    if value.secondary_removal_evidence.is_some()
+        || value.switchover_handoff.is_some()
+        || !value.retire_switchover_preparation_ids.is_empty()
+    {
+        return Err(WireError::InvalidAuthority(
+            "scale-up cannot carry removal or switchover evidence".into(),
+        ));
+    }
+    let transition_kind =
+        match proto::TransitionKind::try_from(value.transition_kind).map_err(|_| {
+            WireError::InvalidEnum {
+                field: "ensure.transition_kind",
+                value: value.transition_kind,
+            }
+        })? {
+            proto::TransitionKind::ScaleUp => TransitionKind::ScaleUp,
+            proto::TransitionKind::Failover => TransitionKind::Failover,
+            other => {
+                return Err(WireError::InvalidEnum {
+                    field: "ensure.transition_kind",
+                    value: other as i32,
+                });
+            }
+        };
+    let primary_write_status = access_status_from_proto(
+        proto::AccessStatus::try_from(value.primary_write_status).map_err(|_| {
+            WireError::InvalidEnum {
+                field: "ensure.primary_write_status",
+                value: value.primary_write_status,
+            }
+        })?,
+    )?;
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new(value.operation_id),
+        previous_configuration: value
+            .previous_configuration
+            .map(TryInto::try_into)
+            .transpose()?,
+        current_configuration: required(
+            value.current_configuration,
+            "ensure.current_configuration",
+        )?
+        .try_into()?,
+        previous_epoch: value.previous_epoch.map(Into::into),
+        current_epoch: required(value.current_epoch, "ensure.current_epoch")?.into(),
+        effective_policy: policy_from_proto(required(
+            value.effective_policy,
+            "ensure.effective_policy",
+        )?)?,
+        previous_policy: Some(policy_from_proto(required(
+            value.previous_policy,
+            "ensure.previous_policy",
+        )?)?),
+        secondary_removal_evidence: None,
+        scale_up_evidence: Some(
+            required(value.scale_up_evidence, "ensure.scale_up_evidence")?.try_into()?,
+        ),
+        local_replica_id: ReplicaId::new(value.local_replica_id),
+        expected_instance_id: ReplicaInstanceId::new(value.expected_instance_id),
+        expected_agent_generation: AgentGeneration::new(value.expected_agent_generation),
+        transition_kind,
+        failover_safe_lsn: value.failover_safe_lsn,
+        primary_write_status,
+        current_only: value.current_only,
+        retire_build_ids: if value.retire_build_ids.is_empty() {
+            (!value.retire_build_id.is_empty())
+                .then(|| OperationId::new(value.retire_build_id))
+                .into_iter()
+                .collect()
+        } else {
+            value
+                .retire_build_ids
+                .into_iter()
+                .map(OperationId::new)
+                .collect()
+        },
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+    validate_scale_up_configuration(&command).map_err(authority)?;
+    Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{id}")),
+            agent_generation: AgentGeneration::new(format!("gen-{id}")),
+        }
+    }
+
+    fn intent() -> ScaleUpIntent {
+        let previous_policy = EffectivePolicy::fixed(1, 30).unwrap();
+        let current_policy = EffectivePolicy::fixed(2, 30).unwrap();
+        let primary = identity(1);
+        let target = identity(2);
+        let previous_configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            primary.replica_id,
+            vec![ConfigurationMember {
+                identity: primary.clone(),
+                role: ReplicaRole::Primary,
+            }],
+            previous_policy.write_quorum,
+        );
+        let current_configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            primary.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: primary.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            current_policy.write_quorum,
+        );
+        let mut intent = ScaleUpIntent {
+            operation_id: OperationId::default(),
+            resource_uid: ResourceUid::new("set"),
+            spec_generation: 2,
+            desired_replicas: 2,
+            previous_configuration,
+            current_configuration,
+            previous_policy,
+            current_policy,
+            primary,
+            target,
+            build_id: OperationId::new("build"),
+            snapshot_boundary_lsn: 0,
+            catch_up_boundary_lsn: 0,
+        };
+        intent.operation_id = intent.expected_operation_id();
+        intent
+    }
+
+    #[test]
+    fn scale_up_intent_round_trips_with_zero_boundaries() {
+        let canonical = intent();
+        let wire: proto::ScaleUpIntent = canonical.clone().into();
+        assert_eq!(ScaleUpIntent::try_from(wire).unwrap(), canonical);
+    }
+
+    #[test]
+    fn scale_up_intent_rejects_negative_and_reversed_boundaries() {
+        let mut wire: proto::ScaleUpIntent = intent().into();
+        wire.snapshot_boundary_lsn = -1;
+        assert!(ScaleUpIntent::try_from(wire).is_err());
+
+        let mut wire: proto::ScaleUpIntent = intent().into();
+        wire.snapshot_boundary_lsn = 2;
+        wire.catch_up_boundary_lsn = 1;
+        assert!(ScaleUpIntent::try_from(wire).is_err());
+    }
+
+    #[test]
+    fn tagged_scale_up_provisioning_round_trips() {
+        use proto::provisioning_intent::Purpose;
+        let intent = intent();
+        let mut canonical = ProvisioningIntent {
+            purpose: ProvisioningPurpose::scale_up(ScaleUpProvisioning {
+                resource_uid: intent.resource_uid.clone(),
+                spec_generation: intent.spec_generation,
+                desired_replicas: intent.desired_replicas,
+                previous_configuration: intent.previous_configuration.clone(),
+                previous_policy: intent.previous_policy.clone(),
+                current_policy: intent.current_policy.clone(),
+                target_replica_id: intent.target.replica_id,
+            }),
+            pod_uid: PodUid::new("pod-2"),
+            pvc_uid: PvcUid::new("pvc-2"),
+            operation_id: OperationId::default(),
+        };
+        canonical.operation_id = canonical.expected_operation_id();
+        let wire = proto::ProvisioningIntent {
+            purpose: Some(Purpose::ScaleUp(
+                canonical.purpose.scale_up.clone().unwrap().into(),
+            )),
+            pod_uid: canonical.pod_uid.to_string(),
+            pvc_uid: canonical.pvc_uid.to_string(),
+            operation_id: canonical.operation_id.to_string(),
+        };
+        assert_eq!(
+            super::super::convert::provisioning_from_proto(wire).unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn scale_up_configuration_command_round_trips_typed_evidence() {
+        let intent = intent();
+        let target = intent.primary.clone();
+        let operation_id = intent.command_operation_id(ScaleUpStage::PreviousCurrent, &target);
+        let wire = proto::EnsureConfigurationCommand {
+            operation_id: operation_id.to_string(),
+            previous_configuration: Some(intent.previous_configuration.clone().into()),
+            current_configuration: Some(intent.current_configuration.clone().into()),
+            previous_epoch: Some(intent.previous_configuration.epoch.into()),
+            current_epoch: Some(intent.current_configuration.epoch.into()),
+            effective_policy: Some(intent.current_policy.clone().into()),
+            local_replica_id: target.replica_id.value(),
+            expected_instance_id: target.instance_id.to_string(),
+            expected_agent_generation: target.agent_generation.to_string(),
+            transition_kind: proto::TransitionKind::ScaleUp as i32,
+            grant_write: true,
+            current_only: false,
+            retire_build_id: String::new(),
+            primary_write_status: proto::AccessStatus::Granted as i32,
+            retire_build_ids: Vec::new(),
+            failover_safe_lsn: None,
+            switchover_handoff: None,
+            retire_switchover_preparation_ids: Vec::new(),
+            previous_policy: Some(intent.previous_policy.clone().into()),
+            secondary_removal_evidence: None,
+            scale_up_evidence: Some(
+                ScaleUpConfigurationEvidence::Admission {
+                    intent: intent.clone(),
+                }
+                .into(),
+            ),
+        };
+        let canonical = configuration_from_proto(wire).unwrap();
+        assert_eq!(canonical.operation_id, operation_id);
+        assert_eq!(
+            canonical.scale_up_evidence,
+            Some(ScaleUpConfigurationEvidence::Admission { intent })
+        );
+    }
+}

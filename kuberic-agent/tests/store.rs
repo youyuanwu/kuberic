@@ -517,6 +517,8 @@ fn bootstrap_fixture() -> (
     let transition = TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
         transition_id: TransitionId::new("bootstrap-1"),
         kind: TransitionKind::Bootstrap,
         spec_generation: 1,
@@ -573,11 +575,11 @@ fn fresh_bootstrap_store_requires_exact_persisted_authority() {
 fn fresh_replacement_store_requires_matching_provisioning_intent() {
     let (command, observed, _) = bootstrap_fixture();
     let provisioning = ProvisioningIntent {
-        replaces: ReplicaIdentity {
+        purpose: kuberic_protocol::types::ProvisioningPurpose::replacement(ReplicaIdentity {
             replica_id: command.local_replica_id,
             instance_id: ReplicaInstanceId::new("old-pod"),
             agent_generation: AgentGeneration::new("old-generation"),
-        },
+        }),
         pod_uid: command.expected_pod_uid.clone(),
         pvc_uid: command.expected_pvc_uid.clone(),
         operation_id: OperationId::new("replace-1"),
@@ -744,6 +746,7 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
     let command = EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id: OperationId::new("current-only-1"),
         previous_configuration: None,
         current_configuration: current.clone(),

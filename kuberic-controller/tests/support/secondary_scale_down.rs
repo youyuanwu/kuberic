@@ -1221,6 +1221,8 @@ fn replacement_at_commit() -> (RawObservation, ReplicaIdentity, ReplicaIdentity)
         switchover: None,
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
     });
     let mut pod = raw.pods[1].clone();
     pod.metadata.name = Some("db-replacement".into());

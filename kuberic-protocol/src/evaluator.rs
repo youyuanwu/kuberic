@@ -422,7 +422,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
             "Persisting one exact replacement outside authority",
         );
         replacement_status.provisioning = Some(ProvisioningIntent {
-            replaces: failed.identity.clone(),
+            purpose: crate::types::ProvisioningPurpose::replacement(failed.identity.clone()),
             operation_id: snapshot
                 .status
                 .pending_replacement_cleanup
@@ -828,6 +828,8 @@ fn begin_switchover(
     status.transition = Some(TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
         transition_id: derive_transition_id(
             &snapshot.resource_uid,
             TransitionKind::PlannedSwitchover,
@@ -1797,6 +1799,7 @@ fn switchover_configuration_command(
     EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id: switchover_operation_id(transition, member, current_only),
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: transition.current_configuration.clone(),
@@ -1962,6 +1965,8 @@ fn maybe_begin_stable_failover(
     status.transition = Some(TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
         transition_id: replacement_cleanup::transition_id(
             snapshot,
             TransitionKind::Failover,
@@ -2097,6 +2102,8 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
     let transition = TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
+        scale_up: None,
+        scale_up_failover: None,
         transition_id: derive_transition_id(
             &snapshot.resource_uid,
             TransitionKind::Bootstrap,
@@ -2333,6 +2340,8 @@ fn evaluate_transition(
         status.transition = Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: replacement_cleanup::transition_id(
                 snapshot,
                 TransitionKind::Failover,
@@ -2513,6 +2522,8 @@ fn evaluate_transition(
                 status.transition = Some(TransitionIntent {
                     secondary_scale_down: None,
                     secondary_removal_evidence: None,
+                    scale_up: None,
+                    scale_up_failover: None,
                     transition_id: replacement_cleanup::transition_id(
                         snapshot,
                         TransitionKind::Failover,
@@ -2830,6 +2841,8 @@ fn evaluate_transition(
         superseded.transition = Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Bootstrap,
@@ -3116,7 +3129,7 @@ fn evaluate_provisioning(
                 .members
                 .iter()
                 .map(|member| {
-                    if member.identity == provisioning.replaces {
+                    if provisioning.replacement() == Some(&member.identity) {
                         ConfigurationMember {
                             identity: target_identity.clone(),
                             role: ReplicaRole::ActiveSecondary,
@@ -3140,6 +3153,8 @@ fn evaluate_provisioning(
             transition_status.transition = Some(TransitionIntent {
                 secondary_scale_down: None,
                 secondary_removal_evidence: None,
+                scale_up: None,
+                scale_up_failover: None,
                 transition_id: replacement_cleanup::transition_id(
                     snapshot,
                     TransitionKind::Replacement,
@@ -3769,6 +3784,7 @@ fn failover_configuration_command(
     EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id,
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: current.clone(),
@@ -3822,6 +3838,7 @@ fn replacement_configuration_command(
     EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id,
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: current.clone(),
@@ -3937,6 +3954,7 @@ fn ensure_configuration_command(
     EnsureConfiguration {
         previous_policy: None,
         secondary_removal_evidence: None,
+        scale_up_evidence: None,
         operation_id,
         previous_configuration: None,
         current_configuration: configuration.clone(),

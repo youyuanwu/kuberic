@@ -45,6 +45,8 @@ pub struct EnsureConfiguration {
     pub previous_policy: Option<EffectivePolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_removal_evidence: Option<crate::types::SecondaryRemovalEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up_evidence: Option<crate::types::ScaleUpConfigurationEvidence>,
     pub local_replica_id: ReplicaId,
     pub expected_instance_id: ReplicaInstanceId,
     pub expected_agent_generation: AgentGeneration,

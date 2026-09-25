@@ -379,9 +379,58 @@ pub struct AcceptedTopology {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct ScaleUpProvisioning {
+    pub resource_uid: ResourceUid,
+    #[schemars(range(min = 1))]
+    pub spec_generation: u64,
+    #[schemars(range(min = 1))]
+    pub desired_replicas: u32,
+    pub previous_configuration: ConfigurationDescriptor,
+    pub previous_policy: EffectivePolicy,
+    pub current_policy: EffectivePolicy,
+    pub target_replica_id: ReplicaId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisioningPurpose {
+    pub kind: ProvisioningKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<ReplicaIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up: Option<ScaleUpProvisioning>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ProvisioningKind {
+    Replacement,
+    ScaleUp,
+}
+
+impl ProvisioningPurpose {
+    pub fn replacement(replaces: ReplicaIdentity) -> Self {
+        Self {
+            kind: ProvisioningKind::Replacement,
+            replaces: Some(replaces),
+            scale_up: None,
+        }
+    }
+
+    pub fn scale_up(scale_up: ScaleUpProvisioning) -> Self {
+        Self {
+            kind: ProvisioningKind::ScaleUp,
+            replaces: None,
+            scale_up: Some(scale_up),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 /// Compact intent for one fresh replica that has not entered PC or CC.
 pub struct ProvisioningIntent {
-    pub replaces: ReplicaIdentity,
+    pub purpose: ProvisioningPurpose,
     pub pod_uid: PodUid,
     pub pvc_uid: PvcUid,
     pub operation_id: OperationId,
@@ -389,7 +438,30 @@ pub struct ProvisioningIntent {
 
 impl ProvisioningIntent {
     pub fn replica_id(&self) -> ReplicaId {
-        self.replaces.replica_id
+        match self.purpose.kind {
+            ProvisioningKind::Replacement => self
+                .purpose
+                .replaces
+                .as_ref()
+                .map_or(ReplicaId::default(), |replaces| replaces.replica_id),
+            ProvisioningKind::ScaleUp => self
+                .purpose
+                .scale_up
+                .as_ref()
+                .map_or(ReplicaId::default(), |scale_up| scale_up.target_replica_id),
+        }
+    }
+
+    pub fn replacement(&self) -> Option<&ReplicaIdentity> {
+        (self.purpose.kind == ProvisioningKind::Replacement)
+            .then_some(self.purpose.replaces.as_ref())
+            .flatten()
+    }
+
+    pub fn scale_up(&self) -> Option<&ScaleUpProvisioning> {
+        (self.purpose.kind == ProvisioningKind::ScaleUp)
+            .then_some(self.purpose.scale_up.as_ref())
+            .flatten()
     }
 
     pub fn instance_id(&self) -> ReplicaInstanceId {
@@ -414,6 +486,29 @@ impl ProvisioningIntent {
             replica_id: self.replica_id(),
             instance_id: self.instance_id(),
             agent_generation: self.assigned_agent_generation(resource_uid),
+        }
+    }
+
+    pub fn expected_operation_id(&self) -> OperationId {
+        match self.purpose.kind {
+            ProvisioningKind::Replacement => self.operation_id.clone(),
+            ProvisioningKind::ScaleUp => {
+                let Some(scale_up) = self.purpose.scale_up.as_ref() else {
+                    return OperationId::default();
+                };
+                OperationId::new(format!(
+                    "scale-up-provisioning-{}",
+                    digest_parts(&[
+                        scale_up.resource_uid.as_str(),
+                        &scale_up.spec_generation.to_string(),
+                        &scale_up.desired_replicas.to_string(),
+                        scale_up.previous_configuration.configuration_id.as_str(),
+                        &scale_up.target_replica_id.to_string(),
+                        self.pod_uid.as_str(),
+                        self.pvc_uid.as_str(),
+                    ])
+                ))
+            }
         }
     }
 }
@@ -487,6 +582,7 @@ pub enum TransitionKind {
     Failover,
     PlannedSwitchover,
     SecondaryScaleDown,
+    ScaleUp,
 }
 
 impl TransitionKind {
@@ -497,6 +593,7 @@ impl TransitionKind {
             Self::Failover => "failover",
             Self::PlannedSwitchover => "planned-switchover",
             Self::SecondaryScaleDown => "secondary-scale-down",
+            Self::ScaleUp => "scale-up",
         }
     }
 }
@@ -603,6 +700,10 @@ pub struct TransitionIntent {
     pub secondary_scale_down: Option<SecondaryScaleDownIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_removal_evidence: Option<SecondaryRemovalEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up: Option<ScaleUpIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up_failover: Option<ScaleUpFailoverEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -635,6 +736,143 @@ pub struct ReplicaCleanupIdentity {
     pub pod: CleanupResourceIdentity,
     pub pvc: CleanupResourceIdentity,
     pub endpoint: CleanupResourceIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// Immutable authority for one exact membership increase.
+pub struct ScaleUpIntent {
+    pub operation_id: OperationId,
+    pub resource_uid: ResourceUid,
+    #[schemars(range(min = 1))]
+    pub spec_generation: u64,
+    #[schemars(range(min = 1))]
+    pub desired_replicas: u32,
+    pub previous_configuration: ConfigurationDescriptor,
+    pub current_configuration: ConfigurationDescriptor,
+    pub previous_policy: EffectivePolicy,
+    pub current_policy: EffectivePolicy,
+    pub primary: ReplicaIdentity,
+    pub target: ReplicaIdentity,
+    pub build_id: OperationId,
+    #[schemars(range(min = 0))]
+    pub snapshot_boundary_lsn: i64,
+    #[schemars(range(min = 0))]
+    pub catch_up_boundary_lsn: i64,
+}
+
+impl ScaleUpIntent {
+    pub fn expected_operation_id(&self) -> OperationId {
+        OperationId::new(format!(
+            "scale-up-{}",
+            digest_parts(&[
+                self.resource_uid.as_str(),
+                &self.spec_generation.to_string(),
+                &self.desired_replicas.to_string(),
+                self.previous_configuration.configuration_id.as_str(),
+                self.current_configuration.configuration_id.as_str(),
+                &self.target.replica_id.to_string(),
+                self.target.instance_id.as_str(),
+                self.target.agent_generation.as_str(),
+                self.build_id.as_str(),
+                &self.snapshot_boundary_lsn.to_string(),
+                &self.catch_up_boundary_lsn.to_string(),
+            ])
+        ))
+    }
+
+    pub fn command_operation_id(
+        &self,
+        stage: ScaleUpStage,
+        target: &ReplicaIdentity,
+    ) -> OperationId {
+        OperationId::new(format!(
+            "scale-up-command-{}",
+            digest_parts(&[
+                self.operation_id.as_str(),
+                stage.as_tag(),
+                &target.replica_id.to_string(),
+                target.instance_id.as_str(),
+                target.agent_generation.as_str(),
+            ])
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleUpStage {
+    PreviousCurrent,
+    CurrentOnly,
+    AcceptCommit,
+}
+
+impl ScaleUpStage {
+    const fn as_tag(self) -> &'static str {
+        match self {
+            Self::PreviousCurrent => "pc-cc",
+            Self::CurrentOnly => "current-only",
+            Self::AcceptCommit => "accept-commit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScaleUpWitness {
+    pub resource_uid: ResourceUid,
+    pub identity: ReplicaIdentity,
+    pub role: ReplicaRole,
+    pub process_session_id: ProcessSessionId,
+    #[schemars(range(min = 1))]
+    pub report_sequence: u64,
+    pub epoch: Epoch,
+    pub previous_configuration_id: Option<ConfigurationId>,
+    pub current_configuration_id: ConfigurationId,
+    #[schemars(range(min = 0))]
+    pub verified_replication_lsn: i64,
+    pub write_status: AccessStatus,
+    pub pending_operation_id: Option<OperationId>,
+    pub retained_operation_id: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScaleUpFailoverEvidence {
+    pub intent: ScaleUpIntent,
+    pub previous_read_quorum: Vec<ScaleUpWitness>,
+    pub current_read_quorum: Vec<ScaleUpWitness>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ScaleUpConfigurationEvidence {
+    Admission { intent: ScaleUpIntent },
+    Failover { evidence: ScaleUpFailoverEvidence },
+}
+
+impl ScaleUpConfigurationEvidence {
+    pub fn intent(&self) -> &ScaleUpIntent {
+        match self {
+            Self::Admission { intent } => intent,
+            Self::Failover { evidence } => &evidence.intent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ScaleUpCleanup {
+    pub provisioning: ProvisioningIntent,
+    pub target: ReplicaIdentity,
+    pub resources: ReplicaCleanupIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// One bounded completed-addition proof retained for late local convergence.
+pub struct ScaleUpReceipt {
+    pub intent: ScaleUpIntent,
+    pub current_only_write_quorum: Vec<ScaleUpWitness>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -912,6 +1150,10 @@ pub struct AcceptedStatus {
     pub secondary_scale_down_cleanup: Option<SecondaryScaleDownCleanup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_secondary_removal: Option<SecondaryRemovalReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_up_cleanup: Option<ScaleUpCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scale_up: Option<ScaleUpReceipt>,
     pub conditions: Vec<StatusCondition>,
 }
 

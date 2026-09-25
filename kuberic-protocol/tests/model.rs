@@ -10,9 +10,9 @@ use kuberic_protocol::plan::Plan;
 use kuberic_protocol::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, AgentGeneration, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverOutcome,
-    PlannedSwitchoverRequest, PodUid, ProcessSessionId, ProvisioningIntent, PvcUid, ReplicaId,
-    ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverHandoff,
-    SwitchoverRequestId, TransitionIntent, TransitionKind, derive_transition_id,
+    PlannedSwitchoverRequest, PodUid, ProcessSessionId, ProvisioningIntent, ProvisioningPurpose,
+    PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ReplicaRole, ResourceUid,
+    SwitchoverHandoff, SwitchoverRequestId, TransitionIntent, TransitionKind, derive_transition_id,
 };
 use kuberic_protocol::validation::{ValidationError, validate_snapshot, validate_status};
 
@@ -78,6 +78,8 @@ fn transition_status(
         transition: Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
+            scale_up: None,
+            scale_up_failover: None,
             transition_id: derive_transition_id(&resource_uid, kind, &current.configuration_id),
             kind,
             spec_generation: 1,
@@ -149,7 +151,7 @@ fn generated_transition_traces_preserve_authority_invariants() {
                 .identity
                 .clone();
             conflicting.provisioning = Some(ProvisioningIntent {
-                replaces: replaced,
+                purpose: ProvisioningPurpose::replacement(replaced),
                 pod_uid: PodUid::new("conflicting-pod"),
                 pvc_uid: PvcUid::new("conflicting-pvc"),
                 operation_id: OperationId::new("conflicting-provisioning"),
