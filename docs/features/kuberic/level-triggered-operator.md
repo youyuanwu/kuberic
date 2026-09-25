@@ -70,7 +70,9 @@ grant replica authority.
 Raw application progress is repair evidence only. Protocol version 3
 introduced a separate authority-bound `verifiedReplicationLsn`; protocol
 version 4 additionally binds control commands to the exact observed target
-process session. The current primary revalidates the progress certificate
+process session. Version 5 adds accepted-spec-generation fencing for preparation
+and retirement; all level-triggered components must use that exact version.
+The current primary revalidates the progress certificate
 before it can contribute remote quorum credit.
 
 ## Kubernetes API
@@ -233,11 +235,20 @@ become eligible later. Wait for a terminal outcome before submitting new work.
 Temporary missing reports wait with observable reasons, not an arbitrary
 switchover timeout. Before restoration, every extant exact member must prove idle
 starting authority; retiring even an unobserved preparation fences delayed
-dispatch. After **any** newer authority admission—even before the application
+dispatch. The accepted spec generation is frozen as `preparationGeneration`
+in intent, commands, and certificates. A durable authority-bound high-water mark
+rejects every older/equal retired preparation, including after multiple
+same-authority restorations and process restarts; a newer request generation
+remains admissible. After **any** newer authority admission—even before the application
 demotion callback completes—restoring the old epoch is forbidden. Compensation
 requires the source's whole handoff certificate, retained durable prefix, exact
 read-quorum evidence, and enough survivors for write quorum. Once target
 topology is accepted, lost replies or delayed routing converge forward.
+During compensation, an extant permanently faulted non-primary is fenced by
+exact UID/resourceVersion Pod deletion, preserving its PVC. The controller
+re-observes absence before converging the surviving quorum; temporary
+unavailability still waits, and a participant observed healthy before deletion
+can converge normally.
 
 An impossible operation first enters durable safety closure with routing
 removed. Each possible writer must report non-granted access and no pending
@@ -258,6 +269,12 @@ access under the resulting accepted authority.
 Every write admitted before revocation either fails or is durably covered by the
 handoff boundary; delayed completion cannot acknowledge a write outside it.
 Acknowledged values survive safe requested or compensated completion.
+Client failure does not discard a durable registered operation. Before granting
+the recovered primary access, the runtime verifies the original operation/data
+identity and reconciles its journal using durable application commit evidence
+or replication/quorum completion under the selected authority. Access stays
+closed until this finishes, including across grant retries and restart. Reserved
+operations are durably applied before certifying the handoff prefix.
 
 Clients should tolerate HTTP 503 and disconnects, reconnect through the write
 Service, and use bounded backoff. A Service port-forward may stay pinned to its

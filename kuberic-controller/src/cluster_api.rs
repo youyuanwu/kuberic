@@ -1556,10 +1556,27 @@ fn agent_endpoint(pod: &Pod) -> Option<String> {
 
 fn map_kube_effect_error(error: kube::Error) -> ControllerError {
     match error {
-        kube::Error::Api(response) if response.code == 409 || response.code == 422 => {
+        kube::Error::Api(response) if matches!(response.code, 409 | 412 | 422) => {
             ControllerError::ObservationStale
         }
         other => ControllerError::Effect(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn exact_pod_precondition_failures_require_reobservation() {
+    for code in [409, 412, 422] {
+        let error = kube::Error::Api(Box::new(kube::core::Status {
+            message: "precondition changed".into(),
+            reason: "Conflict".into(),
+            code,
+            ..Default::default()
+        }));
+        assert!(matches!(
+            map_kube_effect_error(error),
+            ControllerError::ObservationStale
+        ));
     }
 }
 
@@ -1700,14 +1717,15 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
         switchover_handoff: command.switchover_handoff.map(Into::into),
         retire_switchover_preparation_ids: command
             .retire_switchover_preparation_ids
-            .iter()
-            .map(ToString::to_string)
+            .into_iter()
+            .map(Into::into)
             .collect(),
     }
 }
 
 fn prepare_switchover_command(command: PrepareSwitchover) -> proto::PrepareSwitchoverCommand {
     proto::PrepareSwitchoverCommand {
+        preparation_generation: command.preparation_generation,
         operation_id: command.operation_id.to_string(),
         request_id: command.request_id.to_string(),
         local_replica_id: command.local_replica_id.value(),
@@ -2306,6 +2324,7 @@ mod tests {
             2,
         );
         let preparation = ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+            preparation_generation: 1,
             operation_id: OperationId::new("prepare-1"),
             request_id: SwitchoverRequestId::new("request-1"),
             local_replica_id: source.replica_id,

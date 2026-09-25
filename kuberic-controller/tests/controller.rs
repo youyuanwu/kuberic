@@ -509,6 +509,7 @@ async fn observe_switchover_result(api: &InMemoryClusterApi, command: &ProtocolC
             report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
             report.prepared_switchover = Some(
                 kuberic_protocol::types::SwitchoverHandoff {
+                    preparation_generation: command.preparation_generation,
                     preparation_operation_id: command.operation_id.clone(),
                     request_id: command.request_id.clone(),
                     source: command.source.clone(),
@@ -964,6 +965,92 @@ async fn exact_safety_deletion_is_uid_and_resource_version_fenced_and_preserves_
     );
     assert_eq!(after.pvcs, pvcs);
     assert_eq!(after.services, overlap.services);
+}
+
+#[tokio::test]
+async fn persistent_fault_compensation_deletes_exact_pod_without_waiting_for_its_commands() {
+    use kuberic_protocol::command::KubernetesChange;
+    use kuberic_protocol::types::PlannedSwitchoverOutcome;
+    let api = Arc::new(InMemoryClusterApi::new(switchover_observation()));
+    let pvcs = api.observation().await.pvcs;
+    let mut faulted = false;
+    let mut deleted = false;
+    let mut source_admitted = false;
+    let mut completed = false;
+    for _ in 0..40 {
+        refresh_switchover_reports(&api).await;
+        let snapshot = normalize(api.observation().await, BTreeMap::new()).unwrap();
+        if source_admitted && !faulted {
+            let mut observation = api.observation().await;
+            let RawAgentObservation::Report(report) = observation
+                .agents
+                .get_mut(&ReplicaObservationKey::new(
+                    ReplicaId::new(2),
+                    ReplicaInstanceId::new("pod-uid-2"),
+                ))
+                .unwrap()
+            else {
+                panic!("target report")
+            };
+            report.reported_fault = proto::FaultType::Permanent as i32;
+            api.set_observation(observation).await;
+            faulted = true;
+            continue;
+        }
+        let plan = evaluate(&snapshot, &config());
+        if let Plan::Execute { command } = &plan {
+            if let ProtocolCommand::EnsureConfiguration(command) = command {
+                if faulted {
+                    assert_ne!(command.local_replica_id, ReplicaId::new(2));
+                    assert!(deleted, "survivor convergence must follow exact fencing");
+                } else {
+                    source_admitted = true;
+                }
+            }
+            Reconciler::new(api.clone(), config())
+                .reconcile("tests", "db")
+                .await
+                .unwrap();
+            observe_switchover_result(&api, command).await;
+        } else {
+            let safety_delete = matches!(&plan, Plan::Apply { changes } if changes.iter().any(|change|
+                matches!(change, KubernetesChange::DeleteExactPod { pod_uid, .. } if pod_uid.as_str() == "pod-uid-2")));
+            Reconciler::new(api.clone(), config())
+                .reconcile("tests", "db")
+                .await
+                .unwrap();
+            if safety_delete {
+                deleted = true;
+                assert_eq!(api.observation().await.pvcs, pvcs);
+                assert!(
+                    !api.observation()
+                        .await
+                        .pods
+                        .iter()
+                        .any(|pod| pod.uid().as_deref() == Some("pod-uid-2"))
+                );
+            }
+        }
+        let current = normalize(api.observation().await, BTreeMap::new()).unwrap();
+        if current
+            .routing
+            .write_target
+            .as_ref()
+            .is_some_and(|primary| primary.replica_id == ReplicaId::new(1))
+            && current
+                .status
+                .last_switchover
+                .as_ref()
+                .is_some_and(|receipt| {
+                    receipt.outcome == PlannedSwitchoverOutcome::OldPrimaryCompensated
+                })
+        {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed && deleted && faulted);
+    assert_eq!(api.observation().await.pvcs, pvcs);
 }
 
 #[tokio::test]

@@ -229,6 +229,7 @@ impl AgentStore for SqliteStore {
                 state.highest_epoch = state.highest_epoch.max(configuration.epoch);
             }
             if let RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation,
                 request_id,
                 source,
                 target,
@@ -241,7 +242,8 @@ impl AgentStore for SqliteStore {
                         "planned switchover preparation omitted admitted authority".into(),
                     )
                 })?;
-                if result.postcondition.role != ReplicaRole::Primary
+                if *preparation_generation == 0
+                    || result.postcondition.role != ReplicaRole::Primary
                     || result.postcondition.write_status != AccessStatus::ReconfigurationPending
                     || result.postcondition.current_progress < 0
                     || result.postcondition.committed_lsn > result.postcondition.current_progress
@@ -263,6 +265,7 @@ impl AgentStore for SqliteStore {
                     ));
                 }
                 let handoff = SwitchoverHandoff {
+                    preparation_generation: *preparation_generation,
                     preparation_operation_id: pending.effect.operation_id.clone(),
                     request_id: request_id.clone(),
                     source: source.clone(),
@@ -425,7 +428,7 @@ impl AgentStore for SqliteStore {
                     if state
                         .prepared_switchover
                         .as_ref()
-                        .is_some_and(|prepared| &prepared.preparation_operation_id != retirement_id)
+                        .is_some_and(|prepared| &prepared.preparation() != retirement_id)
                     {
                         return Err(AgentError::EffectConflict(
                             "restoration retires another preparation".into(),
@@ -451,7 +454,7 @@ impl AgentStore for SqliteStore {
                     }
                     if record.command.retire_switchover_preparation_ids.len() != 1
                         || record.command.retire_switchover_preparation_ids[0]
-                            != prepared.preparation_operation_id
+                            != prepared.preparation()
                     {
                         return Err(AgentError::EffectConflict(
                             "configuration retires another switchover preparation".into(),
@@ -460,7 +463,42 @@ impl AgentStore for SqliteStore {
                     state.retired_switchover = Some(prepared.clone());
                     state.prepared_switchover = None;
                 }
-                state.retired_preparation_id = Some(retirement_id.clone());
+                let (starting_epoch, starting_configuration_id) =
+                    record.command.switchover_handoff.as_ref().map_or(
+                        (
+                            record.command.current_epoch,
+                            record
+                                .command
+                                .current_configuration
+                                .configuration_id
+                                .clone(),
+                        ),
+                        |handoff| {
+                            (
+                                handoff.starting_epoch,
+                                handoff.starting_configuration_id.clone(),
+                            )
+                        },
+                    );
+                if state
+                    .preparation_retirement
+                    .as_ref()
+                    .is_some_and(|retired| {
+                        retired.starting_epoch > starting_epoch
+                            || (retired.starting_epoch == starting_epoch
+                                && (retired.starting_configuration_id != starting_configuration_id
+                                    || retired.generation > retirement_id.generation))
+                    })
+                {
+                    return Err(AgentError::EffectConflict(
+                        "preparation retirement regresses durable fencing".into(),
+                    ));
+                }
+                state.preparation_retirement = Some(crate::state::PreparationRetirement {
+                    starting_epoch,
+                    starting_configuration_id,
+                    generation: retirement_id.generation,
+                });
             }
             let result = RetainedCommandResult {
                 command: record.command,

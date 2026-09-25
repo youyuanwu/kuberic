@@ -274,6 +274,7 @@ fn planned_switchover_preparation_round_trip_preserves_exact_authority() {
         expected_process_session_id: "session-1".to_string(),
         command: Some(proto::execute_command_request::Command::PrepareSwitchover(
             proto::PrepareSwitchoverCommand {
+                preparation_generation: 2,
                 operation_id: "prepare-1".to_string(),
                 request_id: "request-1".to_string(),
                 local_replica_id: source.replica_id.value(),
@@ -305,6 +306,7 @@ fn planned_switchover_preparation_round_trip_preserves_exact_authority() {
     assert_eq!(envelope.expected_process_session_id.as_str(), "session-1");
     match envelope.command {
         kuberic_protocol::command::ProtocolCommand::PrepareSwitchover(command) => {
+            assert_eq!(command.preparation_generation, 2);
             assert_eq!(command.request_id.as_str(), "request-1");
             assert_eq!(command.target, target);
             assert_eq!(command.current_configuration, current);
@@ -337,6 +339,7 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
         2,
     );
     let handoff = proto::SwitchoverHandoff {
+        preparation_generation: 2,
         preparation_operation_id: "prepare-1".to_string(),
         request_id: "request-1".to_string(),
         source: Some(source.into()),
@@ -397,7 +400,10 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
     command.local_replica_id = source.replica_id.value();
     command.expected_instance_id = source.instance_id.to_string();
     command.expected_agent_generation = source.agent_generation.to_string();
-    command.retire_switchover_preparation_ids = vec!["prepare-1".into()];
+    command.retire_switchover_preparation_ids = vec![proto::SwitchoverPreparationId {
+        operation_id: "prepare-1".into(),
+        generation: 2,
+    }];
     let decoded =
         proto::ExecuteCommandRequest::decode(restoration.encode_to_vec().as_slice()).unwrap();
     let envelope = normalize_execute_request(decoded).unwrap();
@@ -415,7 +421,13 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
     assert!(matches!(envelope.command,
         kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(command)
         if command.is_switchover_restoration() && command.switchover_handoff.is_none()));
-    for fault in ["grant", "retirement", "authority"] {
+    for fault in [
+        "grant",
+        "retirement",
+        "authority",
+        "generation",
+        "retired-generation",
+    ] {
         let mut invalid = restoration.clone();
         let Some(proto::execute_command_request::Command::EnsureConfiguration(command)) =
             invalid.command.as_mut()
@@ -424,7 +436,20 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
         };
         match fault {
             "grant" => command.primary_write_status = proto::AccessStatus::Granted as i32,
-            "retirement" => command.retire_switchover_preparation_ids = vec!["other".into()],
+            "generation" => {
+                command
+                    .switchover_handoff
+                    .as_mut()
+                    .unwrap()
+                    .preparation_generation = 0
+            }
+            "retired-generation" => command.retire_switchover_preparation_ids[0].generation = 3,
+            "retirement" => {
+                command.retire_switchover_preparation_ids = vec![proto::SwitchoverPreparationId {
+                    operation_id: "other".into(),
+                    generation: 2,
+                }]
+            }
             "authority" => {
                 command
                     .switchover_handoff
@@ -459,7 +484,10 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
     else {
         unreachable!()
     };
-    command.retire_switchover_preparation_ids = vec![String::new()];
+    command.retire_switchover_preparation_ids = vec![proto::SwitchoverPreparationId {
+        operation_id: String::new(),
+        generation: 2,
+    }];
     assert!(matches!(
         validate_execute_request(&empty_retirement),
         Err(WireError::InvalidAuthority(_))
@@ -713,6 +741,7 @@ fn prepared_switchover_report_survives_protobuf_round_trip() {
         replica_id: source.replica_id.value(),
         read_status: proto::AccessStatus::Granted as i32,
         prepared_switchover: Some(proto::SwitchoverHandoff {
+            preparation_generation: 2,
             preparation_operation_id: "prepare-1".to_string(),
             request_id: "request-1".to_string(),
             source: Some(source.into()),

@@ -755,6 +755,7 @@ fn begin_switchover(
         build_id: None,
         repair: None,
         switchover: Some(PlannedSwitchoverIntent {
+            preparation_generation: snapshot.desired.generation,
             request_id: request.request_id.clone(),
             source,
             target,
@@ -1071,10 +1072,13 @@ fn recover_switchover(
             let expected_id = derive_switchover_preparation_operation_id(
                 &snapshot.resource_uid,
                 &intent.request_id,
+                intent.preparation_generation,
+                &starting.configuration_id,
                 &intent.source,
                 &intent.target,
             );
             if handoff.preparation_operation_id != expected_id
+                || handoff.preparation_generation != intent.preparation_generation
                 || handoff.request_id != intent.request_id
                 || handoff.source != intent.source
                 || handoff.target != intent.target
@@ -1102,8 +1106,7 @@ fn recover_switchover(
             );
             command.transition_kind = TransitionKind::PlannedSwitchover;
             command.switchover_handoff = Some(handoff.clone());
-            command.retire_switchover_preparation_ids =
-                vec![handoff.preparation_operation_id.clone()];
+            command.retire_switchover_preparation_ids = vec![handoff.preparation()];
             return Some(Plan::Execute {
                 command: ProtocolCommand::EnsureConfiguration(Box::new(command)),
             });
@@ -1129,12 +1132,17 @@ fn recover_switchover(
             );
             command.transition_kind = TransitionKind::PlannedSwitchover;
             command.retire_switchover_preparation_ids =
-                vec![derive_switchover_preparation_operation_id(
-                    &snapshot.resource_uid,
-                    &intent.request_id,
-                    &intent.source,
-                    &intent.target,
-                )];
+                vec![crate::types::SwitchoverPreparationId {
+                    generation: intent.preparation_generation,
+                    operation_id: derive_switchover_preparation_operation_id(
+                        &snapshot.resource_uid,
+                        &intent.request_id,
+                        intent.preparation_generation,
+                        &starting.configuration_id,
+                        &intent.source,
+                        &intent.target,
+                    ),
+                }];
             return Some(Plan::Execute {
                 command: ProtocolCommand::EnsureConfiguration(Box::new(command)),
             });
@@ -1331,6 +1339,8 @@ fn evaluate_switchover(
     let preparation_id = derive_switchover_preparation_operation_id(
         &snapshot.resource_uid,
         &intent.request_id,
+        intent.preparation_generation,
+        &starting.configuration_id,
         &intent.source,
         &intent.target,
     );
@@ -1373,6 +1383,7 @@ fn evaluate_switchover(
         }
         if let Some(handoff) = &source_report.prepared_switchover {
             if handoff.preparation_operation_id != preparation_id
+                || handoff.preparation_generation != intent.preparation_generation
                 || handoff.request_id != intent.request_id
                 || handoff.source != intent.source
                 || handoff.target != intent.target
@@ -1413,6 +1424,7 @@ fn evaluate_switchover(
         }
         return Plan::Execute {
             command: ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+                preparation_generation: intent.preparation_generation,
                 operation_id: preparation_id,
                 request_id: intent.request_id.clone(),
                 source: intent.source.clone(),
@@ -1510,6 +1522,39 @@ fn evaluate_switchover(
         .collect::<Vec<_>>();
     ordered.sort_by_key(|member| (member.identity != intent.source, member.identity.replica_id));
     ordered.push(target);
+
+    if compensating {
+        for member in &ordered {
+            if member.identity == *primary_identity || exact_pod_absent(snapshot, &member.identity)
+            {
+                continue;
+            }
+            if exact_report(snapshot, &member.identity).is_some_and(|report| {
+                report.reported_fault == Some(crate::types::FaultType::Permanent)
+            }) {
+                let Some(pod) = snapshot
+                    .observation_for_identity(&member.identity)
+                    .and_then(|observation| observation.kubernetes.as_ref())
+                    .filter(|pod| {
+                        pod.pod_uid
+                            .as_ref()
+                            .is_some_and(|uid| uid.as_str() == member.identity.instance_id.as_str())
+                    })
+                else {
+                    return wait(
+                        "SwitchoverFaultedPodObservationRequired",
+                        "Re-observe the exact faulted Pod before safety fencing",
+                    );
+                };
+                return Plan::Apply {
+                    changes: vec![KubernetesChange::DeleteExactPod {
+                        pod_name: pod.pod_name.clone(),
+                        pod_uid: pod.pod_uid.clone().unwrap(),
+                    }],
+                };
+            }
+        }
+    }
 
     let mut pc_cc_reports = Vec::new();
     let mut current_only_started = false;
@@ -1679,7 +1724,7 @@ fn switchover_configuration_command(
         retire_build_ids: Vec::new(),
         switchover_handoff: Some(handoff.clone()),
         retire_switchover_preparation_ids: if current_only && member.identity == handoff.source {
-            vec![handoff.preparation_operation_id.clone()]
+            vec![handoff.preparation()]
         } else {
             Vec::new()
         },

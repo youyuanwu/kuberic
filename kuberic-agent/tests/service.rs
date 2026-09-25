@@ -701,6 +701,7 @@ async fn status_reports_durable_switchover_preparation_after_reopen() {
         agent_generation: kuberic_protocol::types::AgentGeneration::new("generation-2"),
     };
     let handoff = SwitchoverHandoff {
+        preparation_generation: 1,
         preparation_operation_id: OperationId::new("prepare-1"),
         request_id: SwitchoverRequestId::new("request-1"),
         source: storage_identity.local_identity.clone(),
@@ -764,6 +765,7 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
     };
     for stage in [
         "prepare",
+        "retired-prepare",
         "demote",
         "promote",
         "current-only",
@@ -771,6 +773,7 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
         "compensate",
         "compensated-current-only",
     ] {
+        let preparing = stage.ends_with("prepare");
         let source = identity();
         let target = ReplicaIdentity {
             replica_id: ReplicaId::new(2),
@@ -799,7 +802,16 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
         let requested = configuration(2, &target);
         let compensation = configuration(3, &source);
         let handoff = SwitchoverHandoff {
-            preparation_operation_id: OperationId::new("session-prepare"),
+            preparation_generation: 1,
+            preparation_operation_id:
+                kuberic_protocol::types::derive_switchover_preparation_operation_id(
+                    &ResourceUid::new("resource-1"),
+                    &SwitchoverRequestId::new("session-request"),
+                    1,
+                    &starting.configuration_id,
+                    &source,
+                    &target,
+                ),
             request_id: SwitchoverRequestId::new("session-request"),
             source: source.clone(),
             target: target.clone(),
@@ -815,23 +827,24 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
         let restoring = stage == "restore";
         let compensating = stage.starts_with("compensat");
         let current_only = stage.ends_with("current-only");
-        let current = if stage == "prepare" || restoring {
+        let current = if preparing || restoring {
             &starting
         } else if compensating {
             &compensation
         } else {
             &requested
         };
-        let previous = (!current_only && !restoring && stage != "prepare").then(|| {
+        let previous = (!current_only && !restoring && !preparing).then(|| {
             if compensating {
                 requested.clone()
             } else {
                 starting.clone()
             }
         });
-        let command = if stage == "prepare" {
+        let command = if preparing {
             proto::execute_command_request::Command::PrepareSwitchover(
                 proto::PrepareSwitchoverCommand {
+                    preparation_generation: handoff.preparation_generation,
                     operation_id: handoff.preparation_operation_id.to_string(),
                     request_id: handoff.request_id.to_string(),
                     local_replica_id: local.replica_id.value(),
@@ -864,7 +877,7 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
                     current_only,
                     switchover_handoff: Some(handoff.clone().into()),
                     retire_switchover_preparation_ids: if current_only || restoring {
-                        vec![handoff.preparation_operation_id.to_string()]
+                        vec![handoff.preparation().into()]
                     } else {
                         Vec::new()
                     },
@@ -905,9 +918,22 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
         state.write_status = AccessStatus::ReconfigurationPending;
         if current_only || restoring {
             state.retired_switchover = Some(handoff.clone());
-            state.retired_preparation_id = Some(handoff.preparation_operation_id.clone());
+            state.preparation_retirement = Some(kuberic_agent::state::PreparationRetirement {
+                starting_configuration_id: handoff.starting_configuration_id.clone(),
+                starting_epoch: handoff.starting_epoch,
+                generation: handoff.preparation_generation,
+            });
         } else if local == source {
             state.prepared_switchover = Some(handoff.clone());
+        }
+        if stage == "retired-prepare" {
+            state.prepared_switchover = None;
+            state.write_status = AccessStatus::Granted;
+            state.preparation_retirement = Some(kuberic_agent::state::PreparationRetirement {
+                starting_configuration_id: starting.configuration_id.clone(),
+                starting_epoch: starting.epoch,
+                generation: 3,
+            });
         }
         if let ProtocolCommand::EnsureConfiguration(command) =
             kuberic_wire::normalize_execute_request(envelope.clone())
@@ -1002,6 +1028,36 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
             "{stage}"
         );
         assert_eq!(store.load_state().await.unwrap(), before);
+        if stage == "retired-prepare" {
+            for generation in 1..=3 {
+                let mut delayed = envelope.clone();
+                delayed.expected_process_session_id = session.clone();
+                let Some(proto::execute_command_request::Command::PrepareSwitchover(command)) =
+                    delayed.command.as_mut()
+                else {
+                    unreachable!()
+                };
+                command.preparation_generation = generation;
+                command.operation_id =
+                    kuberic_protocol::types::derive_switchover_preparation_operation_id(
+                        &ResourceUid::new("resource-1"),
+                        &handoff.request_id,
+                        generation,
+                        &starting.configuration_id,
+                        &source,
+                        &target,
+                    )
+                    .to_string();
+                assert_eq!(
+                    client.execute(authorize(delayed)).await.unwrap_err().code(),
+                    Code::FailedPrecondition
+                );
+                assert_eq!(store.load_state().await.unwrap(), before);
+            }
+            shutdown_tx.send_replace(true);
+            server.await.unwrap().unwrap();
+            continue;
+        }
         for _ in 0..2 {
             let response = client
                 .execute(authorize(proto::ExecuteCommandRequest {

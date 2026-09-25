@@ -87,6 +87,7 @@ where
             return Ok(prepared);
         }
         let action = RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: command.preparation_generation,
             request_id: command.request_id.clone(),
             source: command.source.clone(),
             target: command.target.clone(),

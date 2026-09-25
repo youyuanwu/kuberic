@@ -114,8 +114,9 @@ describes the as-built request and operational contract.
   acceptance freezes exact source/target identities, membership, and policy.
   An active request cannot be cancelled or retargeted. Identical active or
   latest-receipted requests are idempotent; status retains only the latest receipt.
-- Protocol version 4 fences each control dispatch to the observed process
-  session. Durable preparation closes source writes and records a handoff
+- Protocol version 5 fences each control dispatch to the observed process
+  session and preparations to the accepted spec generation with durable
+  retirement high-water marks. Durable preparation closes source writes and records a handoff
   certificate; target catch-up must use authority-verified progress.
 - Write-closed PC/CC and current-only convergence precede accepted topology,
   write grant, and exact-Pod routing. Membership and data-loss authority remain

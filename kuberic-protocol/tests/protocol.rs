@@ -419,9 +419,16 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
         2,
     );
     let request_id = SwitchoverRequestId::new("request-1");
-    let preparation_operation_id =
-        derive_switchover_preparation_operation_id(&resource_uid, &request_id, &source, &target);
+    let preparation_operation_id = derive_switchover_preparation_operation_id(
+        &resource_uid,
+        &request_id,
+        2,
+        &previous.configuration_id,
+        &source,
+        &target,
+    );
     let handoff = SwitchoverHandoff {
+        preparation_generation: 2,
         preparation_operation_id,
         request_id: request_id.clone(),
         source: source.clone(),
@@ -452,6 +459,7 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
             build_id: None,
             repair: None,
             switchover: Some(PlannedSwitchoverIntent {
+                preparation_generation: 2,
                 request_id: request_id.clone(),
                 source,
                 target: target.clone(),
@@ -507,19 +515,55 @@ fn switchover_preparation_id_is_deterministic_and_exact_target_bound() {
     let request_id = SwitchoverRequestId::new("request-1");
     let source = identity(1, "pod-1", "generation-1");
     let target = identity(2, "pod-2", "generation-2");
-    let first =
-        derive_switchover_preparation_operation_id(&resource_uid, &request_id, &source, &target);
-    let second =
-        derive_switchover_preparation_operation_id(&resource_uid, &request_id, &source, &target);
+    let first = derive_switchover_preparation_operation_id(
+        &resource_uid,
+        &request_id,
+        2,
+        &configuration().configuration_id,
+        &source,
+        &target,
+    );
+    let second = derive_switchover_preparation_operation_id(
+        &resource_uid,
+        &request_id,
+        2,
+        &configuration().configuration_id,
+        &source,
+        &target,
+    );
     let changed = derive_switchover_preparation_operation_id(
         &resource_uid,
         &request_id,
+        2,
+        &configuration().configuration_id,
         &source,
         &identity(2, "pod-2b", "generation-2b"),
     );
 
     assert_eq!(first, second);
     assert_ne!(first, changed);
+    assert_ne!(
+        first,
+        derive_switchover_preparation_operation_id(
+            &resource_uid,
+            &request_id,
+            3,
+            &configuration().configuration_id,
+            &source,
+            &target
+        )
+    );
+    assert_ne!(
+        first,
+        derive_switchover_preparation_operation_id(
+            &resource_uid,
+            &request_id,
+            2,
+            &kuberic_protocol::types::ConfigurationId::new("other-authority"),
+            &source,
+            &target
+        )
+    );
 }
 
 #[test]
@@ -625,6 +669,7 @@ fn prepared_switchover_snapshot() -> ObservationSnapshot {
     let source = switchover_report(&mut snapshot, 1);
     source.write_status = AccessStatus::ReconfigurationPending;
     source.prepared_switchover = Some(SwitchoverHandoff {
+        preparation_generation: command.preparation_generation,
         preparation_operation_id: command.operation_id,
         request_id: command.request_id,
         source: command.source,
@@ -686,6 +731,7 @@ fn prepared_switchover_snapshot_with_size(replica_set_size: u32) -> ObservationS
     let source = switchover_report(&mut snapshot, 1);
     source.write_status = AccessStatus::ReconfigurationPending;
     source.prepared_switchover = Some(SwitchoverHandoff {
+        preparation_generation: command.preparation_generation,
         preparation_operation_id: command.operation_id,
         request_id: command.request_id,
         source: command.source,
@@ -939,6 +985,65 @@ fn switchover_compensation_converges_returned_target_and_uninvolved_before_sourc
     };
     assert!(
         matches!(&changes[0], KubernetesChange::PublishWriteRouting { primary } if primary.replica_id == ReplicaId::new(1))
+    );
+}
+
+#[test]
+fn switchover_compensation_fences_permanent_fault_before_survivor_commands() {
+    let mut snapshot = prepared_switchover_snapshot();
+    observe_switchover_command(&mut snapshot);
+    switchover_report(&mut snapshot, 2).reported_fault =
+        Some(kuberic_protocol::types::FaultType::Permanent);
+    apply_switchover_status(&mut snapshot);
+    let mut temporary = snapshot.clone();
+    temporary
+        .replicas
+        .get_mut(&observation_key(2, "pod-2"))
+        .unwrap()
+        .agent = AgentObservation::Unreachable {
+        message: "temporary restart".into(),
+    };
+    assert!(matches!(
+        evaluate(&temporary, &EvaluationConfig::default()),
+        Plan::Wait { .. }
+    ));
+    let expected = Plan::Apply {
+        changes: vec![KubernetesChange::DeleteExactPod {
+            pod_name: snapshot.replicas[&observation_key(2, "pod-2")]
+                .kubernetes
+                .as_ref()
+                .unwrap()
+                .pod_name
+                .clone(),
+            pod_uid: PodUid::new("pod-2"),
+        }],
+    };
+    // An extant failed participant never has to execute another lifecycle command.
+    for _ in 0..3 {
+        assert_eq!(evaluate(&snapshot, &EvaluationConfig::default()), expected);
+    }
+    lose_switchover_pod(&mut snapshot, 2);
+    for current_only in [false, true] {
+        for id in [3, 1] {
+            let command = observe_switchover_command(&mut snapshot);
+            assert_eq!(command.local_replica_id, ReplicaId::new(id));
+            assert_eq!(command.current_only, current_only);
+        }
+    }
+    apply_switchover_status(&mut snapshot);
+    let orphan = snapshot
+        .replicas
+        .remove(&observation_key(2, "pod-2"))
+        .unwrap();
+    snapshot
+        .replicas
+        .insert(observation_key(2, "orphan-pvc-2"), orphan);
+    let grant = observe_switchover_command(&mut snapshot);
+    assert_eq!(grant.local_replica_id, ReplicaId::new(1));
+    assert_eq!(grant.primary_write_status, AccessStatus::Granted);
+    assert_eq!(
+        snapshot.status.last_switchover.as_ref().unwrap().outcome,
+        PlannedSwitchoverOutcome::OldPrimaryCompensated
     );
 }
 
@@ -1349,6 +1454,14 @@ fn switchover_freezes_deterministic_intent_before_removing_routing() {
         derive_switchover_preparation_operation_id(
             &snapshot.resource_uid,
             &intent.request_id,
+            intent.preparation_generation,
+            &snapshot
+                .status
+                .topology
+                .as_ref()
+                .unwrap()
+                .configuration
+                .configuration_id,
             &intent.source,
             &intent.target
         )

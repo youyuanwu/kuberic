@@ -288,6 +288,7 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
         policy.write_quorum,
     );
     let handoff = SwitchoverHandoff {
+        preparation_generation: 1,
         preparation_operation_id: OperationId::new("prepare-1"),
         request_id: SwitchoverRequestId::new("request-1"),
         source: source.clone(),
@@ -342,9 +343,13 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
     current_only.previous_epoch = None;
     current_only.current_only = true;
     current_only.current_configuration = current;
-    current_only.retire_switchover_preparation_ids = vec![OperationId::new("")];
+    current_only.retire_switchover_preparation_ids =
+        vec![kuberic_protocol::types::SwitchoverPreparationId {
+            operation_id: OperationId::new(""),
+            generation: 1,
+        }];
     assert!(admit_configuration(&current_only, &state).is_err());
-    current_only.retire_switchover_preparation_ids = vec![handoff.preparation_operation_id.clone()];
+    current_only.retire_switchover_preparation_ids = vec![handoff.preparation()];
     assert!(admit_configuration(&current_only, &state).is_ok());
     let mut changed_certificate = current_only.clone();
     changed_certificate
@@ -467,7 +472,15 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
         });
     }
     let command = PrepareSwitchover {
-        operation_id: OperationId::new("prepare-1"),
+        preparation_generation: 1,
+        operation_id: kuberic_protocol::types::derive_switchover_preparation_operation_id(
+            &storage_identity().resource_uid,
+            &SwitchoverRequestId::new("request-1"),
+            1,
+            &current.configuration_id,
+            &source,
+            &target,
+        ),
         request_id: SwitchoverRequestId::new("request-1"),
         local_replica_id: source.replica_id,
         expected_instance_id: source.instance_id.clone(),
@@ -534,10 +547,120 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
         prepared
     );
 
-    let mut changed = command;
+    let mut changed = command.clone();
     changed.target = target;
     changed.request_id = SwitchoverRequestId::new("changed");
     assert!(restarted.ensure_switchover_prepared(changed).await.is_err());
+
+    let mut earlier = Vec::new();
+    for generation in 1..=4 {
+        let mut next = command.clone();
+        next.preparation_generation = generation;
+        if generation > 1 {
+            next.request_id = SwitchoverRequestId::new(format!("request-{generation}"));
+            next.operation_id = kuberic_protocol::types::derive_switchover_preparation_operation_id(
+                &storage_identity().resource_uid,
+                &next.request_id,
+                generation,
+                &next.current_configuration.configuration_id,
+                &next.source,
+                &next.target,
+            );
+        }
+        // The last request is retired without ever observing preparation.
+        let handoff = if generation < 4 {
+            Some(
+                restarted
+                    .ensure_switchover_prepared(next.clone())
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let restore = EnsureConfiguration {
+            operation_id: OperationId::new("same-authority-restore"),
+            previous_configuration: None,
+            current_configuration: next.current_configuration.clone(),
+            previous_epoch: None,
+            current_epoch: next.current_configuration.epoch,
+            effective_policy: reopened
+                .load_state()
+                .await
+                .unwrap()
+                .identity
+                .effective_policy,
+            local_replica_id: next.local_replica_id,
+            expected_instance_id: next.expected_instance_id.clone(),
+            expected_agent_generation: next.expected_agent_generation.clone(),
+            transition_kind: TransitionKind::PlannedSwitchover,
+            failover_safe_lsn: None,
+            primary_write_status: AccessStatus::ReconfigurationPending,
+            current_only: false,
+            retire_build_ids: Vec::new(),
+            switchover_handoff: handoff,
+            retire_switchover_preparation_ids: vec![
+                kuberic_protocol::types::SwitchoverPreparationId {
+                    generation,
+                    operation_id: next.operation_id.clone(),
+                },
+            ],
+        };
+        restarted
+            .ensure_configuration(restore.clone())
+            .await
+            .unwrap();
+        let grant = EnsureConfiguration {
+            operation_id: OperationId::new("same-authority-grant"),
+            transition_kind: TransitionKind::Bootstrap,
+            primary_write_status: AccessStatus::Granted,
+            switchover_handoff: None,
+            retire_switchover_preparation_ids: Vec::new(),
+            ..restore
+        };
+        restarted.ensure_configuration(grant).await.unwrap();
+        earlier.push(next);
+        let state = reopened.load_state().await.unwrap();
+        let calls = restarted_runtime.calls.lock().unwrap().clone();
+        assert_eq!(state.write_status, AccessStatus::Granted);
+        assert_eq!(
+            state.preparation_retirement.as_ref().unwrap().generation,
+            generation
+        );
+        for old in &earlier {
+            assert!(
+                restarted
+                    .ensure_switchover_prepared(old.clone())
+                    .await
+                    .is_err()
+            );
+            let mut altered = old.clone();
+            altered.operation_id = OperationId::new("changed-id");
+            assert!(restarted.ensure_switchover_prepared(altered).await.is_err());
+            let mut reused = old.clone();
+            reused.preparation_generation = generation + 1;
+            assert!(restarted.ensure_switchover_prepared(reused).await.is_err());
+        }
+        assert_eq!(reopened.load_state().await.unwrap(), state);
+        assert_eq!(*restarted_runtime.calls.lock().unwrap(), calls);
+
+        let cold_store = Arc::new(
+            SqliteStore::open_existing(SqliteStore::metadata_database_path(directory.path()), None)
+                .unwrap(),
+        );
+        let cold_runtime = Arc::new(FakeRuntime::new());
+        *cold_runtime.state.lock().unwrap() = restarted_runtime.state.lock().unwrap().clone();
+        let cold = Coordinator::new(cold_store.clone(), cold_runtime.clone());
+        for old in &earlier {
+            assert!(cold.ensure_switchover_prepared(old.clone()).await.is_err());
+        }
+        assert_eq!(cold_store.load_state().await.unwrap(), state);
+        assert!(cold_runtime.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            cold_runtime.state.lock().unwrap().write_status,
+            AccessStatus::Granted
+        );
+    }
 }
 
 #[tokio::test]
@@ -593,6 +716,7 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
         policy.write_quorum,
     );
     let handoff = SwitchoverHandoff {
+        preparation_generation: 1,
         preparation_operation_id: OperationId::new("prepare-1"),
         request_id: SwitchoverRequestId::new("request-1"),
         source: source.clone(),
@@ -662,7 +786,7 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
             retire_build_ids: Vec::new(),
             switchover_handoff: Some(handoff.clone()),
             retire_switchover_preparation_ids: if is_source {
-                vec![handoff.preparation_operation_id.clone()]
+                vec![handoff.preparation()]
             } else {
                 Vec::new()
             },
@@ -720,6 +844,7 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
                 .await
                 .unwrap();
             let replay = PrepareSwitchover {
+                preparation_generation: handoff.preparation_generation,
                 operation_id: handoff.preparation_operation_id.clone(),
                 request_id: handoff.request_id.clone(),
                 local_replica_id: source.replica_id,

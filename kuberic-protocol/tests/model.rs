@@ -557,6 +557,7 @@ impl SwitchoverModel {
                 let report = self.report_mut(command.local_replica_id);
                 report.write_status = AccessStatus::ReconfigurationPending;
                 report.prepared_switchover = Some(SwitchoverHandoff {
+                    preparation_generation: command.preparation_generation,
                     preparation_operation_id: command.operation_id,
                     request_id: command.request_id,
                     source: command.source,

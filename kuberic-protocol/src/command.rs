@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     AgentGeneration, BuildAuthority, ConfigurationDescriptor, EffectivePolicy, Epoch,
     InitializationId, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverRequestId,
+    ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverPreparationId,
+    SwitchoverRequestId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +53,7 @@ pub struct EnsureConfiguration {
     #[serde(default)]
     pub switchover_handoff: Option<SwitchoverHandoff>,
     #[serde(default)]
-    pub retire_switchover_preparation_ids: Vec<OperationId>,
+    pub retire_switchover_preparation_ids: Vec<SwitchoverPreparationId>,
 }
 
 impl EnsureConfiguration {
@@ -68,7 +69,10 @@ impl EnsureConfiguration {
             && self.current_epoch == self.current_configuration.epoch
             && self.current_configuration.primary_id == self.local_replica_id
             && self.retire_switchover_preparation_ids.len() == 1
-            && !self.retire_switchover_preparation_ids[0].is_empty()
+            && !self.retire_switchover_preparation_ids[0]
+                .operation_id
+                .is_empty()
+            && self.retire_switchover_preparation_ids[0].generation > 0
             && self.switchover_handoff.as_ref().is_none_or(|handoff| {
                 self.current_epoch == handoff.starting_epoch
                     && self.current_configuration.epoch == handoff.starting_epoch
@@ -78,8 +82,7 @@ impl EnsureConfiguration {
                     && self.local_replica_id == handoff.source.replica_id
                     && self.expected_instance_id == handoff.source.instance_id
                     && self.expected_agent_generation == handoff.source.agent_generation
-                    && self.retire_switchover_preparation_ids
-                        == [handoff.preparation_operation_id.clone()]
+                    && self.retire_switchover_preparation_ids == [handoff.preparation()]
             })
     }
 }
@@ -87,6 +90,7 @@ impl EnsureConfiguration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrepareSwitchover {
+    pub preparation_generation: u64,
     pub operation_id: OperationId,
     pub request_id: SwitchoverRequestId,
     pub local_replica_id: ReplicaId,

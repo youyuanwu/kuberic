@@ -324,9 +324,6 @@ impl PodRuntime {
                 })
                 .await?;
             self.host.sync_access_projection(managed.as_ref()).await;
-            if write_status == AccessStatus::Granted {
-                managed.recover_pending_writes().await?;
-            }
         } else {
             let mut state = self.host.state.write().await;
             state.fallback_snapshot.read_status = read_status;

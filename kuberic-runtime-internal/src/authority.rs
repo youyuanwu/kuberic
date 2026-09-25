@@ -159,6 +159,7 @@ impl AdmittedAuthority {
                 });
             if (self.transition_kind != Some(TransitionKind::PlannedSwitchover)
                 && self.previous_configuration.is_some())
+                || handoff.preparation_generation == 0
                 || !previous_relationship_valid
                 || handoff.starting_epoch.data_loss_number
                     != self.current_configuration.epoch.data_loss_number

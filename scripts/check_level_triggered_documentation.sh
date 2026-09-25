@@ -49,13 +49,13 @@ transition = status["transition"]["properties"]
 assert "plannedSwitchover" in transition["kind"]["enum"]
 intent = transition["switchover"]["properties"]
 assert set(intent) == {
-    "requestId", "source", "target", "requestedConfiguration", "resolution", "handoff"
+    "preparationGeneration", "requestId", "source", "target", "requestedConfiguration", "resolution", "handoff"
 }
 assert set(intent["resolution"]["enum"]) == {
     "requestedTarget", "restoringOldPrimary", "compensatingOldPrimary", "unsafe"
 }
 assert set(intent["handoff"]["properties"]) == {
-    "preparationOperationId", "requestId", "source", "target",
+    "preparationGeneration", "preparationOperationId", "requestId", "source", "target",
     "startingConfigurationId", "startingEpoch", "handoffLsn"
 }
 

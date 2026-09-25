@@ -1287,7 +1287,7 @@ async fn state_replicator_retries_failed_and_cancelled_operations_without_losing
 }
 
 #[tokio::test]
-async fn restarted_state_replicator_does_not_poison_retry_with_a_different_write() {
+async fn restarted_state_replicator_resolves_original_identity_before_a_different_write() {
     let local = identity(1, "primary");
     let store = Arc::new(MemoryAuthorityStore::default());
     store.local_writes.lock().unwrap().insert(
@@ -1327,15 +1327,36 @@ async fn restarted_state_replicator_does_not_poison_retry_with_a_different_write
         .clone()
         .unwrap();
 
-    assert!(matches!(
-        state.replicate(Bytes::from_static(b"different-b")).await,
-        Err(RuntimeError::LocalWritePending(_))
-    ));
+    let original = store
+        .load_local_write(&OperationId::new("sf:old-session:1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        original.phase,
+        kuberic_runtime_internal::authority::LocalWritePhase::Committed
+    );
+    assert_eq!(original.data, Bytes::from_static(b"pending-a"));
     assert_eq!(
         state
-            .replicate(Bytes::from_static(b"pending-a"))
+            .replicate(Bytes::from_static(b"different-b"))
             .await
             .unwrap(),
+        2
+    );
+    assert_eq!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: original.operation_id,
+                data: original.data,
+            })
+            .await
+            .unwrap()
+            .committed()
+            .await
+            .unwrap()
+            .committed_lsn,
         1
     );
 }
@@ -2415,6 +2436,7 @@ async fn custom_factory_does_not_require_the_default_engine_or_service_storage_t
             .apply_effect(effect(
                 3,
                 RuntimeEffectAction::PrepareSwitchover {
+                    preparation_generation: 1,
                     request_id: SwitchoverRequestId::new("custom-request"),
                     source: identity(1, "external"),
                     target: identity(2, "target"),
@@ -3767,6 +3789,7 @@ async fn switchover_preparation_fences_pending_writes_and_returns_applied_bounda
     let prepare = effect(
         5,
         RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
             request_id: SwitchoverRequestId::new("request-1"),
             source: local.clone(),
             target: secondary.clone(),
@@ -3877,6 +3900,7 @@ async fn switchover_preparation_boundary_covers_acknowledged_writes() {
         .apply_effect(effect(
             5,
             RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation: 1,
                 request_id: SwitchoverRequestId::new("request-committed"),
                 source: local,
                 target: secondary,
@@ -3892,6 +3916,439 @@ async fn switchover_preparation_boundary_covers_acknowledged_writes() {
         result.postcondition.write_status,
         AccessStatus::ReconfigurationPending
     );
+}
+
+async fn recovery_action(runtime: &PodRuntime, sequence: &mut u64, action: RuntimeEffectAction) {
+    runtime
+        .apply_effect(effect(*sequence, action))
+        .await
+        .unwrap();
+    *sequence += 1;
+}
+
+async fn replicate_recovery_write(
+    runtimes: &[Arc<PodRuntime>],
+    primary: usize,
+    write: ClientWrite,
+    acknowledge: bool,
+) -> kuberic_agent::hosting::PendingWrite {
+    let pending = runtimes[primary]
+        .data_plane()
+        .begin_write(write)
+        .await
+        .unwrap();
+    for item in &pending.replication_items {
+        let index = item.receiver.as_ref().unwrap().replica_id as usize - 1;
+        let ack = runtimes[index]
+            .data_plane()
+            .receive_replication(item.clone())
+            .await
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
+        if acknowledge {
+            runtimes[primary]
+                .data_plane()
+                .accept_acknowledgement(ack)
+                .await
+                .unwrap();
+        }
+    }
+    pending
+}
+
+#[tokio::test]
+async fn switchover_preparation_materializes_reserved_identity_before_certifying_handoff() {
+    let local = identity(1, "source");
+    let target = identity(2, "target");
+    let application = Arc::new(TestApplication::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        application.clone(),
+        store.clone(),
+    ));
+    let authority = authority(local.clone(), vec![local.clone(), target.clone()]);
+    let mut sequence = 1;
+    for action in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    ] {
+        recovery_action(&runtime, &mut sequence, action).await;
+    }
+    let original = ClientWrite {
+        operation_id: OperationId::new("reserved-original"),
+        data: Bytes::from_static(b"reserved-original-data"),
+    };
+    application.fail_apply.store(true, Ordering::SeqCst);
+    assert!(
+        runtime
+            .data_plane()
+            .begin_write(original.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_local_write(&original.operation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .phase,
+        kuberic_runtime_internal::authority::LocalWritePhase::Reserved
+    );
+    application.fail_apply.store(false, Ordering::SeqCst);
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
+            request_id: SwitchoverRequestId::new("reserved-handoff"),
+            source: local,
+            target: target.clone(),
+            starting_configuration_id: authority.current_configuration.configuration_id.clone(),
+            starting_epoch: authority.current_configuration.epoch,
+        },
+    )
+    .await;
+    assert_eq!(runtime.snapshot().await.current_progress, 1);
+    assert_eq!(runtime.snapshot().await.committed_lsn, 0);
+    assert_eq!(application.applied.lock().unwrap()[&1].data, original.data);
+    let plane = runtime.data_plane();
+    plane.next_outbound().await.unwrap();
+    let granting = runtime.clone();
+    let grant = tokio::spawn(async move {
+        granting
+            .apply_effect(effect(
+                sequence,
+                RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+            ))
+            .await
+    });
+    let Some(OutboundReplication::Replication(replay)) = plane.next_outbound().await else {
+        panic!("recovery replay")
+    };
+    assert_eq!(replay.data, original.data);
+    assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    plane
+        .accept_acknowledgement(acknowledgement(&authority, target.clone(), 1))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), grant)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let fresh = plane
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("fresh-after-reserved"),
+            data: Bytes::from_static(b"fresh"),
+        })
+        .await
+        .unwrap();
+    plane
+        .accept_acknowledgement(acknowledgement(&authority, target, 2))
+        .await
+        .unwrap();
+    assert_eq!(fresh.committed().await.unwrap().committed_lsn, 2);
+}
+
+#[tokio::test]
+async fn switchover_recovery_commits_different_writes_after_restoration_compensation_and_return() {
+    for movement in ["restore", "compensate", "return"] {
+        for restart in [false, true] {
+            let identities = vec![
+                identity(1, "source"),
+                identity(2, "target"),
+                identity(3, "third"),
+            ];
+            let starting =
+                authority(identities[0].clone(), identities.clone()).current_configuration;
+            let mut runtimes = Vec::new();
+            let mut stores = Vec::new();
+            let mut applications = Vec::new();
+            let mut sequences = [1; 3];
+            for index in 0..3 {
+                let application = Arc::new(TestApplication::default());
+                let store = Arc::new(MemoryAuthorityStore::default());
+                let runtime = Arc::new(PodRuntime::new(
+                    identities[index].clone(),
+                    application.clone(),
+                    store.clone(),
+                ));
+                for action in [
+                    RuntimeEffectAction::Open(OpenMode::Existing),
+                    RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                        local_identity: identities[index].clone(),
+                        transition_kind: None,
+                        previous_configuration: None,
+                        current_configuration: starting.clone(),
+                        switchover_handoff: None,
+                    })),
+                    RuntimeEffectAction::ChangeRole(starting.members[index].role),
+                    RuntimeEffectAction::SetWriteStatus(if index == 0 {
+                        AccessStatus::Granted
+                    } else {
+                        AccessStatus::NotPrimary
+                    }),
+                ] {
+                    recovery_action(&runtime, &mut sequences[index], action).await;
+                }
+                runtimes.push(runtime);
+                stores.push(store);
+                applications.push(application);
+            }
+            let original = ClientWrite {
+                operation_id: OperationId::new("interrupted-original"),
+                data: Bytes::from_static(b"original-data"),
+            };
+            let pending = replicate_recovery_write(&runtimes, 0, original.clone(), false).await;
+            let mut handoff = SwitchoverHandoff {
+                preparation_generation: 1,
+                preparation_operation_id: OperationId::new("prepare-original"),
+                request_id: SwitchoverRequestId::new("move-out"),
+                source: identities[0].clone(),
+                target: identities[1].clone(),
+                starting_configuration_id: starting.configuration_id.clone(),
+                starting_epoch: starting.epoch,
+                handoff_lsn: 1,
+            };
+            recovery_action(
+                &runtimes[0],
+                &mut sequences[0],
+                RuntimeEffectAction::PrepareSwitchover {
+                    preparation_generation: 1,
+                    request_id: handoff.request_id.clone(),
+                    source: handoff.source.clone(),
+                    target: handoff.target.clone(),
+                    starting_configuration_id: starting.configuration_id.clone(),
+                    starting_epoch: starting.epoch,
+                },
+            )
+            .await;
+            assert!(matches!(
+                pending.committed().await,
+                Err(RuntimeError::WriteClosed(_))
+            ));
+            assert_eq!(
+                stores[0]
+                    .load_local_write(&original.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                kuberic_runtime_internal::authority::LocalWritePhase::Registered
+            );
+
+            let mut selected = starting.clone();
+            if movement != "restore" {
+                for leg in 0..2 {
+                    let primary = if leg == 0 { 1 } else { 0 };
+                    let next = ConfigurationDescriptor::new(
+                        Epoch::new(
+                            starting.epoch.data_loss_number,
+                            starting.epoch.configuration_number + leg + 1,
+                        ),
+                        identities[primary].replica_id,
+                        identities
+                            .iter()
+                            .enumerate()
+                            .map(|(index, identity)| ConfigurationMember {
+                                identity: identity.clone(),
+                                role: if index == primary {
+                                    ReplicaRole::Primary
+                                } else {
+                                    ReplicaRole::ActiveSecondary
+                                },
+                            })
+                            .collect(),
+                        2,
+                    );
+                    for current_only in [false, true] {
+                        let order = if primary == 1 { [0, 2, 1] } else { [1, 2, 0] };
+                        for index in order {
+                            recovery_action(
+                                &runtimes[index],
+                                &mut sequences[index],
+                                RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                                    local_identity: identities[index].clone(),
+                                    transition_kind: (!current_only)
+                                        .then_some(TransitionKind::PlannedSwitchover),
+                                    previous_configuration: (!current_only)
+                                        .then(|| selected.clone()),
+                                    current_configuration: next.clone(),
+                                    switchover_handoff: Some(handoff.clone()),
+                                })),
+                            )
+                            .await;
+                            if !current_only {
+                                recovery_action(
+                                    &runtimes[index],
+                                    &mut sequences[index],
+                                    RuntimeEffectAction::ChangeRole(next.members[index].role),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    selected = next;
+                    if leg == 0 && movement == "return" {
+                        recovery_action(
+                            &runtimes[1],
+                            &mut sequences[1],
+                            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+                        )
+                        .await;
+                        let moved = replicate_recovery_write(
+                            &runtimes,
+                            1,
+                            ClientWrite {
+                                operation_id: OperationId::new("on-requested-target"),
+                                data: Bytes::from_static(b"target-data"),
+                            },
+                            true,
+                        )
+                        .await;
+                        assert_eq!(moved.committed().await.unwrap().committed_lsn, 2);
+                        handoff = SwitchoverHandoff {
+                            preparation_generation: 2,
+                            preparation_operation_id: OperationId::new("prepare-return"),
+                            request_id: SwitchoverRequestId::new("move-back"),
+                            source: identities[1].clone(),
+                            target: identities[0].clone(),
+                            starting_configuration_id: selected.configuration_id.clone(),
+                            starting_epoch: selected.epoch,
+                            handoff_lsn: 2,
+                        };
+                        recovery_action(
+                            &runtimes[1],
+                            &mut sequences[1],
+                            RuntimeEffectAction::PrepareSwitchover {
+                                preparation_generation: 2,
+                                request_id: handoff.request_id.clone(),
+                                source: handoff.source.clone(),
+                                target: handoff.target.clone(),
+                                starting_configuration_id: selected.configuration_id.clone(),
+                                starting_epoch: selected.epoch,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            if restart {
+                runtimes[0].abort();
+                let cold = Arc::new(PodRuntime::new(
+                    identities[0].clone(),
+                    applications[0].clone(),
+                    stores[0].clone(),
+                ));
+                cold.reconstruct(
+                    OpenMode::Existing,
+                    ReplicaRole::Primary,
+                    AccessStatus::ReconfigurationPending,
+                    AccessStatus::ReconfigurationPending,
+                    None,
+                )
+                .await
+                .unwrap();
+                runtimes[0] = cold;
+            }
+            let grant = effect(
+                sequences[0],
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::Granted,
+                },
+            );
+            if movement != "return" {
+                // Cancel after re-registration but before quorum; retry the same effect.
+                assert!(
+                    timeout(
+                        Duration::from_millis(20),
+                        runtimes[0].apply_effect(grant.clone())
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_ne!(
+                    runtimes[0].snapshot().await.write_status,
+                    AccessStatus::Granted
+                );
+                assert!(
+                    runtimes[0]
+                        .data_plane()
+                        .begin_write(ClientWrite {
+                            operation_id: OperationId::new("must-remain-closed"),
+                            data: Bytes::new(),
+                        })
+                        .await
+                        .is_err()
+                );
+            }
+            let source = runtimes[0].clone();
+            let mut grant_task = tokio::spawn(async move { source.apply_effect(grant).await });
+            let source_data = runtimes[0].data_plane();
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut grant_task => { result.unwrap().unwrap(); break; }
+                        outbound = source_data.next_outbound() => {
+                            let Some(OutboundReplication::Replication(item)) = outbound else { panic!("expected recovery replication") };
+                            if item.current_configuration_id != selected.configuration_id.as_str() { continue; }
+                            assert_eq!(item.lsn, 1);
+                            assert_eq!(item.data, original.data);
+                            assert_ne!(runtimes[0].snapshot().await.write_status, AccessStatus::Granted);
+                            let index = item.receiver.as_ref().unwrap().replica_id as usize - 1;
+                            let ack = runtimes[index].data_plane().receive_replication(item).await.unwrap().applied().await.unwrap();
+                            runtimes[0].data_plane().accept_acknowledgement(ack).await.unwrap();
+                        }
+                    }
+                }
+            }).await.unwrap();
+            for runtime in &runtimes[1..] {
+                assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+            }
+            let committed = stores[0]
+                .load_local_write(&original.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                committed.phase,
+                kuberic_runtime_internal::authority::LocalWritePhase::Committed
+            );
+            assert_eq!(committed.data, original.data);
+            assert_eq!(committed.lsn, 1);
+            let fresh = replicate_recovery_write(
+                &runtimes,
+                0,
+                ClientWrite {
+                    operation_id: OperationId::new("fresh-after-recovery"),
+                    data: Bytes::from_static(b"new-different-data"),
+                },
+                true,
+            )
+            .await;
+            assert_eq!(
+                fresh.committed().await.unwrap().committed_lsn,
+                if movement == "return" { 3 } else { 2 }
+            );
+            assert!(
+                runtimes[0]
+                    .data_plane()
+                    .begin_write(ClientWrite {
+                        data: Bytes::from_static(b"changed-original"),
+                        ..original
+                    })
+                    .await
+                    .is_err()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -3943,6 +4400,7 @@ async fn switchover_preparation_races_ack_without_success_outside_boundary() {
     let prepare = effect(
         5,
         RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
             request_id: SwitchoverRequestId::new("request-race"),
             source: local,
             target: secondary.clone(),
@@ -4055,6 +4513,7 @@ async fn switchover_drain_serializes_durable_boundaries_and_delayed_direct_clien
         let preparation = effect(
             5,
             RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation: 1,
                 request_id: SwitchoverRequestId::new("drain-race"),
                 source: source.clone(),
                 target: target.clone(),
@@ -4082,6 +4541,7 @@ async fn switchover_drain_serializes_durable_boundaries_and_delayed_direct_clien
         assert!(late_result.is_err(), "{boundary}");
         let pending = writer.await.unwrap();
         let handoff = SwitchoverHandoff {
+            preparation_generation: 1,
             preparation_operation_id: preparation.operation_id.clone(),
             request_id: SwitchoverRequestId::new("drain-race"),
             source: source.clone(),
@@ -5654,6 +6114,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         2,
     );
     let handoff = SwitchoverHandoff {
+        preparation_generation: 1,
         preparation_operation_id: OperationId::new("planned-prepare"),
         request_id: SwitchoverRequestId::new("planned-request"),
         source: identities[0].clone(),
@@ -5721,6 +6182,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
             operation_id: handoff.preparation_operation_id.clone(),
             sequence: 5,
             action: RuntimeEffectAction::PrepareSwitchover {
+                preparation_generation: handoff.preparation_generation,
                 request_id: handoff.request_id.clone(),
                 source: handoff.source.clone(),
                 target: handoff.target.clone(),
@@ -6042,6 +6504,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         2,
     );
     let handoff = SwitchoverHandoff {
+        preparation_generation: 1,
         preparation_operation_id: OperationId::new("prepare-1"),
         request_id: SwitchoverRequestId::new("request-1"),
         source: source.clone(),

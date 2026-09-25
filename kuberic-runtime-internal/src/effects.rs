@@ -46,6 +46,7 @@ pub enum RuntimeEffectAction {
     SetReadStatus(AccessStatus),
     SetWriteStatus(AccessStatus),
     PrepareSwitchover {
+        preparation_generation: u64,
         request_id: SwitchoverRequestId,
         source: ReplicaIdentity,
         target: ReplicaIdentity,

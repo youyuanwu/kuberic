@@ -56,10 +56,15 @@ certificate and a read quorum, and allocates a strictly newer configuration
 epoch without changing the data-loss number. Compensation installs write-closed
 PC/CC and current-only authority on every surviving exact participant before
 stable write grant and routing. An absent exact secondary is not rebound.
+An extant permanently faulted non-primary is first fenced by exact Pod deletion
+with its PVC preserved; absence must be re-observed before survivor convergence.
 Accepted target outcomes always converge forward.
 
-Restoration durably retires the exact preparation ID even if preparation was
-never observed, fencing a delayed dispatch without inventing a handoff boundary.
+Restoration durably retires the accepted spec generation and exact preparation ID
+even if preparation was never observed, without inventing a handoff boundary.
+An authority-bound high-water mark rejects all older/equal retired preparations
+across repeated same-authority restorations and restart; deterministic identity
+also binds the starting configuration and generation.
 The source retains one retired certificate for compensation after current-only
 completion but before the cluster receipt is persisted.
 

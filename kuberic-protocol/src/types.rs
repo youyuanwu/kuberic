@@ -518,6 +518,8 @@ pub enum PlannedSwitchoverResolution {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchoverHandoff {
+    #[schemars(range(min = 1))]
+    pub preparation_generation: u64,
     pub preparation_operation_id: OperationId,
     pub request_id: SwitchoverRequestId,
     pub source: ReplicaIdentity,
@@ -527,9 +529,27 @@ pub struct SwitchoverHandoff {
     pub handoff_lsn: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchoverPreparationId {
+    pub generation: u64,
+    pub operation_id: OperationId,
+}
+
+impl SwitchoverHandoff {
+    pub fn preparation(&self) -> SwitchoverPreparationId {
+        SwitchoverPreparationId {
+            generation: self.preparation_generation,
+            operation_id: self.preparation_operation_id.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannedSwitchoverIntent {
+    #[schemars(range(min = 1))]
+    pub preparation_generation: u64,
     pub request_id: SwitchoverRequestId,
     pub source: ReplicaIdentity,
     pub target: ReplicaIdentity,
@@ -725,6 +745,8 @@ pub fn derive_failover_repair_operation_id(
 pub fn derive_switchover_preparation_operation_id(
     resource_uid: &ResourceUid,
     request_id: &SwitchoverRequestId,
+    generation: u64,
+    starting_configuration_id: &ConfigurationId,
     source: &ReplicaIdentity,
     target: &ReplicaIdentity,
 ) -> OperationId {
@@ -733,6 +755,8 @@ pub fn derive_switchover_preparation_operation_id(
         digest_parts(&[
             resource_uid.as_str(),
             request_id.as_str(),
+            &generation.to_string(),
+            starting_configuration_id.as_str(),
             &source.replica_id.to_string(),
             source.instance_id.as_str(),
             source.agent_generation.as_str(),

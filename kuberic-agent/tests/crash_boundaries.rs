@@ -227,6 +227,7 @@ fn switchover_recovery_fixture(boundary: &str) -> (AgentState, EnsureConfigurati
         starting.write_quorum,
     );
     let handoff = kuberic_protocol::types::SwitchoverHandoff {
+        preparation_generation: prepare.preparation_generation,
         preparation_operation_id: prepare.operation_id,
         request_id: prepare.request_id,
         source: prepare.source.clone(),
@@ -299,7 +300,7 @@ fn switchover_recovery_fixture(boundary: &str) -> (AgentState, EnsureConfigurati
         current_only,
         retire_build_ids: Vec::new(),
         retire_switchover_preparation_ids: if current_only || restoring {
-            vec![handoff.preparation_operation_id.clone()]
+            vec![handoff.preparation()]
         } else {
             Vec::new()
         },
@@ -528,6 +529,11 @@ impl DurableState for CrashState {
         candidate.committed_lsn = candidate.committed_lsn.max(committed_lsn);
         self.persist(&candidate)?;
         *state = candidate;
+        if committed_lsn == 1
+            && env::var("KUBERIC_LOCAL_RECOVERY_BOUNDARY").as_deref() == Ok("application-commit")
+        {
+            std::process::exit(73);
+        }
         Ok(Self::progress(&state))
     }
 }
@@ -700,7 +706,15 @@ fn switchover_prepare_command() -> PrepareSwitchover {
     let source = switchover_storage_identity().local_identity;
     let configuration = switchover_configuration();
     PrepareSwitchover {
-        operation_id: OperationId::new("real-switchover-prepare"),
+        preparation_generation: 1,
+        operation_id: kuberic_protocol::types::derive_switchover_preparation_operation_id(
+            &switchover_storage_identity().resource_uid,
+            &SwitchoverRequestId::new("real-switchover-request"),
+            1,
+            &configuration.configuration_id,
+            &source,
+            &configuration.members[1].identity,
+        ),
         request_id: SwitchoverRequestId::new("real-switchover-request"),
         local_replica_id: source.replica_id,
         expected_instance_id: source.instance_id.clone(),
@@ -716,6 +730,7 @@ fn switchover_runtime_effect(command: &PrepareSwitchover, sequence: u64) -> Runt
         operation_id: command.operation_id.clone(),
         sequence,
         action: RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
             request_id: command.request_id.clone(),
             source: command.source.clone(),
             target: command.target.clone(),
@@ -776,6 +791,7 @@ fn switchover_effect() -> RuntimeEffect {
         operation_id: OperationId::new("prepare-switchover-1"),
         sequence: 1,
         action: RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
             request_id: SwitchoverRequestId::new("request-1"),
             source: storage_identity().local_identity,
             target: ReplicaIdentity {
@@ -878,7 +894,7 @@ async fn recovery_reissues_committed_intent_without_reporting_completion() {
         inspect_recovery(reopened.as_ref(), &snapshot(AccessStatus::NotPrimary))
             .await
             .unwrap(),
-        RecoveryDecision::Reissue(effect())
+        RecoveryDecision::Reissue(Box::new(effect()))
     );
     let runtime = Arc::new(FakeRuntime {
         calls: AtomicUsize::new(0),
@@ -1151,8 +1167,14 @@ fn switchover_recovery_boundaries_survive_process_termination() {
                 assert!(state.prepared_switchover.is_none());
                 assert_eq!(state.retired_switchover, command.switchover_handoff);
                 assert_eq!(
-                    state.retired_preparation_id.as_ref(),
-                    command.retire_switchover_preparation_ids.first()
+                    state
+                        .preparation_retirement
+                        .as_ref()
+                        .map(|retired| retired.generation),
+                    command
+                        .retire_switchover_preparation_ids
+                        .first()
+                        .map(|id| id.generation)
                 );
                 let mut writable = state.clone();
                 writable.write_status = AccessStatus::Granted;
@@ -1303,6 +1325,330 @@ fn real_runtime_switchover_preparation_recovers_after_process_termination() {
             assert_eq!(recovered.prepared_switchover, Some(prepared));
         });
     }
+}
+
+async fn acknowledge_recovery_item(
+    pod: &PodRuntime,
+    peer: &CrashState,
+    item: kuberic_wire::proto::ReplicationItem,
+) {
+    let progress = peer
+        .apply(Operation {
+            lsn: item.lsn,
+            committed_lsn: item.committed_lsn,
+            data: item.data.into(),
+        })
+        .await
+        .unwrap();
+    pod.data_plane()
+        .accept_acknowledgement(kuberic_wire::proto::ReplicationAck {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            sender: item.sender,
+            receiver: item.receiver,
+            epoch: item.epoch,
+            previous_configuration_id: item.previous_configuration_id,
+            current_configuration_id: item.current_configuration_id,
+            received_lsn: progress.applied_lsn,
+            applied_lsn: progress.applied_lsn,
+            committed_lsn: progress.committed_lsn,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+}
+
+fn generation_preparation(generation: u64) -> PrepareSwitchover {
+    let mut command = switchover_prepare_command();
+    command.preparation_generation = generation;
+    command.request_id = SwitchoverRequestId::new(format!("restoration-{generation}"));
+    command.operation_id = kuberic_protocol::types::derive_switchover_preparation_operation_id(
+        &switchover_storage_identity().resource_uid,
+        &command.request_id,
+        generation,
+        &command.current_configuration.configuration_id,
+        &command.source,
+        &command.target,
+    );
+    command
+}
+
+#[test]
+fn repeated_preparation_retirement_fences_every_delayed_command_after_process_termination() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "local_write_recovery_writer_process",
+        ])
+        .env("KUBERIC_LOCAL_RECOVERY_PATH", &path)
+        .env("KUBERIC_LOCAL_RECOVERY_BOUNDARY", "retirements")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+        let before = store.load_state().await.unwrap();
+        assert_eq!(
+            before.preparation_retirement.as_ref().unwrap().generation,
+            3
+        );
+        let (pod, _) = switchover_real_runtime(store.clone(), &crash_application_path(&path));
+        pod.reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            before.read_status,
+            before.write_status,
+            None,
+        )
+        .await
+        .unwrap();
+        let runtime_before = pod.snapshot().await;
+        let coordinator = Coordinator::new(store.clone(), pod.clone());
+        for generation in 1..=3 {
+            assert!(
+                coordinator
+                    .ensure_switchover_prepared(generation_preparation(generation))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.load_state().await.unwrap(), before);
+            assert_eq!(pod.snapshot().await, runtime_before);
+        }
+        assert_eq!(runtime_before.write_status, AccessStatus::Granted);
+        assert!(
+            coordinator
+                .ensure_switchover_prepared(generation_preparation(4))
+                .await
+                .is_ok()
+        );
+    });
+}
+
+#[test]
+fn local_write_recovery_boundaries_commit_fresh_writes_after_process_termination() {
+    use kuberic_runtime_internal::authority::LocalWriteJournal;
+    for boundary in ["registered", "application-commit", "grant"] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "local_write_recovery_writer_process",
+            ])
+            .env("KUBERIC_LOCAL_RECOVERY_PATH", &path)
+            .env("KUBERIC_LOCAL_RECOVERY_BOUNDARY", boundary)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(73),
+            "{boundary}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+            let state = store.load_state().await.unwrap();
+            assert_eq!(state.write_status, AccessStatus::ReconfigurationPending);
+            let (pod, _) = switchover_real_runtime(store.clone(), &crash_application_path(&path));
+            pod.reconstruct(OpenMode::Existing, ReplicaRole::Primary,
+                AccessStatus::ReconfigurationPending, AccessStatus::ReconfigurationPending, None).await.unwrap();
+            let adapter = Arc::new(RuntimeAdapter::new(store.clone(), pod.clone()));
+            let recovery = adapter.clone();
+            let mut task = tokio::spawn(async move { recovery.resume_pending().await });
+            let plane = pod.data_plane();
+            let peer = CrashState::open(path.with_extension("peer"));
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut task => { result.unwrap().unwrap(); break; },
+                        item = plane.next_outbound() => {
+                            let Some(kuberic_agent::hosting::OutboundReplication::Replication(item)) = item else { panic!("recovery replication") };
+                            assert_ne!(pod.snapshot().await.write_status, AccessStatus::Granted);
+                            acknowledge_recovery_item(&pod, &peer, item).await;
+                        }
+                    }
+                }
+            }).await.unwrap();
+            let old = store.load_local_write(&OperationId::new("interrupted-before-crash")).await.unwrap().unwrap();
+            assert_eq!(old.phase, kuberic_runtime_internal::authority::LocalWritePhase::Committed);
+            assert_eq!(old.data, Bytes::from_static(b"original-before-crash"));
+            let fresh = plane.begin_write(kuberic_runtime::application::ClientWrite {
+                operation_id: OperationId::new("fresh-after-process-crash"),
+                data: Bytes::from_static(b"different-after-crash"),
+            }).await.unwrap();
+            for item in &fresh.replication_items { acknowledge_recovery_item(&pod, &peer, item.clone()).await; }
+            assert_eq!(fresh.committed().await.unwrap().committed_lsn, 2);
+        });
+    }
+}
+
+#[test]
+#[ignore = "subprocess for local_write_recovery_boundaries_commit_fresh_writes_after_process_termination"]
+fn local_write_recovery_writer_process() {
+    let (Ok(path), Ok(boundary)) = (
+        env::var("KUBERIC_LOCAL_RECOVERY_PATH"),
+        env::var("KUBERIC_LOCAL_RECOVERY_BOUNDARY"),
+    ) else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let configuration = switchover_configuration();
+        let mut state = AgentState::new(switchover_storage_identity());
+        state.highest_epoch = configuration.epoch;
+        state.current_configuration = Some(configuration.clone());
+        state.role = ReplicaRole::Primary;
+        state.read_status = AccessStatus::Granted;
+        state.write_status = AccessStatus::Granted;
+        let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        store
+            .admit(&AdmittedAuthority {
+                local_identity: switchover_storage_identity().local_identity,
+                transition_kind: None,
+                previous_configuration: None,
+                current_configuration: configuration.clone(),
+                switchover_handoff: None,
+            })
+            .await
+            .unwrap();
+        let (pod, _) =
+            switchover_real_runtime(store.clone(), &crash_application_path(Path::new(&path)));
+        pod.reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            AccessStatus::Granted,
+            AccessStatus::Granted,
+            None,
+        )
+        .await
+        .unwrap();
+        if boundary == "retirements" {
+            let coordinator = Coordinator::new(store.clone(), pod.clone());
+            for generation in 1..=3 {
+                let command = generation_preparation(generation);
+                let handoff = if generation < 3 {
+                    Some(
+                        coordinator
+                            .ensure_switchover_prepared(command.clone())
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let restore = EnsureConfiguration {
+                    operation_id: OperationId::new("reused-restoration"),
+                    previous_configuration: None,
+                    previous_epoch: None,
+                    current_epoch: configuration.epoch,
+                    current_configuration: configuration.clone(),
+                    effective_policy: switchover_storage_identity().effective_policy,
+                    local_replica_id: command.source.replica_id,
+                    expected_instance_id: command.source.instance_id,
+                    expected_agent_generation: command.source.agent_generation,
+                    transition_kind: TransitionKind::PlannedSwitchover,
+                    failover_safe_lsn: None,
+                    primary_write_status: AccessStatus::ReconfigurationPending,
+                    current_only: false,
+                    retire_build_ids: Vec::new(),
+                    retire_switchover_preparation_ids: vec![
+                        kuberic_protocol::types::SwitchoverPreparationId {
+                            generation,
+                            operation_id: command.operation_id,
+                        },
+                    ],
+                    switchover_handoff: handoff,
+                };
+                coordinator
+                    .ensure_configuration(restore.clone())
+                    .await
+                    .unwrap();
+                coordinator
+                    .ensure_configuration(EnsureConfiguration {
+                        operation_id: OperationId::new("reused-grant"),
+                        transition_kind: TransitionKind::Bootstrap,
+                        primary_write_status: AccessStatus::Granted,
+                        switchover_handoff: None,
+                        retire_switchover_preparation_ids: Vec::new(),
+                        ..restore
+                    })
+                    .await
+                    .unwrap();
+            }
+            std::process::exit(73);
+        }
+        let pending = pod
+            .data_plane()
+            .begin_write(kuberic_runtime::application::ClientWrite {
+                operation_id: OperationId::new("interrupted-before-crash"),
+                data: Bytes::from_static(b"original-before-crash"),
+            })
+            .await
+            .unwrap();
+        let coordinator = Coordinator::new(store.clone(), pod.clone());
+        let handoff = coordinator
+            .ensure_switchover_prepared(switchover_prepare_command())
+            .await
+            .unwrap();
+        assert!(pending.committed().await.is_err());
+        let restore = EnsureConfiguration {
+            operation_id: OperationId::new("recover-source"),
+            previous_configuration: None,
+            previous_epoch: None,
+            current_epoch: configuration.epoch,
+            current_configuration: configuration,
+            effective_policy: switchover_storage_identity().effective_policy,
+            local_replica_id: handoff.source.replica_id,
+            expected_instance_id: handoff.source.instance_id.clone(),
+            expected_agent_generation: handoff.source.agent_generation.clone(),
+            transition_kind: TransitionKind::PlannedSwitchover,
+            failover_safe_lsn: None,
+            primary_write_status: AccessStatus::ReconfigurationPending,
+            current_only: false,
+            retire_build_ids: Vec::new(),
+            retire_switchover_preparation_ids: vec![handoff.preparation()],
+            switchover_handoff: Some(handoff),
+        };
+        coordinator.ensure_configuration(restore).await.unwrap();
+        let grant = RuntimeEffect {
+            operation_id: OperationId::new("grant-after-retirement"),
+            sequence: store.load_state().await.unwrap().next_effect_sequence,
+            action: RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        };
+        store.begin_effect(&grant).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(30),
+                pod.apply_effect(grant.clone())
+            )
+            .await
+            .is_err()
+        );
+        if boundary == "registered" {
+            std::process::exit(73);
+        }
+        let granting = pod.clone();
+        let task = tokio::spawn(async move { granting.apply_effect(grant).await });
+        let Some(kuberic_agent::hosting::OutboundReplication::Replication(item)) =
+            pod.data_plane().next_outbound().await
+        else {
+            panic!("recovery replication")
+        };
+        let peer = CrashState::open(Path::new(&path).with_extension("peer"));
+        acknowledge_recovery_item(&pod, &peer, item).await;
+        task.await.unwrap().unwrap();
+        std::process::exit(73);
+    });
 }
 
 #[test]
@@ -1466,8 +1812,14 @@ fn real_handoff_configuration_boundaries_survive_process_termination() {
                     assert!(recovered.prepared_switchover.is_none());
                     assert_eq!(recovered.retired_switchover, command.switchover_handoff);
                     assert_eq!(
-                        recovered.retired_preparation_id.as_ref(),
-                        command.retire_switchover_preparation_ids.first()
+                        recovered
+                            .preparation_retirement
+                            .as_ref()
+                            .map(|retired| retired.generation),
+                        command
+                            .retire_switchover_preparation_ids
+                            .first()
+                            .map(|id| id.generation)
                     );
                 }
                 shutdown_tx.send_replace(true);

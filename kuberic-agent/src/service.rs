@@ -968,6 +968,7 @@ mod tests {
     #[test]
     fn pending_switchover_preparation_reconstructs_write_closed() {
         let action = kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
             request_id: SwitchoverRequestId::new("request-1"),
             source: ReplicaIdentity {
                 replica_id: ReplicaId::new(1),

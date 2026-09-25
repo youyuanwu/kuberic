@@ -290,6 +290,7 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
     let current = initialize.bootstrap_configuration.clone();
     let target = identity(2, "pod-2", "generation-2");
     let handoff = SwitchoverHandoff {
+        preparation_generation: 1,
         preparation_operation_id: OperationId::new("prepare-1"),
         request_id: SwitchoverRequestId::new("request-1"),
         source: storage_identity.local_identity.clone(),
@@ -314,7 +315,7 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
         current_only: true,
         retire_build_ids: Vec::new(),
         switchover_handoff: Some(handoff.clone()),
-        retire_switchover_preparation_ids: vec![handoff.preparation_operation_id.clone()],
+        retire_switchover_preparation_ids: vec![handoff.preparation()],
     };
     let mut state = AgentState::new(storage_identity);
     state.highest_epoch = current.epoch;

@@ -65,6 +65,12 @@ message SwitchoverHandoff {
   string starting_configuration_id = 5;
   int64 handoff_lsn = 6;
   Epoch starting_epoch = 7;
+  uint64 preparation_generation = 8;
+}
+
+message SwitchoverPreparationId {
+  string operation_id = 1;
+  uint64 generation = 2;
 }
 
 message ReplicaIdentity {
@@ -190,7 +196,7 @@ message EnsureConfigurationCommand {
   repeated string retire_build_ids = 15;
   optional int64 failover_safe_lsn = 16;
   SwitchoverHandoff switchover_handoff = 17;
-  repeated string retire_switchover_preparation_ids = 18;
+  repeated SwitchoverPreparationId retire_switchover_preparation_ids = 18;
 }
 
 message PrepareSwitchoverCommand {
@@ -202,6 +208,7 @@ message PrepareSwitchoverCommand {
   ReplicaIdentity source = 6;
   ReplicaIdentity target = 7;
   Configuration current_configuration = 8;
+  uint64 preparation_generation = 9;
 }
 
 message EnsureReplicaBuildCommand {

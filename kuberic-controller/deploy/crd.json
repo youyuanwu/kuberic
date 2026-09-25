@@ -575,6 +575,11 @@
                                 "format": "int64",
                                 "type": "integer"
                               },
+                              "preparationGeneration": {
+                                "format": "uint64",
+                                "minimum": 1.0,
+                                "type": "integer"
+                              },
                               "preparationOperationId": {
                                 "type": "string"
                               },
@@ -647,6 +652,7 @@
                             },
                             "required": [
                               "handoffLsn",
+                              "preparationGeneration",
                               "preparationOperationId",
                               "requestId",
                               "source",
@@ -655,6 +661,11 @@
                               "target"
                             ],
                             "type": "object"
+                          },
+                          "preparationGeneration": {
+                            "format": "uint64",
+                            "minimum": 1.0,
+                            "type": "integer"
                           },
                           "requestId": {
                             "type": "string"
@@ -785,6 +796,7 @@
                           }
                         },
                         "required": [
+                          "preparationGeneration",
                           "requestId",
                           "requestedConfiguration",
                           "resolution",

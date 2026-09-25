@@ -843,7 +843,10 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                     .switchover
                     .as_ref()
                     .ok_or(ValidationError::MissingSwitchoverIntent)?;
-                if switchover.request_id.is_empty() {
+                if switchover.request_id.is_empty()
+                    || switchover.preparation_generation == 0
+                    || switchover.preparation_generation != transition.spec_generation
+                {
                     return Err(ValidationError::MissingSwitchoverIntent);
                 }
                 if status.last_switchover.as_ref().is_some_and(|receipt| {
@@ -920,7 +923,8 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                 }
                 if let Some(handoff) = &switchover.handoff {
                     validate_switchover_handoff(handoff)?;
-                    if handoff.request_id != switchover.request_id
+                    if handoff.preparation_generation != switchover.preparation_generation
+                        || handoff.request_id != switchover.request_id
                         || handoff.source != switchover.source
                         || handoff.target != switchover.target
                         || handoff.starting_configuration_id
@@ -1033,7 +1037,8 @@ pub fn validate_transition_relationship(
 fn validate_switchover_handoff(
     handoff: &crate::types::SwitchoverHandoff,
 ) -> Result<(), ValidationError> {
-    if handoff.preparation_operation_id.is_empty()
+    if handoff.preparation_generation == 0
+        || handoff.preparation_operation_id.is_empty()
         || handoff.request_id.is_empty()
         || handoff.source == handoff.target
         || !valid_exact_identity(&handoff.source)

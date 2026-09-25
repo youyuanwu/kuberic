@@ -38,8 +38,18 @@ pub fn admit_persisted_configuration(
 
 pub fn admit_switchover_preparation(command: &PrepareSwitchover, state: &AgentState) -> Result<()> {
     let identity = &state.identity.local_identity;
-    if command.operation_id.is_empty()
+    if command.preparation_generation == 0
+        || command.operation_id.is_empty()
         || command.request_id.is_empty()
+        || command.operation_id
+            != kuberic_protocol::types::derive_switchover_preparation_operation_id(
+                &state.identity.resource_uid,
+                &command.request_id,
+                command.preparation_generation,
+                &command.current_configuration.configuration_id,
+                &command.source,
+                &command.target,
+            )
         || command.local_replica_id != identity.replica_id
         || command.expected_instance_id != identity.instance_id
         || command.expected_agent_generation != identity.agent_generation
@@ -49,11 +59,15 @@ pub fn admit_switchover_preparation(command: &PrepareSwitchover, state: &AgentSt
             "planned switchover preparation target does not match durable identity".into(),
         ));
     }
-    if state.retired_preparation_id.as_ref() == Some(&command.operation_id)
-        || state
-            .retired_switchover
-            .as_ref()
-            .is_some_and(|retired| retired.preparation_operation_id == command.operation_id)
+    if state
+        .preparation_retirement
+        .as_ref()
+        .is_some_and(|retired| {
+            retired.starting_epoch == command.current_configuration.epoch
+                && retired.starting_configuration_id
+                    == command.current_configuration.configuration_id
+                && command.preparation_generation <= retired.generation
+        })
     {
         return Err(AgentError::CommandRejected(
             "planned switchover preparation has already been retired".into(),
@@ -61,6 +75,7 @@ pub fn admit_switchover_preparation(command: &PrepareSwitchover, state: &AgentSt
     }
     if let Some(prepared) = state.prepared_switchover.as_ref() {
         if prepared.preparation_operation_id == command.operation_id
+            && prepared.preparation_generation == command.preparation_generation
             && prepared.request_id == command.request_id
             && prepared.source == command.source
             && prepared.target == command.target
@@ -217,14 +232,22 @@ fn admit_configuration_with_replay(
         });
         if !is_access_only_configuration(command, state)
             || (!persisted_exact_replay
-                && state.retired_preparation_id.as_ref()
-                    == Some(&command.retire_switchover_preparation_ids[0]))
+                && state
+                    .preparation_retirement
+                    .as_ref()
+                    .is_some_and(|retired| {
+                        retired.starting_epoch == command.current_epoch
+                            && retired.starting_configuration_id
+                                == command.current_configuration.configuration_id
+                            && command.retire_switchover_preparation_ids[0].generation
+                                <= retired.generation
+                    }))
             || command
                 .switchover_handoff
                 .as_ref()
                 .is_some_and(|certificate| Some(certificate) != retained)
             || state.prepared_switchover.as_ref().is_some_and(|prepared| {
-                command.retire_switchover_preparation_ids[0] != prepared.preparation_operation_id
+                command.retire_switchover_preparation_ids[0] != prepared.preparation()
             })
         {
             return Err(AgentError::CommandRejected(
@@ -405,12 +428,11 @@ fn admit_configuration_with_replay(
             || command
                 .retire_switchover_preparation_ids
                 .iter()
-                .any(|operation_id| operation_id.is_empty())
+                .any(|id| id.operation_id.is_empty() || id.generation == 0)
             || (command.current_only
                 && *identity == handoff.source
                 && (command.retire_switchover_preparation_ids.len() != 1
-                    || command.retire_switchover_preparation_ids[0]
-                        != handoff.preparation_operation_id))
+                    || command.retire_switchover_preparation_ids[0] != handoff.preparation()))
             || (command.current_only
                 && *identity != handoff.source
                 && !command.retire_switchover_preparation_ids.is_empty())

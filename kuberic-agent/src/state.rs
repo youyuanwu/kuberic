@@ -2,9 +2,9 @@
 
 use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
-    AccessStatus, ConfigurationDescriptor, EffectivePolicy, Epoch, FaultType, InitializationId,
-    LoadMetric, OperationId, PodUid, PvcUid, ReplicaIdentity, ReplicaRole, ResourceUid,
-    SwitchoverHandoff,
+    AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
+    InitializationId, LoadMetric, OperationId, PodUid, PvcUid, ReplicaIdentity, ReplicaRole,
+    ResourceUid, SwitchoverHandoff,
 };
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 use serde::{Deserialize, Serialize};
@@ -95,6 +95,14 @@ fn denied_access() -> AccessStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PreparationRetirement {
+    pub starting_configuration_id: ConfigurationId,
+    pub starting_epoch: Epoch,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentState {
     pub identity: StorageIdentity,
     pub highest_epoch: Epoch,
@@ -123,7 +131,7 @@ pub struct AgentState {
     #[serde(default)]
     pub retired_switchover: Option<SwitchoverHandoff>,
     #[serde(default)]
-    pub retired_preparation_id: Option<OperationId>,
+    pub preparation_retirement: Option<PreparationRetirement>,
 }
 
 impl AgentState {
@@ -147,7 +155,7 @@ impl AgentState {
             retained_result: None,
             prepared_switchover: None,
             retired_switchover: None,
-            retired_preparation_id: None,
+            preparation_retirement: None,
         }
     }
 }

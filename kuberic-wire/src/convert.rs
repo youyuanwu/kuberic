@@ -604,7 +604,10 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 && command.retire_build_id.is_empty()
                 && current.primary_id == target.replica_id
                 && command.retire_switchover_preparation_ids.len() == 1
-                && !command.retire_switchover_preparation_ids[0].is_empty()
+                && !command.retire_switchover_preparation_ids[0]
+                    .operation_id
+                    .is_empty()
+                && command.retire_switchover_preparation_ids[0].generation > 0
                 && command
                     .switchover_handoff
                     .clone()
@@ -620,7 +623,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                                 .iter()
                                 .any(|member| member.identity == handoff.target)
                             && command.retire_switchover_preparation_ids
-                                == [handoff.preparation_operation_id.to_string()]
+                                == [handoff.preparation().into()]
                     });
             if command.current_only {
                 if previous.is_some() || transition_kind == TransitionKind::Bootstrap {
@@ -703,6 +706,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 let retirement_ids = command
                     .retire_switchover_preparation_ids
                     .iter()
+                    .map(|id| (&id.operation_id, id.generation))
                     .collect::<BTreeSet<_>>();
                 if !current_contains_handoff_members
                     || !previous_matches_handoff
@@ -710,12 +714,12 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     || command
                         .retire_switchover_preparation_ids
                         .iter()
-                        .any(String::is_empty)
+                        .any(|id| id.operation_id.is_empty() || id.generation == 0)
                     || (command.current_only
                         && target == handoff.source
                         && (command.retire_switchover_preparation_ids.len() != 1
                             || command.retire_switchover_preparation_ids[0]
-                                != handoff.preparation_operation_id.as_str()))
+                                != handoff.preparation().into()))
                     || (command.current_only
                         && target != handoff.source
                         && !command.retire_switchover_preparation_ids.is_empty())
@@ -762,6 +766,11 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 if value.is_empty() {
                     return Err(WireError::MissingField(field));
                 }
+            }
+            if command.preparation_generation == 0 {
+                return Err(WireError::InvalidAuthority(
+                    "preparation generation must be positive".into(),
+                ));
             }
             let source: ReplicaIdentity = command
                 .source
@@ -964,12 +973,16 @@ pub fn normalize_execute_request(
                 retire_switchover_preparation_ids: command
                     .retire_switchover_preparation_ids
                     .into_iter()
-                    .map(OperationId::new)
+                    .map(|id| kuberic_protocol::types::SwitchoverPreparationId {
+                        operation_id: OperationId::new(id.operation_id),
+                        generation: id.generation,
+                    })
                     .collect(),
             }))
         }
         proto::execute_command_request::Command::PrepareSwitchover(command) => {
             ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+                preparation_generation: command.preparation_generation,
                 operation_id: OperationId::new(command.operation_id),
                 request_id: SwitchoverRequestId::new(command.request_id),
                 local_replica_id: ReplicaId::new(command.local_replica_id),
@@ -1363,6 +1376,7 @@ impl TryFrom<proto::BuildAuthority> for BuildAuthority {
 impl From<SwitchoverHandoff> for proto::SwitchoverHandoff {
     fn from(handoff: SwitchoverHandoff) -> Self {
         Self {
+            preparation_generation: handoff.preparation_generation,
             preparation_operation_id: handoff.preparation_operation_id.to_string(),
             request_id: handoff.request_id.to_string(),
             source: Some(handoff.source.into()),
@@ -1370,6 +1384,15 @@ impl From<SwitchoverHandoff> for proto::SwitchoverHandoff {
             starting_configuration_id: handoff.starting_configuration_id.to_string(),
             handoff_lsn: handoff.handoff_lsn,
             starting_epoch: Some(handoff.starting_epoch.into()),
+        }
+    }
+}
+
+impl From<kuberic_protocol::types::SwitchoverPreparationId> for proto::SwitchoverPreparationId {
+    fn from(id: kuberic_protocol::types::SwitchoverPreparationId) -> Self {
+        Self {
+            operation_id: id.operation_id.to_string(),
+            generation: id.generation,
         }
     }
 }
@@ -1385,7 +1408,8 @@ impl TryFrom<proto::SwitchoverHandoff> for SwitchoverHandoff {
 fn switchover_handoff_from_proto(
     handoff: proto::SwitchoverHandoff,
 ) -> Result<SwitchoverHandoff, WireError> {
-    if handoff.preparation_operation_id.is_empty()
+    if handoff.preparation_generation == 0
+        || handoff.preparation_operation_id.is_empty()
         || handoff.request_id.is_empty()
         || handoff.starting_configuration_id.is_empty()
         || handoff.handoff_lsn < 0
@@ -1395,6 +1419,7 @@ fn switchover_handoff_from_proto(
         ));
     }
     let handoff = SwitchoverHandoff {
+        preparation_generation: handoff.preparation_generation,
         preparation_operation_id: OperationId::new(handoff.preparation_operation_id),
         request_id: SwitchoverRequestId::new(handoff.request_id),
         source: handoff
