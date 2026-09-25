@@ -345,8 +345,8 @@ impl AdmittedAuthority {
     }
 }
 
-/// Durable runtime outputs. The agent must persist these before acknowledging
-/// the enclosing effect and load the tombstone before opening application state.
+/// Exact retirement authority, persisted first as intent and then as a terminal
+/// tombstone. A started record does not yet attest that application Close returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetiredAuthority {
     pub committed: SecondaryScaleDownCleanup,
@@ -401,6 +401,22 @@ pub trait ReplicaAuthorityStore: Send + Sync {
         Ok(None)
     }
 
+    /// Must be checked before Open or active authority restoration.
+    async fn load_retirement_started(&self) -> Result<Option<RetiredAuthority>> {
+        Err(ContractError::Persistence(
+            "retirement-started persistence is unavailable".into(),
+        ))
+    }
+
+    /// Atomically validate the exact local target, resource, committed cleanup and
+    /// installed authority, reject conflicts, and permanently fence active admission.
+    /// Exact replay (including an already retired authority) must be idempotent.
+    async fn record_retirement_started(&self, _authority: &RetiredAuthority) -> Result<()> {
+        Err(ContractError::Persistence(
+            "retirement-started persistence is unavailable".into(),
+        ))
+    }
+
     async fn load_secondary_removal_commit(&self) -> Result<Option<SecondaryScaleDownCleanup>> {
         Ok(None)
     }
@@ -414,7 +430,8 @@ pub trait ReplicaAuthorityStore: Send + Sync {
         ))
     }
 
-    /// Must atomically reject conflicting tombstones and all subsequent active admission.
+    /// Must match any started record, atomically write the tombstone, remove active
+    /// authority and clear the started record. Exact retired replay is idempotent.
     async fn retire(&self, _authority: &RetiredAuthority) -> Result<()> {
         Err(ContractError::Persistence(
             "retirement persistence is unavailable".into(),

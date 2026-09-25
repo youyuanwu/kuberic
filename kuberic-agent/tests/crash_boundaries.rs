@@ -327,12 +327,17 @@ struct CrashPersistedState {
     applied_lsn: i64,
     committed_lsn: i64,
     operations: BTreeMap<i64, Vec<u8>>,
+    #[serde(default)]
+    close_completions: u64,
+    #[serde(default)]
+    last_role: Option<ReplicaRole>,
 }
 
 struct CrashState {
     path: PathBuf,
     state: Mutex<CrashPersistedState>,
     opens: AtomicUsize,
+    consume_replication: bool,
 }
 
 impl CrashState {
@@ -347,6 +352,7 @@ impl CrashState {
             path,
             state: Mutex::new(state),
             opens: AtomicUsize::new(0),
+            consume_replication: false,
         }
     }
 
@@ -384,19 +390,66 @@ impl StatefulServiceReplica for CrashState {
         let interfaces = partition
             .create_replicator(self.clone(), Some(ReplicatorSettings::default()))
             .await?;
+        if self.consume_replication {
+            let mut stream = interfaces
+                .state_replicator()
+                .get_replication_stream()
+                .await?;
+            let application = Arc::downgrade(&self);
+            tokio::spawn(async move {
+                while let Ok(Some(operation)) = stream.get_operation().await {
+                    let Some(application) = application.upgrade() else {
+                        return;
+                    };
+                    let kuberic_runtime::replicator::stream::OperationMetadata::Replication {
+                        lsn,
+                        committed_lsn,
+                    } = operation.metadata
+                    else {
+                        panic!("expected replication")
+                    };
+                    let ack = application
+                        .apply(Operation {
+                            lsn,
+                            committed_lsn,
+                            data: operation.data.clone(),
+                        })
+                        .await
+                        .unwrap();
+                    operation.acknowledge(ack).unwrap();
+                }
+            });
+        }
         Ok(interfaces.replicator())
     }
 
-    async fn change_role(&self, _role: ReplicaRole) -> RuntimeResult<RoleChange> {
+    async fn change_role(&self, role: ReplicaRole) -> RuntimeResult<RoleChange> {
+        let mut state = self.state.lock().unwrap();
+        let mut candidate = state.clone();
+        candidate.last_role = Some(role);
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(RoleChange {
             service_address: None,
         })
     }
 
     async fn close(&self) -> RuntimeResult<()> {
-        if env::var("KUBERIC_REMOVAL_BOUNDARY").as_deref() == Ok("retire:application-close") {
+        if matches!(
+            env::var("KUBERIC_REMOVAL_BOUNDARY").as_deref(),
+            Ok("retire:application-close" | "retire:role-none-before-close")
+        ) {
+            assert_eq!(
+                self.state.lock().unwrap().last_role,
+                Some(ReplicaRole::None)
+            );
             std::process::exit(73);
         }
+        let mut state = self.state.lock().unwrap();
+        let mut candidate = state.clone();
+        candidate.close_completions += 1;
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(())
     }
 

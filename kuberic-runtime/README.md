@@ -83,8 +83,14 @@ catch-up gate the write regrant, including singleton recovery.
 
 Exact peer eviction after PC removal cancels retained windows and prevents a
 delayed session from reconnecting the excluded incarnation. Local retirement
-revokes access, fences traffic, drives role None and hosting Close, and only
-then persists a terminal tombstone. Hosting checks that tombstone before Open.
+validates and durably records the exact retirement-started authority before
+revoking access, fencing traffic, driving role None and hosting Close. Finalization
+atomically writes the terminal tombstone, removes active authority, and clears
+the started record; either lifecycle record prevents active authority admission.
+Hosting checks the tombstone and then the started record before application Open.
+After process termination, a started record is finalized without Open: termination
+already closed the prior host. The pending agent effect then completes its exact
+durable receipt normally. Failed finalization keeps reconstruction closed.
 Preparation, acceptance, and retirement postconditions are unpublished managed
 contracts, not additions to the SF-shaped application traits. Agent schema-2
 storage persists preparation, accepted-current-only, and retirement evidence.

@@ -10,6 +10,13 @@ use kuberic_runtime_internal::authority::LocalWriteJournal;
 #[path = "../../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
 mod fixture;
 
+#[path = "removal_fault_store.rs"]
+mod fault_store;
+use fault_store::FaultAuthorityStore;
+
+#[path = "removal_quorum_crashes.rs"]
+mod quorum_crashes;
+
 struct CrashStore {
     inner: Arc<SqliteStore>,
     boundary: String,
@@ -121,7 +128,22 @@ impl RuntimeEffectExecutor for CrashRuntime {
             .next()
             .unwrap()
             .to_string();
-        let result = self.runtime.apply_effect(effect).await?;
+        let result = self.runtime.apply_effect(effect).await;
+        if self.boundary == "closed-before-tombstone" {
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("crash-before-tombstone"),
+                "{error}"
+            );
+            let snapshot = self.runtime.snapshot().await;
+            assert!(!snapshot.open);
+            assert_eq!(snapshot.role, ReplicaRole::None);
+            assert_eq!(snapshot.read_status, AccessStatus::NotPrimary);
+            assert_eq!(snapshot.write_status, AccessStatus::NotPrimary);
+            assert!(snapshot.authority.is_none());
+            std::process::exit(73);
+        }
+        let result = result?;
         if self.boundary == "runtime" || self.boundary == format!("runtime-{stage}") {
             std::process::exit(73);
         }
@@ -260,10 +282,16 @@ async fn writer() {
         })
         .await
         .unwrap();
+    let fault_store = Arc::new(FaultAuthorityStore {
+        inner: store.clone(),
+        boundary: boundary.clone(),
+        interrupted: Mutex::new(None),
+        candidate_path: path.with_extension("preparation-candidate.json"),
+    });
     let runtime = Arc::new(PodRuntime::new(
         state.identity.local_identity,
         application,
-        store.clone(),
+        fault_store.clone(),
     ));
     runtime
         .reconstruct(
@@ -285,7 +313,7 @@ async fn writer() {
             })
             .await
             .unwrap();
-        drop(pending);
+        *fault_store.interrupted.lock().unwrap() = Some(pending);
     }
     let preparation = if phase == "joint" || phase == "current" {
         Some(
@@ -305,6 +333,16 @@ async fn writer() {
         coordinator
             .ensure_configuration(command(preparation.as_ref().unwrap(), false))
             .await
+            .unwrap();
+    }
+    if point == "closed-before-tombstone" {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER crash_before_tombstone
+                 BEFORE INSERT ON runtime_lifecycle WHEN NEW.kind = 'retired'
+                 BEGIN SELECT RAISE(FAIL, 'crash-before-tombstone'); END;",
+            )
             .unwrap();
     }
     let coordinator = Coordinator::new(
@@ -363,6 +401,7 @@ fn real_process_removal_boundaries_preserve_exact_authority_and_values() {
 fn run_removal_boundary_matrix() {
     let mut boundaries = [
         "prepare:intent",
+        "prepare:closed-before-boundary",
         "prepare:runtime",
         "prepare:applied",
         "prepare:receipt",
@@ -384,6 +423,9 @@ fn run_removal_boundary_matrix() {
         "current:terminal",
         "current:reply",
         "retire:intent",
+        "retire:started-before-role-none",
+        "retire:role-none-before-close",
+        "retire:closed-before-tombstone",
         "retire:application-close",
         "retire:runtime",
         "retire:applied",
@@ -409,6 +451,10 @@ fn run_removal_boundary_matrix() {
             boundaries.push(format!("{phase}:stage-{stage}"));
         }
     }
+    if let Ok(boundary) = env::var("KUBERIC_VERIFY_REMOVAL_BOUNDARY") {
+        assert!(boundaries.contains(&boundary));
+        boundaries = vec![boundary];
+    }
     for boundary in boundaries {
         eprintln!("recovering {boundary}");
         let directory = tempdir().unwrap();
@@ -432,6 +478,12 @@ fn run_removal_boundary_matrix() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        if boundary == "retire:closed-before-tombstone" {
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch("DROP TRIGGER crash_before_tombstone;")
+                .unwrap();
+        }
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -459,7 +511,43 @@ fn run_removal_boundary_matrix() {
                             Arc::new(SqliteStore::open_existing(&path, Some(&provenance)).unwrap());
                         let before = store.load_state().await.unwrap();
                         let tombstone = store.load_retired_authority().await.unwrap();
+                        let started = store.load_retirement_started().await.unwrap();
                         let application = Arc::new(CrashState::open(crash_application_path(&path)));
+                        if boundary == "retire:closed-before-tombstone" {
+                            assert_eq!(application.state.lock().unwrap().close_completions, 1);
+                            assert!(tombstone.is_none());
+                            assert!(before.retired_authority.is_none());
+                            assert_eq!(
+                                before.pending_effect.as_ref().unwrap().stage,
+                                EffectStage::IntentCommitted
+                            );
+                        }
+                        if matches!(
+                            boundary.as_str(),
+                            "retire:started-before-role-none"
+                                | "retire:role-none-before-close"
+                                | "retire:closed-before-tombstone"
+                        ) {
+                            assert!(started.is_some());
+                            assert!(tombstone.is_none());
+                            let app = application.state.lock().unwrap();
+                            assert_eq!(
+                                app.last_role,
+                                Some(if boundary == "retire:started-before-role-none" {
+                                    ReplicaRole::ActiveSecondary
+                                } else {
+                                    ReplicaRole::None
+                                })
+                            );
+                            if boundary != "retire:closed-before-tombstone" {
+                                assert_eq!(app.close_completions, 0);
+                            }
+                        }
+                        if boundary == "prepare:closed-before-boundary" {
+                            assert!(store.load_secondary_removal().await.unwrap().is_none());
+                            assert!(before.prepared_secondary_removal.is_none());
+                            assert_eq!(application.state.lock().unwrap().applied_lsn, 2);
+                        }
                         let runtime = Arc::new(PodRuntime::new(
                             provenance.local_identity.clone(),
                             application.clone(),
@@ -482,11 +570,29 @@ fn run_removal_boundary_matrix() {
                             .await
                             .unwrap_or_else(|e| panic!("{boundary}: {e}"));
                         eprintln!("reconstructed {boundary}");
-                        if tombstone.is_some() {
+                        if tombstone.is_some() || started.is_some() {
                             assert_eq!(
                                 application.opens.load(Ordering::SeqCst),
                                 0,
                                 "{boundary} must not Open a tombstone"
+                            );
+                        }
+                        if boundary == "prepare:closed-before-boundary" {
+                            assert_ne!(
+                                runtime.snapshot().await.write_status,
+                                AccessStatus::Granted
+                            );
+                            assert!(
+                                runtime
+                                    .data_plane()
+                                    .begin_write(kuberic_runtime::application::ClientWrite {
+                                        operation_id: OperationId::new(
+                                            "forbidden-after-preparation-cut"
+                                        ),
+                                        data: Bytes::new(),
+                                    })
+                                    .await
+                                    .is_err()
                             );
                         }
                         let coordinator = Coordinator::new(store.clone(), runtime.clone());
@@ -511,6 +617,16 @@ fn run_removal_boundary_matrix() {
                             assert_eq!(runtime.snapshot().await.role, ReplicaRole::None);
                             assert!(!runtime.snapshot().await.open);
                             assert!(store.load().await.unwrap().is_none());
+                            assert!(store.load_retirement_started().await.unwrap().is_none());
+                            assert_eq!(
+                                store
+                                    .load_retired_authority()
+                                    .await
+                                    .unwrap()
+                                    .unwrap()
+                                    .report,
+                                receipt
+                            );
                             let durable = store.load_state().await.unwrap();
                             let duplicate = coordinator
                                 .ensure_replica_retired(
@@ -565,6 +681,19 @@ fn run_removal_boundary_matrix() {
                                     1
                                 }
                             );
+                            if boundary == "prepare:closed-before-boundary" {
+                                let candidate: SecondaryRemovalPreparation =
+                                    serde_json::from_slice(
+                                        &std::fs::read(
+                                            path.with_extension("preparation-candidate.json"),
+                                        )
+                                        .unwrap(),
+                                    )
+                                    .unwrap();
+                                assert_eq!(prepared, candidate);
+                                assert_eq!(store.load_local_writes().await.unwrap().len(), 1);
+                                assert_eq!(application.state.lock().unwrap().operations.len(), 2);
+                            }
                             if boundary.starts_with("prepare:") {
                                 let durable = store.load_state().await.unwrap();
                                 assert_eq!(

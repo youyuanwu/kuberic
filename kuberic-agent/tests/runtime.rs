@@ -202,6 +202,109 @@ async fn sqlite_retirement_tombstone_precedes_host_open_and_cannot_be_reactivate
     assert_eq!(replay.postcondition.write_status, AccessStatus::NotPrimary);
 }
 
+#[tokio::test]
+async fn retirement_started_recovery_fails_closed_until_exact_tombstone_is_durable() {
+    use kuberic_agent::sqlite_store::SqliteStore;
+    use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+    use kuberic_protocol::types::{InitializationId, PodUid, PvcUid};
+    let intent = removal_fixture::intent(&[1, 2, 3], 1);
+    let provenance = StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        local_identity: intent.target.clone(),
+        pod_uid: PodUid::new(intent.target.instance_id.as_str()),
+        pvc_uid: PvcUid::new("pvc-3"),
+        initialization_id: InitializationId::new("original"),
+        effective_policy: intent.previous_policy.clone(),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store =
+        Arc::new(SqliteStore::create_authorized(&path, AgentState::new(provenance)).unwrap());
+    let original = open_removal_member(
+        &intent,
+        intent.target.clone(),
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    )
+    .await;
+    let active = original.snapshot().await.authority.unwrap();
+    let retired = kuberic_runtime_internal::authority::RetiredAuthority {
+        committed: removal_fixture::cleanup(&intent),
+        report: removal_fixture::retirement(&intent),
+    };
+    store.record_retirement_started(&retired).await.unwrap();
+    assert!(original.restore_authority().await.is_err());
+    assert!(
+        original
+            .apply_effect(effect(
+                5,
+                RuntimeEffectAction::AdmitAuthority(Box::new(active))
+            ))
+            .await
+            .is_err()
+    );
+    original.abort();
+    let application = Arc::new(TestApplication::default());
+    let runtime = PodRuntime::new(intent.target.clone(), application.clone(), store.clone());
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_recovery BEFORE INSERT ON runtime_lifecycle
+         WHEN NEW.kind = 'retired' BEGIN SELECT RAISE(FAIL, 'failed recovery'); END;",
+        )
+        .unwrap();
+    assert!(
+        runtime
+            .reconstruct(
+                OpenMode::Existing,
+                ReplicaRole::ActiveSecondary,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert!(application.events.lock().unwrap().is_empty());
+    assert!(store.load_retired_authority().await.unwrap().is_none());
+    assert_eq!(
+        store.load_retirement_started().await.unwrap(),
+        Some(retired.clone())
+    );
+    assert!(
+        runtime
+            .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+            .await
+            .is_err()
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_recovery;")
+        .unwrap();
+    for _ in 0..2 {
+        runtime
+            .reconstruct(
+                OpenMode::Existing,
+                ReplicaRole::ActiveSecondary,
+                AccessStatus::Granted,
+                AccessStatus::Granted,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(application.events.lock().unwrap().is_empty());
+        let snapshot = runtime.snapshot().await;
+        assert!(!snapshot.open);
+        assert_eq!(snapshot.role, ReplicaRole::None);
+        assert_eq!(snapshot.read_status, AccessStatus::NotPrimary);
+        assert_eq!(snapshot.write_status, AccessStatus::NotPrimary);
+        assert!(snapshot.authority.is_none());
+        assert_eq!(snapshot.retired_authority, Some(retired.clone()));
+    }
+    assert!(store.load_retirement_started().await.unwrap().is_none());
+    assert!(store.load().await.unwrap().is_none());
+}
+
 fn prepare_removal(
     intent: &kuberic_protocol::types::SecondaryScaleDownIntent,
 ) -> RuntimeEffectAction {
@@ -833,13 +936,9 @@ async fn rejected_secondary_removal_retirement_keeps_inbound_delivery_open() {
     let intent = removal_fixture::intent(&[1, 2], 1);
     let app = Arc::new(TestApplication::default());
     app.manual_streams.store(true, Ordering::SeqCst);
-    let target = open_removal_member(
-        &intent,
-        intent.target.clone(),
-        app.clone(),
-        Arc::new(MemoryAuthorityStore::default()),
-    )
-    .await;
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let target =
+        open_removal_member(&intent, intent.target.clone(), app.clone(), store.clone()).await;
     let old_authority = target.snapshot().await.authority.unwrap();
     let pending = target
         .data_plane()
@@ -880,6 +979,7 @@ async fn rejected_secondary_removal_retirement_keeps_inbound_delivery_open() {
             .await
             .is_err()
     );
+    assert!(store.load_retirement_started().await.unwrap().is_none());
     assert!(!applied.is_finished());
     operation
         .acknowledge(DurableApplicationProgress {
@@ -1228,9 +1328,11 @@ async fn secondary_removal_preparations_advance_only_after_the_previous_commit()
 
 #[derive(Default)]
 struct MemoryAuthorityStore {
+    lifecycle: Mutex<()>,
     authority: Mutex<Option<AdmittedAuthority>>,
     prepared_secondary_removal: Mutex<Option<kuberic_protocol::types::SecondaryRemovalPreparation>>,
     retired_authority: Mutex<Option<kuberic_runtime_internal::authority::RetiredAuthority>>,
+    retirement_started: Mutex<Option<kuberic_runtime_internal::authority::RetiredAuthority>>,
     accepted_removal: Mutex<Option<kuberic_protocol::types::SecondaryScaleDownCleanup>>,
     fail_preparation_once: AtomicBool,
     fail_after_preparation_once: AtomicBool,
@@ -1250,6 +1352,41 @@ struct MemoryAuthorityStore {
     pause_committed_write: AtomicBool,
     committed_write_notify: Notify,
     resume_committed_write_notify: Notify,
+}
+
+impl MemoryAuthorityStore {
+    fn validate_retirement(
+        &self,
+        retired: &kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> ContractResult<()> {
+        let active = self.authority.lock().unwrap();
+        retired.validate(
+            active
+                .as_ref()
+                .map_or(&retired.report.intent.target, |a| &a.local_identity),
+        )?;
+        if active.as_ref().is_some_and(|a| {
+            a.current_configuration != retired.report.intent.previous_configuration
+                || a.previous_configuration.is_some()
+        }) || self
+            .retirement_started
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|old| old != retired)
+            || self
+                .retired_authority
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|old| old != retired)
+        {
+            return Err(ContractError::AuthorityMismatch(
+                "conflicting retirement".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1310,10 +1447,34 @@ impl ReplicaAuthorityStore for MemoryAuthorityStore {
         Ok(self.retired_authority.lock().unwrap().clone())
     }
 
+    async fn load_retirement_started(
+        &self,
+    ) -> ContractResult<Option<kuberic_runtime_internal::authority::RetiredAuthority>> {
+        let _guard = self.lifecycle.lock().unwrap();
+        Ok(self.retirement_started.lock().unwrap().clone())
+    }
+
+    async fn record_retirement_started(
+        &self,
+        retired: &kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> ContractResult<()> {
+        let _guard = self.lifecycle.lock().unwrap();
+        self.validate_retirement(retired)?;
+        if self.retired_authority.lock().unwrap().is_none() {
+            *self.retirement_started.lock().unwrap() = Some(retired.clone());
+        }
+        Ok(())
+    }
+
     async fn retire(
         &self,
         retired: &kuberic_runtime_internal::authority::RetiredAuthority,
     ) -> ContractResult<()> {
+        let _guard = self.lifecycle.lock().unwrap();
+        self.validate_retirement(retired)?;
+        if self.retired_authority.lock().unwrap().is_some() {
+            return Ok(());
+        }
         if self.fail_retirement_once.swap(false, Ordering::SeqCst) {
             return Err(ContractError::Persistence(
                 "injected tombstone failure".into(),
@@ -1327,6 +1488,7 @@ impl ReplicaAuthorityStore for MemoryAuthorityStore {
         }
         *stored = Some(retired.clone());
         *self.authority.lock().unwrap() = None;
+        *self.retirement_started.lock().unwrap() = None;
         if self
             .fail_after_retirement_once
             .swap(false, Ordering::SeqCst)
@@ -1339,11 +1501,15 @@ impl ReplicaAuthorityStore for MemoryAuthorityStore {
     }
 
     async fn load(&self) -> ContractResult<Option<AdmittedAuthority>> {
+        let _guard = self.lifecycle.lock().unwrap();
         Ok(self.authority.lock().unwrap().clone())
     }
 
     async fn admit(&self, authority: &AdmittedAuthority) -> ContractResult<()> {
-        if self.retired_authority.lock().unwrap().is_some() {
+        let _guard = self.lifecycle.lock().unwrap();
+        if self.retired_authority.lock().unwrap().is_some()
+            || self.retirement_started.lock().unwrap().is_some()
+        {
             return Err(ContractError::AuthorityMismatch("retired identity".into()));
         }
         self.admit_count.fetch_add(1, Ordering::SeqCst);

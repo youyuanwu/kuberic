@@ -99,6 +99,54 @@ async fn durable_retirement_rejects_active_authority_and_mutated_tombstones() {
         committed: removal_fixture::cleanup(&intent),
         report: removal_fixture::retirement(&intent),
     };
+    let mut wrong_intent = intent.clone();
+    wrong_intent.resource_uid = ResourceUid::new("another-resource");
+    wrong_intent.operation_id = wrong_intent.expected_operation_id();
+    let wrong_resource = RetiredAuthority {
+        committed: removal_fixture::cleanup(&wrong_intent),
+        report: removal_fixture::retirement(&wrong_intent),
+    };
+    assert!(
+        store
+            .record_retirement_started(&wrong_resource)
+            .await
+            .is_err()
+    );
+    assert!(store.load_retirement_started().await.unwrap().is_none());
+    assert_eq!(store.load().await.unwrap(), Some(active.clone()));
+    store.record_retirement_started(&retired).await.unwrap();
+    store.record_retirement_started(&retired).await.unwrap();
+    assert!(store.load_retired_authority().await.unwrap().is_none());
+    assert!(store.admit(&active).await.is_err());
+    drop(store);
+    let store = SqliteStore::open_existing(&path, Some(&identity)).unwrap();
+    assert_eq!(
+        store.load_retirement_started().await.unwrap(),
+        Some(retired.clone())
+    );
+    let mut conflict = retired.clone();
+    conflict.report.process_session_id =
+        kuberic_protocol::types::ProcessSessionId::new("conflicting-session");
+    assert!(store.record_retirement_started(&conflict).await.is_err());
+    assert!(store.retire(&conflict).await.is_err());
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_started_cleanup BEFORE DELETE ON runtime_lifecycle
+         WHEN OLD.kind = 'retirement-started'
+         BEGIN SELECT RAISE(FAIL, 'injected finalization failure'); END;",
+        )
+        .unwrap();
+    assert!(store.retire(&retired).await.is_err());
+    assert_eq!(store.load().await.unwrap(), Some(active.clone()));
+    assert!(store.load_retired_authority().await.unwrap().is_none());
+    assert_eq!(
+        store.load_retirement_started().await.unwrap(),
+        Some(retired.clone())
+    );
+    connection
+        .execute_batch("DROP TRIGGER reject_started_cleanup;")
+        .unwrap();
     store.retire(&retired).await.unwrap();
     drop(store);
     let store = SqliteStore::open_existing(&path, Some(&identity)).unwrap();
@@ -107,8 +155,11 @@ async fn durable_retirement_rejects_active_authority_and_mutated_tombstones() {
         Some(retired.clone())
     );
     assert!(store.load().await.unwrap().is_none());
+    assert!(store.load_retirement_started().await.unwrap().is_none());
     assert!(store.admit(&active).await.is_err());
     store.retire(&retired).await.unwrap();
+    store.record_retirement_started(&retired).await.unwrap();
+    assert!(store.load_retirement_started().await.unwrap().is_none());
     let mut changed = retired;
     changed.report.process_session_id =
         kuberic_protocol::types::ProcessSessionId::new("new-session");

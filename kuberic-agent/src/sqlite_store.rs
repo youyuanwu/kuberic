@@ -742,7 +742,13 @@ impl ReplicaAuthorityStore for SqliteStore {
                 "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retired'",
                 [],
             )?;
+            let started: Option<RetiredAuthority> = load_json_optional(
+                transaction,
+                "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+                [],
+            )?;
             if retired.is_some()
+                || started.is_some()
                 || state.retired_authority.is_some()
                 || authority.local_identity != state.identity.local_identity
             {
@@ -848,6 +854,27 @@ impl ReplicaAuthorityStore for SqliteStore {
         )
     }
 
+    async fn load_retirement_started(&self) -> ContractResult<Option<RetiredAuthority>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|e| ContractError::Persistence(e.to_string()))?;
+        load_json_optional(
+            &connection,
+            "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+            [],
+        )
+    }
+
+    async fn record_retirement_started(&self, authority: &RetiredAuthority) -> ContractResult<()> {
+        self.contract_transaction(|transaction| {
+            if validate_retirement(transaction, authority)? {
+                return Ok(());
+            }
+            write_lifecycle(transaction, "retirement-started", authority)
+        })
+    }
+
     async fn load_secondary_removal_commit(
         &self,
     ) -> ContractResult<Option<kuberic_protocol::types::SecondaryScaleDownCleanup>> {
@@ -908,48 +935,77 @@ impl ReplicaAuthorityStore for SqliteStore {
 
     async fn retire(&self, authority: &RetiredAuthority) -> ContractResult<()> {
         self.contract_transaction(|transaction| {
-            let state = load_state_from_connection(transaction)
-                .map_err(|e| ContractError::Persistence(e.to_string()))?;
-            authority.validate(&state.identity.local_identity)?;
-            if authority.report.intent.resource_uid != state.identity.resource_uid {
-                return Err(ContractError::AuthorityMismatch(
-                    "retirement resource differs".into(),
-                ));
-            }
-            let existing: Option<RetiredAuthority> = load_json_optional(
-                transaction,
-                "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retired'",
-                [],
-            )?;
-            if let Some(existing) = existing {
-                return if existing == *authority {
-                    Ok(())
-                } else {
-                    Err(ContractError::AuthorityMismatch(
-                        "retirement tombstone was mutated".into(),
-                    ))
-                };
-            }
-            let active: Option<AdmittedAuthority> = load_json_optional(
-                transaction,
-                "SELECT authority_json FROM replica_authority WHERE singleton = 1",
-                [],
-            )?;
-            if active.as_ref().is_some_and(|a| {
-                a.current_configuration != authority.report.intent.previous_configuration
-                    || a.previous_configuration.is_some()
-            }) {
-                return Err(ContractError::AuthorityMismatch(
-                    "retirement differs from installed authority".into(),
-                ));
+            if validate_retirement(transaction, authority)? {
+                return Ok(());
             }
             write_lifecycle(transaction, "retired", authority)?;
             transaction
                 .execute("DELETE FROM replica_authority", [])
                 .map_err(contract_sqlite_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+                    [],
+                )
+                .map_err(contract_sqlite_error)?;
             Ok(())
         })
     }
+}
+
+fn validate_retirement(
+    connection: &Connection,
+    authority: &RetiredAuthority,
+) -> ContractResult<bool> {
+    let state = load_state_from_connection(connection)
+        .map_err(|e| ContractError::Persistence(e.to_string()))?;
+    authority.validate(&state.identity.local_identity)?;
+    if authority.report.intent.resource_uid != state.identity.resource_uid {
+        return Err(ContractError::AuthorityMismatch(
+            "retirement resource differs".into(),
+        ));
+    }
+    let retired: Option<RetiredAuthority> = load_json_optional(
+        connection,
+        "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retired'",
+        [],
+    )?;
+    let started: Option<RetiredAuthority> = load_json_optional(
+        connection,
+        "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+        [],
+    )?;
+    if [
+        retired.as_ref(),
+        started.as_ref(),
+        state.retired_authority.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|old| old != authority)
+    {
+        return Err(ContractError::AuthorityMismatch(
+            "conflicting durable retirement".into(),
+        ));
+    }
+    if retired.is_some() {
+        return Ok(true);
+    }
+    let active: Option<AdmittedAuthority> = load_json_optional(
+        connection,
+        "SELECT authority_json FROM replica_authority WHERE singleton = 1",
+        [],
+    )?;
+    if active.as_ref().is_some_and(|a| {
+        a.local_identity != state.identity.local_identity
+            || a.current_configuration != authority.report.intent.previous_configuration
+            || a.previous_configuration.is_some()
+    }) {
+        return Err(ContractError::AuthorityMismatch(
+            "retirement differs from installed authority".into(),
+        ));
+    }
+    Ok(false)
 }
 
 #[async_trait]

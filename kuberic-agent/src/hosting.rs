@@ -287,20 +287,31 @@ impl PodRuntime {
         write_status: AccessStatus,
         transition: Option<(ReplicaRole, bool, bool)>,
     ) -> Result<()> {
-        if let Some(retired) = self
-            .host
-            .default_dependencies
-            .replica_authority_store
-            .load_retired_authority()
-            .await?
-        {
+        let store = &self.host.default_dependencies.replica_authority_store;
+        let retired = match store.load_retired_authority().await? {
+            Some(retired) => Some(retired),
+            None => {
+                if let Some(started) = store.load_retirement_started().await? {
+                    started.validate(&self.host.identity)?;
+                    // This fresh host has never opened. Process termination closed
+                    // the prior host, so the exact durable intent can now finish.
+                    if self.host.registered.get().is_some() {
+                        return Err(RuntimeError::ReconfigurationPending);
+                    }
+                    store.retire(&started).await?;
+                    Some(started)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(retired) = retired {
             retired.validate(&self.host.identity)?;
-            self.host
-                .state
-                .write()
-                .await
-                .fallback_snapshot
-                .retired_authority = Some(retired);
+            let mut state = self.host.state.write().await;
+            state.fallback_snapshot = empty_snapshot(self.host.identity.clone());
+            state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
+            state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+            state.fallback_snapshot.retired_authority = Some(retired);
             self.host.closed.store(true, Ordering::Release);
             return Ok(());
         }
@@ -807,12 +818,18 @@ impl RuntimeHost {
         if !matches!(
             effect.action,
             RuntimeEffectAction::RetireReplica(_) | RuntimeEffectAction::Abort
-        ) && self
+        ) && (self
             .default_dependencies
             .replica_authority_store
             .load_retired_authority()
             .await?
             .is_some()
+            || self
+                .default_dependencies
+                .replica_authority_store
+                .load_retirement_started()
+                .await?
+                .is_some())
         {
             return Err(RuntimeError::Closed);
         }
@@ -946,6 +963,12 @@ impl RuntimeHost {
             .load_retired_authority()
             .await?
             .is_some()
+            || self
+                .default_dependencies
+                .replica_authority_store
+                .load_retirement_started()
+                .await?
+                .is_some()
         {
             return Err(RuntimeError::Closed);
         }

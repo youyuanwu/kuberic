@@ -857,6 +857,11 @@ impl DefaultReplicatorInner {
             .load_retired_authority()
             .await?
             .is_some()
+            || self
+                .replica_authority_store
+                .load_retirement_started()
+                .await?
+                .is_some()
         {
             return Err(RuntimeError::Closed);
         }
@@ -2265,6 +2270,11 @@ impl DefaultReplicatorInner {
                     .load_retired_authority()
                     .await?
                     .is_some()
+                    || self
+                        .replica_authority_store
+                        .load_retirement_started()
+                        .await?
+                        .is_some()
                 {
                     return Err(RuntimeError::Closed);
                 }
@@ -2961,6 +2971,9 @@ impl DefaultReplicatorInner {
                         "retirement differs from installed target authority".into(),
                     ));
                 }
+                self.replica_authority_store
+                    .record_retirement_started(&retired)
+                    .await?;
                 state.read_status = AccessStatus::NotPrimary;
                 state.write_status = AccessStatus::NotPrimary;
                 state.authority = None;
