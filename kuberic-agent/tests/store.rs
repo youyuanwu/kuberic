@@ -369,9 +369,9 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
     drop(store);
 
     let connection = Connection::open(&path).unwrap();
-    for (table, column) in [
-        ("agent_state", "state_json"),
-        ("replica_authority", "authority_json"),
+    for (table, column, removed_key) in [
+        ("agent_state", "state_json", "preparedSwitchover"),
+        ("replica_authority", "authority_json", "switchover_handoff"),
     ] {
         let mut json: Value = connection
             .query_row(
@@ -382,8 +382,10 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
             .map(|json| serde_json::from_str(&json).unwrap())
             .unwrap();
         let object = json.as_object_mut().unwrap();
-        object.remove("preparedSwitchover");
-        object.remove("switchoverHandoff");
+        assert!(
+            object.remove(removed_key).is_some(),
+            "legacy fixture must remove {removed_key} from {table}"
+        );
         connection
             .execute(
                 &format!("UPDATE {table} SET {column} = ?1 WHERE singleton = 1"),
