@@ -72,6 +72,72 @@ During failover it records only the controller-selected election-safe prefix
 under the new authority fence; a replica cannot reuse an arbitrary
 previous-epoch suffix as verified progress.
 
+The controller enables SF-inspired secondary scale-down using PC/CC quorum
+principles, with Kuberic-specific target/minimum coupling, deterministic
+selection, write closure, sequential cleanup, and Kubernetes resource deletion.
+`spec.replicas` target=min is Kuberic policy; SF target and minimum are
+independently configurable. The evaluator, not the runtime, checks retained
+read-quorum availability under stable accepted current-only authority and fresh
+exact sessions before freezing intent, removing routing, or closing writes.
+`ScaleDownRetainedReadQuorumUnavailable` preserves existing service with bounded
+re-observation, without preparing the primary or selecting another target.
+
+Managed secondary-removal preparation serializes with write admission and ACK
+completion, closes writes, reconciles journaled operation identities, and
+persists an authority-verified durable prefix. PC and reduced CC retain their
+independent policies. Removal catch-up needs session-bound, exact reduced-CC
+write-quorum witnesses, including the unchanged primary; ordinary client
+commits still require both PC and CC write quorums. Removal grants no PC/CC
+client writes. A separate accepted current-only certificate and verified
+catch-up gate the write regrant, including singleton recovery.
+Frozen quorum certificates remain immutable authorization evidence after a
+retained peer restarts. They cannot restore obsolete-session credit: acceptance
+uses freshly verified current-session progress for the exact reduced authority
+and prepared boundary. Old-session reports, ACKs, and registration still reject.
+Post-commit live progress is validated separately from transition witnesses and
+binds the exact immutable commit certificate. A current-only primary may report
+Granted access with its completed availability command after restarting and
+resuming writes. This does not relax pre-commit write closure or alter certificates.
+
+Historical local acceptance is a separate managed effect for an exact retained
+secondary whose installed current-only removal authority covers the frozen verified
+boundary. The agent durably binds its pending/completed effect to the certificate.
+Unlike live commit acceptance, it neither loads witnesses into the quorum tracker
+nor persists a live runtime commit; restart replays only that exact local effect.
+It grants no access or configuration authority, and rejects primary/target misuse,
+conflicting installed authority, mutated receipts and insufficient verified progress.
+
+Exact peer eviction after PC removal cancels retained windows and prevents a
+delayed session from reconnecting the excluded incarnation. Local retirement
+validates and durably records the exact retirement-started authority before
+revoking access, fencing traffic, driving role None and hosting Close. Finalization
+atomically writes the terminal tombstone, removes active authority, and clears
+the started record; either lifecycle record prevents active authority admission.
+Hosting checks the tombstone and then the started record before application Open.
+After process termination, a started record is finalized without Open: termination
+already closed the prior host. The pending agent effect then completes its exact
+durable receipt normally. Failed finalization keeps reconstruction closed.
+Preparation, acceptance, and retirement postconditions are unpublished managed
+contracts, not additions to the SF-shaped application traits. Agent schema-2
+storage persists preparation, accepted-current-only, and retirement evidence.
+Recovery revalidates accepted evidence before restoring previously granted
+access; preparation and current-only coordination by themselves stay closed.
+The controller enables secondary scale-down; the application still receives no
+managed authority setters. See the
+[scale-down guide](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
+for target=min policy and availability limits. Exact original PVC provenance
+must be reconstructable before admission; pre-admission Pod/PVC disappearance
+without that provenance waits/fails closed, never treating list omission as
+absence. Unavailable-target support requires frozen or reconstructable exact
+cleanup identity. PVC object deletion has no retention or import path, not a
+physical storage erasure guarantee. Frozen-primary loss during removal/cleanup
+can cause indefinite outage. Sequential cleanup and each retained member's
+original completed current-only witness or fresh completed local acceptance
+gate replacement of the bounded receipt. Scale-up remains absent.
+The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
+include separating replication proof from Kubernetes cleanup obligations; neither
+desired policy nor Kubernetes deletion authority belongs in the runtime.
+
 `ReplicatorFactoryContext` exposes stable identity and partition-access
 capabilities, not a concrete runtime or default-engine pointer. Application
 and custom-factory code constructs only the SF-shaped interface bundle through
@@ -178,8 +244,9 @@ applied acknowledgement may contribute to commit.
 
 ## Remaining Service Fabric completion contracts
 
-The independent controller and agent provide fixed-cardinality bootstrap,
-replacement, ordinary failover, and quorum-loss ownership. The remaining
+The independent controller and agent provide full-set bootstrap,
+replacement, ordinary failover, planned switchover, secondary scale-down, and
+quorum-loss ownership. The remaining
 deferred contracts are:
 
 - persistent resend payloads across process sessions where incremental

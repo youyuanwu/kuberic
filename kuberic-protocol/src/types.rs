@@ -486,6 +486,7 @@ pub enum TransitionKind {
     Replacement,
     Failover,
     PlannedSwitchover,
+    SecondaryScaleDown,
 }
 
 impl TransitionKind {
@@ -495,6 +496,7 @@ impl TransitionKind {
             Self::Replacement => "replacement",
             Self::Failover => "failover",
             Self::PlannedSwitchover => "planned-switchover",
+            Self::SecondaryScaleDown => "secondary-scale-down",
         }
     }
 }
@@ -597,6 +599,254 @@ pub struct TransitionIntent {
     pub repair: Option<ReplicaRepairIntent>,
     #[serde(default)]
     pub switchover: Option<PlannedSwitchoverIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_scale_down: Option<SecondaryScaleDownIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_removal_evidence: Option<SecondaryRemovalEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// Absence may only be frozen from a successful exact-name lookup.
+pub enum CleanupResourceIdentity {
+    Present {
+        #[schemars(length(min = 1))]
+        name: String,
+        #[schemars(length(min = 1))]
+        uid: String,
+    },
+    Absent {
+        #[schemars(length(min = 1))]
+        name: String,
+    },
+}
+
+impl CleanupResourceIdentity {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Present { name, .. } | Self::Absent { name } => name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaCleanupIdentity {
+    pub pod: CleanupResourceIdentity,
+    pub pvc: CleanupResourceIdentity,
+    pub endpoint: CleanupResourceIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplacementCleanup {
+    pub resource_uid: ResourceUid,
+    pub target: ReplicaIdentity,
+    pub resources: ReplicaCleanupIdentity,
+}
+
+impl ReplacementCleanup {
+    pub fn provisioning_operation_id(&self, pod_uid: &PodUid, pvc_uid: &PvcUid) -> OperationId {
+        OperationId::new(format!(
+            "replacement-provisioning-{}",
+            digest_parts(&[&self.provenance(), pod_uid.as_str(), pvc_uid.as_str()])
+        ))
+    }
+
+    pub fn transition_id(
+        &self,
+        kind: TransitionKind,
+        configuration_id: &ConfigurationId,
+    ) -> TransitionId {
+        TransitionId::new(format!(
+            "transition-{}",
+            digest_parts(&[&self.provenance(), kind.as_tag(), configuration_id.as_str()])
+        ))
+    }
+
+    fn provenance(&self) -> String {
+        let replica_id = self.target.replica_id.to_string();
+        let mut parts = vec![
+            self.resource_uid.as_str(),
+            &replica_id,
+            self.target.instance_id.as_str(),
+            self.target.agent_generation.as_str(),
+        ];
+        for resource in [
+            &self.resources.pod,
+            &self.resources.pvc,
+            &self.resources.endpoint,
+        ] {
+            match resource {
+                CleanupResourceIdentity::Present { name, uid } => {
+                    parts.extend(["present", name, uid])
+                }
+                CleanupResourceIdentity::Absent { name } => parts.extend(["absent", name, ""]),
+            }
+        }
+        digest_parts(&parts)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// Immutable authority for one highest-ID committed secondary removal.
+pub struct SecondaryScaleDownIntent {
+    pub operation_id: OperationId,
+    pub resource_uid: ResourceUid,
+    #[schemars(range(min = 1))]
+    pub spec_generation: u64,
+    #[schemars(range(min = 1))]
+    pub desired_replicas: u32,
+    pub previous_configuration: ConfigurationDescriptor,
+    pub current_configuration: ConfigurationDescriptor,
+    pub previous_policy: EffectivePolicy,
+    pub current_policy: EffectivePolicy,
+    pub primary: ReplicaIdentity,
+    pub target: ReplicaIdentity,
+    pub cleanup: ReplicaCleanupIdentity,
+}
+
+impl SecondaryScaleDownIntent {
+    pub fn expected_operation_id(&self) -> OperationId {
+        OperationId::new(format!(
+            "secondary-scale-down-{}",
+            digest_parts(&[
+                self.resource_uid.as_str(),
+                &self.spec_generation.to_string(),
+                &self.desired_replicas.to_string(),
+                self.previous_configuration.configuration_id.as_str(),
+                self.current_configuration.configuration_id.as_str(),
+                &self.target.replica_id.to_string(),
+                self.target.instance_id.as_str(),
+                self.target.agent_generation.as_str(),
+            ])
+        ))
+    }
+
+    pub fn command_operation_id(
+        &self,
+        stage: SecondaryRemovalStage,
+        target: &ReplicaIdentity,
+    ) -> OperationId {
+        OperationId::new(format!(
+            "secondary-removal-{}",
+            digest_parts(&[
+                self.operation_id.as_str(),
+                stage.as_tag(),
+                &target.replica_id.to_string(),
+                target.instance_id.as_str(),
+                target.agent_generation.as_str(),
+            ])
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryRemovalStage {
+    Prepare,
+    PreviousCurrent,
+    CurrentOnly,
+    AcceptCommit,
+    Retire,
+}
+
+impl SecondaryRemovalStage {
+    const fn as_tag(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::PreviousCurrent => "pc-cc",
+            Self::CurrentOnly => "current-only",
+            Self::AcceptCommit => "accept-commit",
+            Self::Retire => "retire",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// Durable write-closure receipt, not a raw progress sample or RPC acknowledgement.
+pub struct SecondaryRemovalPreparation {
+    pub intent: SecondaryScaleDownIntent,
+    pub operation_id: OperationId,
+    pub process_session_id: ProcessSessionId,
+    #[schemars(range(min = 1))]
+    pub report_sequence: u64,
+    #[schemars(range(min = 0))]
+    pub boundary_lsn: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecondaryRemovalWitness {
+    pub resource_uid: ResourceUid,
+    pub identity: ReplicaIdentity,
+    pub role: ReplicaRole,
+    pub process_session_id: ProcessSessionId,
+    #[schemars(range(min = 1))]
+    pub report_sequence: u64,
+    pub epoch: Epoch,
+    pub previous_configuration_id: Option<ConfigurationId>,
+    pub current_configuration_id: ConfigurationId,
+    #[schemars(range(min = 0))]
+    pub verified_replication_lsn: i64,
+    pub write_status: AccessStatus,
+    pub pending_operation_id: Option<OperationId>,
+    pub retained_operation_id: Option<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SecondaryRemovalEvidence {
+    pub preparation: SecondaryRemovalPreparation,
+    pub previous_read_quorum: Vec<SecondaryRemovalWitness>,
+    #[serde(default)]
+    pub reduced_write_quorum: Vec<SecondaryRemovalWitness>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaRetirementReport {
+    pub intent: SecondaryScaleDownIntent,
+    pub operation_id: OperationId,
+    pub process_session_id: ProcessSessionId,
+    #[schemars(range(min = 1))]
+    pub report_sequence: u64,
+    pub epoch: Epoch,
+    pub role: ReplicaRole,
+    pub read_status: AccessStatus,
+    pub write_status: AccessStatus,
+    pub application_closed: bool,
+    pub peers_fenced: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// Published atomically with reduced topology/policy; retained until exact cleanup completes.
+pub struct SecondaryScaleDownCleanup {
+    pub evidence: SecondaryRemovalEvidence,
+    pub current_only_write_quorum: Vec<SecondaryRemovalWitness>,
+    #[serde(default)]
+    pub retirement: Option<ReplicaRetirementReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+/// Last completed removal's immutable convergence proof, never deletion authority.
+/// One receipt is retained; a later removal supersedes it only after lagging members settle.
+pub struct SecondaryRemovalReceipt {
+    pub evidence: SecondaryRemovalEvidence,
+    pub current_only_write_quorum: Vec<SecondaryRemovalWitness>,
+}
+
+impl SecondaryRemovalReceipt {
+    pub fn committed(&self) -> SecondaryScaleDownCleanup {
+        SecondaryScaleDownCleanup {
+            evidence: self.evidence.clone(),
+            current_only_write_quorum: self.current_only_write_quorum.clone(),
+            retirement: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -653,6 +903,15 @@ pub struct AcceptedStatus {
     pub quorum_loss: Option<QuorumLossObservation>,
     #[serde(default)]
     pub last_switchover: Option<PlannedSwitchoverReceipt>,
+    /// One admitted replacement's immutable cleanup identity, moved to lastReplacement on acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_replacement_cleanup: Option<ReplacementCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replacement: Option<ReplacementCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_scale_down_cleanup: Option<SecondaryScaleDownCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_secondary_removal: Option<SecondaryRemovalReceipt>,
     pub conditions: Vec<StatusCondition>,
 }
 

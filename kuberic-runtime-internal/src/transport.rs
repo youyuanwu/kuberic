@@ -74,4 +74,5 @@ pub enum OutboundOperation {
     Copy(CopyItem),
     Build(ReplicaEndpoint),
     Remove(ReplicaId),
+    Evict(ReplicaIdentity),
 }

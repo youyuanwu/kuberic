@@ -15,3 +15,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+async-trait.workspace = true
+kube.workspace = true
+kuberic-controller = { path = "../kuberic-controller" }
+kuberic-protocol = { path = "../kuberic-protocol" }
+kuberic-wire = { path = "../kuberic-wire" }
+tonic.workspace = true

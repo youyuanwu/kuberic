@@ -434,4 +434,66 @@ impl ReplicationLog {
     pub(crate) fn fence_client_writes(&mut self) {
         self.fence_client_writes_inner();
     }
+
+    pub(crate) fn register_peer_session(
+        &mut self,
+        identity: ReplicaIdentity,
+        session: kuberic_protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        self.quorum.register_peer_session(identity, session)
+    }
+
+    pub(crate) fn record_verified_local_progress(&mut self, lsn: Lsn) {
+        self.quorum.record_verified_local_progress(lsn);
+    }
+
+    pub(crate) fn observe_secondary_removal(
+        &mut self,
+        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.quorum.observe_secondary_removal(witness)
+    }
+
+    pub(crate) fn observe_committed_secondary_removal(
+        &mut self,
+        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.quorum.observe_committed_secondary_removal(witness)
+    }
+
+    pub(crate) fn observe_secondary_removal_progress(
+        &mut self,
+        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.quorum
+            .observe_secondary_removal_progress(witness, committed)
+    }
+
+    pub(crate) fn validate_secondary_removal_commit(
+        &self,
+        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.quorum.validate_secondary_removal_commit(committed)
+    }
+
+    pub(crate) fn restore_committed_secondary_removal(
+        &mut self,
+        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.quorum.restore_committed_secondary_removal(witness)
+    }
+
+    pub(crate) fn acknowledge_in_session(
+        &mut self,
+        ack: &ReplicationAck,
+        session: &kuberic_protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        if ack.epoch != self.epoch {
+            return Err(RuntimeError::AuthorityMismatch(
+                "acknowledgement predates replicator epoch".into(),
+            ));
+        }
+        self.quorum.acknowledge_in_session(ack, session)
+    }
 }

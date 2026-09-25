@@ -80,6 +80,19 @@ fn build_report(
                 .map(|effect| effect.effect.operation_id.to_string())
         })
         .unwrap_or_default();
+    let retained_removal = state
+        .retired_authority
+        .as_ref()
+        .map(|r| &r.report.operation_id)
+        .or_else(|| {
+            state
+                .prepared_secondary_removal
+                .as_ref()
+                .filter(|p| {
+                    state.current_configuration.as_ref() == Some(&p.intent.previous_configuration)
+                })
+                .map(|p| &p.operation_id)
+        });
     proto::AgentStatusReport {
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid: state.identity.resource_uid.to_string(),
@@ -123,15 +136,19 @@ fn build_report(
             .collect(),
         reported_fault: fault_to_proto(state.reported_fault) as i32,
         pending_operation_id,
-        retained_operation_id: state.retained_command.as_ref().map_or_else(
-            || {
-                state
-                    .retained_result
-                    .as_ref()
-                    .map_or_else(String::new, |result| result.operation_id.to_string())
-            },
-            |result| result.command.operation_id.to_string(),
-        ),
+        retained_operation_id: retained_removal
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| {
+                state.retained_command.as_ref().map_or_else(
+                    || {
+                        state
+                            .retained_result
+                            .as_ref()
+                            .map_or_else(String::new, |result| result.operation_id.to_string())
+                    },
+                    |result| result.command.operation_id.to_string(),
+                )
+            }),
         builds: snapshot
             .builds
             .into_iter()
@@ -144,6 +161,10 @@ fn build_report(
             })
             .collect(),
         prepared_switchover: state.prepared_switchover.map(Into::into),
+        prepared_secondary_removal: state.prepared_secondary_removal.map(Into::into),
+        secondary_removal_evidence: state.secondary_removal_evidence.map(Into::into),
+        retired_replica: state.retired_authority.map(|r| r.report.into()),
+        accepted_secondary_removal: state.accepted_secondary_removal.map(Into::into),
     }
 }
 
@@ -162,6 +183,7 @@ fn snapshot_matches_state(
         && snapshot.read_status == state.read_status
         && snapshot.write_status == state.write_status
         && authority_matches
+        && snapshot.retired_authority == state.retired_authority
 }
 
 fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {

@@ -65,6 +65,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scale_down_status_schema_and_legacy_defaults_are_explicit() {
+        let schema = serde_json::to_value(KubericSet::crd()).unwrap();
+        let root = &schema["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"];
+        let spec = &root["spec"]["properties"];
+        assert_eq!(spec["replicas"]["minimum"], 1.0);
+        assert!(spec.get("removalTarget").is_none());
+        assert!(spec.get("minimumReplicas").is_none());
+        let status = &root["status"]["properties"];
+        let transition = &status["transition"]["properties"];
+        assert!(
+            transition["kind"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("secondaryScaleDown"))
+        );
+        let intent = &transition["secondaryScaleDown"]["properties"];
+        for field in [
+            "operationId",
+            "resourceUid",
+            "specGeneration",
+            "desiredReplicas",
+            "previousConfiguration",
+            "currentConfiguration",
+            "previousPolicy",
+            "currentPolicy",
+            "primary",
+            "target",
+            "cleanup",
+        ] {
+            assert!(intent.get(field).is_some(), "{field}");
+        }
+        assert_eq!(intent["desiredReplicas"]["minimum"], 1.0);
+        for resource in ["pod", "pvc", "endpoint"] {
+            let identity = &intent["cleanup"]["properties"][resource];
+            assert!(
+                identity["properties"]["present"]["properties"]
+                    .get("name")
+                    .is_some()
+            );
+            assert!(
+                identity["properties"]["present"]["properties"]
+                    .get("uid")
+                    .is_some()
+            );
+            assert!(
+                identity["properties"]["absent"]["properties"]
+                    .get("name")
+                    .is_some()
+            );
+            assert!(identity["oneOf"].as_array().unwrap().len() >= 2);
+        }
+        let cleanup = &status["secondaryScaleDownCleanup"]["properties"];
+        assert!(cleanup.get("evidence").is_some());
+        assert!(cleanup.get("currentOnlyWriteQuorum").is_some());
+        assert!(cleanup.get("retirement").is_some());
+        let old: KubericSetStatus = serde_json::from_value(json!({
+            "initialized": false, "observedGeneration": 0, "conditions": []
+        }))
+        .unwrap();
+        assert!(old.authority.secondary_scale_down_cleanup.is_none());
+        assert!(
+            serde_json::from_value::<KubericSetSpec>(json!({"replicas": -1, "image": "db"}))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn crd_uses_only_the_level_triggered_api_group() {
         let crd = KubericSet::crd();
         assert_eq!(crd.spec.group, API_GROUP);
@@ -117,6 +184,15 @@ mod tests {
         assert!(status["properties"].get("primaryFailure").is_some());
         assert!(status["properties"].get("quorumLoss").is_some());
         assert!(status["properties"].get("lastSwitchover").is_some());
+        assert!(
+            !required
+                .iter()
+                .any(|value| value == "pendingReplacementCleanup")
+        );
+        assert_eq!(
+            status["properties"]["pendingReplacementCleanup"]["properties"],
+            status["properties"]["lastReplacement"]["properties"]
+        );
         assert!(
             status["properties"]["quorumLoss"]["properties"]
                 .get("startedAtUnixSeconds")

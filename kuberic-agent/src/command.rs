@@ -37,6 +37,11 @@ pub fn admit_persisted_configuration(
 }
 
 pub fn admit_switchover_preparation(command: &PrepareSwitchover, state: &AgentState) -> Result<()> {
+    if state.retired_authority.is_some() || state.removal_pending() {
+        return Err(AgentError::CommandRejected(
+            "secondary removal fences switchover preparation".into(),
+        ));
+    }
     let identity = &state.identity.local_identity;
     if command.preparation_generation == 0
         || command.operation_id.is_empty()
@@ -154,6 +159,29 @@ fn admit_configuration_with_replay(
     state: &AgentState,
     persisted_exact_replay: bool,
 ) -> Result<AdmittedAuthority> {
+    if state.retired_authority.is_some() {
+        return Err(AgentError::CommandRejected(
+            "retired incarnation cannot admit authority".into(),
+        ));
+    }
+    if command.transition_kind == TransitionKind::SecondaryScaleDown {
+        return crate::removal::admit_configuration(command, state, persisted_exact_replay);
+    }
+    if state.removal_pending() {
+        return Err(AgentError::CommandRejected(
+            "prepared removal may only roll forward".into(),
+        ));
+    }
+    if command.secondary_removal_evidence.is_some()
+        || command
+            .previous_policy
+            .as_ref()
+            .is_some_and(|policy| policy != &command.effective_policy)
+    {
+        return Err(AgentError::CommandRejected(
+            "secondary scale-down execution is not enabled".into(),
+        ));
+    }
     if command.operation_id.is_empty() {
         return Err(AgentError::CommandRejected(
             "operation ID must not be empty".into(),
@@ -219,9 +247,14 @@ fn admit_configuration_with_replay(
             "same-epoch command conflicts with durable Previous Configuration".into(),
         ));
     }
-    if command.effective_policy != state.identity.effective_policy {
+    if &command.effective_policy
+        != state
+            .admitted_policy
+            .as_ref()
+            .unwrap_or(&state.identity.effective_policy)
+    {
         return Err(AgentError::CommandRejected(
-            "command policy differs from initialized policy".into(),
+            "command policy differs from admitted policy".into(),
         ));
     }
     if command.is_switchover_restoration() {
@@ -256,6 +289,7 @@ fn admit_configuration_with_replay(
             ));
         }
         return Ok(AdmittedAuthority {
+            secondary_removal: None,
             local_identity: identity.clone(),
             transition_kind: None,
             previous_configuration: None,
@@ -449,6 +483,9 @@ fn admit_configuration_with_replay(
         ));
     }
     let admitted = AdmittedAuthority {
+        secondary_removal: is_access_only_configuration(command, state)
+            .then(|| state.secondary_removal_evidence.clone())
+            .flatten(),
         local_identity: identity.clone(),
         transition_kind: (!command.current_only && !is_access_only_configuration(command, state))
             .then_some(command.transition_kind),
@@ -470,6 +507,11 @@ fn admit_configuration_with_replay(
 }
 
 pub fn admit_build(command: &EnsureReplicaBuild, state: &AgentState) -> Result<()> {
+    if state.retired_authority.is_some() || state.removal_pending() {
+        return Err(AgentError::CommandRejected(
+            "secondary removal fences replica builds".into(),
+        ));
+    }
     let identity = &state.identity.local_identity;
     if command.operation_id.is_empty()
         || command.local_replica_id != identity.replica_id

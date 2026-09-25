@@ -31,8 +31,12 @@ const UID: &str = "set-uid";
 const POD_UID: &str = "pod-uid-1";
 const PVC_UID: &str = "pvc-uid-1";
 
+#[path = "support/secondary_scale_down.rs"]
+mod secondary_scale_down;
+
 fn config() -> EvaluationConfig {
     EvaluationConfig {
+        enable_secondary_scale_down: false,
         supported_protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         stable_resync_seconds: 11,
         wait_requeue_seconds: 3,
@@ -55,6 +59,7 @@ fn raw(replicas: u32) -> RawObservation {
     set.metadata.resource_version = Some("1".to_string());
     set.metadata.generation = Some(1);
     RawObservation {
+        exact_resources: Vec::new(),
         set,
         pods: Vec::new(),
         pvcs: Vec::new(),
@@ -422,6 +427,8 @@ fn switchover_observation() -> RawObservation {
             .unwrap()
             .clone();
         endpoint.metadata.name = Some(derive_replica_endpoint_name(&ResourceUid::new(UID), &local));
+        endpoint.metadata.uid = Some(format!("endpoint-uid-{id}"));
+        endpoint.metadata.resource_version = Some("4".into());
         endpoint.spec.as_mut().unwrap().selector =
             Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)]));
         observation.services.push(endpoint);

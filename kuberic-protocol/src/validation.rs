@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use crate::scale_down::*;
 use thiserror::Error;
 
 use crate::observation::{AgentObservation, ObservationSnapshot, ReplicaObservationKey};
@@ -12,6 +13,8 @@ use crate::types::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
+    #[error("invalid secondary scale-down authority: {0}")]
+    InvalidSecondaryScaleDown(&'static str),
     #[error("desired replica count must be greater than zero")]
     DesiredReplicasZero,
     #[error("initialized status has no accepted topology")]
@@ -75,6 +78,8 @@ pub enum ValidationError {
     InvalidFailoverElectionLsn,
     #[error("replacement must change exactly one non-primary incarnation")]
     InvalidReplacementMembership,
+    #[error("replacement cleanup must identify an exact excluded incarnation")]
+    InvalidReplacementCleanup,
     #[error("replacement must preserve the accepted primary")]
     ReplacementPrimaryChanged,
     #[error("build source is not the exact Current Configuration primary")]
@@ -168,10 +173,88 @@ pub enum ValidationError {
 
 /// Validates accepted status and every observed exact replica incarnation.
 pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), ValidationError> {
-    if snapshot.desired.replicas == 0 {
+    if snapshot.desired.replicas == 0
+        && snapshot.status.secondary_scale_down_cleanup.is_none()
+        && !snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.kind == TransitionKind::SecondaryScaleDown)
+    {
         return Err(ValidationError::DesiredReplicasZero);
     }
     validate_status(&snapshot.status)?;
+    if snapshot
+        .status
+        .last_replacement
+        .iter()
+        .chain(snapshot.status.pending_replacement_cleanup.iter())
+        .any(|cleanup| cleanup.resource_uid != snapshot.resource_uid)
+    {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    }
+    for cleanup in snapshot
+        .status
+        .last_replacement
+        .iter()
+        .chain(snapshot.status.pending_replacement_cleanup.iter())
+    {
+        if snapshot
+            .status
+            .topology
+            .iter()
+            .flat_map(|t| &t.configuration.members)
+            .chain(
+                snapshot
+                    .status
+                    .transition
+                    .iter()
+                    .flat_map(|t| &t.current_configuration.members),
+            )
+            .filter(|m| m.identity != cleanup.target)
+            .any(|m| {
+                snapshot
+                    .observation_for_identity(&m.identity)
+                    .and_then(|o| o.kubernetes.as_ref())
+                    .is_some_and(|k| {
+                        matches!(&cleanup.resources.pvc,
+                    crate::types::CleanupResourceIdentity::Present { uid, .. }
+                        if k.pvc_uid.as_ref().is_some_and(|pvc| pvc.as_str() == uid))
+                    })
+            })
+        {
+            return Err(ValidationError::InvalidReplacementCleanup);
+        }
+    }
+    let removal = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.secondary_scale_down.as_ref())
+        .or_else(|| {
+            snapshot
+                .status
+                .secondary_scale_down_cleanup
+                .as_ref()
+                .map(|cleanup| &cleanup.evidence.preparation.intent)
+        });
+    if removal.is_some_and(|intent| intent.resource_uid != snapshot.resource_uid) {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "resource UID mismatch",
+        ));
+    }
+    if snapshot
+        .status
+        .last_secondary_removal
+        .as_ref()
+        .is_some_and(|receipt| {
+            receipt.evidence.preparation.intent.resource_uid != snapshot.resource_uid
+        })
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "completed removal resource UID mismatch",
+        ));
+    }
 
     if let Some(provisioning) = &snapshot.status.provisioning {
         let target = provisioning.target_identity(&snapshot.resource_uid);
@@ -340,6 +423,7 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
 pub(crate) fn validate_report_internal(
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
+    validate_secondary_removal_report(report)?;
     if report.previous_configuration.is_some() && report.current_configuration.is_none() {
         return Err(ValidationError::InvalidReplicaReportAuthority(
             report.identity.replica_id.value(),
@@ -391,7 +475,7 @@ pub(crate) fn validate_report_internal(
             .collect::<BTreeSet<_>>();
         if previous.epoch.data_loss_number != current.epoch.data_loss_number
             || previous.epoch.configuration_number >= current.epoch.configuration_number
-            || previous_ids != current_ids
+            || (previous_ids != current_ids && report.secondary_removal_evidence.is_none())
         {
             return Err(ValidationError::InvalidReplicaReportAuthority(
                 report.identity.replica_id.value(),
@@ -424,6 +508,176 @@ fn validate_report_authority(
     snapshot: &ObservationSnapshot,
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
+    let historical_receipt = snapshot.status.last_secondary_removal.as_ref();
+    // A completed certificate remains evidence of local history after accepted
+    // authority advances, but never authorizes work or access at that authority.
+    let stale_completed = historical_receipt.is_some_and(|receipt| {
+        let intent = &receipt.evidence.preparation.intent;
+        snapshot.status.topology.as_ref().is_some_and(|topology| {
+            report.epoch < topology.configuration.epoch
+                && topology
+                    .configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == report.identity)
+        }) && report.write_status != AccessStatus::Granted
+            && report.previous_configuration.is_none()
+            && report.prepared_secondary_removal.is_none()
+            && report.current_configuration.as_ref() == Some(&intent.current_configuration)
+            && report.secondary_removal_evidence.as_ref() == Some(&receipt.evidence)
+            && report
+                .accepted_secondary_removal
+                .as_ref()
+                .is_none_or(|accepted| {
+                    accepted.evidence == receipt.evidence
+                        && accepted.current_only_write_quorum == receipt.current_only_write_quorum
+                })
+    });
+    let completed = snapshot
+        .status
+        .last_secondary_removal
+        .as_ref()
+        .filter(|receipt| {
+            snapshot.status.topology.as_ref().is_some_and(|topology| {
+                topology.configuration == receipt.evidence.preparation.intent.current_configuration
+            })
+        })
+        .map(|receipt| receipt.committed());
+    let committed = snapshot
+        .status
+        .secondary_scale_down_cleanup
+        .as_ref()
+        .or(completed.as_ref());
+    let removal = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.secondary_scale_down.as_ref())
+        .or_else(|| committed.map(|cleanup| &cleanup.evidence.preparation.intent));
+    for intent in [
+        report
+            .prepared_secondary_removal
+            .as_ref()
+            .map(|prepared| &prepared.intent),
+        report
+            .secondary_removal_evidence
+            .as_ref()
+            .map(|evidence| &evidence.preparation.intent),
+        report
+            .retired_replica
+            .as_ref()
+            .map(|retirement| &retirement.intent),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let historical = report
+            .secondary_removal_evidence
+            .as_ref()
+            .is_some_and(|evidence| {
+                &evidence.preparation.intent == intent
+                    && report.previous_configuration.is_none()
+                    && report
+                        .prepared_secondary_removal
+                        .as_ref()
+                        .is_none_or(|p| removal == Some(&p.intent))
+                    && report.current_configuration.as_ref() == Some(&intent.current_configuration)
+                    && snapshot.status.topology.as_ref().is_some_and(|topology| {
+                        topology.configuration == intent.current_configuration
+                            || removal.is_some_and(|active| {
+                                active.previous_configuration == intent.current_configuration
+                            })
+                    })
+            });
+        let known_history = stale_completed
+            && historical_receipt
+                .is_some_and(|receipt| &receipt.evidence.preparation.intent == intent);
+        if removal != Some(intent) && !historical && !known_history {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "report is not authorized by the frozen removal",
+            ));
+        }
+    }
+    if let Some(intent) = removal
+        && report
+            .accepted_secondary_removal
+            .as_ref()
+            .is_some_and(|c| c.evidence.preparation.intent == *intent)
+        && committed.is_none_or(|c| c.evidence.preparation.intent != *intent)
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "local acceptance cannot precede committed cluster topology",
+        ));
+    }
+    if let (Some(committed), Some(reported)) =
+        (committed, report.accepted_secondary_removal.as_ref())
+        && reported.evidence.preparation.intent == committed.evidence.preparation.intent
+        && (reported.evidence != committed.evidence
+            || reported.current_only_write_quorum != committed.current_only_write_quorum)
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "local acceptance must retain the exact committed quorum evidence",
+        ));
+    }
+    if let Some(intent) = removal
+        && report.current_configuration.as_ref() == Some(&intent.current_configuration)
+        && (report.secondary_removal_evidence.is_none()
+            || (snapshot
+                .status
+                .transition
+                .as_ref()
+                .is_some_and(|transition| {
+                    transition.secondary_scale_down.as_ref() == Some(intent)
+                })
+                && report.write_status == AccessStatus::Granted))
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "reduced authority requires evidence and pre-commit write closure",
+        ));
+    }
+    let frozen_removal_evidence = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.secondary_removal_evidence.as_ref())
+        .or_else(|| {
+            committed
+                .filter(|cleanup| removal == Some(&cleanup.evidence.preparation.intent))
+                .map(|cleanup| &cleanup.evidence)
+        });
+    if let Some(evidence) = &report.secondary_removal_evidence
+        && removal == Some(&evidence.preparation.intent)
+    {
+        let Some(frozen) = frozen_removal_evidence else {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "report does not retain the frozen admission evidence",
+            ));
+        };
+        let reduced_evidence_matches = if report.previous_configuration.is_some() {
+            evidence.reduced_write_quorum.is_empty()
+                || evidence.reduced_write_quorum == frozen.reduced_write_quorum
+        } else {
+            evidence.reduced_write_quorum == frozen.reduced_write_quorum
+        };
+        if evidence.preparation != frozen.preparation
+            || evidence.previous_read_quorum != frozen.previous_read_quorum
+            || !reduced_evidence_matches
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "report does not retain the frozen admission evidence",
+            ));
+        }
+    }
+    if let Some(frozen) = frozen_removal_evidence
+        && report
+            .prepared_secondary_removal
+            .as_ref()
+            .is_some_and(|prepared| prepared != &frozen.preparation)
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "preparation differs from frozen admission boundary",
+        ));
+    }
     let provisioning =
         snapshot.status.provisioning.as_ref().is_some_and(|intent| {
             intent.target_identity(&snapshot.resource_uid) == report.identity
@@ -666,8 +920,151 @@ fn observation_key_string(key: &ReplicaObservationKey) -> String {
     format!("{}@{}", key.replica_id, key.instance_id)
 }
 
+pub(crate) fn validate_replacement_cleanup(
+    cleanup: &crate::types::ReplacementCleanup,
+) -> Result<(), ValidationError> {
+    use crate::types::{
+        CleanupResourceIdentity, PodUid, PvcUid, derive_agent_generation, derive_initialization_id,
+        derive_replica_endpoint_name,
+    };
+    let CleanupResourceIdentity::Present { uid: pod, .. } = &cleanup.resources.pod else {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    };
+    let CleanupResourceIdentity::Present { uid: pvc, .. } = &cleanup.resources.pvc else {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    };
+    if cleanup.target.replica_id.value() <= 0
+        || cleanup.resource_uid.is_empty()
+        || pod.is_empty()
+        || pvc.is_empty()
+        || pod != cleanup.target.instance_id.as_str()
+        || derive_agent_generation(&derive_initialization_id(
+            &cleanup.resource_uid,
+            cleanup.target.replica_id,
+            &PodUid::new(pod),
+            &PvcUid::new(pvc),
+        )) != cleanup.target.agent_generation
+        || [
+            &cleanup.resources.pod,
+            &cleanup.resources.pvc,
+            &cleanup.resources.endpoint,
+        ]
+        .iter()
+        .any(|r| {
+            r.name().is_empty()
+                || matches!(r, CleanupResourceIdentity::Present { uid, .. } if uid.is_empty())
+        })
+        || cleanup.resources.endpoint.name()
+            != derive_replica_endpoint_name(&cleanup.resource_uid, &cleanup.target)
+    {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    }
+    Ok(())
+}
+
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
+    if let Some(cleanup) = &status.pending_replacement_cleanup {
+        validate_replacement_cleanup(cleanup)?;
+        let topology = status
+            .topology
+            .as_ref()
+            .ok_or(ValidationError::InvalidReplacementCleanup)?;
+        let configuration = &topology.configuration;
+        if status.last_replacement.is_some()
+            || status.secondary_scale_down_cleanup.is_some()
+            || !configuration.members.iter().any(|m| m.identity == cleanup.target)
+            || status.provisioning.as_ref().is_some_and(|p| {
+                p.replaces != cleanup.target
+                    || p.pod_uid.as_str() == cleanup.target.instance_id.as_str()
+                    || matches!(&cleanup.resources.pvc, crate::types::CleanupResourceIdentity::Present { uid, .. } if uid == p.pvc_uid.as_str())
+                    || p.operation_id != cleanup.provisioning_operation_id(&p.pod_uid, &p.pvc_uid)
+            })
+            || status.transition.as_ref().is_some_and(|t| {
+                !matches!(t.kind, TransitionKind::Replacement | TransitionKind::Failover)
+                    || configuration.members.iter()
+                        .filter(|old| !t.current_configuration.members.iter().any(|new| new.identity == old.identity))
+                        .any(|old| old.identity != cleanup.target)
+                    || (!t.current_configuration.members.iter().any(|m| m.identity == cleanup.target)
+                        && t.transition_id != cleanup.transition_id(t.kind, &t.current_configuration.configuration_id))
+            })
+        {
+            return Err(ValidationError::InvalidReplacementCleanup);
+        }
+    }
+    if let Some(cleanup) = &status.last_replacement
+        && (validate_replacement_cleanup(cleanup).is_err()
+            || status.provisioning.is_some()
+            || status.transition.is_some()
+            || status.secondary_scale_down_cleanup.is_some()
+            || status.topology.as_ref().is_none_or(|topology| {
+                !topology.configuration.members.iter().any(|member| {
+                    member.identity.replica_id == cleanup.target.replica_id
+                        && member.identity.instance_id != cleanup.target.instance_id
+                })
+            }))
+    {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    }
+    if let Some(cleanup) = status
+        .pending_replacement_cleanup
+        .as_ref()
+        .or(status.last_replacement.as_ref())
+        && status
+            .last_secondary_removal
+            .as_ref()
+            .is_some_and(|receipt| {
+                let protected = &receipt.evidence.preparation.intent.cleanup;
+                [
+                    (&cleanup.resources.pod, &protected.pod),
+                    (&cleanup.resources.pvc, &protected.pvc),
+                    (&cleanup.resources.endpoint, &protected.endpoint),
+                ]
+                .iter()
+                .any(|(a, b)| {
+                    a.name() == b.name()
+                        || matches!((a, b),
+                        (crate::types::CleanupResourceIdentity::Present { uid: a, .. },
+                         crate::types::CleanupResourceIdentity::Present { uid: b, .. }) if a == b)
+                })
+            })
+    {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    }
+    if let Some(receipt) = &status.last_secondary_removal {
+        validate_secondary_scale_down_cleanup(&receipt.committed())?;
+        let intent = &receipt.evidence.preparation.intent;
+        if status.secondary_scale_down_cleanup.is_some()
+            || status.topology.as_ref().is_none_or(|topology| {
+                topology.configuration.epoch < intent.current_configuration.epoch
+                    || (topology.configuration.epoch == intent.current_configuration.epoch
+                        && (topology.configuration != intent.current_configuration
+                            || status.effective_policy.as_ref() != Some(&intent.current_policy)))
+            })
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "completed removal must bind accepted or superseded authority without cleanup",
+            ));
+        }
+    }
+    if let Some(cleanup) = &status.secondary_scale_down_cleanup {
+        validate_secondary_scale_down_cleanup(cleanup)?;
+        let intent = &cleanup.evidence.preparation.intent;
+        if status.transition.is_some()
+            || status.provisioning.is_some()
+            || status.primary_failure.is_some()
+            || status
+                .topology
+                .as_ref()
+                .map(|topology| &topology.configuration)
+                != Some(&intent.current_configuration)
+            || status.effective_policy.as_ref() != Some(&intent.current_policy)
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "cleanup must exclusively bind accepted reduced authority",
+            ));
+        }
+    }
     if let Some(receipt) = &status.last_switchover {
         validate_switchover_receipt(receipt)?;
     }
@@ -718,6 +1115,55 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         return Err(ValidationError::QuorumLossMismatch);
     }
     if let Some(transition) = &status.transition {
+        if transition.kind == TransitionKind::SecondaryScaleDown {
+            let intent = transition.secondary_scale_down.as_ref().ok_or(
+                ValidationError::InvalidSecondaryScaleDown("missing frozen intent"),
+            )?;
+            validate_secondary_scale_down(intent)?;
+            if status
+                .topology
+                .as_ref()
+                .map(|topology| &topology.configuration)
+                != Some(&intent.previous_configuration)
+                || status.effective_policy.as_ref() != Some(&intent.previous_policy)
+                || transition.effective_policy != intent.current_policy
+                || transition.current_configuration != intent.current_configuration
+                || transition.previous_configuration_id.as_ref()
+                    != Some(&intent.previous_configuration.configuration_id)
+                || transition.spec_generation != intent.spec_generation
+                || transition.transition_id
+                    != crate::types::derive_transition_id(
+                        &intent.resource_uid,
+                        transition.kind,
+                        &intent.current_configuration.configuration_id,
+                    )
+                || transition.switchover.is_some()
+                || transition.build_id.is_some()
+                || transition.repair.is_some()
+                || transition.election_lsn.is_some()
+                || status.primary_failure.is_some()
+            {
+                return Err(ValidationError::InvalidSecondaryScaleDown(
+                    "transition differs from immutable intent",
+                ));
+            }
+            if let Some(evidence) = &transition.secondary_removal_evidence {
+                validate_secondary_removal_evidence(evidence, false)?;
+                if evidence.preparation.intent != *intent {
+                    return Err(ValidationError::InvalidSecondaryScaleDown(
+                        "evidence differs from immutable intent",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if transition.secondary_scale_down.is_some()
+            || transition.secondary_removal_evidence.is_some()
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "unexpected removal authority",
+            ));
+        }
         if status
             .effective_policy
             .as_ref()
@@ -732,6 +1178,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
             Some(&transition.effective_policy),
         )?;
         match transition.kind {
+            TransitionKind::SecondaryScaleDown => unreachable!("validated independently above"),
             TransitionKind::Bootstrap => {
                 if transition.switchover.is_some() {
                     return Err(ValidationError::UnexpectedSwitchoverIntent);
@@ -947,6 +1394,11 @@ pub fn validate_transition_relationship(
     current: &ConfigurationDescriptor,
     policy: &EffectivePolicy,
 ) -> Result<(), ValidationError> {
+    if kind == TransitionKind::SecondaryScaleDown {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "requires explicit dual-policy removal intent",
+        ));
+    }
     validate_policy(policy)?;
     validate_configuration(current, Some(policy))?;
     if kind == TransitionKind::Bootstrap {
@@ -980,6 +1432,7 @@ pub fn validate_transition_relationship(
     }
 
     match kind {
+        TransitionKind::SecondaryScaleDown => unreachable!("requires typed authority above"),
         TransitionKind::Bootstrap => unreachable!("bootstrap returned above"),
         TransitionKind::Failover => {
             let previous_identities = previous
@@ -1209,7 +1662,7 @@ pub fn validate_configuration(
     Ok(())
 }
 
-fn validate_policy(policy: &EffectivePolicy) -> Result<(), ValidationError> {
+pub(crate) fn validate_policy(policy: &EffectivePolicy) -> Result<(), ValidationError> {
     let expected = EffectivePolicy::fixed(policy.replica_set_size, policy.failover_delay_seconds)
         .ok_or(ValidationError::InvalidEffectivePolicy(
         policy.replica_set_size,

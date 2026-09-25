@@ -4,6 +4,7 @@
 //! establish canonical `kuberic-protocol` authority before callers use them.
 
 pub mod convert;
+mod scale_down;
 
 pub mod proto {
     tonic::include_proto!("kuberic.level.v1");

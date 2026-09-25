@@ -1504,9 +1504,15 @@ name = "kuberic-level-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "kube",
+ "kuberic-controller",
+ "kuberic-protocol",
+ "kuberic-wire",
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

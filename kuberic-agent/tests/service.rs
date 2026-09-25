@@ -30,6 +30,459 @@ use tempfile::tempdir;
 use tokio::sync::watch;
 use tonic::{Code, Request};
 
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod scale_down_fixture;
+
+#[test]
+fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(secondary_removal_rpc_replay());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn secondary_removal_rpc_replay() {
+    use kuberic_protocol::types::{AccessStatus, ReplicaRole};
+    use kuberic_runtime_internal::authority::{AdmittedAuthority, ReplicaAuthorityStore};
+    let intent = scale_down_fixture::intent(&[1, 2], 1);
+    for retiring in [false, true] {
+        let local = if retiring {
+            intent.target.clone()
+        } else {
+            intent.primary.clone()
+        };
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let provenance = StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: intent.resource_uid.clone(),
+            local_identity: local.clone(),
+            pod_uid: PodUid::new(local.instance_id.as_str()),
+            pvc_uid: PvcUid::new(format!("pvc-{}", local.replica_id)),
+            initialization_id: kuberic_protocol::types::InitializationId::new(
+                "original-initialization",
+            ),
+            effective_policy: intent.previous_policy.clone(),
+        };
+        let mut state = AgentState::new(provenance.clone());
+        state.current_configuration = Some(intent.previous_configuration.clone());
+        state.highest_epoch = intent.previous_configuration.epoch;
+        state.role = if retiring {
+            ReplicaRole::ActiveSecondary
+        } else {
+            ReplicaRole::Primary
+        };
+        state.read_status = AccessStatus::Granted;
+        state.write_status = if retiring {
+            AccessStatus::NotPrimary
+        } else {
+            AccessStatus::Granted
+        };
+        let store = SqliteStore::create_authorized(&path, state).unwrap();
+        store
+            .admit(&AdmittedAuthority {
+                local_identity: local.clone(),
+                transition_kind: None,
+                previous_configuration: None,
+                current_configuration: intent.previous_configuration.clone(),
+                switchover_handoff: None,
+                secondary_removal: None,
+            })
+            .await
+            .unwrap();
+        drop(store);
+        let mut old_session = String::new();
+        let mut terminal_preparation = None;
+        let mut terminal_retirement = None;
+        let mut terminal_commit: Option<kuberic_protocol::types::SecondaryScaleDownCleanup> = None;
+        for restart in 0..3 {
+            let store = Arc::new(SqliteStore::open_existing(&path, Some(&provenance)).unwrap());
+            let runtime = Arc::new(PodRuntime::new(
+                local.clone(),
+                Arc::new(ReplayApplication),
+                store.clone(),
+            ));
+            let service =
+                AgentService::new(store.clone(), runtime.clone(), runtime.clone(), "token")
+                    .unwrap();
+            let session = service.sessions().local_session().to_string();
+            assert_ne!(session, old_session);
+            let control = free_address();
+            let replication = free_address();
+            let (ready, mut ready_rx) = watch::channel(false);
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let server = tokio::spawn(service.serve(control, replication, ready, shutdown_rx));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                ready_rx.wait_for(|ready| *ready),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
+                "http://{control}"
+            ))
+            .await
+            .unwrap();
+            let command = if let Some(committed) = &terminal_commit {
+                proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(Box::new(
+                    kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+                        operation_id: intent.command_operation_id(
+                            kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                            &local,
+                        ),
+                        target: local.clone(),
+                        committed: committed.clone(),
+                        local_recovery: false,
+                    }
+                    .into(),
+                ))
+            } else if retiring {
+                proto::execute_command_request::Command::RetireReplica(Box::new(
+                    scale_down_fixture::retire_command(&intent).into(),
+                ))
+            } else {
+                proto::execute_command_request::Command::PrepareSecondaryRemoval(Box::new(
+                    scale_down_fixture::prepare_command(&intent).into(),
+                ))
+            };
+            let request = |session: &str, command| {
+                let mut request = Request::new(proto::ExecuteCommandRequest {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    resource_uid: intent.resource_uid.to_string(),
+                    target: Some(local.clone().into()),
+                    expected_process_session_id: session.into(),
+                    command: Some(command),
+                });
+                request.metadata_mut().insert(
+                    "authorization",
+                    format!("{} {}", "Bearer", "token").parse().unwrap(),
+                );
+                request
+            };
+            let before = store.load_state().await.unwrap();
+            assert_eq!(
+                client
+                    .execute(request(&old_session, command.clone()))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                if old_session.is_empty() {
+                    Code::InvalidArgument
+                } else {
+                    Code::FailedPrecondition
+                }
+            );
+            assert_eq!(store.load_state().await.unwrap(), before);
+            let report = client
+                .execute(request(&session, command.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .observation
+                .unwrap();
+            kuberic_wire::normalize_agent_status_report(report.clone()).unwrap();
+            assert_eq!(report.process_session_id, session);
+            if restart == 0 {
+                terminal_preparation = report.prepared_secondary_removal.clone();
+                terminal_retirement = report.retired_replica.clone();
+            } else if terminal_commit.is_none() {
+                assert_eq!(report.prepared_secondary_removal, terminal_preparation);
+                assert_eq!(report.retired_replica, terminal_retirement);
+            } else {
+                assert_eq!(
+                    report.accepted_secondary_removal,
+                    terminal_commit.clone().map(Into::into)
+                );
+                assert!(report.prepared_secondary_removal.is_none());
+            }
+            let duplicate = client
+                .execute(request(&session, command.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .observation
+                .unwrap();
+            assert!(duplicate.report_sequence > report.report_sequence);
+            if retiring {
+                assert_eq!(report.role, proto::ReplicaRole::None as i32);
+                assert!(!runtime.snapshot().await.open);
+                assert!(report.retired_replica.as_ref().unwrap().application_closed);
+            } else if restart == 1 {
+                let preparation: kuberic_protocol::types::SecondaryRemovalPreparation = report
+                    .prepared_secondary_removal
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let mut joint = scale_down_fixture::configuration_command(&intent, false);
+                let evidence = joint.secondary_removal_evidence.as_mut().unwrap();
+                evidence.preparation = preparation;
+                evidence.reduced_write_quorum.clear();
+                for witness in &mut evidence.previous_read_quorum {
+                    witness.process_session_id = evidence.preparation.process_session_id.clone();
+                    witness.report_sequence = evidence.preparation.report_sequence + 1;
+                    witness.verified_replication_lsn = 0;
+                }
+                let mut reduced = joint.clone();
+                reduced.current_only = true;
+                reduced.operation_id = intent.command_operation_id(
+                    kuberic_protocol::types::SecondaryRemovalStage::CurrentOnly,
+                    &local,
+                );
+                reduced.previous_configuration = None;
+                reduced.previous_epoch = None;
+                reduced
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .reduced_write_quorum = scale_down_fixture::witnesses(
+                    &intent,
+                    kuberic_protocol::types::SecondaryRemovalStage::PreviousCurrent,
+                );
+                for cmd in [joint, reduced] {
+                    let command = proto::EnsureConfigurationCommand {
+                        operation_id: cmd.operation_id.to_string(),
+                        previous_configuration: cmd.previous_configuration.map(Into::into),
+                        current_configuration: Some(cmd.current_configuration.into()),
+                        previous_epoch: cmd.previous_epoch.map(Into::into),
+                        current_epoch: Some(cmd.current_epoch.into()),
+                        effective_policy: Some(cmd.effective_policy.into()),
+                        previous_policy: cmd.previous_policy.map(Into::into),
+                        secondary_removal_evidence: cmd.secondary_removal_evidence.map(Into::into),
+                        local_replica_id: cmd.local_replica_id.value(),
+                        expected_instance_id: cmd.expected_instance_id.to_string(),
+                        expected_agent_generation: cmd.expected_agent_generation.to_string(),
+                        transition_kind: proto::TransitionKind::SecondaryScaleDown as i32,
+                        primary_write_status: proto::AccessStatus::ReconfigurationPending as i32,
+                        current_only: cmd.current_only,
+                        ..Default::default()
+                    };
+                    let envelope = proto::execute_command_request::Command::EnsureConfiguration(
+                        Box::new(command),
+                    );
+                    let before = store.load_state().await.unwrap();
+                    assert_eq!(
+                        client
+                            .execute(request(&old_session, envelope.clone()))
+                            .await
+                            .unwrap_err()
+                            .code(),
+                        Code::FailedPrecondition,
+                    );
+                    assert_eq!(store.load_state().await.unwrap(), before);
+                    let report = client
+                        .execute(request(&session, envelope.clone()))
+                        .await
+                        .unwrap()
+                        .into_inner()
+                        .observation
+                        .unwrap();
+                    kuberic_wire::normalize_agent_status_report(report.clone()).unwrap();
+                    assert_ne!(report.write_status, proto::AccessStatus::Granted as i32);
+                    let completed = store.load_state().await.unwrap();
+                    client
+                        .execute(request(&session, envelope.clone()))
+                        .await
+                        .unwrap();
+                    assert_eq!(store.load_state().await.unwrap(), completed);
+                    let mut conflict = envelope;
+                    let proto::execute_command_request::Command::EnsureConfiguration(c) =
+                        &mut conflict
+                    else {
+                        unreachable!()
+                    };
+                    c.primary_write_status = proto::AccessStatus::Granted as i32;
+                    assert!(client.execute(request(&session, conflict)).await.is_err());
+                    assert_eq!(store.load_state().await.unwrap(), completed);
+                }
+                assert_eq!(store.identity().await.unwrap(), provenance);
+                assert_eq!(
+                    store.load_state().await.unwrap().admitted_policy,
+                    Some(intent.current_policy.clone())
+                );
+                let state = store.load_state().await.unwrap();
+                let mut committed = scale_down_fixture::cleanup(&intent);
+                committed.evidence = state.secondary_removal_evidence.clone().unwrap();
+                let accept = kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+                    operation_id: intent.command_operation_id(
+                        kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                        &local,
+                    ),
+                    target: local.clone(),
+                    committed: committed.clone(),
+                    local_recovery: false,
+                };
+                let command = proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(
+                    Box::new(accept.into()),
+                );
+                let before = store.load_state().await.unwrap();
+                assert_eq!(
+                    client
+                        .execute(request(&old_session, command.clone()))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::FailedPrecondition
+                );
+                assert_eq!(store.load_state().await.unwrap(), before);
+                for _ in 0..2 {
+                    let report = client
+                        .execute(request(&session, command.clone()))
+                        .await
+                        .unwrap()
+                        .into_inner()
+                        .observation
+                        .unwrap();
+                    kuberic_wire::normalize_agent_status_report(report.clone()).unwrap();
+                    assert_eq!(
+                        report.accepted_secondary_removal,
+                        Some(committed.clone().into())
+                    );
+                    assert!(report.prepared_secondary_removal.is_none());
+                }
+                assert_eq!(
+                    store.load_state().await.unwrap().accepted_secondary_removal,
+                    Some(committed.clone())
+                );
+                terminal_commit = Some(committed);
+            }
+            old_session = session;
+            shutdown.send_replace(true);
+            server.await.unwrap().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_contracts_are_rejected_without_durable_mutation() {
+    use kuberic_runtime_internal::authority::AdmittedAuthority;
+    let intent = scale_down_fixture::intent(&[1, 2], 1);
+    for retiring in [false, true] {
+        let local = if retiring {
+            intent.target.clone()
+        } else {
+            intent.primary.clone()
+        };
+        let state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: intent.resource_uid.clone(),
+            pod_uid: PodUid::new(local.instance_id.as_str()),
+            pvc_uid: PvcUid::new("exact-pvc"),
+            initialization_id: derive_initialization_id(
+                &intent.resource_uid,
+                local.replica_id,
+                &PodUid::new(local.instance_id.as_str()),
+                &PvcUid::new("exact-pvc"),
+            ),
+            local_identity: local.clone(),
+            effective_policy: intent.previous_policy.clone(),
+        });
+        assert!(
+            kuberic_agent::command::admit_configuration(
+                &scale_down_fixture::configuration_command(&intent, false),
+                &state
+            )
+            .is_err()
+        );
+        assert!(
+            AdmittedAuthority {
+                secondary_removal: None,
+                local_identity: local.clone(),
+                transition_kind: Some(kuberic_protocol::types::TransitionKind::SecondaryScaleDown),
+                previous_configuration: Some(intent.previous_configuration.clone()),
+                current_configuration: intent.current_configuration.clone(),
+                switchover_handoff: None,
+            }
+            .validate()
+            .is_err()
+        );
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+        let runtime = Arc::new(PodRuntime::new(
+            local.clone(),
+            Arc::new(ReplayApplication),
+            store.clone(),
+        ));
+        let service = AgentService::new(
+            store.clone(),
+            runtime.clone(),
+            runtime,
+            Arc::<str>::from("token"),
+        )
+        .unwrap();
+        let control = free_address();
+        let replication = free_address();
+        let (ready_tx, mut ready_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(service.serve(control, replication, ready_tx, shutdown_rx));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ready_rx.wait_for(|ready| *ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut client =
+            proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+                .await
+                .unwrap();
+        let mut status = Request::new(proto::GetAgentStatusRequest {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: intent.resource_uid.to_string(),
+            replica_id: local.replica_id.value(),
+            expected_instance_id: local.instance_id.to_string(),
+        });
+        status
+            .metadata_mut()
+            .insert("authorization", "Bearer token".parse().unwrap());
+        let session = client
+            .get_status(status)
+            .await
+            .unwrap()
+            .into_inner()
+            .process_session_id;
+        let command = if retiring {
+            proto::execute_command_request::Command::RetireReplica(Box::new(
+                scale_down_fixture::retire_command(&intent).into(),
+            ))
+        } else {
+            proto::execute_command_request::Command::PrepareSecondaryRemoval(Box::new(
+                scale_down_fixture::prepare_command(&intent).into(),
+            ))
+        };
+        let before = store.load_state().await.unwrap();
+        for session in [session, "obsolete-session".into()] {
+            let mut request = Request::new(proto::ExecuteCommandRequest {
+                protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                resource_uid: intent.resource_uid.to_string(),
+                target: Some(local.clone().into()),
+                expected_process_session_id: session,
+                command: Some(command.clone()),
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", "Bearer token".parse().unwrap());
+            assert_eq!(
+                client.execute(request).await.unwrap_err().code(),
+                Code::FailedPrecondition
+            );
+            assert_eq!(store.load_state().await.unwrap(), before);
+        }
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+}
+
 struct NoopApplication {
     streams: Mutex<Vec<OperationStream>>,
 }
@@ -954,6 +1407,7 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
         let persisted = store.load_state().await.unwrap();
         store
             .admit(&AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: local.clone(),
                 transition_kind: persisted
                     .previous_configuration

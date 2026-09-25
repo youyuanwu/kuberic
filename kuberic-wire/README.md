@@ -37,6 +37,17 @@ source and target. The agent durably retains an authority-bound retirement
 high-water mark, rejecting every earlier generation across repeated restorations
 and process restarts without an unbounded tombstone history.
 
+Protocol version 6 adds `SecondaryScaleDown`, `PrepareSecondaryRemoval`,
+`AcceptSecondaryRemovalCommit`, and `RetireReplica`, optional previous-policy
+and removal evidence on configuration commands, and preparation, acceptance, and
+retirement report fields. Full immutable intent binds both configurations and
+policies, accepted generation, exact target, and frozen
+Pod/PVC/endpoint cleanup identities. Missing authority, unknown enums, and
+nonpositive generation/count or invalid quorum evidence fail closed. New
+commands retain the existing exact process-session envelope fence. Controller,
+agent, and runtime execution is enabled; current-only admission alone does not
+grant writes without separate accepted-commit evidence.
+
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.
 
@@ -54,10 +65,14 @@ configurations cannot relabel historical evidence.
 
 ## Integration boundary
 
-This crate does not negotiate or downgrade versions. Protocol version 5 is an
+This crate does not negotiate or downgrade versions. Protocol version 6 is an
 exact coordinated-deployment boundary; incompatible controller, agent, or
 replica peers are rejected. Authentication, DNS resolution, retry policy, and
 session registration are agent-owned transport concerns around these schemas.
+Protocol 5 is rejected; the protobuf package remains `kuberic.level.v1` and
+existing field/enum numbers are unchanged. Use a fresh coordinated v2 deployment,
+not mixed-version operation. Agent storage uses schema 2 and rejects schema 1;
+there is no metadata conversion or data migration.
 Version 4 switchover-bearing persistent records lack the generation proof
 (including retired certificates). No in-place migration of those records is
 provided; incompatible persisted authority fails closed rather than inventing

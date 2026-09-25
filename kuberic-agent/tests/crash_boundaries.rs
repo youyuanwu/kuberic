@@ -41,6 +41,9 @@ use kuberic_runtime_internal::effects::{
 use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 
+#[path = "support/removal_crashes.rs"]
+mod removal_crashes;
+
 struct FakeRuntime {
     calls: AtomicUsize,
     result: RuntimeEffectResult,
@@ -140,6 +143,7 @@ impl SwitchoverRecoveryRuntime {
         snapshot.current_configuration_quorum_progress = 7;
         snapshot.catch_up_complete = true;
         snapshot.authority = Some(AdmittedAuthority {
+            secondary_removal: None,
             local_identity: state.identity.local_identity.clone(),
             transition_kind: state
                 .previous_configuration
@@ -285,6 +289,8 @@ fn switchover_recovery_fixture(boundary: &str) -> (AgentState, EnsureConfigurati
     state.prepared_switchover =
         (local == handoff.source && !boundary.contains("unobserved")).then(|| handoff.clone());
     let command = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new(format!("recover-{boundary}")),
         previous_configuration: (!current_only && !restoring).then(|| previous.clone()),
         previous_epoch: (!current_only && !restoring).then_some(previous.epoch),
@@ -321,11 +327,17 @@ struct CrashPersistedState {
     applied_lsn: i64,
     committed_lsn: i64,
     operations: BTreeMap<i64, Vec<u8>>,
+    #[serde(default)]
+    close_completions: u64,
+    #[serde(default)]
+    last_role: Option<ReplicaRole>,
 }
 
 struct CrashState {
     path: PathBuf,
     state: Mutex<CrashPersistedState>,
+    opens: AtomicUsize,
+    consume_replication: bool,
 }
 
 impl CrashState {
@@ -339,6 +351,8 @@ impl CrashState {
         Self {
             path,
             state: Mutex::new(state),
+            opens: AtomicUsize::new(0),
+            consume_replication: false,
         }
     }
 
@@ -369,22 +383,73 @@ impl CrashState {
 #[async_trait]
 impl StatefulServiceReplica for CrashState {
     async fn open(self: Arc<Self>, context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
         let partition = context
             .partition
             .with_factory(Arc::new(DefaultReplicatorFactory::new(self.clone())));
         let interfaces = partition
             .create_replicator(self.clone(), Some(ReplicatorSettings::default()))
             .await?;
+        if self.consume_replication {
+            let mut stream = interfaces
+                .state_replicator()
+                .get_replication_stream()
+                .await?;
+            let application = Arc::downgrade(&self);
+            tokio::spawn(async move {
+                while let Ok(Some(operation)) = stream.get_operation().await {
+                    let Some(application) = application.upgrade() else {
+                        return;
+                    };
+                    let kuberic_runtime::replicator::stream::OperationMetadata::Replication {
+                        lsn,
+                        committed_lsn,
+                    } = operation.metadata
+                    else {
+                        panic!("expected replication")
+                    };
+                    let ack = application
+                        .apply(Operation {
+                            lsn,
+                            committed_lsn,
+                            data: operation.data.clone(),
+                        })
+                        .await
+                        .unwrap();
+                    operation.acknowledge(ack).unwrap();
+                }
+            });
+        }
         Ok(interfaces.replicator())
     }
 
-    async fn change_role(&self, _role: ReplicaRole) -> RuntimeResult<RoleChange> {
+    async fn change_role(&self, role: ReplicaRole) -> RuntimeResult<RoleChange> {
+        let mut state = self.state.lock().unwrap();
+        let mut candidate = state.clone();
+        candidate.last_role = Some(role);
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(RoleChange {
             service_address: None,
         })
     }
 
     async fn close(&self) -> RuntimeResult<()> {
+        if matches!(
+            env::var("KUBERIC_REMOVAL_BOUNDARY").as_deref(),
+            Ok("retire:application-close" | "retire:role-none-before-close")
+        ) {
+            assert_eq!(
+                self.state.lock().unwrap().last_role,
+                Some(ReplicaRole::None)
+            );
+            std::process::exit(73);
+        }
+        let mut state = self.state.lock().unwrap();
+        let mut candidate = state.clone();
+        candidate.close_completions += 1;
+        self.persist(&candidate)?;
+        *state = candidate;
         Ok(())
     }
 
@@ -583,6 +648,8 @@ fn configuration_command() -> EnsureConfiguration {
         effective_policy.write_quorum,
     );
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("configuration-1"),
         previous_configuration: None,
         current_configuration,
@@ -622,6 +689,8 @@ fn real_configuration_command() -> EnsureConfiguration {
         policy.write_quorum,
     );
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("real-runtime-configuration"),
         previous_configuration: None,
         current_configuration,
@@ -768,6 +837,9 @@ fn result() -> RuntimeEffectResult {
         operation_id: OperationId::new("effect-1"),
         sequence: 1,
         postcondition: RuntimePostcondition {
+            prepared_secondary_removal: None,
+            retired_authority: None,
+            accepted_secondary_removal: None,
             open: true,
             role: ReplicaRole::None,
             role_transition: None,
@@ -811,6 +883,9 @@ fn switchover_result() -> RuntimeEffectResult {
         operation_id: OperationId::new("prepare-switchover-1"),
         sequence: 1,
         postcondition: RuntimePostcondition {
+            prepared_secondary_removal: None,
+            retired_authority: None,
+            accepted_secondary_removal: None,
             open: true,
             role: ReplicaRole::Primary,
             role_transition: None,
@@ -836,6 +911,7 @@ fn switchover_authority() -> AdmittedAuthority {
         agent_generation: AgentGeneration::new("generation-2"),
     };
     AdmittedAuthority {
+        secondary_removal: None,
         local_identity: source.clone(),
         transition_kind: None,
         previous_configuration: None,
@@ -860,6 +936,9 @@ fn switchover_authority() -> AdmittedAuthority {
 
 fn snapshot(write_status: AccessStatus) -> RuntimeSnapshot {
     RuntimeSnapshot {
+        prepared_secondary_removal: None,
+        retired_authority: None,
+        accepted_secondary_removal: None,
         identity: storage_identity().local_identity,
         open: false,
         replication_address: None,
@@ -1476,7 +1555,7 @@ fn local_write_recovery_boundaries_commit_fresh_writes_after_process_termination
                         }
                     }
                 }
-            }).await.unwrap();
+            }).await.unwrap_or_else(|_| panic!("local write recovery timed out at {boundary}"));
             let old = store.load_local_write(&OperationId::new("interrupted-before-crash")).await.unwrap().unwrap();
             assert_eq!(old.phase, kuberic_runtime_internal::authority::LocalWritePhase::Committed);
             assert_eq!(old.data, Bytes::from_static(b"original-before-crash"));
@@ -1510,6 +1589,7 @@ fn local_write_recovery_writer_process() {
         let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
         store
             .admit(&AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: switchover_storage_identity().local_identity,
                 transition_kind: None,
                 previous_configuration: None,
@@ -1544,6 +1624,8 @@ fn local_write_recovery_writer_process() {
                     None
                 };
                 let restore = EnsureConfiguration {
+                    previous_policy: None,
+                    secondary_removal_evidence: None,
                     operation_id: OperationId::new("reused-restoration"),
                     previous_configuration: None,
                     previous_epoch: None,
@@ -1599,6 +1681,8 @@ fn local_write_recovery_writer_process() {
             .unwrap();
         assert!(pending.committed().await.is_err());
         let restore = EnsureConfiguration {
+            previous_policy: None,
+            secondary_removal_evidence: None,
             operation_id: OperationId::new("recover-source"),
             previous_configuration: None,
             previous_epoch: None,
@@ -1770,15 +1854,15 @@ fn real_handoff_configuration_boundaries_survive_process_termination() {
                         .await
                         .is_err()
                 );
-                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let resumed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                     while store.load_state().await.unwrap().reconfiguration.is_some() {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 })
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("{scenario}/{boundary}: startup recovery did not complete")
-                });
+                .await;
+                assert!(resumed.is_ok(),
+                    "{scenario}/{boundary}: startup recovery did not complete; durable={:?}; runtime={:?}",
+                    store.load_state().await.unwrap(), pod.snapshot().await);
                 let coordinator = Coordinator::new(store.clone(), executor);
                 let completed = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
@@ -1842,6 +1926,7 @@ fn real_handoff_configuration_writer_process() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (state, command) = real_handoff_fixture(&scenario);
         let authority = AdmittedAuthority {
+            secondary_removal: None,
             local_identity: state.identity.local_identity.clone(),
             transition_kind: state
                 .previous_configuration
@@ -2147,6 +2232,7 @@ fn real_switchover_preparation_writer_process() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let authority = AdmittedAuthority {
+            secondary_removal: None,
             local_identity: switchover_storage_identity().local_identity,
             transition_kind: None,
             previous_configuration: None,

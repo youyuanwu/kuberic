@@ -97,6 +97,14 @@ pub struct AgentReport {
     pub builds: Vec<AgentBuildReport>,
     #[serde(default)]
     pub prepared_switchover: Option<SwitchoverHandoff>,
+    #[serde(default)]
+    pub prepared_secondary_removal: Option<crate::types::SecondaryRemovalPreparation>,
+    #[serde(default)]
+    pub secondary_removal_evidence: Option<crate::types::SecondaryRemovalEvidence>,
+    #[serde(default)]
+    pub retired_replica: Option<crate::types::ReplicaRetirementReport>,
+    #[serde(default)]
+    pub accepted_secondary_removal: Option<crate::types::SecondaryScaleDownCleanup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,8 +155,41 @@ impl Default for AgentReport {
             retained_operation_id: None,
             builds: Vec::new(),
             prepared_switchover: None,
+            prepared_secondary_removal: None,
+            secondary_removal_evidence: None,
+            retired_replica: None,
+            accepted_secondary_removal: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+/// Results of an exact-name lookup, never inferred from a label-selected list.
+pub enum ExactResourceObservation {
+    FrozenUidPresent {
+        resource_version: String,
+    },
+    ReplacementPresent {
+        uid: String,
+        resource_version: String,
+    },
+    NotFound,
+    LookupFailed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Authoritative exact lookups and proven Pod/storage mapping, not label-list results.
+pub struct SecondaryScaleDownResourceObservation {
+    pub resource_uid: ResourceUid,
+    pub target: ReplicaIdentity,
+    pub identity: crate::types::ReplicaCleanupIdentity,
+    pub pod: ExactResourceObservation,
+    pub pvc: ExactResourceObservation,
+    pub endpoint: ExactResourceObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -218,6 +259,8 @@ pub struct ObservationSnapshot {
     pub desired: DesiredState,
     pub status: AcceptedStatus,
     pub replicas: BTreeMap<ReplicaObservationKey, ReplicaObservation>,
+    #[serde(default)]
+    pub secondary_scale_down_resources: Vec<SecondaryScaleDownResourceObservation>,
     pub previous_report_watermarks: BTreeMap<ReplicaObservationKey, ReportWatermark>,
     pub durable_storage_evidence: bool,
     pub supporting_resources_ready: bool,

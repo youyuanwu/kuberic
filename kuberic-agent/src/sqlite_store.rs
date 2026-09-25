@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationId, Epoch, FaultType, LoadMetric, OperationId, ReplicaRole,
-    SwitchoverHandoff,
+    SecondaryRemovalPreparation, SwitchoverHandoff, TransitionKind,
 };
 use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, BuildAuthority, BuildAuthorityStore, BuildProgressStore,
     DurableBuildProgress, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
-    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+    ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore, RetiredAuthority,
 };
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 use kuberic_runtime_internal::{ContractError, Result as ContractResult};
@@ -156,6 +156,31 @@ impl AgentStore for SqliteStore {
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
+            if let RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) =
+                &effect.action
+            {
+                crate::removal::admit_commit(command, &state)?;
+                if !command.local_recovery || effect.operation_id != command.operation_id {
+                    return Err(AgentError::CommandRejected(
+                        "historical acceptance effect identity differs".into(),
+                    ));
+                }
+            }
+            if state.retired_authority.is_some()
+                && !matches!(effect.action, RuntimeEffectAction::RetireReplica(_))
+            {
+                return Err(AgentError::CommandRejected(
+                    "retired incarnation is permanently fenced".into(),
+                ));
+            }
+            if let Some(retained) = state.removal_effects.get(&effect.operation_id) {
+                if retained.effect != *effect {
+                    return Err(AgentError::EffectConflict(
+                        "removal effect operation was mutated".into(),
+                    ));
+                }
+                return Ok(BeginEffect::Completed(Box::new(retained.result.clone())));
+            }
             if let Some(retained) = state.retained_result.as_ref()
                 && retained.operation_id == effect.operation_id
             {
@@ -166,11 +191,29 @@ impl AgentStore for SqliteStore {
                 }
                 return Ok(BeginEffect::Completed(Box::new(retained.result.clone())));
             }
-            if let Some(pending) = state.pending_effect.as_ref() {
+            if let Some(pending) = state.pending_effect.as_mut() {
                 if pending.effect != *effect {
-                    return Err(AgentError::EffectConflict(
-                        "another durable effect is pending".into(),
-                    ));
+                    match (&pending.effect.action, &effect.action) {
+                        (
+                            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed),
+                            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command),
+                        ) if pending.effect.operation_id == effect.operation_id
+                            && pending.effect.sequence == effect.sequence
+                            && committed.as_ref() == &command.committed =>
+                        {
+                            validate_acceptance_conversion(transaction, command)?;
+                            // Admission above binds the local identity and full certificate.
+                            // Change only the execution mode; even EffectApplied is retained.
+                            pending.effect = effect.clone();
+                            write_agent_state(transaction, &state)?;
+                            return Ok(BeginEffect::Pending(effect.clone()));
+                        }
+                        _ => {
+                            return Err(AgentError::EffectConflict(
+                                "another durable effect is pending".into(),
+                            ));
+                        }
+                    }
                 }
                 return Ok(BeginEffect::Pending(pending.effect.clone()));
             }
@@ -212,6 +255,11 @@ impl AgentStore for SqliteStore {
                     "effect completion does not match durable intent".into(),
                 ));
             }
+            if let RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) =
+                &pending.effect.action
+            {
+                crate::removal::admit_commit(command, &state)?;
+            }
             state.role = result.postcondition.role;
             state.read_status = result.postcondition.read_status;
             state.write_status = result.postcondition.write_status;
@@ -227,6 +275,143 @@ impl AgentStore for SqliteStore {
                 .map(|authority| authority.current_configuration.clone());
             if let Some(configuration) = state.current_configuration.as_ref() {
                 state.highest_epoch = state.highest_epoch.max(configuration.epoch);
+            }
+            if let Some(authority) = &result.postcondition.authority {
+                state.secondary_removal_evidence = authority.secondary_removal.clone();
+                if let Some(evidence) = &authority.secondary_removal {
+                    state.admitted_policy =
+                        Some(evidence.preparation.intent.current_policy.clone());
+                    state.previous_policy = authority
+                        .previous_configuration
+                        .as_ref()
+                        .map(|_| evidence.preparation.intent.previous_policy.clone());
+                } else {
+                    let policy = state
+                        .admitted_policy
+                        .clone()
+                        .unwrap_or_else(|| state.identity.effective_policy.clone());
+                    state.previous_policy = authority
+                        .previous_configuration
+                        .as_ref()
+                        .map(|_| policy.clone());
+                    state.admitted_policy = Some(policy);
+                }
+                if state.prepared_secondary_removal.as_ref().is_some_and(|p| {
+                    authority.current_configuration.epoch > p.intent.current_configuration.epoch
+                }) {
+                    state.prepared_secondary_removal = None;
+                }
+            }
+            state.accepted_secondary_removal =
+                result.postcondition.accepted_secondary_removal.clone();
+            if result
+                .postcondition
+                .accepted_secondary_removal
+                .as_ref()
+                .is_some_and(|c| {
+                    state.prepared_secondary_removal.as_ref() == Some(&c.evidence.preparation)
+                })
+            {
+                state.prepared_secondary_removal = None;
+            }
+            match &pending.effect.action {
+                RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
+                    kuberic_protocol::validation::validate_accept_secondary_removal_commit(command)
+                        .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
+                    let intent = &command.committed.evidence.preparation.intent;
+                    if !command.local_recovery
+                        || command.operation_id != pending.effect.operation_id
+                        || command.target != state.identity.local_identity
+                        || intent.resource_uid != state.identity.resource_uid
+                        || result.postcondition.accepted_secondary_removal.as_ref()
+                            != Some(&command.committed)
+                        || result.postcondition.role != ReplicaRole::ActiveSecondary
+                        || result.postcondition.write_status == AccessStatus::Granted
+                        || result.postcondition.role_transition.is_some()
+                        || result.postcondition.authority.as_ref().is_none_or(|a| {
+                            a.local_identity != command.target
+                                || a.previous_configuration.is_some()
+                                || a.current_configuration != intent.current_configuration
+                                || a.secondary_removal.as_ref() != Some(&command.committed.evidence)
+                        })
+                        || result
+                            .postcondition
+                            .verified_replication_lsn
+                            .is_none_or(|lsn| {
+                                lsn < command.committed.evidence.preparation.boundary_lsn
+                            })
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "historical acceptance omitted exact local postcondition".into(),
+                        ));
+                    }
+                }
+                RuntimeEffectAction::PrepareSecondaryRemoval {
+                    intent,
+                    process_session_id,
+                    report_sequence,
+                } => {
+                    let prepared = result
+                        .postcondition
+                        .prepared_secondary_removal
+                        .as_ref()
+                        .ok_or_else(|| {
+                            AgentError::EffectConflict(
+                                "preparation omitted durable boundary".into(),
+                            )
+                        })?;
+                    kuberic_protocol::validation::validate_secondary_removal_preparation(prepared)
+                        .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
+                    if &prepared.intent != intent.as_ref()
+                        || &prepared.process_session_id != process_session_id
+                        || prepared.report_sequence != *report_sequence
+                        || prepared.operation_id != pending.effect.operation_id
+                        || result.postcondition.role != ReplicaRole::Primary
+                        || result.postcondition.read_status == AccessStatus::Granted
+                        || result.postcondition.write_status == AccessStatus::Granted
+                        || result.postcondition.current_progress < prepared.boundary_lsn
+                        || result.postcondition.authority.as_ref().is_none_or(|a| {
+                            a.local_identity != intent.primary
+                                || a.current_configuration != intent.previous_configuration
+                                || a.previous_configuration.is_some()
+                        })
+                        || result
+                            .postcondition
+                            .verified_replication_lsn
+                            .is_none_or(|lsn| lsn < prepared.boundary_lsn)
+                        || result.postcondition.committed_lsn > prepared.boundary_lsn
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "preparation returned conflicting authority or progress".into(),
+                        ));
+                    }
+                    state.prepared_secondary_removal = Some(prepared.clone());
+                }
+                RuntimeEffectAction::RetireReplica(retired) => {
+                    retired
+                        .validate(&state.identity.local_identity)
+                        .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
+                    if result.postcondition.retired_authority.as_ref() != Some(retired)
+                        || result.postcondition.open
+                        || result.postcondition.role != ReplicaRole::None
+                        || result.postcondition.read_status != AccessStatus::NotPrimary
+                        || result.postcondition.write_status != AccessStatus::NotPrimary
+                        || result.postcondition.authority.is_some()
+                        || result.postcondition.role_transition.is_some()
+                        || !result.postcondition.builds.is_empty()
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "retirement omitted terminal closure".into(),
+                        ));
+                    }
+                    state.retired_authority = Some(*retired.clone());
+                    state.highest_epoch = state.highest_epoch.max(retired.report.epoch);
+                    state.previous_policy = None;
+                    state.secondary_removal_evidence = None;
+                    state.accepted_secondary_removal = None;
+                    state.prepared_secondary_removal = None;
+                }
+                _ => {}
             }
             if let RuntimeEffectAction::PrepareSwitchover {
                 preparation_generation,
@@ -285,11 +470,22 @@ impl AgentStore for SqliteStore {
                 }
                 state.prepared_switchover = Some(handoff);
             }
-            state.retained_result = Some(RetainedResult {
+            let retained = RetainedResult {
                 operation_id: result.operation_id.clone(),
                 effect: pending.effect,
                 result: result.clone(),
-            });
+            };
+            if matches!(
+                retained.effect.action,
+                RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                    | RuntimeEffectAction::RetireReplica(_)
+                    | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
+            ) {
+                state
+                    .removal_effects
+                    .insert(retained.operation_id.clone(), retained.clone());
+            }
+            state.retained_result = Some(retained);
             state.next_effect_sequence = state.next_effect_sequence.max(result.sequence + 1);
             write_agent_state(transaction, &state)
         })
@@ -316,6 +512,14 @@ impl AgentStore for SqliteStore {
     ) -> Result<BeginConfiguration> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
+            if let Some(retained) = state.removal_commands.get(&command.operation_id) {
+                if retained.command != *command {
+                    return Err(AgentError::EffectConflict(
+                        "removal command operation was mutated".into(),
+                    ));
+                }
+                return Ok(BeginConfiguration::Completed(retained.clone()));
+            }
             if let Some(retained) = state.retained_command.as_ref()
                 && retained.command.operation_id == command.operation_id
             {
@@ -505,6 +709,11 @@ impl AgentStore for SqliteStore {
                 role: state.role,
                 epoch: state.highest_epoch,
             };
+            if result.command.transition_kind == TransitionKind::SecondaryScaleDown {
+                state
+                    .removal_commands
+                    .insert(result.command.operation_id.clone(), result.clone());
+            }
             state.retained_command = Some(result.clone());
             write_agent_state(transaction, &state)?;
             Ok(result)
@@ -575,6 +784,47 @@ impl AgentStore for SqliteStore {
     }
 }
 
+fn validate_acceptance_conversion(
+    transaction: &Transaction<'_>,
+    command: &kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+) -> Result<()> {
+    let authority: Option<AdmittedAuthority> = load_json_optional(
+        transaction,
+        "SELECT authority_json FROM replica_authority WHERE singleton = 1",
+        [],
+    )?;
+    let expected = AdmittedAuthority {
+        local_identity: command.target.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: command
+            .committed
+            .evidence
+            .preparation
+            .intent
+            .current_configuration
+            .clone(),
+        switchover_handoff: None,
+        secondary_removal: Some(command.committed.evidence.clone()),
+    };
+    let progress: Option<ReplicationProgress> = load_json_optional(
+        transaction,
+        "SELECT progress_json FROM replication_progress WHERE fence_json = ?1",
+        [contract_json(&expected.fence())?],
+    )?;
+    if authority.as_ref() != Some(&expected)
+        || progress.as_ref().is_none_or(|p| {
+            p.fence != expected.fence()
+                || p.verified_lsn < command.committed.evidence.preparation.boundary_lsn
+        })
+    {
+        return Err(AgentError::CommandRejected(
+            "acceptance conversion requires exact durable authority and verified boundary".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl ReplicaAuthorityStore for SqliteStore {
     async fn load(&self) -> ContractResult<Option<AdmittedAuthority>> {
@@ -591,6 +841,27 @@ impl ReplicaAuthorityStore for SqliteStore {
     async fn admit(&self, authority: &AdmittedAuthority) -> ContractResult<()> {
         authority.validate()?;
         self.contract_transaction(|transaction| {
+            let state = load_state_from_connection(transaction)
+                .map_err(|e| ContractError::Persistence(e.to_string()))?;
+            let retired: Option<RetiredAuthority> = load_json_optional(
+                transaction,
+                "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retired'",
+                [],
+            )?;
+            let started: Option<RetiredAuthority> = load_json_optional(
+                transaction,
+                "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+                [],
+            )?;
+            if retired.is_some()
+                || started.is_some()
+                || state.retired_authority.is_some()
+                || authority.local_identity != state.identity.local_identity
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "retired or mismatched local authority".into(),
+                ));
+            }
             let existing: Option<AdmittedAuthority> = load_json_optional(
                 transaction,
                 "SELECT authority_json FROM replica_authority WHERE singleton = 1",
@@ -625,6 +896,222 @@ impl ReplicaAuthorityStore for SqliteStore {
             Ok(())
         })
     }
+
+    async fn load_secondary_removal(&self) -> ContractResult<Option<SecondaryRemovalPreparation>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|e| ContractError::Persistence(e.to_string()))?;
+        load_json_optional(
+            &connection,
+            "SELECT value_json FROM runtime_lifecycle WHERE kind = 'preparation'",
+            [],
+        )
+    }
+
+    async fn record_secondary_removal(
+        &self,
+        preparation: &SecondaryRemovalPreparation,
+    ) -> ContractResult<()> {
+        kuberic_protocol::validation::validate_secondary_removal_preparation(preparation)
+            .map_err(|e| ContractError::AuthorityMismatch(e.to_string()))?;
+        self.contract_transaction(|transaction| {
+            let state = load_state_from_connection(transaction)
+                .map_err(|e| ContractError::Persistence(e.to_string()))?;
+            if preparation.intent.primary != state.identity.local_identity
+                || preparation.intent.resource_uid != state.identity.resource_uid
+                || state.retired_authority.is_some()
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "preparation belongs to another primary".into(),
+                ));
+            }
+            let existing: Option<SecondaryRemovalPreparation> = load_json_optional(
+                transaction,
+                "SELECT value_json FROM runtime_lifecycle WHERE kind = 'preparation'",
+                [],
+            )?;
+            if let Some(existing) = existing {
+                if existing == *preparation {
+                    return Ok(());
+                }
+                if existing.operation_id == preparation.operation_id
+                    || preparation.intent.previous_configuration.epoch
+                        < existing.intent.current_configuration.epoch
+                {
+                    return Err(ContractError::AuthorityMismatch(
+                        "preparation regresses durable high-water authority".into(),
+                    ));
+                }
+            }
+            write_lifecycle(transaction, "preparation", preparation)
+        })
+    }
+
+    async fn load_retired_authority(&self) -> ContractResult<Option<RetiredAuthority>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|e| ContractError::Persistence(e.to_string()))?;
+        load_json_optional(
+            &connection,
+            "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retired'",
+            [],
+        )
+    }
+
+    async fn load_retirement_started(&self) -> ContractResult<Option<RetiredAuthority>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|e| ContractError::Persistence(e.to_string()))?;
+        load_json_optional(
+            &connection,
+            "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+            [],
+        )
+    }
+
+    async fn record_retirement_started(&self, authority: &RetiredAuthority) -> ContractResult<()> {
+        self.contract_transaction(|transaction| {
+            if validate_retirement(transaction, authority)? {
+                return Ok(());
+            }
+            write_lifecycle(transaction, "retirement-started", authority)
+        })
+    }
+
+    async fn load_secondary_removal_commit(
+        &self,
+    ) -> ContractResult<Option<kuberic_protocol::types::SecondaryScaleDownCleanup>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|e| ContractError::Persistence(e.to_string()))?;
+        load_json_optional(
+            &connection,
+            "SELECT value_json FROM runtime_lifecycle WHERE kind = 'commit'",
+            [],
+        )
+    }
+
+    async fn record_secondary_removal_commit(
+        &self,
+        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> ContractResult<()> {
+        kuberic_protocol::validation::validate_secondary_scale_down_cleanup(committed)
+            .map_err(|e| ContractError::AuthorityMismatch(e.to_string()))?;
+        self.contract_transaction(|transaction| {
+            let active: Option<AdmittedAuthority> = load_json_optional(
+                transaction,
+                "SELECT authority_json FROM replica_authority WHERE singleton = 1",
+                [],
+            )?;
+            if active.as_ref().is_none_or(|a| {
+                a.previous_configuration.is_some()
+                    || a.secondary_removal.as_ref() != Some(&committed.evidence)
+            }) {
+                return Err(ContractError::AuthorityMismatch(
+                    "commit differs from admitted reduction".into(),
+                ));
+            }
+            let existing: Option<kuberic_protocol::types::SecondaryScaleDownCleanup> =
+                load_json_optional(
+                    transaction,
+                    "SELECT value_json FROM runtime_lifecycle WHERE kind = 'commit'",
+                    [],
+                )?;
+            if existing.as_ref().is_some_and(|old| {
+                old != committed
+                    && old.evidence.preparation.intent.current_configuration.epoch
+                        >= committed
+                            .evidence
+                            .preparation
+                            .intent
+                            .current_configuration
+                            .epoch
+            }) {
+                return Err(ContractError::AuthorityMismatch(
+                    "commit was mutated or regressed".into(),
+                ));
+            }
+            write_lifecycle(transaction, "commit", committed)
+        })
+    }
+
+    async fn retire(&self, authority: &RetiredAuthority) -> ContractResult<()> {
+        self.contract_transaction(|transaction| {
+            if validate_retirement(transaction, authority)? {
+                return Ok(());
+            }
+            write_lifecycle(transaction, "retired", authority)?;
+            transaction
+                .execute("DELETE FROM replica_authority", [])
+                .map_err(contract_sqlite_error)?;
+            transaction
+                .execute(
+                    "DELETE FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+                    [],
+                )
+                .map_err(contract_sqlite_error)?;
+            Ok(())
+        })
+    }
+}
+
+fn validate_retirement(
+    connection: &Connection,
+    authority: &RetiredAuthority,
+) -> ContractResult<bool> {
+    let state = load_state_from_connection(connection)
+        .map_err(|e| ContractError::Persistence(e.to_string()))?;
+    authority.validate(&state.identity.local_identity)?;
+    if authority.report.intent.resource_uid != state.identity.resource_uid {
+        return Err(ContractError::AuthorityMismatch(
+            "retirement resource differs".into(),
+        ));
+    }
+    let retired: Option<RetiredAuthority> = load_json_optional(
+        connection,
+        "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retired'",
+        [],
+    )?;
+    let started: Option<RetiredAuthority> = load_json_optional(
+        connection,
+        "SELECT value_json FROM runtime_lifecycle WHERE kind = 'retirement-started'",
+        [],
+    )?;
+    if [
+        retired.as_ref(),
+        started.as_ref(),
+        state.retired_authority.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|old| old != authority)
+    {
+        return Err(ContractError::AuthorityMismatch(
+            "conflicting durable retirement".into(),
+        ));
+    }
+    if retired.is_some() {
+        return Ok(true);
+    }
+    let active: Option<AdmittedAuthority> = load_json_optional(
+        connection,
+        "SELECT authority_json FROM replica_authority WHERE singleton = 1",
+        [],
+    )?;
+    if active.as_ref().is_some_and(|a| {
+        a.local_identity != state.identity.local_identity
+            || a.current_configuration != authority.report.intent.previous_configuration
+            || a.previous_configuration.is_some()
+    }) {
+        return Err(ContractError::AuthorityMismatch(
+            "retirement differs from installed authority".into(),
+        ));
+    }
+    Ok(false)
 }
 
 #[async_trait]
@@ -953,6 +1440,10 @@ fn create_schema(connection: &mut Connection, state: &AgentState) -> Result<()> 
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             authority_json TEXT NOT NULL
          );
+         CREATE TABLE runtime_lifecycle (
+            kind TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL
+         );
          CREATE TABLE replication_progress (
             fence_json TEXT PRIMARY KEY,
             data_loss_number INTEGER NOT NULL,
@@ -1035,6 +1526,21 @@ where
 
 fn contract_json<T: serde::Serialize>(value: &T) -> ContractResult<String> {
     serde_json::to_string(value).map_err(|error| ContractError::Persistence(error.to_string()))
+}
+
+fn write_lifecycle<T: serde::Serialize>(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    value: &T,
+) -> ContractResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO runtime_lifecycle(kind, value_json) VALUES(?1, ?2)
+         ON CONFLICT(kind) DO UPDATE SET value_json = excluded.value_json",
+            params![kind, contract_json(value)?],
+        )
+        .map_err(contract_sqlite_error)?;
+    Ok(())
 }
 
 fn contract_from_json<T: serde::de::DeserializeOwned>(value: &str) -> ContractResult<T> {

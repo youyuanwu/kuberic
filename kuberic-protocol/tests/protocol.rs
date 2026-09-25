@@ -1,5 +1,1768 @@
 use std::collections::BTreeMap;
 
+use scale_down_model::fixture as scale_down_fixture;
+
+#[allow(dead_code)]
+#[path = "support/scale_down_model.rs"]
+mod scale_down_model;
+
+#[test]
+fn scale_down_commit_boundary_rejects_generated_primary_evidence_corruption() {
+    use scale_down_model::Model;
+    for size in 2..=5 {
+        let mut baseline = Model::new(&(1..=size).collect::<Vec<_>>(), 1, size as u32 - 1);
+        baseline.until(|m| {
+            matches!(m.plan(), Plan::Apply { ref changes }
+            if matches!(changes.first(), Some(KubernetesChange::PersistStatus { status })
+                if status.secondary_scale_down_cleanup.is_some()))
+        });
+        let authority = baseline.snapshot.status.clone();
+        for mutation in 0..8 {
+            let mut broken = baseline.clone();
+            let primary = broken.report(1);
+            match mutation {
+                0 => primary.verified_replication_lsn = None,
+                1 => primary.verified_replication_lsn = Some(9),
+                2 => primary.pending_operation_id = Some(OperationId::new("unrelated-inflight")),
+                3 => primary.retained_operation_id = Some(OperationId::new("other-completion")),
+                4 => primary.report_sequence = 0,
+                5 => primary.write_status = AccessStatus::Granted,
+                6 => primary.identity.agent_generation = AgentGeneration::new("substitute"),
+                _ => primary.epoch.data_loss_number += 1,
+            }
+            let plan = broken.plan();
+            assert!(
+                matches!(plan, Plan::Wait { .. } | Plan::Unsafe { .. }),
+                "size={size} mutation={mutation}: {plan:?}"
+            );
+            assert_eq!(broken.snapshot.status, authority);
+            assert!(broken.removed.is_empty() && broken.deletes.is_empty());
+        }
+        baseline.finish();
+        assert_eq!(baseline.removed.len(), 1);
+    }
+}
+
+#[test]
+fn scale_down_exact_lookup_failures_after_commit_preserve_cleanup_authority() {
+    use kuberic_protocol::command::ScaleDownResource;
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::Model;
+    for resource in [
+        ScaleDownResource::Endpoint,
+        ScaleDownResource::Pod,
+        ScaleDownResource::Pvc,
+    ] {
+        let mut failed = Model::new(&[1, 2, 3], 1, 2);
+        failed.until(|m| matches!(m.plan(), Plan::Apply { changes }
+            if matches!(changes.first(), Some(KubernetesChange::DeleteScaleDownResource { resource: kind, .. }) if *kind == resource)));
+        let before = failed.snapshot.status.clone();
+        let deletes = failed.deletes.clone();
+        let exact = failed.exact(3);
+        *match resource {
+            ScaleDownResource::Pod => &mut exact.pod,
+            ScaleDownResource::Pvc => &mut exact.pvc,
+            ScaleDownResource::Endpoint => &mut exact.endpoint,
+        } = ExactResourceObservation::LookupFailed {
+            message: "authoritative GET failed".into(),
+        };
+        for _ in 0..3 {
+            failed.controller_restart();
+            let plan = failed.plan();
+            assert!(
+                matches!(plan, Plan::Wait { .. }),
+                "resource={resource:?}: {plan:?}"
+            );
+            failed.apply(plan);
+            assert_eq!(failed.snapshot.status.topology, before.topology);
+            assert_eq!(
+                failed.snapshot.status.secondary_scale_down_cleanup,
+                before.secondary_scale_down_cleanup
+            );
+            assert_eq!(failed.deletes, deletes);
+        }
+    }
+}
+
+#[test]
+fn evaluator_scale_down_replays_installed_pending_configurations_after_restart() {
+    use scale_down_model::{CommandBoundary, Model};
+    for current_only in [false, true] {
+        for id in [1, 2] {
+            let mut model = Model::new(&[1, 2, 3], 1, 2);
+            model.until(|m| {
+                matches!(m.plan(), Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(c)
+            } if c.transition_kind == TransitionKind::SecondaryScaleDown
+                && c.current_only == current_only && c.local_replica_id.value() == id)
+            });
+            let original = model.plan();
+            model.interrupt(original.clone(), CommandBoundary::Effect);
+            model.controller_restart();
+            // Other admissions may precede replay, notably the primary that supplies catch-up.
+            model.until(|m| m.plan() == original);
+            assert!(model.removed.is_empty());
+            model.step();
+            assert!(model.report(id).pending_operation_id.is_none());
+            model.finish();
+            assert_eq!(model.removed.len(), 1);
+            assert_eq!(model.deletes.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn evaluator_scale_down_pending_primary_replay_precedes_secondary_catch_up() {
+    use scale_down_model::{CommandBoundary, Model};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        matches!(m.plan(), Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(c)
+    } if c.transition_kind == TransitionKind::SecondaryScaleDown)
+    });
+    model.interrupt(model.plan(), CommandBoundary::Effect);
+    let primary = model.plan();
+    assert!(matches!(&primary, Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(c)
+    } if c.local_replica_id.value() == 1));
+    model.interrupt(primary.clone(), CommandBoundary::Effect);
+    model.controller_restart();
+    assert_eq!(model.plan(), primary);
+    model.finish();
+    assert!(model.inflight.is_empty());
+    assert!(model.applied_effects.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_replays_pending_commit_acceptance_after_restart() {
+    use scale_down_model::Model;
+    for id in [1, 2] {
+        for applied in [false, true] {
+            let mut model = Model::new(&[1, 2, 3], 1, 2);
+            model.until(|m| {
+                matches!(m.plan(), Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(c)
+            } if c.target.replica_id.value() == id)
+            });
+            let original = model.plan();
+            let Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(command),
+            } = &original
+            else {
+                unreachable!()
+            };
+            model.report(id).pending_operation_id = Some(command.operation_id.clone());
+            if applied {
+                model.report(id).accepted_secondary_removal = Some(command.committed.clone());
+                model.report(id).prepared_secondary_removal = None;
+            }
+            model.controller_restart();
+            assert_eq!(model.plan(), original);
+            let mut conflict = model.clone();
+            conflict.report(id).pending_operation_id = Some(OperationId::new("unrelated-work"));
+            assert_ne!(conflict.plan(), original);
+            model.report(id).pending_operation_id = None;
+            model.finish();
+            assert!(model.inflight.is_empty());
+            assert_eq!(model.deletes.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn evaluator_scale_down_replays_pending_retirement_but_not_conflicting_work() {
+    use scale_down_model::{CommandBoundary, Model, reason};
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|m| {
+        matches!(
+            m.plan(),
+            Plan::Execute {
+                command: ProtocolCommand::RetireReplica(_)
+            }
+        )
+    });
+    let original = model.plan();
+    model.interrupt(original.clone(), CommandBoundary::Effect);
+    model.controller_restart();
+    assert_eq!(model.plan(), original);
+    assert!(
+        model.deletes.iter().all(
+            |(resource, _)| *resource == kuberic_protocol::command::ScaleDownResource::Endpoint
+        )
+    );
+    let mut conflict = model.clone();
+    conflict.report(2).pending_operation_id = Some(OperationId::new("different-retirement"));
+    assert!(matches!(conflict.plan(), Plan::Wait { .. }));
+    assert_eq!(reason(&conflict.plan()), "ScaleDownRetirementPending");
+    model.finish();
+    assert_eq!(model.deletes.len(), 3);
+}
+
+#[test]
+fn evaluator_scale_down_conflicting_pending_configuration_is_not_overwritten_or_credited() {
+    use scale_down_model::{CommandBoundary, Model};
+    for current_only in [false, true] {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        model.until(|m| {
+            matches!(m.plan(), Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(c)
+        } if c.transition_kind == TransitionKind::SecondaryScaleDown
+            && c.current_only == current_only && c.local_replica_id.value() == 2)
+        });
+        model.interrupt(model.plan(), CommandBoundary::Effect);
+        model.report(2).pending_operation_id = Some(OperationId::new("conflicting-work"));
+        model.until(|m| matches!(m.plan(), Plan::Wait { .. }));
+        assert!(model.removed.is_empty());
+        assert!(model.deletes.is_empty());
+        assert_eq!(
+            model
+                .report(2)
+                .pending_operation_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "conflicting-work"
+        );
+    }
+}
+
+#[test]
+fn evaluator_scale_down_completed_receipt_converges_late_members_without_cleanup_authority() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::{CommandBoundary, Model, reason};
+    for late_stage in 0..4 {
+        let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+        if late_stage > 0 {
+            model.until(|m| {
+                matches!(m.plan(), Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(c)
+            } if c.transition_kind == TransitionKind::SecondaryScaleDown
+                && c.current_only == (late_stage == 3) && c.local_replica_id.value() == 3)
+            });
+            if late_stage == 2 {
+                model.step();
+            } else {
+                model.interrupt(model.plan(), CommandBoundary::Effect);
+            }
+        }
+        let late = model.report(3).clone();
+        let key = model.key(3);
+        model.unavailable(3);
+        model.until(|m| m.snapshot.status.last_secondary_removal.is_some());
+        assert!(model.snapshot.status.secondary_scale_down_cleanup.is_none());
+        assert_eq!(model.deletes.len(), 3);
+        let receipt = model
+            .snapshot
+            .status
+            .last_secondary_removal
+            .clone()
+            .unwrap();
+        model.controller_restart();
+
+        let exact = model.exact(4);
+        for resource in [&mut exact.pod, &mut exact.pvc, &mut exact.endpoint] {
+            *resource = ExactResourceObservation::ReplacementPresent {
+                uid: "replacement-must-survive".into(),
+                resource_version: "replacement-rv".into(),
+            };
+        }
+        // A single bounded receipt must not be superseded while a non-witness still needs it.
+        model.snapshot.desired.replicas = 2;
+        assert_eq!(reason(&model.plan()), "ScaleDownRetainedMemberPending");
+        model.snapshot.desired.replicas = 3;
+        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+            AgentObservation::Report(Box::new(late));
+        let mut conflict = model.clone();
+        conflict.report(3).pending_operation_id = Some(OperationId::new("unrelated-local-work"));
+        assert_eq!(reason(&conflict.plan()), "ScaleDownRetainedMemberPending");
+        assert!(matches!(conflict.plan(), Plan::Wait { .. }));
+        let mut unhealthy = model.clone();
+        unhealthy.report(3).healthy = false;
+        assert_eq!(reason(&unhealthy.plan()), "ScaleDownRetainedMemberPending");
+        assert!(matches!(unhealthy.plan(), Plan::Wait { .. }));
+        let mut forged = model.clone();
+        forged
+            .snapshot
+            .status
+            .last_secondary_removal
+            .as_mut()
+            .unwrap()
+            .current_only_write_quorum
+            .clear();
+        assert!(matches!(forged.plan(), Plan::Unsafe { .. }));
+        assert!(matches!(
+            evaluate(&model.snapshot, &EvaluationConfig::default()),
+            Plan::Unsafe { .. }
+        ));
+        model.finish();
+        assert!(model.inflight.is_empty());
+        assert!(model.applied_effects.is_empty());
+        assert!(model.report(3).previous_configuration.is_none());
+        assert!(model.report(3).pending_operation_id.is_none());
+        assert_eq!(model.report(3).write_status, AccessStatus::NotPrimary);
+        assert_eq!(
+            model.report(3).accepted_secondary_removal,
+            Some(receipt.committed())
+        );
+        assert_eq!(
+            model.deletes.len(),
+            3,
+            "completed receipt cannot reissue cleanup"
+        );
+        assert_eq!(
+            model.snapshot.status.last_secondary_removal.as_ref(),
+            Some(&receipt)
+        );
+        model.controller_restart();
+        assert!(matches!(model.plan(), Plan::Stable { .. }));
+
+        model.snapshot.desired.replicas = 2;
+        model.finish();
+        assert_eq!(model.removed.len(), 2);
+        assert_eq!(model.deletes.len(), 6);
+        let next = model
+            .snapshot
+            .status
+            .last_secondary_removal
+            .as_ref()
+            .unwrap();
+        assert_ne!(
+            next.evidence.preparation.intent.operation_id,
+            receipt.evidence.preparation.intent.operation_id
+        );
+        assert_eq!(
+            next.evidence.preparation.intent.target.replica_id.value(),
+            3
+        );
+        let mut mixed = model.clone();
+        mixed
+            .snapshot
+            .status
+            .last_secondary_removal
+            .as_mut()
+            .unwrap()
+            .evidence = receipt.evidence;
+        assert!(
+            matches!(mixed.plan(), Plan::Unsafe { .. }),
+            "one removal cannot supply another's proof"
+        );
+    }
+}
+
+#[test]
+fn evaluator_scale_down_completed_witness_can_be_absent_during_next_removal() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+    model.finish();
+    let previous = model
+        .snapshot
+        .status
+        .last_secondary_removal
+        .clone()
+        .unwrap();
+    assert!(
+        previous
+            .current_only_write_quorum
+            .iter()
+            .any(|w| w.identity.replica_id.value() == 3)
+    );
+    model.unavailable(3);
+    model.snapshot.desired.replicas = 2;
+    model.controller_restart();
+    model.finish();
+    assert_eq!(model.removed.len(), 2);
+    assert_eq!(model.deletes.len(), 6);
+    let current = model
+        .snapshot
+        .status
+        .last_secondary_removal
+        .as_ref()
+        .unwrap();
+    assert_ne!(previous.evidence, current.evidence);
+    assert_eq!(
+        current
+            .evidence
+            .preparation
+            .intent
+            .target
+            .replica_id
+            .value(),
+        3
+    );
+}
+
+#[test]
+fn evaluator_scale_down_healthy_traces_preserve_exact_authority() {
+    use scale_down_model::Model;
+    for (ids, primary, desired, targets) in [
+        (vec![1, 2, 3], 1, 2, vec![3]),
+        (vec![1, 2], 1, 1, vec![2]),
+        (vec![1, 2, 3, 4, 5], 1, 2, vec![5, 4, 3]),
+        (vec![2, 4, 9], 9, 1, vec![4, 2]),
+    ] {
+        let mut model = Model::new(&ids, primary, desired);
+        let starting = model
+            .snapshot
+            .status
+            .topology
+            .clone()
+            .unwrap()
+            .configuration;
+        model.finish();
+        assert_eq!(
+            model
+                .removed
+                .iter()
+                .map(|i| i.replica_id.value())
+                .collect::<Vec<_>>(),
+            targets
+        );
+        let accepted = &model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration;
+        assert_eq!(accepted.primary_id.value(), primary);
+        assert_eq!(accepted.members.len(), desired as usize);
+        assert!(
+            accepted
+                .members
+                .iter()
+                .all(|m| starting.members.contains(m))
+        );
+        assert_eq!(
+            accepted.epoch.data_loss_number,
+            starting.epoch.data_loss_number
+        );
+        assert_eq!(
+            accepted.epoch.configuration_number,
+            starting.epoch.configuration_number + targets.len() as i64
+        );
+        assert_eq!(
+            model.snapshot.status.observed_generation,
+            model.snapshot.desired.generation
+        );
+        assert_eq!(model.deletes.len(), targets.len() * 3);
+        for removed in &model.removed {
+            let commands = model
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    ProtocolCommand::EnsureConfiguration(c)
+                        if c.secondary_removal_evidence
+                            .as_ref()
+                            .is_some_and(|e| e.preparation.intent.target == *removed) =>
+                    {
+                        Some(c.as_ref())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut identities = commands[0]
+                .current_configuration
+                .members
+                .iter()
+                .map(|m| m.identity.replica_id)
+                .collect::<Vec<_>>();
+            identities.sort_by_key(|id| (*id == ReplicaId::new(primary), *id));
+            let expected = [false, true]
+                .into_iter()
+                .flat_map(|current_only| identities.iter().map(move |id| (*id, current_only)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|c| (c.local_replica_id, c.current_only))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let commands = model.commands.len();
+        for _ in 0..3 {
+            assert!(matches!(model.step(), Plan::Stable { .. }));
+        }
+        assert_eq!(model.commands.len(), commands);
+    }
+}
+
+#[test]
+fn evaluator_scale_down_default_gate_increase_floor_and_equality() {
+    use scale_down_model::{Model, config};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    assert!(matches!(
+        evaluate(&model.snapshot, &EvaluationConfig::default()),
+        Plan::Stable { .. }
+    ));
+    model.step();
+    assert!(matches!(
+        evaluate(&model.snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+    let mut equal = Model::new(&[1, 2, 3], 1, 3);
+    assert!(matches!(equal.step(), Plan::Stable { .. }));
+    assert!(equal.commands.is_empty());
+    equal.snapshot.desired.replicas = 4;
+    let Plan::Stable { status, .. } = equal.plan() else {
+        panic!("increase must not provision")
+    };
+    assert!(
+        status
+            .conditions
+            .iter()
+            .any(|c| c.reason == "ScaleUpUnsupported")
+    );
+    equal.snapshot.desired.replicas = 0;
+    assert!(matches!(
+        evaluate(&equal.snapshot, &config()),
+        Plan::Unsafe {
+            reason: UnsafeReason::InvalidDesiredState(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn evaluator_scale_down_unavailable_highest_target_does_not_trigger_replacement() {
+    use scale_down_model::Model;
+    for ids in [vec![1, 2], vec![1, 2, 3], vec![2, 4, 9]] {
+        let primary = *ids.first().unwrap();
+        let target = *ids.last().unwrap();
+        let mut model = Model::new(&ids, primary, ids.len() as u32 - 1);
+        model.unavailable(target);
+        let key = model.key(target);
+        model
+            .snapshot
+            .replicas
+            .get_mut(&key)
+            .unwrap()
+            .kubernetes
+            .as_mut()
+            .unwrap()
+            .peer_endpoint_ready = false;
+        model.finish();
+        assert_eq!(model.removed[0].replica_id.value(), target);
+        assert!(
+            !model
+                .commands
+                .iter()
+                .any(|c| matches!(c, ProtocolCommand::RetireReplica(_)))
+        );
+        assert!(model.deletes.iter().any(|(r, uid)| *r
+            == kuberic_protocol::command::ScaleDownResource::Pod
+            && uid == &format!("pod-{target}")));
+    }
+}
+
+#[test]
+fn evaluator_scale_down_retained_read_quorum_preflight_preserves_writable_service() {
+    use scale_down_model::{Model, config, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    let retained = model.snapshot.replicas[&model.key(2)].clone();
+    let authority = model.snapshot.status.clone();
+    let routing = model.snapshot.routing.clone();
+    model.unavailable(2);
+    for _ in 0..3 {
+        let plan = model.step();
+        assert_eq!(reason(&plan), "ScaleDownRetainedReadQuorumUnavailable");
+        assert!(matches!(plan, Plan::Wait { requeue_after_seconds, .. }
+            if requeue_after_seconds == config().wait_requeue_seconds));
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.status.provisioning.is_none());
+        assert!(model.snapshot.status.pending_replacement_cleanup.is_none());
+        assert_eq!(model.snapshot.status.topology, authority.topology);
+        assert_eq!(
+            model.snapshot.status.effective_policy,
+            authority.effective_policy
+        );
+        assert_eq!(model.snapshot.routing, routing);
+        assert_eq!(model.report(1).write_status, AccessStatus::Granted);
+        assert!(model.report(1).prepared_secondary_removal.is_none());
+        assert!(model.commands.is_empty() && model.deletes.is_empty());
+        assert_eq!(model.plan(), plan, "unchanged wait status must be stable");
+    }
+    model.snapshot.replicas.insert(model.key(2), retained);
+    model.step();
+    let intent = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .secondary_scale_down
+        .as_ref()
+        .unwrap();
+    assert_eq!(intent.target.replica_id, ReplicaId::new(3));
+    assert_eq!(
+        intent.previous_configuration,
+        authority.topology.unwrap().configuration
+    );
+    assert_eq!(
+        model.snapshot.routing, routing,
+        "admission only freezes intent"
+    );
+    assert_eq!(model.report(1).write_status, AccessStatus::Granted);
+    model.finish();
+    assert_eq!(model.removed[0].replica_id, ReplicaId::new(3));
+}
+
+#[test]
+fn evaluator_scale_down_preflight_requires_fresh_exact_stable_retained_reports() {
+    use kuberic_protocol::types::FaultType;
+    use scale_down_model::{Model, reason};
+    for mutation in 0..8 {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        match mutation {
+            0 => model.report(2).healthy = false,
+            1 => model.report(2).reported_fault = Some(FaultType::Permanent),
+            2 => model.report(2).pending_operation_id = Some(OperationId::new("unfinished")),
+            3 => model.report(2).identity.agent_generation = AgentGeneration::new("other"),
+            4 => model.report(2).resource_uid = ResourceUid::new("other"),
+            5 => model.report(2).process_session_id = ProcessSessionId::default(),
+            6 => model.report(2).report_sequence = 0,
+            _ => {
+                let report = model.report(2).clone();
+                model.snapshot.previous_report_watermarks.insert(
+                    model.key(2),
+                    ReportWatermark {
+                        process_session_id: report.process_session_id,
+                        report_sequence: report.report_sequence,
+                    },
+                );
+            }
+        }
+        let plan = model.plan();
+        assert!(
+            matches!(plan, Plan::Wait { .. } | Plan::Unsafe { .. }),
+            "{mutation}: {plan:?}"
+        );
+        if mutation < 3 {
+            assert_eq!(reason(&plan), "ScaleDownRetainedReadQuorumUnavailable");
+        }
+        match plan {
+            Plan::Wait { .. } => model.apply(plan),
+            Plan::Unsafe { status, .. } => assert!(status.transition.is_none()),
+            _ => unreachable!(),
+        }
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.routing.write_target.is_some());
+        assert_eq!(model.report(1).write_status, AccessStatus::Granted);
+        assert!(model.commands.is_empty() && model.deletes.is_empty());
+    }
+}
+
+#[test]
+fn evaluator_scale_down_never_credits_target_for_previous_or_reduced_quorum() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.step();
+    model.unavailable(2);
+    model.until(|m| m.snapshot.replicas.values().any(|o| matches!(&o.agent, AgentObservation::Report(r) if r.prepared_secondary_removal.is_some())));
+    assert_eq!(
+        reason(&model.plan()),
+        "ScaleDownPreviousReadQuorumUnavailable"
+    );
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .secondary_removal_evidence
+            .is_none()
+    );
+    assert!(model.deletes.is_empty());
+
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.secondary_removal_evidence.is_some())
+    });
+    model.unavailable(2);
+    model.until(|m| matches!(m.plan(), Plan::Wait { .. }));
+    assert_eq!(
+        reason(&model.plan()),
+        "ScaleDownReducedWriteQuorumUnavailable"
+    );
+    assert!(model.removed.is_empty());
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_primary_prefix_is_required_even_with_other_read_witnesses() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3, 4, 5], 1, 4);
+    model.until(|m| {
+        m.snapshot.replicas.values().any(|o|
+        matches!(&o.agent, AgentObservation::Report(r) if r.prepared_secondary_removal.is_some()))
+    });
+    model.report(1).verified_replication_lsn = None;
+    assert_eq!(
+        reason(&model.plan()),
+        "ScaleDownPreviousReadQuorumUnavailable"
+    );
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .secondary_removal_evidence
+            .is_none()
+    );
+}
+
+#[test]
+fn evaluator_scale_down_requires_verified_completed_fresh_current_only_quorum() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot.status.transition.as_ref().is_some_and(|t| {
+            t.secondary_removal_evidence
+                .as_ref()
+                .is_some_and(|e| !e.reduced_write_quorum.is_empty())
+        })
+    });
+    model.until(|m| m.snapshot.replicas.values().filter(|o| matches!(&o.agent,
+        AgentObservation::Report(r) if r.secondary_removal_evidence.is_some() && r.previous_configuration.is_none())).count() == 2);
+    for mutation in 0..4 {
+        let mut broken = model.clone();
+        let r = broken.report(2);
+        match mutation {
+            0 => r.verified_replication_lsn = None,
+            1 => r.verified_replication_lsn = Some(9),
+            2 => r.pending_operation_id = Some(OperationId::new("unfinished")),
+            _ => r.report_sequence -= 1,
+        }
+        assert_eq!(
+            reason(&broken.plan()),
+            "ScaleDownCurrentOnlyQuorumUnavailable"
+        );
+        assert!(broken.removed.is_empty());
+    }
+    model.step();
+    assert_eq!(model.removed.len(), 1);
+}
+
+#[test]
+fn evaluator_scale_down_primary_loss_at_each_stage_freezes_target() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.step();
+    for _ in 0..16 {
+        if model.snapshot.status.secondary_scale_down_cleanup.is_some() {
+            break;
+        }
+        let mut lost = model.clone();
+        lost.unavailable(1);
+        lost.snapshot.routing.write_target = None;
+        let intent = lost.snapshot.status.transition.clone();
+        assert_eq!(reason(&lost.plan()), "ScaleDownPrimaryUnavailable");
+        lost.step();
+        assert_eq!(lost.snapshot.status.transition, intent);
+        assert!(
+            lost.commands
+                .iter()
+                .all(|c| !matches!(c, ProtocolCommand::RetireReplica(_)))
+        );
+        model.step();
+    }
+}
+
+#[test]
+fn evaluator_scale_down_exact_resources_cannot_be_inferred_from_lists() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.snapshot.secondary_scale_down_resources.clear();
+    assert_eq!(reason(&model.plan()), "ScaleDownExactIdentityRequired");
+    assert!(model.snapshot.status.transition.is_none());
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.exact(3).pvc = kuberic_protocol::observation::ExactResourceObservation::LookupFailed {
+        message: "forbidden".into(),
+    };
+    assert_eq!(reason(&model.plan()), "ScaleDownExactIdentityRequired");
+}
+
+#[test]
+fn evaluator_scale_down_pod_fence_is_post_commit_and_pvc_requires_exact_absence() {
+    use kuberic_protocol::command::ScaleDownResource;
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.unavailable(3);
+    model.until(|m| matches!(m.plan(), Plan::Apply { changes } if changes.iter().any(|c|
+        matches!(c, KubernetesChange::DeleteScaleDownResource { resource: ScaleDownResource::Pod, .. }))));
+    assert_eq!(model.removed.len(), 1);
+    assert_eq!(model.deletes.len(), 1);
+    assert_eq!(
+        reason(&Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            status: model.snapshot.status.clone(),
+            requeue_after_seconds: 5
+        }),
+        "ScaleDownExactPodFencePending"
+    );
+    let fence = model.plan();
+    assert_eq!(
+        fence,
+        model.plan(),
+        "lost delete reply retries exact UID and RV"
+    );
+    let key = model.key(3);
+    model.snapshot.replicas.remove(&key);
+    model.exact(3).pod = ExactResourceObservation::LookupFailed {
+        message: "list omission".into(),
+    };
+    assert_eq!(reason(&model.plan()), "ScaleDownExactPodAbsenceRequired");
+    assert!(
+        !model
+            .deletes
+            .iter()
+            .any(|(r, _)| *r == ScaleDownResource::Pvc)
+    );
+    model.exact(3).pod = ExactResourceObservation::NotFound;
+    model.finish();
+    assert!(
+        model
+            .deletes
+            .iter()
+            .any(|(r, _)| *r == ScaleDownResource::Pvc)
+    );
+}
+
+#[test]
+fn evaluator_scale_down_same_name_replacements_are_never_deleted_even_after_cleanup() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.unavailable(3);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let key = model.key(3);
+    model.snapshot.replicas.remove(&key);
+    model.exact(3).pod = ExactResourceObservation::ReplacementPresent {
+        uid: "replacement".into(),
+        resource_version: "new-rv".into(),
+    };
+    model.exact(3).pvc = ExactResourceObservation::ReplacementPresent {
+        uid: "replacement-pvc".into(),
+        resource_version: "new-rv".into(),
+    };
+    model.exact(3).endpoint = ExactResourceObservation::ReplacementPresent {
+        uid: "replacement-endpoint".into(),
+        resource_version: "new-rv".into(),
+    };
+    model.finish();
+    assert!(model.deletes.is_empty());
+    model.snapshot.replicas.insert(
+        ReplicaObservationKey::new(ReplicaId::new(3), ReplicaInstanceId::new("replacement")),
+        ReplicaObservation {
+            agent: AgentObservation::Absent,
+            kubernetes: Some(KubernetesReplicaObservation {
+                replica_id: ReplicaId::new(3),
+                pod_name: "db-3".into(),
+                pod_uid: Some(PodUid::new("replacement")),
+                pvc_name: "db-storage-3".into(),
+                pvc_uid: Some(PvcUid::new("replacement-pvc")),
+                image: Some("example:v1".into()),
+                pod_ready: true,
+                peer_endpoint_ready: true,
+            }),
+        },
+    );
+    assert!(matches!(model.plan(), Plan::Stable { status, .. }
+        if status.conditions.iter().any(|c| c.reason == "ExactCleanupAuthorityRequired")));
+}
+
+#[test]
+fn evaluator_scale_down_drift_switchover_and_primary_safety_precede_admission() {
+    use scale_down_model::{Model, reason};
+    for field in 0..2 {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        if field == 0 {
+            model.snapshot.desired.image = "example:v2".into();
+        } else {
+            model.snapshot.desired.failover_delay_seconds += 1;
+        }
+        assert_eq!(reason(&model.plan()), "ScaleDownUnsupportedDrift");
+    }
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+        request_id: SwitchoverRequestId::new("move"),
+        target_replica_id: ReplicaId::new(2),
+    });
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("switchover should win")
+    };
+    assert!(changes.iter().any(|c| matches!(c, KubernetesChange::PersistStatus { status }
+        if status.transition.as_ref().is_some_and(|t| t.kind == TransitionKind::PlannedSwitchover))));
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.unavailable(1);
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("primary safety should win")
+    };
+    assert!(
+        changes
+            .iter()
+            .any(|c| matches!(c, KubernetesChange::PersistStatus { status }
+        if status.primary_failure.is_some() && status.transition.is_none()))
+    );
+}
+
+#[test]
+fn evaluator_scale_down_stale_sessions_and_contradictory_authority_fail_closed() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.step();
+    let key = model.key(1);
+    let r = model.report(1).clone();
+    model.snapshot.previous_report_watermarks.insert(
+        key,
+        ReportWatermark {
+            process_session_id: r.process_session_id,
+            report_sequence: r.report_sequence,
+        },
+    );
+    assert_eq!(reason(&model.plan()), "ScaleDownFreshReportRequired");
+    model.report(1).process_session_id = ProcessSessionId::new("restart");
+    assert!(!matches!(
+        model.plan(),
+        Plan::Unsafe { .. } | Plan::Wait { .. }
+    ));
+    model.snapshot.previous_report_watermarks.clear();
+    model.report(2).identity.agent_generation = AgentGeneration::new("replacement");
+    assert!(matches!(model.plan(), Plan::Unsafe { .. }));
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_late_member_replays_pc_cc_before_current_only() {
+    use kuberic_protocol::types::SecondaryRemovalStage;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+    let mut late = model.report(3).clone();
+    model.unavailable(3);
+    model.until(|m| {
+        m.snapshot.status.transition.as_ref().is_some_and(|t| {
+            t.secondary_removal_evidence
+                .as_ref()
+                .is_some_and(|e| !e.reduced_write_quorum.is_empty())
+        })
+    });
+    let intent = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .secondary_scale_down
+        .clone()
+        .unwrap();
+    late.pending_operation_id =
+        Some(intent.command_operation_id(SecondaryRemovalStage::PreviousCurrent, &late.identity));
+    let key = model.key(3);
+    model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Report(Box::new(late));
+    model.until(|m| matches!(m.plan(), Plan::Execute { command: ProtocolCommand::EnsureConfiguration(c) } if c.local_replica_id == ReplicaId::new(3)));
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = model.plan()
+    else {
+        unreachable!()
+    };
+    assert!(!command.current_only);
+    assert_eq!(
+        command.previous_configuration.as_ref(),
+        Some(&intent.previous_configuration)
+    );
+    assert!(
+        command
+            .secondary_removal_evidence
+            .as_ref()
+            .unwrap()
+            .reduced_write_quorum
+            .is_empty()
+    );
+    model.finish();
+}
+
+#[test]
+fn evaluator_scale_down_freezes_evidence_instead_of_resampling_advanced_reports() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.secondary_removal_evidence.is_some())
+    });
+    let frozen = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .secondary_removal_evidence
+        .clone()
+        .unwrap();
+    model.step();
+    assert!(model.report(2).previous_configuration.is_some());
+    assert_eq!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .secondary_removal_evidence
+            .as_ref()
+            .unwrap()
+            .previous_read_quorum,
+        frozen.previous_read_quorum
+    );
+    model.finish();
+}
+
+#[test]
+fn evaluator_scale_down_target_return_uses_retirement_not_a_new_membership() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    let saved = model.report(3).clone();
+    model.unavailable(3);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let key = model.key(3);
+    model.snapshot.replicas.get_mut(&key).unwrap().agent =
+        AgentObservation::Report(Box::new(saved));
+    model.finish();
+    assert!(model.commands.iter().any(|c| matches!(c, ProtocolCommand::RetireReplica(r) if r.local_replica_id == ReplicaId::new(3))));
+    assert_eq!(model.removed.len(), 1);
+}
+
+#[test]
+fn completed_removal_history_allows_return_after_failover_or_replacement() {
+    use kuberic_protocol::validation::validate_snapshot;
+    use scale_down_model::Model;
+    for replacement in [false, true] {
+        let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+        model.finish();
+        let late_id = if replacement { 3 } else { 1 };
+        let mut late = model.report(late_id).clone();
+        late.write_status = AccessStatus::ReconfigurationPending;
+        model.unavailable(late_id);
+        let previous = model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        let mut members = previous.members.clone();
+        if replacement {
+            members[1].identity.instance_id = ReplicaInstanceId::new("replacement-pod");
+            members[1].identity.agent_generation = AgentGeneration::new("replacement-generation");
+        } else {
+            members[0].role = ReplicaRole::ActiveSecondary;
+            members[1].role = ReplicaRole::Primary;
+        }
+        let accepted = ConfigurationDescriptor::new(
+            Epoch::new(
+                previous.epoch.data_loss_number,
+                previous.epoch.configuration_number + 1,
+            ),
+            ReplicaId::new(if replacement { 1 } else { 2 }),
+            members,
+            previous.write_quorum,
+        );
+        for member in &accepted.members {
+            if member.identity.replica_id.value() == late_id {
+                continue;
+            }
+            let key = model.key(member.identity.replica_id.value());
+            let mut observation = model.snapshot.replicas.remove(&key).unwrap();
+            let AgentObservation::Report(report) = &mut observation.agent else {
+                unreachable!()
+            };
+            report.identity = member.identity.clone();
+            report.epoch = accepted.epoch;
+            report.role = member.role;
+            report.current_configuration = Some(accepted.clone());
+            report.secondary_removal_evidence = None;
+            report.accepted_secondary_removal = None;
+            report.prepared_secondary_removal = None;
+            report.write_status = if member.role == ReplicaRole::Primary {
+                AccessStatus::Granted
+            } else {
+                AccessStatus::NotPrimary
+            };
+            observation.kubernetes.as_mut().unwrap().pod_uid =
+                Some(PodUid::new(member.identity.instance_id.as_str()));
+            model.snapshot.replicas.insert(
+                ReplicaObservationKey::new(
+                    member.identity.replica_id,
+                    member.identity.instance_id.clone(),
+                ),
+                observation,
+            );
+        }
+        model.snapshot.status.topology = Some(AcceptedTopology {
+            configuration: accepted.clone(),
+        });
+        model.snapshot.routing.write_target = Some(
+            accepted
+                .members
+                .iter()
+                .find(|m| m.role == ReplicaRole::Primary)
+                .unwrap()
+                .identity
+                .clone(),
+        );
+        let key = model.key(late_id);
+        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+            AgentObservation::Report(Box::new(late));
+        model.controller_restart();
+        validate_snapshot(&model.snapshot).unwrap();
+        for mutation in 0..7 {
+            let mut broken = model.clone();
+            let report = broken.report(late_id);
+            match mutation {
+                0 => report.write_status = AccessStatus::Granted,
+                1 => {
+                    report
+                        .secondary_removal_evidence
+                        .as_mut()
+                        .unwrap()
+                        .preparation
+                        .boundary_lsn -= 1
+                }
+                2 => {
+                    report
+                        .secondary_removal_evidence
+                        .as_mut()
+                        .unwrap()
+                        .previous_read_quorum[0]
+                        .report_sequence += 1
+                }
+                3 => report.resource_uid = ResourceUid::new("other-resource"),
+                4 => report.identity.agent_generation = AgentGeneration::new("wrong-generation"),
+                5 => report.epoch = accepted.epoch,
+                _ => {
+                    report
+                        .accepted_secondary_removal
+                        .as_mut()
+                        .unwrap()
+                        .current_only_write_quorum[0]
+                        .report_sequence += 1
+                }
+            }
+            assert!(
+                validate_snapshot(&broken.snapshot).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        assert!(
+            matches!(model.plan(), Plan::Execute { command: ProtocolCommand::EnsureConfiguration(ref c) }
+            if c.local_replica_id.value() == late_id && c.current_configuration == accepted && !c.current_only)
+        );
+        model.finish();
+        assert_eq!(
+            model.report(late_id).current_configuration.as_ref(),
+            Some(&accepted)
+        );
+        assert!(model.report(late_id).secondary_removal_evidence.is_none());
+    }
+}
+
+#[test]
+fn completed_removal_local_acceptance_precedes_newer_authority_correction() {
+    use kuberic_protocol::types::SecondaryRemovalStage;
+    use scale_down_model::Model;
+    for (replacement, pending) in [false, true]
+        .into_iter()
+        .flat_map(|replacement| [false, true].map(|pending| (replacement, pending)))
+    {
+        let mut model = Model::new(&[1, 2, 3, 4, 5, 6], 1, 5);
+        model.until(|m| {
+            matches!(m.plan(), Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(c)
+        } if c.local_replica_id == ReplicaId::new(5) && c.current_only)
+        });
+        model.step();
+        let mut late = model.report(5).clone();
+        assert!(late.previous_configuration.is_none());
+        assert!(late.accepted_secondary_removal.is_none());
+        model.unavailable(5);
+        model.until(|m| m.snapshot.status.last_secondary_removal.is_some());
+        assert!(model.snapshot.status.secondary_scale_down_cleanup.is_none());
+        let receipt = model
+            .snapshot
+            .status
+            .last_secondary_removal
+            .clone()
+            .unwrap();
+        if pending {
+            late.pending_operation_id = Some(
+                receipt
+                    .evidence
+                    .preparation
+                    .intent
+                    .command_operation_id(SecondaryRemovalStage::AcceptCommit, &late.identity),
+            );
+            late.process_session_id = ProcessSessionId::new("restarted-pending-acceptance");
+            late.report_sequence = 1;
+        }
+        let previous = receipt
+            .evidence
+            .preparation
+            .intent
+            .current_configuration
+            .clone();
+        let mut members = previous.members.clone();
+        if replacement {
+            members[3].identity.instance_id = ReplicaInstanceId::new("replacement-4");
+            members[3].identity.agent_generation = AgentGeneration::new("replacement-generation");
+        } else {
+            members[0].role = ReplicaRole::ActiveSecondary;
+            members[1].role = ReplicaRole::Primary;
+        }
+        let accepted = ConfigurationDescriptor::new(
+            Epoch::new(
+                previous.epoch.data_loss_number,
+                previous.epoch.configuration_number + 1,
+            ),
+            ReplicaId::new(if replacement { 1 } else { 2 }),
+            members,
+            previous.write_quorum,
+        );
+        for member in &accepted.members {
+            if member.identity == late.identity {
+                continue;
+            }
+            let key = model.key(member.identity.replica_id.value());
+            let mut observation = model.snapshot.replicas.remove(&key).unwrap();
+            let AgentObservation::Report(report) = &mut observation.agent else {
+                unreachable!()
+            };
+            report.identity = member.identity.clone();
+            report.epoch = accepted.epoch;
+            report.role = member.role;
+            report.previous_configuration = None;
+            report.current_configuration = Some(accepted.clone());
+            report.secondary_removal_evidence = None;
+            report.accepted_secondary_removal = None;
+            report.prepared_secondary_removal = None;
+            report.write_status = if member.role == ReplicaRole::Primary {
+                AccessStatus::Granted
+            } else {
+                AccessStatus::NotPrimary
+            };
+            observation.kubernetes.as_mut().unwrap().pod_uid =
+                Some(PodUid::new(member.identity.instance_id.as_str()));
+            model.snapshot.replicas.insert(
+                ReplicaObservationKey::new(
+                    member.identity.replica_id,
+                    member.identity.instance_id.clone(),
+                ),
+                observation,
+            );
+        }
+        model.snapshot.status.topology = Some(AcceptedTopology {
+            configuration: accepted.clone(),
+        });
+        model.snapshot.routing.write_target = Some(
+            accepted
+                .members
+                .iter()
+                .find(|m| m.role == ReplicaRole::Primary)
+                .unwrap()
+                .identity
+                .clone(),
+        );
+        let key = model.key(5);
+        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+            AgentObservation::Report(Box::new(late));
+        model.controller_restart();
+        let status = model.snapshot.status.clone();
+        let deletes = model.deletes.clone();
+        for mutation in 0..8 {
+            let mut broken = model.clone();
+            match mutation {
+                0 => broken.snapshot.status.last_secondary_removal = None,
+                1 => broken
+                    .snapshot
+                    .status
+                    .last_secondary_removal
+                    .as_mut()
+                    .unwrap()
+                    .current_only_write_quorum
+                    .clear(),
+                2 => {
+                    broken
+                        .report(5)
+                        .secondary_removal_evidence
+                        .as_mut()
+                        .unwrap()
+                        .preparation
+                        .boundary_lsn -= 1
+                }
+                3 => {
+                    broken.report(5).identity.agent_generation =
+                        AgentGeneration::new("wrong-generation")
+                }
+                4 => broken.report(5).resource_uid = ResourceUid::new("wrong-resource"),
+                5 => broken.report(5).epoch.configuration_number += 2,
+                6 => {
+                    broken.report(5).pending_operation_id = Some(OperationId::new("unrelated-work"))
+                }
+                _ => broken.report(5).verified_replication_lsn = Some(0),
+            }
+            assert!(
+                matches!(broken.plan(), Plan::Unsafe { .. } | Plan::Wait { .. }),
+                "mutation {mutation}: {:?}",
+                broken.plan()
+            );
+        }
+        let Plan::Execute {
+            command: ProtocolCommand::AcceptSecondaryRemovalCommit(command),
+        } = model.plan()
+        else {
+            panic!(
+                "missing exact historical local acceptance: {:?}",
+                model.plan()
+            );
+        };
+        assert_eq!(command.target.replica_id, ReplicaId::new(5));
+        assert!(command.local_recovery);
+        assert_eq!(command.committed, receipt.committed());
+        model.step();
+        assert_eq!(model.snapshot.status, status);
+        assert_eq!(model.deletes, deletes);
+        assert_ne!(model.report(5).write_status, AccessStatus::Granted);
+        assert_eq!(model.report(5).current_configuration, Some(previous));
+        assert_eq!(
+            model.report(5).accepted_secondary_removal,
+            Some(receipt.committed())
+        );
+        for current_only in [false, true] {
+            assert!(matches!(model.plan(), Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(c)
+            } if c.local_replica_id == ReplicaId::new(5) && c.current_configuration == accepted
+                && c.current_only == current_only));
+            model.step();
+        }
+        model.finish();
+        assert_eq!(model.report(5).current_configuration, Some(accepted));
+        assert_eq!(model.snapshot.status.last_secondary_removal, Some(receipt));
+    }
+}
+
+#[test]
+fn scale_down_and_switchover_converge_endpoints_and_lagging_authority_before_admission() {
+    use scale_down_model::Model;
+    for switchover in [false, true] {
+        let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+        if switchover {
+            model.snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+                request_id: SwitchoverRequestId::new("after-catchup"),
+                target_replica_id: ReplicaId::new(3),
+            });
+        } else {
+            model.unavailable(4);
+        }
+        let accepted = model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        let old = ConfigurationDescriptor::new(
+            Epoch::new(
+                accepted.epoch.data_loss_number,
+                accepted.epoch.configuration_number - 1,
+            ),
+            accepted.primary_id,
+            accepted.members.clone(),
+            accepted.write_quorum,
+        );
+        model.report(2).epoch = old.epoch;
+        model.report(2).current_configuration = Some(old);
+        let key = model.key(3);
+        model
+            .snapshot
+            .replicas
+            .get_mut(&key)
+            .unwrap()
+            .kubernetes
+            .as_mut()
+            .unwrap()
+            .peer_endpoint_ready = false;
+        assert!(
+            matches!(model.step(), Plan::Apply { changes } if matches!(changes[0], KubernetesChange::EnsureReplicaScaffolding { .. }))
+        );
+        for current_only in [false, true] {
+            assert!(
+                matches!(model.plan(), Plan::Execute { command: ProtocolCommand::EnsureConfiguration(ref c) }
+                if c.local_replica_id == ReplicaId::new(2) && c.current_only == current_only)
+            );
+            model.step();
+            assert!(model.snapshot.status.transition.is_none());
+        }
+        model.step();
+        let frozen = model
+            .snapshot
+            .status
+            .transition
+            .clone()
+            .expect("admitted after convergence");
+        assert_eq!(
+            frozen.kind,
+            if switchover {
+                TransitionKind::PlannedSwitchover
+            } else {
+                TransitionKind::SecondaryScaleDown
+            }
+        );
+        model.snapshot.desired.replicas = 1;
+        model.controller_restart();
+        assert_eq!(model.snapshot.status.transition.as_ref(), Some(&frozen));
+    }
+}
+
+#[test]
+fn older_returning_excluded_target_uses_exact_pod_fence_and_allows_next_removal() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3, 4], 1, 2);
+    let mut saved = model.report(4).clone();
+    let previous = saved.current_configuration.as_ref().unwrap();
+    let older = ConfigurationDescriptor::new(
+        Epoch::new(
+            previous.epoch.data_loss_number,
+            previous.epoch.configuration_number - 1,
+        ),
+        previous.primary_id,
+        previous.members.clone(),
+        previous.write_quorum,
+    );
+    saved.epoch = older.epoch;
+    saved.current_configuration = Some(older);
+    model.unavailable(4);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let key = model.key(4);
+    model.snapshot.replicas.get_mut(&key).unwrap().agent =
+        AgentObservation::Report(Box::new(saved));
+    model.controller_restart();
+    model.finish();
+    assert_eq!(
+        model
+            .removed
+            .iter()
+            .map(|r| r.replica_id.value())
+            .collect::<Vec<_>>(),
+        [4, 3]
+    );
+    assert!(!model.commands.iter().any(|c| matches!(c, ProtocolCommand::RetireReplica(c) if c.local_replica_id == ReplicaId::new(4))));
+}
+
+#[test]
+fn evaluator_scale_down_reduced_catch_up_and_conflicting_storage_are_explicit() {
+    use kuberic_protocol::types::CleanupResourceIdentity;
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .replicas
+            .values()
+            .filter(|o| {
+                matches!(&o.agent,
+        AgentObservation::Report(r) if r.secondary_removal_evidence.is_some())
+            })
+            .count()
+            == 2
+    });
+    model.report(2).verified_replication_lsn = Some(9);
+    assert_eq!(reason(&model.plan()), "ScaleDownReducedCatchUpPending");
+    model.report(2).verified_replication_lsn = Some(10);
+    model.finish();
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.exact(3).identity.pvc = CleanupResourceIdentity::Present {
+        name: "db-storage-1".into(),
+        uid: "pvc-1".into(),
+    };
+    assert!(matches!(
+        model.plan(),
+        Plan::Unsafe {
+            reason: UnsafeReason::ContradictoryReplicaEvidence(_),
+            ..
+        }
+    ));
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_authoritative_already_absent_target_needs_no_retirement_reply() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use kuberic_protocol::types::CleanupResourceIdentity;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    let key = model.key(2);
+    model.snapshot.replicas.remove(&key);
+    model.exact(2).identity.pod = CleanupResourceIdentity::Absent {
+        name: "db-2".into(),
+    };
+    model.exact(2).pod = ExactResourceObservation::NotFound;
+    model.finish();
+    assert!(
+        !model
+            .commands
+            .iter()
+            .any(|c| matches!(c, ProtocolCommand::RetireReplica(_)))
+    );
+    assert_eq!(model.deletes.len(), 2);
+    assert_eq!(model.removed[0].replica_id, ReplicaId::new(2));
+}
+
+#[test]
+fn evaluator_scale_down_missing_frozen_preparation_does_not_reprepare_or_replace_boundary() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.secondary_removal_evidence.is_some())
+    });
+    let frozen = model.snapshot.status.transition.clone();
+    model.report(1).prepared_secondary_removal = None;
+    assert_eq!(reason(&model.plan()), "ScaleDownPreparationPending");
+    model.step();
+    assert_eq!(model.snapshot.status.transition, frozen);
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_invalid_new_desired_count_cannot_cancel_frozen_authority() {
+    use scale_down_model::Model;
+    let mut trace = Model::new(&[1, 2], 1, 1);
+    trace.step();
+    for _ in 0..50 {
+        if trace.snapshot.status.transition.is_none()
+            && trace.snapshot.status.secondary_scale_down_cleanup.is_none()
+        {
+            break;
+        }
+        let mut edited = trace.clone();
+        edited.snapshot.desired.replicas = 0;
+        edited.snapshot.desired.generation += 1;
+        assert!(!matches!(edited.plan(), Plan::Unsafe { .. }));
+        trace.step();
+    }
+    trace.snapshot.desired.replicas = 0;
+    assert!(matches!(
+        trace.plan(),
+        Plan::Unsafe {
+            reason: UnsafeReason::InvalidDesiredState(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn evaluator_scale_down_existing_transitions_and_provisioning_serialize() {
+    use scale_down_model::{Model, config};
+    let mut snapshots = vec![prepared_switchover_snapshot()];
+    let mut bootstrap = scaffolded_snapshot();
+    let Plan::Apply { changes } = evaluate(&bootstrap, &EvaluationConfig::default()) else {
+        panic!("bootstrap")
+    };
+    for change in changes {
+        if let KubernetesChange::PersistStatus { status } = change {
+            bootstrap.status = *status;
+        }
+    }
+    assert!(bootstrap.status.transition.is_some());
+    snapshots.push(bootstrap);
+    for kind in [TransitionKind::Replacement, TransitionKind::Failover] {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        let previous = model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        let mut members = previous.members.clone();
+        if kind == TransitionKind::Replacement {
+            members[2].identity.instance_id = ReplicaInstanceId::new("replacement");
+            members[2].identity.agent_generation = AgentGeneration::new("replacement-generation");
+        } else {
+            members[0].role = ReplicaRole::ActiveSecondary;
+            members[1].role = ReplicaRole::Primary;
+        }
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(2, 11),
+            ReplicaId::new(if kind == TransitionKind::Replacement {
+                1
+            } else {
+                2
+            }),
+            members,
+            2,
+        );
+        model.snapshot.status.transition = Some(TransitionIntent {
+            transition_id: derive_transition_id(
+                &model.snapshot.resource_uid,
+                kind,
+                &current.configuration_id,
+            ),
+            kind,
+            spec_generation: 6,
+            effective_policy: model.snapshot.status.effective_policy.clone().unwrap(),
+            previous_configuration_id: Some(previous.configuration_id),
+            current_configuration: current,
+            election_lsn: (kind == TransitionKind::Failover).then_some(10),
+            build_id: (kind == TransitionKind::Replacement).then(|| OperationId::new("build")),
+            repair: None,
+            switchover: None,
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
+        });
+        snapshots.push(model.snapshot);
+    }
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    let replacing = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members[2]
+        .identity
+        .clone();
+    model.snapshot.status.provisioning = Some(ProvisioningIntent {
+        replaces: replacing,
+        operation_id: OperationId::new("existing-provisioning"),
+        pod_uid: PodUid::new("new-pod"),
+        pvc_uid: PvcUid::new("new-pvc"),
+    });
+    snapshots.push(model.snapshot);
+    for mut snapshot in snapshots {
+        snapshot.desired.replicas = 1;
+        kuberic_protocol::validation::validate_snapshot(&snapshot).unwrap();
+        for _ in 0..3 {
+            if snapshot.status.transition.is_none() && snapshot.status.provisioning.is_none() {
+                break;
+            }
+            let default = evaluate(&snapshot, &EvaluationConfig::default());
+            assert_eq!(
+                evaluate(&snapshot, &config()),
+                default,
+                "existing work retains precedence"
+            );
+            if let Plan::Apply { changes } = default {
+                for change in changes {
+                    if let KubernetesChange::PersistStatus { status } = change {
+                        snapshot.status = *status;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn evaluator_scale_down_commit_publication_is_exact_and_separate_from_grant() {
+    use kuberic_protocol::validation::validate_accept_secondary_removal_commit;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let Plan::Execute {
+        command: ProtocolCommand::AcceptSecondaryRemovalCommit(command),
+    } = model.plan()
+    else {
+        panic!("publish accepted evidence first")
+    };
+    validate_accept_secondary_removal_commit(&command).unwrap();
+    let mut invalid = command.as_ref().clone();
+    invalid.target = invalid.committed.evidence.preparation.intent.target.clone();
+    assert!(validate_accept_secondary_removal_commit(&invalid).is_err());
+    invalid = command.as_ref().clone();
+    invalid.operation_id = OperationId::new("mutated");
+    assert!(validate_accept_secondary_removal_commit(&invalid).is_err());
+    model.step();
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(grant),
+    } = model.plan()
+    else {
+        panic!("separate grant")
+    };
+    assert_eq!(grant.primary_write_status, AccessStatus::Granted);
+    assert!(grant.secondary_removal_evidence.is_none());
+    assert!(model.snapshot.routing.write_target.is_none());
+}
+
+#[test]
+fn evaluator_scale_down_local_commit_cannot_precede_status_commit_or_change_proof() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let committed = model
+        .snapshot
+        .status
+        .secondary_scale_down_cleanup
+        .clone()
+        .unwrap();
+    let mut premature = model.clone();
+    premature.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: committed
+            .evidence
+            .preparation
+            .intent
+            .previous_configuration
+            .clone(),
+    });
+    premature.snapshot.status.effective_policy = Some(
+        committed
+            .evidence
+            .preparation
+            .intent
+            .previous_policy
+            .clone(),
+    );
+    premature.snapshot.status.transition = Some(scale_down_fixture::transition(
+        &committed.evidence.preparation.intent,
+    ));
+    premature
+        .snapshot
+        .status
+        .transition
+        .as_mut()
+        .unwrap()
+        .secondary_removal_evidence = Some(committed.evidence.clone());
+    premature.snapshot.status.secondary_scale_down_cleanup = None;
+    premature.report(1).prepared_secondary_removal = None;
+    premature.report(1).accepted_secondary_removal = Some(committed);
+    assert!(matches!(premature.plan(), Plan::Unsafe { .. }));
+    model.step();
+    model
+        .report(1)
+        .accepted_secondary_removal
+        .as_mut()
+        .unwrap()
+        .current_only_write_quorum[0]
+        .report_sequence += 1;
+    assert!(matches!(model.plan(), Plan::Unsafe { .. }));
+}
+
 use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, SafetyChange};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
@@ -54,6 +1817,138 @@ fn configuration() -> ConfigurationDescriptor {
     )
 }
 
+fn replacement_configuration(replica_id: i64) -> ConfigurationDescriptor {
+    let mut configuration = configuration();
+    let target = &mut configuration
+        .members
+        .iter_mut()
+        .find(|m| m.identity.replica_id == ReplicaId::new(replica_id))
+        .unwrap()
+        .identity;
+    target.agent_generation = derive_agent_generation(&derive_initialization_id(
+        &ResourceUid::new("resource-uid"),
+        target.replica_id,
+        &PodUid::new(target.instance_id.as_str()),
+        &PvcUid::new("old-pvc"),
+    ));
+    ConfigurationDescriptor::new(
+        configuration.epoch,
+        configuration.primary_id,
+        configuration.members,
+        configuration.write_quorum,
+    )
+}
+
+fn freeze_replacement_fixture(snapshot: &mut ObservationSnapshot, target: &ReplicaIdentity) {
+    let exact = replacement_resources(&snapshot.resource_uid, target);
+    let cleanup = kuberic_protocol::types::ReplacementCleanup {
+        resource_uid: snapshot.resource_uid.clone(),
+        target: target.clone(),
+        resources: exact.identity,
+    };
+    if let Some(p) = &mut snapshot.status.provisioning {
+        p.operation_id = cleanup.provisioning_operation_id(&p.pod_uid, &p.pvc_uid);
+    }
+    if let Some(t) = &mut snapshot.status.transition {
+        t.transition_id = cleanup.transition_id(t.kind, &t.current_configuration.configuration_id);
+    }
+    snapshot.status.pending_replacement_cleanup = Some(cleanup);
+}
+
+#[test]
+fn replacement_provenance_binds_ids_status_and_legacy_json_without_granting_cleanup() {
+    use kuberic_protocol::types::CleanupResourceIdentity;
+    let accepted = replacement_configuration(2);
+    let old = accepted.members[1].identity.clone();
+    let mut snapshot = empty_snapshot(3);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: EffectivePolicy::fixed(3, 10),
+        topology: Some(AcceptedTopology {
+            configuration: accepted,
+        }),
+        provisioning: Some(ProvisioningIntent {
+            replaces: old.clone(),
+            pod_uid: PodUid::new("new-pod"),
+            pvc_uid: PvcUid::new("new-pvc"),
+            operation_id: OperationId::new("unused"),
+        }),
+        ..Default::default()
+    };
+    freeze_replacement_fixture(&mut snapshot, &old);
+    assert_eq!(validate_status(&snapshot.status), Ok(()));
+    let receipt = snapshot.status.pending_replacement_cleanup.clone().unwrap();
+    for mutation in 0..9 {
+        let mut changed = snapshot.clone();
+        let frozen = changed.status.pending_replacement_cleanup.as_mut().unwrap();
+        match mutation {
+            0 => frozen.resource_uid = ResourceUid::new("another-set"),
+            1 => frozen.target.instance_id = ReplicaInstanceId::new("another-pod"),
+            2 => {
+                frozen.resources.pvc = CleanupResourceIdentity::Present {
+                    name: "other".into(),
+                    uid: "another-pvc".into(),
+                }
+            }
+            3 => frozen.resources.pod = CleanupResourceIdentity::Absent { name: "old".into() },
+            4 => {
+                frozen.resources.pvc = CleanupResourceIdentity::Absent {
+                    name: "old-data".into(),
+                }
+            }
+            5 => {
+                frozen.resources.endpoint = CleanupResourceIdentity::Present {
+                    name: frozen.resources.endpoint.name().into(),
+                    uid: "changed-endpoint".into(),
+                }
+            }
+            6 => {
+                frozen.resources.endpoint = CleanupResourceIdentity::Absent {
+                    name: frozen.resources.endpoint.name().into(),
+                }
+            }
+            7 => {
+                changed.status.provisioning.as_mut().unwrap().replaces =
+                    identity(3, "other", "other")
+            }
+            _ => changed.status.last_replacement = Some(receipt.clone()),
+        }
+        assert!(
+            kuberic_protocol::validation::validate_snapshot(&changed).is_err(),
+            "mutation={mutation}"
+        );
+    }
+    let configuration_id = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .configuration_id;
+    let original = receipt.transition_id(TransitionKind::Replacement, configuration_id);
+    let mut changed = receipt;
+    changed.resources.endpoint = CleanupResourceIdentity::Absent {
+        name: changed.resources.endpoint.name().into(),
+    };
+    assert_ne!(
+        changed.transition_id(TransitionKind::Replacement, configuration_id),
+        original
+    );
+    let mut json = serde_json::to_value(&snapshot.status).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("pendingReplacementCleanup");
+    snapshot.status = serde_json::from_value(json).unwrap();
+    assert!(snapshot.status.pending_replacement_cleanup.is_none());
+    assert!(
+        matches!(
+            evaluate(&snapshot, &EvaluationConfig::default()),
+            Plan::Wait { .. }
+        ),
+        "legacy in-flight intent without pre-admission provenance must fail closed"
+    );
+}
+
 fn desired(replicas: u32) -> DesiredState {
     DesiredState {
         generation: 1,
@@ -66,6 +1961,7 @@ fn desired(replicas: u32) -> DesiredState {
 
 fn empty_snapshot(replicas: u32) -> ObservationSnapshot {
     ObservationSnapshot {
+        secondary_scale_down_resources: Vec::new(),
         resource_uid: ResourceUid::new("resource-uid"),
         resource_version: "1".to_string(),
         desired: desired(replicas),
@@ -186,6 +2082,609 @@ fn configuration_id_is_canonical_across_member_order() {
 
     assert_eq!(first.configuration_id, second.configuration_id);
     assert_eq!(first.members, second.members);
+}
+
+#[test]
+fn secondary_scale_down_validates_independent_majorities_and_minimum_evidence() {
+    use kuberic_protocol::validation::*;
+    for (size, old_write, old_read, new_write, new_read) in [
+        (2, 2, 1, 1, 1),
+        (3, 2, 2, 2, 1),
+        (4, 3, 2, 2, 2),
+        (5, 3, 3, 3, 2),
+    ] {
+        let intent = scale_down_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
+        assert_eq!(
+            (
+                intent.previous_policy.write_quorum,
+                intent.previous_policy.read_quorum
+            ),
+            (old_write, old_read)
+        );
+        assert_eq!(
+            (
+                intent.current_policy.write_quorum,
+                intent.current_policy.read_quorum
+            ),
+            (new_write, new_read)
+        );
+        validate_secondary_scale_down(&intent).unwrap();
+        let mut evidence = scale_down_fixture::evidence(&intent);
+        evidence.previous_read_quorum.truncate(old_read as usize);
+        evidence.reduced_write_quorum.truncate(new_write as usize);
+        validate_secondary_removal_evidence(&evidence, true).unwrap();
+        for current_only in [false, true] {
+            validate_secondary_removal_configuration(&scale_down_fixture::configuration_command(
+                &intent,
+                current_only,
+            ))
+            .unwrap();
+        }
+        let mut missing_old = evidence.clone();
+        missing_old.previous_read_quorum.pop();
+        assert!(validate_secondary_removal_evidence(&missing_old, false).is_err());
+        evidence.reduced_write_quorum.pop();
+        assert!(validate_secondary_removal_evidence(&evidence, true).is_err());
+    }
+}
+
+#[test]
+fn secondary_scale_down_preserves_holes_and_high_id_primary() {
+    let intent = scale_down_fixture::intent(&[2, 8, 19, 40], 40);
+    kuberic_protocol::validation::validate_secondary_scale_down(&intent).unwrap();
+    assert_eq!(intent.target.replica_id, ReplicaId::new(19));
+    assert_eq!(intent.current_configuration.primary_id, ReplicaId::new(40));
+    assert_eq!(
+        intent
+            .current_configuration
+            .members
+            .iter()
+            .map(|member| member.identity.replica_id.value())
+            .collect::<Vec<_>>(),
+        [2, 8, 40]
+    );
+}
+
+#[test]
+fn secondary_scale_down_rejects_arbitrary_authority_changes() {
+    use kuberic_protocol::types::SecondaryScaleDownIntent;
+    use kuberic_protocol::validation::validate_secondary_scale_down;
+    type IntentMutation = (&'static str, fn(&mut SecondaryScaleDownIntent));
+    let mutations: &[IntentMutation] = &[
+        ("primary target", |i| i.target = i.primary.clone()),
+        ("non-highest target", |i| {
+            i.target = i.previous_configuration.members[3].identity.clone();
+            i.current_configuration.members = i
+                .previous_configuration
+                .members
+                .iter()
+                .filter(|m| m.identity != i.target)
+                .cloned()
+                .collect();
+        }),
+        ("batch removal", |i| {
+            i.current_configuration.members.pop();
+            i.current_policy = EffectivePolicy::fixed(3, 30).unwrap();
+        }),
+        ("retained incarnation", |i| {
+            i.current_configuration.members[1].identity.instance_id =
+                ReplicaInstanceId::new("replacement")
+        }),
+        ("retained generation", |i| {
+            i.current_configuration.members[1].identity.agent_generation =
+                AgentGeneration::new("replacement")
+        }),
+        ("primary changed", |i| {
+            i.current_configuration.primary_id = ReplicaId::new(2);
+            i.current_configuration.members[0].role = ReplicaRole::ActiveSecondary;
+            i.current_configuration.members[1].role = ReplicaRole::Primary;
+        }),
+        ("data loss", |i| {
+            i.current_configuration.epoch.data_loss_number += 1
+        }),
+        ("same epoch", |i| {
+            i.current_configuration.epoch = i.previous_configuration.epoch
+        }),
+        ("delay", |i| i.current_policy.failover_delay_seconds += 1),
+        ("old read quorum", |i| i.previous_policy.read_quorum -= 1),
+        ("old write quorum", |i| i.previous_policy.write_quorum -= 1),
+        ("new write quorum", |i| i.current_policy.write_quorum -= 1),
+        ("new read quorum", |i| i.current_policy.read_quorum += 1),
+        ("zero desired", |i| i.desired_replicas = 0),
+        ("no reduction requested", |i| i.desired_replicas = 5),
+        ("zero generation", |i| i.spec_generation = 0),
+        ("missing resource", |i| {
+            i.resource_uid = ResourceUid::default()
+        }),
+        ("missing identity", |i| {
+            i.previous_configuration.members[1]
+                .identity
+                .agent_generation = AgentGeneration::default()
+        }),
+        ("idle target", |i| {
+            i.previous_configuration.members[4].role = ReplicaRole::IdleSecondary
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut intent = scale_down_fixture::intent(&[1, 2, 3, 4, 5], 1);
+        mutate(&mut intent);
+        intent.previous_configuration.configuration_id =
+            intent.previous_configuration.expected_id();
+        intent.current_configuration.configuration_id = intent.current_configuration.expected_id();
+        intent.operation_id = intent.expected_operation_id();
+        assert!(validate_secondary_scale_down(&intent).is_err(), "{name}");
+    }
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    for kind in [
+        TransitionKind::Bootstrap,
+        TransitionKind::Replacement,
+        TransitionKind::Failover,
+        TransitionKind::PlannedSwitchover,
+        TransitionKind::SecondaryScaleDown,
+    ] {
+        assert!(
+            validate_transition_relationship(
+                kind,
+                Some(&intent.previous_configuration),
+                &intent.current_configuration,
+                &intent.current_policy
+            )
+            .is_err(),
+            "{kind:?} must not bypass typed dual-policy authority"
+        );
+    }
+}
+
+#[test]
+fn secondary_scale_down_ids_bind_request_authority_target_and_command_stage() {
+    use kuberic_protocol::types::SecondaryRemovalStage::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    assert_eq!(intent.operation_id, intent.expected_operation_id());
+    let mut reversed = intent.clone();
+    reversed.previous_configuration.members.reverse();
+    assert_eq!(
+        intent.expected_operation_id(),
+        reversed.expected_operation_id()
+    );
+    for change in 0..7 {
+        let mut other = intent.clone();
+        match change {
+            0 => other.resource_uid = ResourceUid::new("other"),
+            1 => other.spec_generation += 1,
+            2 => other.desired_replicas += 1,
+            3 => {
+                other.previous_configuration.configuration_id =
+                    kuberic_protocol::types::ConfigurationId::new("other")
+            }
+            4 => {
+                other.current_configuration.configuration_id =
+                    kuberic_protocol::types::ConfigurationId::new("other")
+            }
+            5 => other.target.instance_id = ReplicaInstanceId::new("other"),
+            _ => other.target.agent_generation = AgentGeneration::new("other"),
+        }
+        assert_ne!(
+            intent.expected_operation_id(),
+            other.expected_operation_id()
+        );
+    }
+    let ids = [Prepare, PreviousCurrent, CurrentOnly, Retire]
+        .map(|stage| intent.command_operation_id(stage, &intent.primary));
+    assert_eq!(
+        ids.into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert_ne!(
+        intent.command_operation_id(CurrentOnly, &intent.primary),
+        intent.command_operation_id(CurrentOnly, &intent.target)
+    );
+}
+
+#[test]
+fn secondary_removal_evidence_rejects_stale_unbound_or_excluded_credit() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3, 4, 5], 1);
+    for mutation in 0..13 {
+        let mut evidence = scale_down_fixture::evidence(&intent);
+        match mutation {
+            0 => evidence.previous_read_quorum[0].identity = intent.target.clone(),
+            1 => evidence.previous_read_quorum[1] = evidence.previous_read_quorum[0].clone(),
+            2 => evidence.previous_read_quorum[0].epoch.configuration_number -= 1,
+            3 => evidence.previous_read_quorum[0].process_session_id = ProcessSessionId::default(),
+            4 => evidence.previous_read_quorum[0].report_sequence = 0,
+            5 => evidence.reduced_write_quorum[0].verified_replication_lsn = 9,
+            6 => {
+                evidence.reduced_write_quorum.remove(0);
+            }
+            7 => {
+                evidence.reduced_write_quorum[0].pending_operation_id =
+                    Some(OperationId::new("pending"))
+            }
+            8 => evidence.reduced_write_quorum[0].retained_operation_id = None,
+            9 => evidence.reduced_write_quorum[0].write_status = AccessStatus::Granted,
+            10 => evidence.preparation.operation_id = OperationId::new("wrong"),
+            11 => evidence.reduced_write_quorum[0].report_sequence = 2,
+            _ => evidence.preparation.boundary_lsn = -1,
+        }
+        assert!(
+            validate_secondary_removal_evidence(&evidence, true).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    let mut command = scale_down_fixture::configuration_command(&intent, false);
+    command.previous_policy = None;
+    assert!(validate_secondary_removal_configuration(&command).is_err());
+    command.previous_policy = Some(intent.previous_policy.clone());
+    command.primary_write_status = AccessStatus::Granted;
+    assert!(validate_secondary_removal_configuration(&command).is_err());
+}
+
+#[test]
+fn secondary_scale_down_status_separates_accepted_policy_intent_and_cleanup() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2], 1);
+    let mut snapshot = empty_snapshot(1);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(intent.previous_policy.clone()),
+        topology: Some(AcceptedTopology {
+            configuration: intent.previous_configuration.clone(),
+        }),
+        transition: Some(scale_down_fixture::transition(&intent)),
+        ..Default::default()
+    };
+    validate_snapshot(&snapshot).unwrap();
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+    snapshot.status.effective_policy = Some(intent.current_policy.clone());
+    assert!(validate_status(&snapshot.status).is_err());
+    snapshot.status.topology = Some(AcceptedTopology {
+        configuration: intent.current_configuration.clone(),
+    });
+    snapshot.status.secondary_scale_down_cleanup = Some(scale_down_fixture::cleanup(&intent));
+    assert!(
+        validate_status(&snapshot.status).is_err(),
+        "cleanup cannot overlap active transition"
+    );
+    snapshot.status.transition = None;
+    validate_snapshot(&snapshot).unwrap();
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+    let encoded = serde_json::to_string(&snapshot.status).unwrap();
+    assert_eq!(
+        serde_json::from_str::<AcceptedStatus>(&encoded).unwrap(),
+        snapshot.status
+    );
+    snapshot.resource_uid = ResourceUid::new("replacement-resource");
+    assert!(validate_snapshot(&snapshot).is_err());
+}
+
+#[test]
+fn secondary_retirement_and_cleanup_reject_malformed_or_unbound_identity() {
+    use kuberic_protocol::types::*;
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    let mut cleanup = scale_down_fixture::cleanup(&intent);
+    cleanup.retirement = Some(scale_down_fixture::retirement(&intent));
+    validate_secondary_scale_down_cleanup(&cleanup).unwrap();
+    for mutation in 0..7 {
+        let mut invalid = cleanup.clone();
+        let retirement = invalid.retirement.as_mut().unwrap();
+        match mutation {
+            0 => retirement.application_closed = false,
+            1 => retirement.peers_fenced = false,
+            2 => retirement.role = ReplicaRole::ActiveSecondary,
+            3 => retirement.read_status = AccessStatus::Granted,
+            4 => retirement.epoch.configuration_number -= 1,
+            5 => {
+                retirement.intent.cleanup.pvc = CleanupResourceIdentity::Absent {
+                    name: "different-pvc".into(),
+                }
+            }
+            _ => invalid.current_only_write_quorum[0].report_sequence = 3,
+        }
+        assert!(
+            validate_secondary_scale_down_cleanup(&invalid).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    for resource in 0..3 {
+        let mut malformed = intent.clone();
+        let field = match resource {
+            0 => &mut malformed.cleanup.pod,
+            1 => &mut malformed.cleanup.pvc,
+            _ => &mut malformed.cleanup.endpoint,
+        };
+        *field = CleanupResourceIdentity::Present {
+            name: field.name().into(),
+            uid: String::new(),
+        };
+        assert!(validate_secondary_scale_down(&malformed).is_err());
+    }
+    let mut absent = intent;
+    absent.cleanup.pod = CleanupResourceIdentity::Absent {
+        name: absent.cleanup.pod.name().into(),
+    };
+    validate_secondary_scale_down(&absent).unwrap();
+}
+
+#[test]
+fn existing_json_status_and_transition_default_new_authority_to_none() {
+    let status: AcceptedStatus = serde_json::from_value(serde_json::json!({
+        "initialized": false, "observedGeneration": 0, "conditions": []
+    }))
+    .unwrap();
+    assert!(status.secondary_scale_down_cleanup.is_none());
+    assert!(status.last_secondary_removal.is_none());
+    assert!(
+        serde_json::to_value(&status)
+            .unwrap()
+            .get("lastSecondaryRemoval")
+            .is_none()
+    );
+    let mut value = serde_json::to_value(scale_down_fixture::transition(
+        &scale_down_fixture::intent(&[1, 2], 1),
+    ))
+    .unwrap();
+    value.as_object_mut().unwrap().remove("secondaryScaleDown");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("secondaryRemovalEvidence");
+    let transition: TransitionIntent = serde_json::from_value(value).unwrap();
+    assert!(transition.secondary_scale_down.is_none());
+    assert!(transition.secondary_removal_evidence.is_none());
+    let mut status = status;
+    status.transition = Some(transition);
+    assert!(
+        validate_status(&status).is_err(),
+        "missing scale-down authority cannot default into admission"
+    );
+    let mut command = serde_json::to_value(scale_down_fixture::configuration_command(
+        &scale_down_fixture::intent(&[1, 2], 1),
+        false,
+    ))
+    .unwrap();
+    command.as_object_mut().unwrap().remove("previousPolicy");
+    command
+        .as_object_mut()
+        .unwrap()
+        .remove("secondaryRemovalEvidence");
+    let command: kuberic_protocol::command::EnsureConfiguration =
+        serde_json::from_value(command).unwrap();
+    assert!(command.previous_policy.is_none());
+    assert!(command.secondary_removal_evidence.is_none());
+}
+
+#[test]
+fn secondary_removal_reports_bind_frozen_authority_and_fresh_observation() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    let mut snapshot = empty_snapshot(2);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(intent.previous_policy.clone()),
+        topology: Some(AcceptedTopology {
+            configuration: intent.previous_configuration.clone(),
+        }),
+        transition: Some(scale_down_fixture::transition(&intent)),
+        ..Default::default()
+    };
+    let report = AgentReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        identity: intent.primary.clone(),
+        process_session_id: ProcessSessionId::new("session-1"),
+        report_sequence: 3,
+        role: ReplicaRole::Primary,
+        write_status: AccessStatus::ReconfigurationPending,
+        epoch: intent.current_configuration.epoch,
+        previous_configuration: Some(intent.previous_configuration.clone()),
+        current_configuration: Some(intent.current_configuration.clone()),
+        current_progress: 10,
+        verified_replication_lsn: Some(10),
+        secondary_removal_evidence: Some(scale_down_fixture::evidence(&intent)),
+        ..Default::default()
+    };
+    let key = ReplicaObservationKey::new(
+        intent.primary.replica_id,
+        intent.primary.instance_id.clone(),
+    );
+    snapshot.replicas.insert(
+        key.clone(),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Report(Box::new(report.clone())),
+        },
+    );
+    validate_snapshot(&snapshot).unwrap();
+    for mutation in 0..5 {
+        let mut invalid = snapshot.clone();
+        let AgentObservation::Report(report) = &mut invalid.replicas.get_mut(&key).unwrap().agent
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => report.secondary_removal_evidence = None,
+            1 => report.write_status = AccessStatus::Granted,
+            2 => {
+                report
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation
+                    .boundary_lsn = 9
+            }
+            3 => {
+                report
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation
+                    .intent
+                    .cleanup
+                    .pvc = kuberic_protocol::types::CleanupResourceIdentity::Absent {
+                    name: "unbound".into(),
+                }
+            }
+            _ => {
+                invalid.status.transition = None;
+            }
+        }
+        assert!(validate_snapshot(&invalid).is_err(), "mutation {mutation}");
+    }
+    let mut earlier_pc_cc = snapshot.clone();
+    {
+        let AgentObservation::Report(report) =
+            &mut earlier_pc_cc.replicas.get_mut(&key).unwrap().agent
+        else {
+            unreachable!()
+        };
+        report
+            .secondary_removal_evidence
+            .as_mut()
+            .unwrap()
+            .reduced_write_quorum
+            .clear();
+    }
+    validate_snapshot(&earlier_pc_cc).unwrap();
+    {
+        let AgentObservation::Report(report) =
+            &mut earlier_pc_cc.replicas.get_mut(&key).unwrap().agent
+        else {
+            unreachable!()
+        };
+        report.previous_configuration = None;
+    }
+    assert!(validate_snapshot(&earlier_pc_cc).is_err());
+
+    snapshot.previous_report_watermarks.insert(
+        key,
+        ReportWatermark {
+            process_session_id: report.process_session_id,
+            report_sequence: report.report_sequence,
+        },
+    );
+    assert!(matches!(
+        validate_snapshot(&snapshot),
+        Err(ValidationError::StaleReportSequence { .. })
+    ));
+
+    let mut evidence = scale_down_fixture::evidence(&intent);
+    evidence.previous_read_quorum[0].process_session_id =
+        ProcessSessionId::new("fresh-restarted-primary");
+    evidence.previous_read_quorum[0].report_sequence = 1;
+    validate_secondary_removal_evidence(&evidence, true).unwrap();
+    evidence.reduced_write_quorum[0].role = ReplicaRole::None;
+    assert!(validate_secondary_removal_evidence(&evidence, true).is_err());
+}
+
+#[test]
+fn secondary_removal_cleanup_keeps_reports_bound_to_frozen_admission_evidence() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    let cleanup = scale_down_fixture::cleanup(&intent);
+    let mut snapshot = empty_snapshot(2);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(intent.current_policy.clone()),
+        topology: Some(AcceptedTopology {
+            configuration: intent.current_configuration.clone(),
+        }),
+        secondary_scale_down_cleanup: Some(cleanup.clone()),
+        ..Default::default()
+    };
+    let report = AgentReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        identity: intent.primary.clone(),
+        process_session_id: ProcessSessionId::new("session-1"),
+        report_sequence: 5,
+        role: ReplicaRole::Primary,
+        read_status: AccessStatus::Granted,
+        write_status: AccessStatus::Granted,
+        epoch: intent.current_configuration.epoch,
+        current_configuration: Some(intent.current_configuration.clone()),
+        current_progress: 10,
+        verified_replication_lsn: Some(10),
+        committed_lsn: 10,
+        secondary_removal_evidence: Some(cleanup.evidence.clone()),
+        ..Default::default()
+    };
+    let key = ReplicaObservationKey::new(
+        intent.primary.replica_id,
+        intent.primary.instance_id.clone(),
+    );
+    snapshot.replicas.insert(
+        key.clone(),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Report(Box::new(report)),
+        },
+    );
+    validate_snapshot(&snapshot).unwrap();
+
+    let AgentObservation::Report(report) = &mut snapshot.replicas.get_mut(&key).unwrap().agent
+    else {
+        unreachable!()
+    };
+    report
+        .secondary_removal_evidence
+        .as_mut()
+        .unwrap()
+        .preparation
+        .boundary_lsn = 0;
+    assert!(validate_snapshot(&snapshot).is_err());
+}
+
+#[test]
+fn secondary_removal_current_only_freshness_covers_rotating_quorum_witnesses() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3, 4], 1);
+    let member = |id| {
+        intent
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == ReplicaId::new(id))
+            .unwrap()
+            .identity
+            .clone()
+    };
+    let mut cleanup = scale_down_fixture::cleanup(&intent);
+    cleanup
+        .evidence
+        .previous_read_quorum
+        .retain(|witness| [member(1), member(3)].contains(&witness.identity));
+    cleanup
+        .evidence
+        .reduced_write_quorum
+        .retain(|witness| [member(1), member(2)].contains(&witness.identity));
+    cleanup
+        .current_only_write_quorum
+        .retain(|witness| [member(1), member(3)].contains(&witness.identity));
+    cleanup
+        .evidence
+        .previous_read_quorum
+        .iter_mut()
+        .find(|witness| witness.identity == member(3))
+        .unwrap()
+        .report_sequence = 5;
+    cleanup
+        .current_only_write_quorum
+        .iter_mut()
+        .find(|witness| witness.identity == member(3))
+        .unwrap()
+        .report_sequence = 4;
+
+    validate_secondary_removal_evidence(&cleanup.evidence, true).unwrap();
+    assert!(validate_secondary_scale_down_cleanup(&cleanup).is_err());
 }
 
 #[test]
@@ -445,6 +2944,8 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &resource_uid,
                 TransitionKind::PlannedSwitchover,
@@ -1389,6 +3890,13 @@ fn invalid_switchover_requests_only_project_rejection() {
         }
         let topology = snapshot.status.topology.clone();
         let routing = snapshot.routing.clone();
+        if changed == "stale" {
+            assert!(matches!(evaluate(&snapshot, &EvaluationConfig::default()),
+                Plan::Execute { command: ProtocolCommand::EnsureConfiguration(c) }
+                    if c.local_replica_id == ReplicaId::new(2)));
+            assert!(snapshot.status.transition.is_none());
+            continue;
+        }
         apply_switchover_status(&mut snapshot);
         assert_eq!(snapshot.status.topology, topology, "{changed}");
         assert_eq!(snapshot.routing, routing, "{changed}");
@@ -2066,7 +4574,7 @@ fn bootstrap_validates_all_members_before_initializing_any_store() {
 
 #[test]
 fn provisioning_observation_can_coexist_with_accepted_incarnation() {
-    let accepted = configuration();
+    let accepted = replacement_configuration(3);
     let mut snapshot = empty_snapshot(3);
     let old_identity = accepted
         .members
@@ -2100,6 +4608,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
         }),
         ..AcceptedStatus::default()
     };
+    freeze_replacement_fixture(&mut snapshot, &old_identity);
     snapshot.replicas.insert(
         ReplicaObservationKey::new(old_identity.replica_id, old_identity.instance_id.clone()),
         ReplicaObservation {
@@ -2221,6 +4730,8 @@ fn active_transition_keeps_frozen_policy_after_spec_change() {
     let current_configuration = configuration();
     let policy = EffectivePolicy::fixed(3, 10).unwrap();
     let transition = TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: derive_transition_id(
             &ResourceUid::new("resource-uid"),
             TransitionKind::Bootstrap,
@@ -2494,6 +5005,8 @@ fn failover_corrects_provisional_candidate_with_a_newer_epoch() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -2759,6 +5272,8 @@ fn failover_authorizes_full_copy_when_primary_history_cannot_repair_a_member() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -2915,6 +5430,8 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -3063,6 +5580,8 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -3159,7 +5678,7 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
 
 #[test]
 fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
-    let previous = configuration();
+    let previous = replacement_configuration(3);
     let replacement_identity = identity(3, "replacement-pod", "replacement-generation");
     let replacement = ConfigurationDescriptor::new(
         Epoch::new(0, 2),
@@ -3189,6 +5708,8 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -3210,6 +5731,8 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
         }),
         ..AcceptedStatus::default()
     };
+    freeze_replacement_fixture(&mut snapshot, &previous.members[2].identity);
+    let receipt = snapshot.status.pending_replacement_cleanup.clone();
     for (member, progress) in replacement
         .members
         .iter()
@@ -3333,6 +5856,22 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
         panic!("expected failover transition");
     };
     let failover = status.transition.as_ref().unwrap();
+    assert_eq!(status.pending_replacement_cleanup, receipt);
+    assert!(status.last_replacement.is_none());
+    assert_eq!(validate_status(status), Ok(()));
+    let mut altered = (**status).clone();
+    altered
+        .pending_replacement_cleanup
+        .as_mut()
+        .unwrap()
+        .resources
+        .endpoint = kuberic_protocol::types::CleanupResourceIdentity::Absent {
+        name: receipt.as_ref().unwrap().resources.endpoint.name().into(),
+    };
+    assert!(
+        validate_status(&altered).is_err(),
+        "failover IDs bind the original endpoint UID"
+    );
     assert_eq!(failover.kind, TransitionKind::Failover);
     assert_eq!(failover.build_id.as_ref(), Some(&replacement_build));
     assert_eq!(
@@ -3722,7 +6261,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
     }
 
     fn verify_replacement_provisions_exact_target_builds_then_freezes_pc_cc() {
-        let accepted = configuration();
+        let accepted = replacement_configuration(2);
         let replacing = accepted
             .members
             .iter()
@@ -3763,6 +6302,17 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
                 agent: AgentObservation::Absent,
             },
         );
+        snapshot
+            .secondary_scale_down_resources
+            .push(replacement_resources(&snapshot.resource_uid, &replacing));
+        let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+            panic!("freeze cleanup before scaffolding");
+        };
+        let KubernetesChange::PersistStatus { status } = changes.into_iter().next().unwrap() else {
+            panic!("durable admission");
+        };
+        assert!(status.pending_replacement_cleanup.is_some());
+        snapshot.status = *status;
         assert!(matches!(
             evaluate(&snapshot, &EvaluationConfig::default()),
             Plan::Apply { changes }
@@ -3947,6 +6497,8 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -4046,6 +6598,8 @@ fn bootstrap_report_cannot_claim_previous_configuration() {
 
 #[test]
 fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use kuberic_protocol::types::ReplacementCleanup;
     let accepted = configuration();
     let member = accepted
         .members
@@ -4123,11 +6677,110 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
                     if name == "old-data"
             )
     ));
+    let enabled = EvaluationConfig {
+        enable_secondary_scale_down: true,
+        ..Default::default()
+    };
+    let deletes = |plan: Plan| {
+        matches!(plan, Plan::Apply { changes }
+        if changes.iter().any(|change| matches!(change, KubernetesChange::DeleteScaleDownResource { .. })))
+    };
+    assert!(!deletes(evaluate(&snapshot, &enabled)));
+    let retired_pod = PodUid::new("old-pod");
+    let retired = ReplicaIdentity {
+        replica_id: member.identity.replica_id,
+        instance_id: ReplicaInstanceId::new(retired_pod.as_str()),
+        agent_generation: derive_agent_generation(&derive_initialization_id(
+            &snapshot.resource_uid,
+            member.identity.replica_id,
+            &retired_pod,
+            &PvcUid::new("old-pvc"),
+        )),
+    };
+    let mut exact = replacement_resources(&snapshot.resource_uid, &retired);
+    exact.pvc = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "1".into(),
+    };
+    snapshot.status.last_replacement = Some(ReplacementCleanup {
+        resource_uid: snapshot.resource_uid.clone(),
+        target: retired,
+        resources: exact.identity.clone(),
+    });
+    snapshot.secondary_scale_down_resources.push(exact);
+    let mut wrong_storage = snapshot.status.clone();
+    wrong_storage
+        .last_replacement
+        .as_mut()
+        .unwrap()
+        .resources
+        .pvc = kuberic_protocol::types::CleanupResourceIdentity::Present {
+        name: "old-data".into(),
+        uid: "another-incarnations-storage".into(),
+    };
+    assert!(validate_status(&wrong_storage).is_err());
+    assert!(deletes(evaluate(&snapshot, &enabled)));
+    let mut failed_again = snapshot.clone();
+    let AgentObservation::Report(report) = &mut failed_again
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            member.identity.replica_id,
+            member.identity.instance_id.clone(),
+        ))
+        .unwrap()
+        .agent
+    else {
+        unreachable!()
+    };
+    report.reported_fault = Some(kuberic_protocol::types::FaultType::Permanent);
+    assert!(
+        deletes(evaluate(&failed_again, &enabled)),
+        "a second replacement must not overtake the first cleanup obligation"
+    );
+    snapshot.secondary_scale_down_resources[0].pvc = ExactResourceObservation::ReplacementPresent {
+        uid: "same-name-different-uid".into(),
+        resource_version: "2".into(),
+    };
+    assert!(!deletes(evaluate(&snapshot, &enabled)));
+    snapshot.status.last_replacement.as_mut().unwrap().target = member.identity;
+    assert!(validate_status(&snapshot.status).is_err());
+}
+
+fn replacement_resources(
+    resource_uid: &ResourceUid,
+    target: &ReplicaIdentity,
+) -> kuberic_protocol::observation::SecondaryScaleDownResourceObservation {
+    use kuberic_protocol::observation::{
+        ExactResourceObservation, SecondaryScaleDownResourceObservation,
+    };
+    use kuberic_protocol::types::{
+        CleanupResourceIdentity, ReplicaCleanupIdentity, derive_replica_endpoint_name,
+    };
+    SecondaryScaleDownResourceObservation {
+        resource_uid: resource_uid.clone(),
+        target: target.clone(),
+        identity: ReplicaCleanupIdentity {
+            pod: CleanupResourceIdentity::Present {
+                name: "old".into(),
+                uid: target.instance_id.to_string(),
+            },
+            pvc: CleanupResourceIdentity::Present {
+                name: "old-data".into(),
+                uid: "old-pvc".into(),
+            },
+            endpoint: CleanupResourceIdentity::Present {
+                name: derive_replica_endpoint_name(resource_uid, target),
+                uid: "old-endpoint".into(),
+            },
+        },
+        pod: ExactResourceObservation::NotFound,
+        pvc: ExactResourceObservation::NotFound,
+        endpoint: ExactResourceObservation::NotFound,
+    }
 }
 
 #[test]
 fn replacement_target_loss_before_cc_clears_provisioning() {
-    let accepted = configuration();
+    let accepted = replacement_configuration(2);
     let replacing = accepted
         .members
         .iter()
@@ -4152,6 +6805,7 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
         }),
         ..AcceptedStatus::default()
     };
+    freeze_replacement_fixture(&mut snapshot, &replacing);
     let primary = snapshot
         .status
         .topology
@@ -4226,7 +6880,7 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
 
 #[test]
 fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
-    let accepted = configuration();
+    let accepted = replacement_configuration(2);
     let replacing = accepted
         .members
         .iter()
@@ -4250,7 +6904,7 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: replacing,
+            replaces: replacing.clone(),
             pod_uid: PodUid::new("abandoned-target"),
             pvc_uid: PvcUid::new("abandoned-target-pvc"),
             operation_id: OperationId::new("abandoned-build"),
@@ -4258,6 +6912,7 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
         ..AcceptedStatus::default()
     };
 
+    freeze_replacement_fixture(&mut snapshot, &replacing);
     assert!(matches!(
         evaluate(&snapshot, &EvaluationConfig::default()),
         Plan::Apply { changes }
@@ -4275,7 +6930,24 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
 
 #[test]
 fn replacement_accepts_current_only_quorum_with_missing_target() {
-    let previous = configuration();
+    let configuration = configuration();
+    let mut members = configuration.members.clone();
+    let replacing = members
+        .iter_mut()
+        .find(|m| m.identity.replica_id != configuration.primary_id)
+        .unwrap();
+    replacing.identity.agent_generation = derive_agent_generation(&derive_initialization_id(
+        &ResourceUid::new("resource-uid"),
+        replacing.identity.replica_id,
+        &PodUid::new(replacing.identity.instance_id.as_str()),
+        &PvcUid::new("old-pvc"),
+    ));
+    let previous = ConfigurationDescriptor::new(
+        configuration.epoch,
+        configuration.primary_id,
+        members,
+        configuration.write_quorum,
+    );
     let replacing = previous
         .members
         .iter()
@@ -4309,11 +6981,14 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             .collect(),
         previous.write_quorum,
     );
-    let transition_id = derive_transition_id(
-        &ResourceUid::new("resource"),
-        TransitionKind::Replacement,
-        &current.configuration_id,
-    );
+    let cleanup = kuberic_protocol::types::ReplacementCleanup {
+        resource_uid: ResourceUid::new("resource-uid"),
+        target: replacing.identity.clone(),
+        resources: replacement_resources(&ResourceUid::new("resource-uid"), &replacing.identity)
+            .identity,
+    };
+    let transition_id =
+        cleanup.transition_id(TransitionKind::Replacement, &current.configuration_id);
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
@@ -4322,6 +6997,8 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Replacement,
             spec_generation: 1,
@@ -4335,6 +7012,12 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
         }),
         ..AcceptedStatus::default()
     };
+    snapshot.status.pending_replacement_cleanup = Some(cleanup);
+    let mut resources = replacement_resources(&snapshot.resource_uid, &replacing.identity);
+    resources.pvc = kuberic_protocol::observation::ExactResourceObservation::FrozenUidPresent {
+        resource_version: "held-by-finalizer".into(),
+    };
+    snapshot.secondary_scale_down_resources.push(resources);
     for member in current
         .members
         .iter()
@@ -4425,6 +7108,30 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
     });
     let accepted = accepted.expect("accepted replacement topology");
     snapshot.status = accepted;
+    let first_receipt = snapshot.status.last_replacement.clone().unwrap();
+    for _ in 0..3 {
+        snapshot.status =
+            serde_json::from_value(serde_json::to_value(&snapshot.status).unwrap()).unwrap();
+        assert!(matches!(evaluate(&snapshot, &EvaluationConfig::default()),
+            Plan::Apply { changes } if matches!(changes.as_slice(),
+                [KubernetesChange::DeleteScaleDownResource { resource: kuberic_protocol::command::ScaleDownResource::Pvc, uid, .. }]
+                if uid == "old-pvc")));
+        assert_eq!(
+            snapshot.status.last_replacement,
+            Some(first_receipt.clone())
+        );
+        assert!(snapshot.status.provisioning.is_none());
+    }
+    snapshot.secondary_scale_down_resources[0].pvc =
+        kuberic_protocol::observation::ExactResourceObservation::NotFound;
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("exact absence must clear the cleanup gate");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("cleanup completion");
+    };
+    assert!(status.last_replacement.is_none());
+    snapshot.status = *status;
     snapshot.replicas.insert(
         ReplicaObservationKey::new(
             target.identity.replica_id,
@@ -4453,15 +7160,13 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             })),
         },
     );
-    assert!(matches!(
-        evaluate(&snapshot, &EvaluationConfig::default()),
-        Plan::Apply { changes }
-            if matches!(
-                changes.as_slice(),
-                [KubernetesChange::EnsureReplacementScaffolding { replacing, .. }]
-                    if replacing == &target.identity
-            )
-    ));
+    assert!(
+        matches!(
+            evaluate(&snapshot, &EvaluationConfig::default()),
+            Plan::Wait { .. }
+        ),
+        "the second replacement requires its own authoritative cleanup identity"
+    );
 }
 
 #[test]

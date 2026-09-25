@@ -4,12 +4,15 @@ use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, FaultType,
     InitializationId, LoadMetric, OperationId, PodUid, PvcUid, ReplicaIdentity, ReplicaRole,
-    ResourceUid, SwitchoverHandoff,
+    ResourceUid, SecondaryRemovalEvidence, SecondaryRemovalPreparation, SecondaryScaleDownCleanup,
+    SwitchoverHandoff,
 };
+use kuberic_runtime_internal::authority::RetiredAuthority;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,6 +108,14 @@ pub struct PreparationRetirement {
 #[serde(rename_all = "camelCase")]
 pub struct AgentState {
     pub identity: StorageIdentity,
+    pub admitted_policy: Option<EffectivePolicy>,
+    pub previous_policy: Option<EffectivePolicy>,
+    pub prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
+    pub secondary_removal_evidence: Option<SecondaryRemovalEvidence>,
+    pub accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
+    pub retired_authority: Option<RetiredAuthority>,
+    pub removal_effects: BTreeMap<OperationId, RetainedResult>,
+    pub removal_commands: BTreeMap<OperationId, RetainedCommandResult>,
     pub highest_epoch: Epoch,
     pub previous_configuration: Option<ConfigurationDescriptor>,
     pub current_configuration: Option<ConfigurationDescriptor>,
@@ -138,6 +149,14 @@ impl AgentState {
     pub fn new(identity: StorageIdentity) -> Self {
         Self {
             identity,
+            admitted_policy: None,
+            previous_policy: None,
+            prepared_secondary_removal: None,
+            secondary_removal_evidence: None,
+            accepted_secondary_removal: None,
+            retired_authority: None,
+            removal_effects: BTreeMap::new(),
+            removal_commands: BTreeMap::new(),
             highest_epoch: Epoch::default(),
             previous_configuration: None,
             current_configuration: None,
@@ -157,5 +176,19 @@ impl AgentState {
             retired_switchover: None,
             preparation_retirement: None,
         }
+    }
+
+    pub(crate) fn removal_pending(&self) -> bool {
+        self.prepared_secondary_removal.is_some()
+            || self.pending_effect.as_ref().is_some_and(|p| matches!(
+                p.effect.action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                    | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_)
+            ))
+            || self.secondary_removal_evidence.as_ref().is_some_and(|e| {
+                self.accepted_secondary_removal
+                    .as_ref()
+                    .is_none_or(|c| &c.evidence != e)
+            })
     }
 }

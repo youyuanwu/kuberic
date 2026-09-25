@@ -13,14 +13,18 @@ use crate::types::{
     PrimaryFailureObservation, ProvisioningIntent, QuorumLossObservation, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole, StatusCondition, TransitionIntent,
     TransitionKind, derive_agent_generation, derive_failover_repair_operation_id,
-    derive_initialization_id, derive_replacement_operation_id,
-    derive_switchover_preparation_operation_id, derive_transition_id,
+    derive_initialization_id, derive_switchover_preparation_operation_id, derive_transition_id,
 };
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
 
+mod replacement_cleanup;
+mod secondary_scale_down;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluationConfig {
+    /// Requires exact-resource observation, session-fenced dispatch, and cleanup effects.
+    pub enable_secondary_scale_down: bool,
     pub supported_protocol_version: u32,
     pub stable_resync_seconds: u64,
     pub wait_requeue_seconds: u64,
@@ -30,6 +34,7 @@ pub struct EvaluationConfig {
 impl Default for EvaluationConfig {
     fn default() -> Self {
         Self {
+            enable_secondary_scale_down: false,
             supported_protocol_version: crate::PROTOCOL_VERSION,
             stable_resync_seconds: 30,
             wait_requeue_seconds: 5,
@@ -40,6 +45,13 @@ impl Default for EvaluationConfig {
 
 /// Validates one snapshot and returns the next safe reconciliation outcome.
 pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
+    if !config.enable_secondary_scale_down && (snapshot.status.secondary_scale_down_cleanup.is_some()
+        || snapshot.status.last_secondary_removal.is_some()
+        || snapshot.status.transition.as_ref().is_some_and(|transition| transition.kind == TransitionKind::SecondaryScaleDown)
+        || snapshot.replicas.values().any(|replica| matches!(&replica.agent, AgentObservation::Report(report) if report.prepared_secondary_removal.is_some() || report.secondary_removal_evidence.is_some() || report.retired_replica.is_some() || report.accepted_secondary_removal.is_some())))
+    {
+        return unsafe_plan(snapshot.status.clone(), UnsafeReason::InvalidAcceptedAuthority("Secondary scale-down execution is not enabled".into()), config);
+    }
     let switchover = snapshot
         .status
         .transition
@@ -59,6 +71,17 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         return switchover_unsafe(snapshot, message, config);
     }
     if let Err(error) = validate_snapshot(snapshot) {
+        if config.enable_secondary_scale_down
+            && secondary_scale_down::active(snapshot)
+            && matches!(error, ValidationError::StaleReportSequence { .. })
+        {
+            return secondary_scale_down::wait(
+                snapshot.status.clone(),
+                "ScaleDownFreshReportRequired",
+                "Re-observe a newer report in the exact process session",
+                config,
+            );
+        }
         if switchover.is_some() {
             if matches!(error, ValidationError::StaleReportSequence { .. }) {
                 return switchover_wait(
@@ -115,12 +138,48 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         };
     }
 
+    if let Some(plan) = secondary_scale_down::recover_local_acceptance(snapshot, config) {
+        return plan;
+    }
+
+    if let Some(cleanup) = &snapshot.status.last_replacement {
+        return replacement_cleanup::evaluate(snapshot, cleanup, config);
+    }
+
     if let Some(transition) = &snapshot.status.transition {
+        if matches!(
+            transition.kind,
+            TransitionKind::Replacement | TransitionKind::Failover
+        ) && snapshot.status.topology.as_ref().is_some_and(|t| {
+            t.configuration.members.iter().any(|old| {
+                !transition
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|new| new.identity == old.identity)
+            })
+        }) && snapshot.status.pending_replacement_cleanup.is_none()
+        {
+            return replacement_cleanup::waiting(snapshot, config);
+        }
         return evaluate_transition(snapshot, transition, config);
     }
 
     if let Some(provisioning) = &snapshot.status.provisioning {
+        if snapshot.status.pending_replacement_cleanup.is_none() {
+            return replacement_cleanup::waiting(snapshot, config);
+        }
         return evaluate_provisioning(snapshot, provisioning, config);
+    }
+
+    if let Some(cleanup) = &snapshot.status.secondary_scale_down_cleanup {
+        return secondary_scale_down::cleanup(snapshot, cleanup, config);
+    }
+
+    if let Some(receipt) = &snapshot.status.last_secondary_removal
+        && let Some(plan) = secondary_scale_down::completed(snapshot, receipt, config)
+    {
+        return plan;
     }
 
     if snapshot.status.initialized {
@@ -144,25 +203,48 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         .as_ref()
         .expect("validated initialized status has effective policy");
     let (spec_fully_observed, unsupported) = desired_spec_state(snapshot, configuration, policy);
-    if let Some(condition) = unsupported {
+    if let Some(mut condition) = unsupported {
+        if config.enable_secondary_scale_down
+            && condition.reason == "ReplicaCountImmutable"
+            && snapshot.desired.replicas > policy.replica_set_size
+        {
+            condition.reason = "ScaleUpUnsupported".into();
+        }
         status = status.with_condition(condition);
     } else if spec_fully_observed {
         status.observed_generation = snapshot.desired.generation;
     }
-    status = project_switchover_request(snapshot, status);
-    if switchover_rejection(&status) != switchover_rejection(&snapshot.status) {
-        return Plan::Apply {
-            changes: vec![KubernetesChange::PersistStatus {
-                status: Box::new(status),
-            }],
-        };
-    }
-
     if let Some(plan) = maybe_begin_stable_failover(snapshot, status.clone(), config) {
         return plan;
     }
 
+    let removal_target = (config.enable_secondary_scale_down
+        && snapshot.desired.replicas < policy.replica_set_size
+        && status.pending_replacement_cleanup.is_none())
+    .then(|| {
+        configuration
+            .members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::ActiveSecondary)
+            .max_by_key(|member| member.identity.replica_id)
+    })
+    .flatten();
     if configuration.members.iter().any(|member| {
+        if removal_target == Some(member)
+            && snapshot
+                .observation_for_identity(&member.identity)
+                .is_none_or(|o| !matches!(o.agent, AgentObservation::Report(_)))
+        {
+            return false;
+        }
+        if status
+            .pending_replacement_cleanup
+            .as_ref()
+            .is_some_and(|c| c.target == member.identity)
+            || replacement_needed(snapshot, configuration, member)
+        {
+            return false;
+        }
         snapshot
             .observation_for_identity(&member.identity)
             .and_then(|observation| observation.kubernetes.as_ref())
@@ -189,10 +271,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 AgentObservation::Report(report) => Some(report.as_ref()),
                 _ => None,
             })?;
-        (report.epoch < configuration.epoch
-            && (report.role == ReplicaRole::Primary
-                || report.write_status == AccessStatus::Granted))
-            .then_some((member, report))
+        (report.epoch < configuration.epoch).then_some((member, report))
     }) {
         if let Some(previous) = report.current_configuration.as_ref() {
             return Plan::Execute {
@@ -253,6 +332,27 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         };
     }
 
+    // Converge accepted authority before freezing another transition. Switchover
+    // wins over reduction, which wins over replacing an unavailable removal target.
+    status = project_switchover_request(snapshot, status);
+    if switchover_rejection(&status) != switchover_rejection(&snapshot.status) {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(status),
+            }],
+        };
+    }
+    if status.pending_replacement_cleanup.is_none() {
+        if let Some(plan) = begin_switchover(snapshot, &status, config) {
+            return plan;
+        }
+        if config.enable_secondary_scale_down
+            && let Some(plan) = secondary_scale_down::begin(snapshot, status.clone(), config)
+        {
+            return plan;
+        }
+    }
+
     let recovering_service = status.last_switchover.as_ref().is_some_and(|receipt| {
         matches!(
             receipt.outcome,
@@ -274,44 +374,20 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
             .count()
             >= configuration.write_quorum as usize;
     if let Some(failed) = configuration.members.iter().find(|member| {
+        if let Some(cleanup) = &status.pending_replacement_cleanup {
+            return cleanup.target == member.identity && member.role != ReplicaRole::Primary;
+        }
         if recovering_service {
             return false;
         }
         if member.identity.replica_id == configuration.primary_id {
             return false;
         }
-        let permanent_fault = snapshot
-            .observation_for_identity(&member.identity)
-            .is_some_and(|observation| {
-                matches!(
-                    &observation.agent,
-                    AgentObservation::Report(report)
-                        if report.reported_fault == Some(crate::types::FaultType::Permanent)
-                )
-            });
-        let authorized_lag = snapshot
-            .observation_for_identity(&member.identity)
-            .is_some_and(|observation| {
-                matches!(
-                    &observation.agent,
-                    AgentObservation::Report(report)
-                        if report.role != ReplicaRole::Primary
-                            && report.write_status != AccessStatus::Granted
-                            && report.epoch < configuration.epoch
-                )
-            });
-        let accepted_incarnation_missing = snapshot
-            .observation_for_identity(&member.identity)
-            .and_then(|observation| observation.kubernetes.as_ref())
-            .is_none();
-        let orphaned_storage = snapshot.replicas.iter().any(|(key, observation)| {
-            key.replica_id == member.identity.replica_id
-                && observation.kubernetes.as_ref().is_some_and(|kubernetes| {
-                    kubernetes.pod_uid.is_none() && kubernetes.pvc_uid.is_some()
-                })
-        });
-        permanent_fault || authorized_lag || (accepted_incarnation_missing && orphaned_storage)
+        replacement_needed(snapshot, configuration, member)
     }) {
+        if let Some(plan) = replacement_cleanup::admit(snapshot, &failed.identity, config) {
+            return plan;
+        }
         let candidate = snapshot.replicas.iter().find(|(key, observation)| {
             key.replica_id == failed.identity.replica_id
                 && key.instance_id != failed.identity.instance_id
@@ -347,12 +423,12 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         );
         replacement_status.provisioning = Some(ProvisioningIntent {
             replaces: failed.identity.clone(),
-            operation_id: derive_replacement_operation_id(
-                &snapshot.resource_uid,
-                &failed.identity,
-                &pod_uid,
-                &pvc_uid,
-            ),
+            operation_id: snapshot
+                .status
+                .pending_replacement_cleanup
+                .as_ref()
+                .expect("admission persisted cleanup")
+                .provisioning_operation_id(&pod_uid, &pvc_uid),
             pod_uid,
             pvc_uid,
         });
@@ -363,6 +439,10 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         };
     }
 
+    if status.pending_replacement_cleanup.is_some() {
+        return replacement_cleanup::waiting(snapshot, config);
+    }
+    status = status.without_condition("UnmanagedReplicaResources");
     if let Some(extra) = snapshot.replicas.iter().find_map(|(key, observation)| {
         let accepted = configuration.members.iter().any(|member| {
             member.identity.replica_id == key.replica_id
@@ -371,11 +451,19 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         (!accepted)
             .then_some(observation.kubernetes.as_ref())
             .flatten()
-    }) && !recovering_service
-    {
-        return Plan::Apply {
-            changes: vec![delete_scaffolding_change(extra)],
-        };
+    }) {
+        if config.enable_secondary_scale_down {
+            status = status.with_condition(StatusCondition {
+                type_: "UnmanagedReplicaResources".into(),
+                status: ConditionStatus::True,
+                reason: "ExactCleanupAuthorityRequired".into(),
+                message: "Extra resources are not deletion authority; an exact lifecycle receipt is required".into(),
+            });
+        } else if !recovering_service {
+            return Plan::Apply {
+                changes: vec![delete_scaffolding_change(extra)],
+            };
+        }
     }
 
     let primary = configuration
@@ -544,9 +632,6 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 ],
             };
         }
-    }
-    if let Some(plan) = begin_switchover(snapshot, &status, config) {
-        return plan;
     }
     status = status.with_condition(ready_condition());
     Plan::Stable {
@@ -741,6 +826,8 @@ fn begin_switchover(
         "Frozen the exact source, target, and requested authority before revoking routing",
     );
     status.transition = Some(TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: derive_transition_id(
             &snapshot.resource_uid,
             TransitionKind::PlannedSwitchover,
@@ -1708,6 +1795,8 @@ fn switchover_configuration_command(
         .as_ref()
         .unwrap();
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: switchover_operation_id(transition, member, current_only),
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: transition.current_configuration.clone(),
@@ -1871,10 +1960,12 @@ fn maybe_begin_stable_failover(
         ),
     );
     status.transition = Some(TransitionIntent {
-        transition_id: derive_transition_id(
-            &snapshot.resource_uid,
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
+        transition_id: replacement_cleanup::transition_id(
+            snapshot,
             TransitionKind::Failover,
-            &current.configuration_id,
+            &current,
         ),
         kind: TransitionKind::Failover,
         spec_generation: snapshot.status.observed_generation,
@@ -2004,6 +2095,8 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
     let current_configuration =
         ConfigurationDescriptor::new(Epoch::new(0, 1), primary_id, members, policy.write_quorum);
     let transition = TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: derive_transition_id(
             &snapshot.resource_uid,
             TransitionKind::Bootstrap,
@@ -2037,6 +2130,9 @@ fn evaluate_transition(
     transition: &TransitionIntent,
     config: &EvaluationConfig,
 ) -> Plan {
+    if transition.kind == TransitionKind::SecondaryScaleDown {
+        return secondary_scale_down::transition(snapshot, transition, config);
+    }
     if transition.kind == TransitionKind::PlannedSwitchover {
         return evaluate_switchover(snapshot, transition, config);
     }
@@ -2235,10 +2331,12 @@ fn evaluate_transition(
         );
         let current = configuration_with_primary(basis, &candidate.identity, next_epoch);
         status.transition = Some(TransitionIntent {
-            transition_id: derive_transition_id(
-                &snapshot.resource_uid,
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
+            transition_id: replacement_cleanup::transition_id(
+                snapshot,
                 TransitionKind::Failover,
-                &current.configuration_id,
+                &current,
             ),
             kind: TransitionKind::Failover,
             spec_generation: active_transition
@@ -2413,10 +2511,12 @@ fn evaluate_transition(
                     ),
                 );
                 status.transition = Some(TransitionIntent {
-                    transition_id: derive_transition_id(
-                        &snapshot.resource_uid,
+                    secondary_scale_down: None,
+                    secondary_removal_evidence: None,
+                    transition_id: replacement_cleanup::transition_id(
+                        snapshot,
                         TransitionKind::Failover,
-                        &corrected.configuration_id,
+                        &corrected,
                     ),
                     kind: TransitionKind::Failover,
                     spec_generation: transition.spec_generation,
@@ -2586,20 +2686,18 @@ fn evaluate_transition(
                 configuration: current.clone(),
             });
             accepted.transition = None;
+            if retired.is_some() {
+                accepted.last_replacement = accepted.pending_replacement_cleanup.take();
+            }
             accepted.primary_failure = None;
             accepted.quorum_loss = None;
             accepted = accepted.with_condition(progressing_condition(
                 "FailoverTopologyAccepted",
                 "Accepted the epoch-fenced failover topology",
             ));
-            let mut changes = vec![KubernetesChange::PersistStatus {
+            let changes = vec![KubernetesChange::PersistStatus {
                 status: Box::new(accepted),
             }];
-            if let Some(retired) = retired {
-                changes.push(KubernetesChange::DeleteReplicaEndpoint {
-                    identity: retired.identity.clone(),
-                });
-            }
             return Plan::Apply { changes };
         }
 
@@ -2730,6 +2828,8 @@ fn evaluate_transition(
         );
         let mut superseded = snapshot.status.clone();
         superseded.transition = Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Bootstrap,
@@ -2843,6 +2943,33 @@ fn evaluate_transition(
         status,
         requeue_after_seconds: config.wait_requeue_seconds,
     }
+}
+
+fn replacement_needed(
+    snapshot: &ObservationSnapshot,
+    configuration: &ConfigurationDescriptor,
+    member: &ConfigurationMember,
+) -> bool {
+    if member.role == ReplicaRole::Primary {
+        return false;
+    }
+    let observation = snapshot.observation_for_identity(&member.identity);
+    let faulty = observation.is_some_and(|o| {
+        matches!(&o.agent,
+        AgentObservation::Report(report)
+            if report.reported_fault == Some(crate::types::FaultType::Permanent)
+                || (report.role != ReplicaRole::Primary
+                    && report.write_status != AccessStatus::Granted
+                    && report.epoch < configuration.epoch))
+    });
+    let missing = observation.and_then(|o| o.kubernetes.as_ref()).is_none();
+    let orphaned_storage = snapshot.replicas.iter().any(|(key, o)| {
+        key.replica_id == member.identity.replica_id
+            && o.kubernetes
+                .as_ref()
+                .is_some_and(|k| k.pod_uid.is_none() && k.pvc_uid.is_some())
+    });
+    faulty || (missing && orphaned_storage)
 }
 
 fn evaluate_provisioning(
@@ -3011,10 +3138,12 @@ fn evaluate_provisioning(
             let mut transition_status = snapshot.status.clone();
             transition_status.provisioning = None;
             transition_status.transition = Some(TransitionIntent {
-                transition_id: derive_transition_id(
-                    &snapshot.resource_uid,
+                secondary_scale_down: None,
+                secondary_removal_evidence: None,
+                transition_id: replacement_cleanup::transition_id(
+                    snapshot,
                     TransitionKind::Replacement,
-                    &current.configuration_id,
+                    &current,
                 ),
                 kind: TransitionKind::Replacement,
                 spec_generation: snapshot.status.observed_generation,
@@ -3232,35 +3361,21 @@ fn evaluate_replacement_transition(
         report.identity == primary.identity && report.write_status == AccessStatus::Granted
     });
     if primary_ready && configuration_report_quorum(current, &current_only_reports) {
-        let retired = previous
-            .members
-            .iter()
-            .find(|previous_member| {
-                current.members.iter().all(|current_member| {
-                    current_member.identity.replica_id != previous_member.identity.replica_id
-                        || current_member.identity != previous_member.identity
-                })
-            })
-            .expect("validated replacement changes one exact incarnation")
-            .identity
-            .clone();
         let mut accepted = clear_evaluator_conditions(snapshot.status.clone());
         accepted.observed_generation = transition.spec_generation;
         accepted.topology = Some(AcceptedTopology {
             configuration: current.clone(),
         });
         accepted.transition = None;
+        accepted.last_replacement = accepted.pending_replacement_cleanup.take();
         accepted = accepted.with_condition(progressing_condition(
             "ReplacementTopologyAccepted",
             "Accepted the equal-cardinality replacement topology",
         ));
         return Plan::Apply {
-            changes: vec![
-                KubernetesChange::PersistStatus {
-                    status: Box::new(accepted),
-                },
-                KubernetesChange::DeleteReplicaEndpoint { identity: retired },
-            ],
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(accepted),
+            }],
         };
     }
 
@@ -3652,6 +3767,8 @@ fn failover_configuration_command(
     retire_build_ids: Vec<OperationId>,
 ) -> EnsureConfiguration {
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id,
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: current.clone(),
@@ -3703,6 +3820,8 @@ fn replacement_configuration_command(
     retire_build_id: Option<OperationId>,
 ) -> EnsureConfiguration {
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id,
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: current.clone(),
@@ -3816,6 +3935,8 @@ fn ensure_configuration_command(
     current_only: bool,
 ) -> EnsureConfiguration {
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id,
         previous_configuration: None,
         current_configuration: configuration.clone(),

@@ -55,6 +55,7 @@ pub struct ReplicaDiagnostics {
     pub current_progress: i64,
     pub committed_lsn: i64,
     pub write_status: String,
+    pub retired: bool,
     pub pending_operation: Option<String>,
     pub builds: Vec<ReplicaBuildDiagnostics>,
 }
@@ -98,6 +99,7 @@ impl ReplicaHandle {
             current_progress: snapshot.current_progress,
             committed_lsn: snapshot.committed_lsn,
             write_status: format!("{:?}", snapshot.write_status),
+            retired: state.retired_authority.is_some() || snapshot.retired_authority.is_some(),
             pending_operation: state
                 .reconfiguration
                 .as_ref()

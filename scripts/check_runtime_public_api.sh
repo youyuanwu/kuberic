@@ -6,9 +6,12 @@ cd "$(dirname "$0")/.."
 doc_root="target/doc/kuberic_runtime"
 allowlist="scripts/runtime_public_api.allowlist"
 fixture="scripts/fixtures/runtime-api-leak"
-inventory=$(mktemp)
-fixture_output=$(mktemp)
-trap 'rm -f -- "$inventory" "$fixture_output" "$fixture/Cargo.lock"; rm -rf -- "$fixture/target"' EXIT
+scratch="target/runtime-api-check-$$"
+mkdir -p target
+mkdir "$scratch"
+inventory="$scratch/inventory"
+fixture_output="$scratch/fixture-output"
+trap 'rm -f -- "$fixture/Cargo.lock"; rm -rf -- "$scratch" "$fixture/target"' EXIT
 
 rm -rf -- "$doc_root"
 cargo doc -p kuberic-runtime --no-deps --quiet

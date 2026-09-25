@@ -7,6 +7,43 @@ what each layer validates, and known gaps.
 
 ---
 
+## Independent Level-Triggered Stack
+
+The classic test layers below remain unchanged. The independent v2 stack adds
+pure protocol/model tests, durable SQLite subprocess crash tests, runtime
+successful-write and session-fencing tests, controller exact-resource race tests,
+and explicitly owned KinD scenarios. Secondary scale-down covers healthy 3→2,
+2→1 and singleton restart, sequential 5→2, unavailable-target evidence, retirement,
+and exact Pod/PVC/endpoint cleanup without deleting replacement UIDs.
+
+The scale-down routed-write assertion verifies the exact primary Service selector
+and requires HTTP 200 through `kvstore2-write` before recording an acknowledged
+value. Within the existing scenario deadline, it retries HTTP 503 and recognized
+curl transport or Kubernetes exec/restart races: Pod readiness can precede
+EndpointSlice recovery. Other HTTP statuses (including 500), malformed responses,
+and unknown command failures fail immediately with the last status/stderr.
+Retained-session and deleted-target rejection assertions remain strict.
+
+```bash
+cargo test -p kuberic-protocol --test protocol --test model
+cargo test -p kuberic-agent --test crash_boundaries --test runtime -- --test-threads=1
+cargo test -p kuberic-controller --test controller
+scripts/check_level_triggered_documentation.sh
+# After the owned-cluster installation:
+just level-triggered-kind-test scale-down
+just level-triggered-kind-test scale-down-adversarial
+just level-triggered-kind-test all
+```
+
+Run `all` from fresh bootstrap, not after standalone failover. The
+[Level-Triggered CI workflow](../../../.github/workflows/level-triggered-CI.yml)
+runs serial targeted tests and PR smoke including healthy scale-down; scheduled
+or full manual CI repeats all seven live scenarios on two fresh clusters.
+The [operator guide](level-triggered-operator.md#tests-and-diagnostics) documents
+ownership checks, diagnostics, final measured timings, and availability limits.
+
+---
+
 ## Test Layers
 
 The project uses three testing layers, each with different scope and

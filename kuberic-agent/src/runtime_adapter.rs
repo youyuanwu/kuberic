@@ -59,7 +59,15 @@ where
                             | kuberic_runtime::RuntimeError::ReplicaRemoved(_),
                         ),
                     ) => {
-                        self.store.cancel_effect(&effect).await?;
+                        let state = self.store.load_state().await?;
+                        let removal = matches!(effect.action,
+                            kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                                | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_))
+                            || state.reconfiguration.as_ref().is_some_and(|r|
+                                r.command.transition_kind == kuberic_protocol::types::TransitionKind::SecondaryScaleDown);
+                        if !removal {
+                            self.store.cancel_effect(&effect).await?;
+                        }
                         return Err(error);
                     }
                     Err(error) => return Err(error),

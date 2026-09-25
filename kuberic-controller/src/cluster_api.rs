@@ -15,7 +15,7 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Precon
 use kube::{Api, Client, Resource, ResourceExt};
 use kuberic_protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
-    ProtocolCommand,
+    ProtocolCommand, ScaleDownResource,
 };
 use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
@@ -32,7 +32,9 @@ use crate::crd::{
     CONTROL_ADDRESS_ANNOTATION, CONTROLLER_NAME, INSTANCE_LABEL, KubericSet, KubericSetStatus,
     REPLICA_ID_LABEL, SET_UID_LABEL,
 };
-use crate::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
+use crate::observation::{
+    ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
+};
 use crate::{ControllerError, Result};
 
 const CONTROL_PORT: i32 = 50051;
@@ -40,6 +42,12 @@ const REPLICATION_PORT: i32 = 50052;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
+    DeleteScaleDownResource {
+        resource: ScaleDownResource,
+        name: String,
+        uid: String,
+        resource_version: String,
+    },
     EnsureReplicaSupport,
     EnsureScaffolding(Vec<ReplicaId>),
     EnsureReplacement(ReplicaIdentity),
@@ -84,6 +92,15 @@ pub trait AgentApi: Send + Sync {
 #[async_trait]
 pub trait ClusterApi: Send + Sync {
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation>;
+
+    async fn delete_scale_down_resource(
+        &self,
+        observation: &RawObservation,
+        resource: ScaleDownResource,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()>;
 
     async fn ensure_replica_scaffolding(
         &self,
@@ -216,7 +233,7 @@ fn add_bearer_token<T>(
 
 fn classify_status(status: tonic::Status) -> AgentRpcError {
     match status.code() {
-        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => {
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Unknown => {
             AgentRpcError::Unavailable(status.to_string())
         }
         _ => AgentRpcError::Invalid(status.to_string()),
@@ -226,7 +243,14 @@ fn classify_status(status: tonic::Status) -> AgentRpcError {
 fn classify_execute_status(status: tonic::Status) -> AgentRpcError {
     // Session or authority may have advanced after GetStatus. A rejected
     // dispatch is not a contradictory report and must be resolved by observing.
-    if matches!(status.code(), Code::FailedPrecondition | Code::Aborted) {
+    if matches!(
+        status.code(),
+        Code::FailedPrecondition
+            | Code::Aborted
+            | Code::Internal
+            | Code::Unknown
+            | Code::ResourceExhausted
+    ) {
         AgentRpcError::Unavailable(status.to_string())
     } else {
         classify_status(status)
@@ -260,6 +284,46 @@ impl<A> ClusterApi for KubeClusterApi<A>
 where
     A: AgentApi + 'static,
 {
+    async fn delete_scale_down_resource(
+        &self,
+        observation: &RawObservation,
+        resource: ScaleDownResource,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()> {
+        let params = scale_down_delete_params(observation, resource, name, uid, resource_version)?;
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or(ControllerError::ObservationStale)?;
+        match resource {
+            ScaleDownResource::Pod => {
+                delete_scale_down_exact(
+                    &Api::<Pod>::namespaced(self.client.clone(), &namespace),
+                    name,
+                    &params,
+                )
+                .await
+            }
+            ScaleDownResource::Pvc => {
+                delete_scale_down_exact(
+                    &Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), &namespace),
+                    name,
+                    &params,
+                )
+                .await
+            }
+            ScaleDownResource::Endpoint => {
+                delete_scale_down_exact(
+                    &Api::<Service>::namespaced(self.client.clone(), &namespace),
+                    name,
+                    &params,
+                )
+                .await
+            }
+        }
+    }
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation> {
         let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), namespace);
         let set = sets
@@ -287,16 +351,35 @@ where
         let services = list_or_failure(services_result, "services", &mut failures);
         let secrets = list_or_failure(secrets_result, "secrets", &mut failures);
         let resource_uid = ResourceUid::new(uid);
-        let agent_requests = pods
+        let mut raw = RawObservation {
+            set,
+            pods,
+            pvcs,
+            services,
+            secrets,
+            failures,
+            agents: BTreeMap::new(),
+            exact_resources: Vec::new(),
+            now_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| ControllerError::Observation(error.to_string()))?
+                .as_secs() as i64,
+        };
+        observe_exact_resources(&mut raw, &pods_api, &pvcs_api, &services_api).await;
+        let agent_requests = raw
+            .pods
             .iter()
             .filter_map(|pod| {
-                let replica_id = pod
-                    .labels()
-                    .get(REPLICA_ID_LABEL)?
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .map(ReplicaId::new)?;
+                let replica_id = crate::exact_resources::frozen_pod_target(&raw, pod)
+                    .map(|t| t.replica_id)
+                    .or_else(|| {
+                        pod.labels()
+                            .get(REPLICA_ID_LABEL)?
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|value| *value > 0)
+                            .map(ReplicaId::new)
+                    })?;
                 Some((replica_id, pod.clone()))
             })
             .map(|(replica_id, pod)| {
@@ -311,24 +394,14 @@ where
                     )
                 }
             });
-        let agents = join_all(agent_requests)
+        raw.agents = join_all(agent_requests)
             .await
             .into_iter()
             .collect::<BTreeMap<_, _>>();
+        // Permanent faults and lag are known only after observing the agents.
+        observe_exact_resources(&mut raw, &pods_api, &pvcs_api, &services_api).await;
 
-        Ok(RawObservation {
-            set,
-            pods,
-            pvcs,
-            services,
-            secrets,
-            agents,
-            failures,
-            now_unix_seconds: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| ControllerError::Observation(error.to_string()))?
-                .as_secs() as i64,
-        })
+        Ok(raw)
     }
 
     async fn ensure_replica_scaffolding(
@@ -553,6 +626,11 @@ where
         pvc_name: Option<&str>,
         pvc_uid: Option<&PvcUid>,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, pod_name, pod_uid.map(PodUid::as_str))
+            || crate::exact_resources::protected(observation, pvc_name, pvc_uid.map(PvcUid::as_str))
+        {
+            return Err(ControllerError::ObservationStale);
+        }
         let namespace = observation
             .set
             .namespace()
@@ -568,6 +646,13 @@ where
         {
             let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
             let service_uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+            if crate::exact_resources::protected(
+                observation,
+                Some(&service.name_any()),
+                Some(&service_uid),
+            ) {
+                return Err(ControllerError::ObservationStale);
+            }
             delete_exact(&services, &service.name_any(), &service_uid).await?;
         }
         let pod = pod_uid.and_then(|uid| {
@@ -605,6 +690,9 @@ where
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+            return Err(ControllerError::ObservationStale);
+        }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
         let namespace = observation
             .set
@@ -633,6 +721,9 @@ where
             .map(ResourceUid::new)
             .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
         let name = derive_replica_endpoint_name(&resource_uid, identity);
+        if crate::exact_resources::protected(observation, Some(&name), None) {
+            return Err(ControllerError::ObservationStale);
+        }
         let Some(service) = observation
             .services
             .iter()
@@ -761,9 +852,12 @@ where
             .pods
             .iter()
             .find(|pod| {
-                pod.labels()
-                    .get(REPLICA_ID_LABEL)
-                    .is_some_and(|value| value == &replica_id.to_string())
+                (crate::exact_resources::frozen_pod_target(observation, pod)
+                    .is_some_and(|t| t == &target)
+                    || pod
+                        .labels()
+                        .get(REPLICA_ID_LABEL)
+                        .is_some_and(|value| value == &replica_id.to_string()))
                     && pod.uid().as_deref() == Some(target.instance_id.as_str())
             })
             .ok_or(ControllerError::ObservationStale)?;
@@ -788,7 +882,7 @@ where
                     target,
                     expected_process_session_id,
                     command.clone(),
-                ),
+                )?,
             )
             .await
             .map_err(map_agent_effect_error)?;
@@ -1596,6 +1690,16 @@ fn map_agent_effect_error(error: AgentRpcError) -> ControllerError {
 
 fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
     match command {
+        ProtocolCommand::AcceptSecondaryRemovalCommit(command) => {
+            (command.target.clone(), command.target.replica_id)
+        }
+        ProtocolCommand::PrepareSecondaryRemoval(command) => {
+            (command.intent.primary.clone(), command.local_replica_id)
+        }
+        ProtocolCommand::RetireReplica(command) => (
+            command.committed.evidence.preparation.intent.target.clone(),
+            command.local_replica_id,
+        ),
         ProtocolCommand::InitializeAgentStore(command) => {
             let identity = ReplicaIdentity {
                 replica_id: command.local_replica_id,
@@ -1631,8 +1735,21 @@ fn command_request(
     target: ReplicaIdentity,
     expected_process_session_id: String,
     command: ProtocolCommand,
-) -> proto::ExecuteCommandRequest {
+) -> Result<proto::ExecuteCommandRequest> {
     let command = match command {
+        ProtocolCommand::AcceptSecondaryRemovalCommit(command) => {
+            proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(Box::new(
+                (*command).into(),
+            ))
+        }
+        ProtocolCommand::PrepareSecondaryRemoval(command) => {
+            proto::execute_command_request::Command::PrepareSecondaryRemoval(Box::new(
+                (*command).into(),
+            ))
+        }
+        ProtocolCommand::RetireReplica(command) => {
+            proto::execute_command_request::Command::RetireReplica(Box::new((*command).into()))
+        }
         ProtocolCommand::InitializeAgentStore(command) => {
             proto::execute_command_request::Command::InitializeAgentStore(initialize_command(
                 *command,
@@ -1654,13 +1771,13 @@ fn command_request(
             ))
         }
     };
-    proto::ExecuteCommandRequest {
+    Ok(proto::ExecuteCommandRequest {
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid,
         target: Some(target.into()),
         expected_process_session_id,
         command: Some(command),
-    }
+    })
 }
 
 fn initialize_command(command: InitializeAgentStore) -> proto::InitializeAgentStoreCommand {
@@ -1680,6 +1797,8 @@ fn initialize_command(command: InitializeAgentStore) -> proto::InitializeAgentSt
 
 fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCommand {
     proto::EnsureConfigurationCommand {
+        previous_policy: command.previous_policy.map(Into::into),
+        secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
         operation_id: command.operation_id.to_string(),
         previous_configuration: command.previous_configuration.map(Into::into),
         current_configuration: Some(command.current_configuration.into()),
@@ -1775,6 +1894,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::Replacement => proto::TransitionKind::Replacement,
         TransitionKind::Failover => proto::TransitionKind::Failover,
         TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
+        TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
     }
 }
 
@@ -1792,6 +1912,8 @@ struct InMemoryState {
     max_active_observations: usize,
     observation_delay: Duration,
     unavailable_next_execute: bool,
+    lost_next_delete_reply: bool,
+    exact_lookup_failures: BTreeMap<String, String>,
 }
 
 impl InMemoryClusterApi {
@@ -1806,6 +1928,8 @@ impl InMemoryClusterApi {
                 max_active_observations: 0,
                 observation_delay: Duration::ZERO,
                 unavailable_next_execute: false,
+                lost_next_delete_reply: false,
+                exact_lookup_failures: BTreeMap::new(),
             })),
         }
     }
@@ -1824,6 +1948,19 @@ impl InMemoryClusterApi {
 
     pub async fn unavailable_next_execute(&self) {
         self.state.lock().await.unavailable_next_execute = true;
+    }
+
+    pub async fn lose_next_delete_reply(&self) {
+        self.state.lock().await.lost_next_delete_reply = true;
+    }
+
+    pub async fn fail_exact_lookup(&self, kind_and_name: String, message: Option<String>) {
+        let mut state = self.state.lock().await;
+        if let Some(message) = message {
+            state.exact_lookup_failures.insert(kind_and_name, message);
+        } else {
+            state.exact_lookup_failures.remove(&kind_and_name);
+        }
     }
 
     pub async fn effects(&self) -> Vec<EffectRecord> {
@@ -1845,6 +1982,39 @@ impl InMemoryClusterApi {
 
 #[async_trait]
 impl ClusterApi for InMemoryClusterApi {
+    async fn delete_scale_down_resource(
+        &self,
+        observation: &RawObservation,
+        resource: ScaleDownResource,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()> {
+        let params = scale_down_delete_params(observation, resource, name, uid, resource_version)?;
+        let mut state = self.state.lock().await;
+        if state.observation.set.resource_version() != observation.set.resource_version() {
+            return Err(ControllerError::ObservationStale);
+        }
+        match resource {
+            ScaleDownResource::Pod => memory_delete(&mut state.observation.pods, name, &params)?,
+            ScaleDownResource::Pvc => memory_delete(&mut state.observation.pvcs, name, &params)?,
+            ScaleDownResource::Endpoint => {
+                memory_delete(&mut state.observation.services, name, &params)?
+            }
+        }
+        state.effects.push(EffectRecord::DeleteScaleDownResource {
+            resource,
+            name: name.into(),
+            uid: uid.into(),
+            resource_version: resource_version.into(),
+        });
+        if state.lost_next_delete_reply {
+            state.lost_next_delete_reply = false;
+            return Err(ControllerError::ObservationStale);
+        }
+        Ok(())
+    }
+
     async fn observe(&self, _namespace: &str, _name: &str) -> Result<RawObservation> {
         let delay = {
             let mut state = self.state.lock().await;
@@ -1857,7 +2027,48 @@ impl ClusterApi for InMemoryClusterApi {
         tokio::time::sleep(delay).await;
         let mut state = self.state.lock().await;
         state.active_observations -= 1;
-        Ok(state.observation.clone())
+        let physical = &state.observation;
+        let mut raw = physical.clone();
+        raw.exact_resources.clear();
+        let uid = raw.set.uid().unwrap_or_default();
+        raw.pods
+            .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
+        raw.pvcs
+            .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
+        raw.services
+            .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
+        for (target, identity, frozen) in crate::exact_resources::requests(&raw) {
+            let pod = memory_lookup(
+                &physical.pods,
+                "Pod",
+                crate::exact_resources::name(&identity.pod),
+                &state.exact_lookup_failures,
+            );
+            let pvc = memory_lookup(
+                &physical.pvcs,
+                "PVC",
+                crate::exact_resources::name(&identity.pvc),
+                &state.exact_lookup_failures,
+            );
+            let endpoint = memory_lookup(
+                &physical.services,
+                "Service",
+                crate::exact_resources::name(&identity.endpoint),
+                &state.exact_lookup_failures,
+            );
+            crate::exact_resources::finish(
+                &mut raw,
+                RawScaleDownResources {
+                    target,
+                    identity,
+                    pod,
+                    pvc,
+                    endpoint,
+                },
+                frozen,
+            );
+        }
+        Ok(raw)
     }
 
     async fn ensure_replica_scaffolding(
@@ -1953,13 +2164,44 @@ impl ClusterApi for InMemoryClusterApi {
 
     async fn delete_replica_scaffolding(
         &self,
-        _observation: &RawObservation,
+        observation: &RawObservation,
         pod_name: Option<&str>,
-        _pod_uid: Option<&PodUid>,
+        pod_uid: Option<&PodUid>,
         pvc_name: Option<&str>,
-        _pvc_uid: Option<&PvcUid>,
+        pvc_uid: Option<&PvcUid>,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, pod_name, pod_uid.map(PodUid::as_str))
+            || crate::exact_resources::protected(observation, pvc_name, pvc_uid.map(PvcUid::as_str))
+        {
+            return Err(ControllerError::ObservationStale);
+        }
+        let service = pod_uid.and_then(|pod_uid| {
+            observation.services.iter().find(|service| {
+                service.spec.as_ref().is_some_and(|spec| {
+                    spec.selector.as_ref().is_some_and(|selector| {
+                        selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
+                    })
+                })
+            })
+        });
+        if let Some(service) = service {
+            let service_uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+            if crate::exact_resources::protected(
+                observation,
+                Some(&service.name_any()),
+                Some(&service_uid),
+            ) {
+                return Err(ControllerError::ObservationStale);
+            }
+        }
         let mut state = self.state.lock().await;
+        if let Some(service) = service {
+            let name = service.name_any();
+            let uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+            state.observation.services.retain(|candidate| {
+                candidate.name_any() != name || candidate.uid().as_deref() != Some(uid.as_str())
+            });
+        }
         if let Some(name) = pod_name {
             state.observation.pods.retain(|pod| pod.name_any() != name);
         } else if let Some(name) = pvc_name {
@@ -1978,6 +2220,9 @@ impl ClusterApi for InMemoryClusterApi {
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+            return Err(ControllerError::ObservationStale);
+        }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
         let mut state = self.state.lock().await;
         if let Some(pod) = state
@@ -2016,6 +2261,9 @@ impl ClusterApi for InMemoryClusterApi {
             .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
         let name = derive_replica_endpoint_name(&resource_uid, identity);
         let mut state = self.state.lock().await;
+        if crate::exact_resources::protected(observation, Some(&name), None) {
+            return Err(ControllerError::ObservationStale);
+        }
         state
             .observation
             .services
@@ -2146,10 +2394,25 @@ impl ClusterApi for InMemoryClusterApi {
 
     async fn execute_command(
         &self,
-        _observation: &RawObservation,
+        observation: &RawObservation,
         command: &ProtocolCommand,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
+        let (target, replica_id) = command_target(command);
+        let session = observed_process_session(observation, replica_id, &target)?;
+        if observed_process_session(&state.observation, replica_id, &target)? != session {
+            return Err(ControllerError::ObservationStale);
+        }
+        kuberic_wire::validate_execute_request(&command_request(
+            observation
+                .set
+                .uid()
+                .ok_or(ControllerError::ObservationStale)?,
+            target,
+            session,
+            command.clone(),
+        )?)
+        .map_err(|e| ControllerError::InvalidAgentEvidence(e.to_string()))?;
         state.effects.push(EffectRecord::Execute(command.clone()));
         if state.unavailable_next_execute {
             state.unavailable_next_execute = false;
@@ -2158,6 +2421,145 @@ impl ClusterApi for InMemoryClusterApi {
             ));
         }
         Ok(())
+    }
+}
+
+fn memory_lookup<K: ResourceExt + Clone>(
+    objects: &[K],
+    kind: &str,
+    name: &str,
+    failures: &BTreeMap<String, String>,
+) -> ExactLookup<K> {
+    if let Some(message) = failures.get(&format!("{kind}/{name}")) {
+        ExactLookup::Failed(message.clone())
+    } else {
+        objects
+            .iter()
+            .find(|o| o.name_any() == name)
+            .cloned()
+            .map(ExactLookup::Present)
+            .unwrap_or(ExactLookup::NotFound)
+    }
+}
+
+fn memory_delete<K: ResourceExt>(
+    objects: &mut Vec<K>,
+    name: &str,
+    params: &DeleteParams,
+) -> Result<()> {
+    let object = objects
+        .iter()
+        .find(|o| o.name_any() == name)
+        .ok_or(ControllerError::ObservationStale)?;
+    let conditions = params
+        .preconditions
+        .as_ref()
+        .ok_or(ControllerError::ObservationStale)?;
+    if object.uid() != conditions.uid
+        || (conditions.resource_version.is_some()
+            && object.resource_version() != conditions.resource_version)
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    if object.meta().finalizers.as_ref().is_none_or(Vec::is_empty) {
+        objects.retain(|o| o.name_any() != name);
+    }
+    Ok(())
+}
+
+async fn observe_exact_resources(
+    raw: &mut RawObservation,
+    pods: &Api<Pod>,
+    pvcs: &Api<PersistentVolumeClaim>,
+    services: &Api<Service>,
+) {
+    for (target, identity, frozen) in crate::exact_resources::requests(raw) {
+        if raw.exact_resources.iter().any(|r| r.target == target) {
+            continue;
+        }
+        let (pod, pvc, endpoint) = tokio::join!(
+            exact_lookup(pods, crate::exact_resources::name(&identity.pod)),
+            exact_lookup(pvcs, crate::exact_resources::name(&identity.pvc)),
+            exact_lookup(services, crate::exact_resources::name(&identity.endpoint)),
+        );
+        crate::exact_resources::finish(
+            raw,
+            RawScaleDownResources {
+                target,
+                identity,
+                pod,
+                pvc,
+                endpoint,
+            },
+            frozen,
+        );
+    }
+}
+
+async fn exact_lookup<K>(api: &Api<K>, name: &str) -> ExactLookup<K>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned + kube::Resource<DynamicType = ()>,
+{
+    match api.get(name).await {
+        Ok(object) => ExactLookup::Present(object),
+        Err(kube::Error::Api(response)) if response.code == 404 => ExactLookup::NotFound,
+        Err(error) => ExactLookup::Failed(error.to_string()),
+    }
+}
+
+fn scale_down_delete_params(
+    observation: &RawObservation,
+    resource: ScaleDownResource,
+    name: &str,
+    uid: &str,
+    resource_version: &str,
+) -> Result<DeleteParams> {
+    // Re-evaluate the immutable observation at the effect boundary. Only the
+    // active accepted cleanup receipt can authorize this exact single deletion.
+    let snapshot = crate::normalize::normalize(observation.clone(), BTreeMap::new())?;
+    let plan = kuberic_protocol::evaluator::evaluate(
+        &snapshot,
+        &kuberic_protocol::evaluator::EvaluationConfig {
+            enable_secondary_scale_down: true,
+            ..Default::default()
+        },
+    );
+    let expected = kuberic_protocol::command::KubernetesChange::DeleteScaleDownResource {
+        resource,
+        name: name.into(),
+        uid: uid.into(),
+        resource_version: resource_version.into(),
+    };
+    if !matches!(plan, kuberic_protocol::plan::Plan::Apply { changes } if changes == vec![expected])
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    Ok(DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid.into()),
+            resource_version: Some(resource_version.into()),
+        }),
+        ..Default::default()
+    })
+}
+
+async fn delete_scale_down_exact<K>(api: &Api<K>, name: &str, params: &DeleteParams) -> Result<()>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned + kube::Resource<DynamicType = ()>,
+{
+    match api.delete(name, params).await {
+        Ok(_) => Ok(()),
+        // A racing 404 or an ambiguous response requires another exact GET.
+        Err(kube::Error::Api(response))
+            if matches!(response.code, 404 | 408 | 409 | 412 | 422 | 429 | 500..=599) =>
+        {
+            Err(ControllerError::ObservationStale)
+        }
+        Err(error @ kube::Error::Api(_)) => Err(map_kube_effect_error(error)),
+        Err(error) => {
+            tracing::warn!(%error, %name, "exact deletion reply is unconfirmed; re-observe");
+            Err(ControllerError::ObservationStale)
+        }
     }
 }
 
@@ -2229,6 +2631,11 @@ fn role_label(role: ReplicaRole) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod scale_down_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::crd::KubericSetSpec;
@@ -2246,6 +2653,185 @@ mod tests {
             instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
             agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
         }
+    }
+
+    async fn http_response(
+        status: u16,
+        body: serde_json::Value,
+    ) -> (Client, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .map(|value| value.parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            if status == 0 {
+                return String::from_utf8(bytes).unwrap();
+            }
+            let body = body.to_string();
+            stream.write_all(format!("HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        let config = kube::Config::new(format!("http://{address}").parse().unwrap());
+        (Client::try_from(config).unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn exact_get_and_delete_http_semantics_are_fail_closed() {
+        for code in [404, 403, 500] {
+            let (client, request) = http_response(
+                code,
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                    "message": "exact lookup error", "reason": "error", "code": code,
+                }),
+            )
+            .await;
+            let api = Api::<Pod>::namespaced(client, "tests");
+            let result = exact_lookup(&api, "frozen-pod").await;
+            assert_eq!(matches!(result, ExactLookup::NotFound), code == 404);
+            assert_eq!(matches!(result, ExactLookup::Failed(_)), code != 404);
+            assert!(
+                request
+                    .await
+                    .unwrap()
+                    .starts_with("GET /api/v1/namespaces/tests/pods/frozen-pod ")
+            );
+        }
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some("frozen-uid".into()),
+                resource_version: Some("fresh-rv".into()),
+            }),
+            ..Default::default()
+        };
+        for code in [200, 0, 404, 409, 412, 422, 500] {
+            let (client, request) = http_response(
+                code,
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status",
+                    "status": if code == 200 { "Success" } else { "Failure" },
+                    "message": "delete response", "reason": "response", "code": code,
+                }),
+            )
+            .await;
+            let result = delete_scale_down_exact(
+                &Api::<Pod>::namespaced(client, "tests"),
+                "frozen-pod",
+                &params,
+            )
+            .await;
+            assert_eq!(result.is_ok(), code == 200);
+            if code != 200 {
+                assert!(matches!(result, Err(ControllerError::ObservationStale)));
+            }
+            let request = request.await.unwrap();
+            assert!(request.starts_with("DELETE /api/v1/namespaces/tests/pods/frozen-pod"));
+            let json: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                json["preconditions"],
+                serde_json::json!({"uid": "frozen-uid", "resourceVersion": "fresh-rv"})
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_removal_encoding_preserves_frozen_authority_and_session_target() {
+        let intent = scale_down_fixture::intent(&[2, 8, 19, 40], 40);
+        for command in [
+            ProtocolCommand::PrepareSecondaryRemoval(Box::new(
+                scale_down_fixture::prepare_command(&intent),
+            )),
+            ProtocolCommand::EnsureConfiguration(Box::new(
+                scale_down_fixture::configuration_command(&intent, false),
+            )),
+            ProtocolCommand::EnsureConfiguration(Box::new(
+                scale_down_fixture::configuration_command(&intent, true),
+            )),
+            ProtocolCommand::RetireReplica(Box::new(scale_down_fixture::retire_command(&intent))),
+        ] {
+            let (target, id) = command_target(&command);
+            assert_eq!(id, target.replica_id);
+            let expected = if matches!(command, ProtocolCommand::RetireReplica(_)) {
+                &intent.target
+            } else {
+                &intent.primary
+            };
+            assert_eq!(&target, expected);
+            let request = command_request(
+                intent.resource_uid.to_string(),
+                target.clone(),
+                "fresh-session".into(),
+                command.clone(),
+            )
+            .unwrap();
+            let normalized = kuberic_wire::normalize_execute_request(request).unwrap();
+            assert_eq!(normalized.command, command);
+            assert_eq!(normalized.target, target);
+            assert_eq!(
+                normalized.expected_process_session_id.as_str(),
+                "fresh-session"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_removal_commit_publication_round_trips() {
+        let intent = scale_down_fixture::intent(&[1, 2], 1);
+        let command = ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
+            kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+                operation_id: intent.command_operation_id(
+                    kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                    &intent.primary,
+                ),
+                target: intent.primary.clone(),
+                committed: scale_down_fixture::cleanup(&intent),
+                local_recovery: false,
+            },
+        ));
+        let request = command_request(
+            intent.resource_uid.to_string(),
+            intent.primary,
+            "session".into(),
+            command.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            kuberic_wire::normalize_execute_request(request)
+                .unwrap()
+                .command,
+            command
+        );
+    }
+
+    #[test]
+    fn connection_reset_is_unavailability_not_contradictory_agent_evidence() {
+        assert!(matches!(
+            classify_status(tonic::Status::unknown("transport error: connection reset")),
+            AgentRpcError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_status(tonic::Status::invalid_argument("malformed authority")),
+            AgentRpcError::Invalid(_)
+        ));
     }
 
     #[test]
@@ -2271,6 +2857,7 @@ mod tests {
             })),
         );
         let mut observation = RawObservation {
+            exact_resources: Vec::new(),
             set: KubericSet::new(
                 "db",
                 KubericSetSpec {
@@ -2339,7 +2926,8 @@ mod tests {
             source.clone(),
             session,
             preparation.clone(),
-        );
+        )
+        .unwrap();
         assert_eq!(request.expected_process_session_id, "session-1");
         assert!(matches!(
             &request.command,
@@ -2363,7 +2951,8 @@ mod tests {
             source.clone(),
             observed_process_session(&observation, source.replica_id, &source).unwrap(),
             preparation,
-        );
+        )
+        .unwrap();
         assert_eq!(replay.expected_process_session_id, "session-restarted");
         assert_eq!(replay.command, request.command);
 
@@ -2386,6 +2975,8 @@ mod tests {
             ),
             (
                 ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
+                    previous_policy: None,
+                    secondary_removal_evidence: None,
                     operation_id: OperationId::new("configuration-1"),
                     previous_configuration: None,
                     current_configuration: configuration.clone(),
@@ -2424,7 +3015,8 @@ mod tests {
                 target,
                 "session-current".to_string(),
                 command,
-            );
+            )
+            .unwrap();
             assert_eq!(request.expected_process_session_id, "session-current");
         }
     }

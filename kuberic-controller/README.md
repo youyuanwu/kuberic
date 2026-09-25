@@ -23,6 +23,46 @@ terminal receipt; admission rejections use `SwitchoverRejected` conditions.
 Authority acceptance precedes write grant and exact-Pod routing publication.
 Restoration, newer-epoch compensation, and Unsafe closure remain evidence-gated.
 
+Lowering `spec.replicas` enables SF-inspired secondary scale-down using PC/CC
+quorum principles, with Kuberic-specific target/minimum coupling, deterministic
+selection, write closure, sequential cleanup, and Kubernetes resource deletion.
+Desired count is target and minimum (floor one): a Kuberic policy choice, not
+general SF semantics; SF target and minimum are independently configurable.
+One frozen highest-ID committed secondary is removed at a time. Before intent,
+routing removal, or write closure, retained exact members must provide the
+previous read quorum under stable accepted current-only authority and fresh
+exact sessions. `ScaleDownRetainedReadQuorumUnavailable` preserves existing
+routing/access with bounded re-observation, without preparation, replacement,
+or another target; after heal the same highest-ID target is selected. For 2→1
+the primary alone suffices. Post-freeze previous-read/reduced-write evidence precedes atomic reduced
+topology/policy and `secondaryScaleDownCleanup` acceptance. Separate local commit,
+write grant, and routing can restore service while cleanup is pending.
+Exact-name GETs and frozen UID/fresh resource-version deletes enforce
+endpoint→Pod→PVC cleanup. An unreachable target is fenced only after commit
+by exact Pod deletion; PVC object deletion waits for observed Pod absence, with
+no retention or import path and no physical storage erasure guarantee.
+Exact original PVC provenance must be reconstructable before admission. If Pod
+and PVC already disappeared and their mapping/generation cannot be reconstructed,
+scale-down waits/fails closed; list omission is not absence. Unavailable-target
+support requires frozen or reconstructable exact cleanup identity.
+`lastSecondaryRemoval` retains convergence proof, never deletion authority.
+Before replacing that bounded receipt, every retained member needs its original
+completed current-only witness or fresh proof of completed local acceptance.
+
+Replacement freezes `pendingReplacementCleanup` before provisioning and moves
+it unchanged to `lastReplacement` at commit. Both replacement and scale-down
+serialize subsequent operations until exact cleanup completes; label loss,
+finalizers, and ambiguous replies cannot overwrite the obligation or authorize
+deletion of same-name replacement UIDs.
+
+Protocol 6 and agent store schema 2 require a fresh coordinated deployment.
+Scale-up, primary/explicit-target removal, and active-removal cancellation are
+unsupported. There is no maximum write-interruption guarantee.
+Frozen-primary loss during removal or cleanup can cause indefinite outage;
+there is no overlapping failover even after membership commit.
+See the [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
+for provenance, status/API redesign, helper refactors and recovery/policy expansion.
+
 Deployment assets are under `deploy/` and are intentionally isolated from the
 classic `kuberic.io/v1` operator. The controller and sample images are
 development/CI artifacts and are not currently published release targets.
@@ -30,3 +70,4 @@ development/CI artifacts and are not currently published release targets.
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 for the CRD, deployment, supported operations, diagnostics, and limitations.
 The guide includes the [request example and retry contract](../docs/features/kuberic/level-triggered-operator.md#planned-switchover).
+See also [secondary scale-down usage and conditions](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down).

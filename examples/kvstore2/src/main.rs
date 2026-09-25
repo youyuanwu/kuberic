@@ -173,6 +173,7 @@ async fn get_status(
 fn runtime_http_error(error: kuberic_runtime::RuntimeError) -> (StatusCode, String) {
     let status = match error {
         kuberic_runtime::RuntimeError::NotPrimary
+        | kuberic_runtime::RuntimeError::NotOpen
         | kuberic_runtime::RuntimeError::WriteClosed(_)
         | kuberic_runtime::RuntimeError::ReadClosed(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -186,6 +187,41 @@ async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_distinguish_terminal_retirement_from_closed_access() {
+        for retired in [false, true] {
+            let diagnostics = super::ReplicaDiagnostics {
+                replica_id: 3,
+                instance_id: "pod-3".into(),
+                agent_generation: "generation-3".into(),
+                process_session: "restarted".into(),
+                role: "None".into(),
+                epoch: "0.2".into(),
+                previous_configuration: None,
+                current_configuration: None,
+                current_progress: 5,
+                committed_lsn: 5,
+                write_status: "NotPrimary".into(),
+                retired,
+                pending_operation: None,
+                builds: Vec::new(),
+            };
+            let json = serde_json::to_value(diagnostics).unwrap();
+            assert_eq!(json["retired"], retired);
+            assert_eq!(json["role"], "None");
+            assert_eq!(json["writeStatus"], "NotPrimary");
+            assert!(json.get("retiredAuthority").is_none());
+            assert!(json.get("acceptedSecondaryRemoval").is_none());
+        }
+    }
+
+    #[test]
+    fn retired_application_requests_are_explicitly_unavailable() {
+        let (status, message) = super::runtime_http_error(kuberic_runtime::RuntimeError::NotOpen);
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!message.is_empty());
+    }
+
     #[test]
     fn application_main_uses_the_agent_host_instead_of_protocol_internals() {
         let source = include_str!("main.rs");

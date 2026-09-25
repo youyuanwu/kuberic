@@ -31,6 +31,94 @@ fn item(lsn: i64) -> ReplicationItem {
     }
 }
 
+#[tokio::test]
+async fn reduction_evicts_exact_streams_and_delayed_discovery_cannot_restore_sessions() {
+    let removed = identity(2, "secondary");
+    let replacement = identity(2, "new-incarnation");
+    let registry = SessionRegistry::new(ProcessSessionId::new("primary-session"));
+    registry
+        .register_peer(removed.clone(), ProcessSessionId::new("old-session"))
+        .await;
+    let mut transport =
+        ReliableTransport::new(ProcessSessionId::new("primary-session"), 4).unwrap();
+    transport
+        .admit_peer(removed.clone(), ProcessSessionId::new("old-session"))
+        .unwrap();
+    transport
+        .queue(OutboundOperation::Replication(item(1)))
+        .unwrap();
+    transport
+        .queue(OutboundOperation::Evict(removed.clone()))
+        .unwrap();
+    registry.retire_peer(&removed).await;
+    for session in ["old-session", "restarted-target-session"] {
+        assert!(
+            transport
+                .admit_peer(removed.clone(), ProcessSessionId::new(session))
+                .is_err()
+        );
+        registry
+            .register_peer(removed.clone(), ProcessSessionId::new(session))
+            .await;
+        assert!(
+            registry
+                .validate_peer(&removed, session, "primary-session")
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        transport
+            .queue(OutboundOperation::Replication(item(2)))
+            .is_err()
+    );
+    assert!(transport.acknowledge_replication(&removed, 1).is_err());
+    transport
+        .admit_peer(
+            replacement.clone(),
+            ProcessSessionId::new("replacement-session"),
+        )
+        .unwrap();
+    registry
+        .register_peer(
+            replacement.clone(),
+            ProcessSessionId::new("replacement-session"),
+        )
+        .await;
+    assert!(
+        registry
+            .validate_peer(&replacement, "replacement-session", "primary-session")
+            .await
+            .is_ok()
+    );
+    transport
+        .queue(OutboundOperation::Replication(ReplicationItem {
+            receiver: replacement.clone(),
+            ..item(3)
+        }))
+        .unwrap();
+    for _ in 0..3 {
+        transport
+            .queue(OutboundOperation::Evict(removed.clone()))
+            .unwrap();
+        registry.retire_peer(&removed).await;
+        assert!(
+            registry
+                .validate_peer(&replacement, "replacement-session", "primary-session")
+                .await
+                .is_ok()
+        );
+        let ResumeWindow::Retained(items) =
+            transport.reconnect_replication(&replacement, 3).unwrap()
+        else {
+            panic!("late exact eviction must preserve the replacement stream")
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].payload.receiver, replacement);
+        assert_eq!(items[0].payload.data, item(3).data);
+    }
+}
+
 #[test]
 fn reliable_window_preserves_order_backpressure_reconnect_and_cancellation() {
     let mut window = ReliableWindow::new(2).unwrap();

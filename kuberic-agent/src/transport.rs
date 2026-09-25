@@ -45,6 +45,7 @@ pub enum QueuedOutbound {
     },
     Build(ReplicaEndpoint),
     Remove(ReplicaId),
+    Evict(ReplicaIdentity),
 }
 
 #[async_trait]
@@ -331,6 +332,18 @@ where
 {
     async fn refresh_peer(&self, receiver: &ReplicaIdentity) -> Result<()> {
         let session = self.peer_session(receiver).await?;
+        if self
+            .runtime
+            .snapshot()
+            .await
+            .authority
+            .as_ref()
+            .is_some_and(|a| a.contains_member(receiver))
+        {
+            self.runtime
+                .register_peer_session(receiver.clone(), session.clone())
+                .await?;
+        }
         self.transport
             .lock()
             .await
@@ -345,7 +358,11 @@ where
                 sequence: _,
                 mut item,
             } => {
-                item.receiver_session_id = self.peer_session(&receiver).await?.to_string();
+                let session = self.peer_session(&receiver).await?;
+                self.runtime
+                    .register_peer_session(receiver.clone(), session.clone())
+                    .await?;
+                item.receiver_session_id = session.to_string();
                 let endpoint = self.resolver.replication_endpoint(&receiver);
                 let mut client = tokio::time::timeout(
                     self.deadline,
@@ -381,6 +398,14 @@ where
                             )
                         })?;
                 let applied_lsn = acknowledgement.applied_lsn;
+                if acknowledgement.receiver_session_id != session.as_str()
+                    || acknowledgement.sender_session_id
+                        != self.transport.lock().await.local_session().as_str()
+                {
+                    return Err(AgentError::SessionRejected(
+                        "replication ACK does not match the dispatched sessions".into(),
+                    ));
+                }
                 self.runtime
                     .data_plane()
                     .accept_acknowledgement(acknowledgement)
@@ -402,6 +427,10 @@ where
                 if let Some(receiver) = receiver {
                     self.transport.lock().await.retire_peer(&receiver);
                 }
+                Ok(())
+            }
+            QueuedOutbound::Evict(identity) => {
+                self.transport.lock().await.evict_peer(&identity);
                 Ok(())
             }
         }
@@ -672,6 +701,9 @@ async fn deliver_outbound<D: OutboundDispatcher>(
 
 async fn queued_matches_runtime_authority(runtime: &PodRuntime, queued: &QueuedOutbound) -> bool {
     let snapshot = runtime.snapshot().await;
+    if !snapshot.open {
+        return matches!(queued, QueuedOutbound::Remove(_) | QueuedOutbound::Evict(_));
+    }
     let Some(authority) = snapshot.authority else {
         return !matches!(
             queued,
@@ -679,22 +711,17 @@ async fn queued_matches_runtime_authority(runtime: &PodRuntime, queued: &QueuedO
         );
     };
     match queued {
-        QueuedOutbound::Replication { item, .. } => normalize_replication_item(item.clone())
-            .is_ok_and(|item| {
-                item.epoch == authority.current_configuration.epoch
-                    && item.current_configuration_id
-                        == authority.current_configuration.configuration_id
-                    && item.previous_configuration_id
-                        == authority
-                            .previous_configuration
-                            .as_ref()
-                            .map(|previous| previous.configuration_id.clone())
-            }),
+        QueuedOutbound::Replication { item, .. } => replication_from_proto(item.clone())
+            .is_ok_and(|item| authority.validate_envelope(&item).is_ok()),
         QueuedOutbound::Copy { item, .. } => normalize_copy_item(item.clone()).is_ok_and(|item| {
             item.epoch == authority.current_configuration.epoch
                 && item.current_configuration_id == authority.current_configuration.configuration_id
+                && authority
+                    .secondary_removal
+                    .as_ref()
+                    .is_none_or(|e| item.receiver != e.preparation.intent.target)
         }),
-        QueuedOutbound::Build(_) | QueuedOutbound::Remove(_) => true,
+        QueuedOutbound::Build(_) | QueuedOutbound::Remove(_) | QueuedOutbound::Evict(_) => true,
     }
 }
 
@@ -716,25 +743,112 @@ where
             return Ok(());
         }
         let state = store.load_state().await?;
+        let runtime_snapshot = runtime.snapshot().await;
+        let runtime_authority = runtime_snapshot.authority;
+        if runtime_authority.is_some() || runtime_snapshot.retired_authority.is_some() {
+            sessions.retain_members(runtime_authority.as_ref()).await;
+        }
+        if let Some(retired) = runtime_snapshot.retired_authority {
+            for member in &retired.report.intent.previous_configuration.members {
+                transport.lock().await.evict_peer(&member.identity);
+                sessions.retire_peer(&member.identity).await;
+            }
+        } else if let Some(authority) = &runtime_authority
+            && authority.previous_configuration.is_none()
+            && let Some(evidence) = &authority.secondary_removal
+        {
+            transport
+                .lock()
+                .await
+                .evict_peer(&evidence.preparation.intent.target);
+            sessions
+                .retire_peer(&evidence.preparation.intent.target)
+                .await;
+        }
         if let Some(configuration) = state.current_configuration {
             for member in configuration
                 .members
                 .iter()
                 .filter(|member| member.identity != local)
             {
+                if runtime_authority
+                    .as_ref()
+                    .is_none_or(|a| !a.contains_member(&member.identity))
+                {
+                    if runtime_authority
+                        .as_ref()
+                        .is_some_and(|a| a.secondary_removal.is_some())
+                    {
+                        transport.lock().await.evict_peer(&member.identity);
+                    }
+                    continue;
+                }
                 if let Ok(report) = dispatcher.peer_report(&member.identity).await {
+                    if runtime
+                        .snapshot()
+                        .await
+                        .authority
+                        .as_ref()
+                        .is_none_or(|a| !a.contains_member(&member.identity))
+                    {
+                        transport.lock().await.evict_peer(&member.identity);
+                        continue;
+                    }
                     let session = report.process_session_id.clone();
+                    if runtime_authority.is_some()
+                        && runtime
+                            .register_peer_session(member.identity.clone(), session.clone())
+                            .await
+                            .is_err()
+                    {
+                        continue;
+                    }
                     sessions
                         .register_peer(member.identity.clone(), session.clone())
                         .await;
-                    transport
+                    if transport
                         .lock()
                         .await
-                        .admit_peer(member.identity.clone(), session)?;
+                        .admit_peer(member.identity.clone(), session)
+                        .is_err()
+                    {
+                        continue;
+                    }
                     if report.epoch == configuration.epoch
                         && report.current_configuration.as_ref() == Some(&configuration)
                         && report.previous_configuration == state.previous_configuration
                     {
+                        if runtime_authority.as_ref().is_some_and(|a| {
+                            a.secondary_removal.is_some()
+                                && a.secondary_removal == report.secondary_removal_evidence
+                        }) && let Some(verified_replication_lsn) =
+                            report.verified_replication_lsn
+                        {
+                            let _ = runtime
+                                .observe_secondary_removal_witness(
+                                    kuberic_protocol::types::SecondaryRemovalWitness {
+                                        resource_uid: report.resource_uid.clone(),
+                                        identity: report.identity.clone(),
+                                        role: report.role,
+                                        process_session_id: report.process_session_id.clone(),
+                                        report_sequence: report.report_sequence,
+                                        epoch: report.epoch,
+                                        previous_configuration_id: report
+                                            .previous_configuration
+                                            .as_ref()
+                                            .map(|p| p.configuration_id.clone()),
+                                        current_configuration_id: configuration
+                                            .configuration_id
+                                            .clone(),
+                                        verified_replication_lsn,
+                                        write_status: report.write_status,
+                                        pending_operation_id: report.pending_operation_id.clone(),
+                                        retained_operation_id: report.retained_operation_id.clone(),
+                                    },
+                                    report.accepted_secondary_removal.clone(),
+                                )
+                                .await;
+                        }
                         if let Some(verified_lsn) = report.verified_replication_lsn
                             && configuration.members.iter().any(|member| {
                                 member.identity == local
@@ -743,21 +857,24 @@ where
                         {
                             let _ = runtime
                                 .data_plane()
-                                .accept_acknowledgement(replication_ack_to_proto(ReplicationAck {
-                                    sender: local.clone(),
-                                    receiver: report.identity.clone(),
-                                    epoch: report.epoch,
-                                    previous_configuration_id: report
-                                        .previous_configuration
-                                        .as_ref()
-                                        .map(|previous| previous.configuration_id.clone()),
-                                    current_configuration_id: configuration
-                                        .configuration_id
-                                        .clone(),
-                                    received_lsn: verified_lsn,
-                                    applied_lsn: verified_lsn,
-                                    committed_lsn: report.committed_lsn.min(verified_lsn),
-                                }))
+                                .accept_acknowledgement(proto::ReplicationAck {
+                                    receiver_session_id: report.process_session_id.to_string(),
+                                    ..replication_ack_to_proto(ReplicationAck {
+                                        sender: local.clone(),
+                                        receiver: report.identity.clone(),
+                                        epoch: report.epoch,
+                                        previous_configuration_id: report
+                                            .previous_configuration
+                                            .as_ref()
+                                            .map(|previous| previous.configuration_id.clone()),
+                                        current_configuration_id: configuration
+                                            .configuration_id
+                                            .clone(),
+                                        received_lsn: verified_lsn,
+                                        applied_lsn: verified_lsn,
+                                        committed_lsn: report.committed_lsn.min(verified_lsn),
+                                    })
+                                })
                                 .await;
                         }
                         let _ = runtime
@@ -821,6 +938,7 @@ fn sender_outbound_to_queued(outbound: SenderOutbound) -> QueuedOutbound {
         },
         SenderOutbound::Build(endpoint) => QueuedOutbound::Build(endpoint),
         SenderOutbound::Remove(replica_id) => QueuedOutbound::Remove(replica_id),
+        SenderOutbound::Evict(identity) => QueuedOutbound::Evict(identity),
     }
 }
 
@@ -829,7 +947,7 @@ fn domain_outbound_receiver(outbound: &OutboundOperation) -> Option<&ReplicaIden
         OutboundOperation::Replication(item) => Some(&item.receiver),
         OutboundOperation::Copy(item) => Some(&item.receiver),
         OutboundOperation::Build(endpoint) => Some(&endpoint.identity),
-        OutboundOperation::Remove(_) => None,
+        OutboundOperation::Remove(_) | OutboundOperation::Evict(_) => None,
     }
 }
 
@@ -839,7 +957,7 @@ fn queued_outbound_receiver(outbound: &QueuedOutbound) -> Option<&ReplicaIdentit
             Some(receiver)
         }
         QueuedOutbound::Build(endpoint) => Some(&endpoint.identity),
-        QueuedOutbound::Remove(_) => None,
+        QueuedOutbound::Remove(_) | QueuedOutbound::Evict(_) => None,
     }
 }
 
@@ -1024,7 +1142,8 @@ mod tests {
         async fn dispatch(&self, outbound: QueuedOutbound) -> Result<()> {
             let receiver = match outbound {
                 QueuedOutbound::Replication { receiver, .. }
-                | QueuedOutbound::Copy { receiver, .. } => receiver,
+                | QueuedOutbound::Copy { receiver, .. }
+                | QueuedOutbound::Evict(receiver) => receiver,
                 QueuedOutbound::Build(endpoint) => endpoint.identity,
                 QueuedOutbound::Remove(replica_id) => {
                     self.delivered.send(replica_id).unwrap();

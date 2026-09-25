@@ -95,6 +95,15 @@ async fn execute_change(
     change: KubernetesChange,
 ) -> Result<()> {
     match change {
+        KubernetesChange::DeleteScaleDownResource {
+            resource,
+            name,
+            uid,
+            resource_version,
+        } => {
+            api.delete_scale_down_resource(observation, resource, &name, &uid, &resource_version)
+                .await
+        }
         KubernetesChange::EnsureReplicaSupport => api.ensure_replica_support(observation).await,
         KubernetesChange::EnsureReplicaScaffolding { replica_ids } => {
             api.ensure_replica_scaffolding(observation, &replica_ids)

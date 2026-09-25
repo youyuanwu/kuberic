@@ -41,6 +41,10 @@ pub struct EnsureConfiguration {
     pub previous_epoch: Option<Epoch>,
     pub current_epoch: Epoch,
     pub effective_policy: EffectivePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy: Option<EffectivePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_removal_evidence: Option<crate::types::SecondaryRemovalEvidence>,
     pub local_replica_id: ReplicaId,
     pub expected_instance_id: ReplicaInstanceId,
     pub expected_agent_generation: AgentGeneration,
@@ -114,6 +118,38 @@ pub struct EnsureReplicaBuild {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareSecondaryRemoval {
+    pub operation_id: OperationId,
+    pub local_replica_id: ReplicaId,
+    pub expected_instance_id: ReplicaInstanceId,
+    pub expected_agent_generation: AgentGeneration,
+    pub intent: crate::types::SecondaryScaleDownIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetireReplica {
+    pub operation_id: OperationId,
+    pub local_replica_id: ReplicaId,
+    pub expected_instance_id: ReplicaInstanceId,
+    pub expected_agent_generation: AgentGeneration,
+    pub committed: crate::types::SecondaryScaleDownCleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Publish already-accepted current-only evidence locally before stable access.
+pub struct AcceptSecondaryRemovalCommit {
+    pub operation_id: OperationId,
+    pub target: ReplicaIdentity,
+    pub committed: crate::types::SecondaryScaleDownCleanup,
+    /// Clear a retained secondary's historical local fence without quorum credit.
+    #[serde(default)]
+    pub local_recovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
@@ -121,6 +157,9 @@ pub enum ProtocolCommand {
     PrepareSwitchover(Box<PrepareSwitchover>),
     EnsureConfiguration(Box<EnsureConfiguration>),
     EnsureReplicaBuild(Box<EnsureReplicaBuild>),
+    PrepareSecondaryRemoval(Box<PrepareSecondaryRemoval>),
+    RetireReplica(Box<RetireReplica>),
+    AcceptSecondaryRemovalCommit(Box<AcceptSecondaryRemovalCommit>),
 }
 
 impl ProtocolCommand {
@@ -128,6 +167,9 @@ impl ProtocolCommand {
         match self {
             Self::InitializeAgentStore(_) => EffectClass::ConvergentEnsure,
             Self::PrepareSwitchover(_)
+            | Self::PrepareSecondaryRemoval(_)
+            | Self::RetireReplica(_)
+            | Self::AcceptSecondaryRemovalCommit(_)
             | Self::EnsureConfiguration(_)
             | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
         }
@@ -159,6 +201,12 @@ pub enum KubernetesChange {
         pod_name: String,
         pod_uid: PodUid,
     },
+    DeleteScaleDownResource {
+        resource: ScaleDownResource,
+        name: String,
+        uid: String,
+        resource_version: String,
+    },
     EnsureWriteRoutingService,
     PersistStatus {
         status: Box<crate::types::AcceptedStatus>,
@@ -167,6 +215,14 @@ pub enum KubernetesChange {
     PublishWriteRouting {
         primary: crate::types::ReplicaIdentity,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScaleDownResource {
+    Endpoint,
+    Pod,
+    Pvc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

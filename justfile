@@ -147,7 +147,7 @@ level-triggered-kind-test *scenarios: verify-kind-context
     expanded=()
     for scenario in "${requested[@]}"; do
       if [[ "$scenario" == "all" ]]; then
-        expanded+=(replacement quorum-loss adversarial switchover switchover-adversarial)
+        expanded+=(replacement quorum-loss adversarial switchover switchover-adversarial scale-down scale-down-adversarial)
       else
         expanded+=("$scenario")
       fi
@@ -161,9 +161,14 @@ level-triggered-kind-test *scenarios: verify-kind-context
         adversarial) test_name="level_triggered_k8s::adversarial_restart_partition_and_healing_preserve_single_writer" ;;
         switchover) test_name="level_triggered_k8s::planned_switchover" ;;
         switchover-adversarial) test_name="level_triggered_k8s::planned_switchover_adversarial" ;;
+        scale-down) test_name="level_triggered_k8s::scale_down" ;;
+        scale-down-adversarial) test_name="level_triggered_k8s::scale_down_adversarial" ;;
         *) echo "unknown level-triggered scenario: $scenario" >&2; exit 2 ;;
       esac
+      started=$SECONDS
+      echo "=== level-triggered scenario: $scenario ==="
       cargo test -p kuberic-level-tests "$test_name" -- --ignored --exact --nocapture
+      echo "=== $scenario passed in $((SECONDS - started))s ==="
     done
 
 # Collect level-triggered controller, resource, and replica diagnostics.

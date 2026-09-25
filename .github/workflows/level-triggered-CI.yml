@@ -31,6 +31,8 @@ jobs:
     name: Targeted checks
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    env:
+      RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v7
         with:
@@ -117,10 +119,18 @@ jobs:
       - name: Run healthy planned switchover
         timeout-minutes: 10
         run: just level-triggered-kind-test switchover
+      - name: Run healthy secondary scale-down
+        timeout-minutes: 12
+        run: just level-triggered-kind-test scale-down
       - name: Collect diagnostics
         if: failure()
         timeout-minutes: 3
-        run: just level-triggered-diagnostics
+        run: just level-triggered-diagnostics 2>&1 | tee target/level-diagnostics.log
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: level-smoke-diagnostics
+          path: target/level-diagnostics.log
       - name: Delete owned cluster
         if: always()
         timeout-minutes: 3
@@ -138,7 +148,11 @@ jobs:
       matrix:
         run: [1, 2]
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    env:
+      KIND_CLUSTER_NAME: kuberic-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
+      KUBECONFIG: ${{ github.workspace }}/target/kind/full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}.kubeconfig
+      KUBE_CONTEXT: kind-kuberic-full-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.run }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -168,13 +182,18 @@ jobs:
         run: just level-triggered-images
       - name: Install isolated stack
         run: just level-triggered-install
-      - name: Run full matrix including switchover restart and target-loss variants
-        timeout-minutes: 35
+      - name: Run full matrix including switchover and scale-down fault variants
+        timeout-minutes: 65
         run: just level-triggered-kind-test all
       - name: Collect diagnostics
         if: failure()
         timeout-minutes: 3
-        run: just level-triggered-diagnostics
+        run: just level-triggered-diagnostics 2>&1 | tee target/level-diagnostics.log
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: level-full-${{ matrix.run }}-diagnostics
+          path: target/level-diagnostics.log
       - name: Delete owned cluster
         if: always()
         timeout-minutes: 3

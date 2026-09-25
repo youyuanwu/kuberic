@@ -72,12 +72,21 @@ The operator watches `KubericSet` resources and manages the full lifecycle: pod 
 
 The independent level-triggered controller uses
 `operator.kuberic.io/v1alpha1` and distinct deployment assets. It currently
-supports fixed-cardinality bootstrap, replacement, ordinary failover, explicit
+supports full-set bootstrap, replacement, ordinary failover, explicit
 named-target [planned switchover](docs/features/kuberic/level-triggered-operator.md#planned-switchover),
-and non-destructive quorum-loss recovery for `kvstore2`. Switchover may briefly
-interrupt writes and connections; it is not a zero-downtime guarantee. V2 images
-remain local/CI-only, and scaling and the SQLite/PostgreSQL ports remain future
-work.
+[secondary scale-down](docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
+down to one, and non-destructive quorum-loss recovery for `kvstore2`.
+This is SF-inspired secondary scale-down using PC/CC quorum principles, with
+Kuberic-specific target/minimum coupling, deterministic selection, write closure,
+sequential cleanup, and Kubernetes resource deletion. `spec.replicas` target=min
+is Kuberic policy; SF target and minimum are independently configurable.
+Retained read-quorum preflight preserves existing service when admission must
+wait. Exact original PVC provenance must be reconstructable before admission;
+PVC object deletion has no retention or import path, not a physical-erasure
+guarantee. After admission, frozen-primary loss can block recovery indefinitely.
+Reconfiguration may interrupt writes and connections with no duration guarantee.
+V2 images remain local/CI-only;
+scale-up, primary removal, and the SQLite/PostgreSQL ports remain future work.
 
 ## Continuous Delivery
 
@@ -101,7 +110,8 @@ such as `v0.1.0` also publishes the exact version tag.
 - [Design gaps](docs/features/kuberic/design-gaps.md) — tracked gaps and known limitations
 - [Testing strategy](docs/features/kuberic/testing.md) — test layers and patterns
 - [Level-triggered operator](docs/features/kuberic/level-triggered-operator.md) — independent stack deployment, authority, supported operations, and diagnostics
-- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover workstream and remaining retirement gates
+- [Secondary scale-down](docs/features/kuberic/level-triggered-operator.md#secondary-scale-down) — lower desired membership, singleton risks, and exact permanent cleanup
+- [V1 retirement plan](docs/proposal/v1-retirement-plan.md) — completed switchover, partial scaling, and remaining retirement gates
 - [Kuberic DEX roadmap](docs/features/kuberic/kuberic-dex-roadmap.md) — durable execution kernel boundary and deferred work
 
 ## License

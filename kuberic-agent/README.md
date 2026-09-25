@@ -75,6 +75,82 @@ integrity, exact storage identity, and the exact schema version. The current
 migration hook is idempotent only for that version; it is not an older-schema
 upgrade path.
 
+Schema **2** intentionally rejects schema 1 and unknown versions without
+migration. Initialization identity (including its original policy) remains
+immutable. Admitted PC/CC policies are separate durable authority; a reduced
+policy does not rewrite initialization replay or Pod/PVC validation.
+
+The controller enables SF-inspired secondary scale-down using PC/CC quorum
+principles, with Kuberic-specific target/minimum coupling, deterministic
+selection, write closure, sequential cleanup, and Kubernetes resource deletion.
+`spec.replicas` target=min is Kuberic policy; SF target and minimum are
+independently configurable. Before freezing intent or closing routing/writes,
+controller preflight requires the previous read quorum from retained exact
+members under stable accepted current-only authority and fresh exact sessions.
+Otherwise `ScaleDownRetainedReadQuorumUnavailable` preserves existing service
+with bounded re-observation and no removal preparation or alternate target.
+The agent never owns desired-count or target-selection policy.
+
+The agent executes `PrepareSecondaryRemoval`, write-closed dual-policy
+`EnsureConfiguration`, `AcceptSecondaryRemovalCommit`, and `RetireReplica`
+through durable command/effect intent. Preparation preserves the verified boundary and its original
+session/sequence; exact duplicates return retained evidence even after a
+process restart. Current-only completion retains the full frozen evidence
+after PC disappears. Operation mutation and unrelated authority work are
+rejected while removal is pending. Accepted current-only evidence is separately
+persisted before write regrant; coordination alone never grants reduced writes.
+
+Retirement validates and persists an exact `retirement-started` record before
+revoking access, fencing traffic, driving role None, and closing hosting.
+Finalization atomically persists the tombstone, removes active authority, and
+clears the started record. Restart checks both lifecycle records before
+application `Open`: a started retirement is finalized with **zero Open calls**
+because process termination already closed the prior host. Failed finalization
+stays closed. The control plane continues reporting role None and the exact
+terminal receipt under a fresh process session. Excluded peers cannot regain sessions through
+delayed discovery. Pending removal preparation reconstructs access closed and
+resolves interrupted local writes under their original operation identities
+without waiting for an unavailable old write quorum.
+
+Frozen certificates survive retained-peer restart but do not reinstate
+obsolete-session credit; acceptance revalidates current-session progress.
+An already committed reduction has a separate live-progress path: exact
+current-only peers retain the same immutable commit proof, cover the prepared
+boundary, and report completed work in their current session. The primary may
+already have granted access. Pre-commit witnesses remain write-closed. Startup
+keeps a pending commit-acceptance effect replayable while discovery restores
+fresh peer evidence, rather than requiring obsolete-session credit before
+the control plane can start.
+
+After accepted topology advances, an exact `localRecovery` commit replay can
+clear a retained secondary's still-pending historical removal fence. It requires
+the immutable completed certificate, matching installed current-only authority,
+exact resource/incarnation and verified boundary, plus the current dispatch session.
+It cannot run on the primary or excluded target, replace unrelated work, or grant
+access. SQLite retains the exact local effect for pending/applied/completed startup
+replay without creating a live runtime commit or restoring peer-session credit.
+Only after the acceptance report may ordinary newer-authority correction proceed;
+the general pending-removal admission fence remains unchanged.
+
+`ReplicaDiagnostics.retired` is a compact terminal-retirement indicator from
+durable or runtime authority. Unlike role `None` or denied access alone, `true`
+means a retirement tombstone exists. The JSON field is additive; older diagnostic
+responses may omit it. Diagnostics do not expose managed certificates.
+Controller admission and exact Kubernetes cleanup are enabled; these local
+contracts never select the target or authorize arbitrary Pod/PVC deletion.
+Use a fresh coordinated protocol-6/schema-2 deployment, not a rolling upgrade.
+Exact original PVC provenance must be reconstructable before admission; if Pod
+and PVC already disappeared without that provenance, scale-down waits/fails
+closed rather than treating list omission as absence. Unavailable-target support
+requires frozen or reconstructable exact cleanup identity. PVC object deletion
+has no retention or import path, not a physical storage erasure guarantee.
+Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequential
+cleanup must finish, and every retained member needs its original completed
+current-only witness or fresh completed local acceptance before superseding the
+bounded receipt. Scale-up remains absent. These limits and the explicitly deferred
+durable primary-agent phase coordinator are recorded in
+[scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
+
 Crash-boundary environment variables exist only in the test executable.
 Production agent and application binaries expose no fault-injection mode.
 

@@ -60,14 +60,31 @@ pub fn normalize(
         })
         .collect::<Vec<_>>();
     let mut replica_ids = authority_replica_ids(&status);
+    replica_ids.extend(raw.exact_resources.iter().map(|r| r.target.replica_id));
     replica_ids.extend((1..=raw.set.spec.replicas).map(|value| ReplicaId::new(i64::from(value))));
     collect_labeled_replica_ids(&raw.pods, &mut replica_ids, &mut failures, "Pod");
     collect_labeled_replica_ids(&raw.pvcs, &mut replica_ids, &mut failures, "PVC");
 
     let mut replicas = BTreeMap::new();
     for replica_id in replica_ids {
-        let pods = matching_objects(&raw.pods, &resource_uid, replica_id);
-        let pvcs = matching_objects(&raw.pvcs, &resource_uid, replica_id);
+        let pods = raw
+            .pods
+            .iter()
+            .filter(|pod| {
+                labeled_for(*pod, &resource_uid, replica_id)
+                    || crate::exact_resources::frozen_pod_target(&raw, pod)
+                        .is_some_and(|t| t.replica_id == replica_id)
+            })
+            .collect::<Vec<_>>();
+        let pvcs = raw
+            .pvcs
+            .iter()
+            .filter(|pvc| {
+                labeled_for(*pvc, &resource_uid, replica_id)
+                    || crate::exact_resources::frozen_pvc_target(&raw, pvc)
+                        .is_some_and(|t| t.replica_id == replica_id)
+            })
+            .collect::<Vec<_>>();
         let mut used_pvcs = BTreeSet::new();
         for pod in pods {
             let pod_uid = pod.uid().map(PodUid::new);
@@ -152,6 +169,7 @@ pub fn normalize(
     let routing = normalize_routing(&raw, &replicas, &resource_uid, &mut failures);
     let supporting_resources_ready = supporting_resources_ready(&raw, &resource_uid);
     Ok(ObservationSnapshot {
+        secondary_scale_down_resources: crate::exact_resources::normalized(&raw, &resource_uid),
         resource_uid,
         resource_version,
         desired: DesiredState {
@@ -263,6 +281,18 @@ fn authority_replica_ids(status: &AcceptedStatus) -> BTreeSet<ReplicaId> {
         )
         .map(|member| member.identity.replica_id)
         .chain(status.provisioning.iter().map(|intent| intent.replica_id()))
+        .chain(
+            status
+                .secondary_scale_down_cleanup
+                .iter()
+                .map(|c| c.evidence.preparation.intent.target.replica_id),
+        )
+        .chain(
+            status
+                .transition
+                .iter()
+                .filter_map(|t| t.secondary_scale_down.as_ref().map(|i| i.target.replica_id)),
+        )
         .collect()
 }
 
@@ -290,24 +320,15 @@ fn collect_labeled_replica_ids<K>(
     }
 }
 
-fn matching_objects<'a, K>(
-    objects: &'a [K],
-    resource_uid: &ResourceUid,
-    replica_id: ReplicaId,
-) -> Vec<&'a K>
+fn labeled_for<K>(object: &K, resource_uid: &ResourceUid, replica_id: ReplicaId) -> bool
 where
     K: ResourceExt,
 {
-    objects
-        .iter()
-        .filter(|object| {
-            object.labels().get(SET_UID_LABEL).map(String::as_str) == Some(resource_uid.as_str())
-                && object
-                    .labels()
-                    .get(REPLICA_ID_LABEL)
-                    .is_some_and(|value| value == &replica_id.to_string())
-        })
-        .collect()
+    object.labels().get(SET_UID_LABEL).map(String::as_str) == Some(resource_uid.as_str())
+        && object
+            .labels()
+            .get(REPLICA_ID_LABEL)
+            .is_some_and(|value| value == &replica_id.to_string())
 }
 
 fn normalize_agent(

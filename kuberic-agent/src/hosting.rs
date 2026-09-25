@@ -92,6 +92,7 @@ pub enum OutboundReplication {
     Copy(proto::CopyItem),
     Build(ReplicaEndpoint),
     Remove(kuberic_protocol::types::ReplicaId),
+    Evict(ReplicaIdentity),
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +287,34 @@ impl PodRuntime {
         write_status: AccessStatus,
         transition: Option<(ReplicaRole, bool, bool)>,
     ) -> Result<()> {
+        let store = &self.host.default_dependencies.replica_authority_store;
+        let retired = match store.load_retired_authority().await? {
+            Some(retired) => Some(retired),
+            None => {
+                if let Some(started) = store.load_retirement_started().await? {
+                    started.validate(&self.host.identity)?;
+                    // This fresh host has never opened. Process termination closed
+                    // the prior host, so the exact durable intent can now finish.
+                    if self.host.registered.get().is_some() {
+                        return Err(RuntimeError::ReconfigurationPending);
+                    }
+                    store.retire(&started).await?;
+                    Some(started)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(retired) = retired {
+            retired.validate(&self.host.identity)?;
+            let mut state = self.host.state.write().await;
+            state.fallback_snapshot = empty_snapshot(self.host.identity.clone());
+            state.fallback_snapshot.read_status = AccessStatus::NotPrimary;
+            state.fallback_snapshot.write_status = AccessStatus::NotPrimary;
+            state.fallback_snapshot.retired_authority = Some(retired);
+            self.host.closed.store(true, Ordering::Release);
+            return Ok(());
+        }
         let has_transition = transition.is_some();
         if !self.host.snapshot().await.open {
             self.host.open(mode).await?;
@@ -317,6 +346,29 @@ impl PodRuntime {
             (read_status, write_status)
         };
         if let Ok(managed) = self.host.managed() {
+            if write_status == AccessStatus::Granted
+                && let Some(committed) = self
+                    .host
+                    .default_dependencies
+                    .replica_authority_store
+                    .load_secondary_removal_commit()
+                    .await?
+                && managed
+                    .snapshot()
+                    .await
+                    .authority
+                    .as_ref()
+                    .is_some_and(|a| {
+                        a.previous_configuration.is_none()
+                            && a.secondary_removal.as_ref() == Some(&committed.evidence)
+                    })
+            {
+                managed
+                    .execute_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(
+                        committed,
+                    )))
+                    .await?;
+            }
             managed
                 .execute_action(RuntimeEffectAction::SetAccessStatus {
                     read: read_status,
@@ -330,6 +382,22 @@ impl PodRuntime {
             state.fallback_snapshot.write_status = write_status;
         }
         Ok(())
+    }
+
+    pub(crate) async fn restore_accepted_removal(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+        historical: Option<kuberic_protocol::command::AcceptSecondaryRemovalCommit>,
+    ) -> Result<()> {
+        self.host
+            .managed()?
+            .execute_action(match historical {
+                Some(command) => {
+                    RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command))
+                }
+                None => RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed)),
+            })
+            .await
     }
 
     pub fn abort(&self) {
@@ -384,6 +452,32 @@ impl PodRuntime {
         self.host.managed()?.repair_peer(identity, progress).await
     }
 
+    pub(crate) async fn register_peer_session(
+        &self,
+        identity: ReplicaIdentity,
+        session: kuberic_protocol::types::ProcessSessionId,
+    ) -> Result<()> {
+        self.host
+            .managed()?
+            .execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
+            .await
+    }
+
+    pub(crate) async fn observe_secondary_removal_witness(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: Option<kuberic_protocol::types::SecondaryScaleDownCleanup>,
+    ) -> Result<()> {
+        let action = match committed {
+            Some(committed) => RuntimeEffectAction::ObserveSecondaryRemovalProgress {
+                witness: Box::new(witness),
+                committed: Box::new(committed),
+            },
+            None => RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness)),
+        };
+        self.host.managed()?.execute_action(action).await
+    }
+
     pub async fn partition_report(&self) -> PartitionReportSnapshot {
         let state = self.host.state.read().await;
         PartitionReportSnapshot {
@@ -428,7 +522,18 @@ impl RuntimeDataPlane {
         &self,
         acknowledgement: proto::ReplicationAck,
     ) -> Result<()> {
+        let session = acknowledgement.receiver_session_id.clone();
         let acknowledgement = replication_ack_from_proto(acknowledgement)?;
+        if !session.is_empty() {
+            return self
+                .host
+                .managed()?
+                .execute_action(RuntimeEffectAction::ObserveReplicationAck {
+                    acknowledgement: Box::new(acknowledgement),
+                    session: kuberic_protocol::types::ProcessSessionId::new(session),
+                })
+                .await;
+        }
         self.host
             .managed()?
             .accept_acknowledgement(acknowledgement)
@@ -487,6 +592,7 @@ impl RuntimeDataPlane {
                 OutboundOperation::Copy(item) => OutboundReplication::Copy(copy_to_proto(item)),
                 OutboundOperation::Build(replica) => OutboundReplication::Build(replica),
                 OutboundOperation::Remove(replica_id) => OutboundReplication::Remove(replica_id),
+                OutboundOperation::Evict(identity) => OutboundReplication::Evict(identity),
             })
     }
 
@@ -716,6 +822,24 @@ impl RuntimeHost {
 
     async fn apply_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
         let _guard = self.effect_lock.lock().await;
+        if !matches!(
+            effect.action,
+            RuntimeEffectAction::RetireReplica(_) | RuntimeEffectAction::Abort
+        ) && (self
+            .default_dependencies
+            .replica_authority_store
+            .load_retired_authority()
+            .await?
+            .is_some()
+            || self
+                .default_dependencies
+                .replica_authority_store
+                .load_retirement_started()
+                .await?
+                .is_some())
+        {
+            return Err(RuntimeError::Closed);
+        }
         {
             let state = self.state.read().await;
             if let Some(previous) = state.effects.get(&effect.sequence) {
@@ -737,12 +861,56 @@ impl RuntimeHost {
                 });
             }
         }
-        if !matches!(effect.action, RuntimeEffectAction::Abort)
-            && (self.aborted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire))
+        if !matches!(
+            effect.action,
+            RuntimeEffectAction::Abort | RuntimeEffectAction::RetireReplica(_)
+        ) && (self.aborted.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire))
         {
             return Err(RuntimeError::Closed);
         }
         match effect.action.clone() {
+            RuntimeEffectAction::RetireReplica(retired) => {
+                retired.validate(&self.identity)?;
+                if let Some(durable) = self
+                    .default_dependencies
+                    .replica_authority_store
+                    .load_retired_authority()
+                    .await?
+                {
+                    if durable != *retired {
+                        return Err(RuntimeError::AuthorityMismatch(
+                            "conflicting terminal retirement".into(),
+                        ));
+                    }
+                    if let Ok(managed) = self.managed() {
+                        managed
+                            .execute_action(RuntimeEffectAction::CompleteRetirement(retired))
+                            .await?;
+                    } else {
+                        self.state.write().await.fallback_snapshot.retired_authority =
+                            Some(durable);
+                        self.closed.store(true, Ordering::Release);
+                    }
+                } else {
+                    let managed = self.managed()?;
+                    if !self.closed.load(Ordering::Acquire) {
+                        managed
+                            .execute_action(RuntimeEffectAction::FenceRetirement(retired.clone()))
+                            .await?;
+                        self.sync_access_projection(managed.as_ref()).await;
+                        self.change_replicator_role_at_epoch(
+                            ReplicaRole::None,
+                            Some(retired.report.epoch),
+                        )
+                        .await?;
+                        self.change_application_role(ReplicaRole::None).await?;
+                        self.close().await?;
+                    }
+                    managed
+                        .execute_action(RuntimeEffectAction::CompleteRetirement(retired))
+                        .await?;
+                }
+            }
             RuntimeEffectAction::Open(mode) => self.open(mode).await?,
             RuntimeEffectAction::ChangeRole(role) => self.change_role(role).await?,
             RuntimeEffectAction::ChangeReplicatorRole(role) => {
@@ -796,6 +964,21 @@ impl RuntimeHost {
     }
 
     async fn open(&self, mode: OpenMode) -> Result<()> {
+        if self
+            .default_dependencies
+            .replica_authority_store
+            .load_retired_authority()
+            .await?
+            .is_some()
+            || self
+                .default_dependencies
+                .replica_authority_store
+                .load_retirement_started()
+                .await?
+                .is_some()
+        {
+            return Err(RuntimeError::Closed);
+        }
         if self.registered.get().is_some() {
             return Err(RuntimeError::Application("replica already opened".into()));
         }
@@ -865,17 +1048,27 @@ impl RuntimeHost {
     }
 
     async fn change_replicator_role(&self, role: ReplicaRole) -> Result<()> {
+        self.change_replicator_role_at_epoch(role, None).await
+    }
+
+    async fn change_replicator_role_at_epoch(
+        &self,
+        role: ReplicaRole,
+        retirement_epoch: Option<Epoch>,
+    ) -> Result<()> {
         let registered = self.registered.get().ok_or(RuntimeError::NotOpen)?;
         let snapshot = self.snapshot().await;
         if !snapshot.open {
             return Err(RuntimeError::NotOpen);
         }
-        let epoch = snapshot
-            .authority
-            .as_ref()
-            .map_or_else(Epoch::default, |authority| {
-                authority.current_configuration.epoch
-            });
+        let epoch = retirement_epoch.unwrap_or_else(|| {
+            snapshot
+                .authority
+                .as_ref()
+                .map_or_else(Epoch::default, |authority| {
+                    authority.current_configuration.epoch
+                })
+        });
         let transition = {
             let mut state = self.state.write().await;
             state.fallback_snapshot.write_status = AccessStatus::ReconfigurationPending;
@@ -1065,6 +1258,20 @@ impl RuntimeHost {
                         .into(),
                 ));
             }
+            RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+            | RuntimeEffectAction::RegisterPeerSession { .. }
+            | RuntimeEffectAction::ObserveSecondaryRemovalWitness(_)
+            | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
+            | RuntimeEffectAction::ObserveReplicationAck { .. }
+            | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
+            | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
+            | RuntimeEffectAction::RetireReplica(_)
+            | RuntimeEffectAction::FenceRetirement(_)
+            | RuntimeEffectAction::CompleteRetirement(_) => {
+                return Err(RuntimeError::Application(
+                    "secondary removal requires a managed replicator".into(),
+                ));
+            }
             RuntimeEffectAction::Open(_)
             | RuntimeEffectAction::ChangeRole(_)
             | RuntimeEffectAction::ChangeReplicatorRole(_)
@@ -1115,6 +1322,9 @@ fn empty_snapshot(identity: ReplicaIdentity) -> RuntimeSnapshot {
         read_status: AccessStatus::NotPrimary,
         write_status: AccessStatus::NotPrimary,
         authority: None,
+        prepared_secondary_removal: None,
+        retired_authority: None,
+        accepted_secondary_removal: None,
         current_progress: 0,
         verified_replication_lsn: None,
         committed_lsn: 0,
@@ -1133,6 +1343,9 @@ fn snapshot_postcondition(snapshot: RuntimeSnapshot) -> RuntimePostcondition {
         read_status: snapshot.read_status,
         write_status: snapshot.write_status,
         authority: snapshot.authority,
+        prepared_secondary_removal: snapshot.prepared_secondary_removal,
+        retired_authority: snapshot.retired_authority,
+        accepted_secondary_removal: snapshot.accepted_secondary_removal,
         current_progress: snapshot.current_progress,
         verified_replication_lsn: snapshot.verified_replication_lsn,
         committed_lsn: snapshot.committed_lsn,

@@ -36,6 +36,7 @@ enum TransitionKind {
   TRANSITION_KIND_REPLACEMENT = 2;
   TRANSITION_KIND_FAILOVER = 3;
   TRANSITION_KIND_PLANNED_SWITCHOVER = 4;
+  TRANSITION_KIND_SECONDARY_SCALE_DOWN = 5;
 }
 
 enum FaultType {
@@ -139,6 +140,10 @@ message AgentStatusReport {
   Epoch deactivation_epoch = 30;
   optional int64 verified_replication_lsn = 31;
   SwitchoverHandoff prepared_switchover = 32;
+  SecondaryRemovalPreparation prepared_secondary_removal = 33;
+  SecondaryRemovalEvidence secondary_removal_evidence = 34;
+  ReplicaRetirementReport retired_replica = 35;
+  SecondaryScaleDownCleanup accepted_secondary_removal = 36;
 }
 
 message InitializeAgentStoreCommand {
@@ -197,6 +202,107 @@ message EnsureConfigurationCommand {
   optional int64 failover_safe_lsn = 16;
   SwitchoverHandoff switchover_handoff = 17;
   repeated SwitchoverPreparationId retire_switchover_preparation_ids = 18;
+  EffectivePolicy previous_policy = 19;
+  SecondaryRemovalEvidence secondary_removal_evidence = 20;
+}
+
+message CleanupResourceIdentity {
+  string name = 1;
+  oneof identity {
+    string uid = 2;
+    bool authoritatively_absent = 3;
+  }
+}
+
+message ReplicaCleanupIdentity {
+  CleanupResourceIdentity pod = 1;
+  CleanupResourceIdentity pvc = 2;
+  CleanupResourceIdentity endpoint = 3;
+}
+
+message SecondaryScaleDownIntent {
+  string operation_id = 1;
+  string resource_uid = 2;
+  uint64 spec_generation = 3;
+  uint32 desired_replicas = 4;
+  Configuration previous_configuration = 5;
+  Configuration current_configuration = 6;
+  EffectivePolicy previous_policy = 7;
+  EffectivePolicy current_policy = 8;
+  ReplicaIdentity primary = 9;
+  ReplicaIdentity target = 10;
+  ReplicaCleanupIdentity cleanup = 11;
+}
+
+message SecondaryRemovalPreparation {
+  SecondaryScaleDownIntent intent = 1;
+  string operation_id = 2;
+  string process_session_id = 3;
+  uint64 report_sequence = 4;
+  int64 boundary_lsn = 5;
+}
+
+message SecondaryRemovalWitness {
+  string resource_uid = 1;
+  ReplicaIdentity identity = 2;
+  string process_session_id = 3;
+  uint64 report_sequence = 4;
+  Epoch epoch = 5;
+  string previous_configuration_id = 6;
+  string current_configuration_id = 7;
+  int64 verified_replication_lsn = 8;
+  AccessStatus write_status = 9;
+  string pending_operation_id = 10;
+  string retained_operation_id = 11;
+  ReplicaRole role = 12;
+}
+
+message SecondaryRemovalEvidence {
+  SecondaryRemovalPreparation preparation = 1;
+  repeated SecondaryRemovalWitness previous_read_quorum = 2;
+  repeated SecondaryRemovalWitness reduced_write_quorum = 3;
+}
+
+message ReplicaRetirementReport {
+  SecondaryScaleDownIntent intent = 1;
+  string operation_id = 2;
+  string process_session_id = 3;
+  uint64 report_sequence = 4;
+  Epoch epoch = 5;
+  ReplicaRole role = 6;
+  AccessStatus read_status = 7;
+  AccessStatus write_status = 8;
+  bool application_closed = 9;
+  bool peers_fenced = 10;
+}
+
+message SecondaryScaleDownCleanup {
+  SecondaryRemovalEvidence evidence = 1;
+  repeated SecondaryRemovalWitness current_only_write_quorum = 2;
+  ReplicaRetirementReport retirement = 3;
+}
+
+message PrepareSecondaryRemovalCommand {
+  string operation_id = 1;
+  int64 local_replica_id = 2;
+  string expected_instance_id = 3;
+  string expected_agent_generation = 4;
+  SecondaryScaleDownIntent intent = 5;
+}
+
+message RetireReplicaCommand {
+  string operation_id = 1;
+  int64 local_replica_id = 2;
+  string expected_instance_id = 3;
+  string expected_agent_generation = 4;
+  SecondaryScaleDownCleanup committed = 5;
+}
+
+message AcceptSecondaryRemovalCommitCommand {
+  string operation_id = 1;
+  ReplicaIdentity target = 2;
+  SecondaryScaleDownCleanup committed = 3;
+  bool local_recovery = 4;
 }
 
 message PrepareSwitchoverCommand {
@@ -231,6 +337,9 @@ message ExecuteCommandRequest {
     EnsureConfigurationCommand ensure_configuration = 11;
     EnsureReplicaBuildCommand ensure_replica_build = 12;
     PrepareSwitchoverCommand prepare_switchover = 13;
+    PrepareSecondaryRemovalCommand prepare_secondary_removal = 14;
+    RetireReplicaCommand retire_replica = 15;
+    AcceptSecondaryRemovalCommitCommand accept_secondary_removal_commit = 16;
   }
 }
 
