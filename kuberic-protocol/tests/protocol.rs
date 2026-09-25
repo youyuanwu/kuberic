@@ -637,6 +637,67 @@ fn prepared_switchover_snapshot() -> ObservationSnapshot {
     snapshot
 }
 
+fn prepared_switchover_snapshot_with_size(replica_set_size: u32) -> ObservationSnapshot {
+    let write_quorum = replica_set_size / 2 + 1;
+    let configuration = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        ReplicaId::new(1),
+        (1..=i64::from(replica_set_size))
+            .map(|id| {
+                member(
+                    id,
+                    if id == 1 {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                )
+            })
+            .collect(),
+        write_quorum,
+    );
+    let mut snapshot = empty_snapshot(replica_set_size);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        observed_generation: 1,
+        effective_policy: Some(EffectivePolicy::fixed(replica_set_size, 10).unwrap()),
+        topology: Some(AcceptedTopology {
+            configuration: configuration.clone(),
+        }),
+        ..AcceptedStatus::default()
+    };
+    snapshot.desired.generation = 2;
+    snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+        request_id: SwitchoverRequestId::new(format!("move-{replica_set_size}")),
+        target_replica_id: ReplicaId::new(2),
+    });
+    attest_stable_topology(&mut snapshot, &configuration);
+    for id in 1..=i64::from(replica_set_size) {
+        switchover_report(&mut snapshot, id).verified_replication_lsn = Some(10);
+    }
+    apply_switchover_status(&mut snapshot);
+    apply_switchover_status(&mut snapshot);
+    let Plan::Execute {
+        command: ProtocolCommand::PrepareSwitchover(command),
+    } = evaluate(&snapshot, &EvaluationConfig::default())
+    else {
+        panic!("preparation command")
+    };
+    let source = switchover_report(&mut snapshot, 1);
+    source.write_status = AccessStatus::ReconfigurationPending;
+    source.prepared_switchover = Some(SwitchoverHandoff {
+        preparation_operation_id: command.operation_id,
+        request_id: command.request_id,
+        source: command.source,
+        target: command.target,
+        starting_configuration_id: command.current_configuration.configuration_id,
+        starting_epoch: command.current_configuration.epoch,
+        handoff_lsn: 10,
+    });
+    apply_switchover_status(&mut snapshot);
+    snapshot
+}
+
 fn lose_switchover_pod(snapshot: &mut ObservationSnapshot, id: i64) {
     let observation = snapshot
         .replicas
@@ -953,6 +1014,20 @@ fn switchover_compensation_waits_for_recoverable_read_quorum_and_never_restores_
     ));
     lose_switchover_pod(&mut snapshot, 3);
     assert_switchover_safety_decision(&snapshot);
+}
+
+#[test]
+fn switchover_compensation_fails_closed_when_even_membership_cannot_regain_write_quorum() {
+    let mut two = prepared_switchover_snapshot_with_size(2);
+    observe_switchover_command(&mut two);
+    lose_switchover_pod(&mut two, 2);
+    assert_switchover_safety_decision(&two);
+
+    let mut four = prepared_switchover_snapshot_with_size(4);
+    observe_switchover_command(&mut four);
+    lose_switchover_pod(&mut four, 2);
+    lose_switchover_pod(&mut four, 4);
+    assert_switchover_safety_decision(&four);
 }
 
 #[test]

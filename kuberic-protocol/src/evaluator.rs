@@ -985,13 +985,15 @@ fn recover_switchover(
         ));
     }
     if intent.resolution == PlannedSwitchoverResolution::CompensatingOldPrimary {
-        if starting
-            .members
-            .iter()
-            .filter(|member| !definitively_lost(snapshot, &member.identity))
-            .count()
-            < transition.effective_policy.read_quorum as usize
-        {
+        let surviving = surviving_exact_members(snapshot, starting);
+        if surviving < transition.effective_policy.write_quorum as usize {
+            return Some(switchover_unsafe(
+                snapshot,
+                "Exact retained membership can no longer provide a compensation write quorum",
+                config,
+            ));
+        }
+        if surviving < transition.effective_policy.read_quorum as usize {
             return Some(switchover_unsafe(
                 snapshot,
                 "Exact retained membership can no longer provide a compensation read quorum",
@@ -1205,12 +1207,15 @@ fn recover_switchover(
                     })
         })
         .collect::<Vec<_>>();
+    let surviving = surviving_exact_members(snapshot, starting);
+    if surviving < transition.effective_policy.write_quorum as usize {
+        return Some(switchover_unsafe(
+            snapshot,
+            "Exact retained membership cannot provide a compensation write quorum",
+            config,
+        ));
+    }
     if !configuration_read_quorum(starting, &reports, transition.effective_policy.read_quorum) {
-        let surviving = starting
-            .members
-            .iter()
-            .filter(|member| !definitively_lost(snapshot, &member.identity))
-            .count();
         if surviving < transition.effective_policy.read_quorum as usize {
             return Some(switchover_unsafe(
                 snapshot,
@@ -1452,6 +1457,13 @@ fn evaluate_switchover(
         );
     let compensation_admitted =
         compensating && source_report.current_configuration.as_ref() == Some(current);
+    if compensating && surviving_exact_members(snapshot, current) < current.write_quorum as usize {
+        return switchover_unsafe(
+            snapshot,
+            "Exact compensation membership can no longer provide write quorum",
+            config,
+        );
+    }
     if source_report.write_status == AccessStatus::Granted
         || (!source_retired
             && !source_requested_retired
@@ -3450,6 +3462,17 @@ fn configuration_read_quorum(
         })
         .count()
         >= read_quorum as usize
+}
+
+fn surviving_exact_members(
+    snapshot: &ObservationSnapshot,
+    configuration: &ConfigurationDescriptor,
+) -> usize {
+    configuration
+        .members
+        .iter()
+        .filter(|member| !definitively_lost(snapshot, &member.identity))
+        .count()
 }
 
 fn configuration_cannot_regain_read_quorum(
