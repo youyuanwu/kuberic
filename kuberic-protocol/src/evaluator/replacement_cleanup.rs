@@ -2,6 +2,19 @@ use super::*;
 use crate::command::ScaleDownResource;
 use crate::types::ReplacementCleanup;
 
+pub(super) fn transition_id(
+    snapshot: &ObservationSnapshot,
+    kind: TransitionKind,
+    current: &ConfigurationDescriptor,
+) -> crate::types::TransitionId {
+    match &snapshot.status.pending_replacement_cleanup {
+        Some(cleanup) if !current.members.iter().any(|m| m.identity == cleanup.target) => {
+            cleanup.transition_id(kind, &current.configuration_id)
+        }
+        _ => derive_transition_id(&snapshot.resource_uid, kind, &current.configuration_id),
+    }
+}
+
 pub(super) fn freeze(
     snapshot: &ObservationSnapshot,
     target: &ReplicaIdentity,
@@ -17,21 +30,84 @@ pub(super) fn freeze(
     {
         return None;
     }
-    Some(ReplacementCleanup {
+    let mut cleanup = ReplacementCleanup {
         resource_uid: snapshot.resource_uid.clone(),
         target: target.clone(),
         resources: exact.identity.clone(),
+    };
+    match (&cleanup.resources.endpoint, &exact.endpoint) {
+        (_, crate::observation::ExactResourceObservation::NotFound) => {
+            cleanup.resources.endpoint = crate::types::CleanupResourceIdentity::Absent {
+                name: cleanup.resources.endpoint.name().into(),
+            };
+        }
+        (
+            crate::types::CleanupResourceIdentity::Present { .. },
+            crate::observation::ExactResourceObservation::FrozenUidPresent { .. },
+        ) => {}
+        _ => return None,
+    }
+    crate::validation::validate_replacement_cleanup(&cleanup).ok()?;
+    Some(cleanup)
+}
+
+pub(super) fn admit(
+    snapshot: &ObservationSnapshot,
+    target: &ReplicaIdentity,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    if snapshot
+        .status
+        .pending_replacement_cleanup
+        .as_ref()
+        .is_some_and(|cleanup| cleanup.target != *target)
+    {
+        return Some(waiting(snapshot, config));
+    }
+    if snapshot
+        .status
+        .pending_replacement_cleanup
+        .as_ref()
+        .is_some_and(|cleanup| cleanup.target == *target)
+    {
+        return None;
+    }
+    let Some(cleanup) = freeze(snapshot, target) else {
+        return Some(waiting(snapshot, config));
+    };
+    let mut status = snapshot.status.clone();
+    status.pending_replacement_cleanup = Some(cleanup);
+    if crate::validation::validate_status(&status).is_err() {
+        return Some(waiting(snapshot, config));
+    }
+    Some(Plan::Apply {
+        changes: vec![KubernetesChange::PersistStatus {
+            status: Box::new(waiting_status(
+                status,
+                "ReplacementCleanupFrozen",
+                "Persist exact old-incarnation cleanup before replacement side effects",
+            )),
+        }],
     })
 }
 
 pub(super) fn waiting(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
-    Plan::Wait {
-        reason: WaitReason::ActiveTransition,
-        status: waiting_status(
-            snapshot.status.clone(),
+    let (reason, message) = if snapshot.status.last_replacement.is_none()
+        && snapshot.status.pending_replacement_cleanup.is_none()
+    {
+        (
+            "ReplacementCleanupIdentityPending",
+            "Authoritative old-incarnation cleanup identity is required before replacement; legacy in-flight work without provenance remains fenced",
+        )
+    } else {
+        (
             "ReplacementCleanupPending",
             "Exact replacement cleanup must finish before another operation can start",
-        ),
+        )
+    };
+    Plan::Wait {
+        reason: WaitReason::ActiveTransition,
+        status: waiting_status(snapshot.status.clone(), reason, message),
         requeue_after_seconds: config.wait_requeue_seconds,
     }
 }

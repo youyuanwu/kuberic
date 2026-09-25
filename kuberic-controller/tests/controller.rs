@@ -427,6 +427,8 @@ fn switchover_observation() -> RawObservation {
             .unwrap()
             .clone();
         endpoint.metadata.name = Some(derive_replica_endpoint_name(&ResourceUid::new(UID), &local));
+        endpoint.metadata.uid = Some(format!("endpoint-uid-{id}"));
+        endpoint.metadata.resource_version = Some("4".into());
         endpoint.spec.as_mut().unwrap().selector =
             Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)]));
         observation.services.push(endpoint);

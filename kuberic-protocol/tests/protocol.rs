@@ -1292,6 +1292,138 @@ fn configuration() -> ConfigurationDescriptor {
     )
 }
 
+fn replacement_configuration(replica_id: i64) -> ConfigurationDescriptor {
+    let mut configuration = configuration();
+    let target = &mut configuration
+        .members
+        .iter_mut()
+        .find(|m| m.identity.replica_id == ReplicaId::new(replica_id))
+        .unwrap()
+        .identity;
+    target.agent_generation = derive_agent_generation(&derive_initialization_id(
+        &ResourceUid::new("resource-uid"),
+        target.replica_id,
+        &PodUid::new(target.instance_id.as_str()),
+        &PvcUid::new("old-pvc"),
+    ));
+    ConfigurationDescriptor::new(
+        configuration.epoch,
+        configuration.primary_id,
+        configuration.members,
+        configuration.write_quorum,
+    )
+}
+
+fn freeze_replacement_fixture(snapshot: &mut ObservationSnapshot, target: &ReplicaIdentity) {
+    let exact = replacement_resources(&snapshot.resource_uid, target);
+    let cleanup = kuberic_protocol::types::ReplacementCleanup {
+        resource_uid: snapshot.resource_uid.clone(),
+        target: target.clone(),
+        resources: exact.identity,
+    };
+    if let Some(p) = &mut snapshot.status.provisioning {
+        p.operation_id = cleanup.provisioning_operation_id(&p.pod_uid, &p.pvc_uid);
+    }
+    if let Some(t) = &mut snapshot.status.transition {
+        t.transition_id = cleanup.transition_id(t.kind, &t.current_configuration.configuration_id);
+    }
+    snapshot.status.pending_replacement_cleanup = Some(cleanup);
+}
+
+#[test]
+fn replacement_provenance_binds_ids_status_and_legacy_json_without_granting_cleanup() {
+    use kuberic_protocol::types::CleanupResourceIdentity;
+    let accepted = replacement_configuration(2);
+    let old = accepted.members[1].identity.clone();
+    let mut snapshot = empty_snapshot(3);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: EffectivePolicy::fixed(3, 10),
+        topology: Some(AcceptedTopology {
+            configuration: accepted,
+        }),
+        provisioning: Some(ProvisioningIntent {
+            replaces: old.clone(),
+            pod_uid: PodUid::new("new-pod"),
+            pvc_uid: PvcUid::new("new-pvc"),
+            operation_id: OperationId::new("unused"),
+        }),
+        ..Default::default()
+    };
+    freeze_replacement_fixture(&mut snapshot, &old);
+    assert_eq!(validate_status(&snapshot.status), Ok(()));
+    let receipt = snapshot.status.pending_replacement_cleanup.clone().unwrap();
+    for mutation in 0..9 {
+        let mut changed = snapshot.clone();
+        let frozen = changed.status.pending_replacement_cleanup.as_mut().unwrap();
+        match mutation {
+            0 => frozen.resource_uid = ResourceUid::new("another-set"),
+            1 => frozen.target.instance_id = ReplicaInstanceId::new("another-pod"),
+            2 => {
+                frozen.resources.pvc = CleanupResourceIdentity::Present {
+                    name: "other".into(),
+                    uid: "another-pvc".into(),
+                }
+            }
+            3 => frozen.resources.pod = CleanupResourceIdentity::Absent { name: "old".into() },
+            4 => {
+                frozen.resources.pvc = CleanupResourceIdentity::Absent {
+                    name: "old-data".into(),
+                }
+            }
+            5 => {
+                frozen.resources.endpoint = CleanupResourceIdentity::Present {
+                    name: frozen.resources.endpoint.name().into(),
+                    uid: "changed-endpoint".into(),
+                }
+            }
+            6 => {
+                frozen.resources.endpoint = CleanupResourceIdentity::Absent {
+                    name: frozen.resources.endpoint.name().into(),
+                }
+            }
+            7 => {
+                changed.status.provisioning.as_mut().unwrap().replaces =
+                    identity(3, "other", "other")
+            }
+            _ => changed.status.last_replacement = Some(receipt.clone()),
+        }
+        assert!(
+            kuberic_protocol::validation::validate_snapshot(&changed).is_err(),
+            "mutation={mutation}"
+        );
+    }
+    let configuration_id = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .configuration_id;
+    let original = receipt.transition_id(TransitionKind::Replacement, configuration_id);
+    let mut changed = receipt;
+    changed.resources.endpoint = CleanupResourceIdentity::Absent {
+        name: changed.resources.endpoint.name().into(),
+    };
+    assert_ne!(
+        changed.transition_id(TransitionKind::Replacement, configuration_id),
+        original
+    );
+    let mut json = serde_json::to_value(&snapshot.status).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("pendingReplacementCleanup");
+    snapshot.status = serde_json::from_value(json).unwrap();
+    assert!(snapshot.status.pending_replacement_cleanup.is_none());
+    assert!(
+        matches!(
+            evaluate(&snapshot, &EvaluationConfig::default()),
+            Plan::Wait { .. }
+        ),
+        "legacy in-flight intent without pre-admission provenance must fail closed"
+    );
+}
+
 fn desired(replicas: u32) -> DesiredState {
     DesiredState {
         generation: 1,
@@ -3910,7 +4042,7 @@ fn bootstrap_validates_all_members_before_initializing_any_store() {
 
 #[test]
 fn provisioning_observation_can_coexist_with_accepted_incarnation() {
-    let accepted = configuration();
+    let accepted = replacement_configuration(3);
     let mut snapshot = empty_snapshot(3);
     let old_identity = accepted
         .members
@@ -3944,6 +4076,7 @@ fn provisioning_observation_can_coexist_with_accepted_incarnation() {
         }),
         ..AcceptedStatus::default()
     };
+    freeze_replacement_fixture(&mut snapshot, &old_identity);
     snapshot.replicas.insert(
         ReplicaObservationKey::new(old_identity.replica_id, old_identity.instance_id.clone()),
         ReplicaObservation {
@@ -5013,7 +5146,7 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
 
 #[test]
 fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
-    let previous = configuration();
+    let previous = replacement_configuration(3);
     let replacement_identity = identity(3, "replacement-pod", "replacement-generation");
     let replacement = ConfigurationDescriptor::new(
         Epoch::new(0, 2),
@@ -5066,6 +5199,8 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
         }),
         ..AcceptedStatus::default()
     };
+    freeze_replacement_fixture(&mut snapshot, &previous.members[2].identity);
+    let receipt = snapshot.status.pending_replacement_cleanup.clone();
     for (member, progress) in replacement
         .members
         .iter()
@@ -5189,6 +5324,22 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
         panic!("expected failover transition");
     };
     let failover = status.transition.as_ref().unwrap();
+    assert_eq!(status.pending_replacement_cleanup, receipt);
+    assert!(status.last_replacement.is_none());
+    assert_eq!(validate_status(status), Ok(()));
+    let mut altered = (**status).clone();
+    altered
+        .pending_replacement_cleanup
+        .as_mut()
+        .unwrap()
+        .resources
+        .endpoint = kuberic_protocol::types::CleanupResourceIdentity::Absent {
+        name: receipt.as_ref().unwrap().resources.endpoint.name().into(),
+    };
+    assert!(
+        validate_status(&altered).is_err(),
+        "failover IDs bind the original endpoint UID"
+    );
     assert_eq!(failover.kind, TransitionKind::Failover);
     assert_eq!(failover.build_id.as_ref(), Some(&replacement_build));
     assert_eq!(
@@ -5578,7 +5729,7 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
     }
 
     fn verify_replacement_provisions_exact_target_builds_then_freezes_pc_cc() {
-        let accepted = configuration();
+        let accepted = replacement_configuration(2);
         let replacing = accepted
             .members
             .iter()
@@ -5619,6 +5770,17 @@ fn bootstrap_prevalidates_later_uninitialized_fences() {
                 agent: AgentObservation::Absent,
             },
         );
+        snapshot
+            .secondary_scale_down_resources
+            .push(replacement_resources(&snapshot.resource_uid, &replacing));
+        let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+            panic!("freeze cleanup before scaffolding");
+        };
+        let KubernetesChange::PersistStatus { status } = changes.into_iter().next().unwrap() else {
+            panic!("durable admission");
+        };
+        assert!(status.pending_replacement_cleanup.is_some());
+        snapshot.status = *status;
         assert!(matches!(
             evaluate(&snapshot, &EvaluationConfig::default()),
             Plan::Apply { changes }
@@ -6086,7 +6248,7 @@ fn replacement_resources(
 
 #[test]
 fn replacement_target_loss_before_cc_clears_provisioning() {
-    let accepted = configuration();
+    let accepted = replacement_configuration(2);
     let replacing = accepted
         .members
         .iter()
@@ -6111,6 +6273,7 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
         }),
         ..AcceptedStatus::default()
     };
+    freeze_replacement_fixture(&mut snapshot, &replacing);
     let primary = snapshot
         .status
         .topology
@@ -6185,7 +6348,7 @@ fn replacement_target_loss_before_cc_clears_provisioning() {
 
 #[test]
 fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
-    let accepted = configuration();
+    let accepted = replacement_configuration(2);
     let replacing = accepted
         .members
         .iter()
@@ -6209,7 +6372,7 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
             configuration: accepted,
         }),
         provisioning: Some(ProvisioningIntent {
-            replaces: replacing,
+            replaces: replacing.clone(),
             pod_uid: PodUid::new("abandoned-target"),
             pvc_uid: PvcUid::new("abandoned-target-pvc"),
             operation_id: OperationId::new("abandoned-build"),
@@ -6217,6 +6380,7 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
         ..AcceptedStatus::default()
     };
 
+    freeze_replacement_fixture(&mut snapshot, &replacing);
     assert!(matches!(
         evaluate(&snapshot, &EvaluationConfig::default()),
         Plan::Apply { changes }
@@ -6285,11 +6449,14 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             .collect(),
         previous.write_quorum,
     );
-    let transition_id = derive_transition_id(
-        &ResourceUid::new("resource"),
-        TransitionKind::Replacement,
-        &current.configuration_id,
-    );
+    let cleanup = kuberic_protocol::types::ReplacementCleanup {
+        resource_uid: ResourceUid::new("resource-uid"),
+        target: replacing.identity.clone(),
+        resources: replacement_resources(&ResourceUid::new("resource-uid"), &replacing.identity)
+            .identity,
+    };
+    let transition_id =
+        cleanup.transition_id(TransitionKind::Replacement, &current.configuration_id);
     let mut snapshot = empty_snapshot(3);
     snapshot.status = AcceptedStatus {
         initialized: true,
@@ -6313,6 +6480,7 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
         }),
         ..AcceptedStatus::default()
     };
+    snapshot.status.pending_replacement_cleanup = Some(cleanup);
     let mut resources = replacement_resources(&snapshot.resource_uid, &replacing.identity);
     resources.pvc = kuberic_protocol::observation::ExactResourceObservation::FrozenUidPresent {
         resource_version: "held-by-finalizer".into(),
@@ -6460,15 +6628,13 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             })),
         },
     );
-    assert!(matches!(
-        evaluate(&snapshot, &EvaluationConfig::default()),
-        Plan::Apply { changes }
-            if matches!(
-                changes.as_slice(),
-                [KubernetesChange::EnsureReplacementScaffolding { replacing, .. }]
-                    if replacing == &target.identity
-            )
-    ));
+    assert!(
+        matches!(
+            evaluate(&snapshot, &EvaluationConfig::default()),
+            Plan::Wait { .. }
+        ),
+        "the second replacement requires its own authoritative cleanup identity"
+    );
 }
 
 #[test]

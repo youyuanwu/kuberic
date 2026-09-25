@@ -645,6 +645,49 @@ pub struct ReplacementCleanup {
     pub resources: ReplicaCleanupIdentity,
 }
 
+impl ReplacementCleanup {
+    pub fn provisioning_operation_id(&self, pod_uid: &PodUid, pvc_uid: &PvcUid) -> OperationId {
+        OperationId::new(format!(
+            "replacement-provisioning-{}",
+            digest_parts(&[&self.provenance(), pod_uid.as_str(), pvc_uid.as_str()])
+        ))
+    }
+
+    pub fn transition_id(
+        &self,
+        kind: TransitionKind,
+        configuration_id: &ConfigurationId,
+    ) -> TransitionId {
+        TransitionId::new(format!(
+            "transition-{}",
+            digest_parts(&[&self.provenance(), kind.as_tag(), configuration_id.as_str()])
+        ))
+    }
+
+    fn provenance(&self) -> String {
+        let replica_id = self.target.replica_id.to_string();
+        let mut parts = vec![
+            self.resource_uid.as_str(),
+            &replica_id,
+            self.target.instance_id.as_str(),
+            self.target.agent_generation.as_str(),
+        ];
+        for resource in [
+            &self.resources.pod,
+            &self.resources.pvc,
+            &self.resources.endpoint,
+        ] {
+            match resource {
+                CleanupResourceIdentity::Present { name, uid } => {
+                    parts.extend(["present", name, uid])
+                }
+                CleanupResourceIdentity::Absent { name } => parts.extend(["absent", name, ""]),
+            }
+        }
+        digest_parts(&parts)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 /// Immutable authority for one highest-ID committed secondary removal.
@@ -860,6 +903,9 @@ pub struct AcceptedStatus {
     pub quorum_loss: Option<QuorumLossObservation>,
     #[serde(default)]
     pub last_switchover: Option<PlannedSwitchoverReceipt>,
+    /// One admitted replacement's immutable cleanup identity, moved to lastReplacement on acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_replacement_cleanup: Option<ReplacementCleanup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_replacement: Option<ReplacementCleanup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

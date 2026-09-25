@@ -185,6 +185,15 @@ mod tests {
         assert!(status["properties"].get("quorumLoss").is_some());
         assert!(status["properties"].get("lastSwitchover").is_some());
         assert!(
+            !required
+                .iter()
+                .any(|value| value == "pendingReplacementCleanup")
+        );
+        assert_eq!(
+            status["properties"]["pendingReplacementCleanup"]["properties"],
+            status["properties"]["lastReplacement"]["properties"]
+        );
+        assert!(
             status["properties"]["quorumLoss"]["properties"]
                 .get("startedAtUnixSeconds")
                 .is_none()

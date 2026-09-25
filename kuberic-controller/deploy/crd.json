@@ -1231,6 +1231,193 @@
                     "minimum": 0.0,
                     "type": "integer"
                   },
+                  "pendingReplacementCleanup": {
+                    "description": "One admitted replacement's immutable cleanup identity, moved to lastReplacement on acceptance.",
+                    "nullable": true,
+                    "properties": {
+                      "resourceUid": {
+                        "type": "string"
+                      },
+                      "resources": {
+                        "properties": {
+                          "endpoint": {
+                            "description": "Absence may only be frozen from a successful exact-name lookup.",
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "present"
+                                ]
+                              },
+                              {
+                                "required": [
+                                  "absent"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "absent": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "present": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "uid": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "uid"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "pod": {
+                            "description": "Absence may only be frozen from a successful exact-name lookup.",
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "present"
+                                ]
+                              },
+                              {
+                                "required": [
+                                  "absent"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "absent": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "present": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "uid": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "uid"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          },
+                          "pvc": {
+                            "description": "Absence may only be frozen from a successful exact-name lookup.",
+                            "oneOf": [
+                              {
+                                "required": [
+                                  "present"
+                                ]
+                              },
+                              {
+                                "required": [
+                                  "absent"
+                                ]
+                              }
+                            ],
+                            "properties": {
+                              "absent": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name"
+                                ],
+                                "type": "object"
+                              },
+                              "present": {
+                                "properties": {
+                                  "name": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "uid": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "uid"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "endpoint",
+                          "pod",
+                          "pvc"
+                        ],
+                        "type": "object"
+                      },
+                      "target": {
+                        "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                        "properties": {
+                          "agentGeneration": {
+                            "type": "string"
+                          },
+                          "instanceId": {
+                            "type": "string"
+                          },
+                          "replicaId": {
+                            "format": "int64",
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "agentGeneration",
+                          "instanceId",
+                          "replicaId"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "resourceUid",
+                      "resources",
+                      "target"
+                    ],
+                    "type": "object"
+                  },
                   "primaryFailure": {
                     "nullable": true,
                     "properties": {

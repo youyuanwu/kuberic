@@ -572,11 +572,27 @@ fn replacement_at_commit() -> (RawObservation, ReplicaIdentity, ReplicaIdentity)
         members,
         previous.write_quorum,
     );
-    let transition_id = derive_transition_id(
-        &ResourceUid::new(UID),
-        TransitionKind::Replacement,
-        &current.configuration_id,
-    );
+    let cleanup = ReplacementCleanup {
+        resource_uid: ResourceUid::new(UID),
+        target: old.clone(),
+        resources: ReplicaCleanupIdentity {
+            pod: CleanupResourceIdentity::Present {
+                name: "db-2".into(),
+                uid: old.instance_id.to_string(),
+            },
+            pvc: CleanupResourceIdentity::Present {
+                name: "db-2-data".into(),
+                uid: "pvc-uid-2".into(),
+            },
+            endpoint: CleanupResourceIdentity::Present {
+                name: derive_replica_endpoint_name(&ResourceUid::new(UID), &old),
+                uid: "endpoint-2".into(),
+            },
+        },
+    };
+    let transition_id =
+        cleanup.transition_id(TransitionKind::Replacement, &current.configuration_id);
+    status.pending_replacement_cleanup = Some(cleanup);
     status.transition = Some(TransitionIntent {
         transition_id: transition_id.clone(),
         kind: TransitionKind::Replacement,
@@ -763,8 +779,353 @@ async fn consecutive_replacement_failures_serialize_frozen_cleanup_across_restar
     let (_, plan) = next_plan(&api).await;
     assert!(
         matches!(plan, Plan::Apply { changes } if matches!(changes.as_slice(),
+        [KubernetesChange::PersistStatus { status }] if status.pending_replacement_cleanup.as_ref().is_some_and(|c| c.target == new)))
+    );
+    tick(&api).await;
+    let (_, plan) = next_plan(&api).await;
+    assert!(
+        matches!(plan, Plan::Apply { changes } if matches!(changes.as_slice(),
         [KubernetesChange::EnsureReplacementScaffolding { replacing, .. }] if replacing == &new))
     );
+}
+
+#[tokio::test]
+async fn replacement_no_longer_stalls_when_old_pvc_vanishes_before_acceptance() {
+    let (mut raw, _, _) = replacement_at_commit();
+    raw.pvcs.retain(|p| p.uid().as_deref() != Some("pvc-uid-2"));
+    raw.set.status =
+        serde_json::from_value(serde_json::to_value(&raw.set.status).unwrap()).unwrap();
+    let restarted = Arc::new(InMemoryClusterApi::new(raw));
+    for _ in 0..10 {
+        tick(&restarted).await;
+        if restarted
+            .observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .transition
+            .is_none()
+        {
+            return;
+        }
+    }
+    panic!("replacement acceptance stalled after the old PVC disappeared");
+}
+
+#[tokio::test]
+async fn replacement_acceptance_survives_old_resources_disappearing_before_commit() {
+    for resource in [
+        ScaleDownResource::Endpoint,
+        ScaleDownResource::Pod,
+        ScaleDownResource::Pvc,
+    ] {
+        for recreated in [false, true] {
+            let (mut raw, old, new) = replacement_at_commit();
+            let receipt = raw
+                .set
+                .status
+                .as_ref()
+                .unwrap()
+                .authority
+                .pending_replacement_cleanup
+                .clone()
+                .unwrap();
+            let identity = match resource {
+                ScaleDownResource::Endpoint => &receipt.resources.endpoint,
+                ScaleDownResource::Pod => &receipt.resources.pod,
+                ScaleDownResource::Pvc => &receipt.resources.pvc,
+            };
+            if recreated {
+                let meta = metadata(&mut raw, resource, identity.name());
+                meta.uid = Some("unrelated-same-name-occupant".into());
+                meta.resource_version = Some("99".into());
+                meta.labels = None;
+            } else {
+                match resource {
+                    ScaleDownResource::Endpoint => {
+                        raw.services.retain(|s| s.name_any() != identity.name())
+                    }
+                    ScaleDownResource::Pod => raw.pods.retain(|p| p.name_any() != identity.name()),
+                    ScaleDownResource::Pvc => raw.pvcs.retain(|p| p.name_any() != identity.name()),
+                }
+            }
+            // Only persisted JSON survives the controller restart; no old resource list is required.
+            raw.set.status =
+                serde_json::from_value(serde_json::to_value(&raw.set.status).unwrap()).unwrap();
+            let api = Arc::new(InMemoryClusterApi::new(raw));
+            for _ in 0..20 {
+                tick(&api).await;
+                let status = api.observation().await.set.status.unwrap().authority;
+                if status.transition.is_none() {
+                    assert_eq!(status.last_replacement, Some(receipt.clone()));
+                    assert!(status.pending_replacement_cleanup.is_none());
+                    break;
+                }
+            }
+            assert!(
+                api.observation()
+                    .await
+                    .set
+                    .status
+                    .unwrap()
+                    .authority
+                    .transition
+                    .is_none(),
+                "pre-fix acceptance stalled after old PVC disappeared"
+            );
+            let restarted = Arc::new(InMemoryClusterApi::new(api.observation().await));
+            finish(&restarted).await;
+            let mut raw = restarted.observation().await;
+            assert!(
+                raw.set
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .authority
+                    .last_replacement
+                    .is_none()
+            );
+            assert!(
+                raw.pods
+                    .iter()
+                    .any(|p| p.uid().as_deref() == Some(new.instance_id.as_str()))
+            );
+            assert!(
+                !raw.pods
+                    .iter()
+                    .any(|p| p.uid().as_deref() == Some(old.instance_id.as_str()))
+            );
+            if recreated {
+                assert_eq!(
+                    metadata(&mut raw, resource, identity.name()).uid.as_deref(),
+                    Some("unrelated-same-name-occupant")
+                );
+            }
+            assert!(!restarted.effects().await.iter().any(|e| matches!(e,
+                EffectRecord::DeleteScaleDownResource { uid, .. } if uid == "unrelated-same-name-occupant")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn failover_accepts_carried_replacement_after_all_old_resources_disappear() {
+    let (mut raw, old, _) = replacement_at_commit();
+    let status = &mut raw.set.status.as_mut().unwrap().authority;
+    let cleanup = status.pending_replacement_cleanup.clone().unwrap();
+    let transition = status.transition.as_mut().unwrap();
+    let mut members = transition.current_configuration.members.clone();
+    for member in &mut members {
+        member.role = if member.identity.replica_id == ReplicaId::new(3) {
+            ReplicaRole::Primary
+        } else {
+            ReplicaRole::ActiveSecondary
+        };
+    }
+    transition.current_configuration =
+        ConfigurationDescriptor::new(Epoch::new(0, 3), ReplicaId::new(3), members, 2);
+    transition.kind = TransitionKind::Failover;
+    transition.election_lsn = Some(5);
+    transition.transition_id = cleanup.transition_id(
+        transition.kind,
+        &transition.current_configuration.configuration_id,
+    );
+    for member in &transition.current_configuration.members {
+        let RawAgentObservation::Report(report) = raw
+            .agents
+            .get_mut(&ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            ))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        report.epoch = Some(transition.current_configuration.epoch.into());
+        report.current_configuration = Some(transition.current_configuration.clone().into());
+        report.role = if member.role == ReplicaRole::Primary {
+            proto::ReplicaRole::Primary
+        } else {
+            proto::ReplicaRole::ActiveSecondary
+        } as i32;
+        report.write_status = if member.role == ReplicaRole::Primary {
+            proto::AccessStatus::Granted
+        } else {
+            proto::AccessStatus::NotPrimary
+        } as i32;
+        report.retained_operation_id = format!(
+            "{}:current-only:{}",
+            transition.transition_id, member.identity.replica_id
+        );
+    }
+    raw.pods
+        .retain(|p| p.uid().as_deref() != Some(old.instance_id.as_str()));
+    raw.pvcs
+        .retain(|p| p.name_any() != cleanup.resources.pvc.name());
+    raw.services.retain(|s| {
+        s.name_any() != cleanup.resources.endpoint.name() && s.name_any() != "db-write"
+    });
+    raw.services.push(write_service("disabled"));
+    let api = Arc::new(InMemoryClusterApi::new(raw));
+    for _ in 0..20 {
+        tick(&api).await;
+        let status = api.observation().await.set.status.unwrap().authority;
+        if status.transition.is_none() {
+            assert_eq!(status.last_replacement, Some(cleanup.clone()));
+            assert!(status.pending_replacement_cleanup.is_none());
+            break;
+        }
+        assert_eq!(status.pending_replacement_cleanup, Some(cleanup.clone()));
+    }
+    assert!(
+        api.observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .transition
+            .is_none()
+    );
+    let restarted = Arc::new(InMemoryClusterApi::new(api.observation().await));
+    tick(&restarted).await;
+    let status = restarted.observation().await.set.status.unwrap().authority;
+    assert!(status.last_replacement.is_none());
+    assert_eq!(
+        status.topology.unwrap().configuration.primary_id,
+        ReplicaId::new(3)
+    );
+    assert!(!restarted.effects().await.iter().any(|e| matches!(
+        e,
+        EffectRecord::DeleteScaleDownResource { .. } | EffectRecord::DeleteScaffolding { .. }
+    )));
+}
+
+#[tokio::test]
+async fn replacement_admission_freezes_exact_identity_before_any_scaffolding() {
+    for failure in [false, true] {
+        let mut raw = fixture(3, 3);
+        let old = raw
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members[1]
+            .identity
+            .clone();
+        let RawAgentObservation::Report(report) = raw
+            .agents
+            .get_mut(&ReplicaObservationKey::new(
+                old.replica_id,
+                old.instance_id.clone(),
+            ))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        report.reported_fault = proto::FaultType::Permanent as i32;
+        let api = Arc::new(InMemoryClusterApi::new(raw));
+        if failure {
+            api.fail_exact_lookup("PVC/db-2-data".into(), Some("403".into()))
+                .await;
+            for _ in 0..3 {
+                assert_eq!(tick(&api).await.0, ReconcileKind::Waiting);
+                assert!(
+                    api.observation()
+                        .await
+                        .set
+                        .status
+                        .unwrap()
+                        .authority
+                        .pending_replacement_cleanup
+                        .is_none()
+                );
+            }
+            assert!(
+                !api.effects()
+                    .await
+                    .iter()
+                    .any(|e| matches!(e, EffectRecord::EnsureReplacement(_)))
+            );
+            api.fail_exact_lookup("PVC/db-2-data".into(), None).await;
+        }
+        let (_, effects) = tick(&api).await;
+        assert!(
+            effects
+                .iter()
+                .all(|e| matches!(e, EffectRecord::ReplaceStatus))
+        );
+        let status = api.observation().await.set.status.unwrap().authority;
+        assert_eq!(
+            status.pending_replacement_cleanup.as_ref().unwrap().target,
+            old
+        );
+        assert!(status.provisioning.is_none() && status.transition.is_none());
+        let restarted = Arc::new(InMemoryClusterApi::new(api.observation().await));
+        let (_, effects) = tick(&restarted).await;
+        assert_eq!(effects, vec![EffectRecord::EnsureReplacement(old)]);
+    }
+}
+
+#[tokio::test]
+async fn replacement_admission_requires_storage_provenance_and_authoritative_endpoint_absence() {
+    for missing_pvc in [false, true] {
+        let mut raw = fixture(3, 3);
+        let old = raw
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .members[1]
+            .identity
+            .clone();
+        let endpoint = derive_replica_endpoint_name(&ResourceUid::new(UID), &old);
+        raw.services.retain(|s| s.name_any() != endpoint);
+        let RawAgentObservation::Report(report) = raw
+            .agents
+            .get_mut(&ReplicaObservationKey::new(
+                old.replica_id,
+                old.instance_id.clone(),
+            ))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        report.reported_fault = proto::FaultType::Permanent as i32;
+        if missing_pvc {
+            raw.pvcs.retain(|p| p.uid().as_deref() != Some("pvc-uid-2"));
+        }
+        let api = Arc::new(InMemoryClusterApi::new(raw));
+        tick(&api).await;
+        let status = api.observation().await.set.status.unwrap().authority;
+        if missing_pvc {
+            assert!(status.pending_replacement_cleanup.is_none());
+            assert!(
+                !api.effects()
+                    .await
+                    .iter()
+                    .any(|e| matches!(e, EffectRecord::EnsureReplacement(_)))
+            );
+        } else {
+            let receipt = status.pending_replacement_cleanup.unwrap();
+            assert_eq!(
+                receipt.resources.endpoint,
+                CleanupResourceIdentity::Absent { name: endpoint }
+            );
+            assert_eq!(receipt.target, old);
+        }
+    }
 }
 
 #[tokio::test]

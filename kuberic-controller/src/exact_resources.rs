@@ -1,16 +1,17 @@
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use kube::ResourceExt;
 use kuberic_protocol::observation::{
-    ExactResourceObservation, SecondaryScaleDownResourceObservation,
+    ExactResourceObservation, ReplicaObservationKey, SecondaryScaleDownResourceObservation,
 };
 use kuberic_protocol::types::{
-    CleanupResourceIdentity, PodUid, PvcUid, ReplicaCleanupIdentity, ReplicaIdentity, ReplicaRole,
-    ResourceUid, derive_agent_generation, derive_initialization_id, derive_replica_endpoint_name,
+    CleanupResourceIdentity, Epoch, PodUid, PvcUid, ReplicaCleanupIdentity, ReplicaIdentity,
+    ReplicaRole, ResourceUid, derive_agent_generation, derive_initialization_id,
+    derive_replica_endpoint_name,
 };
 
 use crate::crd::{INSTANCE_LABEL, SET_UID_LABEL};
 use crate::observation::{
-    ExactLookup, RawObservation, RawObservationFailure, RawScaleDownResources,
+    ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
 };
 
 pub(crate) fn requests(
@@ -30,18 +31,18 @@ pub(crate) fn requests(
     if let Some(cleanup) = &status.last_replacement {
         return vec![(cleanup.target.clone(), cleanup.resources.clone(), true)];
     }
+    // Admission already captured the identity. Old-resource lookups are not
+    // prerequisites for building or accepting the new topology.
+    if status.pending_replacement_cleanup.is_some()
+        || status.transition.is_some()
+        || status.provisioning.is_some()
+    {
+        return Vec::new();
+    }
     let Some(topology) = status.topology.as_ref() else {
         return Vec::new();
     };
-    let target = if let Some(transition) = &status.transition {
-        topology.configuration.members.iter().find(|old| {
-            !transition
-                .current_configuration
-                .members
-                .iter()
-                .any(|new| new.identity == old.identity)
-        })
-    } else if raw.set.spec.replicas > 0
+    let mut targets = if raw.set.spec.replicas > 0
         && (raw.set.spec.replicas as usize) < topology.configuration.members.len()
     {
         topology
@@ -50,12 +51,52 @@ pub(crate) fn requests(
             .iter()
             .filter(|m| m.role == ReplicaRole::ActiveSecondary)
             .max_by_key(|m| m.identity.replica_id)
+            .into_iter()
+            .collect::<Vec<_>>()
     } else {
-        None
+        Vec::new()
     };
-    let Some(target) = target.map(|m| &m.identity) else {
-        return Vec::new();
+    for member in &topology.configuration.members {
+        if member.role == ReplicaRole::ActiveSecondary
+            && replacement_candidate(raw, &member.identity, topology.configuration.epoch)
+            && !targets.contains(&member)
+        {
+            targets.push(member);
+        }
+    }
+    targets
+        .into_iter()
+        .filter_map(|m| {
+            candidate(raw, &m.identity).map(|identity| (m.identity.clone(), identity, false))
+        })
+        .collect()
+}
+
+fn replacement_candidate(raw: &RawObservation, target: &ReplicaIdentity, epoch: Epoch) -> bool {
+    use kuberic_wire::proto;
+    if !raw
+        .pods
+        .iter()
+        .any(|p| p.uid().as_deref() == Some(target.instance_id.as_str()))
+    {
+        return true;
+    }
+    let Some(RawAgentObservation::Report(report)) = raw.agents.get(&ReplicaObservationKey::new(
+        target.replica_id,
+        target.instance_id.clone(),
+    )) else {
+        return false;
     };
+    report.reported_fault == proto::FaultType::Permanent as i32
+        || (report.role != proto::ReplicaRole::Primary as i32
+            && report.write_status != proto::AccessStatus::Granted as i32
+            && report.epoch.as_ref().is_some_and(|e| {
+                (e.data_loss_number, e.configuration_number)
+                    < (epoch.data_loss_number, epoch.configuration_number)
+            }))
+}
+
+fn candidate(raw: &RawObservation, target: &ReplicaIdentity) -> Option<ReplicaCleanupIdentity> {
     let resource_uid = ResourceUid::new(raw.set.uid().unwrap_or_default());
     let pod = raw
         .pods
@@ -70,20 +111,18 @@ pub(crate) fn requests(
             &PvcUid::new(uid),
         )) == target.agent_generation
     });
-    let Some(pvc) = pvc else { return Vec::new() };
+    let pvc = pvc?;
     let pvc_name = pvc.name_any();
     let pod_name = if let Some(pod) = pod {
         // The durable generation binds this PVC UID; the actual mount must agree too.
         if mounted_pvc(pod) != Some(pvc_name.as_str()) {
-            return Vec::new();
+            return None;
         }
         pod.name_any()
     } else {
         // Both scaffold constructors use <pod>-data. The generation proves storage
         // provenance; a subsequent exact Pod GET, not list omission, proves absence.
-        let Some(name) = pvc_name.strip_suffix("-data") else {
-            return Vec::new();
-        };
+        let name = pvc_name.strip_suffix("-data")?;
         name.to_string()
     };
     let endpoint_name = derive_replica_endpoint_name(&resource_uid, target);
@@ -99,21 +138,17 @@ pub(crate) fn requests(
         .unwrap_or(CleanupResourceIdentity::Absent {
             name: endpoint_name,
         });
-    vec![(
-        target.clone(),
-        ReplicaCleanupIdentity {
-            pod: CleanupResourceIdentity::Present {
-                name: pod_name,
-                uid: target.instance_id.to_string(),
-            },
-            pvc: CleanupResourceIdentity::Present {
-                name: pvc_name,
-                uid: pvc.uid().expect("proven UID"),
-            },
-            endpoint,
+    Some(ReplicaCleanupIdentity {
+        pod: CleanupResourceIdentity::Present {
+            name: pod_name,
+            uid: target.instance_id.to_string(),
         },
-        false,
-    )]
+        pvc: CleanupResourceIdentity::Present {
+            name: pvc_name,
+            uid: pvc.uid().expect("proven UID"),
+        },
+        endpoint,
+    })
 }
 
 fn mounted_pvc(pod: &Pod) -> Option<&str> {
@@ -146,6 +181,7 @@ pub(crate) fn protected(
         .chain(status.last_secondary_removal.iter().map(|r| &r.evidence.preparation.intent))
         .flat_map(|intent| [&intent.cleanup.pod, &intent.cleanup.pvc, &intent.cleanup.endpoint])
         .chain(status.last_replacement.iter().flat_map(|c| [&c.resources.pod, &c.resources.pvc, &c.resources.endpoint]))
+        .chain(status.pending_replacement_cleanup.iter().flat_map(|c| [&c.resources.pod, &c.resources.pvc, &c.resources.endpoint]))
         .any(|identity| resource_name == Some(name(identity))
             || matches!(identity, CleanupResourceIdentity::Present { uid, .. } if resource_uid == Some(uid.as_str())))
 }
@@ -168,16 +204,17 @@ pub(crate) fn finish(raw: &mut RawObservation, mut exact: RawScaleDownResources,
         if !owned {
             exact.endpoint =
                 ExactLookup::Failed("endpoint is not owned by the exact accepted target".into());
-        } else if matches!(
-            exact.identity.endpoint,
-            CleanupResourceIdentity::Absent { .. }
-        ) && let Some(uid) = service.uid()
-        {
+        } else if let Some(uid) = service.uid() {
             exact.identity.endpoint = CleanupResourceIdentity::Present {
                 name: service.name_any(),
                 uid,
             };
         }
+    }
+    if !frozen && matches!(exact.endpoint, ExactLookup::NotFound) {
+        exact.identity.endpoint = CleanupResourceIdentity::Absent {
+            name: name(&exact.identity.endpoint).into(),
+        };
     }
     for (kind, identity, result) in [
         (

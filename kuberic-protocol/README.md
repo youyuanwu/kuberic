@@ -143,9 +143,24 @@ published only after that proof; it never starts ordinary failover or replacemen
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 for the complete operational contract.
 
-Replacement acceptance atomically records `lastReplacement` with the excluded
-exact identity and frozen Pod, PVC, and endpoint names/UIDs. This is one pending
-cleanup obligation, not an overwriteable history slot. Exact endpoint/Pod/PVC
-absence clears it before another operation (including replacement/provisioning)
+Replacement admission durably records `pendingReplacementCleanup` **before**
+creating replacement scaffolding or provisioning. Authoritative exact-name GETs
+freeze the old Pod/PVC names and UIDs and the peer Service name/UID (or confirmed
+absence). PVC generation provenance and the exact replaced identity bind this
+receipt; provisioning and replacement/failover transition IDs also bind its
+contents. Missing provenance or failed reads prevent admission.
+
+The receipt survives provisioning retries and failover adopting the replacement.
+Topology acceptance atomically moves it, unchanged, to `lastReplacement`; it
+never rediscovers old resources from label-selected lists. The two optional
+status fields are mutually exclusive phases of **one** obligation, not a queue
+or overwriteable history slot. Existing JSON without the new field still
+decodes; legacy in-flight replacement intent without frozen provenance waits
+closed rather than inferring deletion authority at acceptance.
+
+After acceptance, exact-name GETs classify the frozen UID, a different same-name
+UID, NotFound, or failure. Different UIDs prove the old resource absent but never
+become cleanup targets. Exact endpoint/Pod/PVC absence clears the receipt before
+another operation (including replacement/provisioning)
 can start. Finalizers, lost delete replies, and controller restarts retain the
 receipt; same-name replacement resources never inherit its deletion authority.

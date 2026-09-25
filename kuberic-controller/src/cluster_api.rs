@@ -365,27 +365,7 @@ where
                 .map_err(|error| ControllerError::Observation(error.to_string()))?
                 .as_secs() as i64,
         };
-        for (target, identity, frozen) in crate::exact_resources::requests(&raw) {
-            let (pod, pvc, endpoint) = tokio::join!(
-                exact_lookup(&pods_api, crate::exact_resources::name(&identity.pod)),
-                exact_lookup(&pvcs_api, crate::exact_resources::name(&identity.pvc)),
-                exact_lookup(
-                    &services_api,
-                    crate::exact_resources::name(&identity.endpoint)
-                ),
-            );
-            crate::exact_resources::finish(
-                &mut raw,
-                RawScaleDownResources {
-                    target,
-                    identity,
-                    pod,
-                    pvc,
-                    endpoint,
-                },
-                frozen,
-            );
-        }
+        observe_exact_resources(&mut raw, &pods_api, &pvcs_api, &services_api).await;
         let agent_requests = raw
             .pods
             .iter()
@@ -418,6 +398,8 @@ where
             .await
             .into_iter()
             .collect::<BTreeMap<_, _>>();
+        // Permanent faults and lag are known only after observing the agents.
+        observe_exact_resources(&mut raw, &pods_api, &pvcs_api, &services_api).await;
 
         Ok(raw)
     }
@@ -2483,6 +2465,35 @@ fn memory_delete<K: ResourceExt>(
         objects.retain(|o| o.name_any() != name);
     }
     Ok(())
+}
+
+async fn observe_exact_resources(
+    raw: &mut RawObservation,
+    pods: &Api<Pod>,
+    pvcs: &Api<PersistentVolumeClaim>,
+    services: &Api<Service>,
+) {
+    for (target, identity, frozen) in crate::exact_resources::requests(raw) {
+        if raw.exact_resources.iter().any(|r| r.target == target) {
+            continue;
+        }
+        let (pod, pvc, endpoint) = tokio::join!(
+            exact_lookup(pods, crate::exact_resources::name(&identity.pod)),
+            exact_lookup(pvcs, crate::exact_resources::name(&identity.pvc)),
+            exact_lookup(services, crate::exact_resources::name(&identity.endpoint)),
+        );
+        crate::exact_resources::finish(
+            raw,
+            RawScaleDownResources {
+                target,
+                identity,
+                pod,
+                pvc,
+                endpoint,
+            },
+            frozen,
+        );
+    }
 }
 
 async fn exact_lookup<K>(api: &Api<K>, name: &str) -> ExactLookup<K>

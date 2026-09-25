@@ -13,8 +13,7 @@ use crate::types::{
     PrimaryFailureObservation, ProvisioningIntent, QuorumLossObservation, ReplicaIdentity,
     ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole, StatusCondition, TransitionIntent,
     TransitionKind, derive_agent_generation, derive_failover_repair_operation_id,
-    derive_initialization_id, derive_replacement_operation_id,
-    derive_switchover_preparation_operation_id, derive_transition_id,
+    derive_initialization_id, derive_switchover_preparation_operation_id, derive_transition_id,
 };
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
@@ -144,10 +143,28 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
     }
 
     if let Some(transition) = &snapshot.status.transition {
+        if matches!(
+            transition.kind,
+            TransitionKind::Replacement | TransitionKind::Failover
+        ) && snapshot.status.topology.as_ref().is_some_and(|t| {
+            t.configuration.members.iter().any(|old| {
+                !transition
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|new| new.identity == old.identity)
+            })
+        }) && snapshot.status.pending_replacement_cleanup.is_none()
+        {
+            return replacement_cleanup::waiting(snapshot, config);
+        }
         return evaluate_transition(snapshot, transition, config);
     }
 
     if let Some(provisioning) = &snapshot.status.provisioning {
+        if snapshot.status.pending_replacement_cleanup.is_none() {
+            return replacement_cleanup::waiting(snapshot, config);
+        }
         return evaluate_provisioning(snapshot, provisioning, config);
     }
 
@@ -206,7 +223,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         return plan;
     }
 
-    if config.enable_secondary_scale_down {
+    if config.enable_secondary_scale_down && status.pending_replacement_cleanup.is_none() {
         if let Some(plan) = begin_switchover(snapshot, &status, config) {
             return plan;
         }
@@ -216,6 +233,14 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
     }
 
     if configuration.members.iter().any(|member| {
+        if status
+            .pending_replacement_cleanup
+            .as_ref()
+            .is_some_and(|c| c.target == member.identity)
+            || replacement_needed(snapshot, configuration, member)
+        {
+            return false;
+        }
         snapshot
             .observation_for_identity(&member.identity)
             .and_then(|observation| observation.kubernetes.as_ref())
@@ -327,44 +352,20 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
             .count()
             >= configuration.write_quorum as usize;
     if let Some(failed) = configuration.members.iter().find(|member| {
+        if let Some(cleanup) = &status.pending_replacement_cleanup {
+            return cleanup.target == member.identity && member.role != ReplicaRole::Primary;
+        }
         if recovering_service {
             return false;
         }
         if member.identity.replica_id == configuration.primary_id {
             return false;
         }
-        let permanent_fault = snapshot
-            .observation_for_identity(&member.identity)
-            .is_some_and(|observation| {
-                matches!(
-                    &observation.agent,
-                    AgentObservation::Report(report)
-                        if report.reported_fault == Some(crate::types::FaultType::Permanent)
-                )
-            });
-        let authorized_lag = snapshot
-            .observation_for_identity(&member.identity)
-            .is_some_and(|observation| {
-                matches!(
-                    &observation.agent,
-                    AgentObservation::Report(report)
-                        if report.role != ReplicaRole::Primary
-                            && report.write_status != AccessStatus::Granted
-                            && report.epoch < configuration.epoch
-                )
-            });
-        let accepted_incarnation_missing = snapshot
-            .observation_for_identity(&member.identity)
-            .and_then(|observation| observation.kubernetes.as_ref())
-            .is_none();
-        let orphaned_storage = snapshot.replicas.iter().any(|(key, observation)| {
-            key.replica_id == member.identity.replica_id
-                && observation.kubernetes.as_ref().is_some_and(|kubernetes| {
-                    kubernetes.pod_uid.is_none() && kubernetes.pvc_uid.is_some()
-                })
-        });
-        permanent_fault || authorized_lag || (accepted_incarnation_missing && orphaned_storage)
+        replacement_needed(snapshot, configuration, member)
     }) {
+        if let Some(plan) = replacement_cleanup::admit(snapshot, &failed.identity, config) {
+            return plan;
+        }
         let candidate = snapshot.replicas.iter().find(|(key, observation)| {
             key.replica_id == failed.identity.replica_id
                 && key.instance_id != failed.identity.instance_id
@@ -400,12 +401,12 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         );
         replacement_status.provisioning = Some(ProvisioningIntent {
             replaces: failed.identity.clone(),
-            operation_id: derive_replacement_operation_id(
-                &snapshot.resource_uid,
-                &failed.identity,
-                &pod_uid,
-                &pvc_uid,
-            ),
+            operation_id: snapshot
+                .status
+                .pending_replacement_cleanup
+                .as_ref()
+                .expect("admission persisted cleanup")
+                .provisioning_operation_id(&pod_uid, &pvc_uid),
             pod_uid,
             pvc_uid,
         });
@@ -416,6 +417,9 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         };
     }
 
+    if status.pending_replacement_cleanup.is_some() {
+        return replacement_cleanup::waiting(snapshot, config);
+    }
     status = status.without_condition("UnmanagedReplicaResources");
     if let Some(extra) = snapshot.replicas.iter().find_map(|(key, observation)| {
         let accepted = configuration.members.iter().any(|member| {
@@ -1939,10 +1943,10 @@ fn maybe_begin_stable_failover(
     status.transition = Some(TransitionIntent {
         secondary_scale_down: None,
         secondary_removal_evidence: None,
-        transition_id: derive_transition_id(
-            &snapshot.resource_uid,
+        transition_id: replacement_cleanup::transition_id(
+            snapshot,
             TransitionKind::Failover,
-            &current.configuration_id,
+            &current,
         ),
         kind: TransitionKind::Failover,
         spec_generation: snapshot.status.observed_generation,
@@ -2310,10 +2314,10 @@ fn evaluate_transition(
         status.transition = Some(TransitionIntent {
             secondary_scale_down: None,
             secondary_removal_evidence: None,
-            transition_id: derive_transition_id(
-                &snapshot.resource_uid,
+            transition_id: replacement_cleanup::transition_id(
+                snapshot,
                 TransitionKind::Failover,
-                &current.configuration_id,
+                &current,
             ),
             kind: TransitionKind::Failover,
             spec_generation: active_transition
@@ -2490,10 +2494,10 @@ fn evaluate_transition(
                 status.transition = Some(TransitionIntent {
                     secondary_scale_down: None,
                     secondary_removal_evidence: None,
-                    transition_id: derive_transition_id(
-                        &snapshot.resource_uid,
+                    transition_id: replacement_cleanup::transition_id(
+                        snapshot,
                         TransitionKind::Failover,
-                        &corrected.configuration_id,
+                        &corrected,
                     ),
                     kind: TransitionKind::Failover,
                     spec_generation: transition.spec_generation,
@@ -2663,11 +2667,8 @@ fn evaluate_transition(
                 configuration: current.clone(),
             });
             accepted.transition = None;
-            if let Some(retired) = retired {
-                let Some(cleanup) = replacement_cleanup::freeze(snapshot, &retired.identity) else {
-                    return replacement_cleanup::waiting(snapshot, config);
-                };
-                accepted.last_replacement = Some(cleanup);
+            if retired.is_some() {
+                accepted.last_replacement = accepted.pending_replacement_cleanup.take();
             }
             accepted.primary_failure = None;
             accepted.quorum_loss = None;
@@ -2925,6 +2926,33 @@ fn evaluate_transition(
     }
 }
 
+fn replacement_needed(
+    snapshot: &ObservationSnapshot,
+    configuration: &ConfigurationDescriptor,
+    member: &ConfigurationMember,
+) -> bool {
+    if member.role == ReplicaRole::Primary {
+        return false;
+    }
+    let observation = snapshot.observation_for_identity(&member.identity);
+    let faulty = observation.is_some_and(|o| {
+        matches!(&o.agent,
+        AgentObservation::Report(report)
+            if report.reported_fault == Some(crate::types::FaultType::Permanent)
+                || (report.role != ReplicaRole::Primary
+                    && report.write_status != AccessStatus::Granted
+                    && report.epoch < configuration.epoch))
+    });
+    let missing = observation.and_then(|o| o.kubernetes.as_ref()).is_none();
+    let orphaned_storage = snapshot.replicas.iter().any(|(key, o)| {
+        key.replica_id == member.identity.replica_id
+            && o.kubernetes
+                .as_ref()
+                .is_some_and(|k| k.pod_uid.is_none() && k.pvc_uid.is_some())
+    });
+    faulty || (missing && orphaned_storage)
+}
+
 fn evaluate_provisioning(
     snapshot: &ObservationSnapshot,
     provisioning: &ProvisioningIntent,
@@ -3093,10 +3121,10 @@ fn evaluate_provisioning(
             transition_status.transition = Some(TransitionIntent {
                 secondary_scale_down: None,
                 secondary_removal_evidence: None,
-                transition_id: derive_transition_id(
-                    &snapshot.resource_uid,
+                transition_id: replacement_cleanup::transition_id(
+                    snapshot,
                     TransitionKind::Replacement,
-                    &current.configuration_id,
+                    &current,
                 ),
                 kind: TransitionKind::Replacement,
                 spec_generation: snapshot.status.observed_generation,
@@ -3314,28 +3342,13 @@ fn evaluate_replacement_transition(
         report.identity == primary.identity && report.write_status == AccessStatus::Granted
     });
     if primary_ready && configuration_report_quorum(current, &current_only_reports) {
-        let retired = previous
-            .members
-            .iter()
-            .find(|previous_member| {
-                current.members.iter().all(|current_member| {
-                    current_member.identity.replica_id != previous_member.identity.replica_id
-                        || current_member.identity != previous_member.identity
-                })
-            })
-            .expect("validated replacement changes one exact incarnation")
-            .identity
-            .clone();
         let mut accepted = clear_evaluator_conditions(snapshot.status.clone());
         accepted.observed_generation = transition.spec_generation;
         accepted.topology = Some(AcceptedTopology {
             configuration: current.clone(),
         });
         accepted.transition = None;
-        let Some(cleanup) = replacement_cleanup::freeze(snapshot, &retired) else {
-            return replacement_cleanup::waiting(snapshot, config);
-        };
-        accepted.last_replacement = Some(cleanup);
+        accepted.last_replacement = accepted.pending_replacement_cleanup.take();
         accepted = accepted.with_condition(progressing_condition(
             "ReplacementTopologyAccepted",
             "Accepted the equal-cardinality replacement topology",
