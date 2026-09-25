@@ -418,25 +418,49 @@ impl AgentStore for SqliteStore {
                 ));
             }
             if !record.command.retire_switchover_preparation_ids.is_empty() {
-                let prepared = state.prepared_switchover.as_ref().ok_or_else(|| {
-                    AgentError::EffectConflict(
-                        "configuration retires missing switchover preparation".into(),
-                    )
-                })?;
-                if record.command.switchover_handoff.as_ref() != Some(prepared) {
-                    return Err(AgentError::EffectConflict(
-                        "configuration retires a changed switchover certificate".into(),
-                    ));
-                }
-                if record.command.retire_switchover_preparation_ids.len() != 1
-                    || record.command.retire_switchover_preparation_ids[0]
-                        != prepared.preparation_operation_id
+                let retirement_id = &record.command.retire_switchover_preparation_ids[0];
+                if record.command.is_switchover_restoration()
+                    && record.command.switchover_handoff.is_none()
                 {
-                    return Err(AgentError::EffectConflict(
-                        "configuration retires another switchover preparation".into(),
-                    ));
+                    if state
+                        .prepared_switchover
+                        .as_ref()
+                        .is_some_and(|prepared| &prepared.preparation_operation_id != retirement_id)
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "restoration retires another preparation".into(),
+                        ));
+                    }
+                    if let Some(prepared) = state.prepared_switchover.take() {
+                        state.retired_switchover = Some(prepared);
+                    }
+                } else {
+                    let prepared = state
+                        .prepared_switchover
+                        .as_ref()
+                        .or(state.retired_switchover.as_ref())
+                        .ok_or_else(|| {
+                            AgentError::EffectConflict(
+                                "configuration retires missing switchover preparation".into(),
+                            )
+                        })?;
+                    if record.command.switchover_handoff.as_ref() != Some(prepared) {
+                        return Err(AgentError::EffectConflict(
+                            "configuration retires a changed switchover certificate".into(),
+                        ));
+                    }
+                    if record.command.retire_switchover_preparation_ids.len() != 1
+                        || record.command.retire_switchover_preparation_ids[0]
+                            != prepared.preparation_operation_id
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "configuration retires another switchover preparation".into(),
+                        ));
+                    }
+                    state.retired_switchover = Some(prepared.clone());
+                    state.prepared_switchover = None;
                 }
-                state.prepared_switchover = None;
+                state.retired_preparation_id = Some(retirement_id.clone());
             }
             let result = RetainedCommandResult {
                 command: record.command,

@@ -49,6 +49,16 @@ pub fn admit_switchover_preparation(command: &PrepareSwitchover, state: &AgentSt
             "planned switchover preparation target does not match durable identity".into(),
         ));
     }
+    if state.retired_preparation_id.as_ref() == Some(&command.operation_id)
+        || state
+            .retired_switchover
+            .as_ref()
+            .is_some_and(|retired| retired.preparation_operation_id == command.operation_id)
+    {
+        return Err(AgentError::CommandRejected(
+            "planned switchover preparation has already been retired".into(),
+        ));
+    }
     if let Some(prepared) = state.prepared_switchover.as_ref() {
         if prepared.preparation_operation_id == command.operation_id
             && prepared.request_id == command.request_id
@@ -113,8 +123,9 @@ pub(crate) fn is_access_only_configuration(
         && command.current_epoch == state.highest_epoch
         && command.failover_safe_lsn.is_none()
         && command.retire_build_ids.is_empty()
-        && command.switchover_handoff.is_none()
-        && command.retire_switchover_preparation_ids.is_empty()
+        && ((command.switchover_handoff.is_none()
+            && command.retire_switchover_preparation_ids.is_empty())
+            || command.is_switchover_restoration())
         && command
             .current_configuration
             .members
@@ -198,6 +209,37 @@ fn admit_configuration_with_replay(
             "command policy differs from initialized policy".into(),
         ));
     }
+    if command.is_switchover_restoration() {
+        let retained = state.prepared_switchover.as_ref().or_else(|| {
+            persisted_exact_replay
+                .then_some(state.retired_switchover.as_ref())
+                .flatten()
+        });
+        if !is_access_only_configuration(command, state)
+            || (!persisted_exact_replay
+                && state.retired_preparation_id.as_ref()
+                    == Some(&command.retire_switchover_preparation_ids[0]))
+            || command
+                .switchover_handoff
+                .as_ref()
+                .is_some_and(|certificate| Some(certificate) != retained)
+            || state.prepared_switchover.as_ref().is_some_and(|prepared| {
+                command.retire_switchover_preparation_ids[0] != prepared.preparation_operation_id
+            })
+        {
+            return Err(AgentError::CommandRejected(
+                "restoration requires exact starting authority and the whole retained certificate"
+                    .into(),
+            ));
+        }
+        return Ok(AdmittedAuthority {
+            local_identity: identity.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: command.current_configuration.clone(),
+            switchover_handoff: None,
+        });
+    }
     match command.transition_kind {
         TransitionKind::Failover if command.failover_safe_lsn.is_none_or(|lsn| lsn < 0) => {
             return Err(AgentError::CommandRejected(
@@ -229,6 +271,12 @@ fn admit_configuration_with_replay(
     let installed_primary_grant = state.current_configuration.as_ref()
         == Some(&command.current_configuration)
         && state.role == ReplicaRole::Primary;
+    if command.primary_write_status == AccessStatus::Granted && state.prepared_switchover.is_some()
+    {
+        return Err(AgentError::CommandRejected(
+            "retained switchover preparation forbids write grants".into(),
+        ));
+    }
     if command.primary_write_status == kuberic_protocol::types::AccessStatus::Granted
         && !transition_primary_grant
         && !installed_primary_grant
@@ -301,6 +349,9 @@ fn admit_configuration_with_replay(
             completed_current_only_replay && exact_persisted_command;
         let source_certificate_matches = *identity != handoff.source
             || state.prepared_switchover.as_ref() == Some(handoff)
+            || (state.retired_switchover.as_ref() == Some(handoff)
+                && command.current_configuration.primary_id == handoff.source.replica_id
+                && command.current_epoch > handoff.starting_epoch)
             || (completed_current_only_replay
                 && exact_persisted_command
                 && state.prepared_switchover.is_none());

@@ -5406,6 +5406,12 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
 
 #[tokio::test]
 async fn planned_handoff_roles_converge_closed_and_catchup_uses_certified_boundary() {
+    for compensate in [false, true] {
+        planned_handoff_role_recovery(compensate).await;
+    }
+}
+
+async fn planned_handoff_role_recovery(compensate: bool) {
     let identities = [
         identity(1, "source"),
         identity(2, "target"),
@@ -5617,6 +5623,92 @@ async fn planned_handoff_roles_converge_closed_and_catchup_uses_certified_bounda
             .await
             .unwrap();
         assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    }
+    if compensate {
+        let compensation = ConfigurationDescriptor::new(
+            Epoch::new(0, 3),
+            identities[0].replica_id,
+            starting.members.clone(),
+            starting.write_quorum,
+        );
+        for index in [1, 2, 0] {
+            let runtime = &runtimes[index];
+            let authority = AdmittedAuthority {
+                local_identity: identities[index].clone(),
+                transition_kind: Some(TransitionKind::PlannedSwitchover),
+                previous_configuration: Some(current.clone()),
+                current_configuration: compensation.clone(),
+                switchover_handoff: Some(handoff.clone()),
+            };
+            let mut next = sequences[index] + 1;
+            for action in [
+                RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+                RuntimeEffectAction::ChangeRole(starting.members[index].role),
+            ] {
+                runtime.apply_effect(effect(next, action)).await.unwrap();
+                next += 1;
+            }
+            if index == 0 {
+                assert_eq!(runtime.snapshot().await.verified_replication_lsn, Some(7));
+                runtime
+                    .data_plane()
+                    .accept_acknowledgement(acknowledgement(&authority, identities[2].clone(), 7))
+                    .await
+                    .unwrap();
+                timeout(
+                    Duration::from_secs(1),
+                    runtime.apply_effect(effect(next, RuntimeEffectAction::WaitForCatchup)),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                next += 1;
+            }
+            runtime
+                .apply_effect(effect(
+                    next,
+                    RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                        previous_configuration: None,
+                        transition_kind: None,
+                        ..authority
+                    })),
+                ))
+                .await
+                .unwrap();
+            sequences[index] = next + 1;
+            for participant in &runtimes {
+                assert_ne!(
+                    participant.snapshot().await.write_status,
+                    AccessStatus::Granted
+                );
+            }
+        }
+        runtimes[0]
+            .apply_effect(effect(
+                sequences[0],
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: AccessStatus::Granted,
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(runtimes[0].snapshot().await.role, ReplicaRole::Primary);
+        assert_eq!(
+            runtimes[0].snapshot().await.write_status,
+            AccessStatus::Granted
+        );
+        assert!(
+            runtimes[1]
+                .data_plane()
+                .begin_write(ClientWrite {
+                    operation_id: OperationId::new("compensated-target-direct-client"),
+                    data: Bytes::from_static(b"must-not-commit"),
+                })
+                .await
+                .is_err()
+        );
+        return;
     }
     runtimes[1]
         .apply_effect(effect(

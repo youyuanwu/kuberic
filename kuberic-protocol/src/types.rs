@@ -510,7 +510,9 @@ pub struct PlannedSwitchoverRequest {
 #[serde(rename_all = "camelCase")]
 pub enum PlannedSwitchoverResolution {
     RequestedTarget,
+    RestoringOldPrimary,
     CompensatingOldPrimary,
+    Unsafe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

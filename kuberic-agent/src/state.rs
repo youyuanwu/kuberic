@@ -120,6 +120,10 @@ pub struct AgentState {
     pub retained_result: Option<RetainedResult>,
     #[serde(default)]
     pub prepared_switchover: Option<SwitchoverHandoff>,
+    #[serde(default)]
+    pub retired_switchover: Option<SwitchoverHandoff>,
+    #[serde(default)]
+    pub retired_preparation_id: Option<OperationId>,
 }
 
 impl AgentState {
@@ -142,6 +146,8 @@ impl AgentState {
             pending_effect: None,
             retained_result: None,
             prepared_switchover: None,
+            retired_switchover: None,
+            retired_preparation_id: None,
         }
     }
 }

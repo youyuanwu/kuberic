@@ -676,9 +676,119 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
             retire_switchover_preparation_ids: Vec::new(),
             ..command.clone()
         };
+        if is_source {
+            let restore_directory = tempdir().unwrap();
+            let restore_path = SqliteStore::metadata_database_path(restore_directory.path());
+            let restore_store = Arc::new(
+                SqliteStore::create_authorized(&restore_path, store.load_state().await.unwrap())
+                    .unwrap(),
+            );
+            let restore_runtime = Arc::new(FakeRuntime::new());
+            *restore_runtime.state.lock().unwrap() = runtime.state.lock().unwrap().clone();
+            let restore = EnsureConfiguration {
+                operation_id: OperationId::new("restore-source"),
+                current_configuration: previous.clone(),
+                current_epoch: previous.epoch,
+                current_only: false,
+                ..command.clone()
+            };
+            assert!(restore.is_switchover_restoration());
+            let mut delayed_grant = restore.clone();
+            delayed_grant.transition_kind = TransitionKind::Bootstrap;
+            delayed_grant.switchover_handoff = None;
+            delayed_grant.retire_switchover_preparation_ids.clear();
+            delayed_grant.primary_write_status = AccessStatus::Granted;
+            assert!(
+                admit_configuration(&delayed_grant, &restore_store.load_state().await.unwrap())
+                    .is_err()
+            );
+            let restored = Coordinator::new(restore_store.clone(), restore_runtime.clone());
+            restored
+                .ensure_configuration(restore.clone())
+                .await
+                .unwrap();
+            assert_eq!(*restore_runtime.calls.lock().unwrap(), ["access"]);
+            let state = restore_store.load_state().await.unwrap();
+            assert_eq!(state.highest_epoch, previous.epoch);
+            assert_eq!(state.role, ReplicaRole::Primary);
+            assert!(state.prepared_switchover.is_none());
+            assert_eq!(state.retired_switchover, Some(handoff.clone()));
+            assert_ne!(state.write_status, AccessStatus::Granted);
+            let reopened = Arc::new(SqliteStore::open_existing(&restore_path, None).unwrap());
+            Coordinator::new(reopened.clone(), restore_runtime)
+                .ensure_configuration(restore)
+                .await
+                .unwrap();
+            let replay = PrepareSwitchover {
+                operation_id: handoff.preparation_operation_id.clone(),
+                request_id: handoff.request_id.clone(),
+                local_replica_id: source.replica_id,
+                expected_instance_id: source.instance_id.clone(),
+                expected_agent_generation: source.agent_generation.clone(),
+                source: source.clone(),
+                target: target.clone(),
+                current_configuration: previous.clone(),
+            };
+            assert!(
+                kuberic_agent::command::admit_switchover_preparation(
+                    &replay,
+                    &reopened.load_state().await.unwrap()
+                )
+                .is_err()
+            );
+        }
         let mut premature_grant = install.clone();
         premature_grant.primary_write_status = AccessStatus::Granted;
         assert!(admit_configuration(&premature_grant, &store.load_state().await.unwrap()).is_err());
+        if is_source {
+            let interrupted_directory = tempdir().unwrap();
+            let interrupted_store = Arc::new(
+                SqliteStore::create_authorized(
+                    SqliteStore::metadata_database_path(interrupted_directory.path()),
+                    store.load_state().await.unwrap(),
+                )
+                .unwrap(),
+            );
+            let interrupted_runtime = Arc::new(FakeRuntime::new());
+            *interrupted_runtime.state.lock().unwrap() = runtime.state.lock().unwrap().clone();
+            interrupted_runtime.fail_once("read");
+            let interrupted = Coordinator::new(interrupted_store.clone(), interrupted_runtime);
+            assert!(
+                interrupted
+                    .ensure_configuration(install.clone())
+                    .await
+                    .is_err()
+            );
+            let admitted = interrupted_store.load_state().await.unwrap();
+            assert_eq!(admitted.highest_epoch, current.epoch);
+            assert_eq!(admitted.role, ReplicaRole::Primary); // authority admitted, role not demoted
+            let compensation = ConfigurationDescriptor::new(
+                Epoch::new(0, 3),
+                source.replica_id,
+                previous.members.clone(),
+                previous.write_quorum,
+            );
+            let compensate = EnsureConfiguration {
+                operation_id: OperationId::new("supersede-admitted-request"),
+                previous_configuration: Some(current.clone()),
+                previous_epoch: Some(current.epoch),
+                current_configuration: compensation.clone(),
+                current_epoch: compensation.epoch,
+                ..install.clone()
+            };
+            interrupted.ensure_configuration(compensate).await.unwrap();
+            let recovered = interrupted_store.load_state().await.unwrap();
+            assert_eq!(recovered.highest_epoch, Epoch::new(0, 3));
+            assert_eq!(recovered.role, ReplicaRole::Primary);
+            assert_eq!(recovered.prepared_switchover, Some(handoff.clone()));
+            assert_ne!(recovered.write_status, AccessStatus::Granted);
+            assert!(
+                interrupted
+                    .ensure_configuration(install.clone())
+                    .await
+                    .is_err()
+            );
+        }
         let coordinator = Coordinator::new(store.clone(), runtime.clone());
         coordinator.ensure_configuration(install).await.unwrap();
         let mut expected = vec!["admit", "read", "get-lsn", "write", "replicator-role"];
@@ -718,7 +828,88 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
             completed.retained_command.as_ref().unwrap().command,
             command
         );
-        coordinator.ensure_configuration(command).await.unwrap();
+        coordinator
+            .ensure_configuration(command.clone())
+            .await
+            .unwrap();
+        let compensation = ConfigurationDescriptor::new(
+            Epoch::new(0, 3),
+            source.replica_id,
+            previous.members.clone(),
+            previous.write_quorum,
+        );
+        let compensate = EnsureConfiguration {
+            operation_id: OperationId::new(format!("compensate-{}", local.replica_id)),
+            previous_configuration: Some(current.clone()),
+            previous_epoch: Some(current.epoch),
+            current_configuration: compensation.clone(),
+            current_epoch: compensation.epoch,
+            current_only: false,
+            retire_switchover_preparation_ids: Vec::new(),
+            ..command.clone()
+        };
+        if is_source {
+            for wrong in ["prefix", "request", "target"] {
+                let mut changed = compensate.clone();
+                let certificate = changed.switchover_handoff.as_mut().unwrap();
+                match wrong {
+                    "prefix" => certificate.handoff_lsn -= 1,
+                    "request" => certificate.request_id = SwitchoverRequestId::new("other"),
+                    "target" => certificate.target.agent_generation = AgentGeneration::new("other"),
+                    _ => unreachable!(),
+                }
+                assert!(admit_configuration(&changed, &store.load_state().await.unwrap()).is_err());
+            }
+        }
+        coordinator
+            .ensure_configuration(compensate.clone())
+            .await
+            .unwrap();
+        let complete_compensation = EnsureConfiguration {
+            operation_id: OperationId::new(format!(
+                "compensation-current-only-{}",
+                local.replica_id
+            )),
+            previous_configuration: None,
+            previous_epoch: None,
+            current_only: true,
+            retire_switchover_preparation_ids: command.retire_switchover_preparation_ids.clone(),
+            ..compensate.clone()
+        };
+        coordinator
+            .ensure_configuration(complete_compensation)
+            .await
+            .unwrap();
+        let completed = store.load_state().await.unwrap();
+        assert_eq!(
+            completed.role,
+            if is_source {
+                ReplicaRole::Primary
+            } else {
+                ReplicaRole::ActiveSecondary
+            }
+        );
+        assert_eq!(completed.highest_epoch, Epoch::new(0, 3));
+        assert!(completed.previous_configuration.is_none());
+        assert!(completed.prepared_switchover.is_none());
+        assert_ne!(completed.write_status, AccessStatus::Granted);
+        assert!(coordinator.ensure_configuration(command).await.is_err());
+        if is_source {
+            let grant = EnsureConfiguration {
+                operation_id: OperationId::new("compensated-stable-grant"),
+                previous_configuration: None,
+                previous_epoch: None,
+                primary_write_status: AccessStatus::Granted,
+                transition_kind: TransitionKind::Bootstrap,
+                switchover_handoff: None,
+                ..compensate
+            };
+            coordinator.ensure_configuration(grant).await.unwrap();
+            assert_eq!(
+                store.load_state().await.unwrap().write_status,
+                AccessStatus::Granted
+            );
+        }
     }
 }
 

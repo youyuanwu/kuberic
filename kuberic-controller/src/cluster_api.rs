@@ -47,6 +47,10 @@ pub enum EffectRecord {
         pod_name: Option<String>,
         pvc_name: Option<String>,
     },
+    DeleteExactPod {
+        pod_name: String,
+        pod_uid: PodUid,
+    },
     EnsureWriteRoutingService,
     ReplaceStatus,
     RemoveWriteRouting,
@@ -109,6 +113,13 @@ pub trait ClusterApi: Send + Sync {
         &self,
         observation: &RawObservation,
         identity: &ReplicaIdentity,
+    ) -> Result<()>;
+
+    async fn delete_exact_pod(
+        &self,
+        observation: &RawObservation,
+        pod_name: &str,
+        pod_uid: &PodUid,
     ) -> Result<()>;
 
     async fn ensure_write_routing_service(&self, observation: &RawObservation) -> Result<()>;
@@ -188,7 +199,7 @@ impl AgentApi for GrpcAgentApi {
             .await
             .map_err(|_| AgentRpcError::Unavailable("Execute timed out".to_string()))?
             .map(|response| response.into_inner())
-            .map_err(classify_status)
+            .map_err(classify_execute_status)
     }
 }
 
@@ -209,6 +220,16 @@ fn classify_status(status: tonic::Status) -> AgentRpcError {
             AgentRpcError::Unavailable(status.to_string())
         }
         _ => AgentRpcError::Invalid(status.to_string()),
+    }
+}
+
+fn classify_execute_status(status: tonic::Status) -> AgentRpcError {
+    // Session or authority may have advanced after GetStatus. A rejected
+    // dispatch is not a contradictory report and must be resolved by observing.
+    if matches!(status.code(), Code::FailedPrecondition | Code::Aborted) {
+        AgentRpcError::Unavailable(status.to_string())
+    } else {
+        classify_status(status)
     }
 }
 
@@ -576,6 +597,25 @@ where
             delete_exact(&pvcs, name, uid.as_str()).await?;
         }
         Ok(())
+    }
+
+    async fn delete_exact_pod(
+        &self,
+        observation: &RawObservation,
+        pod_name: &str,
+        pod_uid: &PodUid,
+    ) -> Result<()> {
+        let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or_else(|| ControllerError::Effect("KubericSet has no namespace".to_string()))?;
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &namespace);
+        match pods.delete(pod_name, &params).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(response)) if response.code == 404 => Ok(()),
+            Err(error) => Err(map_kube_effect_error(error)),
+        }
     }
 
     async fn delete_replica_endpoint(
@@ -1914,6 +1954,38 @@ impl ClusterApi for InMemoryClusterApi {
         Ok(())
     }
 
+    async fn delete_exact_pod(
+        &self,
+        observation: &RawObservation,
+        pod_name: &str,
+        pod_uid: &PodUid,
+    ) -> Result<()> {
+        let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
+        let mut state = self.state.lock().await;
+        if let Some(pod) = state
+            .observation
+            .pods
+            .iter()
+            .find(|pod| pod.name_any() == pod_name)
+        {
+            let preconditions = params.preconditions.unwrap();
+            if pod.uid() != preconditions.uid
+                || pod.resource_version() != preconditions.resource_version
+            {
+                return Err(ControllerError::ObservationStale);
+            }
+            state
+                .observation
+                .pods
+                .retain(|pod| pod.uid().as_deref() != Some(pod_uid.as_str()));
+        }
+        state.effects.push(EffectRecord::DeleteExactPod {
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.clone(),
+        });
+        Ok(())
+    }
+
     async fn delete_replica_endpoint(
         &self,
         observation: &RawObservation,
@@ -2071,6 +2143,28 @@ impl ClusterApi for InMemoryClusterApi {
     }
 }
 
+fn exact_pod_delete_params(
+    observation: &RawObservation,
+    pod_name: &str,
+    pod_uid: &PodUid,
+) -> Result<DeleteParams> {
+    let pod = observation
+        .pods
+        .iter()
+        .find(|pod| pod.name_any() == pod_name && pod.uid().as_deref() == Some(pod_uid.as_str()))
+        .ok_or(ControllerError::ObservationStale)?;
+    let resource_version = pod
+        .resource_version()
+        .ok_or(ControllerError::ObservationStale)?;
+    Ok(DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(pod_uid.to_string()),
+            resource_version: Some(resource_version),
+        }),
+        ..Default::default()
+    })
+}
+
 #[allow(dead_code)]
 async fn delete_exact<K>(api: &Api<K>, name: &str, uid: &str) -> Result<()>
 where
@@ -2138,6 +2232,16 @@ mod tests {
 
     #[test]
     fn command_dispatch_uses_the_exact_observed_process_session() {
+        assert!(matches!(
+            classify_execute_status(tonic::Status::failed_precondition(
+                "command targets a stale agent process session"
+            )),
+            AgentRpcError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_status(tonic::Status::failed_precondition("invalid durable status")),
+            AgentRpcError::Invalid(_)
+        ));
         let source = identity(1);
         let target = identity(2);
         let mut agents = BTreeMap::new();
@@ -2166,6 +2270,23 @@ mod tests {
             failures: Vec::new(),
             now_unix_seconds: 0,
         };
+        observation.pods.push(Pod {
+            metadata: kube::core::ObjectMeta {
+                name: Some("exact-pod".to_string()),
+                uid: Some("pod-1".to_string()),
+                resource_version: Some("42".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let deletion =
+            exact_pod_delete_params(&observation, "exact-pod", &PodUid::new("pod-1")).unwrap();
+        let serialized = serde_json::to_value(deletion).unwrap();
+        assert_eq!(serialized["preconditions"]["uid"], "pod-1");
+        assert_eq!(serialized["preconditions"]["resourceVersion"], "42");
+        assert!(
+            exact_pod_delete_params(&observation, "exact-pod", &PodUid::new("replaced")).is_err()
+        );
         let session = observed_process_session(&observation, source.replica_id, &source).unwrap();
         assert_eq!(session, "session-1");
 

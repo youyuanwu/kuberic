@@ -36,9 +36,31 @@ configuration or infer authority from Kubernetes readiness, routing, or raw
 application progress.
 
 The supported evaluator contract is fixed-cardinality bootstrap,
-same-cardinality replacement, ordinary failover, and non-destructive quorum
-loss/recovery. Scaling, planned switchover, timed replica dropping, destructive
+same-cardinality replacement, ordinary failover, planned switchover, and non-destructive quorum
+loss/recovery. Scaling, timed replica dropping, destructive
 data-loss recovery, and mixed-version negotiation remain fail-closed.
+
+Planned switchover freezes an exact source, named target, membership, policy,
+and handoff certificate. Definitive target loss before authority admission
+retires preparation and restores service at the starting authority. After any
+requested authority admission, recovery requires the source's whole retained
+certificate and a read quorum, and allocates a strictly newer configuration
+epoch without changing the data-loss number. Compensation installs write-closed
+PC/CC and current-only authority on every surviving exact participant before
+stable write grant and routing. An absent exact secondary is not rebound.
+Accepted target outcomes always converge forward.
+
+Restoration durably retires the exact preparation ID even if preparation was
+never observed, fencing a delayed dispatch without inventing a handoff boundary.
+The source retains one retired certificate for compensation after current-only
+completion but before the cluster receipt is persisted.
+
+Temporary observations wait with bounded requeues. An impossible operation
+retains its frozen intent in safety convergence: routing is removed and every
+extant possible writer must report closed access under accepted or superseding
+authority, or its exact Pod must be observed absent. Safety deletion is Pod-only,
+UID/resourceVersion-fenced, and preserves PVCs. The terminal unsafe receipt is
+published only after that proof; it never starts ordinary failover or replacement.
 
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 for the complete operational contract.

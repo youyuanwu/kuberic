@@ -594,6 +594,34 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                     "ensure target is outside Previous and Current Configuration".to_string(),
                 ));
             }
+            let restoration = transition_kind == TransitionKind::PlannedSwitchover
+                && !command.current_only
+                && previous.is_none()
+                && command.primary_write_status
+                    == proto::AccessStatus::ReconfigurationPending as i32
+                && command.failover_safe_lsn.is_none()
+                && command.retire_build_ids.is_empty()
+                && command.retire_build_id.is_empty()
+                && current.primary_id == target.replica_id
+                && command.retire_switchover_preparation_ids.len() == 1
+                && !command.retire_switchover_preparation_ids[0].is_empty()
+                && command
+                    .switchover_handoff
+                    .clone()
+                    .map(switchover_handoff_from_proto)
+                    .transpose()?
+                    .is_none_or(|handoff| {
+                        current_epoch == handoff.starting_epoch
+                            && current.configuration_id == handoff.starting_configuration_id
+                            && current.primary_id == handoff.source.replica_id
+                            && target == handoff.source
+                            && current
+                                .members
+                                .iter()
+                                .any(|member| member.identity == handoff.target)
+                            && command.retire_switchover_preparation_ids
+                                == [handoff.preparation_operation_id.to_string()]
+                    });
             if command.current_only {
                 if previous.is_some() || transition_kind == TransitionKind::Bootstrap {
                     return Err(WireError::InvalidAuthority(
@@ -609,7 +637,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         "replacement current-only completion must retire its build".to_string(),
                     ));
                 }
-            } else {
+            } else if !restoration {
                 if !command.retire_build_id.is_empty() || !command.retire_build_ids.is_empty() {
                     return Err(WireError::InvalidAuthority(
                         "build retirement requires current-only completion".to_string(),
@@ -628,7 +656,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                 )
                 .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
             }
-            if transition_kind == TransitionKind::PlannedSwitchover {
+            if transition_kind == TransitionKind::PlannedSwitchover && !restoration {
                 let handoff = command
                     .switchover_handoff
                     .clone()
@@ -692,6 +720,7 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         && target != handoff.source
                         && !command.retire_switchover_preparation_ids.is_empty())
                     || (!command.current_only
+                        && !restoration
                         && !command.retire_switchover_preparation_ids.is_empty())
                 {
                     return Err(WireError::InvalidAuthority(
@@ -699,8 +728,9 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                             .to_string(),
                     ));
                 }
-            } else if command.switchover_handoff.is_some()
-                || !command.retire_switchover_preparation_ids.is_empty()
+            } else if transition_kind != TransitionKind::PlannedSwitchover
+                && (command.switchover_handoff.is_some()
+                    || !command.retire_switchover_preparation_ids.is_empty())
             {
                 return Err(WireError::InvalidAuthority(
                     "non-switchover configuration contains switchover evidence".to_string(),

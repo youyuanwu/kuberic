@@ -47,6 +47,9 @@ pub fn normalize(
         .as_ref()
         .map(|status| status.authority.clone())
         .unwrap_or_default();
+    let switchover_active = status.transition.as_ref().is_some_and(|transition| {
+        transition.kind == kuberic_protocol::types::TransitionKind::PlannedSwitchover
+    });
     let mut failures = raw
         .failures
         .iter()
@@ -104,6 +107,7 @@ pub fn normalize(
                 peer_endpoint_ready,
                 &resource_uid,
                 &previous_report_watermarks,
+                switchover_active,
             );
         }
         for pvc in pvcs
@@ -128,6 +132,7 @@ pub fn normalize(
                 false,
                 &resource_uid,
                 &previous_report_watermarks,
+                switchover_active,
             );
         }
         if !replicas.keys().any(|key| key.replica_id == replica_id) {
@@ -312,6 +317,7 @@ fn normalize_agent(
     pod_uid: Option<&PodUid>,
     pvc_uid: Option<&PvcUid>,
     previous: &BTreeMap<ReplicaObservationKey, ReportWatermark>,
+    switchover_active: bool,
 ) -> AgentObservation {
     let observation = match raw {
         RawAgentObservation::Absent => AgentObservation::Absent,
@@ -390,8 +396,11 @@ fn normalize_agent(
             previous.process_session_id == *session && sequence < previous.report_sequence
         })
     {
-        return AgentObservation::Invalid {
-            message: "agent report sequence regressed within one process session".to_string(),
+        let message = "agent report sequence regressed within one process session".to_string();
+        return if switchover_active {
+            AgentObservation::Unreachable { message }
+        } else {
+            AgentObservation::Invalid { message }
         };
     }
     observation
@@ -410,6 +419,7 @@ fn insert_replica_observation(
     peer_endpoint_ready: bool,
     resource_uid: &ResourceUid,
     previous: &BTreeMap<ReplicaObservationKey, ReportWatermark>,
+    switchover_active: bool,
 ) {
     let agent = normalize_agent(
         raw_agent,
@@ -418,6 +428,7 @@ fn insert_replica_observation(
         pod_uid.as_ref(),
         pvc_uid.as_ref(),
         previous,
+        switchover_active,
     );
     let observation = ReplicaObservation {
         kubernetes: (pod.is_some() || pvc.is_some()).then(|| KubernetesReplicaObservation {

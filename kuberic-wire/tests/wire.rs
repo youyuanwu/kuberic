@@ -381,6 +381,62 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
         ),
     };
 
+    let mut restoration = request.clone();
+    let source = previous.members[0].identity.clone();
+    restoration.target = Some(source.clone().into());
+    let Some(proto::execute_command_request::Command::EnsureConfiguration(command)) =
+        restoration.command.as_mut()
+    else {
+        unreachable!()
+    };
+    command.operation_id = "restore-source".into();
+    command.previous_configuration = None;
+    command.previous_epoch = None;
+    command.current_configuration = Some(previous.clone().into());
+    command.current_epoch = Some(previous.epoch.into());
+    command.local_replica_id = source.replica_id.value();
+    command.expected_instance_id = source.instance_id.to_string();
+    command.expected_agent_generation = source.agent_generation.to_string();
+    command.retire_switchover_preparation_ids = vec!["prepare-1".into()];
+    let decoded =
+        proto::ExecuteCommandRequest::decode(restoration.encode_to_vec().as_slice()).unwrap();
+    let envelope = normalize_execute_request(decoded).unwrap();
+    assert!(matches!(envelope.command,
+        kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(command)
+        if command.is_switchover_restoration()));
+    let mut unobserved_preparation = restoration.clone();
+    let Some(proto::execute_command_request::Command::EnsureConfiguration(command)) =
+        unobserved_preparation.command.as_mut()
+    else {
+        unreachable!()
+    };
+    command.switchover_handoff = None;
+    let envelope = normalize_execute_request(unobserved_preparation).unwrap();
+    assert!(matches!(envelope.command,
+        kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(command)
+        if command.is_switchover_restoration() && command.switchover_handoff.is_none()));
+    for fault in ["grant", "retirement", "authority"] {
+        let mut invalid = restoration.clone();
+        let Some(proto::execute_command_request::Command::EnsureConfiguration(command)) =
+            invalid.command.as_mut()
+        else {
+            unreachable!()
+        };
+        match fault {
+            "grant" => command.primary_write_status = proto::AccessStatus::Granted as i32,
+            "retirement" => command.retire_switchover_preparation_ids = vec!["other".into()],
+            "authority" => {
+                command
+                    .switchover_handoff
+                    .as_mut()
+                    .unwrap()
+                    .starting_configuration_id = "other".into()
+            }
+            _ => unreachable!(),
+        }
+        assert!(validate_execute_request(&invalid).is_err(), "{fault}");
+    }
+
     let mut wrong_start = request.clone();
     let Some(proto::execute_command_request::Command::EnsureConfiguration(command)) =
         wrong_start.command.as_mut()

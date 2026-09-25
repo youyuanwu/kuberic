@@ -735,7 +735,9 @@
                           "resolution": {
                             "enum": [
                               "requestedTarget",
-                              "compensatingOldPrimary"
+                              "restoringOldPrimary",
+                              "compensatingOldPrimary",
+                              "unsafe"
                             ],
                             "type": "string"
                           },
