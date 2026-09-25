@@ -86,9 +86,11 @@ delayed session from reconnecting the excluded incarnation. Local retirement
 revokes access, fences traffic, drives role None and hosting Close, and only
 then persists a terminal tombstone. Hosting checks that tombstone before Open.
 Preparation, acceptance, and retirement postconditions are unpublished managed
-contracts, not additions to the SF-shaped application traits. Production agent
-coordination/storage and controller scale-down admission remain disabled;
-the new store persistence hooks deliberately fail closed until implemented.
+contracts, not additions to the SF-shaped application traits. Agent schema-2
+storage persists preparation, accepted-current-only, and retirement evidence.
+Recovery revalidates accepted evidence before restoring previously granted
+access; preparation and current-only coordination by themselves stay closed.
+Controller scale-down admission remains disabled.
 
 `ReplicatorFactoryContext` exposes stable identity and partition-access
 capabilities, not a concrete runtime or default-engine pointer. Application

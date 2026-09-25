@@ -748,6 +748,23 @@ where
         if runtime_authority.is_some() || runtime_snapshot.retired_authority.is_some() {
             sessions.retain_members(runtime_authority.as_ref()).await;
         }
+        if let Some(retired) = runtime_snapshot.retired_authority {
+            for member in &retired.report.intent.previous_configuration.members {
+                transport.lock().await.evict_peer(&member.identity);
+                sessions.retire_peer(&member.identity).await;
+            }
+        } else if let Some(authority) = &runtime_authority
+            && authority.previous_configuration.is_none()
+            && let Some(evidence) = &authority.secondary_removal
+        {
+            transport
+                .lock()
+                .await
+                .evict_peer(&evidence.preparation.intent.target);
+            sessions
+                .retire_peer(&evidence.preparation.intent.target)
+                .await;
+        }
         if let Some(configuration) = state.current_configuration {
             for member in configuration
                 .members
@@ -767,6 +784,16 @@ where
                     continue;
                 }
                 if let Ok(report) = dispatcher.peer_report(&member.identity).await {
+                    if runtime
+                        .snapshot()
+                        .await
+                        .authority
+                        .as_ref()
+                        .is_none_or(|a| !a.contains_member(&member.identity))
+                    {
+                        transport.lock().await.evict_peer(&member.identity);
+                        continue;
+                    }
                     let session = report.process_session_id.clone();
                     if runtime_authority.is_some()
                         && runtime
@@ -779,14 +806,48 @@ where
                     sessions
                         .register_peer(member.identity.clone(), session.clone())
                         .await;
-                    transport
+                    if transport
                         .lock()
                         .await
-                        .admit_peer(member.identity.clone(), session)?;
+                        .admit_peer(member.identity.clone(), session)
+                        .is_err()
+                    {
+                        continue;
+                    }
                     if report.epoch == configuration.epoch
                         && report.current_configuration.as_ref() == Some(&configuration)
                         && report.previous_configuration == state.previous_configuration
                     {
+                        if runtime_authority.as_ref().is_some_and(|a| {
+                            a.secondary_removal.is_some()
+                                && a.secondary_removal == report.secondary_removal_evidence
+                        }) && let Some(verified_replication_lsn) =
+                            report.verified_replication_lsn
+                        {
+                            let _ = runtime
+                                .observe_secondary_removal_witness(
+                                    kuberic_protocol::types::SecondaryRemovalWitness {
+                                        resource_uid: report.resource_uid.clone(),
+                                        identity: report.identity.clone(),
+                                        role: report.role,
+                                        process_session_id: report.process_session_id.clone(),
+                                        report_sequence: report.report_sequence,
+                                        epoch: report.epoch,
+                                        previous_configuration_id: report
+                                            .previous_configuration
+                                            .as_ref()
+                                            .map(|p| p.configuration_id.clone()),
+                                        current_configuration_id: configuration
+                                            .configuration_id
+                                            .clone(),
+                                        verified_replication_lsn,
+                                        write_status: report.write_status,
+                                        pending_operation_id: report.pending_operation_id.clone(),
+                                        retained_operation_id: report.retained_operation_id.clone(),
+                                    },
+                                )
+                                .await;
+                        }
                         if let Some(verified_lsn) = report.verified_replication_lsn
                             && configuration.members.iter().any(|member| {
                                 member.identity == local

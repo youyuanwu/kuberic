@@ -8,6 +8,7 @@ pub mod hosting;
 pub mod process;
 pub mod provisioning;
 pub mod recovery;
+mod removal;
 pub mod report;
 pub mod runtime_adapter;
 pub mod service;

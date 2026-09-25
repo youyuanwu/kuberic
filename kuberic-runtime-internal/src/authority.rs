@@ -401,6 +401,19 @@ pub trait ReplicaAuthorityStore: Send + Sync {
         Ok(None)
     }
 
+    async fn load_secondary_removal_commit(&self) -> Result<Option<SecondaryScaleDownCleanup>> {
+        Ok(None)
+    }
+
+    async fn record_secondary_removal_commit(
+        &self,
+        _committed: &SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        Err(ContractError::Persistence(
+            "secondary-removal commit persistence is unavailable".into(),
+        ))
+    }
+
     /// Must atomically reject conflicting tombstones and all subsequent active admission.
     async fn retire(&self, _authority: &RetiredAuthority) -> Result<()> {
         Err(ContractError::Persistence(

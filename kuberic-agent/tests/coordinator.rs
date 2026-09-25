@@ -25,6 +25,428 @@ use kuberic_runtime_internal::effects::{
 };
 use tempfile::tempdir;
 
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod removal_fixture;
+
+fn removal_state(
+    intent: &kuberic_protocol::types::SecondaryScaleDownIntent,
+    target: bool,
+) -> AgentState {
+    let local = if target {
+        &intent.target
+    } else {
+        &intent.primary
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        resource_uid: intent.resource_uid.clone(),
+        local_identity: local.clone(),
+        pod_uid: PodUid::new(local.instance_id.as_str()),
+        effective_policy: intent.previous_policy.clone(),
+        ..storage_identity()
+    });
+    state.current_configuration = Some(intent.previous_configuration.clone());
+    state.highest_epoch = intent.previous_configuration.epoch;
+    state.role = if target {
+        ReplicaRole::ActiveSecondary
+    } else {
+        ReplicaRole::Primary
+    };
+    state.read_status = AccessStatus::Granted;
+    state.write_status = if target {
+        AccessStatus::NotPrimary
+    } else {
+        AccessStatus::Granted
+    };
+    state
+}
+
+fn removal_runtime(state: &AgentState) -> Arc<FakeRuntime> {
+    let runtime = Arc::new(FakeRuntime::new());
+    {
+        let mut snapshot = runtime.state.lock().unwrap();
+        snapshot.role = state.role;
+        snapshot.read_status = state.read_status;
+        snapshot.write_status = state.write_status;
+        snapshot.authority = Some(AdmittedAuthority {
+            local_identity: state.identity.local_identity.clone(),
+            transition_kind: None,
+            previous_configuration: state.previous_configuration.clone(),
+            current_configuration: state.current_configuration.clone().unwrap(),
+            switchover_handoff: None,
+            secondary_removal: state.secondary_removal_evidence.clone(),
+        });
+        snapshot.prepared_secondary_removal = state.prepared_secondary_removal.clone();
+    }
+    runtime
+}
+
+#[tokio::test]
+async fn reduction_coordinates_retained_secondaries_but_never_admits_the_excluded_target() {
+    let intent = removal_fixture::intent(&[1, 2, 3], 1);
+    for local in [
+        &intent.current_configuration.members[1].identity,
+        &intent.target,
+    ] {
+        let mut state = removal_state(&intent, false);
+        state.identity.local_identity = local.clone();
+        state.identity.pod_uid = PodUid::new(local.instance_id.as_str());
+        state.role = ReplicaRole::ActiveSecondary;
+        state.write_status = AccessStatus::NotPrimary;
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = Arc::new(SqliteStore::create_authorized(&path, state.clone()).unwrap());
+        let runtime = removal_runtime(&state);
+        let coordinator = Coordinator::new(store.clone(), runtime.clone());
+        for current_only in [false, true] {
+            let mut command = removal_fixture::configuration_command(&intent, current_only);
+            command.local_replica_id = local.replica_id;
+            command.expected_instance_id = local.instance_id.clone();
+            command.expected_agent_generation = local.agent_generation.clone();
+            command.operation_id = intent.command_operation_id(
+                if current_only {
+                    kuberic_protocol::types::SecondaryRemovalStage::CurrentOnly
+                } else {
+                    kuberic_protocol::types::SecondaryRemovalStage::PreviousCurrent
+                },
+                local,
+            );
+            let result = coordinator.ensure_configuration(command.clone()).await;
+            if local == &intent.target {
+                assert!(result.is_err());
+                assert_eq!(store.load_state().await.unwrap(), state);
+                assert!(runtime.calls.lock().unwrap().is_empty());
+            } else {
+                result.unwrap();
+                let reopened =
+                    Arc::new(SqliteStore::open_existing(&path, Some(&state.identity)).unwrap());
+                Coordinator::new(reopened, runtime.clone())
+                    .ensure_configuration(command)
+                    .await
+                    .unwrap();
+                let reduced = store.load_state().await.unwrap();
+                assert_eq!(reduced.role, ReplicaRole::ActiveSecondary);
+                assert_eq!(reduced.write_status, AccessStatus::NotPrimary);
+                assert_eq!(reduced.admitted_policy, Some(intent.current_policy.clone()));
+                assert!(reduced.prepared_secondary_removal.is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn removal_commands_reject_identity_generation_primary_and_epoch_mutations_before_effects() {
+    let intent = removal_fixture::intent(&[1, 2, 3], 1);
+    for target in [false, true] {
+        let state = removal_state(&intent, target);
+        let directory = tempdir().unwrap();
+        let store = Arc::new(
+            SqliteStore::create_authorized(
+                SqliteStore::metadata_database_path(directory.path()),
+                state.clone(),
+            )
+            .unwrap(),
+        );
+        let runtime = removal_runtime(&state);
+        let coordinator = Coordinator::new(store.clone(), runtime.clone());
+        let session = ProcessSessionId::new("session-1");
+        for mutation in 0..5 {
+            if target {
+                let mut command = removal_fixture::retire_command(&intent);
+                match mutation {
+                    0 => command.expected_agent_generation = AgentGeneration::new("stale"),
+                    1 => command.expected_instance_id = ReplicaInstanceId::new("replaced"),
+                    2 => command.local_replica_id = intent.primary.replica_id,
+                    3 => {
+                        command.committed.evidence.preparation.intent.primary =
+                            intent.target.clone()
+                    }
+                    _ => {
+                        command
+                            .committed
+                            .evidence
+                            .preparation
+                            .intent
+                            .current_configuration
+                            .epoch = Epoch::new(0, 1)
+                    }
+                }
+                assert!(
+                    coordinator
+                        .ensure_replica_retired(command, session.clone(), 1)
+                        .await
+                        .is_err()
+                );
+            } else {
+                let mut command = removal_fixture::prepare_command(&intent);
+                match mutation {
+                    0 => command.expected_agent_generation = AgentGeneration::new("stale"),
+                    1 => command.expected_instance_id = ReplicaInstanceId::new("replaced"),
+                    2 => command.local_replica_id = intent.target.replica_id,
+                    3 => command.intent.primary = intent.target.clone(),
+                    _ => command.intent.previous_configuration.epoch = Epoch::new(0, 1),
+                }
+                assert!(
+                    coordinator
+                        .ensure_secondary_removal_prepared(command, session.clone(), 1)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(store.load_state().await.unwrap(), state);
+            assert!(runtime.calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_replays_every_coordinator_stage_with_independent_policy() {
+    for size in [2, 3] {
+        for failure in [
+            "admit",
+            "read",
+            "get-lsn",
+            "write",
+            "replicator-role",
+            "epoch",
+            "application-role",
+            "access",
+        ] {
+            for current_only in [false, true] {
+                let intent = removal_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
+                let state = removal_state(&intent, false);
+                let provenance = state.identity.clone();
+                let directory = tempdir().unwrap();
+                let path = SqliteStore::metadata_database_path(directory.path());
+                let store = Arc::new(SqliteStore::create_authorized(&path, state.clone()).unwrap());
+                let runtime = removal_runtime(&state);
+                let coordinator = Coordinator::new(store.clone(), runtime.clone());
+                let preparation = coordinator
+                    .ensure_secondary_removal_prepared(
+                        removal_fixture::prepare_command(&intent),
+                        ProcessSessionId::new("session-1"),
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                let mut joint = removal_fixture::configuration_command(&intent, false);
+                joint
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation = preparation;
+                joint
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .reduced_write_quorum
+                    .clear();
+                let mut reduced = removal_fixture::configuration_command(&intent, true);
+                reduced
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation = joint
+                    .secondary_removal_evidence
+                    .as_ref()
+                    .unwrap()
+                    .preparation
+                    .clone();
+                if current_only {
+                    coordinator
+                        .ensure_configuration(joint.clone())
+                        .await
+                        .unwrap();
+                }
+                let command = if current_only {
+                    reduced.clone()
+                } else {
+                    joint.clone()
+                };
+                runtime.fail_once(failure);
+                assert!(
+                    coordinator
+                        .ensure_configuration(command.clone())
+                        .await
+                        .is_err(),
+                    "{failure}"
+                );
+                let interrupted = store.load_state().await.unwrap();
+                assert_eq!(interrupted.identity, provenance);
+                assert!(interrupted.pending_effect.is_some());
+                drop(coordinator);
+                drop(store);
+                let store = Arc::new(SqliteStore::open_existing(&path, Some(&provenance)).unwrap());
+                let coordinator = Coordinator::new(store.clone(), runtime);
+                coordinator.resume_configuration().await.unwrap();
+                coordinator
+                    .ensure_configuration(joint.clone())
+                    .await
+                    .unwrap();
+                coordinator
+                    .ensure_configuration(reduced.clone())
+                    .await
+                    .unwrap();
+                let final_state = store.load_state().await.unwrap();
+                assert_eq!(final_state.identity, provenance);
+                assert_eq!(
+                    final_state.admitted_policy,
+                    Some(intent.current_policy.clone())
+                );
+                assert!(final_state.previous_policy.is_none());
+                assert!(final_state.previous_configuration.is_none());
+                assert_ne!(final_state.write_status, AccessStatus::Granted);
+                let before = final_state.clone();
+                coordinator
+                    .ensure_configuration(reduced.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(store.load_state().await.unwrap(), before);
+                let mut mutation = reduced.clone();
+                mutation
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .previous_read_quorum[0]
+                    .report_sequence += 1;
+                assert!(coordinator.ensure_configuration(mutation).await.is_err());
+                let mut wrong_policy = reduced.clone();
+                wrong_policy.previous_policy = Some(intent.current_policy.clone());
+                assert!(
+                    coordinator
+                        .ensure_configuration(wrong_policy)
+                        .await
+                        .is_err()
+                );
+                let mut grant = reduced;
+                grant.primary_write_status = AccessStatus::Granted;
+                assert!(coordinator.ensure_configuration(grant).await.is_err());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_preparation_and_retirement_keep_exact_restart_receipts() {
+    let intent = removal_fixture::intent(&[1, 2, 3], 1);
+    for target in [false, true] {
+        let state = removal_state(&intent, target);
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let store = Arc::new(SqliteStore::create_authorized(&path, state.clone()).unwrap());
+        let runtime = removal_runtime(&state);
+        let coordinator = Coordinator::new(store.clone(), runtime.clone());
+        runtime.fail_once(if target { "retire" } else { "prepare-removal" });
+        let session = ProcessSessionId::new("first-session");
+        if target {
+            assert!(
+                coordinator
+                    .ensure_replica_retired(
+                        removal_fixture::retire_command(&intent),
+                        session.clone(),
+                        3
+                    )
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(
+                coordinator
+                    .ensure_secondary_removal_prepared(
+                        removal_fixture::prepare_command(&intent),
+                        session.clone(),
+                        3
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        let pending = store.load_state().await.unwrap().pending_effect.unwrap();
+        drop(coordinator);
+        drop(store);
+        let store = Arc::new(SqliteStore::open_existing(&path, Some(&state.identity)).unwrap());
+        let coordinator = Coordinator::new(store.clone(), runtime.clone());
+        if target {
+            let receipt = coordinator
+                .ensure_replica_retired(
+                    removal_fixture::retire_command(&intent),
+                    ProcessSessionId::new("second-session"),
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.process_session_id, session);
+            assert_eq!(receipt.report_sequence, 3);
+            assert_eq!(receipt.role, ReplicaRole::None);
+            assert!(receipt.application_closed && receipt.peers_fenced);
+            let mut conflict = removal_fixture::retire_command(&intent);
+            conflict.committed.current_only_write_quorum[0].report_sequence += 1;
+            assert!(
+                coordinator
+                    .ensure_replica_retired(conflict, session.clone(), 4)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                coordinator
+                    .ensure_configuration(removal_fixture::configuration_command(&intent, false))
+                    .await
+                    .is_err()
+            );
+        } else {
+            let receipt = coordinator
+                .ensure_secondary_removal_prepared(
+                    removal_fixture::prepare_command(&intent),
+                    ProcessSessionId::new("second-session"),
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(receipt.process_session_id, session);
+            assert_eq!(receipt.report_sequence, 3);
+            assert_eq!(receipt.boundary_lsn, 7);
+            let mut conflict = removal_fixture::prepare_command(&intent);
+            conflict.intent.cleanup.pvc =
+                kuberic_protocol::types::CleanupResourceIdentity::Absent {
+                    name: "changed".into(),
+                };
+            assert!(
+                coordinator
+                    .ensure_secondary_removal_prepared(conflict, session.clone(), 4)
+                    .await
+                    .is_err()
+            );
+        }
+        let terminal = store.load_state().await.unwrap();
+        assert_eq!(
+            terminal.removal_effects[&pending.effect.operation_id].effect,
+            pending.effect
+        );
+        let calls = runtime.calls.lock().unwrap().len();
+        if target {
+            coordinator
+                .ensure_replica_retired(
+                    removal_fixture::retire_command(&intent),
+                    session.clone(),
+                    5,
+                )
+                .await
+                .unwrap();
+        } else {
+            coordinator
+                .ensure_secondary_removal_prepared(
+                    removal_fixture::prepare_command(&intent),
+                    session.clone(),
+                    5,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(runtime.calls.lock().unwrap().len(), calls);
+        assert_eq!(store.load_state().await.unwrap(), terminal);
+    }
+}
+
 struct FakeRuntime {
     state: Mutex<RuntimePostcondition>,
     calls: Mutex<Vec<&'static str>>,
@@ -74,6 +496,8 @@ impl RuntimeEffectExecutor for FakeRuntime {
             RuntimeEffectAction::WaitForCatchup => "catchup",
             RuntimeEffectAction::SetWriteStatus(_) => "write",
             RuntimeEffectAction::PrepareSwitchover { .. } => "prepare-switchover",
+            RuntimeEffectAction::PrepareSecondaryRemoval { .. } => "prepare-removal",
+            RuntimeEffectAction::RetireReplica(_) => "retire",
             RuntimeEffectAction::ChangeReplicatorRole(_) => "replicator-role",
             RuntimeEffectAction::UpdateEpoch => "epoch",
             RuntimeEffectAction::ChangeApplicationRole(_) => "application-role",
@@ -107,6 +531,30 @@ impl RuntimeEffectExecutor for FakeRuntime {
             RuntimeEffectAction::SetWriteStatus(status) => state.write_status = status,
             RuntimeEffectAction::PrepareSwitchover { .. } => {
                 state.write_status = AccessStatus::ReconfigurationPending;
+            }
+            RuntimeEffectAction::PrepareSecondaryRemoval {
+                intent,
+                process_session_id,
+                report_sequence,
+            } => {
+                state.read_status = AccessStatus::ReconfigurationPending;
+                state.write_status = AccessStatus::ReconfigurationPending;
+                state.prepared_secondary_removal =
+                    Some(kuberic_protocol::types::SecondaryRemovalPreparation {
+                        operation_id: effect.operation_id.clone(),
+                        intent: *intent,
+                        process_session_id,
+                        report_sequence,
+                        boundary_lsn: state.current_progress,
+                    });
+            }
+            RuntimeEffectAction::RetireReplica(retired) => {
+                state.open = false;
+                state.role = ReplicaRole::None;
+                state.read_status = AccessStatus::NotPrimary;
+                state.write_status = AccessStatus::NotPrimary;
+                state.authority = None;
+                state.retired_authority = Some(*retired);
             }
             RuntimeEffectAction::RefreshApplicationProgress
             | RuntimeEffectAction::WaitForCatchup => {}

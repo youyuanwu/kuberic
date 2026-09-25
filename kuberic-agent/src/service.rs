@@ -289,6 +289,7 @@ fn authorize_request<T>(
 pub struct SessionRegistry {
     local_session: ProcessSessionId,
     peers: Arc<RwLock<BTreeMap<ReplicaIdentity, ProcessSessionId>>>,
+    excluded: RwLock<std::collections::BTreeSet<ReplicaIdentity>>,
 }
 
 pub struct SessionLease {
@@ -300,6 +301,7 @@ impl SessionRegistry {
         Self {
             local_session,
             peers: Arc::new(RwLock::new(BTreeMap::new())),
+            excluded: RwLock::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -308,7 +310,17 @@ impl SessionRegistry {
     }
 
     pub async fn register_peer(&self, identity: ReplicaIdentity, session: ProcessSessionId) {
+        let excluded = self.excluded.read().await;
+        if excluded.contains(&identity) {
+            return;
+        }
         self.peers.write().await.insert(identity, session);
+    }
+
+    pub async fn retire_peer(&self, identity: &ReplicaIdentity) {
+        let mut excluded = self.excluded.write().await;
+        excluded.insert(identity.clone());
+        self.peers.write().await.remove(identity);
     }
 
     pub(crate) async fn retain_members(
@@ -495,14 +507,27 @@ where
         result
     }
 
-    async fn reconstruct_runtime(&self) -> Result<()> {
+    pub async fn reconstruct_runtime(&self) -> Result<()> {
         let state = self.store.load_state().await?;
         let transition = startup_transition(&state);
+        let removal_pending =
+            state.pending_effect.as_ref().is_some_and(|p| {
+                matches!(p.effect.action,
+            kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_))
+            }) || state.reconfiguration.as_ref().is_some_and(|r| {
+                r.command.transition_kind
+                    == kuberic_protocol::types::TransitionKind::SecondaryScaleDown
+            });
         self.runtime
             .reconstruct(
                 OpenMode::Existing,
                 state.role,
-                state.read_status,
+                if removal_pending {
+                    kuberic_protocol::types::AccessStatus::ReconfigurationPending
+                } else {
+                    state.read_status
+                },
                 startup_write_status(
                     state.write_status,
                     state
@@ -513,6 +538,20 @@ where
                 transition,
             )
             .await?;
+        if let Some(committed) = state.accepted_secondary_removal
+            && self
+                .runtime
+                .snapshot()
+                .await
+                .authority
+                .as_ref()
+                .is_some_and(|a| {
+                    a.previous_configuration.is_none()
+                        && a.secondary_removal.as_ref() == Some(&committed.evidence)
+                })
+        {
+            self.runtime.restore_accepted_removal(committed).await?;
+        }
         if let Some(pending) = state.pending_effect.as_ref()
             && matches!(
                 pending.effect.action,
@@ -613,10 +652,25 @@ where
             ));
         }
         match command.command {
-            ProtocolCommand::PrepareSecondaryRemoval(_) | ProtocolCommand::RetireReplica(_) => {
-                return Err(Status::failed_precondition(
-                    "secondary scale-down execution is not enabled",
-                ));
+            ProtocolCommand::PrepareSecondaryRemoval(command) => {
+                self.coordinator
+                    .ensure_secondary_removal_prepared(
+                        *command,
+                        self.reporter.session().id().clone(),
+                        self.reporter.session().next_report_sequence(),
+                    )
+                    .await
+                    .map_err(status_from_agent)?;
+            }
+            ProtocolCommand::RetireReplica(command) => {
+                self.coordinator
+                    .ensure_replica_retired(
+                        *command,
+                        self.reporter.session().id().clone(),
+                        self.reporter.session().next_report_sequence(),
+                    )
+                    .await
+                    .map_err(status_from_agent)?;
             }
             ProtocolCommand::InitializeAgentStore(initialization) => {
                 if initialization.initialization_id != state.identity.initialization_id
@@ -681,6 +735,8 @@ fn startup_write_status(
         matches!(
             action,
             kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover { .. }
+                | kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSecondaryRemoval { .. }
+                | kuberic_runtime_internal::effects::RuntimeEffectAction::RetireReplica(_)
         )
     }) {
         kuberic_protocol::types::AccessStatus::ReconfigurationPending

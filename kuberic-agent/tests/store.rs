@@ -24,6 +24,98 @@ use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::tempdir;
 
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod removal_fixture;
+
+#[tokio::test]
+async fn schema_one_is_rejected_without_migration_or_provenance_changes() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (command, observed, transition) = bootstrap_fixture();
+    let identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let store = SqliteStore::create_authorized(&path, AgentState::new(identity.clone())).unwrap();
+    assert!(store.migrate_schema(1, 2).await.is_err());
+    drop(store);
+    let connection = Connection::open(&path).unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+    let original: String = connection
+        .query_row("SELECT state_json FROM agent_state", [], |r| r.get(0))
+        .unwrap();
+    assert!(matches!(
+        SqliteStore::open_existing(&path, None),
+        Err(AgentError::SchemaMismatch {
+            expected: 2,
+            observed: 1
+        })
+    ));
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT state_json FROM agent_state", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn durable_retirement_rejects_active_authority_and_mutated_tombstones() {
+    use kuberic_runtime_internal::authority::RetiredAuthority;
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (command, observed, transition) = bootstrap_fixture();
+    let mut identity = authorize_initialization(
+        &command,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    identity.resource_uid = intent.resource_uid.clone();
+    identity.local_identity = intent.target.clone();
+    identity.effective_policy = intent.previous_policy.clone();
+    let store = SqliteStore::create_authorized(&path, AgentState::new(identity.clone())).unwrap();
+    let active = AdmittedAuthority {
+        local_identity: intent.target.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: intent.previous_configuration.clone(),
+        switchover_handoff: None,
+        secondary_removal: None,
+    };
+    store.admit(&active).await.unwrap();
+    let retired = RetiredAuthority {
+        committed: removal_fixture::cleanup(&intent),
+        report: removal_fixture::retirement(&intent),
+    };
+    store.retire(&retired).await.unwrap();
+    drop(store);
+    let store = SqliteStore::open_existing(&path, Some(&identity)).unwrap();
+    assert_eq!(
+        store.load_retired_authority().await.unwrap(),
+        Some(retired.clone())
+    );
+    assert!(store.load().await.unwrap().is_none());
+    assert!(store.admit(&active).await.is_err());
+    store.retire(&retired).await.unwrap();
+    let mut changed = retired;
+    changed.report.process_session_id =
+        kuberic_protocol::types::ProcessSessionId::new("new-session");
+    assert!(store.retire(&changed).await.is_err());
+    assert_eq!(store.identity().await.unwrap(), identity);
+}
+
 fn identity(replica_id: i64, instance: &str, generation: &str) -> ReplicaIdentity {
     ReplicaIdentity {
         replica_id: ReplicaId::new(replica_id),

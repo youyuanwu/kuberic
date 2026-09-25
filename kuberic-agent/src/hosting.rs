@@ -335,6 +335,29 @@ impl PodRuntime {
             (read_status, write_status)
         };
         if let Ok(managed) = self.host.managed() {
+            if write_status == AccessStatus::Granted
+                && let Some(committed) = self
+                    .host
+                    .default_dependencies
+                    .replica_authority_store
+                    .load_secondary_removal_commit()
+                    .await?
+                && managed
+                    .snapshot()
+                    .await
+                    .authority
+                    .as_ref()
+                    .is_some_and(|a| {
+                        a.previous_configuration.is_none()
+                            && a.secondary_removal.as_ref() == Some(&committed.evidence)
+                    })
+            {
+                managed
+                    .execute_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(
+                        committed,
+                    )))
+                    .await?;
+            }
             managed
                 .execute_action(RuntimeEffectAction::SetAccessStatus {
                     read: read_status,
@@ -348,6 +371,18 @@ impl PodRuntime {
             state.fallback_snapshot.write_status = write_status;
         }
         Ok(())
+    }
+
+    pub(crate) async fn restore_accepted_removal(
+        &self,
+        committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.host
+            .managed()?
+            .execute_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(
+                committed,
+            )))
+            .await
     }
 
     pub fn abort(&self) {
@@ -410,6 +445,18 @@ impl PodRuntime {
         self.host
             .managed()?
             .execute_action(RuntimeEffectAction::RegisterPeerSession { identity, session })
+            .await
+    }
+
+    pub(crate) async fn observe_secondary_removal_witness(
+        &self,
+        witness: kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.host
+            .managed()?
+            .execute_action(RuntimeEffectAction::ObserveSecondaryRemovalWitness(
+                Box::new(witness),
+            ))
             .await
     }
 

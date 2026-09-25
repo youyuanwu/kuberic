@@ -3,11 +3,16 @@
 use std::sync::Arc;
 use tokio::sync::{Mutex, watch};
 
-use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, PrepareSwitchover};
+use kuberic_protocol::command::{
+    EnsureConfiguration, EnsureReplicaBuild, PrepareSecondaryRemoval, PrepareSwitchover,
+    RetireReplica,
+};
 use kuberic_protocol::types::{
-    AccessStatus, Epoch, OperationId, ProcessSessionId, ReplicaRole, SwitchoverHandoff,
+    AccessStatus, Epoch, OperationId, ProcessSessionId, ReplicaRetirementReport, ReplicaRole,
+    SecondaryRemovalPreparation, SwitchoverHandoff,
 };
 use kuberic_runtime::application::OpenMode;
+use kuberic_runtime_internal::authority::RetiredAuthority;
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult};
 
 use crate::command::{
@@ -76,6 +81,128 @@ where
         }
     }
 
+    pub async fn ensure_secondary_removal_prepared(
+        &self,
+        command: PrepareSecondaryRemoval,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<SecondaryRemovalPreparation> {
+        let _command = self.command_lock.lock().await;
+        if process_session_id.is_empty() || report_sequence == 0 {
+            return Err(AgentError::CommandRejected(
+                "preparation requires exact session and sequence".into(),
+            ));
+        }
+        let state = self.store.load_state().await?;
+        crate::removal::admit_preparation(&command, &state)?;
+        let action = RuntimeEffectAction::PrepareSecondaryRemoval {
+            intent: Box::new(command.intent.clone()),
+            process_session_id,
+            report_sequence,
+        };
+        let existing = state
+            .pending_effect
+            .as_ref()
+            .map(|p| &p.effect)
+            .or_else(|| {
+                state
+                    .removal_effects
+                    .get(&command.operation_id)
+                    .map(|r| &r.effect)
+            });
+        let effect = if let Some(existing) = existing {
+            if existing.operation_id != command.operation_id
+                || !matches!(&existing.action, RuntimeEffectAction::PrepareSecondaryRemoval { intent, .. } if intent.as_ref() == &command.intent)
+            {
+                return Err(AgentError::EffectConflict(
+                    "preparation differs from persisted intent".into(),
+                ));
+            }
+            existing.clone()
+        } else {
+            RuntimeEffect {
+                operation_id: command.operation_id,
+                sequence: state.next_effect_sequence,
+                action,
+            }
+        };
+        let result = self.runtime.execute(effect).await?;
+        result
+            .postcondition
+            .prepared_secondary_removal
+            .ok_or_else(|| {
+                AgentError::EffectConflict("preparation omitted terminal evidence".into())
+            })
+    }
+
+    pub async fn ensure_replica_retired(
+        &self,
+        command: RetireReplica,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    ) -> Result<ReplicaRetirementReport> {
+        let _command = self.command_lock.lock().await;
+        if process_session_id.is_empty() || report_sequence == 0 {
+            return Err(AgentError::CommandRejected(
+                "retirement requires exact session and sequence".into(),
+            ));
+        }
+        let state = self.store.load_state().await?;
+        crate::removal::admit_retirement(&command, &state)?;
+        let intent = command.committed.evidence.preparation.intent.clone();
+        let retired = RetiredAuthority {
+            report: ReplicaRetirementReport {
+                intent: intent.clone(),
+                operation_id: command.operation_id.clone(),
+                process_session_id,
+                report_sequence,
+                epoch: intent.current_configuration.epoch,
+                role: ReplicaRole::None,
+                read_status: AccessStatus::NotPrimary,
+                write_status: AccessStatus::NotPrimary,
+                application_closed: true,
+                peers_fenced: true,
+            },
+            committed: command.committed.clone(),
+        };
+        let existing = state
+            .pending_effect
+            .as_ref()
+            .map(|p| &p.effect)
+            .or_else(|| {
+                state
+                    .removal_effects
+                    .get(&command.operation_id)
+                    .map(|r| &r.effect)
+            });
+        let effect = if let Some(existing) = existing {
+            if existing.operation_id != command.operation_id
+                || !matches!(&existing.action, RuntimeEffectAction::RetireReplica(r) if r.committed == command.committed)
+            {
+                return Err(AgentError::EffectConflict(
+                    "retirement differs from persisted intent".into(),
+                ));
+            }
+            existing.clone()
+        } else {
+            retired
+                .validate(&state.identity.local_identity)
+                .map_err(|e| AgentError::CommandRejected(e.to_string()))?;
+            RuntimeEffect {
+                operation_id: command.operation_id,
+                sequence: state.next_effect_sequence,
+                action: RuntimeEffectAction::RetireReplica(Box::new(retired)),
+            }
+        };
+        let result = self.runtime.execute(effect).await?;
+        result
+            .postcondition
+            .retired_authority
+            .map(|r| r.report)
+            .ok_or_else(|| {
+                AgentError::EffectConflict("retirement omitted terminal evidence".into())
+            })
+    }
     pub async fn ensure_switchover_prepared(
         &self,
         command: PrepareSwitchover,
@@ -141,7 +268,26 @@ where
         &self,
         command: EnsureConfiguration,
     ) -> Result<RetainedCommandResult> {
+        // Full frozen evidence makes this state machine too large for caller task stacks.
+        Box::pin(self.drive_configuration(command)).await
+    }
+
+    async fn drive_configuration(
+        &self,
+        command: EnsureConfiguration,
+    ) -> Result<RetainedCommandResult> {
         let observed = self.store.load_state().await?;
+        if let Some(retained) = observed.removal_commands.get(&command.operation_id) {
+            if retained.command != command
+                || command.current_epoch < observed.highest_epoch
+                || observed.retired_authority.is_some()
+            {
+                return Err(AgentError::EffectConflict(
+                    "stale or mutated removal command replay".into(),
+                ));
+            }
+            return Ok(retained.clone());
+        }
         if let Some(pending) = observed.reconfiguration.as_ref()
             && pending.command != command
         {
@@ -362,6 +508,7 @@ where
                             record.command.transition_kind,
                             kuberic_protocol::types::TransitionKind::Failover
                                 | kuberic_protocol::types::TransitionKind::PlannedSwitchover
+                                | kuberic_protocol::types::TransitionKind::SecondaryScaleDown
                         )
                         && record.command.primary_write_status != AccessStatus::Granted;
                     let read_status = if provisional_primary {

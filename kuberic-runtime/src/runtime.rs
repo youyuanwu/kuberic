@@ -912,6 +912,28 @@ impl DefaultReplicatorInner {
             .lock()
             .await
             .record_verified_local_progress(replication_progress.verified_lsn);
+        let accepted = self
+            .replica_authority_store
+            .load_secondary_removal_commit()
+            .await?
+            .filter(|c| {
+                authority.previous_configuration.is_none()
+                    && authority.secondary_removal.as_ref() == Some(&c.evidence)
+            });
+        if let Some(committed) = &accepted {
+            validate_secondary_scale_down_cleanup(committed)
+                .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
+            let mut replicator = self.replicator.lock().await;
+            for witness in &committed.current_only_write_quorum {
+                if witness.identity != self.identity {
+                    replicator.register_peer_session(
+                        witness.identity.clone(),
+                        witness.process_session_id.clone(),
+                    )?;
+                    replicator.observe_secondary_removal(witness)?;
+                }
+            }
+        }
         let mut state = self.state.write().await;
         if authority.previous_configuration.is_none()
             && let Some(evidence) = &authority.secondary_removal
@@ -2163,21 +2185,25 @@ impl DefaultReplicatorInner {
                 .map(|progress| progress.verified_lsn),
             state.committed_lsn,
             build_postconditions(&state),
+            state.replication_address.clone(),
+            state.prepared_secondary_removal.clone(),
+            state.retired_authority.clone(),
+            state.accepted_secondary_removal.clone(),
         );
         drop(state);
         let replicator = self.replicator.lock().await;
         RuntimeSnapshot {
             identity: self.identity.clone(),
             open: snapshot.0 && !self.aborted.load(Ordering::Acquire),
-            replication_address: self.state.read().await.replication_address.clone(),
+            replication_address: snapshot.9,
             role: snapshot.1,
             role_transition: None,
             read_status: snapshot.2,
             write_status: snapshot.3,
             authority: snapshot.4,
-            prepared_secondary_removal: self.state.read().await.prepared_secondary_removal.clone(),
-            retired_authority: self.state.read().await.retired_authority.clone(),
-            accepted_secondary_removal: self.state.read().await.accepted_secondary_removal.clone(),
+            prepared_secondary_removal: snapshot.10,
+            retired_authority: snapshot.11,
+            accepted_secondary_removal: snapshot.12,
             current_progress: snapshot.5,
             verified_replication_lsn: snapshot.6,
             committed_lsn: snapshot.7.max(replicator.committed_lsn()),
@@ -2587,9 +2613,13 @@ impl DefaultReplicatorInner {
                 starting_configuration_id,
                 starting_epoch,
             } => {
-                if self.state.read().await.prepared_secondary_removal.is_some() {
+                let state = self.state.read().await;
+                if state.prepared_secondary_removal.is_some()
+                    && state.accepted_secondary_removal.is_none()
+                {
                     return Err(RuntimeError::ReconfigurationPending);
                 }
+                drop(state);
                 if preparation_generation == 0 || request_id.is_empty() {
                     return Err(RuntimeError::AuthorityMismatch(
                         "planned switchover requires a request ID and positive generation"
@@ -2799,6 +2829,7 @@ impl DefaultReplicatorInner {
                 }
                 drop(state);
                 self.state.write().await.removal_in_progress = Some(preparation.intent.clone());
+                self.state.write().await.read_status = AccessStatus::ReconfigurationPending;
                 self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
                 self.replicator.lock().await.fence_client_writes();
                 // Both ACK completion and write registration hold effect_lock. Resolve
@@ -2898,6 +2929,9 @@ impl DefaultReplicatorInner {
                 if !self.replicator.lock().await.catch_up_complete() {
                     return Err(RuntimeError::ReconfigurationPending);
                 }
+                self.replica_authority_store
+                    .record_secondary_removal_commit(&committed)
+                    .await?;
                 self.state.write().await.accepted_secondary_removal = Some(*committed);
             }
             RuntimeEffectAction::FenceRetirement(retired) => {

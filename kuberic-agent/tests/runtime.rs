@@ -39,11 +39,51 @@ use tokio::time::{Duration, timeout};
 #[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
 mod removal_fixture;
 
-async fn open_removal_member(
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_snapshots_do_not_reacquire_read_locks_behind_queued_peer_eviction() {
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let runtime = open_removal_member(
+        &intent,
+        intent.primary.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    )
+    .await;
+    runtime
+        .apply_effect(effect(5, prepare_removal(&intent)))
+        .await
+        .unwrap();
+    let snapshots = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            for _ in 0..2000 {
+                assert_eq!(runtime.snapshot().await.role, ReplicaRole::Primary);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let plane = runtime.data_plane();
+    let eviction_polling = tokio::spawn(async move { plane.next_outbound().await });
+    let notifications = tokio::spawn(async move {
+        for _ in 0..2000 {
+            runtime.cancel_configuration_work().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+    timeout(Duration::from_secs(3), async {
+        snapshots.await.unwrap();
+        notifications.await.unwrap();
+    })
+    .await
+    .expect("snapshot must not deadlock with the pending-eviction writer");
+    eviction_polling.abort();
+}
+
+async fn open_removal_member<S: kuberic_runtime_internal::authority::AuthorityStore + 'static>(
     intent: &kuberic_protocol::types::SecondaryScaleDownIntent,
     local: ReplicaIdentity,
     application: Arc<TestApplication>,
-    store: Arc<MemoryAuthorityStore>,
+    store: Arc<S>,
 ) -> Arc<PodRuntime> {
     let primary = local == intent.primary;
     let runtime = Arc::new(PodRuntime::new(local.clone(), application, store));
@@ -80,6 +120,83 @@ async fn open_removal_member(
             .unwrap();
     }
     runtime
+}
+
+#[tokio::test]
+async fn sqlite_retirement_tombstone_precedes_host_open_and_cannot_be_reactivated() {
+    use kuberic_agent::sqlite_store::SqliteStore;
+    use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+    use kuberic_protocol::types::{InitializationId, PodUid, PvcUid};
+    let intent = removal_fixture::intent(&[1, 2, 3], 1);
+    let local = intent.target.clone();
+    let provenance = StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        local_identity: local.clone(),
+        pod_uid: PodUid::new(local.instance_id.as_str()),
+        pvc_uid: PvcUid::new("pvc-3"),
+        initialization_id: InitializationId::new("original"),
+        effective_policy: intent.previous_policy.clone(),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(
+        SqliteStore::create_authorized(&path, AgentState::new(provenance.clone())).unwrap(),
+    );
+    let runtime = open_removal_member(
+        &intent,
+        local.clone(),
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    )
+    .await;
+    let retired = kuberic_runtime_internal::authority::RetiredAuthority {
+        committed: removal_fixture::cleanup(&intent),
+        report: removal_fixture::retirement(&intent),
+    };
+    runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::RetireReplica(Box::new(retired.clone())),
+        ))
+        .await
+        .unwrap();
+    drop(runtime);
+    drop(store);
+    let store = Arc::new(SqliteStore::open_existing(&path, Some(&provenance)).unwrap());
+    let application = Arc::new(TestApplication::default());
+    let runtime = PodRuntime::new(local, application.clone(), store);
+    runtime
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::ActiveSecondary,
+            AccessStatus::Granted,
+            AccessStatus::Granted,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(application.events.lock().unwrap().is_empty());
+    assert!(!runtime.snapshot().await.open);
+    assert_eq!(
+        runtime.snapshot().await.retired_authority,
+        Some(retired.clone())
+    );
+    assert!(
+        runtime
+            .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+            .await
+            .is_err()
+    );
+    let replay = runtime
+        .apply_effect(effect(
+            1,
+            RuntimeEffectAction::RetireReplica(Box::new(retired)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.postcondition.role, ReplicaRole::None);
+    assert_eq!(replay.postcondition.write_status, AccessStatus::NotPrimary);
 }
 
 fn prepare_removal(
@@ -1105,6 +1222,7 @@ struct MemoryAuthorityStore {
     authority: Mutex<Option<AdmittedAuthority>>,
     prepared_secondary_removal: Mutex<Option<kuberic_protocol::types::SecondaryRemovalPreparation>>,
     retired_authority: Mutex<Option<kuberic_runtime_internal::authority::RetiredAuthority>>,
+    accepted_removal: Mutex<Option<kuberic_protocol::types::SecondaryScaleDownCleanup>>,
     fail_preparation_once: AtomicBool,
     fail_after_preparation_once: AtomicBool,
     fail_retirement_once: AtomicBool,
@@ -1127,6 +1245,20 @@ struct MemoryAuthorityStore {
 
 #[async_trait]
 impl ReplicaAuthorityStore for MemoryAuthorityStore {
+    async fn load_secondary_removal_commit(
+        &self,
+    ) -> ContractResult<Option<kuberic_protocol::types::SecondaryScaleDownCleanup>> {
+        Ok(self.accepted_removal.lock().unwrap().clone())
+    }
+
+    async fn record_secondary_removal_commit(
+        &self,
+        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> ContractResult<()> {
+        *self.accepted_removal.lock().unwrap() = Some(committed.clone());
+        Ok(())
+    }
+
     async fn load_secondary_removal(
         &self,
     ) -> ContractResult<Option<kuberic_protocol::types::SecondaryRemovalPreparation>> {

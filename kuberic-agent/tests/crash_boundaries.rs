@@ -41,6 +41,9 @@ use kuberic_runtime_internal::effects::{
 use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 
+#[path = "support/removal_crashes.rs"]
+mod removal_crashes;
+
 struct FakeRuntime {
     calls: AtomicUsize,
     result: RuntimeEffectResult,
@@ -329,6 +332,7 @@ struct CrashPersistedState {
 struct CrashState {
     path: PathBuf,
     state: Mutex<CrashPersistedState>,
+    opens: AtomicUsize,
 }
 
 impl CrashState {
@@ -342,6 +346,7 @@ impl CrashState {
         Self {
             path,
             state: Mutex::new(state),
+            opens: AtomicUsize::new(0),
         }
     }
 
@@ -372,6 +377,7 @@ impl CrashState {
 #[async_trait]
 impl StatefulServiceReplica for CrashState {
     async fn open(self: Arc<Self>, context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
+        self.opens.fetch_add(1, Ordering::SeqCst);
         let partition = context
             .partition
             .with_factory(Arc::new(DefaultReplicatorFactory::new(self.clone())));
@@ -388,6 +394,9 @@ impl StatefulServiceReplica for CrashState {
     }
 
     async fn close(&self) -> RuntimeResult<()> {
+        if env::var("KUBERIC_REMOVAL_BOUNDARY").as_deref() == Ok("retire:application-close") {
+            std::process::exit(73);
+        }
         Ok(())
     }
 
@@ -1493,7 +1502,7 @@ fn local_write_recovery_boundaries_commit_fresh_writes_after_process_termination
                         }
                     }
                 }
-            }).await.unwrap();
+            }).await.unwrap_or_else(|_| panic!("local write recovery timed out at {boundary}"));
             let old = store.load_local_write(&OperationId::new("interrupted-before-crash")).await.unwrap().unwrap();
             assert_eq!(old.phase, kuberic_runtime_internal::authority::LocalWritePhase::Committed);
             assert_eq!(old.data, Bytes::from_static(b"original-before-crash"));
