@@ -423,6 +423,11 @@ impl AgentStore for SqliteStore {
                         "configuration retires missing switchover preparation".into(),
                     )
                 })?;
+                if record.command.switchover_handoff.as_ref() != Some(prepared) {
+                    return Err(AgentError::EffectConflict(
+                        "configuration retires a changed switchover certificate".into(),
+                    ));
+                }
                 if record.command.retire_switchover_preparation_ids.len() != 1
                     || record.command.retire_switchover_preparation_ids[0]
                         != prepared.preparation_operation_id

@@ -321,6 +321,7 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
         switchover_handoff: Some(handoff.clone()),
         retire_switchover_preparation_ids: Vec::new(),
     };
+    state.prepared_switchover = Some(handoff.clone());
     assert!(admit_configuration(&command, &state).is_ok());
 
     let mut wrong_start = command.clone();
@@ -332,7 +333,7 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
     assert!(admit_configuration(&wrong_start, &state).is_err());
 
     state.highest_epoch = current.epoch;
-    state.previous_configuration = Some(previous);
+    state.previous_configuration = Some(previous.clone());
     state.current_configuration = Some(current.clone());
     state.role = ReplicaRole::ActiveSecondary;
     let mut current_only = command;
@@ -345,7 +346,36 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
     assert!(admit_configuration(&current_only, &state).is_err());
     current_only.retire_switchover_preparation_ids = vec![handoff.preparation_operation_id.clone()];
     assert!(admit_configuration(&current_only, &state).is_ok());
+    let mut changed_certificate = current_only.clone();
+    changed_certificate
+        .switchover_handoff
+        .as_mut()
+        .unwrap()
+        .handoff_lsn += 1;
+    assert!(admit_configuration(&changed_certificate, &state).is_err());
 
+    let mut target_state = AgentState::new(StorageIdentity {
+        local_identity: handoff.target.clone(),
+        effective_policy: state.identity.effective_policy.clone(),
+        ..storage_identity()
+    });
+    target_state.highest_epoch = current_only.current_epoch;
+    target_state.previous_configuration = Some(previous);
+    target_state.current_configuration = Some(current_only.current_configuration.clone());
+    target_state.role = ReplicaRole::Primary;
+    target_state.read_status = AccessStatus::ReconfigurationPending;
+    target_state.write_status = AccessStatus::ReconfigurationPending;
+    let mut target_current_only = current_only.clone();
+    target_current_only.operation_id = OperationId::new("target-current-only");
+    target_current_only.local_replica_id = handoff.target.replica_id;
+    target_current_only.expected_instance_id = handoff.target.instance_id.clone();
+    target_current_only.expected_agent_generation = handoff.target.agent_generation.clone();
+    target_current_only
+        .retire_switchover_preparation_ids
+        .clear();
+    assert!(admit_configuration(&target_current_only, &target_state).is_ok());
+
+    state.prepared_switchover = None;
     state.previous_configuration = None;
     state.reconfiguration = Some(ReconfigurationRecord {
         command: current_only.clone(),
@@ -508,6 +538,117 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
     changed.target = target;
     changed.request_id = SwitchoverRequestId::new("changed");
     assert!(restarted.ensure_switchover_prepared(changed).await.is_err());
+}
+
+#[tokio::test]
+async fn planned_switchover_current_only_completes_on_target_without_local_retirement() {
+    let directory = tempdir().unwrap();
+    let target = identity();
+    let source = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: AgentGeneration::new("generation-2"),
+    };
+    let policy = EffectivePolicy::fixed(2, 30).unwrap();
+    let previous = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::Primary,
+            },
+        ],
+        policy.write_quorum,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        target.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        policy.write_quorum,
+    );
+    let handoff = SwitchoverHandoff {
+        preparation_operation_id: OperationId::new("prepare-1"),
+        request_id: SwitchoverRequestId::new("request-1"),
+        source,
+        target: target.clone(),
+        starting_configuration_id: previous.configuration_id.clone(),
+        starting_epoch: previous.epoch,
+        handoff_lsn: 7,
+    };
+    let mut state = AgentState::new(StorageIdentity {
+        effective_policy: policy.clone(),
+        ..storage_identity()
+    });
+    state.highest_epoch = current.epoch;
+    state.previous_configuration = Some(previous);
+    state.current_configuration = Some(current.clone());
+    state.role = ReplicaRole::Primary;
+    state.read_status = AccessStatus::ReconfigurationPending;
+    state.write_status = AccessStatus::ReconfigurationPending;
+    let store = Arc::new(
+        SqliteStore::create_authorized(
+            SqliteStore::metadata_database_path(directory.path()),
+            state,
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(FakeRuntime::new());
+    let previous_authority = store.load_state().await.unwrap().previous_configuration;
+    {
+        let mut runtime_state = runtime.state.lock().unwrap();
+        runtime_state.role = ReplicaRole::Primary;
+        runtime_state.read_status = AccessStatus::ReconfigurationPending;
+        runtime_state.write_status = AccessStatus::ReconfigurationPending;
+        runtime_state.current_progress = 7;
+        runtime_state.authority = Some(AdmittedAuthority {
+            local_identity: target.clone(),
+            transition_kind: Some(TransitionKind::PlannedSwitchover),
+            previous_configuration: previous_authority,
+            current_configuration: current.clone(),
+            switchover_handoff: Some(handoff.clone()),
+        });
+    }
+    let command = EnsureConfiguration {
+        operation_id: OperationId::new("target-current-only"),
+        previous_configuration: None,
+        current_configuration: current.clone(),
+        previous_epoch: None,
+        current_epoch: current.epoch,
+        effective_policy: policy,
+        local_replica_id: target.replica_id,
+        expected_instance_id: target.instance_id,
+        expected_agent_generation: target.agent_generation,
+        transition_kind: TransitionKind::PlannedSwitchover,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only: true,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: Some(handoff),
+        retire_switchover_preparation_ids: Vec::new(),
+    };
+
+    Coordinator::new(store.clone(), runtime)
+        .ensure_configuration(command.clone())
+        .await
+        .unwrap();
+    let completed = store.load_state().await.unwrap();
+    assert!(completed.reconfiguration.is_none());
+    assert!(completed.prepared_switchover.is_none());
+    assert_eq!(completed.retained_command.unwrap().command, command);
 }
 
 #[tokio::test]

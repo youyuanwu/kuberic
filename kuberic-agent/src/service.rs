@@ -491,7 +491,13 @@ where
                 OpenMode::Existing,
                 state.role,
                 state.read_status,
-                state.write_status,
+                startup_write_status(
+                    state.write_status,
+                    state
+                        .pending_effect
+                        .as_ref()
+                        .map(|pending| &pending.effect.action),
+                ),
                 transition,
             )
             .await?;
@@ -647,6 +653,22 @@ where
                     .map_err(status_from_agent)?,
             ),
         })
+    }
+}
+
+fn startup_write_status(
+    persisted: kuberic_protocol::types::AccessStatus,
+    pending: Option<&kuberic_runtime_internal::effects::RuntimeEffectAction>,
+) -> kuberic_protocol::types::AccessStatus {
+    if pending.is_some_and(|action| {
+        matches!(
+            action,
+            kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover { .. }
+        )
+    }) {
+        kuberic_protocol::types::AccessStatus::ReconfigurationPending
+    } else {
+        persisted
     }
 }
 
@@ -911,7 +933,10 @@ fn status_from_runtime(error: kuberic_runtime::RuntimeError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kuberic_protocol::types::{PodUid, PvcUid, ReplicaInstanceId, ResourceUid};
+    use kuberic_protocol::types::{
+        AgentGeneration, ConfigurationId, PodUid, PvcUid, ReplicaIdentity, ReplicaInstanceId,
+        ResourceUid, SwitchoverRequestId,
+    };
 
     #[test]
     fn uninitialized_report_is_unsafe_when_application_state_survives() {
@@ -938,5 +963,31 @@ mod tests {
             proto::AgentStorageState::Unsafe as i32
         );
         assert!(report.storage_error.contains("application state exists"));
+    }
+
+    #[test]
+    fn pending_switchover_preparation_reconstructs_write_closed() {
+        let action = kuberic_runtime_internal::effects::RuntimeEffectAction::PrepareSwitchover {
+            request_id: SwitchoverRequestId::new("request-1"),
+            source: ReplicaIdentity {
+                replica_id: ReplicaId::new(1),
+                instance_id: ReplicaInstanceId::new("pod-1"),
+                agent_generation: AgentGeneration::new("generation-1"),
+            },
+            target: ReplicaIdentity {
+                replica_id: ReplicaId::new(2),
+                instance_id: ReplicaInstanceId::new("pod-2"),
+                agent_generation: AgentGeneration::new("generation-2"),
+            },
+            starting_configuration_id: ConfigurationId::new("configuration-1"),
+            starting_epoch: kuberic_protocol::types::Epoch::new(0, 1),
+        };
+        assert_eq!(
+            startup_write_status(
+                kuberic_protocol::types::AccessStatus::Granted,
+                Some(&action)
+            ),
+            kuberic_protocol::types::AccessStatus::ReconfigurationPending
+        );
     }
 }

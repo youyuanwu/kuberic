@@ -609,14 +609,6 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         "replacement current-only completion must retire its build".to_string(),
                     ));
                 }
-                if transition_kind == TransitionKind::PlannedSwitchover
-                    && command.retire_switchover_preparation_ids.is_empty()
-                {
-                    return Err(WireError::InvalidAuthority(
-                        "planned switchover current-only completion must retire preparation"
-                            .to_string(),
-                    ));
-                }
             } else {
                 if !command.retire_build_id.is_empty() || !command.retire_build_ids.is_empty() {
                     return Err(WireError::InvalidAuthority(
@@ -692,9 +684,13 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         .iter()
                         .any(String::is_empty)
                     || (command.current_only
+                        && target == handoff.source
                         && (command.retire_switchover_preparation_ids.len() != 1
                             || command.retire_switchover_preparation_ids[0]
                                 != handoff.preparation_operation_id.as_str()))
+                    || (command.current_only
+                        && target != handoff.source
+                        && !command.retire_switchover_preparation_ids.is_empty())
                     || (!command.current_only
                         && !command.retire_switchover_preparation_ids.is_empty())
                 {

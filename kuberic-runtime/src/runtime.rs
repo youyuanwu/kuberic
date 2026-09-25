@@ -2400,7 +2400,11 @@ impl DefaultReplicatorInner {
                 if !state.open {
                     return Err(RuntimeError::NotOpen);
                 }
-                if state.role != ReplicaRole::Primary || state.write_status != AccessStatus::Granted
+                if state.role != ReplicaRole::Primary
+                    || !matches!(
+                        state.write_status,
+                        AccessStatus::Granted | AccessStatus::ReconfigurationPending
+                    )
                 {
                     return Err(RuntimeError::NotPrimary);
                 }

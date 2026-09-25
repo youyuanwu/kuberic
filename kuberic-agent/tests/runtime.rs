@@ -3715,10 +3715,11 @@ async fn switchover_preparation_fences_pending_writes_and_returns_applied_bounda
     let secondary = identity(2, "secondary");
     let third = identity(3, "third");
     let application = Arc::new(TestApplication::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
     let runtime = Arc::new(PodRuntime::new(
         local.clone(),
-        application,
-        Arc::new(MemoryAuthorityStore::default()),
+        application.clone(),
+        store.clone(),
     ));
     runtime
         .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
@@ -3767,8 +3768,8 @@ async fn switchover_preparation_fences_pending_writes_and_returns_applied_bounda
         5,
         RuntimeEffectAction::PrepareSwitchover {
             request_id: SwitchoverRequestId::new("request-1"),
-            source: local,
-            target: secondary,
+            source: local.clone(),
+            target: secondary.clone(),
             starting_configuration_id: starting_configuration.configuration_id,
             starting_epoch: starting_configuration.epoch,
         },
@@ -3798,6 +3799,22 @@ async fn switchover_preparation_fences_pending_writes_and_returns_applied_bounda
             AccessStatus::ReconfigurationPending
         ))
     ));
+    let restarted = PodRuntime::new(local, application, store);
+    restarted
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            AccessStatus::Granted,
+            AccessStatus::ReconfigurationPending,
+            None,
+        )
+        .await
+        .unwrap();
+    let replayed = restarted.apply_effect(prepare.clone()).await.unwrap();
+    assert_eq!(
+        replayed.postcondition.current_progress,
+        result.postcondition.current_progress
+    );
     assert_eq!(runtime.apply_effect(prepare).await.unwrap(), result);
 }
 
@@ -3875,6 +3892,85 @@ async fn switchover_preparation_boundary_covers_acknowledged_writes() {
         result.postcondition.write_status,
         AccessStatus::ReconfigurationPending
     );
+}
+
+#[tokio::test]
+async fn switchover_preparation_races_ack_without_success_outside_boundary() {
+    let local = identity(1, "primary");
+    let secondary = identity(2, "secondary");
+    let third = identity(3, "third");
+    let admitted = authority(local.clone(), vec![local.clone(), secondary.clone(), third]);
+    let runtime = Arc::new(PodRuntime::new(
+        local.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    ));
+    runtime
+        .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            2,
+            RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            3,
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+        ))
+        .await
+        .unwrap();
+    runtime
+        .apply_effect(effect(
+            4,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        ))
+        .await
+        .unwrap();
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("racing-switchover"),
+            data: Bytes::from_static(b"racing-switchover"),
+        })
+        .await
+        .unwrap();
+    let lsn = pending.lsn;
+    let prepare_runtime = runtime.clone();
+    let prepare = effect(
+        5,
+        RuntimeEffectAction::PrepareSwitchover {
+            request_id: SwitchoverRequestId::new("request-race"),
+            source: local,
+            target: secondary.clone(),
+            starting_configuration_id: admitted.current_configuration.configuration_id.clone(),
+            starting_epoch: admitted.current_configuration.epoch,
+        },
+    );
+    let ack_runtime = runtime.clone();
+    let acknowledgement = acknowledgement(&admitted, secondary, lsn);
+    let (prepared, acknowledged) = tokio::join!(
+        async move { prepare_runtime.apply_effect(prepare).await },
+        async move {
+            ack_runtime
+                .data_plane()
+                .accept_acknowledgement(acknowledgement)
+                .await
+        }
+    );
+    let prepared = prepared.unwrap();
+    acknowledged.unwrap();
+    match pending.committed().await {
+        Ok(receipt) => {
+            assert!(prepared.postcondition.current_progress >= receipt.lsn);
+            assert!(prepared.postcondition.committed_lsn >= receipt.committed_lsn);
+        }
+        Err(RuntimeError::WriteClosed(AccessStatus::ReconfigurationPending)) => {}
+        other => panic!("unexpected racing write result: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -5463,7 +5559,11 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
     let source_store = Arc::new(MemoryAuthorityStore::default());
     let source_application = Arc::new(TestApplication::default());
     source_application.seed_progress(9);
-    let source_runtime = PodRuntime::new(source.clone(), source_application, source_store);
+    let source_runtime = PodRuntime::new(
+        source.clone(),
+        source_application.clone(),
+        source_store.clone(),
+    );
     source_runtime
         .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
         .await
@@ -5472,7 +5572,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         .apply_effect(effect(
             2,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
-                local_identity: source,
+                local_identity: source.clone(),
                 transition_kind: Some(TransitionKind::PlannedSwitchover),
                 previous_configuration: Some(requested),
                 current_configuration: compensation,
@@ -5483,6 +5583,21 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         .unwrap();
     assert_eq!(
         source_runtime.snapshot().await.verified_replication_lsn,
+        Some(7)
+    );
+    let restarted_source = PodRuntime::new(source, source_application, source_store);
+    restarted_source
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            AccessStatus::ReconfigurationPending,
+            AccessStatus::ReconfigurationPending,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted_source.snapshot().await.verified_replication_lsn,
         Some(7)
     );
 }

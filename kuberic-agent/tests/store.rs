@@ -20,6 +20,8 @@ use kuberic_runtime_internal::authority::{
     AdmittedAuthority, AuthorityFence, DurableLocalWrite, LocalWriteJournal, LocalWritePhase,
     ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
 };
+use rusqlite::Connection;
+use serde_json::Value;
 use tempfile::tempdir;
 
 fn identity(replica_id: i64, instance: &str, generation: &str) -> ReplicaIdentity {
@@ -342,6 +344,65 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
             .prepared_switchover
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn additive_handoff_fields_default_when_reopening_legacy_json() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let (initialize, observed, transition) = bootstrap_fixture();
+    let storage_identity = authorize_initialization(
+        &initialize,
+        &observed,
+        InitializationAuthority::Bootstrap(&transition),
+    )
+    .unwrap();
+    let authority = AdmittedAuthority {
+        local_identity: storage_identity.local_identity.clone(),
+        transition_kind: Some(TransitionKind::Bootstrap),
+        previous_configuration: None,
+        current_configuration: initialize.bootstrap_configuration,
+        switchover_handoff: None,
+    };
+    let store = SqliteStore::create_authorized(&path, AgentState::new(storage_identity)).unwrap();
+    store.admit(&authority).await.unwrap();
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    for (table, column) in [
+        ("agent_state", "state_json"),
+        ("replica_authority", "authority_json"),
+    ] {
+        let mut json: Value = connection
+            .query_row(
+                &format!("SELECT {column} FROM {table} WHERE singleton = 1"),
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|json| serde_json::from_str(&json).unwrap())
+            .unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("preparedSwitchover");
+        object.remove("switchoverHandoff");
+        connection
+            .execute(
+                &format!("UPDATE {table} SET {column} = ?1 WHERE singleton = 1"),
+                [serde_json::to_string(&json).unwrap()],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    let reopened = SqliteStore::open_existing(&path, None).unwrap();
+    assert!(
+        reopened
+            .load_state()
+            .await
+            .unwrap()
+            .prepared_switchover
+            .is_none()
+    );
+    assert_eq!(reopened.load().await.unwrap(), Some(authority));
 }
 
 #[test]

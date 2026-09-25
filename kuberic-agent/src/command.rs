@@ -253,13 +253,6 @@ fn admit_configuration_with_replay(
                 "replacement current-only completion must retire its build".into(),
             ));
         }
-        if command.transition_kind == TransitionKind::PlannedSwitchover
-            && command.retire_switchover_preparation_ids.is_empty()
-        {
-            return Err(AgentError::CommandRejected(
-                "planned switchover current-only completion must retire preparation".into(),
-            ));
-        }
     } else {
         if !command.retire_build_ids.is_empty() {
             return Err(AgentError::CommandRejected(
@@ -300,6 +293,11 @@ fn admit_configuration_with_replay(
                 .is_some_and(|retained| retained.command == *command);
         let starting_authority_was_durably_admitted =
             completed_current_only_replay && exact_persisted_command;
+        let source_certificate_matches = *identity != handoff.source
+            || state.prepared_switchover.as_ref() == Some(handoff)
+            || (completed_current_only_replay
+                && exact_persisted_command
+                && state.prepared_switchover.is_none());
         let starting_authority_matches = starting_configuration.is_some_and(|configuration| {
             let source_is_primary = configuration.members.iter().any(|member| {
                 member.identity == handoff.source && member.role == ReplicaRole::Primary
@@ -332,7 +330,8 @@ fn admit_configuration_with_replay(
             .retire_switchover_preparation_ids
             .iter()
             .collect::<BTreeSet<_>>();
-        if (!starting_authority_was_durably_admitted && !starting_authority_matches)
+        if !source_certificate_matches
+            || (!starting_authority_was_durably_admitted && !starting_authority_matches)
             || !command
                 .current_configuration
                 .members
@@ -351,9 +350,13 @@ fn admit_configuration_with_replay(
                 .iter()
                 .any(|operation_id| operation_id.is_empty())
             || (command.current_only
+                && *identity == handoff.source
                 && (command.retire_switchover_preparation_ids.len() != 1
                     || command.retire_switchover_preparation_ids[0]
                         != handoff.preparation_operation_id))
+            || (command.current_only
+                && *identity != handoff.source
+                && !command.retire_switchover_preparation_ids.is_empty())
         {
             return Err(AgentError::CommandRejected(
                 "planned switchover handoff differs from configuration authority".into(),
