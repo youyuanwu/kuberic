@@ -3974,6 +3974,208 @@ async fn switchover_preparation_races_ack_without_success_outside_boundary() {
 }
 
 #[tokio::test]
+async fn switchover_drain_serializes_durable_boundaries_and_delayed_direct_clients() {
+    for boundary in ["apply", "registered", "commit", "committed-journal"] {
+        let source = identity(1, "source");
+        let target = identity(2, "target");
+        let starting = authority(
+            source.clone(),
+            vec![source.clone(), target.clone(), identity(3, "third")],
+        );
+        let application = Arc::new(TestApplication::default());
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let runtime = Arc::new(PodRuntime::new(
+            source.clone(),
+            application.clone(),
+            store.clone(),
+        ));
+        for (index, action) in [
+            RuntimeEffectAction::Open(OpenMode::Existing),
+            RuntimeEffectAction::AdmitAuthority(Box::new(starting.clone())),
+            RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime
+                .apply_effect(effect(index as u64 + 1, action))
+                .await
+                .unwrap();
+        }
+        let retained_client = runtime.data_plane();
+        let (pause, entered, resume) = match boundary {
+            "apply" => (
+                &application.pause_after_apply,
+                &application.applied_notify,
+                &application.resume_notify,
+            ),
+            "registered" => (
+                &store.pause_registered_write,
+                &store.registered_write_notify,
+                &store.resume_registered_write_notify,
+            ),
+            "commit" => (
+                &application.pause_commit,
+                &application.commit_notify,
+                &application.resume_commit_notify,
+            ),
+            _ => (
+                &store.pause_committed_write,
+                &store.committed_write_notify,
+                &store.resume_committed_write_notify,
+            ),
+        };
+        pause.store(true, Ordering::SeqCst);
+        let writer_runtime = runtime.clone();
+        let ack = acknowledgement(&starting, target.clone(), 1);
+        let delayed_ack = ack.clone();
+        let commit_first = matches!(boundary, "commit" | "committed-journal");
+        let writer = tokio::spawn(async move {
+            let pending = writer_runtime
+                .data_plane()
+                .begin_write(ClientWrite {
+                    operation_id: OperationId::new("drain-race"),
+                    data: Bytes::from_static(b"durable-before-revocation"),
+                })
+                .await
+                .unwrap();
+            if commit_first {
+                writer_runtime
+                    .data_plane()
+                    .accept_acknowledgement(ack)
+                    .await
+                    .unwrap();
+            }
+            pending
+        });
+        timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        let preparation = effect(
+            5,
+            RuntimeEffectAction::PrepareSwitchover {
+                request_id: SwitchoverRequestId::new("drain-race"),
+                source: source.clone(),
+                target: target.clone(),
+                starting_configuration_id: starting.current_configuration.configuration_id.clone(),
+                starting_epoch: starting.current_configuration.epoch,
+            },
+        );
+        let mut prepare = Box::pin(runtime.apply_effect(preparation.clone()));
+        // Polling registers the preparation behind the blocked durable operation,
+        // before a retained client can queue another admission.
+        assert!(futures::poll!(prepare.as_mut()).is_pending());
+        let mut late_write = Box::pin(retained_client.begin_write(ClientWrite {
+            operation_id: OperationId::new("outside-certificate"),
+            data: Bytes::from_static(b"must-not-apply"),
+        }));
+        assert!(futures::poll!(late_write.as_mut()).is_pending());
+        pause.store(false, Ordering::SeqCst);
+        resume.notify_one();
+        let (prepared, late_result) = timeout(Duration::from_secs(3), async {
+            tokio::join!(prepare, late_write)
+        })
+        .await
+        .unwrap();
+        let prepared = prepared.unwrap();
+        assert!(late_result.is_err(), "{boundary}");
+        let pending = writer.await.unwrap();
+        let handoff = SwitchoverHandoff {
+            preparation_operation_id: preparation.operation_id.clone(),
+            request_id: SwitchoverRequestId::new("drain-race"),
+            source: source.clone(),
+            target: target.clone(),
+            starting_configuration_id: starting.current_configuration.configuration_id.clone(),
+            starting_epoch: starting.current_configuration.epoch,
+            handoff_lsn: prepared.postcondition.current_progress,
+        };
+        assert_eq!(handoff.handoff_lsn, 1);
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(0, 2),
+            target.replica_id,
+            starting
+                .current_configuration
+                .members
+                .iter()
+                .map(|member| ConfigurationMember {
+                    identity: member.identity.clone(),
+                    role: if member.identity == target {
+                        ReplicaRole::Primary
+                    } else {
+                        ReplicaRole::ActiveSecondary
+                    },
+                })
+                .collect(),
+            2,
+        );
+        runtime
+            .apply_effect(effect(
+                6,
+                RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                    local_identity: source,
+                    transition_kind: Some(TransitionKind::PlannedSwitchover),
+                    previous_configuration: Some(starting.current_configuration),
+                    current_configuration: current,
+                    switchover_handoff: Some(handoff.clone()),
+                })),
+            ))
+            .await
+            .unwrap();
+        runtime
+            .apply_effect(effect(
+                7,
+                RuntimeEffectAction::ChangeRole(ReplicaRole::ActiveSecondary),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            retained_client
+                .accept_acknowledgement(delayed_ack)
+                .await
+                .is_err()
+        );
+        // Deliberately deliver the client result only after configuration and role change.
+        match pending.committed().await {
+            Ok(receipt) => {
+                assert!(commit_first, "{boundary}");
+                assert!(receipt.lsn <= handoff.handoff_lsn);
+                assert!(receipt.committed_lsn <= prepared.postcondition.committed_lsn);
+            }
+            Err(RuntimeError::WriteClosed(AccessStatus::ReconfigurationPending)) => {
+                assert!(!commit_first, "{boundary}");
+            }
+            other => panic!("unexpected delayed completion at {boundary}: {other:?}"),
+        }
+        assert!(
+            retained_client
+                .begin_write(ClientWrite {
+                    operation_id: OperationId::new("retained-after-demotion"),
+                    data: Bytes::from_static(b"must-not-apply"),
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(application.applied.lock().unwrap().len(), 1);
+        assert_eq!(
+            application.applied.lock().unwrap()[&1].data,
+            Bytes::from_static(b"durable-before-revocation")
+        );
+        assert_eq!(runtime.apply_effect(preparation).await.unwrap(), prepared);
+        assert_eq!(runtime.snapshot().await.role, ReplicaRole::ActiveSecondary);
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        assert!(
+            !application
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "provider.on_data_loss")
+        );
+    }
+}
+
+#[tokio::test]
 async fn failed_demotion_callback_preserves_completed_role_and_transition_stage() {
     let local = identity(1, "primary");
     let application = Arc::new(TestApplication::default());
@@ -5461,6 +5663,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         handoff_lsn: 7,
     };
     let mut runtimes = Vec::new();
+    let mut applications = Vec::new();
     for (index, identity) in identities.iter().enumerate() {
         let store = Arc::new(MemoryAuthorityStore::default());
         let application = Arc::new(TestApplication::default());
@@ -5479,6 +5682,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
                 verified_lsn: 7,
             },
         );
+        applications.push(application.clone());
         let runtime = PodRuntime::new(identity.clone(), application, store);
         runtime
             .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
@@ -5511,6 +5715,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
             .unwrap();
         runtimes.push(runtime);
     }
+    let retained_clients: Vec<_> = runtimes.iter().map(PodRuntime::data_plane).collect();
     let prepared = runtimes[0]
         .apply_effect(RuntimeEffect {
             operation_id: handoff.preparation_operation_id.clone(),
@@ -5560,6 +5765,17 @@ async fn planned_handoff_role_recovery(compensate: bool) {
                     AccessStatus::Granted
                 );
             }
+            for client in &retained_clients {
+                assert!(
+                    client
+                        .begin_write(ClientWrite {
+                            operation_id: OperationId::new("direct-during-role-convergence"),
+                            data: Bytes::from_static(b"must-not-commit"),
+                        })
+                        .await
+                        .is_err()
+                );
+            }
         }
         if index == 1 {
             assert_eq!(runtime.snapshot().await.catch_up_boundary, Some(7));
@@ -5596,8 +5812,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
             .unwrap();
         next += 1;
         assert!(
-            runtime
-                .data_plane()
+            retained_clients[index]
                 .begin_write(ClientWrite {
                     operation_id: OperationId::new(format!("before-acceptance-{index}")),
                     data: Bytes::from_static(b"must-not-commit"),
@@ -5682,6 +5897,17 @@ async fn planned_handoff_role_recovery(compensate: bool) {
                     AccessStatus::Granted
                 );
             }
+            for client in &retained_clients {
+                assert!(
+                    client
+                        .begin_write(ClientWrite {
+                            operation_id: OperationId::new("direct-during-compensation"),
+                            data: Bytes::from_static(b"must-not-commit"),
+                        })
+                        .await
+                        .is_err()
+                );
+            }
         }
         runtimes[0]
             .apply_effect(effect(
@@ -5699,8 +5925,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
             AccessStatus::Granted
         );
         assert!(
-            runtimes[1]
-                .data_plane()
+            retained_clients[1]
                 .begin_write(ClientWrite {
                     operation_id: OperationId::new("compensated-target-direct-client"),
                     data: Bytes::from_static(b"must-not-commit"),
@@ -5708,6 +5933,20 @@ async fn planned_handoff_role_recovery(compensate: bool) {
                 .await
                 .is_err()
         );
+        for lsn in 1..=handoff.handoff_lsn {
+            assert_eq!(
+                applications[0].applied.lock().unwrap()[&lsn].data,
+                Bytes::from(format!("seed-{lsn}"))
+            );
+        }
+        assert!(applications.iter().all(|application| {
+            !application
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "provider.on_data_loss")
+        }));
         return;
     }
     runtimes[1]
@@ -5729,8 +5968,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         ReplicaRole::ActiveSecondary
     );
     assert!(
-        runtimes[0]
-            .data_plane()
+        retained_clients[0]
             .begin_write(ClientWrite {
                 operation_id: OperationId::new("retained-source-client"),
                 data: Bytes::from_static(b"stale-client"),
@@ -5743,6 +5981,20 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         runtimes[2].snapshot().await.role,
         ReplicaRole::ActiveSecondary
     );
+    for lsn in 1..=handoff.handoff_lsn {
+        assert_eq!(
+            applications[1].applied.lock().unwrap()[&lsn].data,
+            applications[0].applied.lock().unwrap()[&lsn].data
+        );
+    }
+    assert!(applications.iter().all(|application| {
+        !application
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "provider.on_data_loss")
+    }));
 }
 
 #[tokio::test]

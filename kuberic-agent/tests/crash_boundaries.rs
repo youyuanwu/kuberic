@@ -31,7 +31,9 @@ use kuberic_runtime::application::{
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
 use kuberic_runtime::replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings};
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
-use kuberic_runtime_internal::authority::{AdmittedAuthority, ReplicaAuthorityStore};
+use kuberic_runtime_internal::authority::{
+    AdmittedAuthority, ReplicaAuthorityStore, ReplicationProgress, ReplicationProgressStore,
+};
 use kuberic_runtime_internal::effects::{
     OpenMode, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
     RuntimeSnapshot,
@@ -45,6 +47,80 @@ struct FakeRuntime {
 }
 
 struct CancelledRuntime;
+
+struct CrashAfterRealEffect {
+    runtime: Arc<PodRuntime>,
+    boundary: Option<String>,
+}
+
+#[async_trait]
+impl RuntimeEffectExecutor for CrashAfterRealEffect {
+    async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        let boundary = match &effect.action {
+            RuntimeEffectAction::AdmitAuthority(_) => "authority",
+            RuntimeEffectAction::ChangeApplicationRole(_) => "application-role",
+            RuntimeEffectAction::SetAccessStatus { .. } => "access",
+            _ => "",
+        };
+        if matches!(effect.action, RuntimeEffectAction::WaitForCatchup) {
+            let snapshot = self.runtime.snapshot().await;
+            let authority = snapshot.authority.unwrap();
+            let receiver = authority
+                .current_configuration
+                .members
+                .iter()
+                .find(|member| member.identity != authority.local_identity)
+                .unwrap();
+            self.runtime
+                .data_plane()
+                .accept_acknowledgement(kuberic_wire::proto::ReplicationAck {
+                    protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                    sender: Some(authority.primary_identity().clone().into()),
+                    receiver: Some(receiver.identity.clone().into()),
+                    epoch: Some(authority.current_configuration.epoch.into()),
+                    previous_configuration_id: authority
+                        .previous_configuration
+                        .as_ref()
+                        .map_or_else(String::new, |cc| cc.configuration_id.to_string()),
+                    current_configuration_id: authority
+                        .current_configuration
+                        .configuration_id
+                        .to_string(),
+                    received_lsn: 7,
+                    applied_lsn: 7,
+                    committed_lsn: 7,
+                    ..Default::default()
+                })
+                .await?;
+        }
+        let result = self.runtime.apply_effect(effect).await?;
+        if self.boundary.as_deref() == Some(boundary) {
+            // Exit before RuntimeAdapter records the result or advances the stage.
+            std::process::exit(73);
+        }
+        Ok(result)
+    }
+}
+
+fn real_handoff_fixture(scenario: &str) -> (AgentState, EnsureConfiguration) {
+    let fixture = match scenario {
+        "target-current-only" => "retirement-after",
+        "compensation-promotion" => "compensation-admission",
+        other => other,
+    };
+    let (mut state, mut command) = switchover_recovery_fixture(fixture);
+    if scenario == "target-current-only" {
+        let target = switchover_prepare_command().target;
+        state.identity.local_identity = target.clone();
+        state.role = ReplicaRole::Primary;
+        state.prepared_switchover = None;
+        command.local_replica_id = target.replica_id;
+        command.expected_instance_id = target.instance_id;
+        command.expected_agent_generation = target.agent_generation;
+        command.retire_switchover_preparation_ids.clear();
+    }
+    (state, command)
+}
 
 struct SwitchoverRecoveryRuntime {
     state: Mutex<RuntimePostcondition>,
@@ -1227,6 +1303,276 @@ fn real_runtime_switchover_preparation_recovers_after_process_termination() {
             assert_eq!(recovered.prepared_switchover, Some(prepared));
         });
     }
+}
+
+#[test]
+fn real_handoff_configuration_boundaries_survive_process_termination() {
+    for scenario in [
+        "demotion",
+        "promotion",
+        "retirement-after",
+        "target-current-only",
+        "compensation-promotion",
+        "compensation-completion",
+        "restoration-after",
+    ] {
+        for boundary in [
+            "intent",
+            "authority",
+            "application-role",
+            "access",
+            "receipt",
+        ] {
+            // Current-only and restoration deliberately omit role callbacks.
+            if boundary == "application-role"
+                && matches!(
+                    scenario,
+                    "retirement-after"
+                        | "target-current-only"
+                        | "compensation-completion"
+                        | "restoration-after"
+                )
+            {
+                continue;
+            }
+            if boundary == "authority" && scenario == "restoration-after" {
+                continue;
+            }
+            let directory = tempdir().unwrap();
+            let path = SqliteStore::metadata_database_path(directory.path());
+            let output = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "real_handoff_configuration_writer_process",
+                ])
+                .env("KUBERIC_HANDOFF_PATH", &path)
+                .env("KUBERIC_HANDOFF_SCENARIO", scenario)
+                .env("KUBERIC_HANDOFF_BOUNDARY", boundary)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{scenario}/{boundary}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+                let state = store.load_state().await.unwrap();
+                let (_, command) = real_handoff_fixture(scenario);
+                assert_ne!(state.write_status, AccessStatus::Granted);
+                if boundary == "receipt" {
+                    assert!(state.reconfiguration.is_none());
+                    assert_eq!(state.retained_command.as_ref().unwrap().command, command);
+                } else {
+                    assert_eq!(state.reconfiguration.as_ref().unwrap().command, command);
+                    assert_eq!(state.pending_effect.is_some(), boundary != "intent");
+                }
+                let application = Arc::new(CrashState::open(crash_application_path(&path)));
+                assert!(
+                    application
+                        .verify_applied(&seeded_operation())
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    application.durable_progress().await.unwrap().committed_lsn,
+                    7
+                );
+                let pod = Arc::new(PodRuntime::new(
+                    state.identity.local_identity.clone(),
+                    application.clone(),
+                    store.clone(),
+                ));
+                let executor = Arc::new(CrashAfterRealEffect {
+                    runtime: pod.clone(),
+                    boundary: None,
+                });
+                let service = kuberic_agent::service::AgentService::new(
+                    store.clone(),
+                    pod.clone(),
+                    executor.clone(),
+                    Arc::<str>::from("crash-test"),
+                )
+                .unwrap();
+                let address = || {
+                    std::net::TcpListener::bind("127.0.0.1:0")
+                        .unwrap()
+                        .local_addr()
+                        .unwrap()
+                };
+                let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(false);
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                let server =
+                    tokio::spawn(service.serve(address(), address(), ready_tx, shutdown_rx));
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    ready_rx.wait_for(|ready| *ready),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let direct_client = pod.data_plane();
+                assert!(
+                    direct_client
+                        .begin_write(kuberic_runtime::application::ClientWrite {
+                            operation_id: OperationId::new("crash-retained-client"),
+                            data: Bytes::from_static(b"forbidden"),
+                        })
+                        .await
+                        .is_err()
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while store.load_state().await.unwrap().reconfiguration.is_some() {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{scenario}/{boundary}: startup recovery did not complete")
+                });
+                let coordinator = Coordinator::new(store.clone(), executor);
+                let completed = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    coordinator.ensure_configuration(command.clone()),
+                )
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{scenario}/{boundary}: {error}"));
+                assert_eq!(
+                    coordinator
+                        .ensure_configuration(command.clone())
+                        .await
+                        .unwrap(),
+                    completed
+                );
+                let recovered = store.load_state().await.unwrap();
+                assert_eq!(recovered.highest_epoch, command.current_epoch);
+                assert!(recovered.pending_effect.is_none() && recovered.reconfiguration.is_none());
+                assert_ne!(pod.snapshot().await.write_status, AccessStatus::Granted);
+                assert!(
+                    application
+                        .verify_applied(&seeded_operation())
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(
+                    application.durable_progress().await.unwrap().committed_lsn,
+                    7
+                );
+                if !command.retire_switchover_preparation_ids.is_empty() {
+                    assert!(recovered.prepared_switchover.is_none());
+                    assert_eq!(recovered.retired_switchover, command.switchover_handoff);
+                    assert_eq!(
+                        recovered.retired_preparation_id.as_ref(),
+                        command.retire_switchover_preparation_ids.first()
+                    );
+                }
+                shutdown_tx.send_replace(true);
+                server.await.unwrap().unwrap();
+            });
+        }
+    }
+}
+
+#[test]
+#[ignore = "helper process for real_handoff_configuration_boundaries_survive_process_termination"]
+fn real_handoff_configuration_writer_process() {
+    let (Ok(path), Ok(scenario), Ok(boundary)) = (
+        env::var("KUBERIC_HANDOFF_PATH"),
+        env::var("KUBERIC_HANDOFF_SCENARIO"),
+        env::var("KUBERIC_HANDOFF_BOUNDARY"),
+    ) else {
+        return;
+    };
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (state, command) = real_handoff_fixture(&scenario);
+        let authority = AdmittedAuthority {
+            local_identity: state.identity.local_identity.clone(),
+            transition_kind: state
+                .previous_configuration
+                .as_ref()
+                .map(|_| TransitionKind::PlannedSwitchover),
+            previous_configuration: state.previous_configuration.clone(),
+            current_configuration: state.current_configuration.clone().unwrap(),
+            switchover_handoff: (state.highest_epoch.configuration_number > 1)
+                .then(|| command.switchover_handoff.clone())
+                .flatten(),
+        };
+        let store = Arc::new(SqliteStore::create_authorized(&path, state.clone()).unwrap());
+        store.admit(&authority).await.unwrap();
+        store
+            .record_replication_progress(&ReplicationProgress {
+                fence: authority.fence(),
+                verified_lsn: 7,
+            })
+            .await
+            .unwrap();
+        let starting = switchover_configuration();
+        store
+            .record_replication_progress(&ReplicationProgress {
+                fence: kuberic_runtime_internal::authority::AuthorityFence {
+                    epoch: starting.epoch,
+                    previous_configuration_id: None,
+                    current_configuration_id: starting.configuration_id,
+                },
+                verified_lsn: 7,
+            })
+            .await
+            .unwrap();
+        let application = Arc::new(CrashState::open(crash_application_path(Path::new(&path))));
+        for lsn in 1..=7 {
+            application
+                .apply(if lsn == 1 {
+                    seeded_operation()
+                } else {
+                    Operation {
+                        lsn,
+                        committed_lsn: lsn,
+                        data: Bytes::from(format!("acknowledged-{lsn}")),
+                    }
+                })
+                .await
+                .unwrap();
+        }
+        application.commit(7).await.unwrap();
+        let pod = Arc::new(PodRuntime::new(
+            state.identity.local_identity,
+            application,
+            store.clone(),
+        ));
+        pod.reconstruct(
+            OpenMode::Existing,
+            state.role,
+            state.read_status,
+            state.write_status,
+            None,
+        )
+        .await
+        .unwrap();
+        if boundary == "intent" {
+            store.begin_configuration(&command).await.unwrap();
+        } else {
+            let executor = Arc::new(CrashAfterRealEffect {
+                runtime: pod,
+                boundary: Some(boundary.clone()),
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                Coordinator::new(store, executor).ensure_configuration(command),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                boundary, "receipt",
+                "requested effect boundary was not reached"
+            );
+        }
+        std::process::exit(73);
+    });
 }
 
 #[test]

@@ -36,6 +36,97 @@ struct NoopApplication {
 
 struct NoopFactory;
 
+struct ReplayApplication;
+
+#[async_trait]
+impl StatefulServiceReplica for ReplayApplication {
+    async fn open(self: Arc<Self>, context: OpenContext) -> RuntimeResult<Arc<dyn Replicator>> {
+        let provider = Arc::new(NoopApplication {
+            streams: Mutex::new(Vec::new()),
+        });
+        let interfaces = context
+            .partition
+            .with_factory(Arc::new(
+                kuberic_runtime::replicator::DefaultReplicatorFactory::new(self),
+            ))
+            .create_replicator(provider, None)
+            .await?;
+        Ok(interfaces.replicator())
+    }
+
+    async fn change_role(
+        &self,
+        _role: kuberic_protocol::types::ReplicaRole,
+    ) -> RuntimeResult<RoleChange> {
+        Ok(RoleChange {
+            service_address: None,
+        })
+    }
+    async fn close(&self) -> RuntimeResult<()> {
+        Ok(())
+    }
+    fn abort(&self) {}
+}
+
+#[async_trait]
+impl kuberic_runtime::engine::DurableState for ReplayApplication {
+    async fn get_replication_operations(
+        &self,
+        _: i64,
+        _: i64,
+    ) -> RuntimeResult<kuberic_runtime::engine::RetainedOperationStream> {
+        Ok(Box::pin(stream::empty()))
+    }
+    async fn apply_copy_chunk(
+        &self,
+        _: &OperationId,
+        _: u64,
+        _: kuberic_runtime::application::CopyChunk,
+    ) -> RuntimeResult<()> {
+        panic!("retained command replay must not copy")
+    }
+    async fn verify_copy_chunk(
+        &self,
+        _: &OperationId,
+        _: u64,
+        _: &kuberic_runtime::application::CopyChunk,
+    ) -> RuntimeResult<bool> {
+        panic!("retained command replay must not copy")
+    }
+    async fn finish_copy(
+        &self,
+        _: &OperationId,
+        _: i64,
+        _: i64,
+    ) -> RuntimeResult<kuberic_runtime::application::DurableApplicationProgress> {
+        panic!("retained command replay must not copy")
+    }
+    async fn apply(
+        &self,
+        _: kuberic_runtime::application::Operation,
+    ) -> RuntimeResult<kuberic_runtime::application::DurableApplicationAck> {
+        panic!("retained command replay must not write")
+    }
+    async fn durable_progress(
+        &self,
+    ) -> RuntimeResult<kuberic_runtime::application::DurableApplicationProgress> {
+        Ok(Default::default())
+    }
+    async fn verify_applied(
+        &self,
+        _: &kuberic_runtime::application::Operation,
+    ) -> RuntimeResult<bool> {
+        panic!("retained command replay must not write")
+    }
+    async fn commit(
+        &self,
+        lsn: i64,
+    ) -> RuntimeResult<kuberic_runtime::application::DurableApplicationProgress> {
+        assert_eq!(lsn, 0);
+        Ok(Default::default())
+    }
+}
+
 struct NoopReplicator {
     replication: Mutex<Option<OperationStream>>,
     copy: Mutex<Option<OperationStream>>,
@@ -662,6 +753,296 @@ async fn status_reports_durable_switchover_preparation_after_reopen() {
 
     shutdown_tx.send_replace(true);
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn switchover_commands_revalidate_sessions_before_replaying_durable_evidence() {
+    use kuberic_agent::state::RetainedCommandResult;
+    use kuberic_protocol::command::ProtocolCommand;
+    use kuberic_protocol::types::{
+        AccessStatus, ConfigurationDescriptor, ConfigurationMember, Epoch, ReplicaRole,
+    };
+    for stage in [
+        "prepare",
+        "demote",
+        "promote",
+        "current-only",
+        "restore",
+        "compensate",
+        "compensated-current-only",
+    ] {
+        let source = identity();
+        let target = ReplicaIdentity {
+            replica_id: ReplicaId::new(2),
+            instance_id: ReplicaInstanceId::new("pod-2"),
+            agent_generation: kuberic_protocol::types::AgentGeneration::new("generation-2"),
+        };
+        let configuration = |number, primary: &ReplicaIdentity| {
+            ConfigurationDescriptor::new(
+                Epoch::new(0, number),
+                primary.replica_id,
+                [&source, &target]
+                    .into_iter()
+                    .map(|local| ConfigurationMember {
+                        identity: local.clone(),
+                        role: if local == primary {
+                            ReplicaRole::Primary
+                        } else {
+                            ReplicaRole::ActiveSecondary
+                        },
+                    })
+                    .collect(),
+                2,
+            )
+        };
+        let starting = configuration(1, &source);
+        let requested = configuration(2, &target);
+        let compensation = configuration(3, &source);
+        let handoff = SwitchoverHandoff {
+            preparation_operation_id: OperationId::new("session-prepare"),
+            request_id: SwitchoverRequestId::new("session-request"),
+            source: source.clone(),
+            target: target.clone(),
+            starting_configuration_id: starting.configuration_id.clone(),
+            starting_epoch: starting.epoch,
+            handoff_lsn: 0,
+        };
+        let local = if stage == "promote" {
+            target.clone()
+        } else {
+            source.clone()
+        };
+        let restoring = stage == "restore";
+        let compensating = stage.starts_with("compensat");
+        let current_only = stage.ends_with("current-only");
+        let current = if stage == "prepare" || restoring {
+            &starting
+        } else if compensating {
+            &compensation
+        } else {
+            &requested
+        };
+        let previous = (!current_only && !restoring && stage != "prepare").then(|| {
+            if compensating {
+                requested.clone()
+            } else {
+                starting.clone()
+            }
+        });
+        let command = if stage == "prepare" {
+            proto::execute_command_request::Command::PrepareSwitchover(
+                proto::PrepareSwitchoverCommand {
+                    operation_id: handoff.preparation_operation_id.to_string(),
+                    request_id: handoff.request_id.to_string(),
+                    local_replica_id: local.replica_id.value(),
+                    expected_instance_id: local.instance_id.to_string(),
+                    expected_agent_generation: local.agent_generation.to_string(),
+                    source: Some(source.clone().into()),
+                    target: Some(target.clone().into()),
+                    current_configuration: Some(starting.clone().into()),
+                },
+            )
+        } else {
+            proto::execute_command_request::Command::EnsureConfiguration(Box::new(
+                proto::EnsureConfigurationCommand {
+                    operation_id: format!("session-{stage}"),
+                    previous_epoch: previous.as_ref().map(|cc| cc.epoch.into()),
+                    previous_configuration: previous.clone().map(Into::into),
+                    current_configuration: Some(current.clone().into()),
+                    current_epoch: Some(current.epoch.into()),
+                    effective_policy: Some(proto::EffectivePolicy {
+                        replica_set_size: 2,
+                        write_quorum: 2,
+                        read_quorum: 1,
+                        failover_delay_seconds: 30,
+                    }),
+                    local_replica_id: local.replica_id.value(),
+                    expected_instance_id: local.instance_id.to_string(),
+                    expected_agent_generation: local.agent_generation.to_string(),
+                    transition_kind: proto::TransitionKind::PlannedSwitchover as i32,
+                    primary_write_status: proto::AccessStatus::ReconfigurationPending as i32,
+                    current_only,
+                    switchover_handoff: Some(handoff.clone().into()),
+                    retire_switchover_preparation_ids: if current_only || restoring {
+                        vec![handoff.preparation_operation_id.to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                },
+            ))
+        };
+        let envelope = proto::ExecuteCommandRequest {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: "resource-1".into(),
+            target: Some(local.clone().into()),
+            expected_process_session_id: "previous-process".into(),
+            command: Some(command),
+        };
+        let mut state = AgentState::new(StorageIdentity {
+            schema_version: SCHEMA_VERSION,
+            resource_uid: ResourceUid::new("resource-1"),
+            pod_uid: PodUid::new(local.instance_id.as_str()),
+            pvc_uid: PvcUid::new("session-pvc"),
+            initialization_id: derive_initialization_id(
+                &ResourceUid::new("resource-1"),
+                local.replica_id,
+                &PodUid::new(local.instance_id.as_str()),
+                &PvcUid::new("session-pvc"),
+            ),
+            local_identity: local.clone(),
+            effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
+        });
+        state.highest_epoch = current.epoch;
+        state.current_configuration = Some(current.clone());
+        state.previous_configuration = previous;
+        state.role = current
+            .members
+            .iter()
+            .find(|m| m.identity == local)
+            .unwrap()
+            .role;
+        state.write_status = AccessStatus::ReconfigurationPending;
+        if current_only || restoring {
+            state.retired_switchover = Some(handoff.clone());
+            state.retired_preparation_id = Some(handoff.preparation_operation_id.clone());
+        } else if local == source {
+            state.prepared_switchover = Some(handoff.clone());
+        }
+        if let ProtocolCommand::EnsureConfiguration(command) =
+            kuberic_wire::normalize_execute_request(envelope.clone())
+                .unwrap()
+                .command
+        {
+            state.retained_command = Some(RetainedCommandResult {
+                command: *command,
+                role: state.role,
+                epoch: state.highest_epoch,
+            });
+        }
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        drop(SqliteStore::create_authorized(&path, state).unwrap());
+        let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+        use kuberic_runtime_internal::authority::{AdmittedAuthority, ReplicaAuthorityStore};
+        let persisted = store.load_state().await.unwrap();
+        store
+            .admit(&AdmittedAuthority {
+                local_identity: local.clone(),
+                transition_kind: persisted
+                    .previous_configuration
+                    .as_ref()
+                    .map(|_| kuberic_protocol::types::TransitionKind::PlannedSwitchover),
+                previous_configuration: persisted.previous_configuration.clone(),
+                current_configuration: current.clone(),
+                switchover_handoff: (current.epoch > starting.epoch).then_some(handoff.clone()),
+            })
+            .await
+            .unwrap();
+        let runtime = Arc::new(PodRuntime::new(
+            local.clone(),
+            Arc::new(ReplayApplication),
+            store.clone(),
+        ));
+        let service = AgentService::new(
+            store.clone(),
+            runtime.clone(),
+            runtime,
+            Arc::<str>::from("token"),
+        )
+        .unwrap();
+        let control = free_address();
+        let replication = free_address();
+        let (ready_tx, mut ready_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(service.serve(control, replication, ready_tx, shutdown_rx));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ready_rx.wait_for(|ready| *ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut client =
+            proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+                .await
+                .unwrap();
+        let authorize = |body| {
+            let mut request = Request::new(body);
+            request.metadata_mut().insert(
+                "authorization",
+                format!("{} {}", "Bearer", "token").parse().unwrap(),
+            );
+            request
+        };
+        let mut status = Request::new(proto::GetAgentStatusRequest {
+            protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+            resource_uid: "resource-1".into(),
+            replica_id: local.replica_id.value(),
+            expected_instance_id: local.instance_id.to_string(),
+        });
+        status.metadata_mut().insert(
+            "authorization",
+            format!("{} {}", "Bearer", "token").parse().unwrap(),
+        );
+        let session = client
+            .get_status(status)
+            .await
+            .unwrap()
+            .into_inner()
+            .process_session_id;
+        let before = store.load_state().await.unwrap();
+        assert_eq!(
+            client
+                .execute(authorize(envelope.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition,
+            "{stage}"
+        );
+        assert_eq!(store.load_state().await.unwrap(), before);
+        for _ in 0..2 {
+            let response = client
+                .execute(authorize(proto::ExecuteCommandRequest {
+                    expected_process_session_id: session.clone(),
+                    ..envelope.clone()
+                }))
+                .await
+                .unwrap_or_else(|error| panic!("{stage}: {error}"))
+                .into_inner()
+                .observation
+                .unwrap();
+            assert_eq!(response.process_session_id, session);
+            assert_eq!(
+                store.load_state().await.unwrap(),
+                before,
+                "exact replay must not allocate effects: {stage}"
+            );
+            assert_eq!(
+                response.prepared_switchover,
+                before.prepared_switchover.clone().map(Into::into)
+            );
+        }
+        let mut conflicting = envelope.clone();
+        conflicting.expected_process_session_id = session;
+        match conflicting.command.as_mut().unwrap() {
+            proto::execute_command_request::Command::PrepareSwitchover(command) => {
+                command.request_id = "conflicting-request".into();
+            }
+            proto::execute_command_request::Command::EnsureConfiguration(command) => {
+                command.switchover_handoff.as_mut().unwrap().handoff_lsn += 1;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            client.execute(authorize(conflicting)).await.is_err(),
+            "{stage}"
+        );
+        assert_eq!(store.load_state().await.unwrap(), before, "{stage}");
+        shutdown_tx.send_replace(true);
+        server.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]

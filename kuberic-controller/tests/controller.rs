@@ -557,6 +557,203 @@ async fn observe_switchover_result(api: &InMemoryClusterApi, command: &ProtocolC
 }
 
 #[tokio::test]
+async fn switchover_request_mutations_at_every_boundary_heal_without_watch_events() {
+    let baseline = Arc::new(InMemoryClusterApi::new(switchover_observation()));
+    Reconciler::new(baseline.clone(), config())
+        .reconcile("tests", "db")
+        .await
+        .unwrap();
+    let mut boundaries = 0;
+    while baseline
+        .observation()
+        .await
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .transition
+        .is_some()
+    {
+        for mutation in ["cancel", "retarget", "new-request"] {
+            let mut raw = baseline.observation().await;
+            let frozen = raw
+                .set
+                .status
+                .as_ref()
+                .unwrap()
+                .authority
+                .transition
+                .clone()
+                .unwrap();
+            let original = raw.set.spec.clone();
+            raw.set.spec.switchover = match mutation {
+                "cancel" => None,
+                "retarget" => Some(PlannedSwitchoverRequestSpec {
+                    request_id: "move-primary".into(),
+                    target_replica_id: 3,
+                }),
+                _ => Some(PlannedSwitchoverRequestSpec {
+                    request_id: "other-request".into(),
+                    target_replica_id: 2,
+                }),
+            };
+            raw.set.spec.replicas = 5;
+            raw.set.metadata.generation = Some(3);
+            let api = Arc::new(InMemoryClusterApi::new(raw));
+            let stale = api.observation().await;
+            let mut newer = stale.clone();
+            newer.set.metadata.resource_version = Some("newer-request".into());
+            api.set_observation(newer).await;
+            assert!(matches!(
+                api.replace_status(&stale, &stale.set.status.as_ref().unwrap().authority)
+                    .await,
+                Err(ControllerError::ObservationStale)
+            ));
+            assert!(api.effects().await.is_empty());
+            refresh_switchover_reports(&api).await;
+            Reconciler::new(api.clone(), config())
+                .reconcile("tests", "db")
+                .await
+                .unwrap();
+            let rejected = api.observation().await.set.status.unwrap().authority;
+            assert_eq!(rejected.transition, Some(frozen.clone()));
+            assert!(
+                rejected
+                    .conditions
+                    .iter()
+                    .any(|c| c.reason == "ActiveRequestImmutable")
+            );
+            let mut repaired = api.observation().await;
+            repaired.set.spec = original;
+            repaired.set.metadata.generation = Some(4);
+            api.set_observation(repaired).await;
+            let mut completed = false;
+            let mut waited = false;
+            let mut command_count = 0;
+            for _ in 0..40 {
+                refresh_switchover_reports(&api).await;
+                let observation = api.observation().await;
+                let snapshot = normalize(observation.clone(), BTreeMap::new()).unwrap();
+                let plan = evaluate(&snapshot, &config());
+                // A fresh reconciler at each tick has neither watch events nor an in-memory phase.
+                let reconciler = Reconciler::new(api.clone(), config());
+                if let Plan::Execute { command } = &plan {
+                    if !waited && snapshot.status.transition.is_some() {
+                        let mut partitioned = observation.clone();
+                        for agent in partitioned.agents.values_mut() {
+                            *agent = RawAgentObservation::Unavailable {
+                                message: "lost observation".into(),
+                            };
+                        }
+                        api.set_observation(partitioned).await;
+                        let result = reconciler.reconcile("tests", "db").await.unwrap();
+                        assert_eq!(result.kind, ReconcileKind::Waiting);
+                        assert_eq!(result.requeue_after, Duration::from_secs(3));
+                        let waiting_authority = api.observation().await.set.status;
+                        let mut healed = observation;
+                        healed.set.status = waiting_authority;
+                        for (key, agent) in &mut healed.agents {
+                            if let RawAgentObservation::Report(report) = agent {
+                                report.process_session_id = format!("rollover-{}", key.replica_id);
+                                report.report_sequence = 1;
+                            }
+                        }
+                        api.set_observation(healed).await;
+                        waited = true;
+                        continue;
+                    }
+                    api.unavailable_next_execute().await;
+                    assert_eq!(
+                        reconciler.reconcile("tests", "db").await.unwrap().kind,
+                        ReconcileKind::Waiting
+                    );
+                    observe_switchover_result(&api, command).await;
+                    command_count += 1;
+                } else {
+                    let result = reconciler.reconcile("tests", "db").await.unwrap();
+                    if matches!(plan, Plan::Stable { .. }) {
+                        assert_eq!(result.kind, ReconcileKind::Stable);
+                        completed = true;
+                        break;
+                    }
+                    assert_eq!(result.kind, ReconcileKind::Applied, "{plan:?}");
+                }
+                let now = normalize(api.observation().await, BTreeMap::new()).unwrap();
+                if let Some(transition) = &now.status.transition {
+                    assert_eq!(transition.transition_id, frozen.transition_id);
+                    assert_eq!(
+                        transition.current_configuration,
+                        frozen.current_configuration
+                    );
+                }
+                if let Some(routed) = &now.routing.write_target {
+                    if routed.replica_id == ReplicaId::new(2) {
+                        assert!(now.status.transition.is_none());
+                        assert!(now.status.last_switchover.is_some());
+                    } else {
+                        assert_eq!(routed.replica_id, ReplicaId::new(1));
+                    }
+                    assert!(
+                        matches!(&now.observation_for_identity(routed).unwrap().agent,
+                        AgentObservation::Report(report) if report.write_status == kuberic_protocol::types::AccessStatus::Granted)
+                    );
+                }
+            }
+            assert!(completed && command_count > 0, "{mutation}/{boundaries}");
+            let before_retry = api
+                .observation()
+                .await
+                .set
+                .status
+                .unwrap()
+                .authority
+                .last_switchover;
+            let effects_before = api.effects().await.len();
+            for _ in 0..3 {
+                refresh_switchover_reports(&api).await;
+                assert_eq!(
+                    Reconciler::new(api.clone(), config())
+                        .reconcile("tests", "db")
+                        .await
+                        .unwrap()
+                        .kind,
+                    ReconcileKind::Stable
+                );
+            }
+            assert_eq!(
+                api.observation()
+                    .await
+                    .set
+                    .status
+                    .unwrap()
+                    .authority
+                    .last_switchover,
+                before_retry
+            );
+            assert!(
+                api.effects().await[effects_before..]
+                    .iter()
+                    .all(|effect| !matches!(effect, EffectRecord::Execute(_)))
+            );
+        }
+        refresh_switchover_reports(&baseline).await;
+        let snapshot = normalize(baseline.observation().await, BTreeMap::new()).unwrap();
+        let plan = evaluate(&snapshot, &config());
+        Reconciler::new(baseline.clone(), config())
+            .reconcile("tests", "db")
+            .await
+            .unwrap();
+        if let Plan::Execute { command } = plan {
+            observe_switchover_result(&baseline, &command).await;
+        }
+        boundaries += 1;
+        assert!(boundaries < 20);
+    }
+    assert!(boundaries >= 10);
+}
+
+#[tokio::test]
 async fn switchover_recovery_reobserves_lost_effects_allocation_receipts_and_session_rollover() {
     use kuberic_protocol::types::{PlannedSwitchoverOutcome, PlannedSwitchoverResolution};
     for compensate in [false, true] {
@@ -743,6 +940,30 @@ async fn exact_safety_deletion_is_uid_and_resource_version_fenced_and_preserves_
     assert!(
         matches!(api.effects().await.as_slice(), [EffectRecord::DeleteExactPod { pod_uid, .. }] if pod_uid == &uid)
     );
+
+    let mut overlap = observation.clone();
+    let mut replacement = overlap.pods[0].clone();
+    replacement.metadata.name = Some("db-1-new-incarnation".into());
+    replacement.metadata.uid = Some("replacement-pod".into());
+    overlap.pods.push(replacement.clone());
+    api.set_observation(overlap.clone()).await;
+    let mut unversioned = overlap.clone();
+    unversioned.pods[0].metadata.resource_version = None;
+    assert!(matches!(
+        api.delete_exact_pod(&unversioned, &name, &uid).await,
+        Err(ControllerError::ObservationStale)
+    ));
+    api.delete_exact_pod(&overlap, &name, &uid).await.unwrap();
+    let after = api.observation().await;
+    assert!(after.pods.contains(&replacement));
+    assert!(
+        !after
+            .pods
+            .iter()
+            .any(|pod| pod.uid().as_deref() == Some(POD_UID))
+    );
+    assert_eq!(after.pvcs, pvcs);
+    assert_eq!(after.services, overlap.services);
 }
 
 #[tokio::test]
