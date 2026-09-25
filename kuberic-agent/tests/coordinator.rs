@@ -1,11 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use kuberic_agent::command::admit_configuration;
+use kuberic_agent::command::{admit_configuration, admit_persisted_configuration};
 use kuberic_agent::coordinator::Coordinator;
 use kuberic_agent::runtime_adapter::{RuntimeAdapter, RuntimeEffectExecutor};
 use kuberic_agent::sqlite_store::SqliteStore;
-use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+use kuberic_agent::state::{
+    AgentState, CoordinatorStage, ReconfigurationRecord, RetainedCommandResult, SCHEMA_VERSION,
+    StorageIdentity,
+};
 use kuberic_agent::store::{AgentStore, BeginConfiguration};
 use kuberic_agent::{AgentError, Result};
 use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
@@ -337,6 +340,30 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
     assert!(admit_configuration(&current_only, &state).is_err());
     current_only.retire_switchover_preparation_ids = vec![handoff.preparation_operation_id.clone()];
     assert!(admit_configuration(&current_only, &state).is_ok());
+
+    state.previous_configuration = None;
+    state.reconfiguration = Some(ReconfigurationRecord {
+        command: current_only.clone(),
+        stage: CoordinatorStage::Complete,
+        observed_lsn: Some(handoff.handoff_lsn),
+    });
+    assert!(admit_persisted_configuration(&current_only, &state).is_ok());
+
+    let mut changed_replay = current_only.clone();
+    changed_replay
+        .switchover_handoff
+        .as_mut()
+        .unwrap()
+        .starting_configuration_id = kuberic_protocol::types::ConfigurationId::new("changed");
+    assert!(admit_persisted_configuration(&changed_replay, &state).is_err());
+
+    state.reconfiguration = None;
+    state.retained_command = Some(RetainedCommandResult {
+        command: current_only.clone(),
+        role: ReplicaRole::ActiveSecondary,
+        epoch: current_only.current_epoch,
+    });
+    assert!(admit_persisted_configuration(&current_only, &state).is_ok());
 }
 
 #[tokio::test]

@@ -222,23 +222,35 @@ fn admit_configuration_with_replay(
             .previous_configuration
             .as_ref()
             .or(state.previous_configuration.as_ref());
+        let exact_persisted_command = state
+            .reconfiguration
+            .as_ref()
+            .is_some_and(|record| record.command == *command)
+            || state
+                .retained_command
+                .as_ref()
+                .is_some_and(|retained| retained.command == *command);
+        let starting_authority_was_durably_admitted =
+            completed_current_only_replay && exact_persisted_command;
         let retirement_ids = command
             .retire_switchover_preparation_ids
             .iter()
             .collect::<BTreeSet<_>>();
-        if starting_configuration.is_none_or(|configuration| {
-            configuration.configuration_id != handoff.starting_configuration_id
-                || !configuration.members.iter().any(|member| {
-                    member.identity == handoff.source && member.role == ReplicaRole::Primary
-                })
-                || !configuration.members.iter().any(|member| {
-                    member.identity == handoff.target && member.role != ReplicaRole::Primary
-                })
-        }) || !command
-            .current_configuration
-            .members
-            .iter()
-            .any(|member| member.identity == handoff.source)
+        if (!starting_authority_was_durably_admitted
+            && starting_configuration.is_none_or(|configuration| {
+                configuration.configuration_id != handoff.starting_configuration_id
+                    || !configuration.members.iter().any(|member| {
+                        member.identity == handoff.source && member.role == ReplicaRole::Primary
+                    })
+                    || !configuration.members.iter().any(|member| {
+                        member.identity == handoff.target && member.role != ReplicaRole::Primary
+                    })
+            }))
+            || !command
+                .current_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == handoff.source)
             || !command
                 .current_configuration
                 .members
