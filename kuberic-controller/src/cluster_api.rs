@@ -664,6 +664,13 @@ where
         {
             let services: Api<Service> = Api::namespaced(self.client.clone(), &namespace);
             let service_uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+            if crate::exact_resources::protected(
+                observation,
+                Some(&service.name_any()),
+                Some(&service_uid),
+            ) {
+                return Err(ControllerError::ObservationStale);
+            }
             delete_exact(&services, &service.name_any(), &service_uid).await?;
         }
         let pod = pod_uid.and_then(|uid| {
@@ -2186,7 +2193,33 @@ impl ClusterApi for InMemoryClusterApi {
         {
             return Err(ControllerError::ObservationStale);
         }
+        let service = pod_uid.and_then(|pod_uid| {
+            observation.services.iter().find(|service| {
+                service.spec.as_ref().is_some_and(|spec| {
+                    spec.selector.as_ref().is_some_and(|selector| {
+                        selector.get(INSTANCE_LABEL).map(String::as_str) == Some(pod_uid.as_str())
+                    })
+                })
+            })
+        });
+        if let Some(service) = service {
+            let service_uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+            if crate::exact_resources::protected(
+                observation,
+                Some(&service.name_any()),
+                Some(&service_uid),
+            ) {
+                return Err(ControllerError::ObservationStale);
+            }
+        }
         let mut state = self.state.lock().await;
+        if let Some(service) = service {
+            let name = service.name_any();
+            let uid = service.uid().ok_or(ControllerError::ObservationStale)?;
+            state.observation.services.retain(|candidate| {
+                candidate.name_any() != name || candidate.uid().as_deref() != Some(uid.as_str())
+            });
+        }
         if let Some(name) = pod_name {
             state.observation.pods.retain(|pod| pod.name_any() != name);
         } else if let Some(name) = pvc_name {

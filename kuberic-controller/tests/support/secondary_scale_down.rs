@@ -570,6 +570,75 @@ async fn same_name_replacements_and_rv_races_never_acquire_cleanup_authority() {
     }
 }
 
+#[tokio::test]
+async fn generic_cleanup_cannot_adopt_a_protected_replacement_endpoint() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(3, 2)));
+    finish(&api).await;
+    let mut raw = api.observation().await;
+    let receipt = raw
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .last_secondary_removal
+        .as_ref()
+        .unwrap();
+    let endpoint_name = receipt
+        .evidence
+        .preparation
+        .intent
+        .cleanup
+        .endpoint
+        .name()
+        .to_string();
+    raw.services.push(Service {
+        metadata: kube::core::ObjectMeta {
+            name: Some(endpoint_name.clone()),
+            uid: Some("replacement-service-uid".into()),
+            resource_version: Some("99".into()),
+            labels: Some(BTreeMap::from([(SET_UID_LABEL.into(), UID.into())])),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(BTreeMap::from([(
+                INSTANCE_LABEL.into(),
+                "replacement-pod-uid".into(),
+            )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    api.set_observation(raw).await;
+    let observed = api.observation().await;
+
+    assert!(matches!(
+        api.delete_replica_scaffolding(
+            &observed,
+            Some("replacement-pod"),
+            Some(&PodUid::new("replacement-pod-uid")),
+            None,
+            None,
+        )
+        .await,
+        Err(ControllerError::ObservationStale)
+    ));
+    assert!(
+        api.observation()
+            .await
+            .services
+            .iter()
+            .any(|service| service.name_any() == endpoint_name
+                && service.uid().as_deref() == Some("replacement-service-uid"))
+    );
+    assert!(
+        !api.effects()
+            .await
+            .iter()
+            .any(|effect| matches!(effect, EffectRecord::DeleteScaffolding { .. }))
+    );
+}
+
 async fn assert_generic_cleanup_protected(
     api: &InMemoryClusterApi,
     resource: ScaleDownResource,
