@@ -95,6 +95,9 @@ async fn execute_change(
     change: KubernetesChange,
 ) -> Result<()> {
     match change {
+        KubernetesChange::DeleteScaleDownResource { .. } => Err(crate::ControllerError::Effect(
+            "secondary scale-down exact effects are not enabled".into(),
+        )),
         KubernetesChange::EnsureReplicaSupport => api.ensure_replica_support(observation).await,
         KubernetesChange::EnsureReplicaScaffolding { replica_ids } => {
             api.ensure_replica_scaffolding(observation, &replica_ids)

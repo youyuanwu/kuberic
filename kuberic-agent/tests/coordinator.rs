@@ -81,6 +81,29 @@ fn removal_runtime(state: &AgentState) -> Arc<FakeRuntime> {
     runtime
 }
 
+#[test]
+fn accepted_removal_access_command_preserves_admitted_evidence() {
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let mut state = removal_state(&intent, false);
+    state.current_configuration = Some(intent.current_configuration.clone());
+    state.highest_epoch = intent.current_configuration.epoch;
+    state.admitted_policy = Some(intent.current_policy.clone());
+    state.secondary_removal_evidence = Some(removal_fixture::evidence(&intent));
+    let mut grant = removal_fixture::configuration_command(&intent, true);
+    grant.operation_id = OperationId::new("stable-grant");
+    grant.transition_kind = TransitionKind::Bootstrap;
+    grant.current_only = false;
+    grant.previous_policy = None;
+    grant.secondary_removal_evidence = None;
+    grant.primary_write_status = AccessStatus::Granted;
+    assert!(admit_configuration(&grant, &state).is_err());
+    state.accepted_secondary_removal = Some(removal_fixture::cleanup(&intent));
+    let admitted = admit_configuration(&grant, &state).unwrap();
+    assert_eq!(admitted.secondary_removal, state.secondary_removal_evidence);
+    assert_eq!(admitted.previous_configuration, None);
+    assert_eq!(admitted.current_configuration, intent.current_configuration);
+}
+
 #[tokio::test]
 async fn reduction_coordinates_retained_secondaries_but_never_admits_the_excluded_target() {
     let intent = removal_fixture::intent(&[1, 2, 3], 1);

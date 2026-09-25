@@ -352,6 +352,12 @@ async fn converge_removal(runtime: &PodRuntime, sequence: &mut u64) -> AdmittedA
     recovery_action(
         runtime,
         sequence,
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+    )
+    .await;
+    recovery_action(
+        runtime,
+        sequence,
         RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
     )
     .await;

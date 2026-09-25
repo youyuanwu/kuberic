@@ -652,6 +652,11 @@ where
             ));
         }
         match command.command {
+            ProtocolCommand::AcceptSecondaryRemovalCommit(_) => {
+                return Err(Status::unimplemented(
+                    "secondary-removal commit publication transport is not enabled",
+                ));
+            }
             ProtocolCommand::PrepareSecondaryRemoval(command) => {
                 self.coordinator
                     .ensure_secondary_removal_prepared(

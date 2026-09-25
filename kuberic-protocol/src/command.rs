@@ -138,6 +138,15 @@ pub struct RetireReplica {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Publish already-accepted current-only evidence locally before stable access.
+pub struct AcceptSecondaryRemovalCommit {
+    pub operation_id: OperationId,
+    pub target: ReplicaIdentity,
+    pub committed: crate::types::SecondaryScaleDownCleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
@@ -147,6 +156,7 @@ pub enum ProtocolCommand {
     EnsureReplicaBuild(Box<EnsureReplicaBuild>),
     PrepareSecondaryRemoval(Box<PrepareSecondaryRemoval>),
     RetireReplica(Box<RetireReplica>),
+    AcceptSecondaryRemovalCommit(Box<AcceptSecondaryRemovalCommit>),
 }
 
 impl ProtocolCommand {
@@ -156,6 +166,7 @@ impl ProtocolCommand {
             Self::PrepareSwitchover(_)
             | Self::PrepareSecondaryRemoval(_)
             | Self::RetireReplica(_)
+            | Self::AcceptSecondaryRemovalCommit(_)
             | Self::EnsureConfiguration(_)
             | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
         }
@@ -187,6 +198,12 @@ pub enum KubernetesChange {
         pod_name: String,
         pod_uid: PodUid,
     },
+    DeleteScaleDownResource {
+        resource: ScaleDownResource,
+        name: String,
+        uid: String,
+        resource_version: String,
+    },
     EnsureWriteRoutingService,
     PersistStatus {
         status: Box<crate::types::AcceptedStatus>,
@@ -195,6 +212,14 @@ pub enum KubernetesChange {
     PublishWriteRouting {
         primary: crate::types::ReplicaIdentity,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScaleDownResource {
+    Endpoint,
+    Pod,
+    Pvc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

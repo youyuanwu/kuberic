@@ -1,0 +1,475 @@
+use std::collections::BTreeMap;
+
+use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, ScaleDownResource};
+use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
+use kuberic_protocol::observation::*;
+use kuberic_protocol::plan::Plan;
+use kuberic_protocol::types::*;
+use kuberic_protocol::validation::{validate_secondary_removal_configuration, validate_snapshot};
+
+#[path = "secondary_scale_down.rs"]
+pub mod fixture;
+
+pub fn config() -> EvaluationConfig {
+    EvaluationConfig {
+        enable_secondary_scale_down: true,
+        ..EvaluationConfig::default()
+    }
+}
+
+#[derive(Clone)]
+pub struct Model {
+    pub snapshot: ObservationSnapshot,
+    pub commands: Vec<ProtocolCommand>,
+    pub removed: Vec<ReplicaIdentity>,
+    pub deletes: Vec<(ScaleDownResource, String)>,
+}
+
+impl Model {
+    pub fn new(ids: &[i64], primary: i64, desired: u32) -> Self {
+        let intent = fixture::intent(ids, primary);
+        let configuration = intent.previous_configuration.clone();
+        let mut snapshot = ObservationSnapshot {
+            resource_uid: intent.resource_uid,
+            resource_version: "1".into(),
+            desired: DesiredState {
+                generation: 7,
+                replicas: desired,
+                image: "example:v1".into(),
+                failover_delay_seconds: 30,
+                switchover: None,
+            },
+            status: AcceptedStatus {
+                initialized: true,
+                observed_generation: 6,
+                effective_policy: Some(intent.previous_policy),
+                topology: Some(AcceptedTopology {
+                    configuration: configuration.clone(),
+                }),
+                ..AcceptedStatus::default()
+            },
+            replicas: BTreeMap::new(),
+            secondary_scale_down_resources: Vec::new(),
+            previous_report_watermarks: BTreeMap::new(),
+            durable_storage_evidence: true,
+            supporting_resources_ready: true,
+            routing: RoutingObservation {
+                service_present: true,
+                write_target: Some(intent.primary),
+                unresolved_write_target: false,
+            },
+            observation_failures: Vec::new(),
+            now_unix_seconds: 100,
+        };
+        for member in &configuration.members {
+            let identity = member.identity.clone();
+            let id = identity.replica_id;
+            let pod_name = format!("db-{id}");
+            let pvc_name = format!("db-storage-{id}");
+            let pvc_uid = format!("pvc-{id}");
+            snapshot.replicas.insert(
+                ReplicaObservationKey::new(id, identity.instance_id.clone()),
+                ReplicaObservation {
+                    kubernetes: Some(KubernetesReplicaObservation {
+                        replica_id: id,
+                        pod_name: pod_name.clone(),
+                        pod_uid: Some(PodUid::new(identity.instance_id.as_str())),
+                        pvc_name: pvc_name.clone(),
+                        pvc_uid: Some(PvcUid::new(pvc_uid.clone())),
+                        image: Some(snapshot.desired.image.clone()),
+                        pod_ready: true,
+                        peer_endpoint_ready: true,
+                    }),
+                    agent: AgentObservation::Report(Box::new(AgentReport {
+                        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+                        resource_uid: snapshot.resource_uid.clone(),
+                        identity: identity.clone(),
+                        process_session_id: ProcessSessionId::new(format!("session-{id}")),
+                        report_sequence: 1,
+                        role: member.role,
+                        read_status: AccessStatus::Granted,
+                        write_status: if id.value() == primary {
+                            AccessStatus::Granted
+                        } else {
+                            AccessStatus::NotPrimary
+                        },
+                        healthy: true,
+                        epoch: configuration.epoch,
+                        current_configuration: Some(configuration.clone()),
+                        current_progress: 10,
+                        verified_replication_lsn: Some(10),
+                        committed_lsn: 10,
+                        ..AgentReport::default()
+                    })),
+                },
+            );
+            snapshot
+                .secondary_scale_down_resources
+                .push(SecondaryScaleDownResourceObservation {
+                    resource_uid: snapshot.resource_uid.clone(),
+                    target: identity.clone(),
+                    identity: ReplicaCleanupIdentity {
+                        pod: CleanupResourceIdentity::Present {
+                            name: pod_name,
+                            uid: identity.instance_id.to_string(),
+                        },
+                        pvc: CleanupResourceIdentity::Present {
+                            name: pvc_name,
+                            uid: pvc_uid,
+                        },
+                        endpoint: CleanupResourceIdentity::Present {
+                            name: derive_replica_endpoint_name(&snapshot.resource_uid, &identity),
+                            uid: format!("service-{id}"),
+                        },
+                    },
+                    pod: ExactResourceObservation::FrozenUidPresent {
+                        resource_version: "pod-rv".into(),
+                    },
+                    pvc: ExactResourceObservation::FrozenUidPresent {
+                        resource_version: "pvc-rv".into(),
+                    },
+                    endpoint: ExactResourceObservation::FrozenUidPresent {
+                        resource_version: "service-rv".into(),
+                    },
+                });
+        }
+        Self {
+            snapshot,
+            commands: Vec::new(),
+            removed: Vec::new(),
+            deletes: Vec::new(),
+        }
+    }
+
+    pub fn key(&self, id: i64) -> ReplicaObservationKey {
+        self.snapshot
+            .replicas
+            .keys()
+            .find(|k| k.replica_id.value() == id)
+            .unwrap()
+            .clone()
+    }
+
+    pub fn report(&mut self, id: i64) -> &mut AgentReport {
+        let key = self.key(id);
+        let AgentObservation::Report(r) = &mut self.snapshot.replicas.get_mut(&key).unwrap().agent
+        else {
+            panic!("no report")
+        };
+        r
+    }
+
+    pub fn unavailable(&mut self, id: i64) {
+        let key = self.key(id);
+        self.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Unreachable {
+            message: "injected".into(),
+        };
+    }
+
+    pub fn exact(&mut self, id: i64) -> &mut SecondaryScaleDownResourceObservation {
+        self.snapshot
+            .secondary_scale_down_resources
+            .iter_mut()
+            .find(|r| r.target.replica_id.value() == id)
+            .unwrap()
+    }
+
+    pub fn plan(&self) -> Plan {
+        let plan = evaluate(&self.snapshot, &config());
+        assert_eq!(
+            plan,
+            evaluate(&self.snapshot, &config()),
+            "evaluation is pure"
+        );
+        plan
+    }
+
+    pub fn apply(&mut self, plan: Plan) {
+        match plan {
+            Plan::Apply { changes } => {
+                for change in changes {
+                    match change {
+                        KubernetesChange::PersistStatus { status } => {
+                            if self.snapshot.status.transition.is_some()
+                                && let Some(cleanup) = status.secondary_scale_down_cleanup.as_ref()
+                            {
+                                self.removed
+                                    .push(cleanup.evidence.preparation.intent.target.clone());
+                                assert_eq!(
+                                    status.topology.as_ref().unwrap().configuration,
+                                    cleanup.evidence.preparation.intent.current_configuration
+                                );
+                                assert_eq!(
+                                    status.effective_policy.as_ref(),
+                                    Some(&cleanup.evidence.preparation.intent.current_policy)
+                                );
+                            }
+                            self.snapshot.status = *status;
+                        }
+                        KubernetesChange::RemoveWriteRouting => {
+                            self.snapshot.routing.write_target = None;
+                            self.snapshot.routing.unresolved_write_target = false;
+                        }
+                        KubernetesChange::PublishWriteRouting { primary } => {
+                            assert_eq!(
+                                primary.replica_id,
+                                self.snapshot
+                                    .status
+                                    .topology
+                                    .as_ref()
+                                    .unwrap()
+                                    .configuration
+                                    .primary_id
+                            );
+                            assert_eq!(
+                                self.report(primary.replica_id.value()).write_status,
+                                AccessStatus::Granted
+                            );
+                            self.snapshot.routing.write_target = Some(primary);
+                        }
+                        KubernetesChange::EnsureWriteRoutingService => {
+                            self.snapshot.routing.service_present = true
+                        }
+                        KubernetesChange::DeleteScaleDownResource {
+                            resource,
+                            name,
+                            uid,
+                            resource_version,
+                        } => {
+                            assert!(
+                                self.snapshot.status.transition.is_none(),
+                                "never delete before commit"
+                            );
+                            let cleanup = self
+                                .snapshot
+                                .status
+                                .secondary_scale_down_cleanup
+                                .as_ref()
+                                .unwrap();
+                            let intent = &cleanup.evidence.preparation.intent;
+                            let id = intent.target.replica_id.value();
+                            let exact = self.exact(id);
+                            let (identity, observed) = match resource {
+                                ScaleDownResource::Endpoint => {
+                                    (&exact.identity.endpoint, &mut exact.endpoint)
+                                }
+                                ScaleDownResource::Pod => (&exact.identity.pod, &mut exact.pod),
+                                ScaleDownResource::Pvc => {
+                                    assert!(matches!(
+                                        exact.pod,
+                                        ExactResourceObservation::NotFound
+                                            | ExactResourceObservation::ReplacementPresent { .. }
+                                    ));
+                                    (&exact.identity.pvc, &mut exact.pvc)
+                                }
+                            };
+                            assert_eq!(
+                                identity,
+                                &CleanupResourceIdentity::Present {
+                                    name,
+                                    uid: uid.clone()
+                                }
+                            );
+                            assert_eq!(
+                                observed,
+                                &ExactResourceObservation::FrozenUidPresent { resource_version }
+                            );
+                            *observed = ExactResourceObservation::NotFound;
+                            if resource == ScaleDownResource::Pod {
+                                let key = self.key(id);
+                                self.snapshot.replicas.remove(&key);
+                            }
+                            self.deletes.push((resource, uid));
+                        }
+                        other => panic!("unexpected scale-down effect {other:?}"),
+                    }
+                }
+            }
+            Plan::Execute { command } => {
+                self.commands.push(command.clone());
+                match command {
+                    ProtocolCommand::PrepareSecondaryRemoval(c) => {
+                        assert!(self.snapshot.routing.write_target.is_none());
+                        assert_eq!(
+                            self.snapshot
+                                .status
+                                .transition
+                                .as_ref()
+                                .unwrap()
+                                .secondary_scale_down
+                                .as_ref(),
+                            Some(&c.intent)
+                        );
+                        let r = self.report(c.local_replica_id.value());
+                        assert_eq!(r.identity, c.intent.primary);
+                        r.report_sequence += 1;
+                        r.read_status = AccessStatus::ReconfigurationPending;
+                        r.write_status = AccessStatus::ReconfigurationPending;
+                        r.prepared_secondary_removal = Some(SecondaryRemovalPreparation {
+                            intent: c.intent,
+                            operation_id: c.operation_id.clone(),
+                            process_session_id: r.process_session_id.clone(),
+                            report_sequence: r.report_sequence,
+                            boundary_lsn: r.verified_replication_lsn.unwrap(),
+                        });
+                        r.retained_operation_id = Some(c.operation_id);
+                    }
+                    ProtocolCommand::EnsureConfiguration(c) => {
+                        if c.transition_kind == TransitionKind::SecondaryScaleDown {
+                            validate_secondary_removal_configuration(&c).unwrap();
+                            let intent = &c
+                                .secondary_removal_evidence
+                                .as_ref()
+                                .unwrap()
+                                .preparation
+                                .intent;
+                            assert_ne!(c.local_replica_id, intent.target.replica_id);
+                            assert_eq!(
+                                c.primary_write_status,
+                                AccessStatus::ReconfigurationPending
+                            );
+                        } else {
+                            assert!(
+                                self.snapshot.status.transition.is_none(),
+                                "grant only accepted authority"
+                            );
+                            assert_eq!(
+                                self.snapshot
+                                    .status
+                                    .topology
+                                    .as_ref()
+                                    .unwrap()
+                                    .configuration,
+                                c.current_configuration
+                            );
+                        }
+                        let r = self.report(c.local_replica_id.value());
+                        r.report_sequence += 1;
+                        r.epoch = c.current_epoch;
+                        r.previous_configuration = c.previous_configuration;
+                        r.current_configuration = Some(c.current_configuration);
+                        r.pending_operation_id = None;
+                        r.retained_operation_id = Some(c.operation_id);
+                        r.write_status = if r.role == ReplicaRole::Primary {
+                            c.primary_write_status
+                        } else {
+                            AccessStatus::NotPrimary
+                        };
+                        if let Some(evidence) = c.secondary_removal_evidence {
+                            if r.secondary_removal_evidence.as_ref() != Some(&evidence) {
+                                r.accepted_secondary_removal = None;
+                            }
+                            r.secondary_removal_evidence = Some(evidence);
+                        }
+                    }
+                    ProtocolCommand::AcceptSecondaryRemovalCommit(c) => {
+                        kuberic_protocol::validation::validate_accept_secondary_removal_commit(&c)
+                            .unwrap();
+                        let cleanup = self
+                            .snapshot
+                            .status
+                            .secondary_scale_down_cleanup
+                            .as_ref()
+                            .unwrap();
+                        assert_eq!(cleanup.evidence, c.committed.evidence);
+                        assert_eq!(
+                            cleanup.current_only_write_quorum,
+                            c.committed.current_only_write_quorum
+                        );
+                        let r = self.report(c.target.replica_id.value());
+                        assert_eq!(r.previous_configuration, None);
+                        assert_eq!(
+                            r.current_configuration.as_ref(),
+                            Some(
+                                &c.committed
+                                    .evidence
+                                    .preparation
+                                    .intent
+                                    .current_configuration
+                            )
+                        );
+                        r.report_sequence += 1;
+                        r.prepared_secondary_removal = None;
+                        r.accepted_secondary_removal = Some(c.committed);
+                    }
+                    ProtocolCommand::RetireReplica(c) => {
+                        assert!(self.snapshot.status.transition.is_none());
+                        let r = self.report(c.local_replica_id.value());
+                        let mut retirement =
+                            fixture::retirement(&c.committed.evidence.preparation.intent);
+                        r.report_sequence += 1;
+                        retirement.process_session_id = r.process_session_id.clone();
+                        retirement.report_sequence = r.report_sequence;
+                        r.epoch = retirement.epoch;
+                        r.role = ReplicaRole::None;
+                        r.read_status = AccessStatus::NotPrimary;
+                        r.write_status = AccessStatus::NotPrimary;
+                        r.current_configuration = None;
+                        r.verified_replication_lsn = None;
+                        r.previous_configuration = None;
+                        r.pending_operation_id = None;
+                        r.retained_operation_id = Some(c.operation_id);
+                        r.prepared_secondary_removal = None;
+                        r.secondary_removal_evidence = None;
+                        r.retired_replica = Some(retirement);
+                        r.accepted_secondary_removal = None;
+                    }
+                    other => panic!("unexpected command {other:?}"),
+                }
+            }
+            Plan::Wait { status, .. } | Plan::Stable { status, .. } => {
+                self.snapshot.status = status
+            }
+            Plan::Unsafe { reason, .. } => panic!("unsafe model: {reason:?}"),
+        }
+        validate_snapshot(&self.snapshot).unwrap();
+    }
+
+    pub fn step(&mut self) -> Plan {
+        let plan = self.plan();
+        self.apply(plan.clone());
+        plan
+    }
+
+    pub fn finish(&mut self) {
+        for _ in 0..250 {
+            if matches!(self.step(), Plan::Stable { .. }) {
+                assert!(self.snapshot.status.secondary_scale_down_cleanup.is_none());
+                return;
+            }
+        }
+        panic!("model did not converge: {:?}", self.plan());
+    }
+
+    pub fn until(&mut self, predicate: impl Fn(&Self) -> bool) {
+        for _ in 0..100 {
+            if predicate(self) {
+                return;
+            }
+            self.step();
+        }
+        panic!("boundary not reached: {:?}", self.plan());
+    }
+}
+
+pub fn reason(plan: &Plan) -> &str {
+    let status = match plan {
+        Plan::Wait { status, .. } | Plan::Unsafe { status, .. } | Plan::Stable { status, .. } => {
+            status
+        }
+        Plan::Apply { changes } => changes
+            .iter()
+            .find_map(|c| match c {
+                KubernetesChange::PersistStatus { status } => Some(status.as_ref()),
+                _ => None,
+            })
+            .expect("status"),
+        _ => panic!("no status"),
+    };
+    &status
+        .conditions
+        .iter()
+        .find(|c| c.type_ == "Progressing" || c.type_ == "Unsafe")
+        .unwrap()
+        .reason
+}

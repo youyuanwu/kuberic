@@ -171,7 +171,14 @@ pub enum ValidationError {
 
 /// Validates accepted status and every observed exact replica incarnation.
 pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), ValidationError> {
-    if snapshot.desired.replicas == 0 {
+    if snapshot.desired.replicas == 0
+        && snapshot.status.secondary_scale_down_cleanup.is_none()
+        && !snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.kind == TransitionKind::SecondaryScaleDown)
+    {
         return Err(ValidationError::DesiredReplicasZero);
     }
     validate_status(&snapshot.status)?;
@@ -474,11 +481,51 @@ fn validate_report_authority(
     .into_iter()
     .flatten()
     {
-        if removal != Some(intent) {
+        let historical = report
+            .secondary_removal_evidence
+            .as_ref()
+            .is_some_and(|evidence| {
+                &evidence.preparation.intent == intent
+                    && report.previous_configuration.is_none()
+                    && report
+                        .prepared_secondary_removal
+                        .as_ref()
+                        .is_none_or(|p| removal == Some(&p.intent))
+                    && report.current_configuration.as_ref() == Some(&intent.current_configuration)
+                    && snapshot.status.topology.as_ref().is_some_and(|topology| {
+                        topology.configuration == intent.current_configuration
+                            || removal.is_some_and(|active| {
+                                active.previous_configuration == intent.current_configuration
+                            })
+                    })
+            });
+        if removal != Some(intent) && !historical {
             return Err(ValidationError::InvalidSecondaryScaleDown(
                 "report is not authorized by the frozen removal",
             ));
         }
+    }
+    if let Some(intent) = removal
+        && report
+            .accepted_secondary_removal
+            .as_ref()
+            .is_some_and(|c| c.evidence.preparation.intent == *intent)
+        && snapshot.status.secondary_scale_down_cleanup.is_none()
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "local acceptance cannot precede committed cluster topology",
+        ));
+    }
+    if let (Some(committed), Some(reported)) = (
+        snapshot.status.secondary_scale_down_cleanup.as_ref(),
+        report.accepted_secondary_removal.as_ref(),
+    ) && reported.evidence.preparation.intent == committed.evidence.preparation.intent
+        && (reported.evidence != committed.evidence
+            || reported.current_only_write_quorum != committed.current_only_write_quorum)
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "local acceptance must retain the exact committed quorum evidence",
+        ));
     }
     if let Some(intent) = removal
         && report.current_configuration.as_ref() == Some(&intent.current_configuration)
@@ -502,19 +549,20 @@ fn validate_report_authority(
                 .as_ref()
                 .map(|cleanup| &cleanup.evidence)
         });
-    if let Some(evidence) = &report.secondary_removal_evidence {
+    if let Some(evidence) = &report.secondary_removal_evidence
+        && removal == Some(&evidence.preparation.intent)
+    {
         let Some(frozen) = frozen_removal_evidence else {
             return Err(ValidationError::InvalidSecondaryScaleDown(
                 "report does not retain the frozen admission evidence",
             ));
         };
-        let reduced_evidence_matches =
-            if snapshot.status.transition.is_some() && report.previous_configuration.is_some() {
-                evidence.reduced_write_quorum.is_empty()
-                    || evidence.reduced_write_quorum == frozen.reduced_write_quorum
-            } else {
-                evidence.reduced_write_quorum == frozen.reduced_write_quorum
-            };
+        let reduced_evidence_matches = if report.previous_configuration.is_some() {
+            evidence.reduced_write_quorum.is_empty()
+                || evidence.reduced_write_quorum == frozen.reduced_write_quorum
+        } else {
+            evidence.reduced_write_quorum == frozen.reduced_write_quorum
+        };
         if evidence.preparation != frozen.preparation
             || evidence.previous_read_quorum != frozen.previous_read_quorum
             || !reduced_evidence_matches

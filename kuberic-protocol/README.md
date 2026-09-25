@@ -43,7 +43,8 @@ same-cardinality replacement, ordinary failover, planned switchover, and
 non-destructive quorum loss/recovery. Scaling, timed replica dropping,
 destructive data-loss recovery, and mixed-version negotiation remain fail-closed.
 
-Protocol 6 defines, but does not yet execute, secondary scale-down. Its typed
+Protocol 6 defines secondary scale-down, with pure evaluation available behind
+`EvaluationConfig::enable_secondary_scale_down` (default **false**). Its typed
 intent removes exactly the highest logical-ID committed secondary, preserves
 the exact primary and retained members, and validates previous/reduced majority
 policies independently (including 2→1). Preparation freezes a durable
@@ -53,10 +54,40 @@ evidence including the unchanged primary. The removed member supplies no reduced
 credit. Cleanup freezes Pod, PVC, and endpoint names and UIDs, or explicit
 authoritative exact-name absence, separately from accepted topology.
 
-The evaluator rejects these new active contracts without emitting removal
-commands. Agent admission and runtime execution also reject them until their
-execution phases are implemented. Existing status JSON defaults the new optional
-fields to absent; absence never supplies scale-down authority.
+Production reconciliation rejects these active contracts without emitting
+removal commands. Protocol tests explicitly enable the capability. The pure
+evaluator freezes intent before preparation, persists PC read evidence before
+reduced PC/CC dispatch, freezes reduced write evidence before current-only
+dispatch, and atomically accepts reduced topology/policy with a cleanup receipt.
+Each command uses one freshly observed exact session; target availability never
+changes selection or grants reduced quorum credit. Primary loss waits without
+retargeting, failover, or rollback. A later desired count waits for cleanup.
+
+Post-commit local receipt publication (`AcceptSecondaryRemovalCommit`), stable
+write grant, routing, retirement, and resource cleanup are separate decisions.
+The local publication command binds one retained identity and the immutable
+commit evidence; it bridges the runtime's existing accepted-receipt gate rather
+than treating current-only admission as permission to write. Its transport,
+agent dispatch, and normalized report population are deliberately not implemented
+in this phase. Controller integration must implement those together with exact
+resource observation and execution before enabling the capability.
+
+`SecondaryScaleDownResourceObservation` requires authoritative exact-name
+lookups and a proven Pod/mounted-PVC mapping. Controller normalization currently
+supplies none. `DeleteScaleDownResource` carries frozen name/UID and fresh resource
+version and is explicitly rejected by the production executor. Endpoint cleanup
+precedes exact Pod fencing; PVC cleanup requires authoritative Pod-UID absence.
+Same-name replacement UIDs are never adopted or deleted, including after the
+receipt is cleared. Unknown extra resources do not confer deletion authority.
+Existing status JSON defaults the optional fields to absent; absence never
+supplies scale-down authority.
+
+Scale-down progress projects stable reasons for preparation, previous read quorum
+(`ScaleDownPreviousReadQuorumUnavailable`), reduced write quorum and verified
+catch-up (`ScaleDownReducedWriteQuorumUnavailable`, `ScaleDownReducedCatchUpPending`),
+current-only quorum, exact primary recovery (`ScaleDownPrimaryUnavailable`),
+retirement, exact Pod fencing/absence, and cleanup. `ScaleUpUnsupported` and
+`SpecDriftUnsupported` leave the latest desired generation unsatisfied.
 
 Switchover requires a nonempty request ID and a committed logical secondary
 ID. Identical active or latest-receipted requests are idempotent; cancellation,

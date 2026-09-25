@@ -1,8 +1,857 @@
 use std::collections::BTreeMap;
 
+use scale_down_model::fixture as scale_down_fixture;
+
 #[allow(dead_code)]
-#[path = "support/secondary_scale_down.rs"]
-mod scale_down_fixture;
+#[path = "support/scale_down_model.rs"]
+mod scale_down_model;
+
+#[test]
+fn evaluator_scale_down_healthy_traces_preserve_exact_authority() {
+    use scale_down_model::Model;
+    for (ids, primary, desired, targets) in [
+        (vec![1, 2, 3], 1, 2, vec![3]),
+        (vec![1, 2], 1, 1, vec![2]),
+        (vec![1, 2, 3, 4, 5], 1, 2, vec![5, 4, 3]),
+        (vec![2, 4, 9], 9, 1, vec![4, 2]),
+    ] {
+        let mut model = Model::new(&ids, primary, desired);
+        let starting = model
+            .snapshot
+            .status
+            .topology
+            .clone()
+            .unwrap()
+            .configuration;
+        model.finish();
+        assert_eq!(
+            model
+                .removed
+                .iter()
+                .map(|i| i.replica_id.value())
+                .collect::<Vec<_>>(),
+            targets
+        );
+        let accepted = &model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration;
+        assert_eq!(accepted.primary_id.value(), primary);
+        assert_eq!(accepted.members.len(), desired as usize);
+        assert!(
+            accepted
+                .members
+                .iter()
+                .all(|m| starting.members.contains(m))
+        );
+        assert_eq!(
+            accepted.epoch.data_loss_number,
+            starting.epoch.data_loss_number
+        );
+        assert_eq!(
+            accepted.epoch.configuration_number,
+            starting.epoch.configuration_number + targets.len() as i64
+        );
+        assert_eq!(
+            model.snapshot.status.observed_generation,
+            model.snapshot.desired.generation
+        );
+        assert_eq!(model.deletes.len(), targets.len() * 3);
+        for removed in &model.removed {
+            let commands = model
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    ProtocolCommand::EnsureConfiguration(c)
+                        if c.secondary_removal_evidence
+                            .as_ref()
+                            .is_some_and(|e| e.preparation.intent.target == *removed) =>
+                    {
+                        Some(c.as_ref())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut identities = commands[0]
+                .current_configuration
+                .members
+                .iter()
+                .map(|m| m.identity.replica_id)
+                .collect::<Vec<_>>();
+            identities.sort_by_key(|id| (*id == ReplicaId::new(primary), *id));
+            let expected = [false, true]
+                .into_iter()
+                .flat_map(|current_only| identities.iter().map(move |id| (*id, current_only)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                commands
+                    .iter()
+                    .map(|c| (c.local_replica_id, c.current_only))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        let commands = model.commands.len();
+        for _ in 0..3 {
+            assert!(matches!(model.step(), Plan::Stable { .. }));
+        }
+        assert_eq!(model.commands.len(), commands);
+    }
+}
+
+#[test]
+fn evaluator_scale_down_default_gate_increase_floor_and_equality() {
+    use scale_down_model::{Model, config};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    assert!(matches!(
+        evaluate(&model.snapshot, &EvaluationConfig::default()),
+        Plan::Stable { .. }
+    ));
+    model.step();
+    assert!(matches!(
+        evaluate(&model.snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+    let mut equal = Model::new(&[1, 2, 3], 1, 3);
+    assert!(matches!(equal.step(), Plan::Stable { .. }));
+    assert!(equal.commands.is_empty());
+    equal.snapshot.desired.replicas = 4;
+    let Plan::Stable { status, .. } = equal.plan() else {
+        panic!("increase must not provision")
+    };
+    assert!(
+        status
+            .conditions
+            .iter()
+            .any(|c| c.reason == "ScaleUpUnsupported")
+    );
+    equal.snapshot.desired.replicas = 0;
+    assert!(matches!(
+        evaluate(&equal.snapshot, &config()),
+        Plan::Unsafe {
+            reason: UnsafeReason::InvalidDesiredState(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn evaluator_scale_down_unavailable_highest_target_does_not_trigger_replacement() {
+    use scale_down_model::Model;
+    for ids in [vec![1, 2], vec![1, 2, 3], vec![2, 4, 9]] {
+        let primary = *ids.first().unwrap();
+        let target = *ids.last().unwrap();
+        let mut model = Model::new(&ids, primary, ids.len() as u32 - 1);
+        model.unavailable(target);
+        let key = model.key(target);
+        model
+            .snapshot
+            .replicas
+            .get_mut(&key)
+            .unwrap()
+            .kubernetes
+            .as_mut()
+            .unwrap()
+            .peer_endpoint_ready = false;
+        model.finish();
+        assert_eq!(model.removed[0].replica_id.value(), target);
+        assert!(
+            !model
+                .commands
+                .iter()
+                .any(|c| matches!(c, ProtocolCommand::RetireReplica(_)))
+        );
+        assert!(model.deletes.iter().any(|(r, uid)| *r
+            == kuberic_protocol::command::ScaleDownResource::Pod
+            && uid == &format!("pod-{target}")));
+    }
+}
+
+#[test]
+fn evaluator_scale_down_never_credits_target_for_previous_or_reduced_quorum() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.unavailable(2);
+    model.until(|m| m.snapshot.replicas.values().any(|o| matches!(&o.agent, AgentObservation::Report(r) if r.prepared_secondary_removal.is_some())));
+    assert_eq!(
+        reason(&model.plan()),
+        "ScaleDownPreviousReadQuorumUnavailable"
+    );
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .secondary_removal_evidence
+            .is_none()
+    );
+    assert!(model.deletes.is_empty());
+
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.secondary_removal_evidence.is_some())
+    });
+    model.unavailable(2);
+    model.until(|m| matches!(m.plan(), Plan::Wait { .. }));
+    assert_eq!(
+        reason(&model.plan()),
+        "ScaleDownReducedWriteQuorumUnavailable"
+    );
+    assert!(model.removed.is_empty());
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_primary_prefix_is_required_even_with_other_read_witnesses() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3, 4, 5], 1, 4);
+    model.until(|m| {
+        m.snapshot.replicas.values().any(|o|
+        matches!(&o.agent, AgentObservation::Report(r) if r.prepared_secondary_removal.is_some()))
+    });
+    model.report(1).verified_replication_lsn = None;
+    assert_eq!(
+        reason(&model.plan()),
+        "ScaleDownPreviousReadQuorumUnavailable"
+    );
+    assert!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .secondary_removal_evidence
+            .is_none()
+    );
+}
+
+#[test]
+fn evaluator_scale_down_requires_verified_completed_fresh_current_only_quorum() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot.status.transition.as_ref().is_some_and(|t| {
+            t.secondary_removal_evidence
+                .as_ref()
+                .is_some_and(|e| !e.reduced_write_quorum.is_empty())
+        })
+    });
+    model.until(|m| m.snapshot.replicas.values().filter(|o| matches!(&o.agent,
+        AgentObservation::Report(r) if r.secondary_removal_evidence.is_some() && r.previous_configuration.is_none())).count() == 2);
+    for mutation in 0..4 {
+        let mut broken = model.clone();
+        let r = broken.report(2);
+        match mutation {
+            0 => r.verified_replication_lsn = None,
+            1 => r.verified_replication_lsn = Some(9),
+            2 => r.pending_operation_id = Some(OperationId::new("unfinished")),
+            _ => r.report_sequence -= 1,
+        }
+        assert_eq!(
+            reason(&broken.plan()),
+            "ScaleDownCurrentOnlyQuorumUnavailable"
+        );
+        assert!(broken.removed.is_empty());
+    }
+    model.step();
+    assert_eq!(model.removed.len(), 1);
+}
+
+#[test]
+fn evaluator_scale_down_primary_loss_at_each_stage_freezes_target() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.step();
+    for _ in 0..16 {
+        if model.snapshot.status.secondary_scale_down_cleanup.is_some() {
+            break;
+        }
+        let mut lost = model.clone();
+        lost.unavailable(1);
+        lost.snapshot.routing.write_target = None;
+        let intent = lost.snapshot.status.transition.clone();
+        assert_eq!(reason(&lost.plan()), "ScaleDownPrimaryUnavailable");
+        lost.step();
+        assert_eq!(lost.snapshot.status.transition, intent);
+        assert!(
+            lost.commands
+                .iter()
+                .all(|c| !matches!(c, ProtocolCommand::RetireReplica(_)))
+        );
+        model.step();
+    }
+}
+
+#[test]
+fn evaluator_scale_down_exact_resources_cannot_be_inferred_from_lists() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.snapshot.secondary_scale_down_resources.clear();
+    assert_eq!(reason(&model.plan()), "ScaleDownExactIdentityRequired");
+    assert!(model.snapshot.status.transition.is_none());
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.exact(3).pvc = kuberic_protocol::observation::ExactResourceObservation::LookupFailed {
+        message: "forbidden".into(),
+    };
+    assert_eq!(reason(&model.plan()), "ScaleDownExactIdentityRequired");
+}
+
+#[test]
+fn evaluator_scale_down_pod_fence_is_post_commit_and_pvc_requires_exact_absence() {
+    use kuberic_protocol::command::ScaleDownResource;
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.unavailable(3);
+    model.until(|m| matches!(m.plan(), Plan::Apply { changes } if changes.iter().any(|c|
+        matches!(c, KubernetesChange::DeleteScaleDownResource { resource: ScaleDownResource::Pod, .. }))));
+    assert_eq!(model.removed.len(), 1);
+    assert_eq!(model.deletes.len(), 1);
+    assert_eq!(
+        reason(&Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            status: model.snapshot.status.clone(),
+            requeue_after_seconds: 5
+        }),
+        "ScaleDownExactPodFencePending"
+    );
+    let fence = model.plan();
+    assert_eq!(
+        fence,
+        model.plan(),
+        "lost delete reply retries exact UID and RV"
+    );
+    let key = model.key(3);
+    model.snapshot.replicas.remove(&key);
+    model.exact(3).pod = ExactResourceObservation::LookupFailed {
+        message: "list omission".into(),
+    };
+    assert_eq!(reason(&model.plan()), "ScaleDownExactPodAbsenceRequired");
+    assert!(
+        !model
+            .deletes
+            .iter()
+            .any(|(r, _)| *r == ScaleDownResource::Pvc)
+    );
+    model.exact(3).pod = ExactResourceObservation::NotFound;
+    model.finish();
+    assert!(
+        model
+            .deletes
+            .iter()
+            .any(|(r, _)| *r == ScaleDownResource::Pvc)
+    );
+}
+
+#[test]
+fn evaluator_scale_down_same_name_replacements_are_never_deleted_even_after_cleanup() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.unavailable(3);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let key = model.key(3);
+    model.snapshot.replicas.remove(&key);
+    model.exact(3).pod = ExactResourceObservation::ReplacementPresent {
+        uid: "replacement".into(),
+        resource_version: "new-rv".into(),
+    };
+    model.exact(3).pvc = ExactResourceObservation::ReplacementPresent {
+        uid: "replacement-pvc".into(),
+        resource_version: "new-rv".into(),
+    };
+    model.exact(3).endpoint = ExactResourceObservation::ReplacementPresent {
+        uid: "replacement-endpoint".into(),
+        resource_version: "new-rv".into(),
+    };
+    model.finish();
+    assert!(model.deletes.is_empty());
+    model.snapshot.replicas.insert(
+        ReplicaObservationKey::new(ReplicaId::new(3), ReplicaInstanceId::new("replacement")),
+        ReplicaObservation {
+            agent: AgentObservation::Absent,
+            kubernetes: Some(KubernetesReplicaObservation {
+                replica_id: ReplicaId::new(3),
+                pod_name: "db-3".into(),
+                pod_uid: Some(PodUid::new("replacement")),
+                pvc_name: "db-storage-3".into(),
+                pvc_uid: Some(PvcUid::new("replacement-pvc")),
+                image: Some("example:v1".into()),
+                pod_ready: true,
+                peer_endpoint_ready: true,
+            }),
+        },
+    );
+    assert!(matches!(model.plan(), Plan::Stable { status, .. }
+        if status.conditions.iter().any(|c| c.reason == "ExactCleanupAuthorityRequired")));
+}
+
+#[test]
+fn evaluator_scale_down_drift_switchover_and_primary_safety_precede_admission() {
+    use scale_down_model::{Model, reason};
+    for field in 0..2 {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        if field == 0 {
+            model.snapshot.desired.image = "example:v2".into();
+        } else {
+            model.snapshot.desired.failover_delay_seconds += 1;
+        }
+        assert_eq!(reason(&model.plan()), "ScaleDownUnsupportedDrift");
+    }
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.snapshot.desired.switchover = Some(PlannedSwitchoverRequest {
+        request_id: SwitchoverRequestId::new("move"),
+        target_replica_id: ReplicaId::new(2),
+    });
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("switchover should win")
+    };
+    assert!(changes.iter().any(|c| matches!(c, KubernetesChange::PersistStatus { status }
+        if status.transition.as_ref().is_some_and(|t| t.kind == TransitionKind::PlannedSwitchover))));
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.unavailable(1);
+    let Plan::Apply { changes } = model.plan() else {
+        panic!("primary safety should win")
+    };
+    assert!(
+        changes
+            .iter()
+            .any(|c| matches!(c, KubernetesChange::PersistStatus { status }
+        if status.primary_failure.is_some() && status.transition.is_none()))
+    );
+}
+
+#[test]
+fn evaluator_scale_down_stale_sessions_and_contradictory_authority_fail_closed() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.step();
+    let key = model.key(1);
+    let r = model.report(1).clone();
+    model.snapshot.previous_report_watermarks.insert(
+        key,
+        ReportWatermark {
+            process_session_id: r.process_session_id,
+            report_sequence: r.report_sequence,
+        },
+    );
+    assert_eq!(reason(&model.plan()), "ScaleDownFreshReportRequired");
+    model.report(1).process_session_id = ProcessSessionId::new("restart");
+    assert!(!matches!(
+        model.plan(),
+        Plan::Unsafe { .. } | Plan::Wait { .. }
+    ));
+    model.snapshot.previous_report_watermarks.clear();
+    model.report(2).identity.agent_generation = AgentGeneration::new("replacement");
+    assert!(matches!(model.plan(), Plan::Unsafe { .. }));
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_late_member_replays_pc_cc_before_current_only() {
+    use kuberic_protocol::types::SecondaryRemovalStage;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+    let mut late = model.report(3).clone();
+    model.unavailable(3);
+    model.until(|m| {
+        m.snapshot.status.transition.as_ref().is_some_and(|t| {
+            t.secondary_removal_evidence
+                .as_ref()
+                .is_some_and(|e| !e.reduced_write_quorum.is_empty())
+        })
+    });
+    let intent = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .secondary_scale_down
+        .clone()
+        .unwrap();
+    late.pending_operation_id =
+        Some(intent.command_operation_id(SecondaryRemovalStage::PreviousCurrent, &late.identity));
+    let key = model.key(3);
+    model.snapshot.replicas.get_mut(&key).unwrap().agent = AgentObservation::Report(Box::new(late));
+    model.until(|m| matches!(m.plan(), Plan::Execute { command: ProtocolCommand::EnsureConfiguration(c) } if c.local_replica_id == ReplicaId::new(3)));
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(command),
+    } = model.plan()
+    else {
+        unreachable!()
+    };
+    assert!(!command.current_only);
+    assert_eq!(
+        command.previous_configuration.as_ref(),
+        Some(&intent.previous_configuration)
+    );
+    assert!(
+        command
+            .secondary_removal_evidence
+            .as_ref()
+            .unwrap()
+            .reduced_write_quorum
+            .is_empty()
+    );
+    model.finish();
+}
+
+#[test]
+fn evaluator_scale_down_freezes_evidence_instead_of_resampling_advanced_reports() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.secondary_removal_evidence.is_some())
+    });
+    let frozen = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .secondary_removal_evidence
+        .clone()
+        .unwrap();
+    model.step();
+    assert!(model.report(2).previous_configuration.is_some());
+    assert_eq!(
+        model
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .unwrap()
+            .secondary_removal_evidence
+            .as_ref()
+            .unwrap()
+            .previous_read_quorum,
+        frozen.previous_read_quorum
+    );
+    model.finish();
+}
+
+#[test]
+fn evaluator_scale_down_target_return_uses_retirement_not_a_new_membership() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    let saved = model.report(3).clone();
+    model.unavailable(3);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let key = model.key(3);
+    model.snapshot.replicas.get_mut(&key).unwrap().agent =
+        AgentObservation::Report(Box::new(saved));
+    model.finish();
+    assert!(model.commands.iter().any(|c| matches!(c, ProtocolCommand::RetireReplica(r) if r.local_replica_id == ReplicaId::new(3))));
+    assert_eq!(model.removed.len(), 1);
+}
+
+#[test]
+fn evaluator_scale_down_reduced_catch_up_and_conflicting_storage_are_explicit() {
+    use kuberic_protocol::types::CleanupResourceIdentity;
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .replicas
+            .values()
+            .filter(|o| {
+                matches!(&o.agent,
+        AgentObservation::Report(r) if r.secondary_removal_evidence.is_some())
+            })
+            .count()
+            == 2
+    });
+    model.report(2).verified_replication_lsn = Some(9);
+    assert_eq!(reason(&model.plan()), "ScaleDownReducedCatchUpPending");
+    model.report(2).verified_replication_lsn = Some(10);
+    model.finish();
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.exact(3).identity.pvc = CleanupResourceIdentity::Present {
+        name: "db-storage-1".into(),
+        uid: "pvc-1".into(),
+    };
+    assert!(matches!(
+        model.plan(),
+        Plan::Unsafe {
+            reason: UnsafeReason::ContradictoryReplicaEvidence(_),
+            ..
+        }
+    ));
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_authoritative_already_absent_target_needs_no_retirement_reply() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use kuberic_protocol::types::CleanupResourceIdentity;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    let key = model.key(2);
+    model.snapshot.replicas.remove(&key);
+    model.exact(2).identity.pod = CleanupResourceIdentity::Absent {
+        name: "db-2".into(),
+    };
+    model.exact(2).pod = ExactResourceObservation::NotFound;
+    model.finish();
+    assert!(
+        !model
+            .commands
+            .iter()
+            .any(|c| matches!(c, ProtocolCommand::RetireReplica(_)))
+    );
+    assert_eq!(model.deletes.len(), 2);
+    assert_eq!(model.removed[0].replica_id, ReplicaId::new(2));
+}
+
+#[test]
+fn evaluator_scale_down_missing_frozen_preparation_does_not_reprepare_or_replace_boundary() {
+    use scale_down_model::{Model, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        m.snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.secondary_removal_evidence.is_some())
+    });
+    let frozen = model.snapshot.status.transition.clone();
+    model.report(1).prepared_secondary_removal = None;
+    assert_eq!(reason(&model.plan()), "ScaleDownPreparationPending");
+    model.step();
+    assert_eq!(model.snapshot.status.transition, frozen);
+    assert!(model.deletes.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_invalid_new_desired_count_cannot_cancel_frozen_authority() {
+    use scale_down_model::Model;
+    let mut trace = Model::new(&[1, 2], 1, 1);
+    trace.step();
+    for _ in 0..50 {
+        if trace.snapshot.status.transition.is_none()
+            && trace.snapshot.status.secondary_scale_down_cleanup.is_none()
+        {
+            break;
+        }
+        let mut edited = trace.clone();
+        edited.snapshot.desired.replicas = 0;
+        edited.snapshot.desired.generation += 1;
+        assert!(!matches!(edited.plan(), Plan::Unsafe { .. }));
+        trace.step();
+    }
+    trace.snapshot.desired.replicas = 0;
+    assert!(matches!(
+        trace.plan(),
+        Plan::Unsafe {
+            reason: UnsafeReason::InvalidDesiredState(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn evaluator_scale_down_existing_transitions_and_provisioning_serialize() {
+    use scale_down_model::{Model, config};
+    let mut snapshots = vec![prepared_switchover_snapshot()];
+    let mut bootstrap = scaffolded_snapshot();
+    let Plan::Apply { changes } = evaluate(&bootstrap, &EvaluationConfig::default()) else {
+        panic!("bootstrap")
+    };
+    for change in changes {
+        if let KubernetesChange::PersistStatus { status } = change {
+            bootstrap.status = *status;
+        }
+    }
+    assert!(bootstrap.status.transition.is_some());
+    snapshots.push(bootstrap);
+    for kind in [TransitionKind::Replacement, TransitionKind::Failover] {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        let previous = model
+            .snapshot
+            .status
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        let mut members = previous.members.clone();
+        if kind == TransitionKind::Replacement {
+            members[2].identity.instance_id = ReplicaInstanceId::new("replacement");
+            members[2].identity.agent_generation = AgentGeneration::new("replacement-generation");
+        } else {
+            members[0].role = ReplicaRole::ActiveSecondary;
+            members[1].role = ReplicaRole::Primary;
+        }
+        let current = ConfigurationDescriptor::new(
+            Epoch::new(2, 11),
+            ReplicaId::new(if kind == TransitionKind::Replacement {
+                1
+            } else {
+                2
+            }),
+            members,
+            2,
+        );
+        model.snapshot.status.transition = Some(TransitionIntent {
+            transition_id: derive_transition_id(
+                &model.snapshot.resource_uid,
+                kind,
+                &current.configuration_id,
+            ),
+            kind,
+            spec_generation: 6,
+            effective_policy: model.snapshot.status.effective_policy.clone().unwrap(),
+            previous_configuration_id: Some(previous.configuration_id),
+            current_configuration: current,
+            election_lsn: (kind == TransitionKind::Failover).then_some(10),
+            build_id: (kind == TransitionKind::Replacement).then(|| OperationId::new("build")),
+            repair: None,
+            switchover: None,
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
+        });
+        snapshots.push(model.snapshot);
+    }
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    let replacing = model
+        .snapshot
+        .status
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members[2]
+        .identity
+        .clone();
+    model.snapshot.status.provisioning = Some(ProvisioningIntent {
+        replaces: replacing,
+        operation_id: OperationId::new("existing-provisioning"),
+        pod_uid: PodUid::new("new-pod"),
+        pvc_uid: PvcUid::new("new-pvc"),
+    });
+    snapshots.push(model.snapshot);
+    for mut snapshot in snapshots {
+        snapshot.desired.replicas = 1;
+        kuberic_protocol::validation::validate_snapshot(&snapshot).unwrap();
+        for _ in 0..3 {
+            if snapshot.status.transition.is_none() && snapshot.status.provisioning.is_none() {
+                break;
+            }
+            let default = evaluate(&snapshot, &EvaluationConfig::default());
+            assert_eq!(
+                evaluate(&snapshot, &config()),
+                default,
+                "existing work retains precedence"
+            );
+            if let Plan::Apply { changes } = default {
+                for change in changes {
+                    if let KubernetesChange::PersistStatus { status } = change {
+                        snapshot.status = *status;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn evaluator_scale_down_commit_publication_is_exact_and_separate_from_grant() {
+    use kuberic_protocol::validation::validate_accept_secondary_removal_commit;
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let Plan::Execute {
+        command: ProtocolCommand::AcceptSecondaryRemovalCommit(command),
+    } = model.plan()
+    else {
+        panic!("publish accepted evidence first")
+    };
+    validate_accept_secondary_removal_commit(&command).unwrap();
+    let mut invalid = command.as_ref().clone();
+    invalid.target = invalid.committed.evidence.preparation.intent.target.clone();
+    assert!(validate_accept_secondary_removal_commit(&invalid).is_err());
+    invalid = command.as_ref().clone();
+    invalid.operation_id = OperationId::new("mutated");
+    assert!(validate_accept_secondary_removal_commit(&invalid).is_err());
+    model.step();
+    let Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(grant),
+    } = model.plan()
+    else {
+        panic!("separate grant")
+    };
+    assert_eq!(grant.primary_write_status, AccessStatus::Granted);
+    assert!(grant.secondary_removal_evidence.is_none());
+    assert!(model.snapshot.routing.write_target.is_none());
+}
+
+#[test]
+fn evaluator_scale_down_local_commit_cannot_precede_status_commit_or_change_proof() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|m| m.snapshot.status.secondary_scale_down_cleanup.is_some());
+    let committed = model
+        .snapshot
+        .status
+        .secondary_scale_down_cleanup
+        .clone()
+        .unwrap();
+    let mut premature = model.clone();
+    premature.snapshot.status.topology = Some(AcceptedTopology {
+        configuration: committed
+            .evidence
+            .preparation
+            .intent
+            .previous_configuration
+            .clone(),
+    });
+    premature.snapshot.status.effective_policy = Some(
+        committed
+            .evidence
+            .preparation
+            .intent
+            .previous_policy
+            .clone(),
+    );
+    premature.snapshot.status.transition = Some(scale_down_fixture::transition(
+        &committed.evidence.preparation.intent,
+    ));
+    premature
+        .snapshot
+        .status
+        .transition
+        .as_mut()
+        .unwrap()
+        .secondary_removal_evidence = Some(committed.evidence.clone());
+    premature.snapshot.status.secondary_scale_down_cleanup = None;
+    premature.report(1).prepared_secondary_removal = None;
+    premature.report(1).accepted_secondary_removal = Some(committed);
+    assert!(matches!(premature.plan(), Plan::Unsafe { .. }));
+    model.step();
+    model
+        .report(1)
+        .accepted_secondary_removal
+        .as_mut()
+        .unwrap()
+        .current_only_write_quorum[0]
+        .report_sequence += 1;
+    assert!(matches!(model.plan(), Plan::Unsafe { .. }));
+}
 
 use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, SafetyChange};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
@@ -70,6 +919,7 @@ fn desired(replicas: u32) -> DesiredState {
 
 fn empty_snapshot(replicas: u32) -> ObservationSnapshot {
     ObservationSnapshot {
+        secondary_scale_down_resources: Vec::new(),
         resource_uid: ResourceUid::new("resource-uid"),
         resource_version: "1".to_string(),
         desired: desired(replicas),

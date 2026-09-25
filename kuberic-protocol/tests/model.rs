@@ -245,6 +245,7 @@ fn generated_report_sets_never_validate_two_granted_writers() {
                 );
             }
             let snapshot = ObservationSnapshot {
+                secondary_scale_down_resources: Vec::new(),
                 resource_uid: ResourceUid::new("model-resource"),
                 resource_version: "1".to_string(),
                 desired: DesiredState {
@@ -358,6 +359,7 @@ impl SwitchoverModel {
                 })
                 .collect(),
             snapshot: ObservationSnapshot {
+                secondary_scale_down_resources: Vec::new(),
                 resource_uid: ResourceUid::new("model-resource"),
                 resource_version: "1".into(),
                 desired: DesiredState {
@@ -938,4 +940,169 @@ fn terminal_switchover_receipt_writer_process() {
     file.sync_all().unwrap();
     std::fs::File::open("target").unwrap().sync_all().unwrap();
     std::process::exit(73);
+}
+#[allow(dead_code)]
+#[path = "support/scale_down_model.rs"]
+mod scale_down_model;
+
+#[test]
+fn scale_down_model_desired_mutations_and_ambiguous_replies_at_every_boundary() {
+    use kuberic_protocol::types::TransitionKind;
+    use scale_down_model::Model;
+    let mut trace = Model::new(&[1, 2, 3], 1, 2);
+    trace.step();
+    for boundary in 0..60 {
+        let intent = trace
+            .snapshot
+            .status
+            .transition
+            .as_ref()
+            .and_then(|t| t.secondary_scale_down.clone())
+            .or_else(|| {
+                trace
+                    .snapshot
+                    .status
+                    .secondary_scale_down_cleanup
+                    .as_ref()
+                    .map(|c| c.evidence.preparation.intent.clone())
+            });
+        let Some(intent) = intent else { break };
+        for desired in [1, 2, 3, 5] {
+            let mut changed = trace.clone();
+            changed.snapshot.desired.generation = 100 + boundary;
+            changed.snapshot.desired.replicas = desired;
+            let original_plan = changed.plan();
+            assert_eq!(
+                original_plan,
+                changed.plan(),
+                "lost status/command reply is not progress"
+            );
+            changed.until(|m| {
+                m.snapshot.status.transition.is_none()
+                    && m.snapshot.status.secondary_scale_down_cleanup.is_none()
+            });
+            assert_eq!(changed.removed.first(), Some(&intent.target));
+            assert_eq!(changed.removed.len(), 1);
+            assert!(
+                changed.snapshot.status.observed_generation < changed.snapshot.desired.generation
+            );
+            changed.finish();
+            assert_eq!(
+                changed
+                    .snapshot
+                    .status
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .configuration
+                    .members
+                    .len(),
+                desired.min(2) as usize
+            );
+            assert!(changed.commands.iter().all(|c| match c {
+                kuberic_protocol::command::ProtocolCommand::EnsureConfiguration(c) =>
+                    c.transition_kind == TransitionKind::SecondaryScaleDown
+                        || c.previous_configuration.is_none(),
+                _ => true,
+            }));
+        }
+        trace.step();
+    }
+    trace.finish();
+}
+
+#[test]
+fn scale_down_model_restarts_and_unsupported_edits_at_every_durable_boundary() {
+    use kuberic_protocol::observation::AgentObservation;
+    use kuberic_protocol::types::ProcessSessionId;
+    use scale_down_model::Model;
+    let mut trace = Model::new(&[1, 2, 3], 1, 2);
+    trace.step();
+    for boundary in 0..60 {
+        if trace.snapshot.status.transition.is_none()
+            && trace.snapshot.status.secondary_scale_down_cleanup.is_none()
+        {
+            break;
+        }
+        let mut restarted = trace.clone();
+        for (key, observation) in &mut restarted.snapshot.replicas {
+            if let AgentObservation::Report(r) = &mut observation.agent {
+                r.process_session_id =
+                    ProcessSessionId::new(format!("restart-{boundary}-{}", key.replica_id));
+                r.report_sequence = 1;
+            }
+        }
+        restarted.finish();
+        assert_eq!(restarted.removed.len(), 1);
+        let mut changed = trace.clone();
+        changed.snapshot.desired.generation = 100 + boundary;
+        changed.snapshot.desired.image = "unsupported:v2".into();
+        changed.snapshot.desired.failover_delay_seconds = 999;
+        changed.until(|m| {
+            m.snapshot.status.transition.is_none()
+                && m.snapshot.status.secondary_scale_down_cleanup.is_none()
+        });
+        assert_eq!(changed.removed.len(), 1);
+        assert!(
+            changed
+                .snapshot
+                .status
+                .conditions
+                .iter()
+                .any(|c| c.reason == "SpecDriftUnsupported")
+        );
+        assert!(changed.snapshot.status.observed_generation < changed.snapshot.desired.generation);
+        trace.step();
+    }
+}
+
+#[test]
+fn scale_down_model_enumerates_quorum_availability_without_target_credit() {
+    use kuberic_protocol::plan::Plan;
+    use scale_down_model::Model;
+    for size in 2..=5 {
+        let ids = (1..=size).collect::<Vec<_>>();
+        for mask in 0..(1 << (size - 2)) {
+            let mut model = Model::new(&ids, 1, size as u32 - 1);
+            let saved = model.snapshot.replicas.clone();
+            model.unavailable(size);
+            let mut retained = 1;
+            for id in 2..size {
+                if mask & (1 << (id - 2)) == 0 {
+                    model.unavailable(id);
+                } else {
+                    retained += 1;
+                }
+            }
+            let policy = model.snapshot.status.effective_policy.clone().unwrap();
+            let reduced =
+                kuberic_protocol::types::EffectivePolicy::fixed(size as u32 - 1, 30).unwrap();
+            let sufficient = retained >= policy.read_quorum && retained >= reduced.write_quorum;
+            for _ in 0..100 {
+                if matches!(model.step(), Plan::Wait { .. } | Plan::Stable { .. }) {
+                    break;
+                }
+            }
+            assert_eq!(
+                !model.removed.is_empty(),
+                sufficient,
+                "size={size} mask={mask}"
+            );
+            if !sufficient {
+                assert!(model.deletes.is_empty());
+                for (key, observation) in saved {
+                    if key.replica_id.value() != size
+                        && matches!(
+                            model.snapshot.replicas[&key].agent,
+                            kuberic_protocol::observation::AgentObservation::Unreachable { .. }
+                        )
+                    {
+                        model.snapshot.replicas.insert(key, observation);
+                    }
+                }
+                model.finish();
+                assert_eq!(model.removed.len(), 1);
+            }
+        }
+    }
 }

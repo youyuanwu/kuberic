@@ -2286,6 +2286,12 @@ impl DefaultReplicatorInner {
                             ));
                         }
                         if self.identity == intent.primary
+                            && state.accepted_secondary_removal.as_ref().is_none_or(|c| {
+                                c.evidence != *evidence
+                                    || authority.previous_configuration.is_some()
+                                    || authority.current_configuration
+                                        != intent.current_configuration
+                            })
                             && (state.prepared_secondary_removal.as_ref()
                                 != Some(&evidence.preparation)
                                 || state.current_progress < evidence.preparation.boundary_lsn

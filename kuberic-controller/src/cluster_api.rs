@@ -788,7 +788,7 @@ where
                     target,
                     expected_process_session_id,
                     command.clone(),
-                ),
+                )?,
             )
             .await
             .map_err(map_agent_effect_error)?;
@@ -1596,6 +1596,9 @@ fn map_agent_effect_error(error: AgentRpcError) -> ControllerError {
 
 fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
     match command {
+        ProtocolCommand::AcceptSecondaryRemovalCommit(command) => {
+            (command.target.clone(), command.target.replica_id)
+        }
         ProtocolCommand::PrepareSecondaryRemoval(command) => {
             (command.intent.primary.clone(), command.local_replica_id)
         }
@@ -1638,8 +1641,13 @@ fn command_request(
     target: ReplicaIdentity,
     expected_process_session_id: String,
     command: ProtocolCommand,
-) -> proto::ExecuteCommandRequest {
+) -> Result<proto::ExecuteCommandRequest> {
     let command = match command {
+        ProtocolCommand::AcceptSecondaryRemovalCommit(_) => {
+            return Err(ControllerError::Effect(
+                "secondary scale-down commit publication is not enabled".into(),
+            ));
+        }
         ProtocolCommand::PrepareSecondaryRemoval(command) => {
             proto::execute_command_request::Command::PrepareSecondaryRemoval(Box::new(
                 (*command).into(),
@@ -1669,13 +1677,13 @@ fn command_request(
             ))
         }
     };
-    proto::ExecuteCommandRequest {
+    Ok(proto::ExecuteCommandRequest {
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid,
         target: Some(target.into()),
         expected_process_session_id,
         command: Some(command),
-    }
+    })
 }
 
 fn initialize_command(command: InitializeAgentStore) -> proto::InitializeAgentStoreCommand {
@@ -2299,7 +2307,8 @@ mod tests {
                 target.clone(),
                 "fresh-session".into(),
                 command.clone(),
-            );
+            )
+            .unwrap();
             let normalized = kuberic_wire::normalize_execute_request(request).unwrap();
             assert_eq!(normalized.command, command);
             assert_eq!(normalized.target, target);
@@ -2308,6 +2317,30 @@ mod tests {
                 "fresh-session"
             );
         }
+    }
+
+    #[test]
+    fn secondary_removal_commit_publication_stays_disabled_until_integration() {
+        let intent = scale_down_fixture::intent(&[1, 2], 1);
+        let command = ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
+            kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+                operation_id: intent.command_operation_id(
+                    kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                    &intent.primary,
+                ),
+                target: intent.primary.clone(),
+                committed: scale_down_fixture::cleanup(&intent),
+            },
+        ));
+        assert!(matches!(
+            command_request(
+                intent.resource_uid.to_string(),
+                intent.primary,
+                "session".into(),
+                command,
+            ),
+            Err(ControllerError::Effect(_))
+        ));
     }
 
     #[test]
@@ -2401,7 +2434,8 @@ mod tests {
             source.clone(),
             session,
             preparation.clone(),
-        );
+        )
+        .unwrap();
         assert_eq!(request.expected_process_session_id, "session-1");
         assert!(matches!(
             &request.command,
@@ -2425,7 +2459,8 @@ mod tests {
             source.clone(),
             observed_process_session(&observation, source.replica_id, &source).unwrap(),
             preparation,
-        );
+        )
+        .unwrap();
         assert_eq!(replay.expected_process_session_id, "session-restarted");
         assert_eq!(replay.command, request.command);
 
@@ -2488,7 +2523,8 @@ mod tests {
                 target,
                 "session-current".to_string(),
                 command,
-            );
+            )
+            .unwrap();
             assert_eq!(request.expected_process_session_id, "session-current");
         }
     }

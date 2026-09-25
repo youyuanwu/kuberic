@@ -483,7 +483,9 @@ fn admit_configuration_with_replay(
         ));
     }
     let admitted = AdmittedAuthority {
-        secondary_removal: None,
+        secondary_removal: is_access_only_configuration(command, state)
+            .then(|| state.secondary_removal_evidence.clone())
+            .flatten(),
         local_identity: identity.clone(),
         transition_kind: (!command.current_only && !is_access_only_configuration(command, state))
             .then_some(command.transition_kind),

@@ -19,8 +19,12 @@ use crate::types::{
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
 
+mod secondary_scale_down;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluationConfig {
+    /// Pure evaluator capability; production stays disabled until exact effects are integrated.
+    pub enable_secondary_scale_down: bool,
     pub supported_protocol_version: u32,
     pub stable_resync_seconds: u64,
     pub wait_requeue_seconds: u64,
@@ -30,6 +34,7 @@ pub struct EvaluationConfig {
 impl Default for EvaluationConfig {
     fn default() -> Self {
         Self {
+            enable_secondary_scale_down: false,
             supported_protocol_version: crate::PROTOCOL_VERSION,
             stable_resync_seconds: 30,
             wait_requeue_seconds: 5,
@@ -40,9 +45,9 @@ impl Default for EvaluationConfig {
 
 /// Validates one snapshot and returns the next safe reconciliation outcome.
 pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
-    if snapshot.status.secondary_scale_down_cleanup.is_some()
+    if !config.enable_secondary_scale_down && (snapshot.status.secondary_scale_down_cleanup.is_some()
         || snapshot.status.transition.as_ref().is_some_and(|transition| transition.kind == TransitionKind::SecondaryScaleDown)
-        || snapshot.replicas.values().any(|replica| matches!(&replica.agent, AgentObservation::Report(report) if report.prepared_secondary_removal.is_some() || report.secondary_removal_evidence.is_some() || report.retired_replica.is_some()))
+        || snapshot.replicas.values().any(|replica| matches!(&replica.agent, AgentObservation::Report(report) if report.prepared_secondary_removal.is_some() || report.secondary_removal_evidence.is_some() || report.retired_replica.is_some() || report.accepted_secondary_removal.is_some())))
     {
         return unsafe_plan(snapshot.status.clone(), UnsafeReason::InvalidAcceptedAuthority("Secondary scale-down execution is not enabled".into()), config);
     }
@@ -65,6 +70,17 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         return switchover_unsafe(snapshot, message, config);
     }
     if let Err(error) = validate_snapshot(snapshot) {
+        if config.enable_secondary_scale_down
+            && secondary_scale_down::active(snapshot)
+            && matches!(error, ValidationError::StaleReportSequence { .. })
+        {
+            return secondary_scale_down::wait(
+                snapshot.status.clone(),
+                "ScaleDownFreshReportRequired",
+                "Re-observe a newer report in the exact process session",
+                config,
+            );
+        }
         if switchover.is_some() {
             if matches!(error, ValidationError::StaleReportSequence { .. }) {
                 return switchover_wait(
@@ -129,6 +145,10 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         return evaluate_provisioning(snapshot, provisioning, config);
     }
 
+    if let Some(cleanup) = &snapshot.status.secondary_scale_down_cleanup {
+        return secondary_scale_down::cleanup(snapshot, cleanup, config);
+    }
+
     if snapshot.status.initialized {
         return evaluate_stable(snapshot, config);
     }
@@ -150,7 +170,13 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         .as_ref()
         .expect("validated initialized status has effective policy");
     let (spec_fully_observed, unsupported) = desired_spec_state(snapshot, configuration, policy);
-    if let Some(condition) = unsupported {
+    if let Some(mut condition) = unsupported {
+        if config.enable_secondary_scale_down
+            && condition.reason == "ReplicaCountImmutable"
+            && snapshot.desired.replicas > policy.replica_set_size
+        {
+            condition.reason = "ScaleUpUnsupported".into();
+        }
         status = status.with_condition(condition);
     } else if spec_fully_observed {
         status.observed_generation = snapshot.desired.generation;
@@ -166,6 +192,15 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
 
     if let Some(plan) = maybe_begin_stable_failover(snapshot, status.clone(), config) {
         return plan;
+    }
+
+    if config.enable_secondary_scale_down {
+        if let Some(plan) = begin_switchover(snapshot, &status, config) {
+            return plan;
+        }
+        if let Some(plan) = secondary_scale_down::begin(snapshot, status.clone(), config) {
+            return plan;
+        }
     }
 
     if configuration.members.iter().any(|member| {
@@ -369,6 +404,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         };
     }
 
+    status = status.without_condition("UnmanagedReplicaResources");
     if let Some(extra) = snapshot.replicas.iter().find_map(|(key, observation)| {
         let accepted = configuration.members.iter().any(|member| {
             member.identity.replica_id == key.replica_id
@@ -377,11 +413,19 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         (!accepted)
             .then_some(observation.kubernetes.as_ref())
             .flatten()
-    }) && !recovering_service
-    {
-        return Plan::Apply {
-            changes: vec![delete_scaffolding_change(extra)],
-        };
+    }) {
+        if config.enable_secondary_scale_down {
+            status = status.with_condition(StatusCondition {
+                type_: "UnmanagedReplicaResources".into(),
+                status: ConditionStatus::True,
+                reason: "ExactCleanupAuthorityRequired".into(),
+                message: "Extra resources are not deletion authority; an exact lifecycle receipt is required".into(),
+            });
+        } else if !recovering_service {
+            return Plan::Apply {
+                changes: vec![delete_scaffolding_change(extra)],
+            };
+        }
     }
 
     let primary = configuration
@@ -2051,6 +2095,9 @@ fn evaluate_transition(
     transition: &TransitionIntent,
     config: &EvaluationConfig,
 ) -> Plan {
+    if transition.kind == TransitionKind::SecondaryScaleDown {
+        return secondary_scale_down::transition(snapshot, transition, config);
+    }
     if transition.kind == TransitionKind::PlannedSwitchover {
         return evaluate_switchover(snapshot, transition, config);
     }

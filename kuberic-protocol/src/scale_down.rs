@@ -272,6 +272,27 @@ pub fn validate_secondary_scale_down_cleanup(cleanup: &SecondaryScaleDownCleanup
     Ok(())
 }
 
+pub fn validate_accept_secondary_removal_commit(
+    command: &crate::command::AcceptSecondaryRemovalCommit,
+) -> Result {
+    validate_secondary_scale_down_cleanup(&command.committed)?;
+    let intent = &command.committed.evidence.preparation.intent;
+    if !intent
+        .current_configuration
+        .members
+        .iter()
+        .any(|m| m.identity == command.target)
+        || command.operation_id
+            != intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, &command.target)
+        || command.committed.retirement.is_some()
+    {
+        return Err(invalid(
+            "commit publication must bind one retained exact member and immutable acceptance evidence",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_secondary_removal_configuration(command: &EnsureConfiguration) -> Result {
     let evidence = command
         .secondary_removal_evidence
@@ -318,6 +339,29 @@ pub fn validate_secondary_removal_configuration(command: &EnsureConfiguration) -
 }
 
 pub fn validate_secondary_removal_report(report: &AgentReport) -> Result {
+    if let Some(committed) = &report.accepted_secondary_removal {
+        validate_secondary_scale_down_cleanup(committed)?;
+        let intent = &committed.evidence.preparation.intent;
+        if intent.resource_uid != report.resource_uid
+            || !intent
+                .current_configuration
+                .members
+                .iter()
+                .any(|m| m.identity == report.identity)
+            || report.epoch < intent.current_configuration.epoch
+            || (report.epoch == intent.current_configuration.epoch
+                && (report.current_configuration.as_ref() != Some(&intent.current_configuration)
+                    || report.previous_configuration.is_some()
+                    || report.prepared_secondary_removal.as_ref().is_some_and(|p| {
+                        p.intent.previous_configuration != intent.current_configuration
+                    })
+                    || report.secondary_removal_evidence.as_ref() != Some(&committed.evidence)))
+        {
+            return Err(invalid(
+                "accepted removal receipt differs from installed current-only authority",
+            ));
+        }
+    }
     if let Some(preparation) = &report.prepared_secondary_removal {
         validate_secondary_removal_preparation(preparation)?;
         if preparation.intent.primary != report.identity
@@ -362,7 +406,16 @@ pub fn validate_secondary_removal_report(report: &AgentReport) -> Result {
             || report
                 .prepared_secondary_removal
                 .as_ref()
-                .is_some_and(|prepared| prepared != &evidence.preparation)
+                .is_some_and(|prepared| {
+                    prepared != &evidence.preparation
+                        && !(report.previous_configuration.is_none()
+                            && prepared.intent.previous_configuration
+                                == intent.current_configuration
+                            && report
+                                .accepted_secondary_removal
+                                .as_ref()
+                                .is_some_and(|c| c.evidence == *evidence))
+                })
         {
             return Err(invalid(
                 "reported reduced authority is not bound to admission evidence",

@@ -321,6 +321,7 @@ pub fn normalize_agent_status_report(
                 report.secondary_removal_evidence.is_some(),
             )?;
             let report = AgentReport {
+                accepted_secondary_removal: None,
                 protocol_version: report.protocol_version,
                 resource_uid: ResourceUid::new(report.resource_uid),
                 identity,

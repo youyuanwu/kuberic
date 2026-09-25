@@ -152,6 +152,7 @@ pub fn normalize(
     let routing = normalize_routing(&raw, &replicas, &resource_uid, &mut failures);
     let supporting_resources_ready = supporting_resources_ready(&raw, &resource_uid);
     Ok(ObservationSnapshot {
+        secondary_scale_down_resources: Vec::new(),
         resource_uid,
         resource_version,
         desired: DesiredState {

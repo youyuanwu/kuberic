@@ -696,6 +696,7 @@ pub enum SecondaryRemovalStage {
     Prepare,
     PreviousCurrent,
     CurrentOnly,
+    AcceptCommit,
     Retire,
 }
 
@@ -705,6 +706,7 @@ impl SecondaryRemovalStage {
             Self::Prepare => "prepare",
             Self::PreviousCurrent => "pc-cc",
             Self::CurrentOnly => "current-only",
+            Self::AcceptCommit => "accept-commit",
             Self::Retire => "retire",
         }
     }

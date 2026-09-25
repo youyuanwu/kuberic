@@ -1,0 +1,880 @@
+use super::*;
+use crate::command::{
+    AcceptSecondaryRemovalCommit, PrepareSecondaryRemoval, RetireReplica, ScaleDownResource,
+};
+use crate::observation::{
+    AgentReport, ExactResourceObservation, SecondaryScaleDownResourceObservation,
+};
+use crate::types::{
+    CleanupResourceIdentity, SecondaryRemovalEvidence, SecondaryRemovalStage,
+    SecondaryRemovalWitness, SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
+};
+use crate::validation::{
+    validate_secondary_removal_evidence, validate_secondary_scale_down,
+    validate_secondary_scale_down_cleanup,
+};
+
+pub(super) fn active(snapshot: &ObservationSnapshot) -> bool {
+    snapshot.status.secondary_scale_down_cleanup.is_some()
+        || snapshot
+            .status
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.kind == TransitionKind::SecondaryScaleDown)
+}
+
+pub(super) fn wait(
+    status: AcceptedStatus,
+    reason: &str,
+    message: &str,
+    config: &EvaluationConfig,
+) -> Plan {
+    Plan::Wait {
+        reason: WaitReason::ActiveTransition,
+        status: waiting_status(status, reason, message),
+        requeue_after_seconds: config.wait_requeue_seconds,
+    }
+}
+
+fn persist(status: AcceptedStatus) -> Plan {
+    Plan::Apply {
+        changes: vec![KubernetesChange::PersistStatus {
+            status: Box::new(status),
+        }],
+    }
+}
+
+fn report<'a>(
+    snapshot: &'a ObservationSnapshot,
+    identity: &ReplicaIdentity,
+) -> Option<&'a AgentReport> {
+    match &snapshot.observation_for_identity(identity)?.agent {
+        AgentObservation::Report(report)
+            if report.identity == *identity
+                && report.healthy
+                && report.reported_fault != Some(crate::types::FaultType::Permanent)
+                && !report.process_session_id.is_empty()
+                && report.report_sequence > 0 =>
+        {
+            Some(report)
+        }
+        _ => None,
+    }
+}
+
+fn resources<'a>(
+    snapshot: &'a ObservationSnapshot,
+    target: &ReplicaIdentity,
+) -> Option<&'a SecondaryScaleDownResourceObservation> {
+    let mut observations = snapshot
+        .secondary_scale_down_resources
+        .iter()
+        .filter(|r| r.resource_uid == snapshot.resource_uid && r.target == *target);
+    let result = observations.next()?;
+    observations.next().is_none().then_some(result)
+}
+
+fn absent(identity: &CleanupResourceIdentity, observation: &ExactResourceObservation) -> bool {
+    match (identity, observation) {
+        (_, ExactResourceObservation::NotFound) => true,
+        (
+            CleanupResourceIdentity::Present { uid, .. },
+            ExactResourceObservation::ReplacementPresent {
+                uid: replacement,
+                resource_version,
+            },
+        ) => !replacement.is_empty() && replacement != uid && !resource_version.is_empty(),
+        // A resource absent at admission grants no authority over a later occupant.
+        (
+            CleanupResourceIdentity::Absent { .. },
+            ExactResourceObservation::ReplacementPresent {
+                uid,
+                resource_version,
+            },
+        ) => !uid.is_empty() && !resource_version.is_empty(),
+        _ => false,
+    }
+}
+
+fn observed(identity: &CleanupResourceIdentity, observation: &ExactResourceObservation) -> bool {
+    absent(identity, observation)
+        || matches!((identity, observation),
+            (CleanupResourceIdentity::Present { .. }, ExactResourceObservation::FrozenUidPresent { resource_version })
+            if !resource_version.is_empty())
+}
+
+fn drift_status(snapshot: &ObservationSnapshot, mut status: AcceptedStatus) -> AcceptedStatus {
+    let topology = &status.topology.as_ref().expect("initialized").configuration;
+    let policy = status.effective_policy.as_ref().expect("initialized");
+    let (_, drift) = desired_spec_state(snapshot, topology, policy);
+    let accepted_count = topology.members.len() as u32;
+    status = status.without_condition("UnsupportedSpec");
+    if let Some(mut condition) = drift {
+        if condition.reason == "ReplicaCountImmutable" && snapshot.desired.replicas > 0 {
+            if snapshot.desired.replicas < accepted_count {
+                return status;
+            }
+            condition.reason = "ScaleUpUnsupported".into();
+        }
+        status = status.with_condition(condition);
+    }
+    status
+}
+
+pub(super) fn begin(
+    snapshot: &ObservationSnapshot,
+    status: AcceptedStatus,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    let previous = &status.topology.as_ref()?.configuration;
+    let policy = status.effective_policy.as_ref()?;
+    if snapshot.desired.replicas >= policy.replica_set_size {
+        return None;
+    }
+    let status = drift_status(snapshot, status.clone());
+    if status
+        .conditions
+        .iter()
+        .any(|c| c.type_ == "UnsupportedSpec")
+    {
+        return Some(wait(
+            status,
+            "ScaleDownUnsupportedDrift",
+            "Only replica-count reduction is supported; image and delay remain unchanged",
+            config,
+        ));
+    }
+    let primary = configuration_primary(previous);
+    let target = previous
+        .members
+        .iter()
+        .filter(|m| m.role == ReplicaRole::ActiveSecondary)
+        .max_by_key(|m| m.identity.replica_id)?;
+    let Some(exact) = resources(snapshot, &target.identity).filter(|r| {
+        observed(&r.identity.pod, &r.pod)
+            && observed(&r.identity.pvc, &r.pvc)
+            && observed(&r.identity.endpoint, &r.endpoint)
+    }) else {
+        return Some(wait(
+            status,
+            "ScaleDownExactIdentityRequired",
+            "Authoritative exact Pod, mounted PVC, and endpoint identities are required",
+            config,
+        ));
+    };
+    let conflicting_mapping = snapshot.observation_for_identity(&target.identity)
+        .and_then(|r| r.kubernetes.as_ref()).is_some_and(|k| {
+            matches!(&exact.identity.pod, CleanupResourceIdentity::Present { name, uid }
+                if k.pod_uid.as_ref().is_some_and(|observed| observed.as_str() != uid || k.pod_name != *name))
+                || matches!(&exact.identity.pvc, CleanupResourceIdentity::Present { name, uid }
+                    if k.pvc_uid.as_ref().is_some_and(|observed| observed.as_str() != uid || k.pvc_name != *name))
+        })
+        || previous.members.iter().filter(|m| m.identity != target.identity).any(|member| {
+            snapshot.observation_for_identity(&member.identity)
+                .and_then(|r| r.kubernetes.as_ref())
+                .and_then(|k| k.pvc_uid.as_ref())
+                .is_some_and(|observed| matches!(&exact.identity.pvc,
+                    CleanupResourceIdentity::Present { uid, .. } if observed.as_str() == uid))
+        });
+    if conflicting_mapping {
+        return Some(unsafe_plan(
+            status,
+            UnsafeReason::ContradictoryReplicaEvidence(
+                "Scale-down exact Pod/PVC mapping conflicts with observed mounted storage".into(),
+            ),
+            config,
+        ));
+    }
+    if previous.members.iter().any(|member| {
+        snapshot
+            .observation_for_identity(&member.identity)
+            .and_then(|r| r.kubernetes.as_ref())
+            .and_then(|k| k.image.as_ref())
+            .is_none()
+            && !(member.identity == target.identity && absent(&exact.identity.pod, &exact.pod))
+    }) {
+        return Some(wait(
+            status,
+            "ScaleDownSpecObservationPending",
+            "Observe accepted-member images before admitting count-only drift",
+            config,
+        ));
+    }
+    if report(snapshot, &primary.identity)
+        .is_none_or(|r| !stable_member_report(r, primary, previous))
+        || previous.members.iter().any(|member| {
+            report(snapshot, &member.identity).is_some_and(|r| {
+                !stable_member_report(r, member, previous)
+                    || r.prepared_switchover.is_some()
+                    || r.prepared_secondary_removal.is_some()
+            })
+        })
+    {
+        return Some(wait(
+            status,
+            "ScaleDownAwaitingStableAuthority",
+            "Existing exact authority and local work must finish before admission",
+            config,
+        ));
+    }
+    let Some(number) = previous.epoch.configuration_number.checked_add(1) else {
+        return Some(unsafe_plan(
+            status,
+            UnsafeReason::InvalidAcceptedAuthority(
+                "Scale-down configuration epoch exhausted".into(),
+            ),
+            config,
+        ));
+    };
+    let current_policy =
+        EffectivePolicy::fixed(policy.replica_set_size - 1, policy.failover_delay_seconds)
+            .expect("positive reduced policy");
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(previous.epoch.data_loss_number, number),
+        previous.primary_id,
+        previous
+            .members
+            .iter()
+            .filter(|m| m.identity != target.identity)
+            .cloned()
+            .collect(),
+        current_policy.write_quorum,
+    );
+    let mut intent = SecondaryScaleDownIntent {
+        operation_id: OperationId::default(),
+        resource_uid: snapshot.resource_uid.clone(),
+        spec_generation: snapshot.desired.generation,
+        desired_replicas: snapshot.desired.replicas,
+        previous_configuration: previous.clone(),
+        current_configuration: current.clone(),
+        previous_policy: policy.clone(),
+        current_policy: current_policy.clone(),
+        primary: primary.identity.clone(),
+        target: target.identity.clone(),
+        cleanup: exact.identity.clone(),
+    };
+    intent.operation_id = intent.expected_operation_id();
+    if let Err(error) = validate_secondary_scale_down(&intent) {
+        return Some(unsafe_plan(
+            status,
+            UnsafeReason::InvalidAcceptedAuthority(error.to_string()),
+            config,
+        ));
+    }
+    let mut status = waiting_status(
+        status,
+        "ScaleDownPreparationPending",
+        "Frozen exact highest-ID secondary removal; primary preparation is required",
+    );
+    status.quorum_loss = None;
+    status.transition = Some(TransitionIntent {
+        transition_id: derive_transition_id(
+            &snapshot.resource_uid,
+            TransitionKind::SecondaryScaleDown,
+            &current.configuration_id,
+        ),
+        kind: TransitionKind::SecondaryScaleDown,
+        spec_generation: intent.spec_generation,
+        effective_policy: current_policy,
+        previous_configuration_id: Some(previous.configuration_id.clone()),
+        current_configuration: current,
+        secondary_scale_down: Some(intent),
+        secondary_removal_evidence: None,
+        election_lsn: None,
+        build_id: None,
+        repair: None,
+        switchover: None,
+    });
+    Some(persist(status))
+}
+
+fn witness(report: &AgentReport) -> Option<SecondaryRemovalWitness> {
+    Some(SecondaryRemovalWitness {
+        resource_uid: report.resource_uid.clone(),
+        identity: report.identity.clone(),
+        role: report.role,
+        process_session_id: report.process_session_id.clone(),
+        report_sequence: report.report_sequence,
+        epoch: report.epoch,
+        previous_configuration_id: report
+            .previous_configuration
+            .as_ref()
+            .map(|c| c.configuration_id.clone()),
+        current_configuration_id: report
+            .current_configuration
+            .as_ref()?
+            .configuration_id
+            .clone(),
+        verified_replication_lsn: report.verified_replication_lsn?,
+        write_status: report.write_status,
+        pending_operation_id: report.pending_operation_id.clone(),
+        retained_operation_id: report.retained_operation_id.clone(),
+    })
+}
+
+fn witnesses(
+    snapshot: &ObservationSnapshot,
+    evidence: &SecondaryRemovalEvidence,
+    stage: SecondaryRemovalStage,
+) -> Vec<SecondaryRemovalWitness> {
+    let intent = &evidence.preparation.intent;
+    intent
+        .current_configuration
+        .members
+        .iter()
+        .filter_map(|member| {
+            let r = report(snapshot, &member.identity)?;
+            let old = stage == SecondaryRemovalStage::Prepare;
+            let configuration = if old {
+                &intent.previous_configuration
+            } else {
+                &intent.current_configuration
+            };
+            if r.current_configuration.as_ref() != Some(configuration)
+                || r.previous_configuration.as_ref()
+                    != (stage == SecondaryRemovalStage::PreviousCurrent)
+                        .then_some(&intent.previous_configuration)
+                || r.role != member.role
+                || r.write_status == AccessStatus::Granted
+                || r.pending_operation_id.is_some()
+                || (!old
+                    && r.retained_operation_id.as_ref()
+                        != Some(&intent.command_operation_id(stage, &member.identity)))
+                || (!old
+                    && r.verified_replication_lsn
+                        .is_none_or(|v| v < evidence.preparation.boundary_lsn))
+                || (old
+                    && member.identity == intent.primary
+                    && (r.prepared_secondary_removal.as_ref() != Some(&evidence.preparation)
+                        || r.retained_operation_id.as_ref()
+                            != Some(&evidence.preparation.operation_id)))
+            {
+                return None;
+            }
+            witness(r)
+        })
+        .collect()
+}
+
+fn configuration_command(
+    evidence: &SecondaryRemovalEvidence,
+    identity: &ReplicaIdentity,
+    current_only: bool,
+) -> EnsureConfiguration {
+    let intent = &evidence.preparation.intent;
+    EnsureConfiguration {
+        operation_id: intent.command_operation_id(
+            if current_only {
+                SecondaryRemovalStage::CurrentOnly
+            } else {
+                SecondaryRemovalStage::PreviousCurrent
+            },
+            identity,
+        ),
+        previous_configuration: (!current_only).then(|| intent.previous_configuration.clone()),
+        current_configuration: intent.current_configuration.clone(),
+        previous_epoch: (!current_only).then_some(intent.previous_configuration.epoch),
+        current_epoch: intent.current_configuration.epoch,
+        effective_policy: intent.current_policy.clone(),
+        previous_policy: Some(intent.previous_policy.clone()),
+        secondary_removal_evidence: Some(evidence.clone()),
+        local_replica_id: identity.replica_id,
+        expected_instance_id: identity.instance_id.clone(),
+        expected_agent_generation: identity.agent_generation.clone(),
+        transition_kind: TransitionKind::SecondaryScaleDown,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
+    }
+}
+
+fn dispatch(
+    snapshot: &ObservationSnapshot,
+    evidence: &SecondaryRemovalEvidence,
+    current_only: bool,
+) -> Option<Plan> {
+    let intent = &evidence.preparation.intent;
+    // Admit available secondaries before the unchanged primary. Pending local
+    // catch-up does not prevent dispatch to the primary that supplies it.
+    let mut members = intent
+        .current_configuration
+        .members
+        .iter()
+        .collect::<Vec<_>>();
+    members.sort_by_key(|m| (m.role == ReplicaRole::Primary, m.identity.replica_id));
+    for member in members {
+        let Some(r) = report(snapshot, &member.identity) else {
+            continue;
+        };
+        if r.current_configuration.as_ref() != Some(&intent.current_configuration)
+            && (r.current_configuration.as_ref() != Some(&intent.previous_configuration)
+                || r.previous_configuration.is_some())
+        {
+            continue;
+        }
+        if r.current_configuration.as_ref() == Some(&intent.current_configuration)
+            && (!current_only || r.previous_configuration.is_none())
+        {
+            continue;
+        }
+        // A late member must first admit the frozen PC/CC; never skip authority.
+        let command = if current_only
+            && r.current_configuration.as_ref() != Some(&intent.current_configuration)
+        {
+            let mut admission = evidence.clone();
+            admission.reduced_write_quorum.clear();
+            configuration_command(&admission, &member.identity, false)
+        } else {
+            configuration_command(evidence, &member.identity, current_only)
+        };
+        if r.pending_operation_id
+            .as_ref()
+            .is_some_and(|id| id != &command.operation_id)
+        {
+            continue;
+        }
+        return Some(Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(Box::new(command)),
+        });
+    }
+    None
+}
+
+pub(super) fn transition(
+    snapshot: &ObservationSnapshot,
+    transition: &TransitionIntent,
+    config: &EvaluationConfig,
+) -> Plan {
+    let intent = transition
+        .secondary_scale_down
+        .as_ref()
+        .expect("validated intent");
+    let mut status = drift_status(snapshot, snapshot.status.clone());
+    if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::RemoveWriteRouting],
+        };
+    }
+    let Some(primary) = report(snapshot, &intent.primary) else {
+        return wait(
+            status,
+            "ScaleDownPrimaryUnavailable",
+            "The frozen exact primary must recover; no failover or substitution is permitted",
+            config,
+        );
+    };
+    if primary.role != ReplicaRole::Primary
+        || primary.current_configuration.as_ref().is_none_or(|c| {
+            c != &intent.previous_configuration && c != &intent.current_configuration
+        })
+    {
+        return wait(
+            status,
+            "ScaleDownPrimaryUnavailable",
+            "The frozen exact primary must attest previous or requested authority",
+            config,
+        );
+    }
+    let Some(evidence) = transition.secondary_removal_evidence.as_ref() else {
+        if primary.prepared_secondary_removal.is_none() {
+            if primary.pending_operation_id.as_ref().is_some_and(|id| {
+                id != &intent.command_operation_id(SecondaryRemovalStage::Prepare, &intent.primary)
+            }) {
+                return wait(
+                    status,
+                    "ScaleDownPreparationPending",
+                    "The primary is completing local work",
+                    config,
+                );
+            }
+            return Plan::Execute {
+                command: ProtocolCommand::PrepareSecondaryRemoval(Box::new(
+                    PrepareSecondaryRemoval {
+                        operation_id: intent
+                            .command_operation_id(SecondaryRemovalStage::Prepare, &intent.primary),
+                        local_replica_id: intent.primary.replica_id,
+                        expected_instance_id: intent.primary.instance_id.clone(),
+                        expected_agent_generation: intent.primary.agent_generation.clone(),
+                        intent: intent.clone(),
+                    },
+                )),
+            };
+        }
+        let mut evidence = SecondaryRemovalEvidence {
+            preparation: primary.prepared_secondary_removal.clone().expect("checked"),
+            previous_read_quorum: Vec::new(),
+            reduced_write_quorum: Vec::new(),
+        };
+        evidence.previous_read_quorum =
+            witnesses(snapshot, &evidence, SecondaryRemovalStage::Prepare);
+        if primary.pending_operation_id.is_some()
+            || primary.retained_operation_id.as_ref() != Some(&evidence.preparation.operation_id)
+            || primary
+                .verified_replication_lsn
+                .is_none_or(|lsn| lsn < evidence.preparation.boundary_lsn)
+            || validate_secondary_removal_evidence(&evidence, false).is_err()
+        {
+            return wait(
+                status,
+                "ScaleDownPreviousReadQuorumUnavailable",
+                "Fresh retained accepted-epoch read quorum and verified primary preparation are required",
+                config,
+            );
+        }
+        status
+            .transition
+            .as_mut()
+            .expect("active")
+            .secondary_removal_evidence = Some(evidence);
+        return persist(waiting_status(
+            status,
+            "ScaleDownReducedWriteQuorumUnavailable",
+            "Frozen previous read evidence; converging write-closed reduced PC/CC",
+        ));
+    };
+    if primary.current_configuration.as_ref() == Some(&intent.previous_configuration)
+        && (primary.prepared_secondary_removal.as_ref() != Some(&evidence.preparation)
+            || primary
+                .verified_replication_lsn
+                .is_none_or(|lsn| lsn < evidence.preparation.boundary_lsn))
+    {
+        return wait(
+            status,
+            "ScaleDownPreparationPending",
+            "Recover the exact frozen durable preparation; never replace its boundary",
+            config,
+        );
+    }
+    let current_only = !evidence.reduced_write_quorum.is_empty();
+    if let Some(plan) = dispatch(snapshot, evidence, current_only) {
+        return plan;
+    }
+    if !current_only {
+        let mut evidence = evidence.clone();
+        evidence.reduced_write_quorum =
+            witnesses(snapshot, &evidence, SecondaryRemovalStage::PreviousCurrent);
+        if validate_secondary_removal_evidence(&evidence, true).is_err() {
+            let admitted_quorum = primary.current_configuration.as_ref()
+                == Some(&intent.current_configuration)
+                && intent
+                    .current_configuration
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        report(snapshot, &member.identity).is_some_and(|r| {
+                            r.current_configuration.as_ref() == Some(&intent.current_configuration)
+                                && r.previous_configuration.as_ref()
+                                    == Some(&intent.previous_configuration)
+                        })
+                    })
+                    .count()
+                    >= intent.current_policy.write_quorum as usize;
+            return wait(
+                status,
+                if admitted_quorum {
+                    "ScaleDownReducedCatchUpPending"
+                } else {
+                    "ScaleDownReducedWriteQuorumUnavailable"
+                },
+                "Exact reduced write quorum including the primary must verify the prepared boundary",
+                config,
+            );
+        }
+        status
+            .transition
+            .as_mut()
+            .expect("active")
+            .secondary_removal_evidence = Some(evidence);
+        return persist(waiting_status(
+            status,
+            "ScaleDownCurrentOnlyQuorumUnavailable",
+            "Frozen reduced write evidence; converging fresh current-only write quorum",
+        ));
+    }
+    let cleanup = SecondaryScaleDownCleanup {
+        evidence: evidence.clone(),
+        current_only_write_quorum: witnesses(
+            snapshot,
+            evidence,
+            SecondaryRemovalStage::CurrentOnly,
+        ),
+        retirement: None,
+    };
+    if validate_secondary_scale_down_cleanup(&cleanup).is_err() {
+        return wait(
+            status,
+            "ScaleDownCurrentOnlyQuorumUnavailable",
+            "Fresh completed exact current-only write quorum must cover the prepared boundary",
+            config,
+        );
+    }
+    status.topology = Some(AcceptedTopology {
+        configuration: intent.current_configuration.clone(),
+    });
+    status.effective_policy = Some(intent.current_policy.clone());
+    status.transition = None;
+    status.quorum_loss = None;
+    status.secondary_scale_down_cleanup = Some(cleanup);
+    persist(waiting_status(
+        status,
+        "ScaleDownRetirementPending",
+        "Reduced topology and policy committed atomically; exact target retirement and cleanup remain",
+    ))
+}
+
+fn delete(
+    resource: ScaleDownResource,
+    identity: &CleanupResourceIdentity,
+    observation: &ExactResourceObservation,
+) -> Option<KubernetesChange> {
+    match (identity, observation) {
+        (
+            CleanupResourceIdentity::Present { name, uid },
+            ExactResourceObservation::FrozenUidPresent { resource_version },
+        ) if !resource_version.is_empty() => Some(KubernetesChange::DeleteScaleDownResource {
+            resource,
+            name: name.clone(),
+            uid: uid.clone(),
+            resource_version: resource_version.clone(),
+        }),
+        _ => None,
+    }
+}
+
+pub(super) fn cleanup(
+    snapshot: &ObservationSnapshot,
+    cleanup: &SecondaryScaleDownCleanup,
+    config: &EvaluationConfig,
+) -> Plan {
+    let intent = &cleanup.evidence.preparation.intent;
+    let mut status = drift_status(snapshot, snapshot.status.clone());
+    let Some(primary) = report(snapshot, &intent.primary) else {
+        if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+            return Plan::Apply {
+                changes: vec![KubernetesChange::RemoveWriteRouting],
+            };
+        }
+        return wait(
+            status,
+            "ScaleDownPrimaryUnavailable",
+            "Accepted reduced authority remains frozen during cleanup; the exact primary must recover",
+            config,
+        );
+    };
+    if let Some(plan) = dispatch(snapshot, &cleanup.evidence, true) {
+        return plan;
+    }
+    for member in &intent.current_configuration.members {
+        if let Some(r) = report(snapshot, &member.identity)
+            && stable_member_report(r, member, &intent.current_configuration)
+            && r.accepted_secondary_removal
+                .as_ref()
+                .is_none_or(|accepted| {
+                    accepted.evidence != cleanup.evidence
+                        || accepted.current_only_write_quorum != cleanup.current_only_write_quorum
+                })
+        {
+            let mut committed = cleanup.clone();
+            committed.retirement = None;
+            return Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
+                    AcceptSecondaryRemovalCommit {
+                        operation_id: intent.command_operation_id(
+                            SecondaryRemovalStage::AcceptCommit,
+                            &member.identity,
+                        ),
+                        target: member.identity.clone(),
+                        committed,
+                    },
+                )),
+            };
+        }
+    }
+    let quorum = intent
+        .current_configuration
+        .members
+        .iter()
+        .filter(|m| {
+            report(snapshot, &m.identity).is_some_and(|r| {
+                stable_member_report(r, m, &intent.current_configuration)
+                    && r.verified_replication_lsn
+                        .is_some_and(|v| v >= cleanup.evidence.preparation.boundary_lsn)
+            })
+        })
+        .count()
+        >= intent.current_policy.write_quorum as usize;
+    let primary_member = configuration_primary(&intent.current_configuration);
+    if !quorum || !stable_member_report(primary, primary_member, &intent.current_configuration) {
+        if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+            return Plan::Apply {
+                changes: vec![KubernetesChange::RemoveWriteRouting],
+            };
+        }
+        if primary.write_status == AccessStatus::Granted {
+            return access(intent, primary_member, AccessStatus::NoWriteQuorum);
+        }
+        return wait(
+            status,
+            "ScaleDownReducedWriteQuorumUnavailable",
+            "Accepted reduced current-only quorum is unavailable",
+            config,
+        );
+    }
+    if primary.write_status != AccessStatus::Granted {
+        return access(intent, primary_member, AccessStatus::Granted);
+    }
+    if !snapshot.routing.service_present {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::EnsureWriteRoutingService],
+        };
+    }
+    if snapshot.routing.unresolved_write_target
+        || snapshot
+            .routing
+            .write_target
+            .as_ref()
+            .is_some_and(|id| id != &intent.primary)
+    {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::RemoveWriteRouting],
+        };
+    }
+    if snapshot.routing.write_target.is_none() {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PublishWriteRouting {
+                primary: intent.primary.clone(),
+            }],
+        };
+    }
+    let Some(exact) = resources(snapshot, &intent.target).filter(|r| r.identity == intent.cleanup)
+    else {
+        return wait(
+            status,
+            "ScaleDownExactPodAbsenceRequired",
+            "Re-observe frozen resource names and UIDs; label-list omission is not absence",
+            config,
+        );
+    };
+    // Retirement is attempted while its endpoint/session is still available.
+    // A committed tombstone is not a substitute for observing Pod absence.
+    if cleanup.retirement.is_none()
+        && !absent(&intent.cleanup.pod, &exact.pod)
+        && let Some(AgentObservation::Report(target)) = snapshot
+            .observation_for_identity(&intent.target)
+            .map(|r| &r.agent)
+        && !target.process_session_id.is_empty()
+        && target.report_sequence > 0
+    {
+        if let Some(retirement) = &target.retired_replica {
+            status
+                .secondary_scale_down_cleanup
+                .as_mut()
+                .expect("cleanup")
+                .retirement = Some(retirement.clone());
+            return persist(waiting_status(
+                status,
+                "ScaleDownCleanupPending",
+                "Exact target retirement is durable; resource cleanup remains",
+            ));
+        }
+        if target.pending_operation_id.is_none() {
+            return Plan::Execute {
+                command: ProtocolCommand::RetireReplica(Box::new(RetireReplica {
+                    operation_id: intent
+                        .command_operation_id(SecondaryRemovalStage::Retire, &intent.target),
+                    local_replica_id: intent.target.replica_id,
+                    expected_instance_id: intent.target.instance_id.clone(),
+                    expected_agent_generation: intent.target.agent_generation.clone(),
+                    committed: cleanup.clone(),
+                })),
+            };
+        }
+        return wait(
+            status,
+            "ScaleDownRetirementPending",
+            "Exact target retirement is pending",
+            config,
+        );
+    }
+    for (resource, identity, observation, reason) in [
+        (
+            ScaleDownResource::Endpoint,
+            &intent.cleanup.endpoint,
+            &exact.endpoint,
+            "ScaleDownCleanupPending",
+        ),
+        (
+            ScaleDownResource::Pod,
+            &intent.cleanup.pod,
+            &exact.pod,
+            "ScaleDownExactPodFencePending",
+        ),
+        (
+            ScaleDownResource::Pvc,
+            &intent.cleanup.pvc,
+            &exact.pvc,
+            "ScaleDownCleanupPending",
+        ),
+    ] {
+        if absent(identity, observation) {
+            continue;
+        }
+        let status = waiting_status(
+            status,
+            reason,
+            "Post-commit cleanup is limited to frozen UIDs; PVC deletion requires authoritative Pod absence",
+        );
+        if let Some(change) = delete(resource, identity, observation) {
+            if status != snapshot.status {
+                return persist(status);
+            }
+            return Plan::Apply {
+                changes: vec![change],
+            };
+        }
+        return wait(
+            status,
+            if resource == ScaleDownResource::Pod {
+                "ScaleDownExactPodAbsenceRequired"
+            } else {
+                reason
+            },
+            "An authoritative exact-name lookup is required; no absence inferred from lists or RPC failure",
+            config,
+        );
+    }
+    status.secondary_scale_down_cleanup = None;
+    persist(waiting_status(
+        status,
+        "ScaleDownCleanupComplete",
+        "Exact cleanup completed; re-observe latest desired state before another removal",
+    ))
+}
+
+fn access(
+    intent: &SecondaryScaleDownIntent,
+    primary: &ConfigurationMember,
+    access: AccessStatus,
+) -> Plan {
+    Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(Box::new(ensure_configuration_command(
+            &intent.current_configuration,
+            primary,
+            &intent.current_policy,
+            OperationId::new(format!(
+                "availability:{}:{}",
+                intent.current_configuration.configuration_id,
+                if access == AccessStatus::Granted {
+                    "grant-write"
+                } else {
+                    "no-write-quorum"
+                }
+            )),
+            access,
+            false,
+        ))),
+    }
+}
