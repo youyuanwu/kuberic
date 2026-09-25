@@ -786,9 +786,15 @@ fn check_deleted_target_response(response: Result<(u16, String)>) -> Result<()> 
         {
             Ok(())
         }
+
         Err(error) => Err(error.context("deleted target did not explicitly reject or disconnect")),
         Ok((code, body)) => bail!("unexpected deleted-target response: HTTP {code} {body}"),
     }
+}
+
+fn check_old_session_response(response: Result<(u16, String)>) -> Result<()> {
+    check_deleted_target_response(response)
+        .context("old target process connection did not explicitly reject or disconnect")
 }
 
 fn retains_acknowledged_prefix(
@@ -1599,14 +1605,11 @@ fn planned_switchover_adversarial() -> Result<()> {
                 &cluster.context,
                 case.target["replicaId"].as_i64().unwrap(),
             )?;
-            ensure!(
-                !matches!(
-                    case.target_client
-                        .request("PUT", "/kv/old-session", "forbidden"),
-                    Ok((200, _))
-                ),
-                "old target process connection committed a write"
-            );
+            check_old_session_response(case.target_client.request(
+                "PUT",
+                "/kv/old-session",
+                "forbidden",
+            ))?;
             loop {
                 if let Ok(report) = replica_diagnostics(
                     &cluster.kubeconfig,
@@ -1998,11 +2001,28 @@ fn switchover_deleted_target_requires_rejection_or_disconnect() {
             check_deleted_target_response(Err(io::Error::from(kind)).context("request")).is_ok()
         );
     }
+
     for code in [200, 201, 400, 404, 500] {
         assert!(check_deleted_target_response(Ok((code, String::new()))).is_err());
     }
     assert!(
         check_deleted_target_response(read_http_response(
+            &mut &b"HTTP/1.1 503 Unavailable\r\nContent-Length: 6\r\n\r\nclo"[..]
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn switchover_old_session_probe_rejects_unrelated_failures() {
+    assert!(check_old_session_response(Ok((503, "closed".into()))).is_ok());
+    assert!(
+        check_old_session_response(Err(io::Error::from(io::ErrorKind::ConnectionReset).into()))
+            .is_ok()
+    );
+    assert!(check_old_session_response(Ok((500, "internal".into()))).is_err());
+    assert!(
+        check_old_session_response(read_http_response(
             &mut &b"HTTP/1.1 503 Unavailable\r\nContent-Length: 6\r\n\r\nclo"[..]
         ))
         .is_err()
