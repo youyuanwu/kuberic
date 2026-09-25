@@ -31,6 +31,9 @@ const UID: &str = "set-uid";
 const POD_UID: &str = "pod-uid-1";
 const PVC_UID: &str = "pvc-uid-1";
 
+#[path = "support/secondary_scale_down.rs"]
+mod secondary_scale_down;
+
 fn config() -> EvaluationConfig {
     EvaluationConfig {
         enable_secondary_scale_down: false,
@@ -56,6 +59,7 @@ fn raw(replicas: u32) -> RawObservation {
     set.metadata.resource_version = Some("1".to_string());
     set.metadata.generation = Some(1);
     RawObservation {
+        exact_resources: Vec::new(),
         set,
         pods: Vec::new(),
         pvcs: Vec::new(),

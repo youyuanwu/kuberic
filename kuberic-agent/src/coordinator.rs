@@ -135,6 +135,51 @@ where
             })
     }
 
+    pub async fn accept_secondary_removal_commit(
+        &self,
+        command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+    ) -> Result<()> {
+        let _command = self.command_lock.lock().await;
+        kuberic_protocol::validation::validate_accept_secondary_removal_commit(&command)
+            .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+        let state = self.store.load_state().await?;
+        let intent = &command.committed.evidence.preparation.intent;
+        if state.identity.local_identity != command.target
+            || state.identity.resource_uid != intent.resource_uid
+            || state.retired_authority.is_some()
+            || state.reconfiguration.is_some()
+            || state.previous_configuration.is_some()
+            || state.current_configuration.as_ref() != Some(&intent.current_configuration)
+            || state.secondary_removal_evidence.as_ref() != Some(&command.committed.evidence)
+        {
+            return Err(AgentError::CommandRejected(
+                "commit certificate differs from completed local reduced authority".into(),
+            ));
+        }
+        let action =
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(command.committed.clone()));
+        let effect = if let Some(pending) = &state.pending_effect {
+            if pending.effect.operation_id != command.operation_id
+                || pending.effect.action != action
+            {
+                return Err(AgentError::EffectConflict(
+                    "commit conflicts with pending work".into(),
+                ));
+            }
+            pending.effect.clone()
+        } else if state.accepted_secondary_removal.as_ref() == Some(&command.committed) {
+            return Ok(());
+        } else {
+            RuntimeEffect {
+                operation_id: command.operation_id,
+                sequence: state.next_effect_sequence,
+                action,
+            }
+        };
+        self.runtime.execute(effect).await?;
+        Ok(())
+    }
+
     pub async fn ensure_replica_retired(
         &self,
         command: RetireReplica,

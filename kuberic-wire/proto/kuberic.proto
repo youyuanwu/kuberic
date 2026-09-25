@@ -143,6 +143,7 @@ message AgentStatusReport {
   SecondaryRemovalPreparation prepared_secondary_removal = 33;
   SecondaryRemovalEvidence secondary_removal_evidence = 34;
   ReplicaRetirementReport retired_replica = 35;
+  SecondaryScaleDownCleanup accepted_secondary_removal = 36;
 }
 
 message InitializeAgentStoreCommand {
@@ -297,6 +298,12 @@ message RetireReplicaCommand {
   SecondaryScaleDownCleanup committed = 5;
 }
 
+message AcceptSecondaryRemovalCommitCommand {
+  string operation_id = 1;
+  ReplicaIdentity target = 2;
+  SecondaryScaleDownCleanup committed = 3;
+}
+
 message PrepareSwitchoverCommand {
   string operation_id = 1;
   string request_id = 2;
@@ -331,6 +338,7 @@ message ExecuteCommandRequest {
     PrepareSwitchoverCommand prepare_switchover = 13;
     PrepareSecondaryRemovalCommand prepare_secondary_removal = 14;
     RetireReplicaCommand retire_replica = 15;
+    AcceptSecondaryRemovalCommitCommand accept_secondary_removal_commit = 16;
   }
 }
 

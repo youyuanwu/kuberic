@@ -34,8 +34,23 @@ use tonic::{Code, Request};
 #[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
 mod scale_down_fixture;
 
-#[tokio::test]
-async fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
+#[test]
+fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(secondary_removal_rpc_replay());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn secondary_removal_rpc_replay() {
     use kuberic_protocol::types::{AccessStatus, ReplicaRole};
     use kuberic_runtime_internal::authority::{AdmittedAuthority, ReplicaAuthorityStore};
     let intent = scale_down_fixture::intent(&[1, 2], 1);
@@ -88,7 +103,8 @@ async fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
         let mut old_session = String::new();
         let mut terminal_preparation = None;
         let mut terminal_retirement = None;
-        for restart in 0..2 {
+        let mut terminal_commit: Option<kuberic_protocol::types::SecondaryScaleDownCleanup> = None;
+        for restart in 0..3 {
             let store = Arc::new(SqliteStore::open_existing(&path, Some(&provenance)).unwrap());
             let runtime = Arc::new(PodRuntime::new(
                 local.clone(),
@@ -117,7 +133,19 @@ async fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
             ))
             .await
             .unwrap();
-            let command = if retiring {
+            let command = if let Some(committed) = &terminal_commit {
+                proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(Box::new(
+                    kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+                        operation_id: intent.command_operation_id(
+                            kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                            &local,
+                        ),
+                        target: local.clone(),
+                        committed: committed.clone(),
+                    }
+                    .into(),
+                ))
+            } else if retiring {
                 proto::execute_command_request::Command::RetireReplica(Box::new(
                     scale_down_fixture::retire_command(&intent).into(),
                 ))
@@ -166,9 +194,15 @@ async fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
             if restart == 0 {
                 terminal_preparation = report.prepared_secondary_removal.clone();
                 terminal_retirement = report.retired_replica.clone();
-            } else {
+            } else if terminal_commit.is_none() {
                 assert_eq!(report.prepared_secondary_removal, terminal_preparation);
                 assert_eq!(report.retired_replica, terminal_retirement);
+            } else {
+                assert_eq!(
+                    report.accepted_secondary_removal,
+                    terminal_commit.clone().map(Into::into)
+                );
+                assert!(report.prepared_secondary_removal.is_none());
             }
             let duplicate = client
                 .execute(request(&session, command.clone()))
@@ -251,6 +285,50 @@ async fn secondary_removal_rpc_replays_exact_receipts_in_new_sessions() {
                     store.load_state().await.unwrap().admitted_policy,
                     Some(intent.current_policy.clone())
                 );
+                let state = store.load_state().await.unwrap();
+                let mut committed = scale_down_fixture::cleanup(&intent);
+                committed.evidence = state.secondary_removal_evidence.clone().unwrap();
+                let accept = kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+                    operation_id: intent.command_operation_id(
+                        kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                        &local,
+                    ),
+                    target: local.clone(),
+                    committed: committed.clone(),
+                };
+                let command = proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(
+                    Box::new(accept.into()),
+                );
+                let before = store.load_state().await.unwrap();
+                assert_eq!(
+                    client
+                        .execute(request(&old_session, command.clone()))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::FailedPrecondition
+                );
+                assert_eq!(store.load_state().await.unwrap(), before);
+                for _ in 0..2 {
+                    let report = client
+                        .execute(request(&session, command.clone()))
+                        .await
+                        .unwrap()
+                        .into_inner()
+                        .observation
+                        .unwrap();
+                    kuberic_wire::normalize_agent_status_report(report.clone()).unwrap();
+                    assert_eq!(
+                        report.accepted_secondary_removal,
+                        Some(committed.clone().into())
+                    );
+                    assert!(report.prepared_secondary_removal.is_none());
+                }
+                assert_eq!(
+                    store.load_state().await.unwrap().accepted_secondary_removal,
+                    Some(committed.clone())
+                );
+                terminal_commit = Some(committed);
             }
             old_session = session;
             shutdown.send_replace(true);

@@ -1,5 +1,6 @@
 pub mod cluster_api;
 pub mod crd;
+mod exact_resources;
 pub mod executor;
 pub mod normalize;
 pub mod observation;

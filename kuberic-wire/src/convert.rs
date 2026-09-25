@@ -175,6 +175,7 @@ pub fn normalize_agent_status_report(
                 || report.prepared_secondary_removal.is_some()
                 || report.secondary_removal_evidence.is_some()
                 || report.retired_replica.is_some()
+                || report.accepted_secondary_removal.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
@@ -321,7 +322,10 @@ pub fn normalize_agent_status_report(
                 report.secondary_removal_evidence.is_some(),
             )?;
             let report = AgentReport {
-                accepted_secondary_removal: None,
+                accepted_secondary_removal: report
+                    .accepted_secondary_removal
+                    .map(TryInto::try_into)
+                    .transpose()?,
                 protocol_version: report.protocol_version,
                 resource_uid: ResourceUid::new(report.resource_uid),
                 identity,
@@ -382,6 +386,7 @@ pub fn normalize_agent_status_report(
                 || report.prepared_secondary_removal.is_some()
                 || report.secondary_removal_evidence.is_some()
                 || report.retired_replica.is_some()
+                || report.accepted_secondary_removal.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "unsafe storage report contains untrusted authority".to_string(),
@@ -411,6 +416,15 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
         .as_ref()
         .ok_or(WireError::MissingField("execute.command"))?;
     match command {
+        proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(command) => {
+            let command: kuberic_protocol::command::AcceptSecondaryRemovalCommit =
+                (**command).clone().try_into()?;
+            validate_removal_envelope(
+                request,
+                &command.committed.evidence.preparation.intent.resource_uid,
+                &command.target,
+            )
+        }
         proto::execute_command_request::Command::PrepareSecondaryRemoval(command) => {
             let command: kuberic_protocol::command::PrepareSecondaryRemoval =
                 (**command).clone().try_into()?;
@@ -938,6 +952,9 @@ pub fn normalize_execute_request(
         }
         proto::execute_command_request::Command::RetireReplica(command) => {
             ProtocolCommand::RetireReplica(Box::new((*command).try_into()?))
+        }
+        proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(command) => {
+            ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new((*command).try_into()?))
         }
         proto::execute_command_request::Command::InitializeAgentStore(command) => {
             ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {

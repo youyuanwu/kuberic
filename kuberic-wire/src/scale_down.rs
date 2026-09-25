@@ -1,4 +1,6 @@
-use kuberic_protocol::command::{PrepareSecondaryRemoval, RetireReplica};
+use kuberic_protocol::command::{
+    AcceptSecondaryRemovalCommit, PrepareSecondaryRemoval, RetireReplica,
+};
 use kuberic_protocol::types::*;
 use kuberic_protocol::validation::*;
 
@@ -448,6 +450,29 @@ impl From<RetireReplica> for proto::RetireReplicaCommand {
             expected_agent_generation: value.expected_agent_generation.to_string(),
             committed: Some(value.committed.into()),
         }
+    }
+}
+
+impl From<AcceptSecondaryRemovalCommit> for proto::AcceptSecondaryRemovalCommitCommand {
+    fn from(value: AcceptSecondaryRemovalCommit) -> Self {
+        Self {
+            operation_id: value.operation_id.to_string(),
+            target: Some(value.target.into()),
+            committed: Some(value.committed.into()),
+        }
+    }
+}
+
+impl TryFrom<proto::AcceptSecondaryRemovalCommitCommand> for AcceptSecondaryRemovalCommit {
+    type Error = WireError;
+    fn try_from(value: proto::AcceptSecondaryRemovalCommitCommand) -> Result<Self, Self::Error> {
+        let command = Self {
+            operation_id: OperationId::new(value.operation_id),
+            target: required(value.target, "accept_removal.target")?.try_into()?,
+            committed: required(value.committed, "accept_removal.committed")?.try_into()?,
+        };
+        validate_accept_secondary_removal_commit(&command).map_err(authority)?;
+        Ok(command)
     }
 }
 

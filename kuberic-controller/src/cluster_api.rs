@@ -15,7 +15,7 @@ use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Precon
 use kube::{Api, Client, Resource, ResourceExt};
 use kuberic_protocol::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
-    ProtocolCommand,
+    ProtocolCommand, ScaleDownResource,
 };
 use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
@@ -32,7 +32,9 @@ use crate::crd::{
     CONTROL_ADDRESS_ANNOTATION, CONTROLLER_NAME, INSTANCE_LABEL, KubericSet, KubericSetStatus,
     REPLICA_ID_LABEL, SET_UID_LABEL,
 };
-use crate::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
+use crate::observation::{
+    ExactLookup, RawAgentObservation, RawObservation, RawObservationFailure, RawScaleDownResources,
+};
 use crate::{ControllerError, Result};
 
 const CONTROL_PORT: i32 = 50051;
@@ -40,6 +42,12 @@ const REPLICATION_PORT: i32 = 50052;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectRecord {
+    DeleteScaleDownResource {
+        resource: ScaleDownResource,
+        name: String,
+        uid: String,
+        resource_version: String,
+    },
     EnsureReplicaSupport,
     EnsureScaffolding(Vec<ReplicaId>),
     EnsureReplacement(ReplicaIdentity),
@@ -84,6 +92,15 @@ pub trait AgentApi: Send + Sync {
 #[async_trait]
 pub trait ClusterApi: Send + Sync {
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation>;
+
+    async fn delete_scale_down_resource(
+        &self,
+        observation: &RawObservation,
+        resource: ScaleDownResource,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()>;
 
     async fn ensure_replica_scaffolding(
         &self,
@@ -226,7 +243,14 @@ fn classify_status(status: tonic::Status) -> AgentRpcError {
 fn classify_execute_status(status: tonic::Status) -> AgentRpcError {
     // Session or authority may have advanced after GetStatus. A rejected
     // dispatch is not a contradictory report and must be resolved by observing.
-    if matches!(status.code(), Code::FailedPrecondition | Code::Aborted) {
+    if matches!(
+        status.code(),
+        Code::FailedPrecondition
+            | Code::Aborted
+            | Code::Internal
+            | Code::Unknown
+            | Code::ResourceExhausted
+    ) {
         AgentRpcError::Unavailable(status.to_string())
     } else {
         classify_status(status)
@@ -260,6 +284,46 @@ impl<A> ClusterApi for KubeClusterApi<A>
 where
     A: AgentApi + 'static,
 {
+    async fn delete_scale_down_resource(
+        &self,
+        observation: &RawObservation,
+        resource: ScaleDownResource,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()> {
+        let params = scale_down_delete_params(observation, resource, name, uid, resource_version)?;
+        let namespace = observation
+            .set
+            .namespace()
+            .ok_or(ControllerError::ObservationStale)?;
+        match resource {
+            ScaleDownResource::Pod => {
+                delete_scale_down_exact(
+                    &Api::<Pod>::namespaced(self.client.clone(), &namespace),
+                    name,
+                    &params,
+                )
+                .await
+            }
+            ScaleDownResource::Pvc => {
+                delete_scale_down_exact(
+                    &Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), &namespace),
+                    name,
+                    &params,
+                )
+                .await
+            }
+            ScaleDownResource::Endpoint => {
+                delete_scale_down_exact(
+                    &Api::<Service>::namespaced(self.client.clone(), &namespace),
+                    name,
+                    &params,
+                )
+                .await
+            }
+        }
+    }
     async fn observe(&self, namespace: &str, name: &str) -> Result<RawObservation> {
         let sets: Api<KubericSet> = Api::namespaced(self.client.clone(), namespace);
         let set = sets
@@ -287,16 +351,55 @@ where
         let services = list_or_failure(services_result, "services", &mut failures);
         let secrets = list_or_failure(secrets_result, "secrets", &mut failures);
         let resource_uid = ResourceUid::new(uid);
-        let agent_requests = pods
+        let mut raw = RawObservation {
+            set,
+            pods,
+            pvcs,
+            services,
+            secrets,
+            failures,
+            agents: BTreeMap::new(),
+            exact_resources: Vec::new(),
+            now_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| ControllerError::Observation(error.to_string()))?
+                .as_secs() as i64,
+        };
+        for (target, identity, frozen) in crate::exact_resources::requests(&raw) {
+            let (pod, pvc, endpoint) = tokio::join!(
+                exact_lookup(&pods_api, crate::exact_resources::name(&identity.pod)),
+                exact_lookup(&pvcs_api, crate::exact_resources::name(&identity.pvc)),
+                exact_lookup(
+                    &services_api,
+                    crate::exact_resources::name(&identity.endpoint)
+                ),
+            );
+            crate::exact_resources::finish(
+                &mut raw,
+                RawScaleDownResources {
+                    target,
+                    identity,
+                    pod,
+                    pvc,
+                    endpoint,
+                },
+                frozen,
+            );
+        }
+        let agent_requests = raw
+            .pods
             .iter()
             .filter_map(|pod| {
-                let replica_id = pod
-                    .labels()
-                    .get(REPLICA_ID_LABEL)?
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .map(ReplicaId::new)?;
+                let replica_id = crate::exact_resources::frozen_pod_target(&raw, pod)
+                    .map(|t| t.replica_id)
+                    .or_else(|| {
+                        pod.labels()
+                            .get(REPLICA_ID_LABEL)?
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|value| *value > 0)
+                            .map(ReplicaId::new)
+                    })?;
                 Some((replica_id, pod.clone()))
             })
             .map(|(replica_id, pod)| {
@@ -311,24 +414,12 @@ where
                     )
                 }
             });
-        let agents = join_all(agent_requests)
+        raw.agents = join_all(agent_requests)
             .await
             .into_iter()
             .collect::<BTreeMap<_, _>>();
 
-        Ok(RawObservation {
-            set,
-            pods,
-            pvcs,
-            services,
-            secrets,
-            agents,
-            failures,
-            now_unix_seconds: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| ControllerError::Observation(error.to_string()))?
-                .as_secs() as i64,
-        })
+        Ok(raw)
     }
 
     async fn ensure_replica_scaffolding(
@@ -553,6 +644,11 @@ where
         pvc_name: Option<&str>,
         pvc_uid: Option<&PvcUid>,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, pod_name, pod_uid.map(PodUid::as_str))
+            || crate::exact_resources::protected(observation, pvc_name, pvc_uid.map(PvcUid::as_str))
+        {
+            return Err(ControllerError::ObservationStale);
+        }
         let namespace = observation
             .set
             .namespace()
@@ -605,6 +701,9 @@ where
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+            return Err(ControllerError::ObservationStale);
+        }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
         let namespace = observation
             .set
@@ -633,6 +732,9 @@ where
             .map(ResourceUid::new)
             .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
         let name = derive_replica_endpoint_name(&resource_uid, identity);
+        if crate::exact_resources::protected(observation, Some(&name), None) {
+            return Err(ControllerError::ObservationStale);
+        }
         let Some(service) = observation
             .services
             .iter()
@@ -761,9 +863,12 @@ where
             .pods
             .iter()
             .find(|pod| {
-                pod.labels()
-                    .get(REPLICA_ID_LABEL)
-                    .is_some_and(|value| value == &replica_id.to_string())
+                (crate::exact_resources::frozen_pod_target(observation, pod)
+                    .is_some_and(|t| t == &target)
+                    || pod
+                        .labels()
+                        .get(REPLICA_ID_LABEL)
+                        .is_some_and(|value| value == &replica_id.to_string()))
                     && pod.uid().as_deref() == Some(target.instance_id.as_str())
             })
             .ok_or(ControllerError::ObservationStale)?;
@@ -1643,10 +1748,10 @@ fn command_request(
     command: ProtocolCommand,
 ) -> Result<proto::ExecuteCommandRequest> {
     let command = match command {
-        ProtocolCommand::AcceptSecondaryRemovalCommit(_) => {
-            return Err(ControllerError::Effect(
-                "secondary scale-down commit publication is not enabled".into(),
-            ));
+        ProtocolCommand::AcceptSecondaryRemovalCommit(command) => {
+            proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(Box::new(
+                (*command).into(),
+            ))
         }
         ProtocolCommand::PrepareSecondaryRemoval(command) => {
             proto::execute_command_request::Command::PrepareSecondaryRemoval(Box::new(
@@ -1818,6 +1923,8 @@ struct InMemoryState {
     max_active_observations: usize,
     observation_delay: Duration,
     unavailable_next_execute: bool,
+    lost_next_delete_reply: bool,
+    exact_lookup_failures: BTreeMap<String, String>,
 }
 
 impl InMemoryClusterApi {
@@ -1832,6 +1939,8 @@ impl InMemoryClusterApi {
                 max_active_observations: 0,
                 observation_delay: Duration::ZERO,
                 unavailable_next_execute: false,
+                lost_next_delete_reply: false,
+                exact_lookup_failures: BTreeMap::new(),
             })),
         }
     }
@@ -1850,6 +1959,19 @@ impl InMemoryClusterApi {
 
     pub async fn unavailable_next_execute(&self) {
         self.state.lock().await.unavailable_next_execute = true;
+    }
+
+    pub async fn lose_next_delete_reply(&self) {
+        self.state.lock().await.lost_next_delete_reply = true;
+    }
+
+    pub async fn fail_exact_lookup(&self, kind_and_name: String, message: Option<String>) {
+        let mut state = self.state.lock().await;
+        if let Some(message) = message {
+            state.exact_lookup_failures.insert(kind_and_name, message);
+        } else {
+            state.exact_lookup_failures.remove(&kind_and_name);
+        }
     }
 
     pub async fn effects(&self) -> Vec<EffectRecord> {
@@ -1871,6 +1993,39 @@ impl InMemoryClusterApi {
 
 #[async_trait]
 impl ClusterApi for InMemoryClusterApi {
+    async fn delete_scale_down_resource(
+        &self,
+        observation: &RawObservation,
+        resource: ScaleDownResource,
+        name: &str,
+        uid: &str,
+        resource_version: &str,
+    ) -> Result<()> {
+        let params = scale_down_delete_params(observation, resource, name, uid, resource_version)?;
+        let mut state = self.state.lock().await;
+        if state.observation.set.resource_version() != observation.set.resource_version() {
+            return Err(ControllerError::ObservationStale);
+        }
+        match resource {
+            ScaleDownResource::Pod => memory_delete(&mut state.observation.pods, name, &params)?,
+            ScaleDownResource::Pvc => memory_delete(&mut state.observation.pvcs, name, &params)?,
+            ScaleDownResource::Endpoint => {
+                memory_delete(&mut state.observation.services, name, &params)?
+            }
+        }
+        state.effects.push(EffectRecord::DeleteScaleDownResource {
+            resource,
+            name: name.into(),
+            uid: uid.into(),
+            resource_version: resource_version.into(),
+        });
+        if state.lost_next_delete_reply {
+            state.lost_next_delete_reply = false;
+            return Err(ControllerError::ObservationStale);
+        }
+        Ok(())
+    }
+
     async fn observe(&self, _namespace: &str, _name: &str) -> Result<RawObservation> {
         let delay = {
             let mut state = self.state.lock().await;
@@ -1883,7 +2038,48 @@ impl ClusterApi for InMemoryClusterApi {
         tokio::time::sleep(delay).await;
         let mut state = self.state.lock().await;
         state.active_observations -= 1;
-        Ok(state.observation.clone())
+        let physical = &state.observation;
+        let mut raw = physical.clone();
+        raw.exact_resources.clear();
+        let uid = raw.set.uid().unwrap_or_default();
+        raw.pods
+            .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
+        raw.pvcs
+            .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
+        raw.services
+            .retain(|p| p.labels().get(SET_UID_LABEL) == Some(&uid));
+        for (target, identity, frozen) in crate::exact_resources::requests(&raw) {
+            let pod = memory_lookup(
+                &physical.pods,
+                "Pod",
+                crate::exact_resources::name(&identity.pod),
+                &state.exact_lookup_failures,
+            );
+            let pvc = memory_lookup(
+                &physical.pvcs,
+                "PVC",
+                crate::exact_resources::name(&identity.pvc),
+                &state.exact_lookup_failures,
+            );
+            let endpoint = memory_lookup(
+                &physical.services,
+                "Service",
+                crate::exact_resources::name(&identity.endpoint),
+                &state.exact_lookup_failures,
+            );
+            crate::exact_resources::finish(
+                &mut raw,
+                RawScaleDownResources {
+                    target,
+                    identity,
+                    pod,
+                    pvc,
+                    endpoint,
+                },
+                frozen,
+            );
+        }
+        Ok(raw)
     }
 
     async fn ensure_replica_scaffolding(
@@ -1979,12 +2175,17 @@ impl ClusterApi for InMemoryClusterApi {
 
     async fn delete_replica_scaffolding(
         &self,
-        _observation: &RawObservation,
+        observation: &RawObservation,
         pod_name: Option<&str>,
-        _pod_uid: Option<&PodUid>,
+        pod_uid: Option<&PodUid>,
         pvc_name: Option<&str>,
-        _pvc_uid: Option<&PvcUid>,
+        pvc_uid: Option<&PvcUid>,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, pod_name, pod_uid.map(PodUid::as_str))
+            || crate::exact_resources::protected(observation, pvc_name, pvc_uid.map(PvcUid::as_str))
+        {
+            return Err(ControllerError::ObservationStale);
+        }
         let mut state = self.state.lock().await;
         if let Some(name) = pod_name {
             state.observation.pods.retain(|pod| pod.name_any() != name);
@@ -2004,6 +2205,9 @@ impl ClusterApi for InMemoryClusterApi {
         pod_name: &str,
         pod_uid: &PodUid,
     ) -> Result<()> {
+        if crate::exact_resources::protected(observation, Some(pod_name), Some(pod_uid.as_str())) {
+            return Err(ControllerError::ObservationStale);
+        }
         let params = exact_pod_delete_params(observation, pod_name, pod_uid)?;
         let mut state = self.state.lock().await;
         if let Some(pod) = state
@@ -2042,6 +2246,9 @@ impl ClusterApi for InMemoryClusterApi {
             .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
         let name = derive_replica_endpoint_name(&resource_uid, identity);
         let mut state = self.state.lock().await;
+        if crate::exact_resources::protected(observation, Some(&name), None) {
+            return Err(ControllerError::ObservationStale);
+        }
         state
             .observation
             .services
@@ -2172,10 +2379,25 @@ impl ClusterApi for InMemoryClusterApi {
 
     async fn execute_command(
         &self,
-        _observation: &RawObservation,
+        observation: &RawObservation,
         command: &ProtocolCommand,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
+        let (target, replica_id) = command_target(command);
+        let session = observed_process_session(observation, replica_id, &target)?;
+        if observed_process_session(&state.observation, replica_id, &target)? != session {
+            return Err(ControllerError::ObservationStale);
+        }
+        kuberic_wire::validate_execute_request(&command_request(
+            observation
+                .set
+                .uid()
+                .ok_or(ControllerError::ObservationStale)?,
+            target,
+            session,
+            command.clone(),
+        )?)
+        .map_err(|e| ControllerError::InvalidAgentEvidence(e.to_string()))?;
         state.effects.push(EffectRecord::Execute(command.clone()));
         if state.unavailable_next_execute {
             state.unavailable_next_execute = false;
@@ -2184,6 +2406,116 @@ impl ClusterApi for InMemoryClusterApi {
             ));
         }
         Ok(())
+    }
+}
+
+fn memory_lookup<K: ResourceExt + Clone>(
+    objects: &[K],
+    kind: &str,
+    name: &str,
+    failures: &BTreeMap<String, String>,
+) -> ExactLookup<K> {
+    if let Some(message) = failures.get(&format!("{kind}/{name}")) {
+        ExactLookup::Failed(message.clone())
+    } else {
+        objects
+            .iter()
+            .find(|o| o.name_any() == name)
+            .cloned()
+            .map(ExactLookup::Present)
+            .unwrap_or(ExactLookup::NotFound)
+    }
+}
+
+fn memory_delete<K: ResourceExt>(
+    objects: &mut Vec<K>,
+    name: &str,
+    params: &DeleteParams,
+) -> Result<()> {
+    let object = objects
+        .iter()
+        .find(|o| o.name_any() == name)
+        .ok_or(ControllerError::ObservationStale)?;
+    let conditions = params
+        .preconditions
+        .as_ref()
+        .ok_or(ControllerError::ObservationStale)?;
+    if object.uid() != conditions.uid
+        || (conditions.resource_version.is_some()
+            && object.resource_version() != conditions.resource_version)
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    if object.meta().finalizers.as_ref().is_none_or(Vec::is_empty) {
+        objects.retain(|o| o.name_any() != name);
+    }
+    Ok(())
+}
+
+async fn exact_lookup<K>(api: &Api<K>, name: &str) -> ExactLookup<K>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned + kube::Resource<DynamicType = ()>,
+{
+    match api.get(name).await {
+        Ok(object) => ExactLookup::Present(object),
+        Err(kube::Error::Api(response)) if response.code == 404 => ExactLookup::NotFound,
+        Err(error) => ExactLookup::Failed(error.to_string()),
+    }
+}
+
+fn scale_down_delete_params(
+    observation: &RawObservation,
+    resource: ScaleDownResource,
+    name: &str,
+    uid: &str,
+    resource_version: &str,
+) -> Result<DeleteParams> {
+    // Re-evaluate the immutable observation at the effect boundary. Only the
+    // active accepted cleanup receipt can authorize this exact single deletion.
+    let snapshot = crate::normalize::normalize(observation.clone(), BTreeMap::new())?;
+    let plan = kuberic_protocol::evaluator::evaluate(
+        &snapshot,
+        &kuberic_protocol::evaluator::EvaluationConfig {
+            enable_secondary_scale_down: true,
+            ..Default::default()
+        },
+    );
+    let expected = kuberic_protocol::command::KubernetesChange::DeleteScaleDownResource {
+        resource,
+        name: name.into(),
+        uid: uid.into(),
+        resource_version: resource_version.into(),
+    };
+    if !matches!(plan, kuberic_protocol::plan::Plan::Apply { changes } if changes == vec![expected])
+    {
+        return Err(ControllerError::ObservationStale);
+    }
+    Ok(DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: Some(uid.into()),
+            resource_version: Some(resource_version.into()),
+        }),
+        ..Default::default()
+    })
+}
+
+async fn delete_scale_down_exact<K>(api: &Api<K>, name: &str, params: &DeleteParams) -> Result<()>
+where
+    K: Clone + std::fmt::Debug + serde::de::DeserializeOwned + kube::Resource<DynamicType = ()>,
+{
+    match api.delete(name, params).await {
+        Ok(_) => Ok(()),
+        // A racing 404 or an ambiguous response requires another exact GET.
+        Err(kube::Error::Api(response))
+            if matches!(response.code, 404 | 408 | 409 | 412 | 422 | 429 | 500..=599) =>
+        {
+            Err(ControllerError::ObservationStale)
+        }
+        Err(error @ kube::Error::Api(_)) => Err(map_kube_effect_error(error)),
+        Err(error) => {
+            tracing::warn!(%error, %name, "exact deletion reply is unconfirmed; re-observe");
+            Err(ControllerError::ObservationStale)
+        }
     }
 }
 
@@ -2279,6 +2611,104 @@ mod tests {
         }
     }
 
+    async fn http_response(
+        status: u16,
+        body: serde_json::Value,
+    ) -> (Client, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 4096];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .map(|value| value.parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            if status == 0 {
+                return String::from_utf8(bytes).unwrap();
+            }
+            let body = body.to_string();
+            stream.write_all(format!("HTTP/1.1 {status} response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        let config = kube::Config::new(format!("http://{address}").parse().unwrap());
+        (Client::try_from(config).unwrap(), server)
+    }
+
+    #[tokio::test]
+    async fn exact_get_and_delete_http_semantics_are_fail_closed() {
+        for code in [404, 403, 500] {
+            let (client, request) = http_response(
+                code,
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                    "message": "exact lookup error", "reason": "error", "code": code,
+                }),
+            )
+            .await;
+            let api = Api::<Pod>::namespaced(client, "tests");
+            let result = exact_lookup(&api, "frozen-pod").await;
+            assert_eq!(matches!(result, ExactLookup::NotFound), code == 404);
+            assert_eq!(matches!(result, ExactLookup::Failed(_)), code != 404);
+            assert!(
+                request
+                    .await
+                    .unwrap()
+                    .starts_with("GET /api/v1/namespaces/tests/pods/frozen-pod ")
+            );
+        }
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some("frozen-uid".into()),
+                resource_version: Some("fresh-rv".into()),
+            }),
+            ..Default::default()
+        };
+        for code in [200, 0, 404, 409, 412, 422, 500] {
+            let (client, request) = http_response(
+                code,
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status",
+                    "status": if code == 200 { "Success" } else { "Failure" },
+                    "message": "delete response", "reason": "response", "code": code,
+                }),
+            )
+            .await;
+            let result = delete_scale_down_exact(
+                &Api::<Pod>::namespaced(client, "tests"),
+                "frozen-pod",
+                &params,
+            )
+            .await;
+            assert_eq!(result.is_ok(), code == 200);
+            if code != 200 {
+                assert!(matches!(result, Err(ControllerError::ObservationStale)));
+            }
+            let request = request.await.unwrap();
+            assert!(request.starts_with("DELETE /api/v1/namespaces/tests/pods/frozen-pod"));
+            let json: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                json["preconditions"],
+                serde_json::json!({"uid": "frozen-uid", "resourceVersion": "fresh-rv"})
+            );
+        }
+    }
+
     #[test]
     fn secondary_removal_encoding_preserves_frozen_authority_and_session_target() {
         let intent = scale_down_fixture::intent(&[2, 8, 19, 40], 40);
@@ -2320,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn secondary_removal_commit_publication_stays_disabled_until_integration() {
+    fn secondary_removal_commit_publication_round_trips() {
         let intent = scale_down_fixture::intent(&[1, 2], 1);
         let command = ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
             kuberic_protocol::command::AcceptSecondaryRemovalCommit {
@@ -2332,15 +2762,19 @@ mod tests {
                 committed: scale_down_fixture::cleanup(&intent),
             },
         ));
-        assert!(matches!(
-            command_request(
-                intent.resource_uid.to_string(),
-                intent.primary,
-                "session".into(),
-                command,
-            ),
-            Err(ControllerError::Effect(_))
-        ));
+        let request = command_request(
+            intent.resource_uid.to_string(),
+            intent.primary,
+            "session".into(),
+            command.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            kuberic_wire::normalize_execute_request(request)
+                .unwrap()
+                .command,
+            command
+        );
     }
 
     #[test]
@@ -2366,6 +2800,7 @@ mod tests {
             })),
         );
         let mut observation = RawObservation {
+            exact_resources: Vec::new(),
             set: KubericSet::new(
                 "db",
                 KubericSetSpec {

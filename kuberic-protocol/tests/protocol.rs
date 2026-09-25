@@ -71,7 +71,11 @@ fn evaluator_scale_down_replays_pending_retirement_but_not_conflicting_work() {
     model.interrupt(original.clone(), CommandBoundary::Effect);
     model.controller_restart();
     assert_eq!(model.plan(), original);
-    assert!(model.deletes.is_empty());
+    assert!(
+        model.deletes.iter().all(
+            |(resource, _)| *resource == kuberic_protocol::command::ScaleDownResource::Endpoint
+        )
+    );
     let mut conflict = model.clone();
     conflict.report(2).pending_operation_id = Some(OperationId::new("different-retirement"));
     assert!(matches!(conflict.plan(), Plan::Wait { .. }));

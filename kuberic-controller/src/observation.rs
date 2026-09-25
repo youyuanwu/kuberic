@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret, Service};
 use kuberic_protocol::observation::ReplicaObservationKey;
+use kuberic_protocol::types::{ReplicaCleanupIdentity, ReplicaIdentity};
 use kuberic_wire::proto;
 
 use crate::crd::KubericSet;
@@ -22,8 +23,25 @@ pub struct RawObservation {
     pub services: Vec<Service>,
     pub secrets: Vec<Secret>,
     pub agents: BTreeMap<ReplicaObservationKey, RawAgentObservation>,
+    pub exact_resources: Vec<RawScaleDownResources>,
     pub failures: Vec<RawObservationFailure>,
     pub now_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExactLookup<T> {
+    Present(T),
+    NotFound,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RawScaleDownResources {
+    pub target: ReplicaIdentity,
+    pub identity: ReplicaCleanupIdentity,
+    pub pod: ExactLookup<Pod>,
+    pub pvc: ExactLookup<PersistentVolumeClaim>,
+    pub endpoint: ExactLookup<Service>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

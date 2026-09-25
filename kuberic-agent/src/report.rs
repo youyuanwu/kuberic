@@ -164,6 +164,7 @@ fn build_report(
         prepared_secondary_removal: state.prepared_secondary_removal.map(Into::into),
         secondary_removal_evidence: state.secondary_removal_evidence.map(Into::into),
         retired_replica: state.retired_authority.map(|r| r.report.into()),
+        accepted_secondary_removal: state.accepted_secondary_removal.map(Into::into),
     }
 }
 

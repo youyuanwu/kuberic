@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reconciler = Arc::new(Reconciler::new(
         api,
         EvaluationConfig {
-            enable_secondary_scale_down: false,
+            enable_secondary_scale_down: true,
             supported_protocol_version: kuberic_protocol::PROTOCOL_VERSION,
             stable_resync_seconds: config.stable_resync_seconds,
             wait_requeue_seconds: config.wait_requeue_seconds,

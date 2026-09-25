@@ -777,7 +777,32 @@ pub(super) fn cleanup(
             config,
         );
     };
-    // Retirement is attempted while its endpoint/session is still available.
+    if !absent(&intent.cleanup.endpoint, &exact.endpoint) {
+        let status = waiting_status(
+            status,
+            "ScaleDownCleanupPending",
+            "Post-commit cleanup is limited to frozen UIDs; PVC deletion requires authoritative Pod absence",
+        );
+        if let Some(change) = delete(
+            ScaleDownResource::Endpoint,
+            &intent.cleanup.endpoint,
+            &exact.endpoint,
+        ) {
+            if status != snapshot.status {
+                return persist(status);
+            }
+            return Plan::Apply {
+                changes: vec![change],
+            };
+        }
+        return wait(
+            status,
+            "ScaleDownCleanupPending",
+            "An authoritative exact endpoint lookup is required",
+            config,
+        );
+    }
+    // Control dispatch uses the exact Pod address, not the removed peer Service.
     // A committed tombstone is not a substitute for observing Pod absence.
     if cleanup.retirement.is_none()
         && !absent(&intent.cleanup.pod, &exact.pod)
@@ -821,12 +846,6 @@ pub(super) fn cleanup(
         );
     }
     for (resource, identity, observation, reason) in [
-        (
-            ScaleDownResource::Endpoint,
-            &intent.cleanup.endpoint,
-            &exact.endpoint,
-            "ScaleDownCleanupPending",
-        ),
         (
             ScaleDownResource::Pod,
             &intent.cleanup.pod,

@@ -23,7 +23,7 @@ mod secondary_scale_down;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluationConfig {
-    /// Pure evaluator capability; production stays disabled until exact effects are integrated.
+    /// Requires exact-resource observation, session-fenced dispatch, and cleanup effects.
     pub enable_secondary_scale_down: bool,
     pub supported_protocol_version: u32,
     pub stable_resync_seconds: u64,

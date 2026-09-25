@@ -5,6 +5,7 @@ fn main() {
         .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.ensure_configuration")
         .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.prepare_secondary_removal")
         .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.retire_replica")
+        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.accept_secondary_removal_commit")
         .compile_protos(
             &["proto/kuberic.proto", "proto/replication.proto"],
             &["proto"],

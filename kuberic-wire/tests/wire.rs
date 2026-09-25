@@ -59,7 +59,20 @@ fn secondary_removal_commands_round_trip_exact_authority_for_sizes_two_through_f
         let intent = scale_down_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
         let prepare = scale_down_fixture::prepare_command(&intent);
         let retire = scale_down_fixture::retire_command(&intent);
+        let accept = kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+            operation_id: intent.command_operation_id(
+                kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                &intent.primary,
+            ),
+            target: intent.primary.clone(),
+            committed: scale_down_fixture::cleanup(&intent),
+        };
         for (wire, target, canonical) in [
+            (
+                Command::AcceptSecondaryRemovalCommit(Box::new(accept.clone().into())),
+                intent.primary.clone(),
+                ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(accept)),
+            ),
             (
                 Command::PrepareSecondaryRemoval(Box::new(prepare.clone().into())),
                 intent.primary.clone(),
@@ -99,6 +112,54 @@ fn secondary_removal_commands_round_trip_exact_authority_for_sizes_two_through_f
     }
     assert_eq!(proto::TransitionKind::PlannedSwitchover as i32, 4);
     assert_eq!(proto::TransitionKind::SecondaryScaleDown as i32, 5);
+}
+
+#[test]
+fn accepted_removal_commit_rejects_mutated_certificates_and_envelopes() {
+    let intent = scale_down_fixture::intent(&[1, 2], 1);
+    let command = kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+        operation_id: intent.command_operation_id(
+            kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+            &intent.primary,
+        ),
+        target: intent.primary.clone(),
+        committed: scale_down_fixture::cleanup(&intent),
+    };
+    let request = removal_request(
+        proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(Box::new(
+            command.into(),
+        )),
+        intent.primary.clone(),
+    );
+    for mutation in 0..7 {
+        let mut invalid = request.clone();
+        let Some(proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(c)) =
+            invalid.command.as_mut()
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => invalid.expected_process_session_id.clear(),
+            1 => invalid.resource_uid = "another-set".into(),
+            2 => invalid.target = Some(intent.target.clone().into()),
+            3 => c.operation_id = "reused-authority".into(),
+            4 => c
+                .committed
+                .as_mut()
+                .unwrap()
+                .current_only_write_quorum
+                .clear(),
+            5 => c.target = None,
+            _ => {
+                c.committed.as_mut().unwrap().retirement =
+                    Some(scale_down_fixture::retirement(&intent).into())
+            }
+        }
+        assert!(
+            normalize_execute_request(invalid).is_err(),
+            "mutation {mutation}"
+        );
+    }
 }
 
 #[test]
@@ -312,6 +373,27 @@ fn secondary_preparation_reduced_authority_and_retirement_reports_round_trip() {
         );
     }
     let retirement = scale_down_fixture::retirement(&intent);
+    report.prepared_secondary_removal = None;
+    report.accepted_secondary_removal = Some(scale_down_fixture::cleanup(&intent).into());
+    let AgentObservation::Report(accepted) = normalize_agent_status_report(report.clone()).unwrap()
+    else {
+        panic!("accepted report")
+    };
+    assert_eq!(
+        accepted.accepted_secondary_removal,
+        Some(scale_down_fixture::cleanup(&intent))
+    );
+    let mut invalid = report.clone();
+    invalid.previous_configuration = Some(intent.previous_configuration.clone().into());
+    assert!(normalize_agent_status_report(invalid).is_err());
+    let mut invalid = report.clone();
+    invalid
+        .accepted_secondary_removal
+        .as_mut()
+        .unwrap()
+        .current_only_write_quorum
+        .clear();
+    assert!(normalize_agent_status_report(invalid).is_err());
     let retired = proto::AgentStatusReport {
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid: intent.resource_uid.to_string(),
