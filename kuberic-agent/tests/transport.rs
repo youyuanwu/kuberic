@@ -91,6 +91,32 @@ async fn reduction_evicts_exact_streams_and_delayed_discovery_cannot_restore_ses
             .await
             .is_ok()
     );
+    transport
+        .queue(OutboundOperation::Replication(ReplicationItem {
+            receiver: replacement.clone(),
+            ..item(3)
+        }))
+        .unwrap();
+    for _ in 0..3 {
+        transport
+            .queue(OutboundOperation::Evict(removed.clone()))
+            .unwrap();
+        registry.retire_peer(&removed).await;
+        assert!(
+            registry
+                .validate_peer(&replacement, "replacement-session", "primary-session")
+                .await
+                .is_ok()
+        );
+        let ResumeWindow::Retained(items) =
+            transport.reconnect_replication(&replacement, 3).unwrap()
+        else {
+            panic!("late exact eviction must preserve the replacement stream")
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].payload.receiver, replacement);
+        assert_eq!(items[0].payload.data, item(3).data);
+    }
 }
 
 #[test]

@@ -945,6 +945,9 @@ fn terminal_switchover_receipt_writer_process() {
 #[path = "support/scale_down_model.rs"]
 mod scale_down_model;
 
+#[path = "support/reduction_traces.rs"]
+mod reduction_traces;
+
 #[test]
 fn scale_down_model_lost_replies_at_intent_pending_and_effect_boundaries() {
     use kuberic_protocol::command::ProtocolCommand;

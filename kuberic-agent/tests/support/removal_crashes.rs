@@ -4,6 +4,7 @@ use kuberic_protocol::types::{FaultType, LoadMetric};
 use kuberic_protocol::types::{
     ProcessSessionId, SecondaryRemovalPreparation, SecondaryScaleDownIntent,
 };
+use kuberic_runtime_internal::authority::LocalWriteJournal;
 
 #[allow(dead_code)]
 #[path = "../../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
@@ -20,6 +21,14 @@ impl CrashStore {
             std::process::exit(73);
         }
     }
+
+    fn effect_hit(&self, point: &str, operation: &OperationId) {
+        self.hit(point);
+        self.hit(&format!(
+            "{point}-{}",
+            operation.as_str().rsplit(':').next().unwrap()
+        ));
+    }
 }
 
 #[async_trait]
@@ -32,17 +41,17 @@ impl AgentStore for CrashStore {
     }
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         let result = self.inner.begin_effect(effect).await?;
-        self.hit("intent");
+        self.effect_hit("intent", &effect.operation_id);
         Ok(result)
     }
     async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()> {
         self.inner.mark_effect_applied(effect).await?;
-        self.hit("applied");
+        self.effect_hit("applied", &effect.operation_id);
         Ok(())
     }
     async fn complete_effect(&self, result: &RuntimeEffectResult) -> Result<()> {
         self.inner.complete_effect(result).await?;
-        self.hit("receipt");
+        self.effect_hit("receipt", &result.operation_id);
         Ok(())
     }
     async fn cancel_effect(&self, effect: &RuntimeEffect) -> Result<()> {
@@ -68,6 +77,7 @@ impl AgentStore for CrashStore {
             .advance_configuration(id, expected, next, lsn)
             .await?;
         self.hit("stage");
+        self.hit(&format!("stage-{expected:?}"));
         Ok(result)
     }
     async fn complete_configuration(&self, id: &OperationId) -> Result<RetainedCommandResult> {
@@ -104,8 +114,15 @@ struct CrashRuntime {
 #[async_trait]
 impl RuntimeEffectExecutor for CrashRuntime {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        let stage = effect
+            .operation_id
+            .as_str()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_string();
         let result = self.runtime.apply_effect(effect).await?;
-        if self.boundary == "runtime" {
+        if self.boundary == "runtime" || self.boundary == format!("runtime-{stage}") {
             std::process::exit(73);
         }
         Ok(result)
@@ -344,7 +361,7 @@ fn real_process_removal_boundaries_preserve_exact_authority_and_values() {
 }
 
 fn run_removal_boundary_matrix() {
-    let boundaries = [
+    let mut boundaries = [
         "prepare:intent",
         "prepare:runtime",
         "prepare:applied",
@@ -372,7 +389,26 @@ fn run_removal_boundary_matrix() {
         "retire:applied",
         "retire:receipt",
         "retire:reply",
-    ];
+    ]
+    .map(str::to_string)
+    .to_vec();
+    for phase in ["joint", "current"] {
+        for (effect, stage) in [
+            ("admit-authority", "AdmitAuthority"),
+            ("demote", "Demote"),
+            ("get-lsn", "GetLsn"),
+            ("deactivate", "Deactivate"),
+            ("replicator-role", "ReplicatorRole"),
+            ("epoch", "Epoch"),
+            ("application-role", "ApplicationRole"),
+            ("activate", "Activate"),
+        ] {
+            for point in ["intent", "runtime", "applied", "receipt"] {
+                boundaries.push(format!("{phase}:{point}-{effect}"));
+            }
+            boundaries.push(format!("{phase}:stage-{stage}"));
+        }
+    }
     for boundary in boundaries {
         eprintln!("recovering {boundary}");
         let directory = tempdir().unwrap();
@@ -385,7 +421,7 @@ fn run_removal_boundary_matrix() {
                 "--nocapture",
             ])
             .env("KUBERIC_REMOVAL_PATH", &path)
-            .env("KUBERIC_REMOVAL_BOUNDARY", boundary)
+            .env("KUBERIC_REMOVAL_BOUNDARY", &boundary)
             .env("RUST_MIN_STACK", "16777216")
             .output()
             .unwrap();
@@ -396,7 +432,9 @@ fn run_removal_boundary_matrix() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        tokio::runtime::Runtime::new()
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap()
             .block_on(Box::pin(async {
                 tokio::time::timeout(
@@ -405,6 +443,18 @@ fn run_removal_boundary_matrix() {
                         let intent = fixture::intent(&[1, 2], 1);
                         let retiring = boundary.starts_with("retire:");
                         let provenance = state(&intent, retiring).identity;
+                        for changed_pod in [true, false] {
+                            let mut wrong = provenance.clone();
+                            if changed_pod {
+                                wrong.pod_uid = PodUid::new("replacement-pod");
+                            } else {
+                                wrong.pvc_uid = PvcUid::new("replacement-pvc");
+                            }
+                            assert!(
+                                SqliteStore::open_existing(&path, Some(&wrong)).is_err(),
+                                "{boundary}: cannot reopen another incarnation's storage"
+                            );
+                        }
                         let store =
                             Arc::new(SqliteStore::open_existing(&path, Some(&provenance)).unwrap());
                         let before = store.load_state().await.unwrap();
@@ -422,6 +472,11 @@ fn run_removal_boundary_matrix() {
                             "token",
                         )
                         .unwrap();
+                        assert_ne!(service.sessions().local_session().as_str(), "session-1");
+                        assert_ne!(
+                            service.sessions().local_session().as_str(),
+                            "target-session-1"
+                        );
                         service
                             .reconstruct_runtime()
                             .await
@@ -456,6 +511,30 @@ fn run_removal_boundary_matrix() {
                             assert_eq!(runtime.snapshot().await.role, ReplicaRole::None);
                             assert!(!runtime.snapshot().await.open);
                             assert!(store.load().await.unwrap().is_none());
+                            let durable = store.load_state().await.unwrap();
+                            let duplicate = coordinator
+                                .ensure_replica_retired(
+                                    fixture::retire_command(&intent),
+                                    service.sessions().local_session().clone(),
+                                    99,
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(receipt, duplicate);
+                            assert_eq!(store.load_state().await.unwrap(), durable);
+                            let mut conflicting = fixture::retire_command(&intent);
+                            conflicting.committed.evidence.preparation.boundary_lsn += 1;
+                            assert!(
+                                coordinator
+                                    .ensure_replica_retired(
+                                        conflicting,
+                                        service.sessions().local_session().clone(),
+                                        100,
+                                    )
+                                    .await
+                                    .is_err()
+                            );
+                            assert_eq!(store.load_state().await.unwrap(), durable);
                         } else {
                             let prepared = if boundary.starts_with("prepare:") {
                                 coordinator
@@ -486,6 +565,34 @@ fn run_removal_boundary_matrix() {
                                     1
                                 }
                             );
+                            if boundary.starts_with("prepare:") {
+                                let durable = store.load_state().await.unwrap();
+                                assert_eq!(
+                                    coordinator
+                                        .ensure_secondary_removal_prepared(
+                                            fixture::prepare_command(&intent),
+                                            service.sessions().local_session().clone(),
+                                            99,
+                                        )
+                                        .await
+                                        .unwrap(),
+                                    prepared
+                                );
+                                assert_eq!(store.load_state().await.unwrap(), durable);
+                                let mut conflicting = fixture::prepare_command(&intent);
+                                conflicting.intent.spec_generation += 1;
+                                assert!(
+                                    coordinator
+                                        .ensure_secondary_removal_prepared(
+                                            conflicting,
+                                            service.sessions().local_session().clone(),
+                                            100,
+                                        )
+                                        .await
+                                        .is_err()
+                                );
+                                assert_eq!(store.load_state().await.unwrap(), durable);
+                            }
                             coordinator
                                 .ensure_configuration(command(&prepared, false))
                                 .await
@@ -494,6 +601,29 @@ fn run_removal_boundary_matrix() {
                                 .ensure_configuration(command(&prepared, true))
                                 .await
                                 .unwrap();
+                            let durable = store.load_state().await.unwrap();
+                            let duplicate = coordinator
+                                .ensure_configuration(command(&prepared, true))
+                                .await
+                                .unwrap();
+                            assert_eq!(Some(duplicate), durable.retained_command);
+                            assert_eq!(store.load_state().await.unwrap(), durable);
+                            let mut conflicting = command(&prepared, true);
+                            conflicting.primary_write_status = AccessStatus::Granted;
+                            assert!(coordinator.ensure_configuration(conflicting).await.is_err());
+                            assert_eq!(store.load_state().await.unwrap(), durable);
+                            if boundary.starts_with("prepare:") {
+                                let original = store
+                                    .load_local_write(&OperationId::new("interrupted-local-write"))
+                                    .await
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(original.lsn, 2);
+                                assert_eq!(
+                                    original.data.as_ref(),
+                                    b"unacknowledged-before-preparation"
+                                );
+                            }
                             assert_eq!(
                                 store.load_state().await.unwrap().admitted_policy,
                                 Some(intent.current_policy.clone())

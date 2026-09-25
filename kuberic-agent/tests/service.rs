@@ -265,13 +265,21 @@ async fn secondary_removal_rpc_replay() {
                         current_only: cmd.current_only,
                         ..Default::default()
                     };
+                    let envelope = proto::execute_command_request::Command::EnsureConfiguration(
+                        Box::new(command),
+                    );
+                    let before = store.load_state().await.unwrap();
+                    assert_eq!(
+                        client
+                            .execute(request(&old_session, envelope.clone()))
+                            .await
+                            .unwrap_err()
+                            .code(),
+                        Code::FailedPrecondition,
+                    );
+                    assert_eq!(store.load_state().await.unwrap(), before);
                     let report = client
-                        .execute(request(
-                            &session,
-                            proto::execute_command_request::Command::EnsureConfiguration(Box::new(
-                                command,
-                            )),
-                        ))
+                        .execute(request(&session, envelope.clone()))
                         .await
                         .unwrap()
                         .into_inner()
@@ -279,6 +287,21 @@ async fn secondary_removal_rpc_replay() {
                         .unwrap();
                     kuberic_wire::normalize_agent_status_report(report.clone()).unwrap();
                     assert_ne!(report.write_status, proto::AccessStatus::Granted as i32);
+                    let completed = store.load_state().await.unwrap();
+                    client
+                        .execute(request(&session, envelope.clone()))
+                        .await
+                        .unwrap();
+                    assert_eq!(store.load_state().await.unwrap(), completed);
+                    let mut conflict = envelope;
+                    let proto::execute_command_request::Command::EnsureConfiguration(c) =
+                        &mut conflict
+                    else {
+                        unreachable!()
+                    };
+                    c.primary_write_status = proto::AccessStatus::Granted as i32;
+                    assert!(client.execute(request(&session, conflict)).await.is_err());
+                    assert_eq!(store.load_state().await.unwrap(), completed);
                 }
                 assert_eq!(store.identity().await.unwrap(), provenance);
                 assert_eq!(

@@ -1801,15 +1801,15 @@ fn real_handoff_configuration_boundaries_survive_process_termination() {
                         .await
                         .is_err()
                 );
-                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let resumed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                     while store.load_state().await.unwrap().reconfiguration.is_some() {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     }
                 })
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("{scenario}/{boundary}: startup recovery did not complete")
-                });
+                .await;
+                assert!(resumed.is_ok(),
+                    "{scenario}/{boundary}: startup recovery did not complete; durable={:?}; runtime={:?}",
+                    store.load_state().await.unwrap(), pod.snapshot().await);
                 let coordinator = Coordinator::new(store.clone(), executor);
                 let completed = tokio::time::timeout(
                     std::time::Duration::from_secs(3),

@@ -7,6 +7,84 @@ use scale_down_model::fixture as scale_down_fixture;
 mod scale_down_model;
 
 #[test]
+fn scale_down_commit_boundary_rejects_generated_primary_evidence_corruption() {
+    use scale_down_model::Model;
+    for size in 2..=5 {
+        let mut baseline = Model::new(&(1..=size).collect::<Vec<_>>(), 1, size as u32 - 1);
+        baseline.until(|m| {
+            matches!(m.plan(), Plan::Apply { ref changes }
+            if matches!(changes.first(), Some(KubernetesChange::PersistStatus { status })
+                if status.secondary_scale_down_cleanup.is_some()))
+        });
+        let authority = baseline.snapshot.status.clone();
+        for mutation in 0..8 {
+            let mut broken = baseline.clone();
+            let primary = broken.report(1);
+            match mutation {
+                0 => primary.verified_replication_lsn = None,
+                1 => primary.verified_replication_lsn = Some(9),
+                2 => primary.pending_operation_id = Some(OperationId::new("unrelated-inflight")),
+                3 => primary.retained_operation_id = Some(OperationId::new("other-completion")),
+                4 => primary.report_sequence = 0,
+                5 => primary.write_status = AccessStatus::Granted,
+                6 => primary.identity.agent_generation = AgentGeneration::new("substitute"),
+                _ => primary.epoch.data_loss_number += 1,
+            }
+            let plan = broken.plan();
+            assert!(
+                matches!(plan, Plan::Wait { .. } | Plan::Unsafe { .. }),
+                "size={size} mutation={mutation}: {plan:?}"
+            );
+            assert_eq!(broken.snapshot.status, authority);
+            assert!(broken.removed.is_empty() && broken.deletes.is_empty());
+        }
+        baseline.finish();
+        assert_eq!(baseline.removed.len(), 1);
+    }
+}
+
+#[test]
+fn scale_down_exact_lookup_failures_after_commit_preserve_cleanup_authority() {
+    use kuberic_protocol::command::ScaleDownResource;
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::Model;
+    for resource in [
+        ScaleDownResource::Endpoint,
+        ScaleDownResource::Pod,
+        ScaleDownResource::Pvc,
+    ] {
+        let mut failed = Model::new(&[1, 2, 3], 1, 2);
+        failed.until(|m| matches!(m.plan(), Plan::Apply { changes }
+            if matches!(changes.first(), Some(KubernetesChange::DeleteScaleDownResource { resource: kind, .. }) if *kind == resource)));
+        let before = failed.snapshot.status.clone();
+        let deletes = failed.deletes.clone();
+        let exact = failed.exact(3);
+        *match resource {
+            ScaleDownResource::Pod => &mut exact.pod,
+            ScaleDownResource::Pvc => &mut exact.pvc,
+            ScaleDownResource::Endpoint => &mut exact.endpoint,
+        } = ExactResourceObservation::LookupFailed {
+            message: "authoritative GET failed".into(),
+        };
+        for _ in 0..3 {
+            failed.controller_restart();
+            let plan = failed.plan();
+            assert!(
+                matches!(plan, Plan::Wait { .. }),
+                "resource={resource:?}: {plan:?}"
+            );
+            failed.apply(plan);
+            assert_eq!(failed.snapshot.status.topology, before.topology);
+            assert_eq!(
+                failed.snapshot.status.secondary_scale_down_cleanup,
+                before.secondary_scale_down_cleanup
+            );
+            assert_eq!(failed.deletes, deletes);
+        }
+    }
+}
+
+#[test]
 fn evaluator_scale_down_replays_installed_pending_configurations_after_restart() {
     use scale_down_model::{CommandBoundary, Model};
     for current_only in [false, true] {

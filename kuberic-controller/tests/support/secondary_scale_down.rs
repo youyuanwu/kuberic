@@ -987,3 +987,248 @@ async fn missing_storage_mapping_or_exact_metadata_never_freezes_cleanup() {
         )));
     }
 }
+#[tokio::test]
+async fn every_status_and_command_boundary_survives_conflict_loss_and_controller_restart() {
+    for (size, desired) in [(2, 1), (3, 2), (5, 2)] {
+        let baseline = Arc::new(InMemoryClusterApi::new(fixture(size, desired)));
+        let mut statuses = 0;
+        let mut commands = 0;
+        for boundary in 0..250 {
+            let (raw, plan) = next_plan(&baseline).await;
+            if matches!(plan, Plan::Stable { .. }) {
+                break;
+            }
+            let mut persisted = raw.clone();
+            persisted.set =
+                serde_json::from_slice(&serde_json::to_vec(&persisted.set).unwrap()).unwrap();
+            let fork = Arc::new(InMemoryClusterApi::new(persisted));
+            match &plan {
+                Plan::Apply { changes }
+                    if matches!(
+                        changes.first(),
+                        Some(KubernetesChange::PersistStatus { .. })
+                    ) =>
+                {
+                    fork.conflict_next_status().await;
+                    let (kind, effects) = tick(&fork).await;
+                    assert_eq!(
+                        kind,
+                        ReconcileKind::ObservationStale,
+                        "size={size} boundary={boundary}"
+                    );
+                    assert!(effects.is_empty());
+                    assert_eq!(fork.observation().await.set.status, raw.set.status);
+                    assert_eq!(fork.observation().await.pods, raw.pods);
+                    assert_eq!(fork.observation().await.pvcs, raw.pvcs);
+                    statuses += 1;
+                }
+                Plan::Execute { command } => {
+                    fork.unavailable_next_execute().await;
+                    let result = Reconciler::new(fork.clone(), enabled())
+                        .reconcile("tests", "db")
+                        .await
+                        .unwrap();
+                    assert_eq!(result.kind, ReconcileKind::Waiting);
+                    assert_eq!(
+                        next_plan(&fork).await.1,
+                        plan,
+                        "undelivered request retains exact command"
+                    );
+                    // The same ambiguity also permits a completed effect with no reply.
+                    apply_command(&fork, command).await;
+                    assert_eq!(fork.observation().await.set.status, raw.set.status);
+                    commands += 1;
+                }
+                _ => {}
+            }
+            let restarted = Arc::new(InMemoryClusterApi::new(fork.observation().await));
+            finish(&restarted).await;
+            let final_raw = restarted.observation().await;
+            let status = final_raw.set.status.unwrap().authority;
+            assert_eq!(
+                status.topology.unwrap().configuration.members.len(),
+                desired as usize
+            );
+            assert!(status.transition.is_none() && status.secondary_scale_down_cleanup.is_none());
+            assert_eq!(final_raw.pods.len(), desired as usize);
+            assert_eq!(final_raw.pvcs.len(), desired as usize);
+            tick(&baseline).await;
+        }
+        assert!(
+            statuses >= 4,
+            "intent/evidence/commit/cleanup status boundaries"
+        );
+        assert!(
+            commands >= 5,
+            "prepare/member/current-only/accept/retire boundaries"
+        );
+    }
+}
+
+#[tokio::test]
+async fn primary_or_retained_loss_at_every_precommit_boundary_preserves_authority_then_heals() {
+    let baseline = Arc::new(InMemoryClusterApi::new(fixture(3, 2)));
+    tick(&baseline).await;
+    let mut boundaries = 0;
+    for _ in 0..80 {
+        let (raw, _) = next_plan(&baseline).await;
+        let before = raw.set.status.as_ref().unwrap().authority.clone();
+        if before.secondary_scale_down_cleanup.is_some() {
+            break;
+        }
+        for id in [1, 2] {
+            let mut lost = raw.clone();
+            let key = ReplicaObservationKey::new(
+                ReplicaId::new(id),
+                ReplicaInstanceId::new(format!("pod-uid-{id}")),
+            );
+            let original = lost
+                .agents
+                .insert(
+                    key.clone(),
+                    RawAgentObservation::Unavailable {
+                        message: "exact retained process lost".into(),
+                    },
+                )
+                .unwrap();
+            let api = Arc::new(InMemoryClusterApi::new(lost));
+            for _ in 0..8 {
+                tick(&api).await;
+                let after = api.observation().await;
+                let status = after.set.status.unwrap().authority;
+                assert_eq!(status.topology, before.topology);
+                assert_eq!(status.effective_policy, before.effective_policy);
+                assert_eq!(
+                    status.transition.as_ref().unwrap().secondary_scale_down,
+                    before.transition.as_ref().unwrap().secondary_scale_down
+                );
+                assert!(status.secondary_scale_down_cleanup.is_none());
+                assert_eq!(after.pods, raw.pods);
+                assert_eq!(after.pvcs, raw.pvcs);
+                assert!(!api.effects().await.iter().any(|e| matches!(
+                    e,
+                    EffectRecord::DeleteScaleDownResource { .. }
+                        | EffectRecord::DeleteScaffolding { .. }
+                )));
+            }
+            let mut healed = api.observation().await;
+            healed.agents.insert(key, original);
+            let restarted = Arc::new(InMemoryClusterApi::new(healed));
+            finish(&restarted).await;
+            assert_eq!(restarted.observation().await.pods.len(), 2);
+        }
+        boundaries += 1;
+        tick(&baseline).await;
+    }
+    assert!(boundaries >= 8);
+}
+
+#[tokio::test]
+async fn target_return_after_commit_is_retired_before_sequential_next_removal() {
+    let mut original = fixture(3, 1);
+    let key = ReplicaObservationKey::new(ReplicaId::new(3), ReplicaInstanceId::new("pod-uid-3"));
+    let target = original
+        .agents
+        .insert(
+            key.clone(),
+            RawAgentObservation::Unavailable {
+                message: "partitioned target".into(),
+            },
+        )
+        .unwrap();
+    let api = Arc::new(InMemoryClusterApi::new(original));
+    at_delete(&api, ScaleDownResource::Endpoint).await;
+    let mut returned = api.observation().await;
+    let accepted = returned
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .clone();
+    assert_eq!(accepted.as_ref().unwrap().configuration.members.len(), 2);
+    let RawAgentObservation::Report(mut target) = target else {
+        unreachable!()
+    };
+    target.process_session_id = "returned-new-session".into();
+    target.report_sequence = 1;
+    returned
+        .agents
+        .insert(key, RawAgentObservation::Report(target));
+    let restarted = Arc::new(InMemoryClusterApi::new(returned));
+    finish(&restarted).await;
+    let effects = restarted.effects().await;
+    let retired = effects.iter().position(|e| matches!(e,
+                EffectRecord::Execute(ProtocolCommand::RetireReplica(c)) if c.local_replica_id == ReplicaId::new(3))).unwrap();
+    let pvc = effects.iter().position(|e| matches!(e,
+                EffectRecord::DeleteScaleDownResource { resource: ScaleDownResource::Pvc, uid, .. } if uid == "pvc-uid-3")).unwrap();
+    let next = effects.iter().position(|e| matches!(e,
+                EffectRecord::Execute(ProtocolCommand::PrepareSecondaryRemoval(c)) if c.intent.target.replica_id == ReplicaId::new(2))).unwrap();
+    assert!(retired < pvc && pvc < next);
+    assert_eq!(restarted.observation().await.pods.len(), 1);
+    assert!(!effects.iter().any(|e| matches!(e,
+                EffectRecord::Execute(ProtocolCommand::EnsureConfiguration(c)) if c.local_replica_id == ReplicaId::new(3))));
+}
+
+#[tokio::test]
+async fn contradictory_current_only_reports_cannot_publish_reduced_status() {
+    let baseline = Arc::new(InMemoryClusterApi::new(fixture(3, 2)));
+    for _ in 0..80 {
+        let (_, plan) = next_plan(&baseline).await;
+        if matches!(plan, Plan::Apply { changes }
+                    if matches!(changes.first(), Some(KubernetesChange::PersistStatus { status })
+                        if status.secondary_scale_down_cleanup.is_some()))
+        {
+            break;
+        }
+        tick(&baseline).await;
+    }
+    let original = baseline.observation().await;
+    let before = original.set.status.as_ref().unwrap().authority.clone();
+    let key = ReplicaObservationKey::new(ReplicaId::new(1), ReplicaInstanceId::new("pod-uid-1"));
+    for mutation in 0..4 {
+        let mut broken = original.clone();
+        let RawAgentObservation::Report(report) = broken.agents.get_mut(&key).unwrap() else {
+            unreachable!()
+        };
+        match mutation {
+            0 => report.verified_replication_lsn = None,
+            1 => report.pending_operation_id = "unrelated-command".into(),
+            2 => report.epoch.as_mut().unwrap().configuration_number += 1,
+            _ => report.identity.as_mut().unwrap().agent_generation = "different-generation".into(),
+        }
+        let api = Arc::new(InMemoryClusterApi::new(broken));
+        for _ in 0..3 {
+            let count = api.observation_count().await;
+            Reconciler::new(api.clone(), enabled())
+                .reconcile("tests", "db")
+                .await
+                .unwrap();
+            assert_eq!(api.observation_count().await, count + 1);
+            assert!(api.effects().await.iter().all(|e| matches!(
+                e,
+                EffectRecord::RemoveWriteRouting | EffectRecord::ReplaceStatus
+            )));
+            let observed = api.observation().await;
+            let status = observed.set.status.unwrap().authority;
+            assert_eq!(status.topology, before.topology, "mutation={mutation}");
+            assert_eq!(status.transition, before.transition);
+            assert!(status.secondary_scale_down_cleanup.is_none());
+            assert_eq!(observed.pods, original.pods);
+            assert_eq!(observed.pvcs, original.pvcs);
+            assert!(!api.effects().await.iter().any(|e| matches!(
+                e,
+                EffectRecord::DeleteScaleDownResource { .. }
+                    | EffectRecord::DeleteScaffolding { .. }
+            )));
+        }
+        let mut healed = api.observation().await;
+        healed
+            .agents
+            .insert(key.clone(), original.agents[&key].clone());
+        let restarted = Arc::new(InMemoryClusterApi::new(healed));
+        finish(&restarted).await;
+        assert_eq!(restarted.observation().await.pods.len(), 2);
+    }
+}

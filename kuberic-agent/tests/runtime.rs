@@ -39,6 +39,9 @@ use tokio::time::{Duration, timeout};
 #[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
 mod removal_fixture;
 
+#[path = "support/removal_oracle.rs"]
+mod removal_oracle;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_snapshots_do_not_reacquire_read_locks_behind_queued_peer_eviction() {
     let intent = removal_fixture::intent(&[1, 2], 1);
