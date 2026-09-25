@@ -2148,7 +2148,7 @@ mod tests {
                 ..Default::default()
             })),
         );
-        let observation = RawObservation {
+        let mut observation = RawObservation {
             set: KubericSet::new(
                 "db",
                 KubericSetSpec {
@@ -2184,28 +2184,48 @@ mod tests {
             ],
             2,
         );
+        let preparation = ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+            operation_id: OperationId::new("prepare-1"),
+            request_id: SwitchoverRequestId::new("request-1"),
+            local_replica_id: source.replica_id,
+            expected_instance_id: source.instance_id.clone(),
+            expected_agent_generation: source.agent_generation.clone(),
+            source: source.clone(),
+            target: target.clone(),
+            current_configuration: configuration.clone(),
+        }));
         let request = command_request(
             "resource".to_string(),
             source.clone(),
             session,
-            ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
-                operation_id: OperationId::new("prepare-1"),
-                request_id: SwitchoverRequestId::new("request-1"),
-                local_replica_id: source.replica_id,
-                expected_instance_id: source.instance_id.clone(),
-                expected_agent_generation: source.agent_generation.clone(),
-                source: source.clone(),
-                target: target.clone(),
-                current_configuration: configuration.clone(),
-            })),
+            preparation.clone(),
         );
         assert_eq!(request.expected_process_session_id, "session-1");
         assert!(matches!(
-            request.command,
+            &request.command,
             Some(proto::execute_command_request::Command::PrepareSwitchover(
                 _
             ))
         ));
+        let RawAgentObservation::Report(report) = observation
+            .agents
+            .get_mut(&ReplicaObservationKey::new(
+                source.replica_id,
+                source.instance_id.clone(),
+            ))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        report.process_session_id = "session-restarted".to_string();
+        let replay = command_request(
+            "resource".to_string(),
+            source.clone(),
+            observed_process_session(&observation, source.replica_id, &source).unwrap(),
+            preparation,
+        );
+        assert_eq!(replay.expected_process_session_id, "session-restarted");
+        assert_eq!(replay.command, request.command);
 
         let policy = EffectivePolicy::fixed(2, 30).unwrap();
         let existing_commands = vec![

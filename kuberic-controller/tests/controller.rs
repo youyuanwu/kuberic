@@ -16,6 +16,7 @@ use kuberic_controller::crd::{
 use kuberic_controller::normalize::normalize;
 use kuberic_controller::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
 use kuberic_controller::reconciler::{ReconcileKind, Reconciler};
+use kuberic_protocol::command::ProtocolCommand;
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{AgentObservation, ReplicaObservationKey};
 use kuberic_protocol::plan::Plan;
@@ -365,6 +366,345 @@ fn stable_observation() -> RawObservation {
         .services
         .push(write_service(identity.instance_id.as_str()));
     stable
+}
+
+fn switchover_observation() -> RawObservation {
+    let mut observation = stable_observation();
+    observation.set.spec.replicas = 3;
+    observation.set.spec.failover_delay_seconds = 10;
+    observation.set.spec.switchover = Some(PlannedSwitchoverRequestSpec {
+        request_id: "move-primary".to_string(),
+        target_replica_id: 2,
+    });
+    observation.set.metadata.generation = Some(2);
+    let primary = observation
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .members[0]
+        .clone();
+    let mut members = vec![primary];
+    for id in 2..=3 {
+        let pod_uid = format!("pod-uid-{id}");
+        let pvc_uid = format!("pvc-uid-{id}");
+        let local = ReplicaIdentity {
+            replica_id: ReplicaId::new(id),
+            instance_id: ReplicaInstanceId::new(&pod_uid),
+            agent_generation: derive_agent_generation(&derive_initialization_id(
+                &ResourceUid::new(UID),
+                ReplicaId::new(id),
+                &PodUid::new(&pod_uid),
+                &PvcUid::new(&pvc_uid),
+            )),
+        };
+        let mut pod = observation.pods[0].clone();
+        pod.metadata.uid = Some(pod_uid.clone());
+        pod.metadata.name = Some(format!("db-{id}"));
+        let mut pod_labels = labels(local.replica_id);
+        pod_labels.insert(INSTANCE_LABEL.to_string(), pod_uid.clone());
+        pod.metadata.labels = Some(pod_labels);
+        observation.pods.push(pod);
+        let mut pvc = observation.pvcs[0].clone();
+        pvc.metadata.name = Some(format!("db-{id}-data"));
+        pvc.metadata.uid = Some(pvc_uid);
+        pvc.metadata.labels = Some(labels(local.replica_id));
+        observation.pvcs.push(pvc);
+        let mut endpoint = observation
+            .services
+            .iter()
+            .find(|service| service.name_any().starts_with("kr-"))
+            .unwrap()
+            .clone();
+        endpoint.metadata.name = Some(derive_replica_endpoint_name(&ResourceUid::new(UID), &local));
+        endpoint.spec.as_mut().unwrap().selector =
+            Some(BTreeMap::from([(INSTANCE_LABEL.to_string(), pod_uid)]));
+        observation.services.push(endpoint);
+        members.push(kuberic_protocol::types::ConfigurationMember {
+            identity: local,
+            role: ReplicaRole::ActiveSecondary,
+        });
+    }
+    let configuration = kuberic_protocol::types::ConfigurationDescriptor::new(
+        kuberic_protocol::types::Epoch::new(0, 1),
+        ReplicaId::new(1),
+        members,
+        2,
+    );
+    let status = &mut observation.set.status.as_mut().unwrap().authority;
+    status.effective_policy = kuberic_protocol::types::EffectivePolicy::fixed(3, 10);
+    status.topology = Some(AcceptedTopology {
+        configuration: configuration.clone(),
+    });
+    for pod in &mut observation.pods {
+        pod.spec = Some(PodSpec {
+            containers: vec![k8s_openapi::api::core::v1::Container {
+                name: "replica".to_string(),
+                image: Some(observation.set.spec.image.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+    }
+    for member in &configuration.members {
+        let mut report = initialized_report(member.identity.clone(), configuration.clone());
+        report.replica_id = member.identity.replica_id.value();
+        report.role = if member.role == ReplicaRole::Primary {
+            proto::ReplicaRole::Primary as i32
+        } else {
+            proto::ReplicaRole::ActiveSecondary as i32
+        };
+        report.write_status = if member.role == ReplicaRole::Primary {
+            proto::AccessStatus::Granted as i32
+        } else {
+            proto::AccessStatus::NotPrimary as i32
+        };
+        report.verified_replication_lsn = Some(5);
+        observation.agents.insert(
+            ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            ),
+            RawAgentObservation::Report(Box::new(report)),
+        );
+    }
+    observation
+}
+
+async fn refresh_switchover_reports(api: &InMemoryClusterApi) {
+    let mut observation = api.observation().await;
+    for agent in observation.agents.values_mut() {
+        if let RawAgentObservation::Report(report) = agent {
+            report.report_sequence += 1;
+        }
+    }
+    api.set_observation(observation).await;
+}
+
+async fn observe_switchover_result(api: &InMemoryClusterApi, command: &ProtocolCommand) {
+    let mut observation = api.observation().await;
+    let (id, instance) = match command {
+        ProtocolCommand::PrepareSwitchover(command) => {
+            (command.local_replica_id, &command.expected_instance_id)
+        }
+        ProtocolCommand::EnsureConfiguration(command) => {
+            (command.local_replica_id, &command.expected_instance_id)
+        }
+        _ => panic!("unexpected switchover command"),
+    };
+    let RawAgentObservation::Report(report) = observation
+        .agents
+        .get_mut(&ReplicaObservationKey::new(id, instance.clone()))
+        .unwrap()
+    else {
+        panic!("exact report")
+    };
+    match command {
+        ProtocolCommand::PrepareSwitchover(command) => {
+            report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
+            report.prepared_switchover = Some(
+                kuberic_protocol::types::SwitchoverHandoff {
+                    preparation_operation_id: command.operation_id.clone(),
+                    request_id: command.request_id.clone(),
+                    source: command.source.clone(),
+                    target: command.target.clone(),
+                    starting_configuration_id: command
+                        .current_configuration
+                        .configuration_id
+                        .clone(),
+                    starting_epoch: command.current_configuration.epoch,
+                    handoff_lsn: 5,
+                }
+                .into(),
+            );
+        }
+        ProtocolCommand::EnsureConfiguration(command) => {
+            report.epoch = Some(command.current_epoch.into());
+            report.previous_configuration = command.previous_configuration.clone().map(Into::into);
+            report.current_configuration = Some(command.current_configuration.clone().into());
+            let primary = command.current_configuration.primary_id == id;
+            report.role = if primary {
+                proto::ReplicaRole::Primary as i32
+            } else {
+                proto::ReplicaRole::ActiveSecondary as i32
+            };
+            report.write_status = if primary
+                && command.primary_write_status == kuberic_protocol::types::AccessStatus::Granted
+            {
+                proto::AccessStatus::Granted as i32
+            } else if primary {
+                proto::AccessStatus::ReconfigurationPending as i32
+            } else {
+                proto::AccessStatus::NotPrimary as i32
+            };
+            report.retained_operation_id = command.operation_id.to_string();
+            report.pending_operation_id.clear();
+            report.catch_up_boundary = command.previous_configuration.as_ref().map(|_| 5);
+            report.catch_up_complete = true;
+            report.current_configuration_quorum_progress = 5;
+            if !command.retire_switchover_preparation_ids.is_empty() {
+                report.prepared_switchover = None;
+            }
+        }
+        _ => unreachable!(),
+    }
+    api.set_observation(observation).await;
+}
+
+#[tokio::test]
+async fn switchover_reobserves_conflicts_ambiguous_replies_sessions_and_completed_request() {
+    let api = Arc::new(InMemoryClusterApi::new(switchover_observation()));
+    let reconciler = Reconciler::new(api.clone(), config());
+    api.conflict_next_status().await;
+    assert_eq!(
+        reconciler.reconcile("tests", "db").await.unwrap().kind,
+        ReconcileKind::ObservationStale
+    );
+    assert!(api.effects().await.is_empty());
+    assert!(
+        api.observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .transition
+            .is_none()
+    );
+    let mut first_preparation = None;
+    let mut receipt_conflicted = false;
+    let mut completed = false;
+    let mut command_count = 0;
+    for _ in 0..30 {
+        refresh_switchover_reports(&api).await;
+        let observation = api.observation().await;
+        let snapshot = normalize(observation.clone(), BTreeMap::new()).unwrap();
+        let plan = evaluate(&snapshot, &config());
+        let command = if let Plan::Execute { command } = &plan {
+            Some(command.clone())
+        } else {
+            None
+        };
+        if let Some(ProtocolCommand::PrepareSwitchover(_)) = &command
+            && first_preparation.is_none()
+        {
+            assert!(snapshot.routing.write_target.is_none());
+            api.unavailable_next_execute().await;
+            let action = reconciler.reconcile("tests", "db").await.unwrap();
+            assert_eq!(action.kind, ReconcileKind::Waiting);
+            first_preparation = command;
+            let mut restarted = api.observation().await;
+            let RawAgentObservation::Report(source) =
+                restarted.agents.get_mut(&replica_key(POD_UID)).unwrap()
+            else {
+                unreachable!()
+            };
+            source.process_session_id = "source-restarted".to_string();
+            source.report_sequence = 1;
+            api.set_observation(restarted).await;
+            continue;
+        }
+        if let Some(ProtocolCommand::PrepareSwitchover(_)) = &command {
+            assert_eq!(command, first_preparation);
+        }
+        if let Plan::Apply { changes } = &plan
+            && changes.iter().any(|change| {
+                matches!(change,
+                kuberic_protocol::command::KubernetesChange::PersistStatus { status }
+                    if status.last_switchover.is_some())
+            })
+            && snapshot.status.transition.is_some()
+            && !receipt_conflicted
+        {
+            api.conflict_next_status().await;
+            assert_eq!(
+                reconciler.reconcile("tests", "db").await.unwrap().kind,
+                ReconcileKind::ObservationStale
+            );
+            receipt_conflicted = true;
+            continue;
+        }
+        if matches!(command, Some(ProtocolCommand::EnsureConfiguration(_))) {
+            api.unavailable_next_execute().await;
+        }
+        let action = reconciler.reconcile("tests", "db").await.unwrap();
+        if let Some(command) = command {
+            assert!(matches!(
+                action.kind,
+                ReconcileKind::Executed | ReconcileKind::Waiting
+            ));
+            observe_switchover_result(&api, &command).await;
+            command_count += 1;
+        } else if matches!(plan, Plan::Stable { .. }) {
+            assert_eq!(action.kind, ReconcileKind::Stable);
+            completed = true;
+            break;
+        } else {
+            assert_eq!(action.kind, ReconcileKind::Applied, "{plan:?}");
+        }
+        let snapshot = normalize(api.observation().await, BTreeMap::new()).unwrap();
+        if let Some(target) = &snapshot.routing.write_target
+            && target.replica_id == ReplicaId::new(2)
+        {
+            assert!(snapshot.status.transition.is_none());
+            assert!(snapshot.status.last_switchover.is_some());
+            assert!(
+                matches!(&snapshot.observation_for_identity(target).unwrap().agent,
+                AgentObservation::Report(report) if report.write_status == kuberic_protocol::types::AccessStatus::Granted)
+            );
+        }
+    }
+    assert!(completed && receipt_conflicted);
+    assert_eq!(command_count, 8); // prepare, six authority commands, stable write grant
+    let completed_snapshot = normalize(api.observation().await, BTreeMap::new()).unwrap();
+    assert_eq!(
+        completed_snapshot
+            .routing
+            .write_target
+            .as_ref()
+            .unwrap()
+            .replica_id,
+        ReplicaId::new(2)
+    );
+    let effects = api.effects().await;
+    let prepare = effects
+        .iter()
+        .position(|effect| {
+            matches!(
+                effect,
+                EffectRecord::Execute(ProtocolCommand::PrepareSwitchover(_))
+            )
+        })
+        .unwrap();
+    let remove = effects
+        .iter()
+        .position(|effect| matches!(effect, EffectRecord::RemoveWriteRouting))
+        .unwrap();
+    assert!(remove < prepare);
+    let before = effects
+        .iter()
+        .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+        .count();
+    for _ in 0..3 {
+        refresh_switchover_reports(&api).await;
+        assert_eq!(
+            reconciler.reconcile("tests", "db").await.unwrap().kind,
+            ReconcileKind::Stable
+        );
+    }
+    assert_eq!(
+        api.effects()
+            .await
+            .iter()
+            .filter(|effect| matches!(effect, EffectRecord::Execute(_)))
+            .count(),
+        before
+    );
 }
 
 #[test]

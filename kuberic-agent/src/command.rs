@@ -274,6 +274,12 @@ fn admit_configuration_with_replay(
         .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
     }
     if command.transition_kind == TransitionKind::PlannedSwitchover {
+        if command.primary_write_status == AccessStatus::Granted {
+            return Err(AgentError::CommandRejected(
+                "planned switchover must remain write-closed until stable access convergence"
+                    .into(),
+            ));
+        }
         let handoff = command.switchover_handoff.as_ref().ok_or_else(|| {
             AgentError::CommandRejected(
                 "planned switchover authority requires a handoff certificate".into(),

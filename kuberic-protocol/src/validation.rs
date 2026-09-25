@@ -509,6 +509,17 @@ fn validate_report_authority(
         }
     }
     if let Some(transition) = &snapshot.status.transition
+        && transition.kind == TransitionKind::PlannedSwitchover
+        && report.epoch == transition.current_configuration.epoch
+        && (report.write_status == AccessStatus::Granted
+            || transition
+                .switchover
+                .as_ref()
+                .is_none_or(|intent| intent.handoff.is_none()))
+    {
+        return Err(ValidationError::InvalidSwitchoverEvidence);
+    }
+    if let Some(transition) = &snapshot.status.transition
         && transition.kind != TransitionKind::Bootstrap
         && report.epoch == transition.current_configuration.epoch
         && report

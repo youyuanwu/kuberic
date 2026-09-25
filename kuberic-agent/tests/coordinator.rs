@@ -541,7 +541,7 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
 }
 
 #[tokio::test]
-async fn planned_switchover_current_only_completes_on_every_participant() {
+async fn planned_switchover_sequences_source_target_and_uninvolved_through_current_only() {
     let source = identity();
     let target = ReplicaIdentity {
         replica_id: ReplicaId::new(2),
@@ -612,10 +612,14 @@ async fn planned_switchover_current_only_completes_on_every_participant() {
             effective_policy: policy.clone(),
             ..storage_identity()
         });
-        state.highest_epoch = current.epoch;
-        state.previous_configuration = Some(previous.clone());
-        state.current_configuration = Some(current.clone());
-        state.role = role;
+        let starting_role = if is_source {
+            ReplicaRole::Primary
+        } else {
+            ReplicaRole::ActiveSecondary
+        };
+        state.highest_epoch = previous.epoch;
+        state.current_configuration = Some(previous.clone());
+        state.role = starting_role;
         state.read_status = AccessStatus::ReconfigurationPending;
         state.write_status = AccessStatus::ReconfigurationPending;
         state.prepared_switchover = is_source.then(|| handoff.clone());
@@ -629,16 +633,16 @@ async fn planned_switchover_current_only_completes_on_every_participant() {
         let runtime = Arc::new(FakeRuntime::new());
         {
             let mut runtime_state = runtime.state.lock().unwrap();
-            runtime_state.role = role;
+            runtime_state.role = starting_role;
             runtime_state.read_status = AccessStatus::ReconfigurationPending;
             runtime_state.write_status = AccessStatus::ReconfigurationPending;
             runtime_state.current_progress = 7;
             runtime_state.authority = Some(AdmittedAuthority {
                 local_identity: local.clone(),
-                transition_kind: Some(TransitionKind::PlannedSwitchover),
-                previous_configuration: Some(previous.clone()),
-                current_configuration: current.clone(),
-                switchover_handoff: Some(handoff.clone()),
+                transition_kind: None,
+                previous_configuration: None,
+                current_configuration: previous.clone(),
+                switchover_handoff: None,
             });
         }
         let command = EnsureConfiguration {
@@ -664,7 +668,37 @@ async fn planned_switchover_current_only_completes_on_every_participant() {
             },
         };
 
-        let coordinator = Coordinator::new(store.clone(), runtime);
+        let install = EnsureConfiguration {
+            operation_id: OperationId::new(format!("pc-cc-{}", local.replica_id)),
+            previous_configuration: Some(previous.clone()),
+            previous_epoch: Some(previous.epoch),
+            current_only: false,
+            retire_switchover_preparation_ids: Vec::new(),
+            ..command.clone()
+        };
+        let mut premature_grant = install.clone();
+        premature_grant.primary_write_status = AccessStatus::Granted;
+        assert!(admit_configuration(&premature_grant, &store.load_state().await.unwrap()).is_err());
+        let coordinator = Coordinator::new(store.clone(), runtime.clone());
+        coordinator.ensure_configuration(install).await.unwrap();
+        let mut expected = vec!["admit", "read", "get-lsn", "write", "replicator-role"];
+        if role == ReplicaRole::Primary {
+            expected.push("epoch");
+        }
+        expected.push("application-role");
+        if role == ReplicaRole::Primary {
+            expected.push("catchup");
+        }
+        expected.push("access");
+        assert_eq!(*runtime.calls.lock().unwrap(), expected);
+        let installed = store.load_state().await.unwrap();
+        assert_eq!(installed.role, role);
+        assert_ne!(installed.write_status, AccessStatus::Granted);
+        assert_eq!(
+            installed.prepared_switchover,
+            is_source.then(|| handoff.clone())
+        );
+        runtime.calls.lock().unwrap().clear();
         coordinator
             .ensure_configuration(command.clone())
             .await
@@ -672,6 +706,8 @@ async fn planned_switchover_current_only_completes_on_every_participant() {
         let completed = store.load_state().await.unwrap();
         assert!(completed.reconfiguration.is_none());
         assert!(completed.prepared_switchover.is_none());
+        assert_ne!(completed.write_status, AccessStatus::Granted);
+        assert_eq!(*runtime.calls.lock().unwrap(), expected);
         assert_eq!(
             completed.retained_command.as_ref().unwrap().command,
             command

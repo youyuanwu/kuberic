@@ -2,17 +2,19 @@
 
 use crate::command::{
     EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, KubernetesChange,
-    ProtocolCommand, SafetyChange,
+    PrepareSwitchover, ProtocolCommand, SafetyChange,
 };
 use crate::observation::{AgentObservation, ObservationSnapshot};
 use crate::plan::{Plan, UnsafeReason, WaitReason};
 use crate::types::{
     AcceptedStatus, AcceptedTopology, AccessStatus, ConditionStatus, ConfigurationDescriptor,
-    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PrimaryFailureObservation,
-    ProvisioningIntent, QuorumLossObservation, ReplicaIdentity, ReplicaInstanceId,
-    ReplicaRepairIntent, ReplicaRole, StatusCondition, TransitionIntent, TransitionKind,
-    derive_agent_generation, derive_failover_repair_operation_id, derive_initialization_id,
-    derive_replacement_operation_id, derive_transition_id,
+    ConfigurationMember, EffectivePolicy, Epoch, OperationId, PlannedSwitchoverIntent,
+    PlannedSwitchoverOutcome, PlannedSwitchoverReceipt, PlannedSwitchoverResolution,
+    PrimaryFailureObservation, ProvisioningIntent, QuorumLossObservation, ReplicaIdentity,
+    ReplicaInstanceId, ReplicaRepairIntent, ReplicaRole, StatusCondition, TransitionIntent,
+    TransitionKind, derive_agent_generation, derive_failover_repair_operation_id,
+    derive_initialization_id, derive_replacement_operation_id,
+    derive_switchover_preparation_operation_id, derive_transition_id,
 };
 use crate::validation::ValidationError;
 use crate::validation::validate_snapshot;
@@ -103,6 +105,14 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
         status = status.with_condition(condition);
     } else if spec_fully_observed {
         status.observed_generation = snapshot.desired.generation;
+    }
+    status = project_switchover_request(snapshot, status);
+    if switchover_rejection(&status) != switchover_rejection(&snapshot.status) {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(status),
+            }],
+        };
     }
 
     if let Some(plan) = maybe_begin_stable_failover(snapshot, status.clone(), config) {
@@ -468,10 +478,569 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
             };
         }
     }
+    if let Some(plan) = begin_switchover(snapshot, &status, config) {
+        return plan;
+    }
     status = status.with_condition(ready_condition());
     Plan::Stable {
         status,
         requeue_after_seconds: config.stable_resync_seconds,
+    }
+}
+
+fn project_switchover_request(
+    snapshot: &ObservationSnapshot,
+    status: AcceptedStatus,
+) -> AcceptedStatus {
+    let status = status.without_condition("SwitchoverRejected");
+    let reject = |reason: &str, message: &str| {
+        status.clone().with_condition(StatusCondition {
+            type_: "SwitchoverRejected".to_string(),
+            status: ConditionStatus::True,
+            reason: reason.to_string(),
+            message: message.to_string(),
+        })
+    };
+    if let Some(intent) = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.switchover.as_ref())
+    {
+        return if snapshot.desired.switchover.as_ref().is_some_and(|request| {
+            request.request_id == intent.request_id
+                && request.target_replica_id == intent.target.replica_id
+        }) {
+            status
+        } else {
+            reject(
+                "ActiveRequestImmutable",
+                "Cancellation or retargeting is rejected; the accepted switchover remains frozen",
+            )
+        };
+    }
+    let Some(request) = &snapshot.desired.switchover else {
+        return status;
+    };
+    if request.request_id.as_str().trim().is_empty() || request.target_replica_id.value() <= 0 {
+        return reject(
+            "MalformedRequest",
+            "Switchover requires a request ID and positive target ID",
+        );
+    }
+    if let Some(receipt) = &status.last_switchover
+        && receipt.request_id == request.request_id
+    {
+        return if receipt.requested_target_replica_id == request.target_replica_id {
+            status
+        } else {
+            reject(
+                "RequestIdReused",
+                "A completed request ID cannot name a different target",
+            )
+        };
+    }
+    let Some(topology) = &status.topology else {
+        return status;
+    };
+    let current = &topology.configuration;
+    if request.target_replica_id == current.primary_id {
+        return reject(
+            "TargetAlreadyPrimary",
+            "The requested target is already the accepted primary",
+        );
+    }
+    let Some(target) = current
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == request.target_replica_id)
+    else {
+        return reject(
+            "TargetNotMember",
+            "The requested target is not an accepted member",
+        );
+    };
+    if target.role != ReplicaRole::ActiveSecondary
+        || healthy_report(snapshot, &target.identity).is_none_or(|report| {
+            !stable_member_report(report, target, current)
+                || report.write_status == AccessStatus::Granted
+                || report.prepared_switchover.is_some()
+        })
+    {
+        return reject(
+            "TargetNotEligible",
+            "The exact accepted target must attest healthy, idle secondary authority",
+        );
+    }
+    status
+}
+
+fn switchover_rejection(status: &AcceptedStatus) -> Option<&StatusCondition> {
+    status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "SwitchoverRejected")
+}
+
+fn stable_member_report(
+    report: &crate::observation::AgentReport,
+    member: &ConfigurationMember,
+    configuration: &ConfigurationDescriptor,
+) -> bool {
+    report.identity == member.identity
+        && report.role == member.role
+        && report.epoch == configuration.epoch
+        && report.previous_configuration.is_none()
+        && report.current_configuration.as_ref() == Some(configuration)
+        && report.pending_operation_id.is_none()
+}
+
+fn begin_switchover(
+    snapshot: &ObservationSnapshot,
+    status: &AcceptedStatus,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    let request = snapshot.desired.switchover.as_ref()?;
+    if status
+        .conditions
+        .iter()
+        .any(|condition| condition.type_ == "SwitchoverRejected")
+        || status
+            .last_switchover
+            .as_ref()
+            .is_some_and(|receipt| receipt.request_id == request.request_id)
+        || status.primary_failure.is_some()
+        || status.quorum_loss.is_some()
+    {
+        return None;
+    }
+    let previous = &status.topology.as_ref()?.configuration;
+    if !previous.members.iter().all(|member| {
+        healthy_report(snapshot, &member.identity).is_some_and(|report| {
+            stable_member_report(report, member, previous) && report.prepared_switchover.is_none()
+        })
+    }) {
+        return Some(Plan::Wait {
+            reason: WaitReason::AwaitingStableEvidence,
+            status: waiting_status(
+                status.clone(),
+                "SwitchoverAwaitingStableAuthority",
+                "Every exact member must finish accepted authority before planned movement",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        });
+    }
+    let Some(configuration_number) = previous.epoch.configuration_number.checked_add(1) else {
+        return Some(Plan::Stable {
+            status: status.clone().with_condition(StatusCondition {
+                type_: "SwitchoverRejected".to_string(),
+                status: ConditionStatus::True,
+                reason: "ConfigurationEpochExhausted".to_string(),
+                message: "A strictly newer configuration epoch cannot be allocated".to_string(),
+            }),
+            requeue_after_seconds: config.stable_resync_seconds,
+        });
+    };
+    let source = configuration_primary(previous).identity.clone();
+    let target = previous
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == request.target_replica_id)?
+        .identity
+        .clone();
+    let members = previous
+        .members
+        .iter()
+        .map(|member| ConfigurationMember {
+            identity: member.identity.clone(),
+            role: if member.identity == target {
+                ReplicaRole::Primary
+            } else if member.identity == source {
+                ReplicaRole::ActiveSecondary
+            } else {
+                member.role
+            },
+        })
+        .collect();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(previous.epoch.data_loss_number, configuration_number),
+        target.replica_id,
+        members,
+        previous.write_quorum,
+    );
+    let mut status = waiting_status(
+        status.clone(),
+        "SwitchoverAccepted",
+        "Frozen the exact source, target, and requested authority before revoking routing",
+    );
+    status.transition = Some(TransitionIntent {
+        transition_id: derive_transition_id(
+            &snapshot.resource_uid,
+            TransitionKind::PlannedSwitchover,
+            &current.configuration_id,
+        ),
+        kind: TransitionKind::PlannedSwitchover,
+        spec_generation: snapshot.desired.generation,
+        effective_policy: status.effective_policy.clone().expect("stable policy"),
+        previous_configuration_id: Some(previous.configuration_id.clone()),
+        current_configuration: current.clone(),
+        election_lsn: None,
+        build_id: None,
+        repair: None,
+        switchover: Some(PlannedSwitchoverIntent {
+            request_id: request.request_id.clone(),
+            source,
+            target,
+            requested_configuration: current,
+            resolution: PlannedSwitchoverResolution::RequestedTarget,
+            handoff: None,
+        }),
+    });
+    Some(Plan::Apply {
+        changes: vec![KubernetesChange::PersistStatus {
+            status: Box::new(status),
+        }],
+    })
+}
+
+fn evaluate_switchover(
+    snapshot: &ObservationSnapshot,
+    transition: &TransitionIntent,
+    config: &EvaluationConfig,
+) -> Plan {
+    let mut status = project_switchover_request(snapshot, snapshot.status.clone());
+    if switchover_rejection(&status) != switchover_rejection(&snapshot.status) {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(status),
+            }],
+        };
+    }
+    let (_, unsupported) = desired_spec_state(
+        snapshot,
+        &transition.current_configuration,
+        &transition.effective_policy,
+    );
+    status = status.without_condition("UnsupportedSpec");
+    if let Some(condition) = unsupported {
+        status = status.with_condition(condition);
+    }
+    let wait = |reason: &str, message: &str| Plan::Wait {
+        reason: WaitReason::ActiveTransition,
+        status: waiting_status(status.clone(), reason, message),
+        requeue_after_seconds: config.wait_requeue_seconds,
+    };
+    if snapshot.routing.write_target.is_some() || snapshot.routing.unresolved_write_target {
+        return Plan::Apply {
+            changes: vec![
+                KubernetesChange::RemoveWriteRouting,
+                KubernetesChange::PersistStatus {
+                    status: Box::new(waiting_status(
+                        status,
+                        "SwitchoverRoutingRemoved",
+                        "Removing write routing before old-primary preparation",
+                    )),
+                },
+            ],
+        };
+    }
+    let intent = transition
+        .switchover
+        .as_ref()
+        .expect("validated switchover intent");
+    if intent.resolution != PlannedSwitchoverResolution::RequestedTarget {
+        return wait(
+            "SwitchoverRecoveryPending",
+            "Compensation requires recovery evidence",
+        );
+    }
+    let previous = &snapshot
+        .status
+        .topology
+        .as_ref()
+        .expect("accepted topology")
+        .configuration;
+    let current = &transition.current_configuration;
+    let preparation_id = derive_switchover_preparation_operation_id(
+        &snapshot.resource_uid,
+        &intent.request_id,
+        &intent.source,
+        &intent.target,
+    );
+    let Some(source_report) = healthy_report(snapshot, &intent.source) else {
+        return wait(
+            "SwitchoverSourceUnavailable",
+            "Waiting for the exact source's fresh authority evidence",
+        );
+    };
+    let source = configuration_primary(previous);
+    let Some(handoff) = &intent.handoff else {
+        if !stable_member_report(source_report, source, previous) {
+            return wait(
+                "SwitchoverPreparationPending",
+                "Waiting for idle starting authority on the exact source",
+            );
+        }
+        if let Some(handoff) = &source_report.prepared_switchover {
+            if handoff.preparation_operation_id != preparation_id
+                || handoff.request_id != intent.request_id
+                || handoff.source != intent.source
+                || handoff.target != intent.target
+                || handoff.starting_configuration_id != previous.configuration_id
+                || handoff.starting_epoch != previous.epoch
+                || handoff.handoff_lsn > source_report.current_progress
+                || source_report.write_status == AccessStatus::Granted
+            {
+                return unsafe_plan(
+                    status,
+                    UnsafeReason::ContradictoryReplicaEvidence(
+                        "Prepared switchover differs from the frozen operation".to_string(),
+                    ),
+                    config,
+                );
+            }
+            status
+                .transition
+                .as_mut()
+                .unwrap()
+                .switchover
+                .as_mut()
+                .unwrap()
+                .handoff = Some(handoff.clone());
+            return Plan::Apply {
+                changes: vec![KubernetesChange::PersistStatus {
+                    status: Box::new(waiting_status(
+                        status,
+                        "SwitchoverPrepared",
+                        "Persisted the old primary's durable write handoff certificate",
+                    )),
+                }],
+            };
+        }
+        if source_report.write_status != AccessStatus::Granted {
+            return wait(
+                "SwitchoverPreparationPending",
+                "Waiting for retained write-revocation evidence",
+            );
+        }
+        return Plan::Execute {
+            command: ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+                operation_id: preparation_id,
+                request_id: intent.request_id.clone(),
+                source: intent.source.clone(),
+                target: intent.target.clone(),
+                current_configuration: previous.clone(),
+                local_replica_id: intent.source.replica_id,
+                expected_instance_id: intent.source.instance_id.clone(),
+                expected_agent_generation: intent.source.agent_generation.clone(),
+            })),
+        };
+    };
+    let source_retired = switchover_member_complete(
+        source_report,
+        transition,
+        current
+            .members
+            .iter()
+            .find(|member| member.identity == intent.source)
+            .unwrap(),
+        previous,
+        true,
+    );
+    if source_report.write_status == AccessStatus::Granted
+        || (!source_retired && source_report.prepared_switchover.as_ref() != Some(handoff))
+    {
+        return wait(
+            "SwitchoverSourceFencePending",
+            "The source must retain the exact preparation and remain write-closed until retirement",
+        );
+    }
+    let Some(target_report) = healthy_report(snapshot, &intent.target) else {
+        return wait(
+            "SwitchoverTargetUnavailable",
+            "Waiting for the exact requested target",
+        );
+    };
+    if target_report.epoch == previous.epoch
+        && (!stable_member_report(
+            target_report,
+            previous
+                .members
+                .iter()
+                .find(|member| member.identity == intent.target)
+                .unwrap(),
+            previous,
+        ) || target_report
+            .verified_replication_lsn
+            .is_none_or(|lsn| lsn < handoff.handoff_lsn))
+    {
+        return wait(
+            "SwitchoverTargetCatchupPending",
+            "The exact target must verify the handoff prefix under starting authority; raw progress is insufficient",
+        );
+    }
+    let target = configuration_primary(current);
+    let mut ordered = current
+        .members
+        .iter()
+        .filter(|member| member.identity != target.identity)
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|member| (member.identity != intent.source, member.identity.replica_id));
+    ordered.push(target);
+
+    let mut pc_cc_reports = Vec::new();
+    let mut current_only_started = false;
+    for member in &ordered {
+        let Some(report) = healthy_report(snapshot, &member.identity) else {
+            return wait(
+                "SwitchoverMemberUnavailable",
+                "Every exact member must attest requested authority",
+            );
+        };
+        let current_only = report.epoch == current.epoch
+            && report.current_configuration.as_ref() == Some(current)
+            && report.previous_configuration.is_none();
+        if current_only {
+            current_only_started = true;
+            continue;
+        }
+        if !switchover_member_complete(report, transition, member, previous, false) {
+            return Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(
+                    switchover_configuration_command(transition, previous, member, false),
+                )),
+            };
+        }
+        pc_cc_reports.push(report);
+    }
+    if !current_only_started
+        && (!configuration_report_quorum(previous, &pc_cc_reports)
+            || !configuration_report_quorum(current, &pc_cc_reports))
+    {
+        return wait(
+            "SwitchoverJointQuorumPending",
+            "Waiting for exact PC/CC report quorums",
+        );
+    }
+    if !target_report.catch_up_complete
+        || target_report
+            .verified_replication_lsn
+            .is_none_or(|lsn| lsn < handoff.handoff_lsn)
+        || (!current_only_started
+            && (target_report.catch_up_boundary != Some(handoff.handoff_lsn)
+                || target_report.current_configuration_quorum_progress < handoff.handoff_lsn))
+    {
+        return wait(
+            "SwitchoverRequestedCatchupPending",
+            "The requested primary must prove certified catch-up while write-closed",
+        );
+    }
+    for member in &ordered {
+        let report =
+            healthy_report(snapshot, &member.identity).expect("all members observed above");
+        if !switchover_member_complete(report, transition, member, previous, true) {
+            return Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(Box::new(
+                    switchover_configuration_command(transition, previous, member, true),
+                )),
+            };
+        }
+    }
+    status.topology = Some(AcceptedTopology {
+        configuration: current.clone(),
+    });
+    status.observed_generation = transition.spec_generation;
+    status.transition = None;
+    status.primary_failure = None;
+    status.quorum_loss = None;
+    status.last_switchover = Some(PlannedSwitchoverReceipt {
+        request_id: intent.request_id.clone(),
+        requested_target_replica_id: intent.target.replica_id,
+        accepted_target: Some(intent.target.clone()),
+        resulting_primary: Some(intent.target.clone()),
+        outcome: PlannedSwitchoverOutcome::RequestedTargetCompleted,
+    });
+    Plan::Apply {
+        changes: vec![KubernetesChange::PersistStatus {
+            status: Box::new(waiting_status(
+                status,
+                "SwitchoverCompleted",
+                "Accepted requested current-only authority; stable convergence will grant writes and publish routing",
+            )),
+        }],
+    }
+}
+
+fn switchover_member_complete(
+    report: &crate::observation::AgentReport,
+    transition: &TransitionIntent,
+    member: &ConfigurationMember,
+    previous: &ConfigurationDescriptor,
+    current_only: bool,
+) -> bool {
+    let operation_id = switchover_operation_id(transition, member, current_only);
+    report.identity == member.identity
+        && report.role == member.role
+        && report.epoch == transition.current_configuration.epoch
+        && report.current_configuration.as_ref() == Some(&transition.current_configuration)
+        && report.previous_configuration.as_ref() == (!current_only).then_some(previous)
+        && report.write_status != AccessStatus::Granted
+        && report.pending_operation_id.is_none()
+        && report.retained_operation_id.as_ref() == Some(&operation_id)
+        && (!current_only || report.prepared_switchover.is_none())
+}
+
+fn switchover_operation_id(
+    transition: &TransitionIntent,
+    member: &ConfigurationMember,
+    current_only: bool,
+) -> OperationId {
+    OperationId::new(format!(
+        "{}:{}:{}",
+        transition.transition_id,
+        if current_only {
+            "current-only"
+        } else {
+            "pc-cc"
+        },
+        member.identity.replica_id
+    ))
+}
+
+fn switchover_configuration_command(
+    transition: &TransitionIntent,
+    previous: &ConfigurationDescriptor,
+    member: &ConfigurationMember,
+    current_only: bool,
+) -> EnsureConfiguration {
+    let handoff = transition
+        .switchover
+        .as_ref()
+        .unwrap()
+        .handoff
+        .as_ref()
+        .unwrap();
+    EnsureConfiguration {
+        operation_id: switchover_operation_id(transition, member, current_only),
+        previous_configuration: (!current_only).then(|| previous.clone()),
+        current_configuration: transition.current_configuration.clone(),
+        previous_epoch: (!current_only).then_some(previous.epoch),
+        current_epoch: transition.current_configuration.epoch,
+        effective_policy: transition.effective_policy.clone(),
+        local_replica_id: member.identity.replica_id,
+        expected_instance_id: member.identity.instance_id.clone(),
+        expected_agent_generation: member.identity.agent_generation.clone(),
+        transition_kind: TransitionKind::PlannedSwitchover,
+        failover_safe_lsn: None,
+        primary_write_status: AccessStatus::ReconfigurationPending,
+        current_only,
+        retire_build_ids: Vec::new(),
+        switchover_handoff: Some(handoff.clone()),
+        retire_switchover_preparation_ids: if current_only && member.identity == handoff.source {
+            vec![handoff.preparation_operation_id.clone()]
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -781,6 +1350,9 @@ fn evaluate_transition(
     transition: &TransitionIntent,
     config: &EvaluationConfig,
 ) -> Plan {
+    if transition.kind == TransitionKind::PlannedSwitchover {
+        return evaluate_switchover(snapshot, transition, config);
+    }
     let mut status = transition_status(snapshot.status.clone());
     let (_, unsupported) = desired_spec_state(
         snapshot,
@@ -807,17 +1379,6 @@ fn evaluate_transition(
     }
     if transition.kind == TransitionKind::Failover {
         return evaluate_failover_transition(snapshot, transition, status, config);
-    }
-    if transition.kind == TransitionKind::PlannedSwitchover {
-        return Plan::Wait {
-            reason: WaitReason::ActiveTransition,
-            status: waiting_status(
-                status,
-                "PlannedSwitchoverNotEnabled",
-                "Planned switchover authority is defined but execution is not enabled",
-            ),
-            requeue_after_seconds: config.wait_requeue_seconds,
-        };
     }
 
     if let Some(plan) =
@@ -2705,16 +3266,6 @@ fn desired_spec_state(
             "requested failover delay {} differs from frozen delay {}",
             snapshot.desired.failover_delay_seconds, policy.failover_delay_seconds
         ));
-    }
-    if let Some(request) = &snapshot.desired.switchover {
-        if request.request_id.is_empty() || request.target_replica_id.value() <= 0 {
-            differences.push("planned switchover request is malformed".to_string());
-        } else {
-            differences.push(format!(
-                "planned switchover request {} targeting replica {} is not enabled",
-                request.request_id, request.target_replica_id
-            ));
-        }
     }
 
     let mut observed_images = 0_usize;

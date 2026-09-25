@@ -271,7 +271,9 @@ where
                         } else {
                             CoordinatorStage::Deactivate
                         }
-                    } else if state.role == ReplicaRole::Primary
+                    } else if record.command.transition_kind
+                        != kuberic_protocol::types::TransitionKind::PlannedSwitchover
+                        && state.role == ReplicaRole::Primary
                         && authority.local_role() != ReplicaRole::Primary
                     {
                         CoordinatorStage::Catchup
@@ -343,7 +345,9 @@ where
                     {
                         CoordinatorStage::GetLsn
                     } else if authority.local_role() == ReplicaRole::Primary
-                        && record.command.primary_write_status == AccessStatus::Granted
+                        && (record.command.primary_write_status == AccessStatus::Granted
+                            || record.command.transition_kind
+                                == kuberic_protocol::types::TransitionKind::PlannedSwitchover)
                     {
                         CoordinatorStage::Catchup
                     } else {

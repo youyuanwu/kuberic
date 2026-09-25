@@ -5405,6 +5405,255 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
 }
 
 #[tokio::test]
+async fn planned_handoff_roles_converge_closed_and_catchup_uses_certified_boundary() {
+    let identities = [
+        identity(1, "source"),
+        identity(2, "target"),
+        identity(3, "third"),
+    ];
+    let starting = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        identities[0].replica_id,
+        identities
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| ConfigurationMember {
+                identity: identity.clone(),
+                role: if index == 0 {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        2,
+    );
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        identities[1].replica_id,
+        identities
+            .iter()
+            .enumerate()
+            .map(|(index, identity)| ConfigurationMember {
+                identity: identity.clone(),
+                role: if index == 1 {
+                    ReplicaRole::Primary
+                } else {
+                    ReplicaRole::ActiveSecondary
+                },
+            })
+            .collect(),
+        2,
+    );
+    let handoff = SwitchoverHandoff {
+        preparation_operation_id: OperationId::new("planned-prepare"),
+        request_id: SwitchoverRequestId::new("planned-request"),
+        source: identities[0].clone(),
+        target: identities[1].clone(),
+        starting_configuration_id: starting.configuration_id.clone(),
+        starting_epoch: starting.epoch,
+        handoff_lsn: 7,
+    };
+    let mut runtimes = Vec::new();
+    for (index, identity) in identities.iter().enumerate() {
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let application = Arc::new(TestApplication::default());
+        application.seed_progress(if index == 1 { 9 } else { 7 });
+        let authority = AdmittedAuthority {
+            local_identity: identity.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: starting.clone(),
+            switchover_handoff: None,
+        };
+        store.replication_progress.lock().unwrap().insert(
+            authority.fence(),
+            ReplicationProgress {
+                fence: authority.fence(),
+                verified_lsn: 7,
+            },
+        );
+        let runtime = PodRuntime::new(identity.clone(), application, store);
+        runtime
+            .apply_effect(effect(1, RuntimeEffectAction::Open(OpenMode::Existing)))
+            .await
+            .unwrap();
+        runtime
+            .apply_effect(effect(
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+            ))
+            .await
+            .unwrap();
+        runtime
+            .apply_effect(effect(
+                3,
+                RuntimeEffectAction::ChangeRole(starting.members[index].role),
+            ))
+            .await
+            .unwrap();
+        runtime
+            .apply_effect(effect(
+                4,
+                RuntimeEffectAction::SetWriteStatus(if index == 0 {
+                    AccessStatus::Granted
+                } else {
+                    AccessStatus::NotPrimary
+                }),
+            ))
+            .await
+            .unwrap();
+        runtimes.push(runtime);
+    }
+    let prepared = runtimes[0]
+        .apply_effect(RuntimeEffect {
+            operation_id: handoff.preparation_operation_id.clone(),
+            sequence: 5,
+            action: RuntimeEffectAction::PrepareSwitchover {
+                request_id: handoff.request_id.clone(),
+                source: handoff.source.clone(),
+                target: handoff.target.clone(),
+                starting_configuration_id: handoff.starting_configuration_id.clone(),
+                starting_epoch: handoff.starting_epoch,
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(prepared.postcondition.current_progress, 7);
+    let mut sequences = [0; 3];
+    for index in [0, 2, 1] {
+        let runtime = &runtimes[index];
+        let authority = AdmittedAuthority {
+            local_identity: identities[index].clone(),
+            transition_kind: Some(TransitionKind::PlannedSwitchover),
+            previous_configuration: Some(starting.clone()),
+            current_configuration: current.clone(),
+            switchover_handoff: Some(handoff.clone()),
+        };
+        let first_sequence = if index == 0 { 6 } else { 5 };
+        let mut actions = vec![
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+            RuntimeEffectAction::SetReadStatus(AccessStatus::ReconfigurationPending),
+            RuntimeEffectAction::RefreshApplicationProgress,
+            RuntimeEffectAction::SetWriteStatus(AccessStatus::ReconfigurationPending),
+            RuntimeEffectAction::ChangeReplicatorRole(current.members[index].role),
+        ];
+        if index == 1 {
+            actions.push(RuntimeEffectAction::UpdateEpoch);
+        }
+        actions.push(RuntimeEffectAction::ChangeApplicationRole(
+            current.members[index].role,
+        ));
+        let mut next = first_sequence;
+        for action in actions {
+            runtime.apply_effect(effect(next, action)).await.unwrap();
+            next += 1;
+            for participant in &runtimes {
+                assert_ne!(
+                    participant.snapshot().await.write_status,
+                    AccessStatus::Granted
+                );
+            }
+        }
+        if index == 1 {
+            assert_eq!(runtime.snapshot().await.catch_up_boundary, Some(7));
+            assert_eq!(runtime.snapshot().await.current_progress, 9);
+            assert_eq!(runtime.snapshot().await.verified_replication_lsn, Some(7));
+            assert!(!runtime.snapshot().await.catch_up_complete);
+            runtime
+                .data_plane()
+                .accept_acknowledgement(acknowledgement(&authority, identities[0].clone(), 7))
+                .await
+                .unwrap();
+            timeout(
+                Duration::from_secs(1),
+                runtime.apply_effect(effect(next, RuntimeEffectAction::WaitForCatchup)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            next += 1;
+        }
+        runtime
+            .apply_effect(effect(
+                next,
+                RuntimeEffectAction::SetAccessStatus {
+                    read: AccessStatus::Granted,
+                    write: if index == 1 {
+                        AccessStatus::ReconfigurationPending
+                    } else {
+                        AccessStatus::NotPrimary
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+        next += 1;
+        assert!(
+            runtime
+                .data_plane()
+                .begin_write(ClientWrite {
+                    operation_id: OperationId::new(format!("before-acceptance-{index}")),
+                    data: Bytes::from_static(b"must-not-commit"),
+                })
+                .await
+                .is_err()
+        );
+        sequences[index] = next;
+    }
+    for index in [0, 2, 1] {
+        let runtime = &runtimes[index];
+        runtime
+            .apply_effect(effect(
+                sequences[index],
+                RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                    local_identity: identities[index].clone(),
+                    transition_kind: None,
+                    previous_configuration: None,
+                    current_configuration: current.clone(),
+                    switchover_handoff: Some(handoff.clone()),
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+    }
+    runtimes[1]
+        .apply_effect(effect(
+            sequences[1] + 1,
+            RuntimeEffectAction::SetAccessStatus {
+                read: AccessStatus::Granted,
+                write: AccessStatus::Granted,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtimes[1].snapshot().await.write_status,
+        AccessStatus::Granted
+    );
+    assert_eq!(
+        runtimes[0].snapshot().await.role,
+        ReplicaRole::ActiveSecondary
+    );
+    assert!(
+        runtimes[0]
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("retained-source-client"),
+                data: Bytes::from_static(b"stale-client"),
+            })
+            .await
+            .is_err()
+    );
+    assert_eq!(runtimes[1].snapshot().await.role, ReplicaRole::Primary);
+    assert_eq!(
+        runtimes[2].snapshot().await.role,
+        ReplicaRole::ActiveSecondary
+    );
+}
+
+#[tokio::test]
 async fn switchover_certificate_transfers_only_the_verified_prefix_across_restart_and_compensation()
 {
     let source = identity(1, "source");
