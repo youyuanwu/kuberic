@@ -490,25 +490,26 @@ fn validate_report_authority(
             "reduced authority requires evidence and pre-commit write closure",
         ));
     }
-    if let Some(transition) = &snapshot.status.transition
-        && let Some(evidence) = &report.secondary_removal_evidence
-        && transition
-            .secondary_removal_evidence
-            .as_ref()
-            .is_none_or(|frozen| {
-                frozen.preparation != evidence.preparation
-                    || frozen.previous_read_quorum != evidence.previous_read_quorum
-            })
+    let frozen_removal_evidence = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.secondary_removal_evidence.as_ref())
+        .or_else(|| {
+            snapshot
+                .status
+                .secondary_scale_down_cleanup
+                .as_ref()
+                .map(|cleanup| &cleanup.evidence)
+        });
+    if let Some(evidence) = &report.secondary_removal_evidence
+        && frozen_removal_evidence.is_none_or(|frozen| frozen != evidence)
     {
         return Err(ValidationError::InvalidSecondaryScaleDown(
             "report does not retain the frozen admission evidence",
         ));
     }
-    if let Some(frozen) = snapshot
-        .status
-        .transition
-        .as_ref()
-        .and_then(|transition| transition.secondary_removal_evidence.as_ref())
+    if let Some(frozen) = frozen_removal_evidence
         && report
             .prepared_secondary_removal
             .as_ref()

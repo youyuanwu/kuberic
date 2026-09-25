@@ -661,6 +661,108 @@ fn secondary_removal_reports_bind_frozen_authority_and_fresh_observation() {
 }
 
 #[test]
+fn secondary_removal_cleanup_keeps_reports_bound_to_frozen_admission_evidence() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    let cleanup = scale_down_fixture::cleanup(&intent);
+    let mut snapshot = empty_snapshot(2);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(intent.current_policy.clone()),
+        topology: Some(AcceptedTopology {
+            configuration: intent.current_configuration.clone(),
+        }),
+        secondary_scale_down_cleanup: Some(cleanup.clone()),
+        ..Default::default()
+    };
+    let report = AgentReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        identity: intent.primary.clone(),
+        process_session_id: ProcessSessionId::new("session-1"),
+        report_sequence: 5,
+        role: ReplicaRole::Primary,
+        read_status: AccessStatus::Granted,
+        write_status: AccessStatus::Granted,
+        epoch: intent.current_configuration.epoch,
+        current_configuration: Some(intent.current_configuration.clone()),
+        current_progress: 10,
+        verified_replication_lsn: Some(10),
+        committed_lsn: 10,
+        secondary_removal_evidence: Some(cleanup.evidence.clone()),
+        ..Default::default()
+    };
+    let key = ReplicaObservationKey::new(
+        intent.primary.replica_id,
+        intent.primary.instance_id.clone(),
+    );
+    snapshot.replicas.insert(
+        key.clone(),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Report(Box::new(report)),
+        },
+    );
+    validate_snapshot(&snapshot).unwrap();
+
+    let AgentObservation::Report(report) = &mut snapshot.replicas.get_mut(&key).unwrap().agent
+    else {
+        unreachable!()
+    };
+    report
+        .secondary_removal_evidence
+        .as_mut()
+        .unwrap()
+        .preparation
+        .boundary_lsn = 0;
+    assert!(validate_snapshot(&snapshot).is_err());
+}
+
+#[test]
+fn secondary_removal_current_only_freshness_covers_rotating_quorum_witnesses() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3, 4], 1);
+    let member = |id| {
+        intent
+            .current_configuration
+            .members
+            .iter()
+            .find(|member| member.identity.replica_id == ReplicaId::new(id))
+            .unwrap()
+            .identity
+            .clone()
+    };
+    let mut cleanup = scale_down_fixture::cleanup(&intent);
+    cleanup
+        .evidence
+        .previous_read_quorum
+        .retain(|witness| [member(1), member(3)].contains(&witness.identity));
+    cleanup
+        .evidence
+        .reduced_write_quorum
+        .retain(|witness| [member(1), member(2)].contains(&witness.identity));
+    cleanup
+        .current_only_write_quorum
+        .retain(|witness| [member(1), member(3)].contains(&witness.identity));
+    cleanup
+        .evidence
+        .previous_read_quorum
+        .iter_mut()
+        .find(|witness| witness.identity == member(3))
+        .unwrap()
+        .report_sequence = 5;
+    cleanup
+        .current_only_write_quorum
+        .iter_mut()
+        .find(|witness| witness.identity == member(3))
+        .unwrap()
+        .report_sequence = 4;
+
+    validate_secondary_removal_evidence(&cleanup.evidence, true).unwrap();
+    assert!(validate_secondary_scale_down_cleanup(&cleanup).is_err());
+}
+
+#[test]
 fn configuration_json_derives_primary_and_flattens_member_identity() {
     let configuration = configuration();
     let value = serde_json::to_value(&configuration).unwrap();

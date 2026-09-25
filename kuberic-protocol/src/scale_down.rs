@@ -247,11 +247,17 @@ pub fn validate_secondary_scale_down_cleanup(cleanup: &SecondaryScaleDownCleanup
         SecondaryRemovalStage::CurrentOnly,
     )?;
     for witness in &cleanup.current_only_write_quorum {
-        if cleanup.evidence.reduced_write_quorum.iter().any(|earlier| {
-            earlier.identity == witness.identity
-                && earlier.process_session_id == witness.process_session_id
-                && earlier.report_sequence >= witness.report_sequence
-        }) {
+        if cleanup
+            .evidence
+            .previous_read_quorum
+            .iter()
+            .chain(&cleanup.evidence.reduced_write_quorum)
+            .any(|earlier| {
+                earlier.identity == witness.identity
+                    && earlier.process_session_id == witness.process_session_id
+                    && earlier.report_sequence >= witness.report_sequence
+            })
+        {
             return Err(invalid("current-only evidence is not fresh"));
         }
     }
