@@ -2902,9 +2902,6 @@ impl DefaultReplicatorInner {
             }
             RuntimeEffectAction::FenceRetirement(retired) => {
                 retired.validate(&self.identity)?;
-                if let Some(streams) = self.streams.read().await.as_ref() {
-                    streams.shutdown();
-                }
                 let mut state = self.state.write().await;
                 if state
                     .retiring_authority
@@ -2933,6 +2930,9 @@ impl DefaultReplicatorInner {
                 state.peer_repair_targets.clear();
                 state.retiring_authority = Some(*retired);
                 drop(state);
+                if let Some(streams) = self.streams.read().await.as_ref() {
+                    streams.shutdown();
+                }
                 self.fence_generation.fetch_add(1, Ordering::AcqRel);
                 self.replicator.lock().await.fence_client_writes();
             }

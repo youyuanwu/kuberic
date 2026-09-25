@@ -703,6 +703,70 @@ async fn secondary_removal_retirement_cancels_unacknowledged_inbound_delivery() 
 }
 
 #[tokio::test]
+async fn rejected_secondary_removal_retirement_keeps_inbound_delivery_open() {
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let app = Arc::new(TestApplication::default());
+    app.manual_streams.store(true, Ordering::SeqCst);
+    let target = open_removal_member(
+        &intent,
+        intent.target.clone(),
+        app.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+    )
+    .await;
+    let old_authority = target.snapshot().await.authority.unwrap();
+    let pending = target
+        .data_plane()
+        .receive_replication(retry_item(
+            &acknowledgement(&old_authority, intent.target.clone(), 1),
+            intent.target.clone(),
+        ))
+        .await
+        .unwrap();
+    let applied = tokio::spawn(async move { pending.applied().await });
+    let mut stream = app.held_streams.lock().unwrap().remove(0);
+    let operation = stream.get_operation().await.unwrap().unwrap();
+    let mut conflicting_intent = intent.clone();
+    conflicting_intent
+        .previous_configuration
+        .epoch
+        .configuration_number += 10;
+    conflicting_intent.previous_configuration.configuration_id =
+        conflicting_intent.previous_configuration.expected_id();
+    conflicting_intent
+        .current_configuration
+        .epoch
+        .configuration_number += 10;
+    conflicting_intent.current_configuration.configuration_id =
+        conflicting_intent.current_configuration.expected_id();
+    conflicting_intent.operation_id = conflicting_intent.expected_operation_id();
+    let conflicting = kuberic_runtime_internal::authority::RetiredAuthority {
+        committed: removal_fixture::cleanup(&conflicting_intent),
+        report: removal_fixture::retirement(&conflicting_intent),
+    };
+
+    assert!(
+        target
+            .apply_effect(effect(
+                5,
+                RuntimeEffectAction::RetireReplica(Box::new(conflicting)),
+            ))
+            .await
+            .is_err()
+    );
+    assert!(!applied.is_finished());
+    operation
+        .acknowledge(DurableApplicationProgress {
+            applied_lsn: 1,
+            committed_lsn: 0,
+        })
+        .unwrap();
+    assert_eq!(applied.await.unwrap().unwrap().applied_lsn, 1);
+    assert!(target.snapshot().await.open);
+    assert_eq!(target.snapshot().await.role, ReplicaRole::ActiveSecondary);
+}
+
+#[tokio::test]
 async fn secondary_removal_preparation_failure_is_closed_and_exactly_replayable() {
     for ambiguous in [false, true] {
         let intent = removal_fixture::intent(&[1, 2], 1);
