@@ -939,24 +939,32 @@ fn converge_committed(
     }
     let intent = &cleanup.evidence.preparation.intent;
     for member in &intent.current_configuration.members {
+        let operation_id =
+            intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, &member.identity);
         if let Some(r) = report(snapshot, &member.identity)
-            && stable_member_report(r, member, &intent.current_configuration)
-            && r.accepted_secondary_removal
+            && r.identity == member.identity
+            && r.role == member.role
+            && r.epoch == intent.current_configuration.epoch
+            && r.previous_configuration.is_none()
+            && r.current_configuration.as_ref() == Some(&intent.current_configuration)
+            && r.pending_operation_id
                 .as_ref()
-                .is_none_or(|accepted| {
-                    accepted.evidence != cleanup.evidence
-                        || accepted.current_only_write_quorum != cleanup.current_only_write_quorum
-                })
+                .is_none_or(|id| id == &operation_id)
+            && (r.pending_operation_id.is_some()
+                || r.accepted_secondary_removal
+                    .as_ref()
+                    .is_none_or(|accepted| {
+                        accepted.evidence != cleanup.evidence
+                            || accepted.current_only_write_quorum
+                                != cleanup.current_only_write_quorum
+                    }))
         {
             let mut committed = cleanup.clone();
             committed.retirement = None;
             return Some(Plan::Execute {
                 command: ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
                     AcceptSecondaryRemovalCommit {
-                        operation_id: intent.command_operation_id(
-                            SecondaryRemovalStage::AcceptCommit,
-                            &member.identity,
-                        ),
+                        operation_id,
                         target: member.identity.clone(),
                         committed,
                     },

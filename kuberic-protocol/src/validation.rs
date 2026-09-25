@@ -78,6 +78,8 @@ pub enum ValidationError {
     InvalidFailoverElectionLsn,
     #[error("replacement must change exactly one non-primary incarnation")]
     InvalidReplacementMembership,
+    #[error("replacement cleanup must identify an exact excluded incarnation")]
+    InvalidReplacementCleanup,
     #[error("replacement must preserve the accepted primary")]
     ReplacementPrimaryChanged,
     #[error("build source is not the exact Current Configuration primary")]
@@ -850,6 +852,20 @@ fn observation_key_string(key: &ReplicaObservationKey) -> String {
 
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
+    if let Some(retired) = &status.last_replacement
+        && (retired.replica_id.value() <= 0
+            || retired.instance_id.is_empty()
+            || retired.agent_generation.is_empty()
+            || status.topology.as_ref().is_none_or(|topology| {
+                topology
+                    .configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == *retired)
+            }))
+    {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    }
     if let Some(receipt) = &status.last_secondary_removal {
         validate_secondary_scale_down_cleanup(&receipt.committed())?;
         let intent = &receipt.evidence.preparation.intent;

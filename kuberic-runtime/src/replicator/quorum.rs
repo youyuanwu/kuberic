@@ -177,6 +177,29 @@ impl QuorumTracker {
         Ok(())
     }
 
+    pub(crate) fn observe_committed_secondary_removal(
+        &mut self,
+        witness: &SecondaryRemovalWitness,
+    ) -> Result<()> {
+        // A frozen commit certificate can arrive after fresher peer discovery.
+        // Retain the newer verified credit, without replaying an older sequence.
+        if self
+            .witnesses
+            .get(&witness.identity)
+            .is_some_and(|current| {
+                current.process_session_id == witness.process_session_id
+                    && current.epoch == witness.epoch
+                    && current.current_configuration_id == witness.current_configuration_id
+                    && current.previous_configuration_id == witness.previous_configuration_id
+                    && current.report_sequence >= witness.report_sequence
+                    && current.verified_replication_lsn >= witness.verified_replication_lsn
+            })
+        {
+            return Ok(());
+        }
+        self.observe_secondary_removal(witness)
+    }
+
     pub fn register_write(&mut self, lsn: Lsn) -> Result<oneshot::Receiver<Result<Lsn>>> {
         if self.authority.is_none() {
             return Err(RuntimeError::AuthorityNotAdmitted);

@@ -454,6 +454,13 @@ impl ReplicationLog {
         self.quorum.observe_secondary_removal(witness)
     }
 
+    pub(crate) fn observe_committed_secondary_removal(
+        &mut self,
+        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+    ) -> Result<()> {
+        self.quorum.observe_committed_secondary_removal(witness)
+    }
+
     pub(crate) fn acknowledge_in_session(
         &mut self,
         ack: &ReplicationAck,

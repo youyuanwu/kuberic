@@ -134,6 +134,42 @@ fn evaluator_scale_down_pending_primary_replay_precedes_secondary_catch_up() {
 }
 
 #[test]
+fn evaluator_scale_down_replays_pending_commit_acceptance_after_restart() {
+    use scale_down_model::Model;
+    for id in [1, 2] {
+        for applied in [false, true] {
+            let mut model = Model::new(&[1, 2, 3], 1, 2);
+            model.until(|m| {
+                matches!(m.plan(), Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(c)
+            } if c.target.replica_id.value() == id)
+            });
+            let original = model.plan();
+            let Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(command),
+            } = &original
+            else {
+                unreachable!()
+            };
+            model.report(id).pending_operation_id = Some(command.operation_id.clone());
+            if applied {
+                model.report(id).accepted_secondary_removal = Some(command.committed.clone());
+                model.report(id).prepared_secondary_removal = None;
+            }
+            model.controller_restart();
+            assert_eq!(model.plan(), original);
+            let mut conflict = model.clone();
+            conflict.report(id).pending_operation_id = Some(OperationId::new("unrelated-work"));
+            assert_ne!(conflict.plan(), original);
+            model.report(id).pending_operation_id = None;
+            model.finish();
+            assert!(model.inflight.is_empty());
+            assert_eq!(model.deletes.len(), 3);
+        }
+    }
+}
+
+#[test]
 fn evaluator_scale_down_replays_pending_retirement_but_not_conflicting_work() {
     use scale_down_model::{CommandBoundary, Model, reason};
     let mut model = Model::new(&[1, 2], 1, 1);
@@ -5945,6 +5981,41 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
                     if name == "old-data"
             )
     ));
+    let enabled = EvaluationConfig {
+        enable_secondary_scale_down: true,
+        ..Default::default()
+    };
+    let deletes = |plan: Plan| {
+        matches!(plan, Plan::Apply { changes }
+        if changes.iter().any(|change| matches!(change, KubernetesChange::DeleteReplicaScaffolding { .. })))
+    };
+    assert!(!deletes(evaluate(&snapshot, &enabled)));
+    let retired_pod = PodUid::new("old-pod");
+    snapshot.status.last_replacement = Some(ReplicaIdentity {
+        replica_id: member.identity.replica_id,
+        instance_id: ReplicaInstanceId::new(retired_pod.as_str()),
+        agent_generation: derive_agent_generation(&derive_initialization_id(
+            &snapshot.resource_uid,
+            member.identity.replica_id,
+            &retired_pod,
+            &PvcUid::new("old-pvc"),
+        )),
+    });
+    assert!(deletes(evaluate(&snapshot, &enabled)));
+    let old = snapshot
+        .replicas
+        .get_mut(&ReplicaObservationKey::new(
+            member.identity.replica_id,
+            ReplicaInstanceId::new("orphan-old-pvc"),
+        ))
+        .unwrap()
+        .kubernetes
+        .as_mut()
+        .unwrap();
+    old.pvc_uid = Some(PvcUid::new("same-name-different-uid"));
+    assert!(!deletes(evaluate(&snapshot, &enabled)));
+    snapshot.status.last_replacement = Some(member.identity);
+    assert!(validate_status(&snapshot.status).is_err());
 }
 
 #[test]

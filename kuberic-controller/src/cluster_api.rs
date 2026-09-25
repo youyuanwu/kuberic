@@ -233,7 +233,7 @@ fn add_bearer_token<T>(
 
 fn classify_status(status: tonic::Status) -> AgentRpcError {
     match status.code() {
-        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled => {
+        Code::Unavailable | Code::DeadlineExceeded | Code::Cancelled | Code::Unknown => {
             AgentRpcError::Unavailable(status.to_string())
         }
         _ => AgentRpcError::Invalid(status.to_string()),
@@ -2808,6 +2808,18 @@ mod tests {
                 .command,
             command
         );
+    }
+
+    #[test]
+    fn connection_reset_is_unavailability_not_contradictory_agent_evidence() {
+        assert!(matches!(
+            classify_status(tonic::Status::unknown("transport error: connection reset")),
+            AgentRpcError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_status(tonic::Status::invalid_argument("malformed authority")),
+            AgentRpcError::Invalid(_)
+        ));
     }
 
     #[test]

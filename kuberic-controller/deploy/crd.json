@@ -153,6 +153,28 @@
                   "initialized": {
                     "type": "boolean"
                   },
+                  "lastReplacement": {
+                    "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
+                    "nullable": true,
+                    "properties": {
+                      "agentGeneration": {
+                        "type": "string"
+                      },
+                      "instanceId": {
+                        "type": "string"
+                      },
+                      "replicaId": {
+                        "format": "int64",
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "agentGeneration",
+                      "instanceId",
+                      "replicaId"
+                    ],
+                    "type": "object"
+                  },
                   "lastSecondaryRemoval": {
                     "description": "Last completed removal's immutable convergence proof, never deletion authority.\nOne receipt is retained; a later removal supersedes it only after lagging members settle.",
                     "nullable": true,

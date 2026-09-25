@@ -412,6 +412,32 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
     }
 
     status = status.without_condition("UnmanagedReplicaResources");
+    if !recovering_service
+        && let Some(retired) = &status.last_replacement
+        && let Some(extra) = snapshot
+            .replicas
+            .values()
+            .filter_map(|o| o.kubernetes.as_ref())
+            .find(|extra| {
+                extra.replica_id == retired.replica_id
+                    && extra
+                        .pod_uid
+                        .as_ref()
+                        .is_none_or(|uid| uid.as_str() == retired.instance_id.as_str())
+                    && extra.pvc_uid.as_ref().is_some_and(|uid| {
+                        derive_agent_generation(&derive_initialization_id(
+                            &snapshot.resource_uid,
+                            retired.replica_id,
+                            &crate::types::PodUid::new(retired.instance_id.as_str()),
+                            uid,
+                        )) == retired.agent_generation
+                    })
+            })
+    {
+        return Plan::Apply {
+            changes: vec![delete_scaffolding_change(extra)],
+        };
+    }
     if let Some(extra) = snapshot.replicas.iter().find_map(|(key, observation)| {
         let accepted = configuration.members.iter().any(|member| {
             member.identity.replica_id == key.replica_id
@@ -2658,6 +2684,9 @@ fn evaluate_transition(
                 configuration: current.clone(),
             });
             accepted.transition = None;
+            if let Some(retired) = retired {
+                accepted.last_replacement = Some(retired.identity.clone());
+            }
             accepted.primary_failure = None;
             accepted.quorum_loss = None;
             accepted = accepted.with_condition(progressing_condition(
@@ -3326,6 +3355,7 @@ fn evaluate_replacement_transition(
             configuration: current.clone(),
         });
         accepted.transition = None;
+        accepted.last_replacement = Some(retired.clone());
         accepted = accepted.with_condition(progressing_condition(
             "ReplacementTopologyAccepted",
             "Accepted the equal-cardinality replacement topology",

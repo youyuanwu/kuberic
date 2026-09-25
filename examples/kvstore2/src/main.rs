@@ -173,6 +173,7 @@ async fn get_status(
 fn runtime_http_error(error: kuberic_runtime::RuntimeError) -> (StatusCode, String) {
     let status = match error {
         kuberic_runtime::RuntimeError::NotPrimary
+        | kuberic_runtime::RuntimeError::NotOpen
         | kuberic_runtime::RuntimeError::WriteClosed(_)
         | kuberic_runtime::RuntimeError::ReadClosed(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -186,6 +187,13 @@ async fn wait_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_application_requests_are_explicitly_unavailable() {
+        let (status, message) = super::runtime_http_error(kuberic_runtime::RuntimeError::NotOpen);
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!message.is_empty());
+    }
+
     #[test]
     fn application_main_uses_the_agent_host_instead_of_protocol_internals() {
         let source = include_str!("main.rs");

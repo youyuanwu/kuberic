@@ -436,6 +436,14 @@ async fn converge_removal(runtime: &PodRuntime, sequence: &mut u64) -> AdmittedA
                 },
             )
             .await;
+            let mut fresher = witness.clone();
+            fresher.report_sequence += 100;
+            recovery_action(
+                runtime,
+                sequence,
+                RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(fresher)),
+            )
+            .await;
         }
     }
     let committed = kuberic_protocol::types::SecondaryScaleDownCleanup {
@@ -468,6 +476,66 @@ async fn converge_removal(runtime: &PodRuntime, sequence: &mut u64) -> AdmittedA
     )
     .await;
     admitted
+}
+
+#[tokio::test]
+async fn sequential_removal_preparation_preserves_previous_commit_until_new_admission() {
+    let first = removal_fixture::intent(&[1, 2, 3], 1);
+    let runtime = open_removal_member(
+        &first,
+        first.primary.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    )
+    .await;
+    let mut sequence = 5;
+    recovery_action(&runtime, &mut sequence, prepare_removal(&first)).await;
+    converge_removal(&runtime, &mut sequence).await;
+    let committed = runtime.snapshot().await.accepted_secondary_removal.unwrap();
+    let mut next = removal_fixture::intent(&[1, 2], 1);
+    next.previous_configuration = first.current_configuration.clone();
+    next.current_configuration = ConfigurationDescriptor::new(
+        Epoch::new(
+            first.current_configuration.epoch.data_loss_number,
+            first.current_configuration.epoch.configuration_number + 1,
+        ),
+        next.current_configuration.primary_id,
+        next.current_configuration.members,
+        next.current_configuration.write_quorum,
+    );
+    next.spec_generation += 1;
+    next.operation_id = next.expected_operation_id();
+    recovery_action(&runtime, &mut sequence, prepare_removal(&next)).await;
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.accepted_secondary_removal, Some(committed));
+    assert_eq!(snapshot.prepared_secondary_removal.unwrap().intent, next);
+    assert_eq!(snapshot.write_status, AccessStatus::ReconfigurationPending);
+    for action in [
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: AccessStatus::Granted,
+        },
+        RuntimeEffectAction::AdmitAuthority(Box::new(snapshot.authority.unwrap())),
+        RuntimeEffectAction::PrepareSwitchover {
+            preparation_generation: 1,
+            request_id: kuberic_protocol::types::SwitchoverRequestId::new("stale-handoff"),
+            source: next.primary.clone(),
+            target: next.target.clone(),
+            starting_configuration_id: next.previous_configuration.configuration_id.clone(),
+            starting_epoch: next.previous_configuration.epoch,
+        },
+    ] {
+        assert!(
+            runtime
+                .apply_effect(effect(sequence, action))
+                .await
+                .is_err(),
+            "a previous commit must not authorize reopening or replacing a newer preparation"
+        );
+    }
+    converge_removal(&runtime, &mut sequence).await;
+    assert_eq!(runtime.snapshot().await.write_status, AccessStatus::Granted);
 }
 
 #[tokio::test]

@@ -2317,7 +2317,10 @@ impl DefaultReplicatorInner {
                     if let Some(preparation) = &state.prepared_secondary_removal
                         && authority.secondary_removal.as_ref().map(|e| &e.preparation)
                             != Some(preparation)
-                        && state.accepted_secondary_removal.is_none()
+                        && state
+                            .accepted_secondary_removal
+                            .as_ref()
+                            .is_none_or(|committed| committed.evidence.preparation != *preparation)
                     {
                         return Err(RuntimeError::AuthorityMismatch(
                             "prepared removal may only roll forward".into(),
@@ -2630,8 +2633,15 @@ impl DefaultReplicatorInner {
                 starting_epoch,
             } => {
                 let state = self.state.read().await;
-                if state.prepared_secondary_removal.is_some()
-                    && state.accepted_secondary_removal.is_none()
+                if state
+                    .prepared_secondary_removal
+                    .as_ref()
+                    .is_some_and(|preparation| {
+                        state
+                            .accepted_secondary_removal
+                            .as_ref()
+                            .is_none_or(|committed| committed.evidence.preparation != *preparation)
+                    })
                 {
                     return Err(RuntimeError::ReconfigurationPending);
                 }
@@ -2804,7 +2814,6 @@ impl DefaultReplicatorInner {
                         let mut state = self.state.write().await;
                         state.prepared_secondary_removal = None;
                         state.removal_in_progress = None;
-                        state.accepted_secondary_removal = None;
                         preparation.boundary_lsn = 0;
                     } else {
                         self.state.write().await.prepared_secondary_removal = Some(durable);
@@ -2939,7 +2948,7 @@ impl DefaultReplicatorInner {
                         self.replicator
                             .lock()
                             .await
-                            .observe_secondary_removal(witness)?;
+                            .observe_committed_secondary_removal(witness)?;
                     }
                 }
                 if !self.replicator.lock().await.catch_up_complete() {
@@ -3091,7 +3100,18 @@ impl DefaultReplicatorInner {
                 .authority
                 .as_ref()
                 .is_none_or(|a| a.previous_configuration.is_some())
-                || state.accepted_secondary_removal.is_none()
+                || state
+                    .accepted_secondary_removal
+                    .as_ref()
+                    .is_none_or(|committed| {
+                        state
+                            .removal_in_progress
+                            .as_ref()
+                            .is_some_and(|intent| intent != &committed.evidence.preparation.intent)
+                            || state.prepared_secondary_removal.as_ref().is_some_and(
+                                |preparation| preparation != &committed.evidence.preparation,
+                            )
+                    })
                 || !self.replicator.lock().await.catch_up_complete())
         {
             return Err(RuntimeError::ReconfigurationPending);

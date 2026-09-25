@@ -853,6 +853,8 @@ pub struct AcceptedStatus {
     #[serde(default)]
     pub last_switchover: Option<PlannedSwitchoverReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_replacement: Option<ReplicaIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_scale_down_cleanup: Option<SecondaryScaleDownCleanup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_secondary_removal: Option<SecondaryRemovalReceipt>,
