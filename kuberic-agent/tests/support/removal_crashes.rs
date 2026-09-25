@@ -49,11 +49,23 @@ impl AgentStore for CrashStore {
     }
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         let result = self.inner.begin_effect(effect).await?;
+        if matches!(
+            effect.action,
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
+        ) {
+            self.hit("historical-intent");
+        }
         self.effect_hit("intent", &effect.operation_id);
         Ok(result)
     }
     async fn mark_effect_applied(&self, effect: &RuntimeEffect) -> Result<()> {
         self.inner.mark_effect_applied(effect).await?;
+        if matches!(
+            effect.action,
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
+        ) {
+            self.hit("historical-applied");
+        }
         self.effect_hit("applied", &effect.operation_id);
         Ok(())
     }
@@ -122,6 +134,10 @@ struct CrashRuntime {
 #[async_trait]
 impl RuntimeEffectExecutor for CrashRuntime {
     async fn apply_runtime_effect(&self, effect: RuntimeEffect) -> Result<RuntimeEffectResult> {
+        let historical = matches!(
+            effect.action,
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
+        );
         let stage = effect
             .operation_id
             .as_str()
@@ -145,6 +161,9 @@ impl RuntimeEffectExecutor for CrashRuntime {
             std::process::exit(73);
         }
         let result = result?;
+        if historical && self.boundary == "historical-runtime" {
+            std::process::exit(73);
+        }
         if self.boundary == "runtime" || self.boundary == format!("runtime-{stage}") {
             std::process::exit(73);
         }

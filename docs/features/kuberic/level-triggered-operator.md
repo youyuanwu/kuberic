@@ -320,6 +320,12 @@ fence after verifying exact identity, authority and boundary, without old-sessio
 quorum credit, access grants, cleanup, or changes to cluster status/receipt. A fresh
 report proving acceptance is required before ordinary newer-authority correction.
 Missing or mismatched bounded proof fails closed; unrelated pending work waits.
+If ordinary acceptance was already pending when the member crashed, the same
+operation and complete certificate can resume in local-recovery mode. SQLite
+atomically changes only that pending effect's mode, preserving its sequence,
+stage and retained results. The conversion is one-way and requires exact local
+identity, write-closed current-only authority and a durably verified boundary;
+stale process sessions and mutated or conflicting effects remain rejected.
 Peer endpoint scaffolding and accepted-configuration catch-up run before a new
 switchover or removal is admitted.
 

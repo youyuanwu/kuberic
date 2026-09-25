@@ -148,14 +148,17 @@ where
             RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(command.committed.clone()))
         };
         let effect = if let Some(pending) = &state.pending_effect {
-            if pending.effect.operation_id != command.operation_id
-                || pending.effect.action != action
-            {
+            if pending.effect.operation_id != command.operation_id {
                 return Err(AgentError::EffectConflict(
                     "commit conflicts with pending work".into(),
                 ));
             }
-            pending.effect.clone()
+            // SQLite checks exact replay or atomically narrows ordinary acceptance
+            // to receipt-authorized local recovery without allocating a new effect.
+            RuntimeEffect {
+                action,
+                ..pending.effect.clone()
+            }
         } else if state.accepted_secondary_removal.as_ref() == Some(&command.committed) {
             return Ok(());
         } else {

@@ -191,11 +191,29 @@ impl AgentStore for SqliteStore {
                 }
                 return Ok(BeginEffect::Completed(Box::new(retained.result.clone())));
             }
-            if let Some(pending) = state.pending_effect.as_ref() {
+            if let Some(pending) = state.pending_effect.as_mut() {
                 if pending.effect != *effect {
-                    return Err(AgentError::EffectConflict(
-                        "another durable effect is pending".into(),
-                    ));
+                    match (&pending.effect.action, &effect.action) {
+                        (
+                            RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed),
+                            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command),
+                        ) if pending.effect.operation_id == effect.operation_id
+                            && pending.effect.sequence == effect.sequence
+                            && committed.as_ref() == &command.committed =>
+                        {
+                            validate_acceptance_conversion(transaction, command)?;
+                            // Admission above binds the local identity and full certificate.
+                            // Change only the execution mode; even EffectApplied is retained.
+                            pending.effect = effect.clone();
+                            write_agent_state(transaction, &state)?;
+                            return Ok(BeginEffect::Pending(effect.clone()));
+                        }
+                        _ => {
+                            return Err(AgentError::EffectConflict(
+                                "another durable effect is pending".into(),
+                            ));
+                        }
+                    }
                 }
                 return Ok(BeginEffect::Pending(pending.effect.clone()));
             }
@@ -764,6 +782,47 @@ impl AgentStore for SqliteStore {
             write_agent_state(transaction, &state)
         })
     }
+}
+
+fn validate_acceptance_conversion(
+    transaction: &Transaction<'_>,
+    command: &kuberic_protocol::command::AcceptSecondaryRemovalCommit,
+) -> Result<()> {
+    let authority: Option<AdmittedAuthority> = load_json_optional(
+        transaction,
+        "SELECT authority_json FROM replica_authority WHERE singleton = 1",
+        [],
+    )?;
+    let expected = AdmittedAuthority {
+        local_identity: command.target.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: command
+            .committed
+            .evidence
+            .preparation
+            .intent
+            .current_configuration
+            .clone(),
+        switchover_handoff: None,
+        secondary_removal: Some(command.committed.evidence.clone()),
+    };
+    let progress: Option<ReplicationProgress> = load_json_optional(
+        transaction,
+        "SELECT progress_json FROM replication_progress WHERE fence_json = ?1",
+        [contract_json(&expected.fence())?],
+    )?;
+    if authority.as_ref() != Some(&expected)
+        || progress.as_ref().is_none_or(|p| {
+            p.fence != expected.fence()
+                || p.verified_lsn < command.committed.evidence.preparation.boundary_lsn
+        })
+    {
+        return Err(AgentError::CommandRejected(
+            "acceptance conversion requires exact durable authority and verified boundary".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]

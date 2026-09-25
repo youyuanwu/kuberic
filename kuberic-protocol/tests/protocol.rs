@@ -1082,8 +1082,12 @@ fn completed_removal_history_allows_return_after_failover_or_replacement() {
 
 #[test]
 fn completed_removal_local_acceptance_precedes_newer_authority_correction() {
+    use kuberic_protocol::types::SecondaryRemovalStage;
     use scale_down_model::Model;
-    for replacement in [false, true] {
+    for (replacement, pending) in [false, true]
+        .into_iter()
+        .flat_map(|replacement| [false, true].map(|pending| (replacement, pending)))
+    {
         let mut model = Model::new(&[1, 2, 3, 4, 5, 6], 1, 5);
         model.until(|m| {
             matches!(m.plan(), Plan::Execute {
@@ -1091,7 +1095,7 @@ fn completed_removal_local_acceptance_precedes_newer_authority_correction() {
         } if c.local_replica_id == ReplicaId::new(5) && c.current_only)
         });
         model.step();
-        let late = model.report(5).clone();
+        let mut late = model.report(5).clone();
         assert!(late.previous_configuration.is_none());
         assert!(late.accepted_secondary_removal.is_none());
         model.unavailable(5);
@@ -1103,6 +1107,17 @@ fn completed_removal_local_acceptance_precedes_newer_authority_correction() {
             .last_secondary_removal
             .clone()
             .unwrap();
+        if pending {
+            late.pending_operation_id = Some(
+                receipt
+                    .evidence
+                    .preparation
+                    .intent
+                    .command_operation_id(SecondaryRemovalStage::AcceptCommit, &late.identity),
+            );
+            late.process_session_id = ProcessSessionId::new("restarted-pending-acceptance");
+            late.report_sequence = 1;
+        }
         let previous = receipt
             .evidence
             .preparation

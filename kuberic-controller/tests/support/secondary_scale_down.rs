@@ -246,6 +246,7 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
         ProtocolCommand::AcceptSecondaryRemovalCommit(c) => {
             report.accepted_secondary_removal = Some(c.committed.clone().into());
             report.prepared_secondary_removal = None;
+            report.pending_operation_id.clear();
         }
         ProtocolCommand::RetireReplica(c) => {
             let intent = &c.committed.evidence.preparation.intent;
@@ -535,15 +536,20 @@ async fn completed_reduction_then_real_failover_corrects_returning_old_primary()
 
 #[tokio::test]
 async fn historical_removal_survives_new_authority_and_status_reload() {
-    historical_removal_return(false).await;
+    historical_removal_return(false, false).await;
 }
 
 #[tokio::test]
 async fn historical_removal_local_acceptance_precedes_correction_after_cleanup() {
-    historical_removal_return(true).await;
+    historical_removal_return(true, false).await;
 }
 
-async fn historical_removal_return(unaccepted: bool) {
+#[tokio::test]
+async fn historical_removal_resumes_pending_acceptance_before_newer_correction() {
+    historical_removal_return(true, true).await;
+}
+
+async fn historical_removal_return(unaccepted: bool, pending: bool) {
     for replacement in [false, true] {
         let api = Arc::new(InMemoryClusterApi::new(if unaccepted {
             fixture(6, 5)
@@ -686,6 +692,16 @@ async fn historical_removal_return(unaccepted: bool) {
             };
             if member.identity.replica_id.value() == late {
                 report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
+                if pending {
+                    report.pending_operation_id = receipt
+                        .evidence
+                        .preparation
+                        .intent
+                        .command_operation_id(SecondaryRemovalStage::AcceptCommit, &member.identity)
+                        .to_string();
+                    report.process_session_id = "restarted-pending-acceptance".into();
+                    report.report_sequence = 1;
+                }
             } else {
                 report.identity = Some(member.identity.clone().into());
                 report.pod_uid = member.identity.instance_id.to_string();
@@ -726,6 +742,7 @@ async fn historical_removal_return(unaccepted: bool) {
             *service = write_service("pod-uid-2");
         }
         api.set_observation(raw).await;
+        let api = Arc::new(InMemoryClusterApi::new(api.observation().await));
         if unaccepted {
             let (raw, plan) = next_plan(&api).await;
             let status = raw.set.status.unwrap().authority;

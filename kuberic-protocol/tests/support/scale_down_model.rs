@@ -474,6 +474,7 @@ impl Model {
                         r.report_sequence += 1;
                         r.prepared_secondary_removal = None;
                         r.accepted_secondary_removal = Some(c.committed);
+                        r.pending_operation_id = None;
                     }
                     ProtocolCommand::RetireReplica(c) => {
                         assert!(self.snapshot.status.transition.is_none());

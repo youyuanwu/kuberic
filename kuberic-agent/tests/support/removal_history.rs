@@ -7,6 +7,108 @@ use kuberic_wire::proto;
 use tokio::sync::watch;
 use tonic::{Code, Request};
 
+fn crash_child(root: &Path, boundary: &str) {
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "removal_crashes::quorum_crashes::history::pending_acceptance_writer",
+            "--nocapture",
+        ])
+        .env("KUBERIC_HISTORY_PATH", root)
+        .env("KUBERIC_HISTORY_BOUNDARY", boundary)
+        .env("RUST_MIN_STACK", "16777216")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "{boundary}: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pending_acceptance_writer() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let root = PathBuf::from(env::var("KUBERIC_HISTORY_PATH").unwrap());
+        let boundary = env::var("KUBERIC_HISTORY_BOUNDARY").unwrap();
+        if boundary == "ordinary" {
+            prepare_history(&root, true).await;
+            unreachable!();
+        }
+        let command: AcceptSecondaryRemovalCommit =
+            serde_json::from_slice(&std::fs::read(root.join("recovery-command")).unwrap()).unwrap();
+        let intent = &command.committed.evidence.preparation.intent;
+        let late = member(&root, intent, 4, false).await;
+        let service = kuberic_agent::service::AgentService::new(
+            Arc::new(CrashStore {
+                inner: late.store.clone(),
+                boundary: boundary.clone(),
+            }),
+            late.runtime.clone(),
+            Arc::new(CrashRuntime {
+                runtime: late.runtime.clone(),
+                boundary,
+            }),
+            "token",
+        )
+        .unwrap();
+        let session = service.sessions().local_session().to_string();
+        std::fs::write(root.join("conversion-session"), &session).unwrap();
+        let (mut client, _shutdown, _server) = serve(service).await;
+        client
+            .execute(request(
+                intent,
+                &command.target,
+                &session,
+                wire_command(ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
+                    command.clone(),
+                ))),
+            ))
+            .await
+            .unwrap();
+        panic!("historical acceptance crash was not reached");
+    })
+    .await
+    .unwrap();
+}
+
+async fn serve<S, E>(
+    service: kuberic_agent::service::AgentService<S, E>,
+) -> (
+    proto::agent_control_client::AgentControlClient<tonic::transport::Channel>,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<Result<()>>,
+)
+where
+    S: AgentStore + 'static,
+    E: RuntimeEffectExecutor + 'static,
+{
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let replication = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let (ready, mut ready_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(address, replication, ready, shutdown_rx));
+    tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.wait_for(|r| *r))
+        .await
+        .unwrap()
+        .unwrap();
+    let client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+    (client, shutdown, server)
+}
+
 #[test]
 fn historical_local_acceptance_survives_sqlite_service_restart_and_newer_authority() {
     std::thread::Builder::new()
@@ -17,9 +119,12 @@ fn historical_local_acceptance_survives_sqlite_service_restart_and_newer_authori
                 .build()
                 .unwrap()
                 .block_on(async {
-                    tokio::time::timeout(std::time::Duration::from_secs(90), recover_history())
-                        .await
-                        .unwrap();
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(90),
+                        recover_history(false),
+                    )
+                    .await
+                    .unwrap();
                 });
         })
         .unwrap()
@@ -78,131 +183,202 @@ fn wire_command(command: ProtocolCommand) -> proto::execute_command_request::Com
     }
 }
 
-async fn recover_history() {
-    for (replacement, cut) in [false, true]
-        .into_iter()
-        .flat_map(|replacement| (0..3).map(move |cut| (replacement, cut)))
-    {
-        let directory = tempdir().unwrap();
-        let mut intent = fixture::intent(&[1, 2, 3, 4, 5, 6], 1);
-        intent.desired_replicas = 5;
-        intent.operation_id = intent.expected_operation_id();
-        let mut members = Vec::new();
-        for index in 0..5 {
-            members.push(member(directory.path(), &intent, index, true).await);
-        }
-        let primary = &members[0];
-        for peer in &members[1..] {
-            register(primary, peer).await;
-        }
-        let pending = primary
+#[test]
+fn pending_ordinary_acceptance_recovers_after_cleanup_and_newer_authority() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(90), recover_history(true))
+                        .await
+                        .unwrap();
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn prepare_history(
+    root: &Path,
+    pending_ordinary: bool,
+) -> (SecondaryScaleDownCleanup, String) {
+    let mut intent = fixture::intent(&[1, 2, 3, 4, 5, 6], 1);
+    intent.desired_replicas = 5;
+    intent.operation_id = intent.expected_operation_id();
+    let mut members = Vec::new();
+    for index in 0..5 {
+        members.push(member(root, &intent, index, true).await);
+    }
+    let primary = &members[0];
+    for peer in &members[1..] {
+        register(primary, peer).await;
+    }
+    let pending = primary
+        .runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("before-six-to-five"),
+            data: Bytes::from_static(b"historical-prefix"),
+        })
+        .await
+        .unwrap();
+    for peer in &members[1..] {
+        let identity = peer.runtime.snapshot().await.identity;
+        let item = pending
+            .replication_items
+            .iter()
+            .find(|item| item.receiver.as_ref() == Some(&identity.clone().into()))
+            .unwrap()
+            .clone();
+        let mut ack = peer
             .runtime
             .data_plane()
-            .begin_write(ClientWrite {
-                operation_id: OperationId::new("before-six-to-five"),
-                data: Bytes::from_static(b"historical-prefix"),
+            .receive_replication(item)
+            .await
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
+        ack.receiver_session_id = peer.session.to_string();
+        primary
+            .runtime
+            .data_plane()
+            .accept_acknowledgement(ack)
+            .await
+            .unwrap();
+    }
+    assert_eq!(pending.committed().await.unwrap().lsn, 1);
+    let preparation = Coordinator::new(primary.store.clone(), primary.runtime.clone())
+        .ensure_secondary_removal_prepared(
+            fixture::prepare_command(&intent),
+            primary.session.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preparation.boundary_lsn, 1);
+    let mut evidence = SecondaryRemovalEvidence {
+        preparation,
+        previous_read_quorum: Vec::new(),
+        reduced_write_quorum: Vec::new(),
+    };
+    for peer in &members[..3] {
+        evidence
+            .previous_read_quorum
+            .push(witness(peer, &intent, 2).await);
+    }
+    for peer in members[1..].iter().chain(&members[..1]) {
+        configure(peer, &evidence, false).await;
+    }
+    for peer in &members[..3] {
+        evidence
+            .reduced_write_quorum
+            .push(witness(peer, &intent, 3).await);
+    }
+    for peer in members[1..].iter().chain(&members[..1]) {
+        configure(peer, &evidence, true).await;
+    }
+    let mut committed = SecondaryScaleDownCleanup {
+        evidence,
+        current_only_write_quorum: Vec::new(),
+        retirement: None,
+    };
+    for peer in &members[..3] {
+        committed
+            .current_only_write_quorum
+            .push(witness(peer, &intent, 4).await);
+    }
+    for peer in &members[..4] {
+        for source in &members[..3] {
+            if peer.session != source.session {
+                register(peer, source).await;
+            }
+        }
+        let local = peer.runtime.snapshot().await.identity;
+        Coordinator::new(peer.store.clone(), peer.runtime.clone())
+            .accept_secondary_removal_commit(AcceptSecondaryRemovalCommit {
+                operation_id: intent
+                    .command_operation_id(SecondaryRemovalStage::AcceptCommit, &local),
+                target: local,
+                committed: committed.clone(),
+                local_recovery: false,
             })
             .await
             .unwrap();
-        for peer in &members[1..] {
-            let identity = peer.runtime.snapshot().await.identity;
-            let item = pending
-                .replication_items
-                .iter()
-                .find(|item| item.receiver.as_ref() == Some(&identity.clone().into()))
-                .unwrap()
-                .clone();
-            let mut ack = peer
-                .runtime
-                .data_plane()
-                .receive_replication(item)
-                .await
-                .unwrap()
-                .applied()
-                .await
-                .unwrap();
-            ack.receiver_session_id = peer.session.to_string();
-            primary
-                .runtime
-                .data_plane()
-                .accept_acknowledgement(ack)
-                .await
-                .unwrap();
-        }
-        assert_eq!(pending.committed().await.unwrap().lsn, 1);
-        let preparation = Coordinator::new(primary.store.clone(), primary.runtime.clone())
-            .ensure_secondary_removal_prepared(
-                fixture::prepare_command(&intent),
-                primary.session.clone(),
-                1,
-            )
+    }
+    let old_session = members[4].session.to_string();
+    assert!(
+        members[4]
+            .store
+            .load_state()
             .await
-            .unwrap();
-        assert_eq!(preparation.boundary_lsn, 1);
-        let mut evidence = SecondaryRemovalEvidence {
-            preparation,
-            previous_read_quorum: Vec::new(),
-            reduced_write_quorum: Vec::new(),
-        };
-        for peer in &members[..3] {
-            evidence
-                .previous_read_quorum
-                .push(witness(peer, &intent, 2).await);
-        }
-        for peer in members[1..].iter().chain(&members[..1]) {
-            configure(peer, &evidence, false).await;
-        }
-        for peer in &members[..3] {
-            evidence
-                .reduced_write_quorum
-                .push(witness(peer, &intent, 3).await);
-        }
-        for peer in members[1..].iter().chain(&members[..1]) {
-            configure(peer, &evidence, true).await;
-        }
-        let mut committed = SecondaryScaleDownCleanup {
-            evidence,
-            current_only_write_quorum: Vec::new(),
-            retirement: None,
-        };
-        for peer in &members[..3] {
-            committed
-                .current_only_write_quorum
-                .push(witness(peer, &intent, 4).await);
-        }
-        for peer in &members[..4] {
-            for source in &members[..3] {
-                if peer.session != source.session {
-                    register(peer, source).await;
-                }
-            }
-            let local = peer.runtime.snapshot().await.identity;
-            Coordinator::new(peer.store.clone(), peer.runtime.clone())
-                .accept_secondary_removal_commit(AcceptSecondaryRemovalCommit {
-                    operation_id: intent
-                        .command_operation_id(SecondaryRemovalStage::AcceptCommit, &local),
-                    target: local,
-                    committed: committed.clone(),
-                    local_recovery: false,
-                })
-                .await
-                .unwrap();
-        }
-        let mut old_session = members[4].session.to_string();
-        assert!(
-            members[4]
-                .store
-                .load_state()
-                .await
-                .unwrap()
-                .accepted_secondary_removal
-                .is_none()
-        );
-        for peer in &members {
-            peer.runtime.abort();
-        }
-        drop(members);
+            .unwrap()
+            .accepted_secondary_removal
+            .is_none()
+    );
+    if pending_ordinary {
+        let late = &members[4];
+        let local = late.runtime.snapshot().await.identity;
+        std::fs::write(root.join("ordinary-session"), &old_session).unwrap();
+        Coordinator::new(
+            Arc::new(CrashStore {
+                inner: late.store.clone(),
+                boundary: "intent".into(),
+            }),
+            late.runtime.clone(),
+        )
+        .accept_secondary_removal_commit(AcceptSecondaryRemovalCommit {
+            operation_id: intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, &local),
+            target: local,
+            committed: committed.clone(),
+            local_recovery: false,
+        })
+        .await
+        .unwrap();
+        panic!("ordinary intent crash was not reached");
+    }
+    for peer in &members {
+        peer.runtime.abort();
+    }
+    drop(members);
+    (committed, old_session)
+}
 
+async fn recover_history(pending_ordinary: bool) {
+    for (replacement, cut) in [false, true].into_iter().flat_map(|replacement| {
+        (0..if pending_ordinary { 4 } else { 3 }).map(move |cut| (replacement, cut))
+    }) {
+        let directory = tempdir().unwrap();
+        let (committed, mut old_session) = if pending_ordinary {
+            crash_child(directory.path(), "ordinary");
+            let store = SqliteStore::open_existing(
+                SqliteStore::metadata_database_path(&directory.path().join("replica-5")),
+                None,
+            )
+            .unwrap();
+            let pending = store.load_state().await.unwrap().pending_effect.unwrap();
+            assert_eq!(
+                pending.stage,
+                kuberic_agent::state::EffectStage::IntentCommitted
+            );
+            let RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) =
+                pending.effect.action
+            else {
+                panic!("ordinary intent was not persisted")
+            };
+            (
+                *committed,
+                std::fs::read_to_string(directory.path().join("ordinary-session")).unwrap(),
+            )
+        } else {
+            prepare_history(directory.path(), false).await
+        };
+        let intent = committed.evidence.preparation.intent.clone();
         // Cleanup has completed and a quorum has accepted newer authority while 5 is absent.
         let receipt = SecondaryRemovalReceipt {
             evidence: committed.evidence.clone(),
@@ -273,31 +449,7 @@ async fn recover_history() {
                 late.application.state.lock().unwrap().operations[&1],
                 b"historical-prefix"
             );
-            let address = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            let replication = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            let (ready, mut ready_rx) = watch::channel(false);
-            let (shutdown, shutdown_rx) = watch::channel(false);
-            let server = tokio::spawn(late.service.clone().serve(
-                address,
-                replication,
-                ready,
-                shutdown_rx,
-            ));
-            tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx.wait_for(|r| *r))
-                .await
-                .unwrap()
-                .unwrap();
-            let mut client = proto::agent_control_client::AgentControlClient::connect(format!(
-                "http://{address}"
-            ))
-            .await
-            .unwrap();
+            let (mut client, shutdown, server) = serve(late.service.clone()).await;
             let mut status = Request::new(proto::GetAgentStatusRequest {
                 protocol_version: kuberic_protocol::PROTOCOL_VERSION,
                 resource_uid: intent.resource_uid.to_string(),
@@ -416,6 +568,44 @@ async fn recover_history() {
                             Box::new(command.clone()),
                         ),
                     };
+                    if pending_ordinary {
+                        shutdown.send_replace(true);
+                        server.await.unwrap().unwrap();
+                        std::fs::write(
+                            directory.path().join("recovery-command"),
+                            serde_json::to_vec(&command).unwrap(),
+                        )
+                        .unwrap();
+                        crash_child(
+                            directory.path(),
+                            match cut {
+                                1 => "historical-intent",
+                                2 => "historical-runtime",
+                                3 => "historical-applied",
+                                _ => unreachable!(),
+                            },
+                        );
+                        let converted = late.store.load_state().await.unwrap();
+                        let mut expected = before.clone();
+                        let pending = expected.pending_effect.as_mut().unwrap();
+                        pending.effect = effect;
+                        if cut == 3 {
+                            pending.stage = kuberic_agent::state::EffectStage::EffectApplied;
+                        }
+                        assert_eq!(converted, expected, "conversion changes only mode/stage");
+                        assert!(
+                            late.store
+                                .load_secondary_removal_commit()
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                        old_session =
+                            std::fs::read_to_string(directory.path().join("conversion-session"))
+                                .unwrap();
+                        assert_ne!(old_session, late.session.as_str());
+                        continue;
+                    }
                     late.store.begin_effect(&effect).await.unwrap();
                     if cut == 2 {
                         late.runtime.apply_effect(effect.clone()).await.unwrap();
