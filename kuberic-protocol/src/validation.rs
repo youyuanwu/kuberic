@@ -502,12 +502,27 @@ fn validate_report_authority(
                 .as_ref()
                 .map(|cleanup| &cleanup.evidence)
         });
-    if let Some(evidence) = &report.secondary_removal_evidence
-        && frozen_removal_evidence.is_none_or(|frozen| frozen != evidence)
-    {
-        return Err(ValidationError::InvalidSecondaryScaleDown(
-            "report does not retain the frozen admission evidence",
-        ));
+    if let Some(evidence) = &report.secondary_removal_evidence {
+        let Some(frozen) = frozen_removal_evidence else {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "report does not retain the frozen admission evidence",
+            ));
+        };
+        let reduced_evidence_matches =
+            if snapshot.status.transition.is_some() && report.previous_configuration.is_some() {
+                evidence.reduced_write_quorum.is_empty()
+                    || evidence.reduced_write_quorum == frozen.reduced_write_quorum
+            } else {
+                evidence.reduced_write_quorum == frozen.reduced_write_quorum
+            };
+        if evidence.preparation != frozen.preparation
+            || evidence.previous_read_quorum != frozen.previous_read_quorum
+            || !reduced_evidence_matches
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "report does not retain the frozen admission evidence",
+            ));
+        }
     }
     if let Some(frozen) = frozen_removal_evidence
         && report

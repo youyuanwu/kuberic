@@ -639,6 +639,31 @@ fn secondary_removal_reports_bind_frozen_authority_and_fresh_observation() {
         }
         assert!(validate_snapshot(&invalid).is_err(), "mutation {mutation}");
     }
+    let mut earlier_pc_cc = snapshot.clone();
+    {
+        let AgentObservation::Report(report) =
+            &mut earlier_pc_cc.replicas.get_mut(&key).unwrap().agent
+        else {
+            unreachable!()
+        };
+        report
+            .secondary_removal_evidence
+            .as_mut()
+            .unwrap()
+            .reduced_write_quorum
+            .clear();
+    }
+    validate_snapshot(&earlier_pc_cc).unwrap();
+    {
+        let AgentObservation::Report(report) =
+            &mut earlier_pc_cc.replicas.get_mut(&key).unwrap().agent
+        else {
+            unreachable!()
+        };
+        report.previous_configuration = None;
+    }
+    assert!(validate_snapshot(&earlier_pc_cc).is_err());
+
     snapshot.previous_report_watermarks.insert(
         key,
         ReportWatermark {
