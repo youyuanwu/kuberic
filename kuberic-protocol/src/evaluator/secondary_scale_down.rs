@@ -188,6 +188,28 @@ pub(super) fn begin(
         .iter()
         .filter(|m| m.role == ReplicaRole::ActiveSecondary)
         .max_by_key(|m| m.identity.replica_id)?;
+    // Snapshot validation fences report identity and session freshness. This
+    // availability preflight is not the durable post-preparation quorum proof.
+    let retained_read_quorum = previous
+        .members
+        .iter()
+        .filter(|member| member.identity != target.identity)
+        .filter(|member| {
+            report(snapshot, &member.identity).is_some_and(|r| {
+                stable_member_report(r, member, previous)
+                    && r.prepared_switchover.is_none()
+                    && r.prepared_secondary_removal.is_none()
+            })
+        })
+        .count();
+    if retained_read_quorum < policy.read_quorum as usize {
+        return Some(wait(
+            status,
+            "ScaleDownRetainedReadQuorumUnavailable",
+            "Retained exact members must provide the accepted read quorum before freezing removal; existing service is unchanged",
+            config,
+        ));
+    }
     let Some(exact) = resources(snapshot, &target.identity).filter(|r| {
         observed(&r.identity.pod, &r.pod)
             && observed(&r.identity.pvc, &r.pvc)

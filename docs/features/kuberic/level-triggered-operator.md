@@ -168,9 +168,15 @@ application data-loss callback. Unsupported evidence produces `Wait` or
 
 ## Secondary Scale-Down
 
+This is SF-inspired secondary scale-down using PC/CC quorum principles, with
+Kuberic-specific target/minimum coupling, deterministic selection, write closure,
+sequential cleanup, and Kubernetes resource deletion. It is not general SF
+scaling parity.
+
 Lower only `spec.replicas` on an initialized set. The desired count is both the
-**target and minimum**, with a floor of **one**, following the selected Service
-Fabric target/minimum semantics. There is no independent `minReplicas` or quorum
+**target and minimum**, with a floor of **one**. This `spec.replicas` target=min
+coupling is a **Kuberic policy choice**, not general SF semantics: SF target and
+minimum are independently configurable. There is no independent `minReplicas` or quorum
 setting. The controller selects the **highest logical-ID committed secondary**,
 not the highest Pod name or the highest reachable member. The exact primary,
 retained incarnations, and data-loss number stay unchanged.
@@ -218,7 +224,8 @@ active intent, cleanup, and conditions together.
 | Lower positive count | One frozen highest-ID secondary removal at a time |
 | 5→2 | 5→4, 4→3, 3→2, each committing and cleaning up before the next |
 | Count equals accepted membership | No new removal |
-| Unavailable selected secondary | Same target; proceed only with required retained evidence |
+| Retained read quorum unavailable before admission | Preserve existing routing/access; wait without a transition, preparation, replacement, or alternate target |
+| Unavailable selected secondary | Same target; proceed only with retained evidence and frozen or reconstructable exact cleanup identity |
 | Missing primary or insufficient evidence | Wait fail-closed; no alternate target or automatic failover inside the frozen removal |
 | Count below one | Rejected |
 | Scale-up, primary/explicit-target removal | Unsupported |
@@ -232,8 +239,22 @@ cannot currently restore redundancy after a completed reduction.
 
 ### Authority and cleanup
 
-Removal freezes the desired generation/count, exact primary/target, full PC/CC,
-independent policies, and endpoint/Pod/PVC identities. Routing is removed first;
+**Retained-quorum preflight:** before freezing intent, removing routing, or closing
+writes, the exact accepted members excluding the deterministic highest-ID target
+must currently provide the previous configuration's read quorum. Credited members
+must report stable accepted current-only authority, completed local work, and
+fresh exact sessions. Otherwise `ScaleDownRetainedReadQuorumUnavailable` preserves
+existing writable service and re-observes with bounded requeues: no transition,
+primary preparation, retained-member replacement, or alternate target selection.
+For `{P1,S2-down,S3-up}` requesting 3→2, P1+S3 continue serving under accepted
+authority; after S2 heals, admission still selects S3. For 2→1 the retained
+primary alone supplies the previous read quorum of one. An unavailable selected
+target does not block admission when retained quorum exists.
+
+This preflight is availability screening, not durable admission evidence and
+not a guarantee against a member failing immediately afterward. Removal then
+freezes the desired generation/count, exact primary/target, full PC/CC,
+independent policies, and endpoint/Pod/PVC identities. Routing is removed;
 durable primary preparation closes client access and records a verified boundary
 covering acknowledged writes. Retained members must supply a previous-configuration
 read quorum under accepted authority. Write-closed PC/CC convergence then needs
@@ -258,9 +279,18 @@ must prove that Pod UID absent before PVC deletion. Deletes use frozen UIDs and
 fresh resource versions; label-list omission or RPC failure is not absence.
 Same-name/different-UID resources are preserved, including after cleanup ends.
 
-> **Permanent PVC deletion:** scale-down deletes the removed replica's PVC.
-> There is no retention option, storage import, or recovery path for that
-> removed storage. This differs from classic v1 scale-down.
+**Cleanup-provenance limitation:** exact original PVC provenance must be
+reconstructable before intent admission. If the Pod and PVC already disappeared
+before the request and their exact mapping/generation cannot be reconstructed,
+scale-down waits/fails closed (`ScaleDownExactIdentityRequired`); list omission
+is not absence. “Unavailable target supported” applies only once exact cleanup
+identity is frozen or reconstructable, not to arbitrary pre-admission resource
+loss. Durable per-member provenance is a [deferred follow-up](../../proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
+
+> **PVC object deletion:** there is no retention option, storage import, or
+> recovery path for removed storage. This differs from classic v1 scale-down.
+> Deleting the PVC object is not a claim of physical storage erasure; backend
+> reclaim behavior is separate.
 
 During convergence, `status.transition.kind` is `secondaryScaleDown`.
 After commit, `status.topology` and `effectivePolicy` are reduced while
@@ -268,11 +298,15 @@ After commit, `status.topology` and `effectivePolicy` are reduced while
 obligation. Cleanup waits normally show `Ready=unknown`, `Progressing=true`;
 routed writes can already be available. Completion replaces cleanup with
 `lastSecondaryRemoval`, a single retained convergence proof, **not** deletion
-authority or a history. A late retained member can delay the next reduction
-until its authority settles.
+authority or a history. Before superseding this receipt, **every retained
+member** needs its original completed current-only witness in the receipt or
+fresh proof of completed local acceptance. A late non-witness can delay the next
+reduction even when quorum arithmetic alone would permit it.
 
 | Condition reason | Inspect or wait for |
 |---|---|
+| `ScaleDownRetainedReadQuorumUnavailable` | Pre-admission retained read quorum; existing routing/access stay unchanged |
+| `ScaleDownExactIdentityRequired` | Reconstructable exact original Pod/PVC/endpoint cleanup provenance |
 | `ScaleDownPreparationPending` | Exact primary's durable write closure |
 | `ScaleDownPreviousReadQuorumUnavailable` | Retained accepted-epoch read evidence |
 | `ScaleDownReducedWriteQuorumUnavailable`, `ScaleDownReducedCatchUpPending` | Reduced quorum and verified prepared prefix |
@@ -298,7 +332,14 @@ Service with bounded backoff; a lost reply remains ambiguous and requires
 application-level idempotence. There is no zero-downtime or maximum interruption
 guarantee. RPC deadlines, requeue intervals, and `failoverDelaySeconds` are not
 scale-down deadlines. A frozen-primary failure deliberately blocks progress
-rather than changing this operation into failover or primary removal.
+rather than changing this operation into failover or primary removal, including
+after membership commit while cleanup is pending. This can cause an **indefinite
+outage**; recovery requires that exact primary. Sequential cleanup also blocks
+otherwise unrelated failover. These are Kuberic availability limitations, not
+general SF behavior. Independent target/minimum policy, placement-aware selection,
+overlapping recovery, multi-member removal, and durable primary-agent phase
+scheduling are [deferred](../../proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
+Scale-up remains absent and requires a separate protocol.
 
 Protocol 6 and agent store schema 2 require a **fresh coordinated deployment**;
 protocol 5 and schema 1 are rejected, with no migration or mixed-version mode.

@@ -1107,13 +1107,17 @@ fn scale_down_model_restarts_and_unsupported_edits_at_every_durable_boundary() {
 #[test]
 fn scale_down_model_enumerates_quorum_availability_without_target_credit() {
     use kuberic_protocol::plan::Plan;
-    use scale_down_model::Model;
+    use kuberic_protocol::types::AccessStatus;
+    use scale_down_model::{Model, reason};
     for size in 2..=5 {
         let ids = (1..=size).collect::<Vec<_>>();
-        for mask in 0..(1 << (size - 2)) {
+        for mask in 0..(1 << (size - 1)) {
             let mut model = Model::new(&ids, 1, size as u32 - 1);
             let saved = model.snapshot.replicas.clone();
-            model.unavailable(size);
+            let routing = model.snapshot.routing.clone();
+            if mask & (1 << (size - 2)) == 0 {
+                model.unavailable(size);
+            }
             let mut retained = 1;
             for id in 2..size {
                 if mask & (1 << (id - 2)) == 0 {
@@ -1137,7 +1141,22 @@ fn scale_down_model_enumerates_quorum_availability_without_target_credit() {
                 "size={size} mask={mask}"
             );
             if !sufficient {
-                assert!(model.deletes.is_empty());
+                let waiting = model.plan();
+                assert_eq!(reason(&waiting), "ScaleDownRetainedReadQuorumUnavailable");
+                for _ in 0..3 {
+                    model.controller_restart();
+                    assert_eq!(
+                        model.step(),
+                        waiting,
+                        "restart/lost reply keeps the same wait"
+                    );
+                    assert_eq!(model.snapshot.routing, routing);
+                    assert_eq!(model.report(1).write_status, AccessStatus::Granted);
+                    assert!(model.report(1).prepared_secondary_removal.is_none());
+                    assert!(model.snapshot.status.transition.is_none());
+                    assert!(model.snapshot.status.provisioning.is_none());
+                    assert!(model.commands.is_empty() && model.deletes.is_empty());
+                }
                 for (key, observation) in saved {
                     if key.replica_id.value() != size
                         && matches!(
@@ -1151,6 +1170,7 @@ fn scale_down_model_enumerates_quorum_availability_without_target_credit() {
                 model.finish();
                 assert_eq!(model.removed.len(), 1);
             }
+            assert_eq!(model.removed[0].replica_id.value(), size);
         }
     }
 }

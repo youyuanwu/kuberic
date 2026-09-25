@@ -122,7 +122,7 @@ patches = [json.loads(value) for value in re.findall(r"-p '(\{.*\})'", guide_tex
 for replicas in (2, 1):
     assert {"spec": {"replicas": replicas}} in patches, \
         f"Missing spec-only scale-down patch for {replicas} replicas"
-assert "Permanent PVC deletion" in sample and "Permanent PVC deletion" in guide_text
+assert "PVC object deletion" in sample and "PVC object deletion" in guide_text
 
 protocol = (root / "kuberic-protocol/src/lib.rs").read_text()
 store = (root / "kuberic-agent/src/state.rs").read_text()
@@ -185,6 +185,60 @@ assert {"secondary-scale-down", "authority-and-cleanup", "availability-and-resta
 for document in (root / "README.md", root / "examples/kvstore2/README.md",
                  root / "docs/proposal/v1-retirement-plan.md"):
     assert "level-triggered-operator.md#secondary-scale-down" in document.read_text()
+
+def prose(text):
+    # Check claims across Markdown wrapping/emphasis, not incidental line layout.
+    return " ".join(re.sub(r"[`*>]", "", text).split()).lower()
+
+summary_documents = [
+    root / "README.md", guide, root / "docs/proposal/v1-retirement-plan.md",
+    root / "kuberic-protocol/README.md", root / "kuberic-controller/README.md",
+    root / "kuberic-runtime/README.md", root / "kuberic-agent/README.md",
+]
+for document in summary_documents:
+    text = prose(document.read_text())
+    for claim in ("sf-inspired secondary scale-down using pc/cc quorum principles",
+                  "kuberic-specific target/minimum coupling", "deterministic selection",
+                  "write closure", "sequential cleanup", "kubernetes resource deletion",
+                  "independently configurable"):
+        assert claim in text, f"{document.relative_to(root)}: missing narrowed claim: {claim}"
+
+removal_text = prose(guide_text.split("## Secondary Scale-Down\n", 1)[1]
+                    .split("\n## Planned Switchover", 1)[0])
+for claim in ("kuberic policy choice", "not general sf semantics",
+              "retained-quorum preflight", "before freezing intent",
+              "stable accepted current-only authority", "fresh exact sessions",
+              "scaledownretainedreadquorumunavailable", "bounded requeues",
+              "existing writable service", "no transition",
+              "cleanup-provenance limitation", "exact original pvc provenance",
+              "reconstructable before intent admission", "list omission is not absence",
+              "frozen or reconstructable", "not a claim of physical storage erasure",
+              "every retained member", "completed local acceptance", "indefinite outage"):
+    assert claim in removal_text, f"Scale-down guide missing contract: {claim}"
+# Restrict legacy wording checks to the scaling section: unrelated SF interface
+# documentation and the historical proposal are not scaling-parity claims.
+assert not re.search(r"(?:service fabric|sf)[ -]aligned", removal_text), \
+    "Describe the precise SF-inspired subset rather than broad SF alignment"
+assert not re.search(r"following the (?:selected )?service fabric target/minimum", removal_text)
+
+retirement = root / "docs/proposal/v1-retirement-plan.md"
+assert "deferred-scale-down-follow-ups" in heading_anchors(retirement)
+assert "v1-retirement-plan.md#deferred-scale-down-follow-ups" in guide_text
+followups = prose(retirement.read_text().split("### Deferred scale-down follow-ups\n", 1)[1]
+                  .split("\n## Workstream 3", 1)[0])
+for claim in ("priority", "why deferred", "durable per-member kubernetes resource provenance",
+              "context-bound preparation/retirement", "replication proof",
+              "cleanupobligation", "serialized status-size tests", "replica-count budget",
+              "compatibility/api-breaking", "mechanical refactors",
+              "candidate-selection helper", "neutral exact-cleanup helpers",
+              "static command-binding predicates", "independent target/minimum",
+              "plb/placement-aware", "frozen-primary recovery", "overlapping cleanup",
+              "multi-member removal", "durable primary-agent coordinator",
+              "keep desired-count/target policy in the evaluator/controller",
+              "keep local journals out of cr status", "scale-up", "build/copy",
+              "catch-up", "ready-state admission",
+              "do not use opaque schemas, hash-only receipts, or ttl evidence deletion"):
+    assert claim in followups, f"Deferred follow-ups missing contract: {claim}"
 
 for document in documents:
     if not document.is_file():

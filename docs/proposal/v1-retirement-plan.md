@@ -156,12 +156,23 @@ unsupported or deferred.
 **Partially complete.** The
 [secondary-scale-down guide](../features/kuberic/level-triggered-operator.md#secondary-scale-down)
 describes the implemented and validated subset. It extends existing PC/CC
-authority rather than adding an independent membership protocol:
+authority rather than adding an independent membership protocol.
+
+This is SF-inspired secondary scale-down using PC/CC quorum principles, with
+Kuberic-specific target/minimum coupling, deterministic selection, write closure,
+sequential cleanup, and Kubernetes resource deletion.
 
 - Lowering `spec.replicas` selects one highest logical-ID committed secondary
   at a time, preserving the exact primary and retained identities. Desired
-  count is both target and minimum, down to one; there is no independent minimum.
-- Durable write closure and a verified primary boundary precede retained
+  count is both target and minimum, down to one. This target=min coupling is a
+  Kuberic policy choice; SF target and minimum are independently configurable.
+- Before freezing intent or removing routing/closing writes, exact retained
+  members must currently provide the previous read quorum under stable accepted
+  current-only authority and fresh exact sessions. Otherwise
+  `ScaleDownRetainedReadQuorumUnavailable` preserves existing service with bounded
+  re-observation, without replacement or an alternate target. Healing the retained
+  member admits the same highest-ID target; 2→1 still needs only the primary.
+- After admission, durable write closure and a verified primary boundary precede retained
   previous-read-quorum evidence, write-closed reduced PC/CC, and fresh reduced
   current-only write-quorum evidence. Ordinary replication still requires both
   PC and CC write quorums when PC exists.
@@ -169,13 +180,22 @@ authority rather than adding an independent membership protocol:
   Separate local acceptance, write grant, and routing restore service.
   Endpoint→Pod→PVC deletion is exact-UID/resource-version fenced; unavailable
   targets can use post-commit exact Pod deletion instead of a retirement reply.
-  PVC deletion is permanent and waits for authoritative Pod absence.
+  PVC object deletion waits for authoritative Pod absence, with no retention or
+  import path; it does not promise physical storage erasure. Exact original PVC
+  provenance must be reconstructable before admission. If Pod/PVC disappearance
+  prevents this, scale-down waits/fails closed rather than treating list omission
+  as absence. Unavailable-target support requires frozen or reconstructable exact
+  cleanup identity.
 - Schema-2 retirement-started/tombstone recovery prevents application Open
   after retirement begins. Protocol 6/store schema 2 require fresh deployment,
   without migration or mixed-version support.
 - Active removal cannot be cancelled or retargeted. Cleanup serializes later
   removals and other authority work. Primary loss or missing evidence waits
-  fail-closed; singleton operation deliberately has no redundancy.
+  fail-closed, including indefinite outage if the frozen primary is lost during
+  removal or cleanup. Before superseding the bounded receipt, every retained
+  member needs its original completed current-only witness or fresh completed
+  local acceptance, so sequential reductions need more than quorum availability.
+  Singleton operation deliberately has no redundancy.
 
 Validation covers healthy 3→2, 2→1 and singleton restart, sequential 5→2,
 unavailable-target 3→1, exact deletion races, durable process crashes, and
@@ -205,6 +225,32 @@ separately approved removal gates still apply.
 
 Only one authority-changing membership command may be issued from one
 observation. Reconciliation must remain level-triggered and restart-safe.
+
+### Deferred scale-down follow-ups
+
+These are explicitly **deferred**, not merge requirements or claims of existing
+SF parity. P1 is the first follow-up tier (availability/status boundaries), P2
+is maintainability or policy expansion, and P3 needs a new recovery protocol.
+Scale-up is separately prioritized by retirement Workstream 2.
+
+| Priority | Follow-up | Why deferred / change class |
+|---|---|---|
+| P1 | Durable per-member Kubernetes resource provenance | Persist exact original Pod/PVC/endpoint identity before disappearance so pre-admission loss can converge. Requires a durable lifecycle/status contract, not permission to infer absence from lists. |
+| P1 | CRD/status compaction and boundary redesign | Context-bound preparation/retirement records should reference their enclosing frozen intent; split replication proof (`RemovalAuthority` / `CommittedRemovalProof`) from Kubernetes `CleanupObligation` and request metadata. Add serialized status-size tests and an operational replica-count budget. This is compatibility/API-breaking status and potentially wire/store redesign, requiring coordinated validation/recovery changes, not a formatting refactor. |
+| P2 | Shared candidate-selection helper, neutral exact-cleanup helpers, and static command-binding predicates | Mechanical refactors reduce duplicated policy/identity checks without changing selection or evidence. Keep layer-specific installed-authority and live-session checks; defer to isolate the admission fix from unrelated code movement. |
+| P2 | Independent target/minimum policy and PLB/placement-aware selection | SF target and minimum are independently configurable. New API, placement inputs, and availability policy are needed; highest-ID selection and target=min remain the deliberately narrow Kuberic contract. |
+| P1 design / P3 implementation | Frozen-primary recovery during removal/cleanup; possible overlapping cleanup and failover | Current serialization can cause indefinite outage. Safe continuation needs a new cross-epoch recovery and cleanup-ownership protocol; do not loosen frozen evidence or silently enable overlap. |
+| P3 | Multi-member removal in one reconfiguration | Current reductions are sequential and require cleanup plus receipt/local-acceptance prerequisites between steps. Batch removal changes quorum, identity, evidence and cleanup semantics, not just the loop. |
+| P3 | Move RA-style distributed phase scheduling from evaluator to a durable primary-agent coordinator | Explicitly defer: per-member ordering, witness freezing, PC/CC progression and restart replay require a durable cross-replica coordination protocol. Keep desired-count/target policy in the evaluator/controller, not the agent/runtime; keep local journals out of CR status and Kubernetes cleanup authority out of the replicator. |
+| Separate Workstream 2 | Scale-up | Remains absent. Requires placement, fresh build/copy, catch-up, ready-state admission, accepted-policy changes, and failed-build recovery as a separate protocol; replacement is not scaling parity. |
+
+Compaction must preserve typed structural schemas, exact contextual evidence and
+late-member recovery. Do **not** use opaque schemas, hash-only receipts, or TTL
+evidence deletion to shrink status. Actual serialized status size, not only the
+generated CRD's pretty-printed byte count, determines the replica-count budget.
+No backward compatibility or migration is promised by this experimental stack,
+but status/API-breaking redesign still needs an explicit coordinated deployment
+contract; mechanical helper extraction does not.
 
 ## Workstream 3: SQLite on V2
 

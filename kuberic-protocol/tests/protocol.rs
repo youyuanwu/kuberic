@@ -556,9 +556,107 @@ fn evaluator_scale_down_unavailable_highest_target_does_not_trigger_replacement(
 }
 
 #[test]
+fn evaluator_scale_down_retained_read_quorum_preflight_preserves_writable_service() {
+    use scale_down_model::{Model, config, reason};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    let retained = model.snapshot.replicas[&model.key(2)].clone();
+    let authority = model.snapshot.status.clone();
+    let routing = model.snapshot.routing.clone();
+    model.unavailable(2);
+    for _ in 0..3 {
+        let plan = model.step();
+        assert_eq!(reason(&plan), "ScaleDownRetainedReadQuorumUnavailable");
+        assert!(matches!(plan, Plan::Wait { requeue_after_seconds, .. }
+            if requeue_after_seconds == config().wait_requeue_seconds));
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.status.provisioning.is_none());
+        assert!(model.snapshot.status.pending_replacement_cleanup.is_none());
+        assert_eq!(model.snapshot.status.topology, authority.topology);
+        assert_eq!(
+            model.snapshot.status.effective_policy,
+            authority.effective_policy
+        );
+        assert_eq!(model.snapshot.routing, routing);
+        assert_eq!(model.report(1).write_status, AccessStatus::Granted);
+        assert!(model.report(1).prepared_secondary_removal.is_none());
+        assert!(model.commands.is_empty() && model.deletes.is_empty());
+        assert_eq!(model.plan(), plan, "unchanged wait status must be stable");
+    }
+    model.snapshot.replicas.insert(model.key(2), retained);
+    model.step();
+    let intent = model
+        .snapshot
+        .status
+        .transition
+        .as_ref()
+        .unwrap()
+        .secondary_scale_down
+        .as_ref()
+        .unwrap();
+    assert_eq!(intent.target.replica_id, ReplicaId::new(3));
+    assert_eq!(
+        intent.previous_configuration,
+        authority.topology.unwrap().configuration
+    );
+    assert_eq!(
+        model.snapshot.routing, routing,
+        "admission only freezes intent"
+    );
+    assert_eq!(model.report(1).write_status, AccessStatus::Granted);
+    model.finish();
+    assert_eq!(model.removed[0].replica_id, ReplicaId::new(3));
+}
+
+#[test]
+fn evaluator_scale_down_preflight_requires_fresh_exact_stable_retained_reports() {
+    use kuberic_protocol::types::FaultType;
+    use scale_down_model::{Model, reason};
+    for mutation in 0..8 {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        match mutation {
+            0 => model.report(2).healthy = false,
+            1 => model.report(2).reported_fault = Some(FaultType::Permanent),
+            2 => model.report(2).pending_operation_id = Some(OperationId::new("unfinished")),
+            3 => model.report(2).identity.agent_generation = AgentGeneration::new("other"),
+            4 => model.report(2).resource_uid = ResourceUid::new("other"),
+            5 => model.report(2).process_session_id = ProcessSessionId::default(),
+            6 => model.report(2).report_sequence = 0,
+            _ => {
+                let report = model.report(2).clone();
+                model.snapshot.previous_report_watermarks.insert(
+                    model.key(2),
+                    ReportWatermark {
+                        process_session_id: report.process_session_id,
+                        report_sequence: report.report_sequence,
+                    },
+                );
+            }
+        }
+        let plan = model.plan();
+        assert!(
+            matches!(plan, Plan::Wait { .. } | Plan::Unsafe { .. }),
+            "{mutation}: {plan:?}"
+        );
+        if mutation < 3 {
+            assert_eq!(reason(&plan), "ScaleDownRetainedReadQuorumUnavailable");
+        }
+        match plan {
+            Plan::Wait { .. } => model.apply(plan),
+            Plan::Unsafe { status, .. } => assert!(status.transition.is_none()),
+            _ => unreachable!(),
+        }
+        assert!(model.snapshot.status.transition.is_none());
+        assert!(model.snapshot.routing.write_target.is_some());
+        assert_eq!(model.report(1).write_status, AccessStatus::Granted);
+        assert!(model.commands.is_empty() && model.deletes.is_empty());
+    }
+}
+
+#[test]
 fn evaluator_scale_down_never_credits_target_for_previous_or_reduced_quorum() {
     use scale_down_model::{Model, reason};
     let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.step();
     model.unavailable(2);
     model.until(|m| m.snapshot.replicas.values().any(|o| matches!(&o.agent, AgentObservation::Report(r) if r.prepared_secondary_removal.is_some())));
     assert_eq!(

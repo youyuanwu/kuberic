@@ -10,6 +10,14 @@
 > [level-triggered operator guide](../features/kuberic/level-triggered-operator.md).
 > This document preserves the design rationale and does not define a migration
 > from classic v1.
+> The implemented scaling subset is SF-inspired secondary scale-down using PC/CC
+> quorum principles, with Kuberic-specific target/minimum coupling, deterministic
+> selection, write closure, sequential cleanup, and Kubernetes resource deletion.
+> `spec.replicas` target=min is Kuberic policy; SF target and minimum are
+> independently configurable. Scale-up remains absent. Availability, provenance,
+> status/API redesign and ownership gaps are explicit
+> [deferred follow-ups](v1-retirement-plan.md#deferred-scale-down-follow-ups),
+> not a general SF scaling-equivalence claim.
 
 ## Summary
 

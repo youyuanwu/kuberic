@@ -25,9 +25,17 @@ client cannot commit while its write authority is revoked.
 
 Lowering `spec.replicas` supports secondary-only 3→2 and 2→1, or sequential
 larger reductions, preserving the primary and acknowledged values. Desired
-count is target and minimum; a singleton has no redundancy. Scale-down
-permanently deletes the removed replica's PVC, Pod, and peer endpoint after
+count is target and minimum by Kuberic policy, not general SF semantics (SF
+configures them independently); a singleton has no redundancy. This is
+SF-inspired secondary scale-down, not general scaling parity. Retained read-quorum
+preflight preserves existing routing/access if admission must wait, without an
+alternate target or replacement. Exact original PVC provenance must be
+reconstructable before admission; otherwise pre-request Pod/PVC disappearance
+waits/fails closed. Unavailable-target support requires frozen or reconstructable
+cleanup identity. Scale-down deletes the removed replica's PVC object, Pod, and peer endpoint after
 authority commit. Scale-up, primary removal, and cancellation are unsupported.
+There is no PVC retention or import path, nor a physical storage erasure promise.
+Frozen-primary loss during removal/cleanup can block service indefinitely.
 Expect HTTP 503/disconnects during convergence, with no interruption-duration
 guarantee. Protocol 6 / store schema 2 require fresh deployment, not data migration.
 

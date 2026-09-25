@@ -76,9 +76,16 @@ supports full-set bootstrap, replacement, ordinary failover, explicit
 named-target [planned switchover](docs/features/kuberic/level-triggered-operator.md#planned-switchover),
 [secondary scale-down](docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
 down to one, and non-destructive quorum-loss recovery for `kvstore2`.
-Scale-down preserves the primary and permanently deletes removed PVCs; the
-desired count is both target and minimum. Reconfiguration may interrupt writes
-and connections with no duration guarantee. V2 images remain local/CI-only;
+This is SF-inspired secondary scale-down using PC/CC quorum principles, with
+Kuberic-specific target/minimum coupling, deterministic selection, write closure,
+sequential cleanup, and Kubernetes resource deletion. `spec.replicas` target=min
+is Kuberic policy; SF target and minimum are independently configurable.
+Retained read-quorum preflight preserves existing service when admission must
+wait. Exact original PVC provenance must be reconstructable before admission;
+PVC object deletion has no retention or import path, not a physical-erasure
+guarantee. After admission, frozen-primary loss can block recovery indefinitely.
+Reconfiguration may interrupt writes and connections with no duration guarantee.
+V2 images remain local/CI-only;
 scale-up, primary removal, and the SQLite/PostgreSQL ports remain future work.
 
 ## Continuous Delivery

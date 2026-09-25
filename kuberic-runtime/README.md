@@ -72,6 +72,16 @@ During failover it records only the controller-selected election-safe prefix
 under the new authority fence; a replica cannot reuse an arbitrary
 previous-epoch suffix as verified progress.
 
+The controller enables SF-inspired secondary scale-down using PC/CC quorum
+principles, with Kuberic-specific target/minimum coupling, deterministic
+selection, write closure, sequential cleanup, and Kubernetes resource deletion.
+`spec.replicas` target=min is Kuberic policy; SF target and minimum are
+independently configurable. The evaluator, not the runtime, checks retained
+read-quorum availability under stable accepted current-only authority and fresh
+exact sessions before freezing intent, removing routing, or closing writes.
+`ScaleDownRetainedReadQuorumUnavailable` preserves existing service with bounded
+re-observation, without preparing the primary or selecting another target.
+
 Managed secondary-removal preparation serializes with write admission and ACK
 completion, closes writes, reconciles journaled operation identities, and
 persists an authority-verified durable prefix. PC and reduced CC retain their
@@ -115,7 +125,18 @@ access; preparation and current-only coordination by themselves stay closed.
 The controller enables secondary scale-down; the application still receives no
 managed authority setters. See the
 [scale-down guide](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
-for target=min semantics, permanent PVC deletion, and availability limits.
+for target=min policy and availability limits. Exact original PVC provenance
+must be reconstructable before admission; pre-admission Pod/PVC disappearance
+without that provenance waits/fails closed, never treating list omission as
+absence. Unavailable-target support requires frozen or reconstructable exact
+cleanup identity. PVC object deletion has no retention or import path, not a
+physical storage erasure guarantee. Frozen-primary loss during removal/cleanup
+can cause indefinite outage. Sequential cleanup and each retained member's
+original completed current-only witness or fresh completed local acceptance
+gate replacement of the bounded receipt. Scale-up remains absent.
+The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
+include separating replication proof from Kubernetes cleanup obligations; neither
+desired policy nor Kubernetes deletion authority belongs in the runtime.
 
 `ReplicatorFactoryContext` exposes stable identity and partition-access
 capabilities, not a concrete runtime or default-engine pointer. Application

@@ -80,6 +80,17 @@ migration. Initialization identity (including its original policy) remains
 immutable. Admitted PC/CC policies are separate durable authority; a reduced
 policy does not rewrite initialization replay or Pod/PVC validation.
 
+The controller enables SF-inspired secondary scale-down using PC/CC quorum
+principles, with Kuberic-specific target/minimum coupling, deterministic
+selection, write closure, sequential cleanup, and Kubernetes resource deletion.
+`spec.replicas` target=min is Kuberic policy; SF target and minimum are
+independently configurable. Before freezing intent or closing routing/writes,
+controller preflight requires the previous read quorum from retained exact
+members under stable accepted current-only authority and fresh exact sessions.
+Otherwise `ScaleDownRetainedReadQuorumUnavailable` preserves existing service
+with bounded re-observation and no removal preparation or alternate target.
+The agent never owns desired-count or target-selection policy.
+
 The agent executes `PrepareSecondaryRemoval`, write-closed dual-policy
 `EnsureConfiguration`, `AcceptSecondaryRemovalCommit`, and `RetireReplica`
 through durable command/effect intent. Preparation preserves the verified boundary and its original
@@ -128,6 +139,17 @@ responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
 Use a fresh coordinated protocol-6/schema-2 deployment, not a rolling upgrade.
+Exact original PVC provenance must be reconstructable before admission; if Pod
+and PVC already disappeared without that provenance, scale-down waits/fails
+closed rather than treating list omission as absence. Unavailable-target support
+requires frozen or reconstructable exact cleanup identity. PVC object deletion
+has no retention or import path, not a physical storage erasure guarantee.
+Frozen-primary loss during removal/cleanup can cause indefinite outage. Sequential
+cleanup must finish, and every retained member needs its original completed
+current-only witness or fresh completed local acceptance before superseding the
+bounded receipt. Scale-up remains absent. These limits and the explicitly deferred
+durable primary-agent phase coordinator are recorded in
+[scale-down follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups).
 
 Crash-boundary environment variables exist only in the test executable.
 Production agent and application binaries expose no fault-injection mode.

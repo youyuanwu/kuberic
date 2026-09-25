@@ -385,6 +385,136 @@ fn metadata<'a>(
 }
 
 #[tokio::test]
+async fn retained_read_quorum_preflight_preserves_service_until_the_same_member_heals() {
+    for failure in ["unreachable", "permanent", "missing"] {
+        let mut original = fixture(3, 2);
+        let key = original
+            .agents
+            .keys()
+            .find(|k| k.replica_id == ReplicaId::new(2))
+            .unwrap()
+            .clone();
+        let retained = original.agents[&key].clone();
+        match failure {
+            "unreachable" => {
+                original.agents.insert(
+                    key.clone(),
+                    RawAgentObservation::Unavailable {
+                        message: "retained member unavailable".into(),
+                    },
+                );
+            }
+            "permanent" => {
+                let RawAgentObservation::Report(r) = original.agents.get_mut(&key).unwrap() else {
+                    unreachable!()
+                };
+                r.reported_fault = proto::FaultType::Permanent as i32;
+            }
+            _ => {
+                original.agents.remove(&key);
+            }
+        }
+        let before = original.clone();
+        let api = Arc::new(InMemoryClusterApi::new(original));
+        for attempt in 0..3 {
+            let (kind, effects) = tick(&api).await;
+            assert_eq!(kind, ReconcileKind::Waiting, "{failure}");
+            assert!(
+                effects
+                    .iter()
+                    .all(|e| matches!(e, EffectRecord::ReplaceStatus))
+            );
+            if attempt > 0 {
+                assert!(
+                    effects.is_empty(),
+                    "unchanged condition must not rewrite status"
+                );
+            }
+            let observed = api.observation().await;
+            let status = &observed.set.status.as_ref().unwrap().authority;
+            assert!(
+                status
+                    .conditions
+                    .iter()
+                    .any(|c| c.reason == "ScaleDownRetainedReadQuorumUnavailable")
+            );
+            assert!(status.transition.is_none() && status.provisioning.is_none());
+            assert!(status.pending_replacement_cleanup.is_none());
+            assert_eq!(
+                status.topology,
+                before.set.status.as_ref().unwrap().authority.topology
+            );
+            assert_eq!(
+                status.effective_policy,
+                before
+                    .set
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .authority
+                    .effective_policy
+            );
+            assert_eq!(
+                observed.services, before.services,
+                "write routing stays live"
+            );
+            let primary = observed
+                .agents
+                .iter()
+                .find(|(key, _)| key.replica_id == ReplicaId::new(1))
+                .unwrap()
+                .1;
+            let RawAgentObservation::Report(primary) = primary else {
+                unreachable!()
+            };
+            assert_eq!(primary.write_status, proto::AccessStatus::Granted as i32);
+            assert!(primary.prepared_secondary_removal.is_none());
+            assert!(primary.pending_operation_id.is_empty());
+            assert_eq!(observed.pods, before.pods);
+            assert_eq!(observed.pvcs, before.pvcs);
+        }
+        let mut healed = api.observation().await;
+        healed.agents.insert(key, retained);
+        api.set_observation(healed).await;
+        tick(&api).await;
+        let admitted = api.observation().await;
+        assert_eq!(
+            admitted
+                .set
+                .status
+                .as_ref()
+                .unwrap()
+                .authority
+                .transition
+                .as_ref()
+                .unwrap()
+                .secondary_scale_down
+                .as_ref()
+                .unwrap()
+                .target
+                .replica_id,
+            ReplicaId::new(3)
+        );
+        assert_eq!(admitted.services, before.services);
+        finish(&api).await;
+        assert_eq!(
+            api.observation()
+                .await
+                .set
+                .status
+                .unwrap()
+                .authority
+                .topology
+                .unwrap()
+                .configuration
+                .members
+                .len(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
 async fn healthy_reductions_are_sequential_exact_and_quiescent() {
     for (count, desired) in [(3, 2), (2, 1), (3, 1), (5, 2)] {
         let original = fixture(count, desired);

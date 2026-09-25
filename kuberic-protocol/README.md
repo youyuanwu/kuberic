@@ -46,7 +46,10 @@ mixed-version negotiation remain fail-closed.
 
 Protocol 6 defines secondary scale-down, with pure evaluation available behind
 `EvaluationConfig::enable_secondary_scale_down` (library default **false**,
-enabled by the production controller). Its typed intent removes exactly the
+enabled by the production controller). This is SF-inspired secondary scale-down
+using PC/CC quorum principles, with Kuberic-specific target/minimum coupling,
+deterministic selection, write closure, sequential cleanup, and Kubernetes
+resource deletion. Its typed intent removes exactly the
 highest logical-ID committed secondary, preserves
 the exact primary and retained members, and validates previous/reduced majority
 policies independently (including 2→1). Preparation freezes a durable
@@ -58,12 +61,22 @@ authoritative exact-name absence, separately from accepted topology.
 
 Lowering `spec.replicas` requests sequential single-secondary removal; the desired
 count is target and minimum, down to one. Increasing accepted membership is unsupported.
-The evaluator freezes intent before preparation, persists PC read evidence before
+This `spec.replicas` target=min coupling is Kuberic policy, not general SF
+semantics; SF target and minimum are independently configurable.
+Before freezing intent, removing routing, or closing writes, retained exact
+members (excluding the highest-ID target) must currently supply the previous
+read quorum under stable accepted current-only authority and fresh exact
+sessions. `ScaleDownRetainedReadQuorumUnavailable` preserves existing writable
+service with bounded re-observation, without preparation, replacement, or another
+target. Healing the retained member admits the same target; 2→1 requires only
+the retained primary. This preflight does not replace or weaken post-freeze proof.
+The evaluator then freezes intent before preparation, persists PC read evidence before
 reduced PC/CC dispatch, freezes reduced write evidence before current-only
 dispatch, and atomically accepts reduced topology/policy with a cleanup receipt.
 Each command uses one freshly observed exact session; target availability never
 changes selection or grants reduced quorum credit. Primary loss waits without
-retargeting, failover, or rollback. A later desired count waits for cleanup.
+retargeting, failover, or rollback, even during cleanup after commit; this can
+cause indefinite outage. A later desired count waits for cleanup.
 
 Post-commit local receipt publication (`AcceptSecondaryRemovalCommit`), stable
 write grant, routing, retirement, and resource cleanup are separate decisions.
@@ -74,14 +87,19 @@ are wired through the controller, wire adapter, and durable agent execution;
 the controller performs exact-resource observation and deletion.
 
 `SecondaryScaleDownResourceObservation` requires authoritative exact-name
-lookups and a proven Pod/mounted-PVC mapping. `DeleteScaleDownResource` carries
+lookups and a proven Pod/mounted-PVC mapping. If exact original PVC provenance
+cannot be reconstructed before admission (for example Pod and PVC already
+disappeared), scale-down waits/fails closed; list omission is not absence.
+Unavailable-target support requires frozen or reconstructable exact cleanup
+identity. `DeleteScaleDownResource` carries
 frozen name/UID and fresh resource version. Endpoint cleanup
 precedes exact Pod fencing; PVC cleanup requires authoritative Pod-UID absence.
 Same-name replacement UIDs are never adopted or deleted, including after the
 cleanup obligation is cleared. Unknown extra resources do not confer deletion authority.
 The target never contributes reduced quorum credit; after commit, exact Pod
 deletion and observed absence substitute for an unavailable local retirement
-reply. Cleanup permanently deletes the frozen PVC and serializes new operations.
+reply. Cleanup deletes the frozen PVC object with no retention or import path,
+not a physical storage erasure guarantee, and serializes new operations.
 Existing status JSON defaults the optional fields to absent; absence never
 supplies scale-down authority.
 
@@ -114,7 +132,8 @@ Endpoint scaffolding and accepted-authority convergence precede new transition
 admission; switchover then precedes reduction, which precedes replacement of an
 unavailable selected removal target.
 
-Scale-down progress projects stable reasons for preparation, previous read quorum
+Scale-down progress projects stable reasons for pre-admission retained quorum
+(`ScaleDownRetainedReadQuorumUnavailable`), preparation, previous read quorum
 (`ScaleDownPreviousReadQuorumUnavailable`), reduced write quorum and verified
 catch-up (`ScaleDownReducedWriteQuorumUnavailable`, `ScaleDownReducedCatchUpPending`),
 current-only quorum, exact primary recovery (`ScaleDownPrimaryUnavailable`),
@@ -158,6 +177,8 @@ published only after that proof; it never starts ordinary failover or replacemen
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 and [secondary scale-down](../docs/features/kuberic/level-triggered-operator.md#secondary-scale-down)
 for usage, target/minimum risks, and the protocol-6/schema-2 fresh-deployment contract.
+The [deferred follow-ups](../docs/proposal/v1-retirement-plan.md#deferred-scale-down-follow-ups)
+separate status/API redesign, mechanical helper refactors, and new recovery protocols.
 
 Replacement admission durably records `pendingReplacementCleanup` **before**
 creating replacement scaffolding or provisioning. Authoritative exact-name GETs
