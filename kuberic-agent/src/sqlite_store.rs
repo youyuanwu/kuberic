@@ -156,6 +156,16 @@ impl AgentStore for SqliteStore {
     async fn begin_effect(&self, effect: &RuntimeEffect) -> Result<BeginEffect> {
         self.with_transaction(|transaction| {
             let mut state = load_state_from_connection(transaction)?;
+            if let RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) =
+                &effect.action
+            {
+                crate::removal::admit_commit(command, &state)?;
+                if !command.local_recovery || effect.operation_id != command.operation_id {
+                    return Err(AgentError::CommandRejected(
+                        "historical acceptance effect identity differs".into(),
+                    ));
+                }
+            }
             if state.retired_authority.is_some()
                 && !matches!(effect.action, RuntimeEffectAction::RetireReplica(_))
             {
@@ -227,6 +237,11 @@ impl AgentStore for SqliteStore {
                     "effect completion does not match durable intent".into(),
                 ));
             }
+            if let RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) =
+                &pending.effect.action
+            {
+                crate::removal::admit_commit(command, &state)?;
+            }
             state.role = result.postcondition.role;
             state.read_status = result.postcondition.read_status;
             state.write_status = result.postcondition.write_status;
@@ -282,6 +297,37 @@ impl AgentStore for SqliteStore {
                 state.prepared_secondary_removal = None;
             }
             match &pending.effect.action {
+                RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
+                    kuberic_protocol::validation::validate_accept_secondary_removal_commit(command)
+                        .map_err(|e| AgentError::EffectConflict(e.to_string()))?;
+                    let intent = &command.committed.evidence.preparation.intent;
+                    if !command.local_recovery
+                        || command.operation_id != pending.effect.operation_id
+                        || command.target != state.identity.local_identity
+                        || intent.resource_uid != state.identity.resource_uid
+                        || result.postcondition.accepted_secondary_removal.as_ref()
+                            != Some(&command.committed)
+                        || result.postcondition.role != ReplicaRole::ActiveSecondary
+                        || result.postcondition.write_status == AccessStatus::Granted
+                        || result.postcondition.role_transition.is_some()
+                        || result.postcondition.authority.as_ref().is_none_or(|a| {
+                            a.local_identity != command.target
+                                || a.previous_configuration.is_some()
+                                || a.current_configuration != intent.current_configuration
+                                || a.secondary_removal.as_ref() != Some(&command.committed.evidence)
+                        })
+                        || result
+                            .postcondition
+                            .verified_replication_lsn
+                            .is_none_or(|lsn| {
+                                lsn < command.committed.evidence.preparation.boundary_lsn
+                            })
+                    {
+                        return Err(AgentError::EffectConflict(
+                            "historical acceptance omitted exact local postcondition".into(),
+                        ));
+                    }
+                }
                 RuntimeEffectAction::PrepareSecondaryRemoval {
                     intent,
                     process_session_id,
@@ -415,6 +461,7 @@ impl AgentStore for SqliteStore {
                 retained.effect.action,
                 RuntimeEffectAction::PrepareSecondaryRemoval { .. }
                     | RuntimeEffectAction::RetireReplica(_)
+                    | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
             ) {
                 state
                     .removal_effects

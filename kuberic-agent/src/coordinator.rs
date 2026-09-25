@@ -140,24 +140,13 @@ where
         command: kuberic_protocol::command::AcceptSecondaryRemovalCommit,
     ) -> Result<()> {
         let _command = self.command_lock.lock().await;
-        kuberic_protocol::validation::validate_accept_secondary_removal_commit(&command)
-            .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
         let state = self.store.load_state().await?;
-        let intent = &command.committed.evidence.preparation.intent;
-        if state.identity.local_identity != command.target
-            || state.identity.resource_uid != intent.resource_uid
-            || state.retired_authority.is_some()
-            || state.reconfiguration.is_some()
-            || state.previous_configuration.is_some()
-            || state.current_configuration.as_ref() != Some(&intent.current_configuration)
-            || state.secondary_removal_evidence.as_ref() != Some(&command.committed.evidence)
-        {
-            return Err(AgentError::CommandRejected(
-                "commit certificate differs from completed local reduced authority".into(),
-            ));
-        }
-        let action =
-            RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(command.committed.clone()));
+        crate::removal::admit_commit(&command, &state)?;
+        let action = if command.local_recovery {
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command.clone()))
+        } else {
+            RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(command.committed.clone()))
+        };
         let effect = if let Some(pending) = &state.pending_effect {
             if pending.effect.operation_id != command.operation_id
                 || pending.effect.action != action

@@ -1081,6 +1081,174 @@ fn completed_removal_history_allows_return_after_failover_or_replacement() {
 }
 
 #[test]
+fn completed_removal_local_acceptance_precedes_newer_authority_correction() {
+    use scale_down_model::Model;
+    for replacement in [false, true] {
+        let mut model = Model::new(&[1, 2, 3, 4, 5, 6], 1, 5);
+        model.until(|m| {
+            matches!(m.plan(), Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(c)
+        } if c.local_replica_id == ReplicaId::new(5) && c.current_only)
+        });
+        model.step();
+        let late = model.report(5).clone();
+        assert!(late.previous_configuration.is_none());
+        assert!(late.accepted_secondary_removal.is_none());
+        model.unavailable(5);
+        model.until(|m| m.snapshot.status.last_secondary_removal.is_some());
+        assert!(model.snapshot.status.secondary_scale_down_cleanup.is_none());
+        let receipt = model
+            .snapshot
+            .status
+            .last_secondary_removal
+            .clone()
+            .unwrap();
+        let previous = receipt
+            .evidence
+            .preparation
+            .intent
+            .current_configuration
+            .clone();
+        let mut members = previous.members.clone();
+        if replacement {
+            members[3].identity.instance_id = ReplicaInstanceId::new("replacement-4");
+            members[3].identity.agent_generation = AgentGeneration::new("replacement-generation");
+        } else {
+            members[0].role = ReplicaRole::ActiveSecondary;
+            members[1].role = ReplicaRole::Primary;
+        }
+        let accepted = ConfigurationDescriptor::new(
+            Epoch::new(
+                previous.epoch.data_loss_number,
+                previous.epoch.configuration_number + 1,
+            ),
+            ReplicaId::new(if replacement { 1 } else { 2 }),
+            members,
+            previous.write_quorum,
+        );
+        for member in &accepted.members {
+            if member.identity == late.identity {
+                continue;
+            }
+            let key = model.key(member.identity.replica_id.value());
+            let mut observation = model.snapshot.replicas.remove(&key).unwrap();
+            let AgentObservation::Report(report) = &mut observation.agent else {
+                unreachable!()
+            };
+            report.identity = member.identity.clone();
+            report.epoch = accepted.epoch;
+            report.role = member.role;
+            report.previous_configuration = None;
+            report.current_configuration = Some(accepted.clone());
+            report.secondary_removal_evidence = None;
+            report.accepted_secondary_removal = None;
+            report.prepared_secondary_removal = None;
+            report.write_status = if member.role == ReplicaRole::Primary {
+                AccessStatus::Granted
+            } else {
+                AccessStatus::NotPrimary
+            };
+            observation.kubernetes.as_mut().unwrap().pod_uid =
+                Some(PodUid::new(member.identity.instance_id.as_str()));
+            model.snapshot.replicas.insert(
+                ReplicaObservationKey::new(
+                    member.identity.replica_id,
+                    member.identity.instance_id.clone(),
+                ),
+                observation,
+            );
+        }
+        model.snapshot.status.topology = Some(AcceptedTopology {
+            configuration: accepted.clone(),
+        });
+        model.snapshot.routing.write_target = Some(
+            accepted
+                .members
+                .iter()
+                .find(|m| m.role == ReplicaRole::Primary)
+                .unwrap()
+                .identity
+                .clone(),
+        );
+        let key = model.key(5);
+        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+            AgentObservation::Report(Box::new(late));
+        model.controller_restart();
+        let status = model.snapshot.status.clone();
+        let deletes = model.deletes.clone();
+        for mutation in 0..8 {
+            let mut broken = model.clone();
+            match mutation {
+                0 => broken.snapshot.status.last_secondary_removal = None,
+                1 => broken
+                    .snapshot
+                    .status
+                    .last_secondary_removal
+                    .as_mut()
+                    .unwrap()
+                    .current_only_write_quorum
+                    .clear(),
+                2 => {
+                    broken
+                        .report(5)
+                        .secondary_removal_evidence
+                        .as_mut()
+                        .unwrap()
+                        .preparation
+                        .boundary_lsn -= 1
+                }
+                3 => {
+                    broken.report(5).identity.agent_generation =
+                        AgentGeneration::new("wrong-generation")
+                }
+                4 => broken.report(5).resource_uid = ResourceUid::new("wrong-resource"),
+                5 => broken.report(5).epoch.configuration_number += 2,
+                6 => {
+                    broken.report(5).pending_operation_id = Some(OperationId::new("unrelated-work"))
+                }
+                _ => broken.report(5).verified_replication_lsn = Some(0),
+            }
+            assert!(
+                matches!(broken.plan(), Plan::Unsafe { .. } | Plan::Wait { .. }),
+                "mutation {mutation}: {:?}",
+                broken.plan()
+            );
+        }
+        let Plan::Execute {
+            command: ProtocolCommand::AcceptSecondaryRemovalCommit(command),
+        } = model.plan()
+        else {
+            panic!(
+                "missing exact historical local acceptance: {:?}",
+                model.plan()
+            );
+        };
+        assert_eq!(command.target.replica_id, ReplicaId::new(5));
+        assert!(command.local_recovery);
+        assert_eq!(command.committed, receipt.committed());
+        model.step();
+        assert_eq!(model.snapshot.status, status);
+        assert_eq!(model.deletes, deletes);
+        assert_ne!(model.report(5).write_status, AccessStatus::Granted);
+        assert_eq!(model.report(5).current_configuration, Some(previous));
+        assert_eq!(
+            model.report(5).accepted_secondary_removal,
+            Some(receipt.committed())
+        );
+        for current_only in [false, true] {
+            assert!(matches!(model.plan(), Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(c)
+            } if c.local_replica_id == ReplicaId::new(5) && c.current_configuration == accepted
+                && c.current_only == current_only));
+            model.step();
+        }
+        model.finish();
+        assert_eq!(model.report(5).current_configuration, Some(accepted));
+        assert_eq!(model.snapshot.status.last_secondary_removal, Some(receipt));
+    }
+}
+
+#[test]
 fn scale_down_and_switchover_converge_endpoints_and_lagging_authority_before_admission() {
     use scale_down_model::Model;
     for switchover in [false, true] {

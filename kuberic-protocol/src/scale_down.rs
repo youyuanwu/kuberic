@@ -285,6 +285,7 @@ pub fn validate_accept_secondary_removal_commit(
         || command.operation_id
             != intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, &command.target)
         || command.committed.retirement.is_some()
+        || (command.local_recovery && command.target == intent.primary)
     {
         return Err(invalid(
             "commit publication must bind one retained exact member and immutable acceptance evidence",

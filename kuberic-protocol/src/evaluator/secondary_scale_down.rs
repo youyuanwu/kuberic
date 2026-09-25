@@ -908,6 +908,68 @@ pub(super) fn cleanup(
     ))
 }
 
+pub(super) fn recover_local_acceptance(
+    snapshot: &ObservationSnapshot,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    let receipt = snapshot.status.last_secondary_removal.as_ref()?;
+    let intent = &receipt.evidence.preparation.intent;
+    let topology = &snapshot.status.topology.as_ref()?.configuration;
+    if topology.epoch <= intent.current_configuration.epoch {
+        return None;
+    }
+    for member in &intent.current_configuration.members {
+        if member.role != ReplicaRole::ActiveSecondary
+            || !topology
+                .members
+                .iter()
+                .any(|m| m.identity == member.identity)
+        {
+            continue;
+        }
+        let Some(r) = report(snapshot, &member.identity) else {
+            continue;
+        };
+        if r.current_configuration.as_ref() != Some(&intent.current_configuration)
+            || r.previous_configuration.is_some()
+            || r.secondary_removal_evidence.as_ref() != Some(&receipt.evidence)
+            || r.accepted_secondary_removal.is_some()
+        {
+            continue;
+        }
+        let operation_id =
+            intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, &member.identity);
+        if r.role != member.role
+            || r.epoch != intent.current_configuration.epoch
+            || r.write_status == AccessStatus::Granted
+            || r.prepared_secondary_removal.is_some()
+            || r.pending_operation_id
+                .as_ref()
+                .is_some_and(|id| id != &operation_id)
+            || r.verified_replication_lsn
+                .is_none_or(|lsn| lsn < receipt.evidence.preparation.boundary_lsn)
+        {
+            return Some(wait(
+                snapshot.status.clone(),
+                "ScaleDownLocalAcceptancePending",
+                "Exact historical local authority, completed work and verified boundary are required before correction",
+                config,
+            ));
+        }
+        return Some(Plan::Execute {
+            command: ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
+                AcceptSecondaryRemovalCommit {
+                    operation_id,
+                    target: member.identity.clone(),
+                    committed: receipt.committed(),
+                    local_recovery: true,
+                },
+            )),
+        });
+    }
+    None
+}
+
 pub(super) fn completed(
     snapshot: &ObservationSnapshot,
     receipt: &SecondaryRemovalReceipt,
@@ -977,6 +1039,7 @@ fn converge_committed(
                         operation_id,
                         target: member.identity.clone(),
                         committed,
+                        local_recovery: false,
                     },
                 )),
             });

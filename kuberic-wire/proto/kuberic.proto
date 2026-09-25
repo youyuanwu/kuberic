@@ -302,6 +302,7 @@ message AcceptSecondaryRemovalCommitCommand {
   string operation_id = 1;
   ReplicaIdentity target = 2;
   SecondaryScaleDownCleanup committed = 3;
+  bool local_recovery = 4;
 }
 
 message PrepareSwitchoverCommand {

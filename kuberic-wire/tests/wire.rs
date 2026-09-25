@@ -66,6 +66,7 @@ fn secondary_removal_commands_round_trip_exact_authority_for_sizes_two_through_f
             ),
             target: intent.primary.clone(),
             committed: scale_down_fixture::cleanup(&intent),
+            local_recovery: false,
         };
         for (wire, target, canonical) in [
             (
@@ -124,6 +125,7 @@ fn accepted_removal_commit_rejects_mutated_certificates_and_envelopes() {
         ),
         target: intent.primary.clone(),
         committed: scale_down_fixture::cleanup(&intent),
+        local_recovery: false,
     };
     let request = removal_request(
         proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(Box::new(

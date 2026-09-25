@@ -2919,6 +2919,44 @@ impl DefaultReplicatorInner {
                     .acknowledge_in_session(&acknowledgement, &session)?;
                 self.finalize_ready_commit().await?;
             }
+            RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command) => {
+                kuberic_protocol::validation::validate_accept_secondary_removal_commit(&command)
+                    .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
+                let committed = &command.committed;
+                let state = self.state.read().await;
+                let authority = state
+                    .authority
+                    .as_ref()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                if !command.local_recovery
+                    || command.target != self.identity
+                    || state.role != ReplicaRole::ActiveSecondary
+                    || state.write_status == AccessStatus::Granted
+                    || state.prepared_secondary_removal.is_some()
+                    || authority.previous_configuration.is_some()
+                    || authority.current_configuration
+                        != committed.evidence.preparation.intent.current_configuration
+                    || authority.secondary_removal.as_ref() != Some(&committed.evidence)
+                    || state.current_progress < committed.evidence.preparation.boundary_lsn
+                    || state.replication_progress.as_ref().is_none_or(|p| {
+                        p.fence != authority.fence()
+                            || p.verified_lsn < committed.evidence.preparation.boundary_lsn
+                    })
+                    || state
+                        .accepted_secondary_removal
+                        .as_ref()
+                        .is_some_and(|c| c != committed)
+                    || self.replica_authority_store.load().await?.as_ref() != Some(authority)
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "historical acceptance requires exact verified write-closed secondary authority".into(),
+                    ));
+                }
+                drop(state);
+                // Durability belongs to the agent's exact pending/completed effect.
+                // Do not persist a live runtime commit or resurrect peer-session credit.
+                self.state.write().await.accepted_secondary_removal = Some(committed.clone());
+            }
             RuntimeEffectAction::AcceptSecondaryRemovalCommit(committed) => {
                 validate_secondary_scale_down_cleanup(&committed)
                     .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;

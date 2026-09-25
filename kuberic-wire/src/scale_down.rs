@@ -459,6 +459,7 @@ impl From<AcceptSecondaryRemovalCommit> for proto::AcceptSecondaryRemovalCommitC
             operation_id: value.operation_id.to_string(),
             target: Some(value.target.into()),
             committed: Some(value.committed.into()),
+            local_recovery: value.local_recovery,
         }
     }
 }
@@ -470,6 +471,7 @@ impl TryFrom<proto::AcceptSecondaryRemovalCommitCommand> for AcceptSecondaryRemo
             operation_id: OperationId::new(value.operation_id),
             target: required(value.target, "accept_removal.target")?.try_into()?,
             committed: required(value.committed, "accept_removal.committed")?.try_into()?,
+            local_recovery: value.local_recovery,
         };
         validate_accept_secondary_removal_commit(&command).map_err(authority)?;
         Ok(command)

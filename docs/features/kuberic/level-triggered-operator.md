@@ -312,7 +312,14 @@ For an already committed reduction, that progress may come from a current-only
 primary that has restarted and resumed writes, provided its live report retains
 the exact commit proof. Pre-commit witnesses remain strictly write-closed.
 After a later accepted failover or replacement, matching bounded historical
-removal evidence permits stale-member correction, not new authority.
+removal evidence permits stale-member correction, not new authority. If a retained
+secondary installed current-only removal authority but missed local commit
+acceptance, the controller first publishes the exact certificate locally using
+`AcceptSecondaryRemovalCommit.localRecovery`. This clears only its durable removal
+fence after verifying exact identity, authority and boundary, without old-session
+quorum credit, access grants, cleanup, or changes to cluster status/receipt. A fresh
+report proving acceptance is required before ordinary newer-authority correction.
+Missing or mismatched bounded proof fails closed; unrelated pending work waits.
 Peer endpoint scaffolding and accepted-configuration catch-up run before a new
 switchover or removal is admitted.
 

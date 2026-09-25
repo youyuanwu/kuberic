@@ -641,6 +641,7 @@ async fn restarted_removal_peer(
                 .command_operation_id(SecondaryRemovalStage::AcceptCommit, &frozen.identity),
             target: frozen.identity.clone(),
             committed: committed.clone(),
+            local_recovery: false,
         })
         .await
         .unwrap();
@@ -708,6 +709,73 @@ async fn removal_commit_replay_after_retained_peer_restart_uses_live_session_cre
     )
     .await;
     assert_eq!(pending.committed().await.unwrap().lsn, 1);
+}
+
+#[tokio::test]
+async fn historical_removal_acceptance_requires_exact_verified_local_boundary() {
+    let intent = removal_fixture::intent(&[1, 2, 3, 4, 5, 6], 1);
+    let local = intent.current_configuration.members[4].identity.clone();
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = open_removal_member(
+        &intent,
+        local.clone(),
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    )
+    .await;
+    let evidence = removal_fixture::evidence(&intent);
+    let mut authority = AdmittedAuthority {
+        local_identity: local.clone(),
+        transition_kind: Some(TransitionKind::SecondaryScaleDown),
+        previous_configuration: Some(intent.previous_configuration.clone()),
+        current_configuration: intent.current_configuration.clone(),
+        switchover_handoff: None,
+        secondary_removal: Some(evidence.clone()),
+    };
+    runtime
+        .apply_effect(effect(
+            5,
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority.clone())),
+        ))
+        .await
+        .unwrap();
+    authority.previous_configuration = None;
+    authority.transition_kind = None;
+    runtime
+        .apply_effect(effect(
+            6,
+            RuntimeEffectAction::AdmitAuthority(Box::new(authority)),
+        ))
+        .await
+        .unwrap();
+    let command = kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+        operation_id: intent.command_operation_id(
+            kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+            &local,
+        ),
+        target: local,
+        committed: removal_fixture::cleanup(&intent),
+        local_recovery: true,
+    };
+    let before = runtime.snapshot().await;
+    assert!(before.verified_replication_lsn.unwrap() < evidence.preparation.boundary_lsn);
+    assert!(
+        runtime
+            .apply_effect(effect(
+                7,
+                RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command))
+            ))
+            .await
+            .is_err()
+    );
+    assert_eq!(runtime.snapshot().await, before);
+    assert!(
+        store
+            .load_secondary_removal_commit()
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn session_ack(

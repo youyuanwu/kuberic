@@ -535,10 +535,84 @@ async fn completed_reduction_then_real_failover_corrects_returning_old_primary()
 
 #[tokio::test]
 async fn historical_removal_survives_new_authority_and_status_reload() {
+    historical_removal_return(false).await;
+}
+
+#[tokio::test]
+async fn historical_removal_local_acceptance_precedes_correction_after_cleanup() {
+    historical_removal_return(true).await;
+}
+
+async fn historical_removal_return(unaccepted: bool) {
     for replacement in [false, true] {
-        let api = Arc::new(InMemoryClusterApi::new(fixture(4, 3)));
-        finish(&api).await;
+        let api = Arc::new(InMemoryClusterApi::new(if unaccepted {
+            fixture(6, 5)
+        } else {
+            fixture(4, 3)
+        }));
+        let mut returning = None;
+        if unaccepted {
+            for _ in 0..100 {
+                let (_, plan) = next_plan(&api).await;
+                let boundary = matches!(plan, Plan::Execute {
+                    command: ProtocolCommand::EnsureConfiguration(ref c)
+                } if c.local_replica_id.value() == 5 && c.current_only);
+                tick(&api).await;
+                if boundary {
+                    let mut raw = api.observation().await;
+                    let key = raw
+                        .agents
+                        .keys()
+                        .find(|k| k.replica_id.value() == 5)
+                        .unwrap()
+                        .clone();
+                    returning = Some((key.clone(), raw.agents.remove(&key).unwrap()));
+                    api.set_observation(raw).await;
+                    break;
+                }
+            }
+            assert!(returning.is_some());
+            for _ in 0..100 {
+                if api
+                    .observation()
+                    .await
+                    .set
+                    .status
+                    .as_ref()
+                    .unwrap()
+                    .authority
+                    .last_secondary_removal
+                    .is_some()
+                {
+                    break;
+                }
+                tick(&api).await;
+            }
+        } else {
+            finish(&api).await;
+        }
         let mut raw = api.observation().await;
+        assert!(
+            raw.set
+                .status
+                .as_ref()
+                .unwrap()
+                .authority
+                .secondary_scale_down_cleanup
+                .is_none()
+        );
+        let receipt = raw
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .last_secondary_removal
+            .clone()
+            .unwrap();
+        if let Some((key, report)) = returning {
+            raw.agents.insert(key, report);
+        }
         let previous = raw
             .set
             .status
@@ -550,7 +624,13 @@ async fn historical_removal_survives_new_authority_and_status_reload() {
             .unwrap()
             .configuration
             .clone();
-        let late = if replacement { 3 } else { 1 };
+        let late = if unaccepted {
+            5
+        } else if replacement {
+            3
+        } else {
+            1
+        };
         let mut members = previous.members.clone();
         if replacement {
             let identity = &mut members[1].identity;
@@ -646,6 +726,21 @@ async fn historical_removal_survives_new_authority_and_status_reload() {
             *service = write_service("pod-uid-2");
         }
         api.set_observation(raw).await;
+        if unaccepted {
+            let (raw, plan) = next_plan(&api).await;
+            let status = raw.set.status.unwrap().authority;
+            assert!(
+                matches!(plan, Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(ref c)
+            } if c.target.replica_id.value() == 5 && c.local_recovery && c.committed == receipt.committed()),
+                "{plan:?}"
+            );
+            tick(&api).await;
+            assert_eq!(
+                api.observation().await.set.status.unwrap().authority,
+                status
+            );
+        }
         let (_, plan) = next_plan(&api).await;
         assert!(
             matches!(plan, Plan::Execute { command: ProtocolCommand::EnsureConfiguration(ref c) } if c.local_replica_id.value() == late),
@@ -666,14 +761,9 @@ async fn historical_removal_survives_new_authority_and_status_reload() {
                 .configuration,
             accepted
         );
-        assert!(
-            result
-                .set
-                .status
-                .unwrap()
-                .authority
-                .last_secondary_removal
-                .is_some()
+        assert_eq!(
+            result.set.status.unwrap().authority.last_secondary_removal,
+            Some(receipt)
         );
     }
 }

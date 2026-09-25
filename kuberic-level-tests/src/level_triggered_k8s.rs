@@ -2526,6 +2526,7 @@ fn restart_scale_process(case: &mut ScaleCase<'_>, member: &Value) -> Result<()>
 fn scale_down_adversarial() -> Result<()> {
     run_switchover(|cluster| {
         use kuberic_protocol::{command::ProtocolCommand, plan::Plan};
+        scale_down_historical_member_return(cluster)?;
         // Reachable-target retirement and every command/status/cleanup lost-reply
         // boundary, with a fresh controller state after each production effect.
         reset_scale_set(cluster, 3)?;
@@ -2865,6 +2866,229 @@ fn scale_down_adversarial() -> Result<()> {
         drop(pause);
         case.finish(1)
     })
+}
+
+fn scale_down_historical_member_return(cluster: &SwitchoverCluster) -> Result<()> {
+    use kuberic_protocol::{command::ProtocolCommand, plan::Plan};
+    reset_scale_set(cluster, 6)?;
+    let mut case = ScaleCase::new(cluster, 6)?;
+    let late = case.accepted["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["replicaId"] == 5)
+        .context("retained member 5")?
+        .clone();
+    let primary = case.primary.clone();
+    let pause = ControllerPause::new(cluster)?;
+    case.submit(5)?;
+    let mut stepper = LiveStepper::new(cluster)?;
+    let mut suspension = None;
+    let mut old_command = None;
+    let receipt = loop {
+        let step = stepper.step(cluster)?;
+        ensure!(
+            !matches!(step.plan, Plan::Unsafe { .. }),
+            "unsafe removal: {:?}",
+            step.plan
+        );
+        if matches!(&step.plan, Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(c)
+        } if c.local_replica_id.value() == 5 && c.current_only)
+            && step.command.is_some()
+        {
+            ensure!(suspension.is_none(), "duplicate disappearance boundary");
+            old_command = step.command;
+            suspension = Some(suspend_replica_process(
+                &cluster.kubeconfig,
+                &cluster.context,
+                5,
+            )?);
+            eprintln!(
+                "historical recovery: suspended 5 after current-only, before local acceptance"
+            );
+        }
+        let status = case.observe()?;
+        if status["status"]["lastSecondaryRemoval"].is_object()
+            && status["status"]["secondaryScaleDownCleanup"].is_null()
+        {
+            ensure!(suspension.is_some(), "missed retained acceptance gap");
+            break status["status"]["lastSecondaryRemoval"].clone();
+        }
+        poll(
+            case.deadline,
+            "6->5 cleanup with locally unaccepted retained member",
+        )?;
+    };
+    for (id, resource, _) in &case.resources {
+        if *id == 6 {
+            ensure!(
+                resource.get(cluster)?.is_none(),
+                "target resource remains after cleanup"
+            );
+        }
+    }
+    let acknowledged = case.acknowledged.clone();
+    drop(case);
+    let deadline = Instant::now() + Duration::from_secs(240);
+    let peers = (2..=4)
+        .map(|id| suspend_replica_process(&cluster.kubeconfig, &cluster.context, id))
+        .collect::<Result<Vec<_>>>()?;
+    loop {
+        let step = stepper.step(cluster)?;
+        ensure!(
+            !matches!(step.plan, Plan::Unsafe { .. }),
+            "unsafe quorum fence: {:?}",
+            step.plan
+        );
+        if cluster.report(&primary)?["writeStatus"] == "NoWriteQuorum" {
+            break;
+        }
+        poll(deadline, "close old primary before failover suspension")?;
+    }
+    let primary_suspension = suspend_replica_process(
+        &cluster.kubeconfig,
+        &cluster.context,
+        primary["replicaId"].as_i64().unwrap(),
+    )?;
+    drop(peers);
+    let accepted = loop {
+        let step = stepper.step(cluster)?;
+        ensure!(
+            !matches!(step.plan, Plan::Unsafe { .. }),
+            "unsafe failover: {:?}",
+            step.plan
+        );
+        let status = cluster.status()?;
+        ensure!(
+            status["status"]["lastSecondaryRemoval"] == receipt,
+            "failover changed removal receipt"
+        );
+        if topology_primary_id(&status) != primary["replicaId"].as_i64()
+            && status["status"]["topology"]["epoch"]["configurationNumber"].as_i64()
+                > receipt["evidence"]["preparation"]["intent"]["currentConfiguration"]["epoch"]["configurationNumber"].as_i64()
+            && status["status"]["transition"].is_null()
+        {
+            break status["status"]["topology"].clone();
+        }
+        poll(deadline, "failover while retained 5 is absent")?;
+    };
+    ensure!(
+        accepted["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| identity(m) == identity(&late)),
+        "failover replaced the returning member"
+    );
+    eprintln!(
+        "historical recovery: cleanup complete, newer failover accepted: {}",
+        accepted["epoch"]
+    );
+    drop(suspension);
+    drop(primary_suspension);
+    let old_session = cluster.report(&late)?["processSession"].clone();
+    stop_replica_process(&cluster.kubeconfig, &cluster.context, 5)?;
+    loop {
+        if cluster
+            .report(&late)
+            .is_ok_and(|r| r["processSession"] != old_session)
+        {
+            break;
+        }
+        poll(deadline, "fresh returning retained process session")?;
+    }
+    stepper = LiveStepper::new(cluster)?;
+    let (endpoint, request) = old_command.context("old current-only command")?;
+    stepper.reject_stale(&endpoint, request)?;
+    let mut accepted_locally = false;
+    let mut corrected = false;
+    loop {
+        let before = cluster.status()?;
+        let step = stepper.step(cluster)?;
+        ensure!(
+            !matches!(step.plan, Plan::Unsafe { .. }),
+            "unsafe return: {:?}",
+            step.plan
+        );
+        match &step.plan {
+            Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(c),
+            } if c.target.replica_id.value() == 5 => {
+                ensure!(c.local_recovery, "not historical local-only acceptance");
+                ensure!(
+                    serde_json::to_value(&c.committed.evidence)? == receipt["evidence"],
+                    "historical certificate mutated"
+                );
+                if step.command.is_some() {
+                    accepted_locally = true;
+                    ensure!(
+                        cluster.status()?["status"] == before["status"],
+                        "local replay rewrote cluster status"
+                    );
+                    let report = cluster.report(&late)?;
+                    ensure!(
+                        report["writeStatus"] != "Granted"
+                            && report["currentConfiguration"]
+                                == receipt["evidence"]["preparation"]["intent"]["currentConfiguration"]
+                                    ["configurationId"],
+                        "historical replay granted access or new authority"
+                    );
+                    eprintln!(
+                        "historical recovery: exact local acceptance on 5, status and authority unchanged"
+                    );
+                }
+            }
+            Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(c),
+            } if c.local_replica_id.value() == 5 => {
+                ensure!(
+                    accepted_locally,
+                    "newer correction preceded observed local acceptance"
+                );
+                corrected |= c.current_only && step.command.is_some();
+            }
+            _ => {}
+        }
+        if corrected && matches!(step.plan, Plan::Stable { .. }) {
+            break;
+        }
+        poll(
+            deadline,
+            "historical acceptance then ordinary failover correction",
+        )?;
+    }
+    ensure!(
+        cluster.status()?["status"]["lastSecondaryRemoval"] == receipt,
+        "recovery rewrote receipt"
+    );
+    let stable = scale_ready(cluster, 5, deadline)?;
+    let writer = stable["status"]["topology"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "primary")
+        .context("new primary")?;
+    let mut client = DirectClient::connect(cluster, &cluster.pod(writer)?, deadline)?;
+    for (key, value) in acknowledged {
+        let (code, body) = client.request("GET", &format!("/kv/{key}"), "")?;
+        ensure!(
+            code == 200 && body == value,
+            "failover lost acknowledged prefix"
+        );
+    }
+    ensure!(
+        client
+            .request("PUT", "/kv/historical-recovery", "after-return")?
+            .0
+            == 200,
+        "post-recovery quorum write failed"
+    );
+    eprintln!(
+        "historical recovery: 6->5, cleanup, failover, restart, exact acceptance, correction, stable and durable read/write PASS"
+    );
+    drop(pause);
+    Ok(())
 }
 
 #[test]

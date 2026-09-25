@@ -138,6 +138,10 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
         };
     }
 
+    if let Some(plan) = secondary_scale_down::recover_local_acceptance(snapshot, config) {
+        return plan;
+    }
+
     if let Some(cleanup) = &snapshot.status.last_replacement {
         return replacement_cleanup::evaluate(snapshot, cleanup, config);
     }

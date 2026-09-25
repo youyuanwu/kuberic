@@ -7,8 +7,9 @@ use kuberic_protocol::types::{
 use kuberic_runtime_internal::authority::LocalWriteJournal;
 
 #[allow(dead_code)]
-#[path = "../../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
-mod fixture;
+#[path = "../../../kuberic-protocol/tests/support/scale_down_model.rs"]
+mod model;
+use model::fixture;
 
 #[path = "removal_fault_store.rs"]
 mod fault_store;

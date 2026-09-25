@@ -56,6 +56,9 @@ pub enum RuntimeEffectAction {
         session: ProcessSessionId,
     },
     AcceptSecondaryRemovalCommit(Box<SecondaryScaleDownCleanup>),
+    AcceptHistoricalSecondaryRemovalCommit(
+        Box<kuberic_protocol::command::AcceptSecondaryRemovalCommit>,
+    ),
     RetireReplica(Box<RetiredAuthority>),
     FenceRetirement(Box<RetiredAuthority>),
     CompleteRetirement(Box<RetiredAuthority>),

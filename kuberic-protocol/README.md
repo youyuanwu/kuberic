@@ -93,8 +93,8 @@ admission. Conflicting pending work is neither overwritten nor credited.
 Cleanup completion replaces the deletion obligation with one bounded
 `lastSecondaryRemoval` receipt containing only the immutable admission and
 current-only quorum proof (no retirement report). It authorizes retained-member
-convergence and local commit publication only while its exact reduced topology
-is accepted, never resource deletion or retirement. Late members first finish
+convergence while its exact reduced topology is accepted, never resource deletion
+or retirement. Late members first finish
 PC/CC, then current-only, with writes closed. Before another removal supersedes
 this proof, each retained member must have completed current-only evidence in
 the receipt or currently attest completed local acceptance; otherwise
@@ -103,7 +103,12 @@ removal replaces the receipt, not an accumulating history. The optional status
 field preserves restart recovery without re-authorizing cleanup of replacements.
 After a later failover or replacement, that receipt can also validate a returning
 exact accepted member's older, write-closed current-only removal report. This is
-bounded local history only: normal stale-authority correction still runs, and
+bounded local history only. A retained secondary missing local commit acceptance
+first receives the exact `AcceptSecondaryRemovalCommit` with `localRecovery`.
+It must attest the frozen current-only authority and verified boundary; unrelated
+pending work blocks recovery. Only a subsequent report proving local acceptance
+permits normal stale-authority correction. This step preserves cluster status and
+the receipt, requires no old live quorum, and
 historical evidence grants no writes, quorum votes, cleanup, or new transition.
 Endpoint scaffolding and accepted-authority convergence precede new transition
 admission; switchover then precedes reduction, which precedes replacement of an

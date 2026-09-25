@@ -142,6 +142,7 @@ async fn secondary_removal_rpc_replay() {
                         ),
                         target: local.clone(),
                         committed: committed.clone(),
+                        local_recovery: false,
                     }
                     .into(),
                 ))
@@ -318,6 +319,7 @@ async fn secondary_removal_rpc_replay() {
                     ),
                     target: local.clone(),
                     committed: committed.clone(),
+                    local_recovery: false,
                 };
                 let command = proto::execute_command_request::Command::AcceptSecondaryRemovalCommit(
                     Box::new(accept.into()),

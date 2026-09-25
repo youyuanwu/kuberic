@@ -1,6 +1,8 @@
 //! Exact local admission for durable secondary-removal effects.
 
-use kuberic_protocol::command::{EnsureConfiguration, PrepareSecondaryRemoval, RetireReplica};
+use kuberic_protocol::command::{
+    AcceptSecondaryRemovalCommit, EnsureConfiguration, PrepareSecondaryRemoval, RetireReplica,
+};
 use kuberic_protocol::types::{AccessStatus, ReplicaRole, SecondaryRemovalStage};
 use kuberic_protocol::validation::{
     validate_secondary_removal_configuration, validate_secondary_scale_down,
@@ -13,6 +15,38 @@ use crate::{AgentError, Result};
 
 fn reject(message: &str) -> AgentError {
     AgentError::CommandRejected(message.into())
+}
+
+pub(crate) fn admit_commit(
+    command: &AcceptSecondaryRemovalCommit,
+    state: &AgentState,
+) -> Result<()> {
+    kuberic_protocol::validation::validate_accept_secondary_removal_commit(command)
+        .map_err(|e| reject(&e.to_string()))?;
+    let intent = &command.committed.evidence.preparation.intent;
+    if state.identity.local_identity != command.target
+        || state.identity.resource_uid != intent.resource_uid
+        || state.retired_authority.is_some()
+        || state.reconfiguration.is_some()
+        || state.previous_configuration.is_some()
+        || state.current_configuration.as_ref() != Some(&intent.current_configuration)
+        || state.secondary_removal_evidence.as_ref() != Some(&command.committed.evidence)
+        || state.highest_epoch != intent.current_configuration.epoch
+        || state
+            .accepted_secondary_removal
+            .as_ref()
+            .is_some_and(|c| c != &command.committed)
+        || (command.local_recovery
+            && (state.role != ReplicaRole::ActiveSecondary
+                || state.write_status == AccessStatus::Granted
+                || state.prepared_secondary_removal.is_some()
+                || state.prepared_switchover.is_some()))
+    {
+        return Err(reject(
+            "commit certificate differs from completed local reduced authority",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn admit_preparation(

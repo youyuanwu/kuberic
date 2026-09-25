@@ -5,6 +5,9 @@ use kuberic_protocol::types::{
 };
 use kuberic_runtime::application::ClientWrite;
 
+#[path = "removal_history.rs"]
+mod history;
+
 struct Member {
     store: Arc<SqliteStore>,
     runtime: Arc<PodRuntime>,
@@ -377,6 +380,7 @@ async fn late_member_recovery() {
         operation_id: intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, identity),
         target: identity.clone(),
         committed: committed.clone(),
+        local_recovery: false,
     };
     register(&primary, &secondary).await;
     register(&secondary, &primary).await;

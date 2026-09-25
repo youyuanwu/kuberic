@@ -550,7 +550,20 @@ where
                         && a.secondary_removal.as_ref() == Some(&committed.evidence)
                 })
         {
-            self.runtime.restore_accepted_removal(committed).await?;
+            let operation = committed.evidence.preparation.intent.command_operation_id(
+                kuberic_protocol::types::SecondaryRemovalStage::AcceptCommit,
+                &state.identity.local_identity,
+            );
+            let historical = state.removal_effects.get(&operation).and_then(|retained| {
+                match &retained.effect.action {
+                    kuberic_runtime_internal::effects::RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(command)
+                        if command.committed == committed => Some(*command.clone()),
+                    _ => None,
+                }
+            });
+            self.runtime
+                .restore_accepted_removal(committed, historical)
+                .await?;
         }
         if let Some(pending) = state.pending_effect.as_ref()
             && matches!(

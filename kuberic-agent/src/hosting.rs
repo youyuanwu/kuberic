@@ -387,12 +387,16 @@ impl PodRuntime {
     pub(crate) async fn restore_accepted_removal(
         &self,
         committed: kuberic_protocol::types::SecondaryScaleDownCleanup,
+        historical: Option<kuberic_protocol::command::AcceptSecondaryRemovalCommit>,
     ) -> Result<()> {
         self.host
             .managed()?
-            .execute_action(RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(
-                committed,
-            )))
+            .execute_action(match historical {
+                Some(command) => {
+                    RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(Box::new(command))
+                }
+                None => RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed)),
+            })
             .await
     }
 
@@ -1260,6 +1264,7 @@ impl RuntimeHost {
             | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
             | RuntimeEffectAction::ObserveReplicationAck { .. }
             | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
+            | RuntimeEffectAction::AcceptHistoricalSecondaryRemovalCommit(_)
             | RuntimeEffectAction::RetireReplica(_)
             | RuntimeEffectAction::FenceRetirement(_)
             | RuntimeEffectAction::CompleteRetirement(_) => {

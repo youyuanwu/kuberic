@@ -89,6 +89,14 @@ binds the exact immutable commit certificate. A current-only primary may report
 Granted access with its completed availability command after restarting and
 resuming writes. This does not relax pre-commit write closure or alter certificates.
 
+Historical local acceptance is a separate managed effect for an exact retained
+secondary whose installed current-only removal authority covers the frozen verified
+boundary. The agent durably binds its pending/completed effect to the certificate.
+Unlike live commit acceptance, it neither loads witnesses into the quorum tracker
+nor persists a live runtime commit; restart replays only that exact local effect.
+It grants no access or configuration authority, and rejects primary/target misuse,
+conflicting installed authority, mutated receipts and insufficient verified progress.
+
 Exact peer eviction after PC removal cancels retained windows and prevents a
 delayed session from reconnecting the excluded incarnation. Local retirement
 validates and durably records the exact retirement-started authority before

@@ -2804,6 +2804,7 @@ mod tests {
                 ),
                 target: intent.primary.clone(),
                 committed: scale_down_fixture::cleanup(&intent),
+                local_recovery: false,
             },
         ));
         let request = command_request(

@@ -144,6 +144,9 @@ pub struct AcceptSecondaryRemovalCommit {
     pub operation_id: OperationId,
     pub target: ReplicaIdentity,
     pub committed: crate::types::SecondaryScaleDownCleanup,
+    /// Clear a retained secondary's historical local fence without quorum credit.
+    #[serde(default)]
+    pub local_recovery: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

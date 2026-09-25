@@ -111,6 +111,16 @@ keeps a pending commit-acceptance effect replayable while discovery restores
 fresh peer evidence, rather than requiring obsolete-session credit before
 the control plane can start.
 
+After accepted topology advances, an exact `localRecovery` commit replay can
+clear a retained secondary's still-pending historical removal fence. It requires
+the immutable completed certificate, matching installed current-only authority,
+exact resource/incarnation and verified boundary, plus the current dispatch session.
+It cannot run on the primary or excluded target, replace unrelated work, or grant
+access. SQLite retains the exact local effect for pending/applied/completed startup
+replay without creating a live runtime commit or restoring peer-session credit.
+Only after the acceptance report may ordinary newer-authority correction proceed;
+the general pending-removal admission fence remains unchanged.
+
 `ReplicaDiagnostics.retired` is a compact terminal-retirement indicator from
 durable or runtime authority. Unlike role `None` or denied access alone, `true`
 means a retirement tombstone exists. The JSON field is additive; older diagnostic
