@@ -3,6 +3,8 @@ fn main() {
         .build_server(true)
         .build_client(true)
         .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.ensure_configuration")
+        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.prepare_secondary_removal")
+        .boxed(".kuberic.level.v1.ExecuteCommandRequest.command.retire_replica")
         .compile_protos(
             &["proto/kuberic.proto", "proto/replication.proto"],
             &["proto"],

@@ -97,6 +97,12 @@ pub struct AgentReport {
     pub builds: Vec<AgentBuildReport>,
     #[serde(default)]
     pub prepared_switchover: Option<SwitchoverHandoff>,
+    #[serde(default)]
+    pub prepared_secondary_removal: Option<crate::types::SecondaryRemovalPreparation>,
+    #[serde(default)]
+    pub secondary_removal_evidence: Option<crate::types::SecondaryRemovalEvidence>,
+    #[serde(default)]
+    pub retired_replica: Option<crate::types::ReplicaRetirementReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,8 +153,28 @@ impl Default for AgentReport {
             retained_operation_id: None,
             builds: Vec::new(),
             prepared_switchover: None,
+            prepared_secondary_removal: None,
+            secondary_removal_evidence: None,
+            retired_replica: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "state")]
+/// Results of an exact-name lookup, never inferred from a label-selected list.
+pub enum ExactResourceObservation {
+    FrozenUidPresent {
+        resource_version: String,
+    },
+    ReplacementPresent {
+        uid: String,
+        resource_version: String,
+    },
+    NotFound,
+    LookupFailed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

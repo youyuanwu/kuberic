@@ -172,6 +172,9 @@ pub fn normalize_agent_status_report(
                 || !report.retained_operation_id.is_empty()
                 || !report.builds.is_empty()
                 || report.prepared_switchover.is_some()
+                || report.prepared_secondary_removal.is_some()
+                || report.secondary_removal_evidence.is_some()
+                || report.retired_replica.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "uninitialized status contains durable authority".to_string(),
@@ -315,8 +318,9 @@ pub fn normalize_agent_status_report(
                 role,
                 read_status,
                 write_status,
+                report.secondary_removal_evidence.is_some(),
             )?;
-            Ok(AgentObservation::Report(Box::new(AgentReport {
+            let report = AgentReport {
                 protocol_version: report.protocol_version,
                 resource_uid: ResourceUid::new(report.resource_uid),
                 identity,
@@ -346,7 +350,19 @@ pub fn normalize_agent_status_report(
                     .then(|| OperationId::new(report.retained_operation_id)),
                 builds,
                 prepared_switchover,
-            })))
+                prepared_secondary_removal: report
+                    .prepared_secondary_removal
+                    .map(TryInto::try_into)
+                    .transpose()?,
+                secondary_removal_evidence: report
+                    .secondary_removal_evidence
+                    .map(TryInto::try_into)
+                    .transpose()?,
+                retired_replica: report.retired_replica.map(TryInto::try_into).transpose()?,
+            };
+            kuberic_protocol::validation::validate_secondary_removal_report(&report)
+                .map_err(|error| WireError::InvalidAuthority(error.to_string()))?;
+            Ok(AgentObservation::Report(Box::new(report)))
         }
         proto::AgentStorageState::Unsafe => {
             if report.storage_error.is_empty() {
@@ -362,6 +378,9 @@ pub fn normalize_agent_status_report(
                 || !report.builds.is_empty()
                 || report.deactivation_epoch.is_some()
                 || report.prepared_switchover.is_some()
+                || report.prepared_secondary_removal.is_some()
+                || report.secondary_removal_evidence.is_some()
+                || report.retired_replica.is_some()
             {
                 return Err(WireError::InvalidAuthority(
                     "unsafe storage report contains untrusted authority".to_string(),
@@ -391,6 +410,21 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
         .as_ref()
         .ok_or(WireError::MissingField("execute.command"))?;
     match command {
+        proto::execute_command_request::Command::PrepareSecondaryRemoval(command) => {
+            let command: kuberic_protocol::command::PrepareSecondaryRemoval =
+                (**command).clone().try_into()?;
+            validate_removal_envelope(
+                request,
+                &command.intent.resource_uid,
+                &command.intent.primary,
+            )
+        }
+        proto::execute_command_request::Command::RetireReplica(command) => {
+            let command: kuberic_protocol::command::RetireReplica =
+                (**command).clone().try_into()?;
+            let intent = &command.committed.evidence.preparation.intent;
+            validate_removal_envelope(request, &intent.resource_uid, &intent.target)
+        }
         proto::execute_command_request::Command::InitializeAgentStore(command) => {
             for (field, value) in [
                 (
@@ -625,6 +659,26 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                             && command.retire_switchover_preparation_ids
                                 == [handoff.preparation().into()]
                     });
+            if transition_kind == TransitionKind::SecondaryScaleDown {
+                let normalized = crate::scale_down::configuration_from_proto((**command).clone())?;
+                let intent = &normalized
+                    .secondary_removal_evidence
+                    .as_ref()
+                    .expect("validated evidence")
+                    .preparation
+                    .intent;
+                return validate_removal_envelope(request, &intent.resource_uid, &target);
+            }
+            if command.secondary_removal_evidence.is_some()
+                || command
+                    .previous_policy
+                    .as_ref()
+                    .is_some_and(|previous| previous != policy)
+            {
+                return Err(WireError::InvalidAuthority(
+                    "unexpected removal evidence or previous policy".into(),
+                ));
+            }
             if command.current_only {
                 if previous.is_some() || transition_kind == TransitionKind::Bootstrap {
                     return Err(WireError::InvalidAuthority(
@@ -878,6 +932,12 @@ pub fn normalize_execute_request(
         .command
         .ok_or(WireError::MissingField("execute.command"))?
     {
+        proto::execute_command_request::Command::PrepareSecondaryRemoval(command) => {
+            ProtocolCommand::PrepareSecondaryRemoval(Box::new((*command).try_into()?))
+        }
+        proto::execute_command_request::Command::RetireReplica(command) => {
+            ProtocolCommand::RetireReplica(Box::new((*command).try_into()?))
+        }
         proto::execute_command_request::Command::InitializeAgentStore(command) => {
             ProtocolCommand::InitializeAgentStore(Box::new(InitializeAgentStore {
                 initialization_id: InitializationId::new(command.initialization_id),
@@ -906,79 +966,89 @@ pub fn normalize_execute_request(
         }
         proto::execute_command_request::Command::EnsureConfiguration(command) => {
             let command = *command;
-            let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
-                .map_err(|_| WireError::InvalidEnum {
-                    field: "ensure.transition_kind",
-                    value: command.transition_kind,
-                })
-                .and_then(transition_kind_from_proto)?;
-            ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
-                operation_id: OperationId::new(command.operation_id),
-                previous_configuration: command
-                    .previous_configuration
-                    .map(ConfigurationDescriptor::try_from)
-                    .transpose()?,
-                current_configuration: command
-                    .current_configuration
-                    .ok_or(WireError::MissingField("ensure.current_configuration"))?
-                    .try_into()?,
-                previous_epoch: command.previous_epoch.map(Into::into),
-                current_epoch: command
-                    .current_epoch
-                    .ok_or(WireError::MissingField("ensure.current_epoch"))?
-                    .into(),
-                effective_policy: policy_from_proto(
-                    command
-                        .effective_policy
-                        .ok_or(WireError::MissingField("ensure.effective_policy"))?,
-                )?,
-                local_replica_id: ReplicaId::new(command.local_replica_id),
-                expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
-                expected_agent_generation: AgentGeneration::new(command.expected_agent_generation),
-                transition_kind,
-                failover_safe_lsn: command.failover_safe_lsn,
-                primary_write_status: if command.primary_write_status
-                    == proto::AccessStatus::Unknown as i32
-                {
-                    if command.grant_write {
-                        AccessStatus::Granted
-                    } else {
-                        AccessStatus::ReconfigurationPending
-                    }
-                } else {
-                    proto::AccessStatus::try_from(command.primary_write_status)
-                        .map_err(|_| WireError::InvalidEnum {
-                            field: "ensure.primary_write_status",
-                            value: command.primary_write_status,
-                        })
-                        .and_then(access_status_from_proto)?
-                },
-                current_only: command.current_only,
-                retire_build_ids: if command.retire_build_ids.is_empty() {
-                    (!command.retire_build_id.is_empty())
-                        .then(|| OperationId::new(command.retire_build_id))
-                        .into_iter()
-                        .collect()
-                } else {
-                    command
-                        .retire_build_ids
-                        .into_iter()
-                        .map(OperationId::new)
-                        .collect()
-                },
-                switchover_handoff: command
-                    .switchover_handoff
-                    .map(switchover_handoff_from_proto)
-                    .transpose()?,
-                retire_switchover_preparation_ids: command
-                    .retire_switchover_preparation_ids
-                    .into_iter()
-                    .map(|id| kuberic_protocol::types::SwitchoverPreparationId {
-                        operation_id: OperationId::new(id.operation_id),
-                        generation: id.generation,
+            if command.transition_kind == proto::TransitionKind::SecondaryScaleDown as i32 {
+                ProtocolCommand::EnsureConfiguration(Box::new(
+                    crate::scale_down::configuration_from_proto(command)?,
+                ))
+            } else {
+                let transition_kind = proto::TransitionKind::try_from(command.transition_kind)
+                    .map_err(|_| WireError::InvalidEnum {
+                        field: "ensure.transition_kind",
+                        value: command.transition_kind,
                     })
-                    .collect(),
-            }))
+                    .and_then(transition_kind_from_proto)?;
+                ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
+                    operation_id: OperationId::new(command.operation_id),
+                    previous_configuration: command
+                        .previous_configuration
+                        .map(ConfigurationDescriptor::try_from)
+                        .transpose()?,
+                    current_configuration: command
+                        .current_configuration
+                        .ok_or(WireError::MissingField("ensure.current_configuration"))?
+                        .try_into()?,
+                    previous_epoch: command.previous_epoch.map(Into::into),
+                    current_epoch: command
+                        .current_epoch
+                        .ok_or(WireError::MissingField("ensure.current_epoch"))?
+                        .into(),
+                    effective_policy: policy_from_proto(
+                        command
+                            .effective_policy
+                            .ok_or(WireError::MissingField("ensure.effective_policy"))?,
+                    )?,
+                    previous_policy: command.previous_policy.map(policy_from_proto).transpose()?,
+                    secondary_removal_evidence: None,
+                    local_replica_id: ReplicaId::new(command.local_replica_id),
+                    expected_instance_id: ReplicaInstanceId::new(command.expected_instance_id),
+                    expected_agent_generation: AgentGeneration::new(
+                        command.expected_agent_generation,
+                    ),
+                    transition_kind,
+                    failover_safe_lsn: command.failover_safe_lsn,
+                    primary_write_status: if command.primary_write_status
+                        == proto::AccessStatus::Unknown as i32
+                    {
+                        if command.grant_write {
+                            AccessStatus::Granted
+                        } else {
+                            AccessStatus::ReconfigurationPending
+                        }
+                    } else {
+                        proto::AccessStatus::try_from(command.primary_write_status)
+                            .map_err(|_| WireError::InvalidEnum {
+                                field: "ensure.primary_write_status",
+                                value: command.primary_write_status,
+                            })
+                            .and_then(access_status_from_proto)?
+                    },
+                    current_only: command.current_only,
+                    retire_build_ids: if command.retire_build_ids.is_empty() {
+                        (!command.retire_build_id.is_empty())
+                            .then(|| OperationId::new(command.retire_build_id))
+                            .into_iter()
+                            .collect()
+                    } else {
+                        command
+                            .retire_build_ids
+                            .into_iter()
+                            .map(OperationId::new)
+                            .collect()
+                    },
+                    switchover_handoff: command
+                        .switchover_handoff
+                        .map(switchover_handoff_from_proto)
+                        .transpose()?,
+                    retire_switchover_preparation_ids: command
+                        .retire_switchover_preparation_ids
+                        .into_iter()
+                        .map(|id| kuberic_protocol::types::SwitchoverPreparationId {
+                            operation_id: OperationId::new(id.operation_id),
+                            generation: id.generation,
+                        })
+                        .collect(),
+                }))
+            }
         }
         proto::execute_command_request::Command::PrepareSwitchover(command) => {
             ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
@@ -1513,7 +1583,7 @@ fn provisioning_from_proto(
     Ok(intent)
 }
 
-fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
+pub(crate) fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
     match role {
         ReplicaRole::Primary => proto::ReplicaRole::Primary,
         ReplicaRole::ActiveSecondary => proto::ReplicaRole::ActiveSecondary,
@@ -1522,7 +1592,7 @@ fn role_to_proto(role: ReplicaRole) -> proto::ReplicaRole {
     }
 }
 
-fn role_from_proto(role: proto::ReplicaRole) -> Result<ReplicaRole, WireError> {
+pub(crate) fn role_from_proto(role: proto::ReplicaRole) -> Result<ReplicaRole, WireError> {
     match role {
         proto::ReplicaRole::Unknown => Err(WireError::InvalidEnum {
             field: "configuration.member.role",
@@ -1545,10 +1615,13 @@ fn transition_kind_from_proto(kind: proto::TransitionKind) -> Result<TransitionK
         proto::TransitionKind::Replacement => Ok(TransitionKind::Replacement),
         proto::TransitionKind::Failover => Ok(TransitionKind::Failover),
         proto::TransitionKind::PlannedSwitchover => Ok(TransitionKind::PlannedSwitchover),
+        proto::TransitionKind::SecondaryScaleDown => Ok(TransitionKind::SecondaryScaleDown),
     }
 }
 
-fn access_status_from_proto(status: proto::AccessStatus) -> Result<AccessStatus, WireError> {
+pub(crate) fn access_status_from_proto(
+    status: proto::AccessStatus,
+) -> Result<AccessStatus, WireError> {
     match status {
         proto::AccessStatus::Unknown => Err(WireError::InvalidEnum {
             field: "agent_status.write_status",
@@ -1568,6 +1641,7 @@ fn validate_report_configurations(
     role: ReplicaRole,
     read_status: AccessStatus,
     write_status: AccessStatus,
+    secondary_removal: bool,
 ) -> Result<(), WireError> {
     if previous.is_some() && current.is_none() {
         return Err(WireError::InvalidAuthority(
@@ -1594,8 +1668,8 @@ fn validate_report_configurations(
             .collect::<BTreeSet<_>>();
         if previous.epoch.data_loss_number != current.epoch.data_loss_number
             || previous.epoch.configuration_number >= current.epoch.configuration_number
-            || previous_ids != current_ids
-            || previous.write_quorum != current.write_quorum
+            || (!secondary_removal
+                && (previous_ids != current_ids || previous.write_quorum != current.write_quorum))
         {
             return Err(WireError::InvalidAuthority(
                 "report PC/CC relationship is invalid".to_string(),
@@ -1635,7 +1709,9 @@ fn validate_policy(policy: &proto::EffectivePolicy) -> Result<(), WireError> {
     Ok(())
 }
 
-fn policy_from_proto(policy: proto::EffectivePolicy) -> Result<EffectivePolicy, WireError> {
+pub(crate) fn policy_from_proto(
+    policy: proto::EffectivePolicy,
+) -> Result<EffectivePolicy, WireError> {
     validate_policy(&policy)?;
     Ok(EffectivePolicy {
         replica_set_size: policy.replica_set_size,
@@ -1643,4 +1719,22 @@ fn policy_from_proto(policy: proto::EffectivePolicy) -> Result<EffectivePolicy, 
         read_quorum: policy.read_quorum,
         failover_delay_seconds: policy.failover_delay_seconds,
     })
+}
+
+fn validate_removal_envelope(
+    request: &proto::ExecuteCommandRequest,
+    resource_uid: &ResourceUid,
+    target: &ReplicaIdentity,
+) -> Result<(), WireError> {
+    let envelope_target: ReplicaIdentity = request
+        .target
+        .clone()
+        .ok_or(WireError::MissingField("execute.target"))?
+        .try_into()?;
+    if resource_uid.as_str() != request.resource_uid || target != &envelope_target {
+        return Err(WireError::InvalidAuthority(
+            "removal authority differs from envelope".into(),
+        ));
+    }
+    Ok(())
 }

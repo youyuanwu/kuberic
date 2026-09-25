@@ -177,6 +177,8 @@ impl InitializationService {
             ));
         }
         let transition = TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &command.resource_uid,
                 TransitionKind::Bootstrap,
@@ -601,6 +603,11 @@ where
             ));
         }
         match command.command {
+            ProtocolCommand::PrepareSecondaryRemoval(_) | ProtocolCommand::RetireReplica(_) => {
+                return Err(Status::failed_precondition(
+                    "secondary scale-down execution is not enabled",
+                ));
+            }
             ProtocolCommand::InitializeAgentStore(initialization) => {
                 if initialization.initialization_id != state.identity.initialization_id
                     || initialization.resource_uid != state.identity.resource_uid

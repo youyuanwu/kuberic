@@ -76,6 +76,8 @@ fn bootstrap_fixture() -> (
         instance_id: command.expected_instance_id.clone(),
     };
     let transition = TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: TransitionId::new("bootstrap-1"),
         kind: TransitionKind::Bootstrap,
         spec_generation: 1,
@@ -300,6 +302,8 @@ async fn current_only_completion_retires_exact_switchover_preparation() {
         handoff_lsn: 7,
     };
     let command = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("current-only-1"),
         previous_configuration: None,
         current_configuration: current.clone(),

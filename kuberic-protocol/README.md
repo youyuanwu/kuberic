@@ -6,6 +6,8 @@ The crate defines:
 
 - replica identity, epoch, PC/CC, topology, provisioning, and transition types;
 - explicit switchover requests, frozen handoffs, and terminal receipts;
+- secondary scale-down intent, dual policies, preparation/quorum evidence,
+  terminal local-retirement reports, and exact post-commit cleanup contracts;
 - normalized Kubernetes and replica-agent observations;
 - fenced protocol commands and reconciliation plans;
 - validation for quorum, incarnation, epoch, and transition invariants;
@@ -40,6 +42,21 @@ The supported evaluator contract is fixed-cardinality bootstrap,
 same-cardinality replacement, ordinary failover, planned switchover, and
 non-destructive quorum loss/recovery. Scaling, timed replica dropping,
 destructive data-loss recovery, and mixed-version negotiation remain fail-closed.
+
+Protocol 6 defines, but does not yet execute, secondary scale-down. Its typed
+intent removes exactly the highest logical-ID committed secondary, preserves
+the exact primary and retained members, and validates previous/reduced majority
+policies independently (including 2→1). Preparation freezes a durable
+write-closed primary boundary; admission carries retained previous-read-quorum
+evidence, while current-only completion and cleanup require reduced-write-quorum
+evidence including the unchanged primary. The removed member supplies no reduced
+credit. Cleanup freezes Pod, PVC, and endpoint names and UIDs, or explicit
+authoritative exact-name absence, separately from accepted topology.
+
+The evaluator rejects these new active contracts without emitting removal
+commands. Agent admission and runtime execution also reject them until their
+execution phases are implemented. Existing status JSON defaults the new optional
+fields to absent; absence never supplies scale-down authority.
 
 Switchover requires a nonempty request ID and a committed logical secondary
 ID. Identical active or latest-receipted requests are idempotent; cancellation,

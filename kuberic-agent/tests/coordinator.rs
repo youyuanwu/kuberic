@@ -202,6 +202,8 @@ fn command(operation_id: &str, epoch: Epoch) -> EnsureConfiguration {
         policy.write_quorum,
     );
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new(operation_id),
         previous_configuration: None,
         current_configuration,
@@ -305,6 +307,8 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
     state.current_configuration = Some(previous.clone());
     state.role = ReplicaRole::Primary;
     let command = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("install-1"),
         previous_configuration: Some(previous.clone()),
         current_configuration: current.clone(),
@@ -579,6 +583,8 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
             None
         };
         let restore = EnsureConfiguration {
+            previous_policy: None,
+            secondary_removal_evidence: None,
             operation_id: OperationId::new("same-authority-restore"),
             previous_configuration: None,
             current_configuration: next.current_configuration.clone(),
@@ -770,6 +776,8 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
             });
         }
         let command = EnsureConfiguration {
+            previous_policy: None,
+            secondary_removal_evidence: None,
             operation_id: OperationId::new(format!("current-only-{}", local.replica_id)),
             previous_configuration: None,
             current_configuration: current.clone(),
@@ -1213,6 +1221,8 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
     let coordinator = Coordinator::new(store.clone(), runtime.clone());
     coordinator
         .ensure_configuration(EnsureConfiguration {
+            previous_policy: None,
+            secondary_removal_evidence: None,
             operation_id: OperationId::new("failover-no-quorum"),
             previous_configuration: Some(previous.clone()),
             current_configuration: current.clone(),
@@ -1508,6 +1518,8 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
         });
     }
     let command = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("replacement-current-only"),
         previous_configuration: None,
         current_configuration: current.clone(),
@@ -1591,6 +1603,8 @@ fn same_epoch_new_operation_cannot_replace_durable_membership() {
     state.highest_epoch = existing.epoch;
     state.current_configuration = Some(existing);
     let command = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("conflicting-same-epoch"),
         previous_configuration: None,
         current_configuration: conflicting,

@@ -41,6 +41,10 @@ pub struct EnsureConfiguration {
     pub previous_epoch: Option<Epoch>,
     pub current_epoch: Epoch,
     pub effective_policy: EffectivePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy: Option<EffectivePolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_removal_evidence: Option<crate::types::SecondaryRemovalEvidence>,
     pub local_replica_id: ReplicaId,
     pub expected_instance_id: ReplicaInstanceId,
     pub expected_agent_generation: AgentGeneration,
@@ -114,6 +118,26 @@ pub struct EnsureReplicaBuild {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareSecondaryRemoval {
+    pub operation_id: OperationId,
+    pub local_replica_id: ReplicaId,
+    pub expected_instance_id: ReplicaInstanceId,
+    pub expected_agent_generation: AgentGeneration,
+    pub intent: crate::types::SecondaryScaleDownIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetireReplica {
+    pub operation_id: OperationId,
+    pub local_replica_id: ReplicaId,
+    pub expected_instance_id: ReplicaInstanceId,
+    pub expected_agent_generation: AgentGeneration,
+    pub committed: crate::types::SecondaryScaleDownCleanup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 /// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
@@ -121,6 +145,8 @@ pub enum ProtocolCommand {
     PrepareSwitchover(Box<PrepareSwitchover>),
     EnsureConfiguration(Box<EnsureConfiguration>),
     EnsureReplicaBuild(Box<EnsureReplicaBuild>),
+    PrepareSecondaryRemoval(Box<PrepareSecondaryRemoval>),
+    RetireReplica(Box<RetireReplica>),
 }
 
 impl ProtocolCommand {
@@ -128,6 +154,8 @@ impl ProtocolCommand {
         match self {
             Self::InitializeAgentStore(_) => EffectClass::ConvergentEnsure,
             Self::PrepareSwitchover(_)
+            | Self::PrepareSecondaryRemoval(_)
+            | Self::RetireReplica(_)
             | Self::EnsureConfiguration(_)
             | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
         }

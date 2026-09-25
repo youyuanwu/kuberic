@@ -285,6 +285,8 @@ fn switchover_recovery_fixture(boundary: &str) -> (AgentState, EnsureConfigurati
     state.prepared_switchover =
         (local == handoff.source && !boundary.contains("unobserved")).then(|| handoff.clone());
     let command = EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new(format!("recover-{boundary}")),
         previous_configuration: (!current_only && !restoring).then(|| previous.clone()),
         previous_epoch: (!current_only && !restoring).then_some(previous.epoch),
@@ -583,6 +585,8 @@ fn configuration_command() -> EnsureConfiguration {
         effective_policy.write_quorum,
     );
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("configuration-1"),
         previous_configuration: None,
         current_configuration,
@@ -622,6 +626,8 @@ fn real_configuration_command() -> EnsureConfiguration {
         policy.write_quorum,
     );
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: OperationId::new("real-runtime-configuration"),
         previous_configuration: None,
         current_configuration,
@@ -1544,6 +1550,8 @@ fn local_write_recovery_writer_process() {
                     None
                 };
                 let restore = EnsureConfiguration {
+                    previous_policy: None,
+                    secondary_removal_evidence: None,
                     operation_id: OperationId::new("reused-restoration"),
                     previous_configuration: None,
                     previous_epoch: None,
@@ -1599,6 +1607,8 @@ fn local_write_recovery_writer_process() {
             .unwrap();
         assert!(pending.committed().await.is_err());
         let restore = EnsureConfiguration {
+            previous_policy: None,
+            secondary_removal_evidence: None,
             operation_id: OperationId::new("recover-source"),
             previous_configuration: None,
             previous_epoch: None,

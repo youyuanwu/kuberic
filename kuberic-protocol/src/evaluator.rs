@@ -40,6 +40,12 @@ impl Default for EvaluationConfig {
 
 /// Validates one snapshot and returns the next safe reconciliation outcome.
 pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
+    if snapshot.status.secondary_scale_down_cleanup.is_some()
+        || snapshot.status.transition.as_ref().is_some_and(|transition| transition.kind == TransitionKind::SecondaryScaleDown)
+        || snapshot.replicas.values().any(|replica| matches!(&replica.agent, AgentObservation::Report(report) if report.prepared_secondary_removal.is_some() || report.secondary_removal_evidence.is_some() || report.retired_replica.is_some()))
+    {
+        return unsafe_plan(snapshot.status.clone(), UnsafeReason::InvalidAcceptedAuthority("Secondary scale-down execution is not enabled".into()), config);
+    }
     let switchover = snapshot
         .status
         .transition
@@ -741,6 +747,8 @@ fn begin_switchover(
         "Frozen the exact source, target, and requested authority before revoking routing",
     );
     status.transition = Some(TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: derive_transition_id(
             &snapshot.resource_uid,
             TransitionKind::PlannedSwitchover,
@@ -1708,6 +1716,8 @@ fn switchover_configuration_command(
         .as_ref()
         .unwrap();
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id: switchover_operation_id(transition, member, current_only),
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: transition.current_configuration.clone(),
@@ -1871,6 +1881,8 @@ fn maybe_begin_stable_failover(
         ),
     );
     status.transition = Some(TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: derive_transition_id(
             &snapshot.resource_uid,
             TransitionKind::Failover,
@@ -2004,6 +2016,8 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
     let current_configuration =
         ConfigurationDescriptor::new(Epoch::new(0, 1), primary_id, members, policy.write_quorum);
     let transition = TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: derive_transition_id(
             &snapshot.resource_uid,
             TransitionKind::Bootstrap,
@@ -2235,6 +2249,8 @@ fn evaluate_transition(
         );
         let current = configuration_with_primary(basis, &candidate.identity, next_epoch);
         status.transition = Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Failover,
@@ -2413,6 +2429,8 @@ fn evaluate_transition(
                     ),
                 );
                 status.transition = Some(TransitionIntent {
+                    secondary_scale_down: None,
+                    secondary_removal_evidence: None,
                     transition_id: derive_transition_id(
                         &snapshot.resource_uid,
                         TransitionKind::Failover,
@@ -2730,6 +2748,8 @@ fn evaluate_transition(
         );
         let mut superseded = snapshot.status.clone();
         superseded.transition = Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Bootstrap,
@@ -3011,6 +3031,8 @@ fn evaluate_provisioning(
             let mut transition_status = snapshot.status.clone();
             transition_status.provisioning = None;
             transition_status.transition = Some(TransitionIntent {
+                secondary_scale_down: None,
+                secondary_removal_evidence: None,
                 transition_id: derive_transition_id(
                     &snapshot.resource_uid,
                     TransitionKind::Replacement,
@@ -3652,6 +3674,8 @@ fn failover_configuration_command(
     retire_build_ids: Vec<OperationId>,
 ) -> EnsureConfiguration {
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id,
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: current.clone(),
@@ -3703,6 +3727,8 @@ fn replacement_configuration_command(
     retire_build_id: Option<OperationId>,
 ) -> EnsureConfiguration {
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id,
         previous_configuration: (!current_only).then(|| previous.clone()),
         current_configuration: current.clone(),
@@ -3816,6 +3842,8 @@ fn ensure_configuration_command(
     current_only: bool,
 ) -> EnsureConfiguration {
     EnsureConfiguration {
+        previous_policy: None,
+        secondary_removal_evidence: None,
         operation_id,
         previous_configuration: None,
         current_configuration: configuration.clone(),

@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+#[allow(dead_code)]
+#[path = "support/secondary_scale_down.rs"]
+mod scale_down_fixture;
+
 use kuberic_protocol::command::{KubernetesChange, ProtocolCommand, SafetyChange};
 use kuberic_protocol::evaluator::{EvaluationConfig, evaluate};
 use kuberic_protocol::observation::{
@@ -186,6 +190,474 @@ fn configuration_id_is_canonical_across_member_order() {
 
     assert_eq!(first.configuration_id, second.configuration_id);
     assert_eq!(first.members, second.members);
+}
+
+#[test]
+fn secondary_scale_down_validates_independent_majorities_and_minimum_evidence() {
+    use kuberic_protocol::validation::*;
+    for (size, old_write, old_read, new_write, new_read) in [
+        (2, 2, 1, 1, 1),
+        (3, 2, 2, 2, 1),
+        (4, 3, 2, 2, 2),
+        (5, 3, 3, 3, 2),
+    ] {
+        let intent = scale_down_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
+        assert_eq!(
+            (
+                intent.previous_policy.write_quorum,
+                intent.previous_policy.read_quorum
+            ),
+            (old_write, old_read)
+        );
+        assert_eq!(
+            (
+                intent.current_policy.write_quorum,
+                intent.current_policy.read_quorum
+            ),
+            (new_write, new_read)
+        );
+        validate_secondary_scale_down(&intent).unwrap();
+        let mut evidence = scale_down_fixture::evidence(&intent);
+        evidence.previous_read_quorum.truncate(old_read as usize);
+        evidence.reduced_write_quorum.truncate(new_write as usize);
+        validate_secondary_removal_evidence(&evidence, true).unwrap();
+        for current_only in [false, true] {
+            validate_secondary_removal_configuration(&scale_down_fixture::configuration_command(
+                &intent,
+                current_only,
+            ))
+            .unwrap();
+        }
+        let mut missing_old = evidence.clone();
+        missing_old.previous_read_quorum.pop();
+        assert!(validate_secondary_removal_evidence(&missing_old, false).is_err());
+        evidence.reduced_write_quorum.pop();
+        assert!(validate_secondary_removal_evidence(&evidence, true).is_err());
+    }
+}
+
+#[test]
+fn secondary_scale_down_preserves_holes_and_high_id_primary() {
+    let intent = scale_down_fixture::intent(&[2, 8, 19, 40], 40);
+    kuberic_protocol::validation::validate_secondary_scale_down(&intent).unwrap();
+    assert_eq!(intent.target.replica_id, ReplicaId::new(19));
+    assert_eq!(intent.current_configuration.primary_id, ReplicaId::new(40));
+    assert_eq!(
+        intent
+            .current_configuration
+            .members
+            .iter()
+            .map(|member| member.identity.replica_id.value())
+            .collect::<Vec<_>>(),
+        [2, 8, 40]
+    );
+}
+
+#[test]
+fn secondary_scale_down_rejects_arbitrary_authority_changes() {
+    use kuberic_protocol::types::SecondaryScaleDownIntent;
+    use kuberic_protocol::validation::validate_secondary_scale_down;
+    let mutations: &[(&str, fn(&mut SecondaryScaleDownIntent))] = &[
+        ("primary target", |i| i.target = i.primary.clone()),
+        ("non-highest target", |i| {
+            i.target = i.previous_configuration.members[3].identity.clone();
+            i.current_configuration.members = i
+                .previous_configuration
+                .members
+                .iter()
+                .filter(|m| m.identity != i.target)
+                .cloned()
+                .collect();
+        }),
+        ("batch removal", |i| {
+            i.current_configuration.members.pop();
+            i.current_policy = EffectivePolicy::fixed(3, 30).unwrap();
+        }),
+        ("retained incarnation", |i| {
+            i.current_configuration.members[1].identity.instance_id =
+                ReplicaInstanceId::new("replacement")
+        }),
+        ("retained generation", |i| {
+            i.current_configuration.members[1].identity.agent_generation =
+                AgentGeneration::new("replacement")
+        }),
+        ("primary changed", |i| {
+            i.current_configuration.primary_id = ReplicaId::new(2);
+            i.current_configuration.members[0].role = ReplicaRole::ActiveSecondary;
+            i.current_configuration.members[1].role = ReplicaRole::Primary;
+        }),
+        ("data loss", |i| {
+            i.current_configuration.epoch.data_loss_number += 1
+        }),
+        ("same epoch", |i| {
+            i.current_configuration.epoch = i.previous_configuration.epoch
+        }),
+        ("delay", |i| i.current_policy.failover_delay_seconds += 1),
+        ("old read quorum", |i| i.previous_policy.read_quorum -= 1),
+        ("old write quorum", |i| i.previous_policy.write_quorum -= 1),
+        ("new write quorum", |i| i.current_policy.write_quorum -= 1),
+        ("new read quorum", |i| i.current_policy.read_quorum += 1),
+        ("zero desired", |i| i.desired_replicas = 0),
+        ("no reduction requested", |i| i.desired_replicas = 5),
+        ("zero generation", |i| i.spec_generation = 0),
+        ("missing resource", |i| {
+            i.resource_uid = ResourceUid::default()
+        }),
+        ("missing identity", |i| {
+            i.previous_configuration.members[1]
+                .identity
+                .agent_generation = AgentGeneration::default()
+        }),
+        ("idle target", |i| {
+            i.previous_configuration.members[4].role = ReplicaRole::IdleSecondary
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut intent = scale_down_fixture::intent(&[1, 2, 3, 4, 5], 1);
+        mutate(&mut intent);
+        intent.previous_configuration.configuration_id =
+            intent.previous_configuration.expected_id();
+        intent.current_configuration.configuration_id = intent.current_configuration.expected_id();
+        intent.operation_id = intent.expected_operation_id();
+        assert!(validate_secondary_scale_down(&intent).is_err(), "{name}");
+    }
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    for kind in [
+        TransitionKind::Bootstrap,
+        TransitionKind::Replacement,
+        TransitionKind::Failover,
+        TransitionKind::PlannedSwitchover,
+        TransitionKind::SecondaryScaleDown,
+    ] {
+        assert!(
+            validate_transition_relationship(
+                kind,
+                Some(&intent.previous_configuration),
+                &intent.current_configuration,
+                &intent.current_policy
+            )
+            .is_err(),
+            "{kind:?} must not bypass typed dual-policy authority"
+        );
+    }
+}
+
+#[test]
+fn secondary_scale_down_ids_bind_request_authority_target_and_command_stage() {
+    use kuberic_protocol::types::SecondaryRemovalStage::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    assert_eq!(intent.operation_id, intent.expected_operation_id());
+    let mut reversed = intent.clone();
+    reversed.previous_configuration.members.reverse();
+    assert_eq!(
+        intent.expected_operation_id(),
+        reversed.expected_operation_id()
+    );
+    for change in 0..7 {
+        let mut other = intent.clone();
+        match change {
+            0 => other.resource_uid = ResourceUid::new("other"),
+            1 => other.spec_generation += 1,
+            2 => other.desired_replicas += 1,
+            3 => {
+                other.previous_configuration.configuration_id =
+                    kuberic_protocol::types::ConfigurationId::new("other")
+            }
+            4 => {
+                other.current_configuration.configuration_id =
+                    kuberic_protocol::types::ConfigurationId::new("other")
+            }
+            5 => other.target.instance_id = ReplicaInstanceId::new("other"),
+            _ => other.target.agent_generation = AgentGeneration::new("other"),
+        }
+        assert_ne!(
+            intent.expected_operation_id(),
+            other.expected_operation_id()
+        );
+    }
+    let ids = [Prepare, PreviousCurrent, CurrentOnly, Retire]
+        .map(|stage| intent.command_operation_id(stage, &intent.primary));
+    assert_eq!(
+        ids.into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert_ne!(
+        intent.command_operation_id(CurrentOnly, &intent.primary),
+        intent.command_operation_id(CurrentOnly, &intent.target)
+    );
+}
+
+#[test]
+fn secondary_removal_evidence_rejects_stale_unbound_or_excluded_credit() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3, 4, 5], 1);
+    for mutation in 0..13 {
+        let mut evidence = scale_down_fixture::evidence(&intent);
+        match mutation {
+            0 => evidence.previous_read_quorum[0].identity = intent.target.clone(),
+            1 => evidence.previous_read_quorum[1] = evidence.previous_read_quorum[0].clone(),
+            2 => evidence.previous_read_quorum[0].epoch.configuration_number -= 1,
+            3 => evidence.previous_read_quorum[0].process_session_id = ProcessSessionId::default(),
+            4 => evidence.previous_read_quorum[0].report_sequence = 0,
+            5 => evidence.reduced_write_quorum[0].verified_replication_lsn = 9,
+            6 => {
+                evidence.reduced_write_quorum.remove(0);
+            }
+            7 => {
+                evidence.reduced_write_quorum[0].pending_operation_id =
+                    Some(OperationId::new("pending"))
+            }
+            8 => evidence.reduced_write_quorum[0].retained_operation_id = None,
+            9 => evidence.reduced_write_quorum[0].write_status = AccessStatus::Granted,
+            10 => evidence.preparation.operation_id = OperationId::new("wrong"),
+            11 => evidence.reduced_write_quorum[0].report_sequence = 2,
+            _ => evidence.preparation.boundary_lsn = -1,
+        }
+        assert!(
+            validate_secondary_removal_evidence(&evidence, true).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    let mut command = scale_down_fixture::configuration_command(&intent, false);
+    command.previous_policy = None;
+    assert!(validate_secondary_removal_configuration(&command).is_err());
+    command.previous_policy = Some(intent.previous_policy.clone());
+    command.primary_write_status = AccessStatus::Granted;
+    assert!(validate_secondary_removal_configuration(&command).is_err());
+}
+
+#[test]
+fn secondary_scale_down_status_separates_accepted_policy_intent_and_cleanup() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2], 1);
+    let mut snapshot = empty_snapshot(1);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(intent.previous_policy.clone()),
+        topology: Some(AcceptedTopology {
+            configuration: intent.previous_configuration.clone(),
+        }),
+        transition: Some(scale_down_fixture::transition(&intent)),
+        ..Default::default()
+    };
+    validate_snapshot(&snapshot).unwrap();
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+    snapshot.status.effective_policy = Some(intent.current_policy.clone());
+    assert!(validate_status(&snapshot.status).is_err());
+    snapshot.status.topology = Some(AcceptedTopology {
+        configuration: intent.current_configuration.clone(),
+    });
+    snapshot.status.secondary_scale_down_cleanup = Some(scale_down_fixture::cleanup(&intent));
+    assert!(
+        validate_status(&snapshot.status).is_err(),
+        "cleanup cannot overlap active transition"
+    );
+    snapshot.status.transition = None;
+    validate_snapshot(&snapshot).unwrap();
+    assert!(matches!(
+        evaluate(&snapshot, &EvaluationConfig::default()),
+        Plan::Unsafe { .. }
+    ));
+    let encoded = serde_json::to_string(&snapshot.status).unwrap();
+    assert_eq!(
+        serde_json::from_str::<AcceptedStatus>(&encoded).unwrap(),
+        snapshot.status
+    );
+    snapshot.resource_uid = ResourceUid::new("replacement-resource");
+    assert!(validate_snapshot(&snapshot).is_err());
+}
+
+#[test]
+fn secondary_retirement_and_cleanup_reject_malformed_or_unbound_identity() {
+    use kuberic_protocol::types::*;
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    let mut cleanup = scale_down_fixture::cleanup(&intent);
+    cleanup.retirement = Some(scale_down_fixture::retirement(&intent));
+    validate_secondary_scale_down_cleanup(&cleanup).unwrap();
+    for mutation in 0..7 {
+        let mut invalid = cleanup.clone();
+        let retirement = invalid.retirement.as_mut().unwrap();
+        match mutation {
+            0 => retirement.application_closed = false,
+            1 => retirement.peers_fenced = false,
+            2 => retirement.role = ReplicaRole::ActiveSecondary,
+            3 => retirement.read_status = AccessStatus::Granted,
+            4 => retirement.epoch.configuration_number -= 1,
+            5 => {
+                retirement.intent.cleanup.pvc = CleanupResourceIdentity::Absent {
+                    name: "different-pvc".into(),
+                }
+            }
+            _ => invalid.current_only_write_quorum[0].report_sequence = 3,
+        }
+        assert!(
+            validate_secondary_scale_down_cleanup(&invalid).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    for resource in 0..3 {
+        let mut malformed = intent.clone();
+        let field = match resource {
+            0 => &mut malformed.cleanup.pod,
+            1 => &mut malformed.cleanup.pvc,
+            _ => &mut malformed.cleanup.endpoint,
+        };
+        *field = CleanupResourceIdentity::Present {
+            name: field.name().into(),
+            uid: String::new(),
+        };
+        assert!(validate_secondary_scale_down(&malformed).is_err());
+    }
+    let mut absent = intent;
+    absent.cleanup.pod = CleanupResourceIdentity::Absent {
+        name: absent.cleanup.pod.name().into(),
+    };
+    validate_secondary_scale_down(&absent).unwrap();
+}
+
+#[test]
+fn existing_json_status_and_transition_default_new_authority_to_none() {
+    let status: AcceptedStatus = serde_json::from_value(serde_json::json!({
+        "initialized": false, "observedGeneration": 0, "conditions": []
+    }))
+    .unwrap();
+    assert!(status.secondary_scale_down_cleanup.is_none());
+    let mut value = serde_json::to_value(scale_down_fixture::transition(
+        &scale_down_fixture::intent(&[1, 2], 1),
+    ))
+    .unwrap();
+    value.as_object_mut().unwrap().remove("secondaryScaleDown");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("secondaryRemovalEvidence");
+    let transition: TransitionIntent = serde_json::from_value(value).unwrap();
+    assert!(transition.secondary_scale_down.is_none());
+    assert!(transition.secondary_removal_evidence.is_none());
+    let mut status = status;
+    status.transition = Some(transition);
+    assert!(
+        validate_status(&status).is_err(),
+        "missing scale-down authority cannot default into admission"
+    );
+    let mut command = serde_json::to_value(scale_down_fixture::configuration_command(
+        &scale_down_fixture::intent(&[1, 2], 1),
+        false,
+    ))
+    .unwrap();
+    command.as_object_mut().unwrap().remove("previousPolicy");
+    command
+        .as_object_mut()
+        .unwrap()
+        .remove("secondaryRemovalEvidence");
+    let command: kuberic_protocol::command::EnsureConfiguration =
+        serde_json::from_value(command).unwrap();
+    assert!(command.previous_policy.is_none());
+    assert!(command.secondary_removal_evidence.is_none());
+}
+
+#[test]
+fn secondary_removal_reports_bind_frozen_authority_and_fresh_observation() {
+    use kuberic_protocol::validation::*;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    let mut snapshot = empty_snapshot(2);
+    snapshot.status = AcceptedStatus {
+        initialized: true,
+        effective_policy: Some(intent.previous_policy.clone()),
+        topology: Some(AcceptedTopology {
+            configuration: intent.previous_configuration.clone(),
+        }),
+        transition: Some(scale_down_fixture::transition(&intent)),
+        ..Default::default()
+    };
+    let report = AgentReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        identity: intent.primary.clone(),
+        process_session_id: ProcessSessionId::new("session-1"),
+        report_sequence: 3,
+        role: ReplicaRole::Primary,
+        write_status: AccessStatus::ReconfigurationPending,
+        epoch: intent.current_configuration.epoch,
+        previous_configuration: Some(intent.previous_configuration.clone()),
+        current_configuration: Some(intent.current_configuration.clone()),
+        current_progress: 10,
+        verified_replication_lsn: Some(10),
+        secondary_removal_evidence: Some(scale_down_fixture::evidence(&intent)),
+        ..Default::default()
+    };
+    let key = ReplicaObservationKey::new(
+        intent.primary.replica_id,
+        intent.primary.instance_id.clone(),
+    );
+    snapshot.replicas.insert(
+        key.clone(),
+        ReplicaObservation {
+            kubernetes: None,
+            agent: AgentObservation::Report(Box::new(report.clone())),
+        },
+    );
+    validate_snapshot(&snapshot).unwrap();
+    for mutation in 0..5 {
+        let mut invalid = snapshot.clone();
+        let AgentObservation::Report(report) = &mut invalid.replicas.get_mut(&key).unwrap().agent
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => report.secondary_removal_evidence = None,
+            1 => report.write_status = AccessStatus::Granted,
+            2 => {
+                report
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation
+                    .boundary_lsn = 9
+            }
+            3 => {
+                report
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation
+                    .intent
+                    .cleanup
+                    .pvc = kuberic_protocol::types::CleanupResourceIdentity::Absent {
+                    name: "unbound".into(),
+                }
+            }
+            _ => {
+                invalid.status.transition = None;
+            }
+        }
+        assert!(validate_snapshot(&invalid).is_err(), "mutation {mutation}");
+    }
+    snapshot.previous_report_watermarks.insert(
+        key,
+        ReportWatermark {
+            process_session_id: report.process_session_id,
+            report_sequence: report.report_sequence,
+        },
+    );
+    assert!(matches!(
+        validate_snapshot(&snapshot),
+        Err(ValidationError::StaleReportSequence { .. })
+    ));
+
+    let mut evidence = scale_down_fixture::evidence(&intent);
+    evidence.previous_read_quorum[0].process_session_id =
+        ProcessSessionId::new("fresh-restarted-primary");
+    evidence.previous_read_quorum[0].report_sequence = 1;
+    validate_secondary_removal_evidence(&evidence, true).unwrap();
+    evidence.reduced_write_quorum[0].role = ReplicaRole::None;
+    assert!(validate_secondary_removal_evidence(&evidence, true).is_err());
 }
 
 #[test]
@@ -445,6 +917,8 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &resource_uid,
                 TransitionKind::PlannedSwitchover,
@@ -2221,6 +2695,8 @@ fn active_transition_keeps_frozen_policy_after_spec_change() {
     let current_configuration = configuration();
     let policy = EffectivePolicy::fixed(3, 10).unwrap();
     let transition = TransitionIntent {
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
         transition_id: derive_transition_id(
             &ResourceUid::new("resource-uid"),
             TransitionKind::Bootstrap,
@@ -2494,6 +2970,8 @@ fn failover_corrects_provisional_candidate_with_a_newer_epoch() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -2759,6 +3237,8 @@ fn failover_authorizes_full_copy_when_primary_history_cannot_repair_a_member() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id,
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -2915,6 +3395,8 @@ fn failover_serializes_multiple_required_full_copy_repairs() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -3063,6 +3545,8 @@ fn failover_current_only_keeps_secondary_write_access_non_primary() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Failover,
             spec_generation: 1,
@@ -3189,6 +3673,8 @@ fn failover_preserves_outstanding_replacement_membership_and_build_authority() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -3947,6 +4433,8 @@ fn transition_report_previous_configuration_must_match_frozen_topology() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(
                 &snapshot.resource_uid,
                 TransitionKind::Replacement,
@@ -4322,6 +4810,8 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
             configuration: previous.clone(),
         }),
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: transition_id.clone(),
             kind: TransitionKind::Replacement,
             spec_generation: 1,

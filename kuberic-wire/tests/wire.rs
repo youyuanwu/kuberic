@@ -10,6 +10,355 @@ use kuberic_wire::{
 };
 use prost::Message;
 
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod scale_down_fixture;
+
+fn removal_ensure(
+    intent: &kuberic_protocol::types::SecondaryScaleDownIntent,
+    current_only: bool,
+) -> proto::EnsureConfigurationCommand {
+    let command = scale_down_fixture::configuration_command(intent, current_only);
+    proto::EnsureConfigurationCommand {
+        operation_id: command.operation_id.to_string(),
+        previous_configuration: command.previous_configuration.map(Into::into),
+        current_configuration: Some(command.current_configuration.into()),
+        previous_epoch: command.previous_epoch.map(Into::into),
+        current_epoch: Some(command.current_epoch.into()),
+        effective_policy: Some(command.effective_policy.into()),
+        previous_policy: command.previous_policy.map(Into::into),
+        secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
+        local_replica_id: command.local_replica_id.value(),
+        expected_instance_id: command.expected_instance_id.to_string(),
+        expected_agent_generation: command.expected_agent_generation.to_string(),
+        transition_kind: proto::TransitionKind::SecondaryScaleDown as i32,
+        primary_write_status: proto::AccessStatus::ReconfigurationPending as i32,
+        current_only,
+        ..Default::default()
+    }
+}
+
+fn removal_request(
+    command: proto::execute_command_request::Command,
+    target: ReplicaIdentity,
+) -> proto::ExecuteCommandRequest {
+    proto::ExecuteCommandRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-uid".into(),
+        target: Some(target.into()),
+        expected_process_session_id: "observed-exact-session".into(),
+        command: Some(command),
+    }
+}
+
+#[test]
+fn secondary_removal_commands_round_trip_exact_authority_for_sizes_two_through_five() {
+    use kuberic_protocol::command::ProtocolCommand;
+    use kuberic_wire::proto::execute_command_request::Command;
+    for size in 2..=5 {
+        let intent = scale_down_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
+        let prepare = scale_down_fixture::prepare_command(&intent);
+        let retire = scale_down_fixture::retire_command(&intent);
+        for (wire, target, canonical) in [
+            (
+                Command::PrepareSecondaryRemoval(Box::new(prepare.clone().into())),
+                intent.primary.clone(),
+                ProtocolCommand::PrepareSecondaryRemoval(Box::new(prepare)),
+            ),
+            (
+                Command::RetireReplica(Box::new(retire.clone().into())),
+                intent.target.clone(),
+                ProtocolCommand::RetireReplica(Box::new(retire)),
+            ),
+            (
+                Command::EnsureConfiguration(Box::new(removal_ensure(&intent, false))),
+                intent.primary.clone(),
+                ProtocolCommand::EnsureConfiguration(Box::new(
+                    scale_down_fixture::configuration_command(&intent, false),
+                )),
+            ),
+            (
+                Command::EnsureConfiguration(Box::new(removal_ensure(&intent, true))),
+                intent.primary.clone(),
+                ProtocolCommand::EnsureConfiguration(Box::new(
+                    scale_down_fixture::configuration_command(&intent, true),
+                )),
+            ),
+        ] {
+            let request = removal_request(wire, target.clone());
+            let decoded =
+                proto::ExecuteCommandRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+            let normalized = normalize_execute_request(decoded).unwrap();
+            assert_eq!(normalized.command, canonical);
+            assert_eq!(normalized.target, target);
+            assert_eq!(
+                normalized.expected_process_session_id.as_str(),
+                "observed-exact-session"
+            );
+        }
+    }
+    assert_eq!(proto::TransitionKind::PlannedSwitchover as i32, 4);
+    assert_eq!(proto::TransitionKind::SecondaryScaleDown as i32, 5);
+}
+
+#[test]
+fn secondary_removal_rejects_missing_unknown_and_mismatched_wire_authority() {
+    use kuberic_wire::proto::execute_command_request::Command;
+    let intent = scale_down_fixture::intent(&[1, 2], 1);
+    for mutation in 0..17 {
+        let mut command = removal_ensure(&intent, false);
+        match mutation {
+            0 => command.previous_policy = None,
+            1 => command.secondary_removal_evidence = None,
+            2 => command.current_configuration = None,
+            3 => command.previous_epoch = None,
+            4 => command.current_epoch = None,
+            5 => command.transition_kind = 999,
+            6 => command.transition_kind = proto::TransitionKind::Unknown as i32,
+            7 => command.primary_write_status = proto::AccessStatus::Unknown as i32,
+            8 => command.primary_write_status = proto::AccessStatus::Granted as i32,
+            9 => command.grant_write = true,
+            10 => command.local_replica_id = -1,
+            11 => command.expected_agent_generation.clear(),
+            12 => command.effective_policy.as_mut().unwrap().replica_set_size = 0,
+            13 => {
+                command
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation = None
+            }
+            14 => command
+                .secondary_removal_evidence
+                .as_mut()
+                .unwrap()
+                .previous_read_quorum
+                .clear(),
+            15 => {
+                command
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation
+                    .as_mut()
+                    .unwrap()
+                    .intent
+                    .as_mut()
+                    .unwrap()
+                    .desired_replicas = 0
+            }
+            _ => {
+                command
+                    .secondary_removal_evidence
+                    .as_mut()
+                    .unwrap()
+                    .preparation
+                    .as_mut()
+                    .unwrap()
+                    .boundary_lsn = -1
+            }
+        }
+        let request = removal_request(
+            Command::EnsureConfiguration(Box::new(command)),
+            intent.primary.clone(),
+        );
+        assert!(
+            normalize_execute_request(request).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    for mutation in 0..7 {
+        let command: proto::PrepareSecondaryRemovalCommand =
+            scale_down_fixture::prepare_command(&intent).into();
+        let mut request = removal_request(
+            Command::PrepareSecondaryRemoval(Box::new(command)),
+            intent.primary.clone(),
+        );
+        match mutation {
+            0 => request.protocol_version = 5,
+            1 => request.protocol_version = 0,
+            2 => request.protocol_version = 7,
+            3 => request.expected_process_session_id.clear(),
+            4 => request.target = None,
+            5 => request.resource_uid = "other-resource".into(),
+            _ => request.target = Some(intent.target.clone().into()),
+        }
+        assert!(
+            normalize_execute_request(request).is_err(),
+            "envelope mutation {mutation}"
+        );
+    }
+    let missing = removal_request(
+        Command::PrepareSecondaryRemoval(Box::default()),
+        intent.primary.clone(),
+    );
+    assert!(normalize_execute_request(missing).is_err());
+    let missing = removal_request(
+        Command::RetireReplica(Box::default()),
+        intent.target.clone(),
+    );
+    assert!(normalize_execute_request(missing).is_err());
+    let mut retirement: proto::RetireReplicaCommand =
+        scale_down_fixture::retire_command(&intent).into();
+    retirement
+        .committed
+        .as_mut()
+        .unwrap()
+        .current_only_write_quorum
+        .clear();
+    assert!(
+        normalize_execute_request(removal_request(
+            Command::RetireReplica(Box::new(retirement)),
+            intent.target
+        ))
+        .is_err()
+    );
+}
+
+#[test]
+fn secondary_cleanup_wire_requires_positive_exact_identity_or_absence() {
+    use kuberic_protocol::types::{CleanupResourceIdentity, SecondaryScaleDownIntent};
+    let original = scale_down_fixture::intent(&[2, 8, 19, 40], 40);
+    let encoded: proto::SecondaryScaleDownIntent = original.clone().into();
+    assert_eq!(
+        SecondaryScaleDownIntent::try_from(encoded.clone()).unwrap(),
+        original
+    );
+    for resource in 0..3 {
+        for mutation in 0..4 {
+            let mut value = encoded.clone();
+            let cleanup = value.cleanup.as_mut().unwrap();
+            let field = match resource {
+                0 => &mut cleanup.pod,
+                1 => &mut cleanup.pvc,
+                _ => &mut cleanup.endpoint,
+            };
+            match mutation {
+                0 => *field = None,
+                1 => field.as_mut().unwrap().identity = None,
+                2 => {
+                    field.as_mut().unwrap().identity = Some(
+                        proto::cleanup_resource_identity::Identity::AuthoritativelyAbsent(false),
+                    )
+                }
+                _ => {
+                    field.as_mut().unwrap().identity = Some(
+                        proto::cleanup_resource_identity::Identity::Uid(String::new()),
+                    )
+                }
+            }
+            assert!(SecondaryScaleDownIntent::try_from(value).is_err());
+        }
+    }
+    let mut absent = original.clone();
+    absent.cleanup.pod = CleanupResourceIdentity::Absent {
+        name: original.cleanup.pod.name().into(),
+    };
+    assert_eq!(
+        SecondaryScaleDownIntent::try_from(proto::SecondaryScaleDownIntent::from(absent.clone()))
+            .unwrap(),
+        absent
+    );
+}
+
+#[test]
+fn secondary_preparation_reduced_authority_and_retirement_reports_round_trip() {
+    use kuberic_protocol::observation::AgentObservation;
+    let intent = scale_down_fixture::intent(&[1, 2, 3], 1);
+    let prepared = scale_down_fixture::preparation(&intent);
+    let mut report = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: intent.resource_uid.to_string(),
+        identity: Some(intent.primary.clone().into()),
+        process_session_id: prepared.process_session_id.to_string(),
+        report_sequence: 2,
+        role: proto::ReplicaRole::Primary as i32,
+        read_status: proto::AccessStatus::ReconfigurationPending as i32,
+        write_status: proto::AccessStatus::ReconfigurationPending as i32,
+        epoch: Some(intent.previous_configuration.epoch.into()),
+        current_configuration: Some(intent.previous_configuration.clone().into()),
+        current_progress: 10,
+        verified_replication_lsn: Some(10),
+        committed_lsn: 10,
+        storage_state: proto::AgentStorageState::Initialized as i32,
+        prepared_secondary_removal: Some(prepared.clone().into()),
+        ..Default::default()
+    };
+    let AgentObservation::Report(normalized) =
+        normalize_agent_status_report(report.clone()).unwrap()
+    else {
+        panic!("initialized")
+    };
+    assert_eq!(normalized.prepared_secondary_removal, Some(prepared));
+    let mut invalid = report.clone();
+    invalid.write_status = proto::AccessStatus::Granted as i32;
+    assert!(normalize_agent_status_report(invalid).is_err());
+    report.previous_configuration = report.current_configuration.clone();
+    report.current_configuration = Some(intent.current_configuration.clone().into());
+    report.epoch = Some(intent.current_configuration.epoch.into());
+    report.secondary_removal_evidence = Some(scale_down_fixture::evidence(&intent).into());
+    for current_only in [false, true] {
+        if current_only {
+            report.previous_configuration = None;
+        }
+        let decoded = proto::AgentStatusReport::decode(report.encode_to_vec().as_slice()).unwrap();
+        let AgentObservation::Report(normalized) = normalize_agent_status_report(decoded).unwrap()
+        else {
+            panic!("initialized")
+        };
+        assert_eq!(
+            normalized.secondary_removal_evidence,
+            Some(scale_down_fixture::evidence(&intent))
+        );
+    }
+    let retirement = scale_down_fixture::retirement(&intent);
+    let retired = proto::AgentStatusReport {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: intent.resource_uid.to_string(),
+        identity: Some(intent.target.clone().into()),
+        process_session_id: retirement.process_session_id.to_string(),
+        report_sequence: retirement.report_sequence,
+        role: proto::ReplicaRole::None as i32,
+        read_status: proto::AccessStatus::NotPrimary as i32,
+        write_status: proto::AccessStatus::NotPrimary as i32,
+        epoch: Some(retirement.epoch.into()),
+        storage_state: proto::AgentStorageState::Initialized as i32,
+        retained_operation_id: retirement.operation_id.to_string(),
+        retired_replica: Some(retirement.clone().into()),
+        ..Default::default()
+    };
+    let AgentObservation::Report(normalized) =
+        normalize_agent_status_report(retired.clone()).unwrap()
+    else {
+        panic!("initialized")
+    };
+    assert_eq!(normalized.retired_replica, Some(retirement));
+    let mut restarted = retired.clone();
+    restarted.process_session_id = "fresh-retired-session".into();
+    restarted.report_sequence = 1;
+    assert!(
+        normalize_agent_status_report(restarted).is_ok(),
+        "durable retirement survives process-session renewal"
+    );
+    for mutation in 0..8 {
+        let mut invalid = retired.clone();
+        match mutation {
+            0 => invalid.retired_replica.as_mut().unwrap().intent = None,
+            1 => invalid.retired_replica.as_mut().unwrap().application_closed = false,
+            2 => invalid.retired_replica.as_mut().unwrap().read_status = 99,
+            3 => invalid.retired_replica.as_mut().unwrap().epoch = None,
+            4 => invalid.current_configuration = Some(intent.previous_configuration.clone().into()),
+            5 => invalid.role = proto::ReplicaRole::ActiveSecondary as i32,
+            6 => invalid.storage_state = proto::AgentStorageState::Uninitialized as i32,
+            _ => invalid.protocol_version = 5,
+        }
+        assert!(
+            normalize_agent_status_report(invalid).is_err(),
+            "retirement mutation {mutation}"
+        );
+    }
+}
+
 fn configuration() -> ConfigurationDescriptor {
     ConfigurationDescriptor::new(
         Epoch::new(0, 1),
@@ -356,6 +705,8 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
         command: Some(
             proto::execute_command_request::Command::EnsureConfiguration(Box::new(
                 proto::EnsureConfigurationCommand {
+                    previous_policy: None,
+                    secondary_removal_evidence: None,
                     operation_id: "install-1".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),
@@ -800,6 +1151,8 @@ fn ensure_request_rejects_previous_configuration_outside_frozen_policy() {
         command: Some(
             proto::execute_command_request::Command::EnsureConfiguration(Box::new(
                 proto::EnsureConfigurationCommand {
+                    previous_policy: None,
+                    secondary_removal_evidence: None,
                     operation_id: "operation".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),
@@ -857,6 +1210,8 @@ fn ensure_request_rejects_regressing_pc_cc_relationship() {
         command: Some(
             proto::execute_command_request::Command::EnsureConfiguration(Box::new(
                 proto::EnsureConfigurationCommand {
+                    previous_policy: None,
+                    secondary_removal_evidence: None,
                     operation_id: "operation".to_string(),
                     previous_configuration: Some(previous.clone().into()),
                     current_configuration: Some(current.clone().into()),

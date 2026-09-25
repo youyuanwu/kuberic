@@ -154,6 +154,17 @@ fn admit_configuration_with_replay(
     state: &AgentState,
     persisted_exact_replay: bool,
 ) -> Result<AdmittedAuthority> {
+    if command.transition_kind == TransitionKind::SecondaryScaleDown
+        || command.secondary_removal_evidence.is_some()
+        || command
+            .previous_policy
+            .as_ref()
+            .is_some_and(|policy| policy != &command.effective_policy)
+    {
+        return Err(AgentError::CommandRejected(
+            "secondary scale-down execution is not enabled".into(),
+        ));
+    }
     if command.operation_id.is_empty() {
         return Err(AgentError::CommandRejected(
             "operation ID must not be empty".into(),

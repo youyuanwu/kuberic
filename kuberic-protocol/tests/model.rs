@@ -76,6 +76,8 @@ fn transition_status(
         .then(|| OperationId::new(format!("build-{}", current.epoch.configuration_number)));
     AcceptedStatus {
         transition: Some(TransitionIntent {
+            secondary_scale_down: None,
+            secondary_removal_evidence: None,
             transition_id: derive_transition_id(&resource_uid, kind, &current.configuration_id),
             kind,
             spec_generation: 1,

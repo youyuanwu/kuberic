@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use crate::scale_down::*;
 use thiserror::Error;
 
 use crate::observation::{AgentObservation, ObservationSnapshot, ReplicaObservationKey};
@@ -12,6 +13,8 @@ use crate::types::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ValidationError {
+    #[error("invalid secondary scale-down authority: {0}")]
+    InvalidSecondaryScaleDown(&'static str),
     #[error("desired replica count must be greater than zero")]
     DesiredReplicasZero,
     #[error("initialized status has no accepted topology")]
@@ -172,6 +175,23 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
         return Err(ValidationError::DesiredReplicasZero);
     }
     validate_status(&snapshot.status)?;
+    let removal = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.secondary_scale_down.as_ref())
+        .or_else(|| {
+            snapshot
+                .status
+                .secondary_scale_down_cleanup
+                .as_ref()
+                .map(|cleanup| &cleanup.evidence.preparation.intent)
+        });
+    if removal.is_some_and(|intent| intent.resource_uid != snapshot.resource_uid) {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "resource UID mismatch",
+        ));
+    }
 
     if let Some(provisioning) = &snapshot.status.provisioning {
         let target = provisioning.target_identity(&snapshot.resource_uid);
@@ -340,6 +360,7 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
 pub(crate) fn validate_report_internal(
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
+    validate_secondary_removal_report(report)?;
     if report.previous_configuration.is_some() && report.current_configuration.is_none() {
         return Err(ValidationError::InvalidReplicaReportAuthority(
             report.identity.replica_id.value(),
@@ -391,7 +412,7 @@ pub(crate) fn validate_report_internal(
             .collect::<BTreeSet<_>>();
         if previous.epoch.data_loss_number != current.epoch.data_loss_number
             || previous.epoch.configuration_number >= current.epoch.configuration_number
-            || previous_ids != current_ids
+            || (previous_ids != current_ids && report.secondary_removal_evidence.is_none())
         {
             return Err(ValidationError::InvalidReplicaReportAuthority(
                 report.identity.replica_id.value(),
@@ -424,6 +445,79 @@ fn validate_report_authority(
     snapshot: &ObservationSnapshot,
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
+    let removal = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.secondary_scale_down.as_ref())
+        .or_else(|| {
+            snapshot
+                .status
+                .secondary_scale_down_cleanup
+                .as_ref()
+                .map(|cleanup| &cleanup.evidence.preparation.intent)
+        });
+    for intent in [
+        report
+            .prepared_secondary_removal
+            .as_ref()
+            .map(|prepared| &prepared.intent),
+        report
+            .secondary_removal_evidence
+            .as_ref()
+            .map(|evidence| &evidence.preparation.intent),
+        report
+            .retired_replica
+            .as_ref()
+            .map(|retirement| &retirement.intent),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if removal != Some(intent) {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "report is not authorized by the frozen removal",
+            ));
+        }
+    }
+    if let Some(intent) = removal
+        && report.current_configuration.as_ref() == Some(&intent.current_configuration)
+        && (report.secondary_removal_evidence.is_none()
+            || (snapshot.status.transition.is_some()
+                && report.write_status == AccessStatus::Granted))
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "reduced authority requires evidence and pre-commit write closure",
+        ));
+    }
+    if let Some(transition) = &snapshot.status.transition
+        && let Some(evidence) = &report.secondary_removal_evidence
+        && transition
+            .secondary_removal_evidence
+            .as_ref()
+            .is_none_or(|frozen| {
+                frozen.preparation != evidence.preparation
+                    || frozen.previous_read_quorum != evidence.previous_read_quorum
+            })
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "report does not retain the frozen admission evidence",
+        ));
+    }
+    if let Some(frozen) = snapshot
+        .status
+        .transition
+        .as_ref()
+        .and_then(|transition| transition.secondary_removal_evidence.as_ref())
+        && report
+            .prepared_secondary_removal
+            .as_ref()
+            .is_some_and(|prepared| prepared != &frozen.preparation)
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "preparation differs from frozen admission boundary",
+        ));
+    }
     let provisioning =
         snapshot.status.provisioning.as_ref().is_some_and(|intent| {
             intent.target_identity(&snapshot.resource_uid) == report.identity
@@ -668,6 +762,24 @@ fn observation_key_string(key: &ReplicaObservationKey) -> String {
 
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
+    if let Some(cleanup) = &status.secondary_scale_down_cleanup {
+        validate_secondary_scale_down_cleanup(cleanup)?;
+        let intent = &cleanup.evidence.preparation.intent;
+        if status.transition.is_some()
+            || status.provisioning.is_some()
+            || status.primary_failure.is_some()
+            || status
+                .topology
+                .as_ref()
+                .map(|topology| &topology.configuration)
+                != Some(&intent.current_configuration)
+            || status.effective_policy.as_ref() != Some(&intent.current_policy)
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "cleanup must exclusively bind accepted reduced authority",
+            ));
+        }
+    }
     if let Some(receipt) = &status.last_switchover {
         validate_switchover_receipt(receipt)?;
     }
@@ -718,6 +830,55 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
         return Err(ValidationError::QuorumLossMismatch);
     }
     if let Some(transition) = &status.transition {
+        if transition.kind == TransitionKind::SecondaryScaleDown {
+            let intent = transition.secondary_scale_down.as_ref().ok_or(
+                ValidationError::InvalidSecondaryScaleDown("missing frozen intent"),
+            )?;
+            validate_secondary_scale_down(intent)?;
+            if status
+                .topology
+                .as_ref()
+                .map(|topology| &topology.configuration)
+                != Some(&intent.previous_configuration)
+                || status.effective_policy.as_ref() != Some(&intent.previous_policy)
+                || transition.effective_policy != intent.current_policy
+                || transition.current_configuration != intent.current_configuration
+                || transition.previous_configuration_id.as_ref()
+                    != Some(&intent.previous_configuration.configuration_id)
+                || transition.spec_generation != intent.spec_generation
+                || transition.transition_id
+                    != crate::types::derive_transition_id(
+                        &intent.resource_uid,
+                        transition.kind,
+                        &intent.current_configuration.configuration_id,
+                    )
+                || transition.switchover.is_some()
+                || transition.build_id.is_some()
+                || transition.repair.is_some()
+                || transition.election_lsn.is_some()
+                || status.primary_failure.is_some()
+            {
+                return Err(ValidationError::InvalidSecondaryScaleDown(
+                    "transition differs from immutable intent",
+                ));
+            }
+            if let Some(evidence) = &transition.secondary_removal_evidence {
+                validate_secondary_removal_evidence(evidence, false)?;
+                if evidence.preparation.intent != *intent {
+                    return Err(ValidationError::InvalidSecondaryScaleDown(
+                        "evidence differs from immutable intent",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if transition.secondary_scale_down.is_some()
+            || transition.secondary_removal_evidence.is_some()
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "unexpected removal authority",
+            ));
+        }
         if status
             .effective_policy
             .as_ref()
@@ -732,6 +893,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
             Some(&transition.effective_policy),
         )?;
         match transition.kind {
+            TransitionKind::SecondaryScaleDown => unreachable!("validated independently above"),
             TransitionKind::Bootstrap => {
                 if transition.switchover.is_some() {
                     return Err(ValidationError::UnexpectedSwitchoverIntent);
@@ -947,6 +1109,11 @@ pub fn validate_transition_relationship(
     current: &ConfigurationDescriptor,
     policy: &EffectivePolicy,
 ) -> Result<(), ValidationError> {
+    if kind == TransitionKind::SecondaryScaleDown {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "requires explicit dual-policy removal intent",
+        ));
+    }
     validate_policy(policy)?;
     validate_configuration(current, Some(policy))?;
     if kind == TransitionKind::Bootstrap {
@@ -980,6 +1147,7 @@ pub fn validate_transition_relationship(
     }
 
     match kind {
+        TransitionKind::SecondaryScaleDown => unreachable!("requires typed authority above"),
         TransitionKind::Bootstrap => unreachable!("bootstrap returned above"),
         TransitionKind::Failover => {
             let previous_identities = previous
@@ -1209,7 +1377,7 @@ pub fn validate_configuration(
     Ok(())
 }
 
-fn validate_policy(policy: &EffectivePolicy) -> Result<(), ValidationError> {
+pub(crate) fn validate_policy(policy: &EffectivePolicy) -> Result<(), ValidationError> {
     let expected = EffectivePolicy::fixed(policy.replica_set_size, policy.failover_delay_seconds)
         .ok_or(ValidationError::InvalidEffectivePolicy(
         policy.replica_set_size,

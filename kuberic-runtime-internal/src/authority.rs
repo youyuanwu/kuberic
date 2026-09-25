@@ -99,6 +99,11 @@ impl AdmittedAuthority {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.transition_kind == Some(TransitionKind::SecondaryScaleDown) {
+            return Err(ContractError::AuthorityMismatch(
+                "secondary scale-down execution is not enabled".into(),
+            ));
+        }
         validate_configuration(&self.current_configuration, None)
             .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
         let policy = EffectivePolicy::fixed(self.current_configuration.members.len() as u32, 0)

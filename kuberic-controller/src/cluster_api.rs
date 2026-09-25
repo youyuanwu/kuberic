@@ -1596,6 +1596,13 @@ fn map_agent_effect_error(error: AgentRpcError) -> ControllerError {
 
 fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
     match command {
+        ProtocolCommand::PrepareSecondaryRemoval(command) => {
+            (command.intent.primary.clone(), command.local_replica_id)
+        }
+        ProtocolCommand::RetireReplica(command) => (
+            command.committed.evidence.preparation.intent.target.clone(),
+            command.local_replica_id,
+        ),
         ProtocolCommand::InitializeAgentStore(command) => {
             let identity = ReplicaIdentity {
                 replica_id: command.local_replica_id,
@@ -1633,6 +1640,14 @@ fn command_request(
     command: ProtocolCommand,
 ) -> proto::ExecuteCommandRequest {
     let command = match command {
+        ProtocolCommand::PrepareSecondaryRemoval(command) => {
+            proto::execute_command_request::Command::PrepareSecondaryRemoval(Box::new(
+                (*command).into(),
+            ))
+        }
+        ProtocolCommand::RetireReplica(command) => {
+            proto::execute_command_request::Command::RetireReplica(Box::new((*command).into()))
+        }
         ProtocolCommand::InitializeAgentStore(command) => {
             proto::execute_command_request::Command::InitializeAgentStore(initialize_command(
                 *command,
@@ -1680,6 +1695,8 @@ fn initialize_command(command: InitializeAgentStore) -> proto::InitializeAgentSt
 
 fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCommand {
     proto::EnsureConfigurationCommand {
+        previous_policy: command.previous_policy.map(Into::into),
+        secondary_removal_evidence: command.secondary_removal_evidence.map(Into::into),
         operation_id: command.operation_id.to_string(),
         previous_configuration: command.previous_configuration.map(Into::into),
         current_configuration: Some(command.current_configuration.into()),
@@ -1775,6 +1792,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::Replacement => proto::TransitionKind::Replacement,
         TransitionKind::Failover => proto::TransitionKind::Failover,
         TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
+        TransitionKind::SecondaryScaleDown => proto::TransitionKind::SecondaryScaleDown,
     }
 }
 
@@ -2229,6 +2247,11 @@ fn role_label(role: ReplicaRole) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod scale_down_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::crd::KubericSetSpec;
@@ -2245,6 +2268,45 @@ mod tests {
             replica_id: ReplicaId::new(replica_id),
             instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
             agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
+        }
+    }
+
+    #[test]
+    fn secondary_removal_encoding_preserves_frozen_authority_and_session_target() {
+        let intent = scale_down_fixture::intent(&[2, 8, 19, 40], 40);
+        for command in [
+            ProtocolCommand::PrepareSecondaryRemoval(Box::new(
+                scale_down_fixture::prepare_command(&intent),
+            )),
+            ProtocolCommand::EnsureConfiguration(Box::new(
+                scale_down_fixture::configuration_command(&intent, false),
+            )),
+            ProtocolCommand::EnsureConfiguration(Box::new(
+                scale_down_fixture::configuration_command(&intent, true),
+            )),
+            ProtocolCommand::RetireReplica(Box::new(scale_down_fixture::retire_command(&intent))),
+        ] {
+            let (target, id) = command_target(&command);
+            assert_eq!(id, target.replica_id);
+            let expected = if matches!(command, ProtocolCommand::RetireReplica(_)) {
+                &intent.target
+            } else {
+                &intent.primary
+            };
+            assert_eq!(&target, expected);
+            let request = command_request(
+                intent.resource_uid.to_string(),
+                target.clone(),
+                "fresh-session".into(),
+                command.clone(),
+            );
+            let normalized = kuberic_wire::normalize_execute_request(request).unwrap();
+            assert_eq!(normalized.command, command);
+            assert_eq!(normalized.target, target);
+            assert_eq!(
+                normalized.expected_process_session_id.as_str(),
+                "fresh-session"
+            );
         }
     }
 
@@ -2386,6 +2448,8 @@ mod tests {
             ),
             (
                 ProtocolCommand::EnsureConfiguration(Box::new(EnsureConfiguration {
+                    previous_policy: None,
+                    secondary_removal_evidence: None,
                     operation_id: OperationId::new("configuration-1"),
                     previous_configuration: None,
                     current_configuration: configuration.clone(),

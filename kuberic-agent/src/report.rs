@@ -144,6 +144,9 @@ fn build_report(
             })
             .collect(),
         prepared_switchover: state.prepared_switchover.map(Into::into),
+        prepared_secondary_removal: None,
+        secondary_removal_evidence: None,
+        retired_replica: None,
     }
 }
 
