@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::{
     AgentGeneration, BuildAuthority, ConfigurationDescriptor, EffectivePolicy, Epoch,
     InitializationId, OperationId, PodUid, ProvisioningIntent, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ResourceUid,
+    ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverRequestId,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +49,23 @@ pub struct EnsureConfiguration {
     pub current_only: bool,
     #[serde(default)]
     pub retire_build_ids: Vec<OperationId>,
+    #[serde(default)]
+    pub switchover_handoff: Option<SwitchoverHandoff>,
+    #[serde(default)]
+    pub retire_switchover_preparation_ids: Vec<OperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareSwitchover {
+    pub operation_id: OperationId,
+    pub request_id: SwitchoverRequestId,
+    pub local_replica_id: ReplicaId,
+    pub expected_instance_id: ReplicaInstanceId,
+    pub expected_agent_generation: AgentGeneration,
+    pub source: ReplicaIdentity,
+    pub target: ReplicaIdentity,
+    pub current_configuration: ConfigurationDescriptor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +85,7 @@ pub struct EnsureReplicaBuild {
 /// One fenced, idempotent authority command issued after a full observation.
 pub enum ProtocolCommand {
     InitializeAgentStore(Box<InitializeAgentStore>),
+    PrepareSwitchover(Box<PrepareSwitchover>),
     EnsureConfiguration(Box<EnsureConfiguration>),
     EnsureReplicaBuild(Box<EnsureReplicaBuild>),
 }
@@ -76,9 +94,9 @@ impl ProtocolCommand {
     pub fn effect_class(&self) -> EffectClass {
         match self {
             Self::InitializeAgentStore(_) => EffectClass::ConvergentEnsure,
-            Self::EnsureConfiguration(_) | Self::EnsureReplicaBuild(_) => {
-                EffectClass::ReconfigurationAction
-            }
+            Self::PrepareSwitchover(_)
+            | Self::EnsureConfiguration(_)
+            | Self::EnsureReplicaBuild(_) => EffectClass::ReconfigurationAction,
         }
     }
 }

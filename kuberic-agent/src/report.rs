@@ -143,6 +143,7 @@ fn build_report(
                 completed: build.completed,
             })
             .collect(),
+        prepared_switchover: None,
     }
 }
 

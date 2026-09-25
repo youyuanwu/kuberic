@@ -105,7 +105,11 @@ impl AdmittedAuthority {
         match (self.previous_configuration.as_ref(), self.transition_kind) {
             (
                 Some(previous),
-                Some(kind @ (TransitionKind::Replacement | TransitionKind::Failover)),
+                Some(
+                    kind @ (TransitionKind::Replacement
+                    | TransitionKind::Failover
+                    | TransitionKind::PlannedSwitchover),
+                ),
             ) => {
                 validate_transition_relationship(
                     kind,
@@ -118,7 +122,8 @@ impl AdmittedAuthority {
             (None, Some(TransitionKind::Bootstrap)) | (None, None) => {}
             (Some(_), _) => {
                 return Err(ContractError::AuthorityMismatch(
-                    "Previous Configuration requires replacement or failover authority".to_string(),
+                    "Previous Configuration requires replacement, failover, or planned switchover authority"
+                        .to_string(),
                 ));
             }
             (None, Some(_)) => {

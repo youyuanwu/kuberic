@@ -209,6 +209,8 @@ fn command(operation_id: &str, epoch: Epoch) -> EnsureConfiguration {
         primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
         retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     }
 }
 
@@ -414,6 +416,8 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
             primary_write_status: AccessStatus::NoWriteQuorum,
             current_only: false,
             retire_build_ids: Vec::new(),
+            switchover_handoff: None,
+            retire_switchover_preparation_ids: Vec::new(),
         })
         .await
         .unwrap();
@@ -706,6 +710,8 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
         primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: true,
         retire_build_ids: vec![OperationId::new("replacement-build")],
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     };
     runtime.fail_once("read");
     let coordinator = Coordinator::new(store.clone(), runtime.clone());
@@ -787,6 +793,8 @@ fn same_epoch_new_operation_cannot_replace_durable_membership() {
         primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
         retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     };
     assert!(matches!(
         admit_configuration(&command, &state),

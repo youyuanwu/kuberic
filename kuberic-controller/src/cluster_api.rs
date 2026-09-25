@@ -14,7 +14,8 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReferen
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{Api, Client, Resource, ResourceExt};
 use kuberic_protocol::command::{
-    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, ProtocolCommand,
+    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
+    ProtocolCommand,
 };
 use kuberic_protocol::observation::ReplicaObservationKey;
 use kuberic_protocol::types::{
@@ -735,12 +736,19 @@ where
             .set
             .uid()
             .ok_or_else(|| ControllerError::Effect("KubericSet has no UID".to_string()))?;
+        let expected_process_session_id =
+            observed_process_session(observation, replica_id, &target)?;
         let response = self
             .agents
             .execute(
                 &endpoint,
                 &self.bearer_token,
-                command_request(resource_uid, target, command.clone()),
+                command_request(
+                    resource_uid,
+                    target,
+                    expected_process_session_id,
+                    command.clone(),
+                ),
             )
             .await
             .map_err(map_agent_effect_error)?;
@@ -756,6 +764,20 @@ where
         })?;
         kuberic_wire::validate_agent_status_report(&report)
             .map_err(|error| ControllerError::InvalidAgentEvidence(error.to_string()))
+    }
+}
+
+fn observed_process_session(
+    observation: &RawObservation,
+    replica_id: ReplicaId,
+    target: &ReplicaIdentity,
+) -> Result<String> {
+    let observation_key = ReplicaObservationKey::new(replica_id, target.instance_id.clone());
+    match observation.agents.get(&observation_key) {
+        Some(RawAgentObservation::Report(report)) if !report.process_session_id.is_empty() => {
+            Ok(report.process_session_id.clone())
+        }
+        _ => Err(ControllerError::ObservationStale),
     }
 }
 
@@ -1533,6 +1555,9 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
             };
             (identity, command.local_replica_id)
         }
+        ProtocolCommand::PrepareSwitchover(command) => {
+            (command.source.clone(), command.local_replica_id)
+        }
         ProtocolCommand::EnsureReplicaBuild(command) => {
             let identity = ReplicaIdentity {
                 replica_id: command.local_replica_id,
@@ -1547,6 +1572,7 @@ fn command_target(command: &ProtocolCommand) -> (ReplicaIdentity, ReplicaId) {
 fn command_request(
     resource_uid: String,
     target: ReplicaIdentity,
+    expected_process_session_id: String,
     command: ProtocolCommand,
 ) -> proto::ExecuteCommandRequest {
     let command = match command {
@@ -1556,7 +1582,14 @@ fn command_request(
             ))
         }
         ProtocolCommand::EnsureConfiguration(command) => {
-            proto::execute_command_request::Command::EnsureConfiguration(ensure_command(*command))
+            proto::execute_command_request::Command::EnsureConfiguration(Box::new(ensure_command(
+                *command,
+            )))
+        }
+        ProtocolCommand::PrepareSwitchover(command) => {
+            proto::execute_command_request::Command::PrepareSwitchover(prepare_switchover_command(
+                *command,
+            ))
         }
         ProtocolCommand::EnsureReplicaBuild(command) => {
             proto::execute_command_request::Command::EnsureReplicaBuild(ensure_build_command(
@@ -1568,6 +1601,7 @@ fn command_request(
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid,
         target: Some(target.into()),
+        expected_process_session_id,
         command: Some(command),
     }
 }
@@ -1623,6 +1657,25 @@ fn ensure_command(command: EnsureConfiguration) -> proto::EnsureConfigurationCom
             .map(ToString::to_string)
             .collect(),
         failover_safe_lsn: command.failover_safe_lsn,
+        switchover_handoff: command.switchover_handoff.map(Into::into),
+        retire_switchover_preparation_ids: command
+            .retire_switchover_preparation_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    }
+}
+
+fn prepare_switchover_command(command: PrepareSwitchover) -> proto::PrepareSwitchoverCommand {
+    proto::PrepareSwitchoverCommand {
+        operation_id: command.operation_id.to_string(),
+        request_id: command.request_id.to_string(),
+        local_replica_id: command.local_replica_id.value(),
+        expected_instance_id: command.expected_instance_id.to_string(),
+        expected_agent_generation: command.expected_agent_generation.to_string(),
+        source: Some(command.source.into()),
+        target: Some(command.target.into()),
+        current_configuration: Some(command.current_configuration.into()),
     }
 }
 
@@ -1663,6 +1716,7 @@ fn transition_kind(kind: TransitionKind) -> proto::TransitionKind {
         TransitionKind::Bootstrap => proto::TransitionKind::Bootstrap,
         TransitionKind::Replacement => proto::TransitionKind::Replacement,
         TransitionKind::Failover => proto::TransitionKind::Failover,
+        TransitionKind::PlannedSwitchover => proto::TransitionKind::PlannedSwitchover,
     }
 }
 
@@ -2059,5 +2113,96 @@ fn role_label(role: ReplicaRole) -> &'static str {
         ReplicaRole::ActiveSecondary => "active-secondary",
         ReplicaRole::IdleSecondary => "idle-secondary",
         ReplicaRole::None => "none",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crd::KubericSetSpec;
+    use kuberic_protocol::command::PrepareSwitchover;
+    use kuberic_protocol::types::{
+        AgentGeneration, ConfigurationDescriptor, ConfigurationMember, Epoch, OperationId,
+        SwitchoverRequestId,
+    };
+
+    fn identity(replica_id: i64) -> ReplicaIdentity {
+        ReplicaIdentity {
+            replica_id: ReplicaId::new(replica_id),
+            instance_id: ReplicaInstanceId::new(format!("pod-{replica_id}")),
+            agent_generation: AgentGeneration::new(format!("generation-{replica_id}")),
+        }
+    }
+
+    #[test]
+    fn command_dispatch_uses_the_exact_observed_process_session() {
+        let source = identity(1);
+        let target = identity(2);
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            ReplicaObservationKey::new(source.replica_id, source.instance_id.clone()),
+            RawAgentObservation::Report(Box::new(proto::AgentStatusReport {
+                process_session_id: "session-1".to_string(),
+                ..Default::default()
+            })),
+        );
+        let observation = RawObservation {
+            set: KubericSet::new(
+                "db",
+                KubericSetSpec {
+                    replicas: 2,
+                    image: "example/db:latest".to_string(),
+                    failover_delay_seconds: 30,
+                    switchover: None,
+                },
+            ),
+            pods: Vec::new(),
+            pvcs: Vec::new(),
+            services: Vec::new(),
+            secrets: Vec::new(),
+            agents,
+            failures: Vec::new(),
+            now_unix_seconds: 0,
+        };
+        let session = observed_process_session(&observation, source.replica_id, &source).unwrap();
+        assert_eq!(session, "session-1");
+
+        let configuration = ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            source.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source.clone(),
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target.clone(),
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        );
+        let request = command_request(
+            "resource".to_string(),
+            source.clone(),
+            session,
+            ProtocolCommand::PrepareSwitchover(Box::new(PrepareSwitchover {
+                operation_id: OperationId::new("prepare-1"),
+                request_id: SwitchoverRequestId::new("request-1"),
+                local_replica_id: source.replica_id,
+                expected_instance_id: source.instance_id.clone(),
+                expected_agent_generation: source.agent_generation.clone(),
+                source,
+                target,
+                current_configuration: configuration,
+            })),
+        );
+        assert_eq!(request.expected_process_session_id, "session-1");
+        assert!(matches!(
+            request.command,
+            Some(proto::execute_command_request::Command::PrepareSwitchover(
+                _
+            ))
+        ));
     }
 }

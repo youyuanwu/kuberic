@@ -83,6 +83,7 @@ fn bootstrap_fixture() -> (
         election_lsn: None,
         build_id: None,
         repair: None,
+        switchover: None,
     };
     (command, observed, transition)
 }

@@ -22,6 +22,10 @@ and failover build authority.
 Protocol version 3 adds the authority-bound `verifiedReplicationLsn`
 certificate used to close failover catch-up without treating raw application
 progress as quorum credit.
+Protocol version 4 binds every control command dispatch to the exact observed
+target process session and adds the planned-switchover request, handoff, and
+receipt wire contracts. Planned-switchover execution remains fail-closed until
+its evaluator and runtime phases are implemented.
 
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.
@@ -37,7 +41,7 @@ configurations cannot relabel historical evidence.
 
 ## Integration boundary
 
-This crate does not negotiate or downgrade versions. Protocol version 3 is an
+This crate does not negotiate or downgrade versions. Protocol version 4 is an
 exact coordinated-deployment boundary; incompatible controller, agent, or
 replica peers are rejected. Authentication, DNS resolution, retry policy, and
 session registration are agent-owned transport concerns around these schemas.

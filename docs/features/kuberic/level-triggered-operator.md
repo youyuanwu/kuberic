@@ -67,9 +67,11 @@ incarnation cannot inherit old authority. Status, routing labels, command
 responses, and Pod readiness are observations; none is sufficient alone to
 grant replica authority.
 
-Raw application progress is repair evidence only. Protocol version 3 carries a
-separate authority-bound `verifiedReplicationLsn`. The current primary
-revalidates that certificate before it can contribute remote quorum credit.
+Raw application progress is repair evidence only. Protocol version 3
+introduced a separate authority-bound `verifiedReplicationLsn`; protocol
+version 4 additionally binds control commands to the exact observed target
+process session. The current primary revalidates the progress certificate
+before it can contribute remote quorum credit.
 
 ## Kubernetes API
 

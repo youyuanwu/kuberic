@@ -628,6 +628,7 @@ fn maybe_begin_stable_failover(
         election_lsn: Some(candidate.current_progress),
         build_id: None,
         repair: None,
+        switchover: None,
     });
     status.quorum_loss = None;
     Some(Plan::Apply {
@@ -760,6 +761,7 @@ fn evaluate_never_initialized(snapshot: &ObservationSnapshot, config: &Evaluatio
         election_lsn: None,
         build_id: None,
         repair: None,
+        switchover: None,
     };
     let mut status = snapshot.status.clone();
     status.transition = Some(transition);
@@ -805,6 +807,17 @@ fn evaluate_transition(
     }
     if transition.kind == TransitionKind::Failover {
         return evaluate_failover_transition(snapshot, transition, status, config);
+    }
+    if transition.kind == TransitionKind::PlannedSwitchover {
+        return Plan::Wait {
+            reason: WaitReason::ActiveTransition,
+            status: waiting_status(
+                status,
+                "PlannedSwitchoverNotEnabled",
+                "Planned switchover authority is defined but execution is not enabled",
+            ),
+            requeue_after_seconds: config.wait_requeue_seconds,
+        };
     }
 
     if let Some(plan) =
@@ -990,6 +1003,7 @@ fn evaluate_transition(
             election_lsn: Some(candidate.current_progress),
             build_id: active_transition.and_then(|transition| transition.build_id.clone()),
             repair: None,
+            switchover: None,
         });
         status.quorum_loss = None;
         Some(Plan::Apply {
@@ -1164,6 +1178,7 @@ fn evaluate_transition(
                     election_lsn: Some(candidate.current_progress),
                     build_id: transition.build_id.clone(),
                     repair: None,
+                    switchover: None,
                 });
                 return Plan::Apply {
                     changes: vec![KubernetesChange::PersistStatus {
@@ -1480,6 +1495,7 @@ fn evaluate_transition(
             election_lsn: None,
             build_id: None,
             repair: None,
+            switchover: None,
         });
         superseded = waiting_status(
             superseded,
@@ -1760,6 +1776,7 @@ fn evaluate_provisioning(
                 election_lsn: None,
                 build_id: Some(provisioning.operation_id.clone()),
                 repair: None,
+                switchover: None,
             });
             transition_status = waiting_status(
                 transition_status,
@@ -2390,6 +2407,8 @@ fn failover_configuration_command(
         primary_write_status,
         current_only,
         retire_build_ids,
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     }
 }
 
@@ -2443,6 +2462,8 @@ fn replacement_configuration_command(
         },
         current_only,
         retire_build_ids: retire_build_id.into_iter().collect(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     }
 }
 
@@ -2550,6 +2571,8 @@ fn ensure_configuration_command(
         primary_write_status,
         current_only,
         retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     }
 }
 
@@ -2682,6 +2705,16 @@ fn desired_spec_state(
             "requested failover delay {} differs from frozen delay {}",
             snapshot.desired.failover_delay_seconds, policy.failover_delay_seconds
         ));
+    }
+    if let Some(request) = &snapshot.desired.switchover {
+        if request.request_id.is_empty() || request.target_replica_id.value() <= 0 {
+            differences.push("planned switchover request is malformed".to_string());
+        } else {
+            differences.push(format!(
+                "planned switchover request {} targeting replica {} is not enabled",
+                request.request_id, request.target_replica_id
+            ));
+        }
     }
 
     let mut observed_images = 0_usize;

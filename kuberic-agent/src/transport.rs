@@ -224,7 +224,7 @@ where
         self.transport
             .lock()
             .await
-            .admit_peer(endpoint.identity.clone(), target_session)?;
+            .admit_peer(endpoint.identity.clone(), target_session.clone())?;
         let target_command = EnsureReplicaBuild {
             operation_id: endpoint.build_id.clone(),
             local_replica_id: endpoint.identity.replica_id,
@@ -246,6 +246,7 @@ where
             protocol_version: kuberic_protocol::PROTOCOL_VERSION,
             resource_uid: self.resource_uid.to_string(),
             target: Some(endpoint.identity.clone().into()),
+            expected_process_session_id: target_session.to_string(),
             command: Some(proto::execute_command_request::Command::EnsureReplicaBuild(
                 ensure_build_to_proto(target_command),
             )),

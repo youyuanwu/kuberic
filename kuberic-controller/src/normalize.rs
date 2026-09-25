@@ -8,8 +8,9 @@ use kuberic_protocol::observation::{
     RoutingObservation,
 };
 use kuberic_protocol::types::{
-    AcceptedStatus, PodUid, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
-    derive_agent_generation, derive_initialization_id, derive_replica_endpoint_name,
+    AcceptedStatus, PlannedSwitchoverRequest, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ResourceUid, SwitchoverRequestId, derive_agent_generation,
+    derive_initialization_id, derive_replica_endpoint_name,
 };
 
 use crate::crd::{INSTANCE_LABEL, REPLICA_ID_LABEL, SET_UID_LABEL};
@@ -153,6 +154,14 @@ pub fn normalize(
             replicas: raw.set.spec.replicas,
             image: raw.set.spec.image,
             failover_delay_seconds: raw.set.spec.failover_delay_seconds,
+            switchover: raw
+                .set
+                .spec
+                .switchover
+                .map(|request| PlannedSwitchoverRequest {
+                    request_id: SwitchoverRequestId::new(request.request_id),
+                    target_replica_id: ReplicaId::new(i64::from(request.target_replica_id)),
+                }),
         },
         status,
         replicas,

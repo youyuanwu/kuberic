@@ -10,7 +10,8 @@ use kube::ResourceExt;
 use kuberic_controller::ControllerError;
 use kuberic_controller::cluster_api::{EffectRecord, InMemoryClusterApi};
 use kuberic_controller::crd::{
-    INSTANCE_LABEL, KubericSet, KubericSetSpec, KubericSetStatus, REPLICA_ID_LABEL, SET_UID_LABEL,
+    INSTANCE_LABEL, KubericSet, KubericSetSpec, KubericSetStatus, PlannedSwitchoverRequestSpec,
+    REPLICA_ID_LABEL, SET_UID_LABEL,
 };
 use kuberic_controller::normalize::normalize;
 use kuberic_controller::observation::{RawAgentObservation, RawObservation, RawObservationFailure};
@@ -45,6 +46,7 @@ fn raw(replicas: u32) -> RawObservation {
             replicas,
             image: "example/db:latest".to_string(),
             failover_delay_seconds: 9,
+            switchover: None,
         },
     );
     set.metadata.namespace = Some("tests".to_string());
@@ -61,6 +63,20 @@ fn raw(replicas: u32) -> RawObservation {
         failures: Vec::new(),
         now_unix_seconds: 100,
     }
+}
+
+#[test]
+fn normalization_projects_planned_switchover_user_intent() {
+    let mut observation = raw(3);
+    observation.set.spec.switchover = Some(PlannedSwitchoverRequestSpec {
+        request_id: "request-1".to_string(),
+        target_replica_id: 2,
+    });
+
+    let snapshot = normalize(observation, BTreeMap::new()).unwrap();
+    let request = snapshot.desired.switchover.unwrap();
+    assert_eq!(request.request_id.as_str(), "request-1");
+    assert_eq!(request.target_replica_id, ReplicaId::new(2));
 }
 
 fn labels(replica_id: ReplicaId) -> BTreeMap<String, String> {

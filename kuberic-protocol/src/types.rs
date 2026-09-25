@@ -59,6 +59,7 @@ string_id!(ConfigurationId);
 string_id!(TransitionId);
 string_id!(InitializationId);
 string_id!(OperationId);
+string_id!(SwitchoverRequestId);
 
 #[derive(
     Debug,
@@ -484,6 +485,7 @@ pub enum TransitionKind {
     Bootstrap,
     Replacement,
     Failover,
+    PlannedSwitchover,
 }
 
 impl TransitionKind {
@@ -492,8 +494,65 @@ impl TransitionKind {
             Self::Bootstrap => "bootstrap",
             Self::Replacement => "replacement",
             Self::Failover => "failover",
+            Self::PlannedSwitchover => "planned-switchover",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedSwitchoverRequest {
+    pub request_id: SwitchoverRequestId,
+    pub target_replica_id: ReplicaId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PlannedSwitchoverResolution {
+    RequestedTarget,
+    CompensatingOldPrimary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchoverHandoff {
+    pub preparation_operation_id: OperationId,
+    pub request_id: SwitchoverRequestId,
+    pub source: ReplicaIdentity,
+    pub target: ReplicaIdentity,
+    pub starting_configuration_id: ConfigurationId,
+    pub handoff_lsn: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedSwitchoverIntent {
+    pub request_id: SwitchoverRequestId,
+    pub source: ReplicaIdentity,
+    pub target: ReplicaIdentity,
+    pub resolution: PlannedSwitchoverResolution,
+    #[serde(default)]
+    pub handoff: Option<SwitchoverHandoff>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum PlannedSwitchoverOutcome {
+    RequestedTargetCompleted,
+    OldPrimaryRestored,
+    OldPrimaryCompensated,
+    Rejected,
+    Unsafe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedSwitchoverReceipt {
+    pub request_id: SwitchoverRequestId,
+    pub requested_target_replica_id: ReplicaId,
+    pub accepted_target: Option<ReplicaIdentity>,
+    pub resulting_primary: Option<ReplicaIdentity>,
+    pub outcome: PlannedSwitchoverOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -512,6 +571,8 @@ pub struct TransitionIntent {
     pub build_id: Option<OperationId>,
     #[serde(default)]
     pub repair: Option<ReplicaRepairIntent>,
+    #[serde(default)]
+    pub switchover: Option<PlannedSwitchoverIntent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -566,6 +627,8 @@ pub struct AcceptedStatus {
     pub primary_failure: Option<PrimaryFailureObservation>,
     #[serde(default)]
     pub quorum_loss: Option<QuorumLossObservation>,
+    #[serde(default)]
+    pub last_switchover: Option<PlannedSwitchoverReceipt>,
     pub conditions: Vec<StatusCondition>,
 }
 
@@ -648,6 +711,27 @@ pub fn derive_failover_repair_operation_id(
         digest_parts(&[
             resource_uid.as_str(),
             transition_id.as_str(),
+            &target.replica_id.to_string(),
+            target.instance_id.as_str(),
+            target.agent_generation.as_str(),
+        ])
+    ))
+}
+
+pub fn derive_switchover_preparation_operation_id(
+    resource_uid: &ResourceUid,
+    request_id: &SwitchoverRequestId,
+    source: &ReplicaIdentity,
+    target: &ReplicaIdentity,
+) -> OperationId {
+    OperationId::new(format!(
+        "switchover-prepare-{}",
+        digest_parts(&[
+            resource_uid.as_str(),
+            request_id.as_str(),
+            &source.replica_id.to_string(),
+            source.instance_id.as_str(),
+            source.agent_generation.as_str(),
             &target.replica_id.to_string(),
             target.instance_id.as_str(),
             target.agent_generation.as_str(),

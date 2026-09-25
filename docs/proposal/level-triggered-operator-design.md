@@ -986,7 +986,7 @@ before status accepts and publishes the new topology. A returned stale former
 primary is admitted only as evidence for an exact newer-epoch correction; its
 old epoch cannot receive quorum credit.
 
-The level-triggered control protocol is version 3. `EnsureConfiguration`
+The level-triggered control protocol is version 4. `EnsureConfiguration`
 carries the intended primary access state rather than a write-grant boolean,
 allowing `ReconfigurationPending`, `NoWriteQuorum`, and `Granted` to remain
 distinct durable postconditions. Current-only completion can retire every

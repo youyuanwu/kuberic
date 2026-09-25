@@ -328,6 +328,8 @@ fn configuration_command() -> EnsureConfiguration {
         primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
         retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     }
 }
 
@@ -365,6 +367,8 @@ fn real_configuration_command() -> EnsureConfiguration {
         primary_write_status: AccessStatus::ReconfigurationPending,
         current_only: false,
         retire_build_ids: Vec::new(),
+        switchover_handoff: None,
+        retire_switchover_preparation_ids: Vec::new(),
     }
 }
 

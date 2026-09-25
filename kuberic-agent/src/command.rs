@@ -43,6 +43,8 @@ pub(crate) fn is_access_only_configuration(
         && command.current_epoch == state.highest_epoch
         && command.failover_safe_lsn.is_none()
         && command.retire_build_ids.is_empty()
+        && command.switchover_handoff.is_none()
+        && command.retire_switchover_preparation_ids.is_empty()
         && command
             .current_configuration
             .members
@@ -132,7 +134,9 @@ fn admit_configuration_with_replay(
                 "failover command requires a non-negative election-safe LSN".into(),
             ));
         }
-        TransitionKind::Bootstrap | TransitionKind::Replacement
+        TransitionKind::Bootstrap
+        | TransitionKind::Replacement
+        | TransitionKind::PlannedSwitchover
             if command.failover_safe_lsn.is_some() =>
         {
             return Err(AgentError::CommandRejected(
@@ -143,7 +147,7 @@ fn admit_configuration_with_replay(
     }
     let transition_primary_grant = matches!(
         command.transition_kind,
-        TransitionKind::Replacement | TransitionKind::Failover
+        TransitionKind::Replacement | TransitionKind::Failover | TransitionKind::PlannedSwitchover
     ) && !command.current_only
         && state.current_configuration.as_ref() == command.previous_configuration.as_ref()
         && command.current_configuration.primary_id == identity.replica_id
@@ -179,10 +183,23 @@ fn admit_configuration_with_replay(
                 "replacement current-only completion must retire its build".into(),
             ));
         }
+        if command.transition_kind == TransitionKind::PlannedSwitchover
+            && command.retire_switchover_preparation_ids.is_empty()
+        {
+            return Err(AgentError::CommandRejected(
+                "planned switchover current-only completion must retire preparation".into(),
+            ));
+        }
     } else {
         if !command.retire_build_ids.is_empty() {
             return Err(AgentError::CommandRejected(
                 "build retirement is valid only for current-only completion".into(),
+            ));
+        }
+        if !command.retire_switchover_preparation_ids.is_empty() {
+            return Err(AgentError::CommandRejected(
+                "switchover preparation retirement is valid only for current-only completion"
+                    .into(),
             ));
         }
         validate_transition_relationship(
@@ -192,6 +209,40 @@ fn admit_configuration_with_replay(
             &command.effective_policy,
         )
         .map_err(|error| AgentError::CommandRejected(error.to_string()))?;
+    }
+    if command.transition_kind == TransitionKind::PlannedSwitchover {
+        let handoff = command.switchover_handoff.as_ref().ok_or_else(|| {
+            AgentError::CommandRejected(
+                "planned switchover authority requires a handoff certificate".into(),
+            )
+        })?;
+        if command
+            .previous_configuration
+            .as_ref()
+            .is_some_and(|configuration| configuration.primary_id != handoff.source.replica_id)
+            || !command
+                .current_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == handoff.source)
+            || !command
+                .current_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == handoff.target)
+            || (command.current_configuration.primary_id != handoff.source.replica_id
+                && command.current_configuration.primary_id != handoff.target.replica_id)
+        {
+            return Err(AgentError::CommandRejected(
+                "planned switchover handoff differs from configuration authority".into(),
+            ));
+        }
+    } else if command.switchover_handoff.is_some()
+        || !command.retire_switchover_preparation_ids.is_empty()
+    {
+        return Err(AgentError::CommandRejected(
+            "non-switchover command contains switchover evidence".into(),
+        ));
     }
     let admitted = AdmittedAuthority {
         local_identity: identity.clone(),

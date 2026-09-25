@@ -81,6 +81,7 @@ fn transition_status(
             election_lsn: (kind == TransitionKind::Failover).then_some(100),
             build_id,
             repair: None,
+            switchover: None,
         }),
         ..stable_status(previous.clone(), effective_policy)
     }
@@ -245,6 +246,7 @@ fn generated_report_sets_never_validate_two_granted_writers() {
                     replicas: replica_set_size,
                     image: "example:v1".to_string(),
                     failover_delay_seconds: effective_policy.failover_delay_seconds,
+                    switchover: None,
                 },
                 status: stable_status(configuration.clone(), effective_policy.clone()),
                 replicas,

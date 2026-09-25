@@ -308,6 +308,7 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid: "resource-1".into(),
         target: Some(identity().into()),
+        expected_process_session_id: report.process_session_id.clone(),
         command: Some(
             proto::execute_command_request::Command::InitializeAgentStore(
                 proto::InitializeAgentStoreCommand {
@@ -346,6 +347,15 @@ async fn services_bind_separate_listeners_require_credentials_and_report_readine
     initialize
         .metadata_mut()
         .insert("authorization", "Bearer secret".parse().unwrap());
+    let mut stale = Request::new(proto::ExecuteCommandRequest {
+        expected_process_session_id: "stale-session".to_string(),
+        ..initialize.get_ref().clone()
+    });
+    *stale.metadata_mut() = initialize.metadata().clone();
+    assert_eq!(
+        client.execute(stale).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
     let response = client.execute(initialize).await.unwrap().into_inner();
     assert_eq!(response.observation.unwrap().report_sequence, 2);
 
@@ -428,6 +438,7 @@ async fn fresh_storage_reports_uninitialized_and_creates_exact_bootstrap_identit
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
         resource_uid: "resource-1".into(),
         target: Some(identity().into()),
+        expected_process_session_id: report.process_session_id.clone(),
         command: Some(
             proto::execute_command_request::Command::InitializeAgentStore(
                 proto::InitializeAgentStoreCommand {
@@ -453,6 +464,15 @@ async fn fresh_storage_reports_uninitialized_and_creates_exact_bootstrap_identit
     initialize.metadata_mut().insert(
         "authorization",
         format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    let mut stale = Request::new(proto::ExecuteCommandRequest {
+        expected_process_session_id: "stale-session".to_string(),
+        ..initialize.get_ref().clone()
+    });
+    *stale.metadata_mut() = initialize.metadata().clone();
+    assert_eq!(
+        client.execute(stale).await.unwrap_err().code(),
+        Code::FailedPrecondition
     );
     client.execute(initialize).await.unwrap();
     initialized_rx

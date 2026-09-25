@@ -157,6 +157,11 @@ impl InitializationService {
         }
         let envelope = normalize_execute_request(request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if envelope.expected_process_session_id != *self.session.id() {
+            return Err(Status::failed_precondition(
+                "command targets a stale agent process session",
+            ));
+        }
         let ProtocolCommand::InitializeAgentStore(command) = envelope.command else {
             return Err(Status::failed_precondition(
                 "fresh storage accepts only InitializeAgentStore",
@@ -185,6 +190,7 @@ impl InitializationService {
             election_lsn: None,
             build_id: None,
             repair: None,
+            switchover: None,
         };
         let authority = command.provisioning.as_ref().map_or(
             InitializationAuthority::Bootstrap(&transition),
@@ -575,6 +581,11 @@ where
     ) -> std::result::Result<proto::ExecuteCommandResponse, Status> {
         let command = normalize_execute_request(request)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if command.expected_process_session_id != *self.reporter.session().id() {
+            return Err(Status::failed_precondition(
+                "command targets a stale agent process session",
+            ));
+        }
         let state = self.store.load_state().await.map_err(status_from_agent)?;
         if command.resource_uid != state.identity.resource_uid
             || command.target != state.identity.local_identity
@@ -606,6 +617,11 @@ where
                     .ensure_configuration(*command)
                     .await
                     .map_err(status_from_agent)?;
+            }
+            ProtocolCommand::PrepareSwitchover(_) => {
+                return Err(Status::failed_precondition(
+                    "planned switchover preparation is not enabled",
+                ));
             }
             ProtocolCommand::EnsureReplicaBuild(command) => {
                 if let (Some(authority), Some(source_session_id)) =
