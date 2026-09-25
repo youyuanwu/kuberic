@@ -931,11 +931,7 @@ impl DefaultReplicatorInner {
             let mut replicator = self.replicator.lock().await;
             for witness in &committed.current_only_write_quorum {
                 if witness.identity != self.identity {
-                    replicator.register_peer_session(
-                        witness.identity.clone(),
-                        witness.process_session_id.clone(),
-                    )?;
-                    replicator.observe_secondary_removal(witness)?;
+                    replicator.restore_committed_secondary_removal(witness)?;
                 }
             }
         }

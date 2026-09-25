@@ -639,6 +639,14 @@ pub struct ReplicaCleanupIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct ReplacementCleanup {
+    pub resource_uid: ResourceUid,
+    pub target: ReplicaIdentity,
+    pub resources: ReplicaCleanupIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 /// Immutable authority for one highest-ID committed secondary removal.
 pub struct SecondaryScaleDownIntent {
     pub operation_id: OperationId,
@@ -853,7 +861,7 @@ pub struct AcceptedStatus {
     #[serde(default)]
     pub last_switchover: Option<PlannedSwitchoverReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_replacement: Option<ReplicaIdentity>,
+    pub last_replacement: Option<ReplacementCleanup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_scale_down_cleanup: Option<SecondaryScaleDownCleanup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

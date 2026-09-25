@@ -331,6 +331,14 @@ fn removal_evidence(
 }
 
 async fn converge_removal(runtime: &PodRuntime, sequence: &mut u64) -> AdmittedAuthority {
+    converge_removal_with_peer_restart(runtime, sequence, false).await
+}
+
+async fn converge_removal_with_peer_restart(
+    runtime: &PodRuntime,
+    sequence: &mut u64,
+    restart_peer: bool,
+) -> AdmittedAuthority {
     use kuberic_protocol::types::SecondaryRemovalStage;
     let preparation = runtime.snapshot().await.prepared_secondary_removal.unwrap();
     let intent = preparation.intent.clone();
@@ -444,6 +452,50 @@ async fn converge_removal(runtime: &PodRuntime, sequence: &mut u64) -> AdmittedA
                 RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(fresher)),
             )
             .await;
+            if restart_peer {
+                let session = kuberic_protocol::types::ProcessSessionId::new("restarted-peer");
+                recovery_action(
+                    runtime,
+                    sequence,
+                    RuntimeEffectAction::RegisterPeerSession {
+                        identity: witness.identity.clone(),
+                        session: session.clone(),
+                    },
+                )
+                .await;
+                assert!(!runtime.snapshot().await.catch_up_complete);
+                for stale in [
+                    RuntimeEffectAction::RegisterPeerSession {
+                        identity: witness.identity.clone(),
+                        session: witness.process_session_id.clone(),
+                    },
+                    RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness.clone())),
+                    RuntimeEffectAction::ObserveReplicationAck {
+                        acknowledgement: Box::new(session_ack(
+                            &admitted,
+                            witness.identity.clone(),
+                            100,
+                        )),
+                        session: witness.process_session_id.clone(),
+                    },
+                ] {
+                    assert!(
+                        runtime
+                            .apply_effect(effect(*sequence, stale))
+                            .await
+                            .is_err()
+                    );
+                    assert!(!runtime.snapshot().await.catch_up_complete);
+                }
+                let fresh = restarted_removal_peer(&admitted, witness, session).await;
+                recovery_action(
+                    runtime,
+                    sequence,
+                    RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(fresh)),
+                )
+                .await;
+                assert!(runtime.snapshot().await.catch_up_complete);
+            }
         }
     }
     let committed = kuberic_protocol::types::SecondaryScaleDownCleanup {
@@ -476,6 +528,203 @@ async fn converge_removal(runtime: &PodRuntime, sequence: &mut u64) -> AdmittedA
     )
     .await;
     admitted
+}
+
+async fn restarted_removal_peer(
+    authority: &AdmittedAuthority,
+    frozen: &kuberic_protocol::types::SecondaryRemovalWitness,
+    session: kuberic_protocol::types::ProcessSessionId,
+) -> kuberic_protocol::types::SecondaryRemovalWitness {
+    use kuberic_agent::coordinator::Coordinator;
+    use kuberic_agent::sqlite_store::SqliteStore;
+    use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
+    use kuberic_agent::store::AgentStore;
+    use kuberic_protocol::types::{InitializationId, PodUid, PvcUid, SecondaryRemovalStage};
+
+    let mut authority = authority.clone();
+    authority.local_identity = frozen.identity.clone();
+    let evidence = authority.secondary_removal.clone().unwrap();
+    let intent = &evidence.preparation.intent;
+    let mut state = AgentState::new(StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: intent.resource_uid.clone(),
+        local_identity: frozen.identity.clone(),
+        pod_uid: PodUid::new(frozen.identity.instance_id.as_str()),
+        pvc_uid: PvcUid::new("retained-peer-pvc"),
+        initialization_id: InitializationId::new("retained-peer"),
+        effective_policy: intent.previous_policy.clone(),
+    });
+    state.current_configuration = Some(authority.current_configuration.clone());
+    state.highest_epoch = authority.current_configuration.epoch;
+    state.role = ReplicaRole::ActiveSecondary;
+    state.admitted_policy = Some(intent.current_policy.clone());
+    state.secondary_removal_evidence = Some(evidence.clone());
+    state.next_effect_sequence = 3;
+    let directory = tempfile::tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    store.admit(&authority).await.unwrap();
+    store
+        .record_replication_progress(&ReplicationProgress {
+            fence: authority.fence(),
+            verified_lsn: frozen.verified_replication_lsn,
+        })
+        .await
+        .unwrap();
+    let mut reopened = None;
+    for restart in [false, true] {
+        let runtime = Arc::new(PodRuntime::new(
+            frozen.identity.clone(),
+            Arc::new(TestApplication::default()),
+            Arc::new(SqliteStore::open_existing(&path, None).unwrap()),
+        ));
+        runtime
+            .reconstruct(
+                OpenMode::Existing,
+                ReplicaRole::ActiveSecondary,
+                AccessStatus::Granted,
+                AccessStatus::NotPrimary,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .snapshot()
+                .await
+                .accepted_secondary_removal
+                .is_none()
+        );
+        if restart {
+            reopened = Some(runtime);
+        } else {
+            runtime.abort();
+        }
+    }
+    let runtime = reopened.unwrap();
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.authority, Some(authority.clone()));
+    let mut fresh = frozen.clone();
+    fresh.process_session_id = session;
+    fresh.report_sequence = 1;
+    fresh.verified_replication_lsn = snapshot.verified_replication_lsn.unwrap();
+    let mut committed = removal_fixture::cleanup(intent);
+    committed.evidence = evidence.clone();
+    for witness in &mut committed.current_only_write_quorum {
+        witness.verified_replication_lsn = evidence.preparation.boundary_lsn;
+    }
+    let primary = committed
+        .current_only_write_quorum
+        .iter()
+        .find(|w| w.identity == intent.primary)
+        .unwrap();
+    let mut sequence = 1;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::RegisterPeerSession {
+            identity: primary.identity.clone(),
+            session: primary.process_session_id.clone(),
+        },
+    )
+    .await;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(primary.clone())),
+    )
+    .await;
+    let coordinator = Coordinator::new(store.clone(), runtime);
+    coordinator
+        .accept_secondary_removal_commit(kuberic_protocol::command::AcceptSecondaryRemovalCommit {
+            operation_id: intent
+                .command_operation_id(SecondaryRemovalStage::AcceptCommit, &frozen.identity),
+            target: frozen.identity.clone(),
+            committed: committed.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load_state().await.unwrap().accepted_secondary_removal,
+        Some(committed)
+    );
+    fresh
+}
+
+#[tokio::test]
+async fn removal_commit_replay_after_retained_peer_restart_uses_live_session_credit() {
+    let intent = removal_fixture::intent(&[1, 2, 3], 1);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let runtime = open_removal_member(
+        &intent,
+        intent.primary.clone(),
+        Arc::new(TestApplication::default()),
+        store.clone(),
+    )
+    .await;
+    let mut sequence = 5;
+    recovery_action(&runtime, &mut sequence, prepare_removal(&intent)).await;
+    let authority = converge_removal_with_peer_restart(&runtime, &mut sequence, true).await;
+    let committed = runtime.snapshot().await.accepted_secondary_removal.unwrap();
+    assert_eq!(
+        store.load_secondary_removal_commit().await.unwrap(),
+        Some(committed.clone())
+    );
+    runtime.restore_authority().await.unwrap();
+    assert_eq!(
+        runtime.snapshot().await.accepted_secondary_removal,
+        Some(committed.clone())
+    );
+    let pending = runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("fresh-after-peer-restart"),
+            data: Bytes::from_static(b"fresh"),
+        })
+        .await
+        .unwrap();
+    let peer = intent.current_configuration.members[1].identity.clone();
+    let stale = &committed.current_only_write_quorum[1];
+    assert!(
+        runtime
+            .apply_effect(effect(
+                sequence,
+                RuntimeEffectAction::ObserveReplicationAck {
+                    acknowledgement: Box::new(session_ack(&authority, peer.clone(), 1)),
+                    session: stale.process_session_id.clone(),
+                }
+            ))
+            .await
+            .is_err()
+    );
+    assert_eq!(runtime.snapshot().await.committed_lsn, 0);
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::ObserveReplicationAck {
+            acknowledgement: Box::new(session_ack(&authority, peer, 1)),
+            session: kuberic_protocol::types::ProcessSessionId::new("restarted-peer"),
+        },
+    )
+    .await;
+    assert_eq!(pending.committed().await.unwrap().lsn, 1);
+}
+
+fn session_ack(
+    authority: &AdmittedAuthority,
+    receiver: ReplicaIdentity,
+    lsn: i64,
+) -> kuberic_runtime_internal::transport::ReplicationAck {
+    kuberic_runtime_internal::transport::ReplicationAck {
+        sender: authority.primary_identity().clone(),
+        receiver,
+        epoch: authority.current_configuration.epoch,
+        previous_configuration_id: authority.fence().previous_configuration_id,
+        current_configuration_id: authority.current_configuration.configuration_id.clone(),
+        received_lsn: lsn,
+        applied_lsn: lsn,
+        committed_lsn: 0,
+    }
 }
 
 #[tokio::test]

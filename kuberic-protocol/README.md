@@ -142,3 +142,10 @@ published only after that proof; it never starts ordinary failover or replacemen
 
 See the [level-triggered operator guide](../docs/features/kuberic/level-triggered-operator.md)
 for the complete operational contract.
+
+Replacement acceptance atomically records `lastReplacement` with the excluded
+exact identity and frozen Pod, PVC, and endpoint names/UIDs. This is one pending
+cleanup obligation, not an overwriteable history slot. Exact endpoint/Pod/PVC
+absence clears it before another operation (including replacement/provisioning)
+can start. Finalizers, lost delete replies, and controller restarts retain the
+receipt; same-name replacement resources never inherit its deletion authority.

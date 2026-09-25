@@ -493,6 +493,364 @@ async fn exact_cleanup_survives_restart_lost_delete_reply_and_finalizers() {
 }
 
 #[tokio::test]
+async fn published_removal_commit_survives_retained_peer_session_restart() {
+    for id in [1, 2] {
+        let api = Arc::new(InMemoryClusterApi::new(fixture(3, 2)));
+        let frozen = loop {
+            let (raw, plan) = next_plan(&api).await;
+            if let Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(c),
+            } = plan
+                && c.target.replica_id.value() == id
+            {
+                assert_eq!(
+                    raw.set
+                        .status
+                        .unwrap()
+                        .authority
+                        .secondary_scale_down_cleanup,
+                    Some(c.committed.clone())
+                );
+                break c.committed;
+            }
+            tick(&api).await;
+        };
+        let mut raw = api.observation().await;
+        let key = ReplicaObservationKey::new(
+            ReplicaId::new(id),
+            ReplicaInstanceId::new(format!("pod-uid-{id}")),
+        );
+        let RawAgentObservation::Report(report) = raw.agents.get_mut(&key).unwrap() else {
+            unreachable!()
+        };
+        report.process_session_id = format!("restarted-{id}");
+        report.report_sequence = 1;
+        let restarted = Arc::new(InMemoryClusterApi::new(raw));
+        let (_, plan) = next_plan(&restarted).await;
+        assert!(matches!(plan, Plan::Execute {
+            command: ProtocolCommand::AcceptSecondaryRemovalCommit(c)
+        } if c.target.replica_id.value() == id && c.committed == frozen));
+        finish(&restarted).await;
+        let raw = restarted.observation().await;
+        let receipt = raw
+            .set
+            .status
+            .unwrap()
+            .authority
+            .last_secondary_removal
+            .unwrap();
+        assert_eq!(receipt.committed(), frozen);
+        let RawAgentObservation::Report(primary) = &raw.agents
+            [&ReplicaObservationKey::new(ReplicaId::new(1), ReplicaInstanceId::new("pod-uid-1"))]
+        else {
+            unreachable!()
+        };
+        assert_eq!(primary.write_status, proto::AccessStatus::Granted as i32);
+    }
+}
+
+fn replacement_at_commit() -> (RawObservation, ReplicaIdentity, ReplicaIdentity) {
+    let mut raw = fixture(3, 3);
+    let status = &mut raw.set.status.as_mut().unwrap().authority;
+    let previous = status.topology.as_ref().unwrap().configuration.clone();
+    let old = previous.members[1].identity.clone();
+    let new = ReplicaIdentity {
+        replica_id: old.replica_id,
+        instance_id: ReplicaInstanceId::new("replacement-pod"),
+        agent_generation: derive_agent_generation(&derive_initialization_id(
+            &ResourceUid::new(UID),
+            old.replica_id,
+            &PodUid::new("replacement-pod"),
+            &PvcUid::new("replacement-pvc"),
+        )),
+    };
+    let mut members = previous.members.clone();
+    members[1].identity = new.clone();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 2),
+        previous.primary_id,
+        members,
+        previous.write_quorum,
+    );
+    let transition_id = derive_transition_id(
+        &ResourceUid::new(UID),
+        TransitionKind::Replacement,
+        &current.configuration_id,
+    );
+    status.transition = Some(TransitionIntent {
+        transition_id: transition_id.clone(),
+        kind: TransitionKind::Replacement,
+        spec_generation: 2,
+        effective_policy: status.effective_policy.clone().unwrap(),
+        previous_configuration_id: Some(previous.configuration_id),
+        current_configuration: current.clone(),
+        election_lsn: None,
+        build_id: Some(OperationId::new("first-replacement")),
+        repair: None,
+        switchover: None,
+        secondary_scale_down: None,
+        secondary_removal_evidence: None,
+    });
+    let mut pod = raw.pods[1].clone();
+    pod.metadata.name = Some("db-replacement".into());
+    pod.metadata.uid = Some(new.instance_id.to_string());
+    pod.metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .insert(INSTANCE_LABEL.into(), new.instance_id.to_string());
+    pod.spec.as_mut().unwrap().volumes.as_mut().unwrap()[0]
+        .persistent_volume_claim
+        .as_mut()
+        .unwrap()
+        .claim_name = "db-replacement-data".into();
+    raw.pods.push(pod);
+    let mut pvc = raw.pvcs[1].clone();
+    pvc.metadata.name = Some("db-replacement-data".into());
+    pvc.metadata.uid = Some("replacement-pvc".into());
+    pvc.metadata
+        .labels
+        .as_mut()
+        .unwrap()
+        .insert(INSTANCE_LABEL.into(), new.instance_id.to_string());
+    raw.pvcs.push(pvc);
+    let mut endpoint = raw.services[1].clone();
+    endpoint.metadata.name = Some(derive_replica_endpoint_name(&ResourceUid::new(UID), &new));
+    endpoint.metadata.uid = Some("replacement-endpoint".into());
+    endpoint.spec.as_mut().unwrap().selector = Some(BTreeMap::from([(
+        INSTANCE_LABEL.into(),
+        new.instance_id.to_string(),
+    )]));
+    raw.services.push(endpoint);
+    raw.agents.remove(&ReplicaObservationKey::new(
+        old.replica_id,
+        old.instance_id.clone(),
+    ));
+    for member in &current.members {
+        let mut report = initialized_report(member.identity.clone(), current.clone());
+        report.replica_id = member.identity.replica_id.value();
+        report.pod_uid = member.identity.instance_id.to_string();
+        report.pvc_uid = if member.identity == new {
+            "replacement-pvc".into()
+        } else {
+            format!("pvc-uid-{}", member.identity.replica_id)
+        };
+        report.process_session_id = format!("replacement-session-{}", member.identity.replica_id);
+        report.role = if member.role == ReplicaRole::Primary {
+            proto::ReplicaRole::Primary as i32
+        } else {
+            proto::ReplicaRole::ActiveSecondary as i32
+        };
+        report.write_status = if member.role == ReplicaRole::Primary {
+            proto::AccessStatus::Granted as i32
+        } else {
+            proto::AccessStatus::NotPrimary as i32
+        };
+        report.retained_operation_id = format!(
+            "{transition_id}:current-only:{}",
+            member.identity.replica_id
+        );
+        raw.agents.insert(
+            ReplicaObservationKey::new(
+                member.identity.replica_id,
+                member.identity.instance_id.clone(),
+            ),
+            RawAgentObservation::Report(Box::new(report)),
+        );
+    }
+    (raw, old, new)
+}
+
+#[tokio::test]
+async fn consecutive_replacement_failures_serialize_frozen_cleanup_across_restarts() {
+    let (raw, old, new) = replacement_at_commit();
+    let mut api = Arc::new(InMemoryClusterApi::new(raw));
+    let receipt = loop {
+        tick(&api).await;
+        if let Some(receipt) = api
+            .observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .last_replacement
+        {
+            assert_eq!(receipt.target, old);
+            break receipt;
+        }
+    };
+    let healthy = api.observation().await;
+    let mut failed = healthy.clone();
+    let RawAgentObservation::Report(report) = failed
+        .agents
+        .get_mut(&ReplicaObservationKey::new(
+            new.replica_id,
+            new.instance_id.clone(),
+        ))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    report.reported_fault = proto::FaultType::Permanent as i32;
+    api.set_observation(failed).await;
+    for (resource, identity) in [
+        (ScaleDownResource::Endpoint, &receipt.resources.endpoint),
+        (ScaleDownResource::Pod, &receipt.resources.pod),
+        (ScaleDownResource::Pvc, &receipt.resources.pvc),
+    ] {
+        let mut raw = api.observation().await;
+        metadata(&mut raw, resource, identity.name()).finalizers = Some(vec!["test/hold".into()]);
+        api = Arc::new(InMemoryClusterApi::new(raw));
+        for _ in 0..3 {
+            let (_, effects) = tick(&api).await;
+            assert!(
+                matches!(effects.as_slice(), [EffectRecord::DeleteScaleDownResource { resource: r, .. }] if *r == resource)
+            );
+            let status = api.observation().await.set.status.unwrap().authority;
+            assert_eq!(status.last_replacement, Some(receipt.clone()));
+            assert!(status.provisioning.is_none() && status.transition.is_none());
+        }
+        let mut raw = api.observation().await;
+        metadata(&mut raw, resource, identity.name()).finalizers = None;
+        api.set_observation(raw).await;
+        api.lose_next_delete_reply().await;
+        assert_eq!(tick(&api).await.0, ReconcileKind::ObservationStale);
+        api = Arc::new(InMemoryClusterApi::new(api.observation().await));
+    }
+    tick(&api).await;
+    assert!(
+        api.observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .last_replacement
+            .is_none()
+    );
+    let raw = api.observation().await;
+    assert!(
+        raw.pods
+            .iter()
+            .any(|p| p.uid().as_deref() == Some(new.instance_id.as_str()))
+    );
+    assert!(
+        raw.pvcs
+            .iter()
+            .any(|p| p.uid().as_deref() == Some("replacement-pvc"))
+    );
+    assert!(
+        raw.services
+            .iter()
+            .any(|s| s.uid().as_deref() == Some("replacement-endpoint"))
+    );
+    assert!(
+        !raw.pods
+            .iter()
+            .any(|p| p.uid().as_deref() == Some(old.instance_id.as_str()))
+    );
+    assert!(
+        !raw.pvcs
+            .iter()
+            .any(|p| p.uid().as_deref() == Some("pvc-uid-2"))
+    );
+    assert!(
+        !raw.services
+            .iter()
+            .any(|s| s.uid().as_deref() == Some("endpoint-2"))
+    );
+    let (_, plan) = next_plan(&api).await;
+    assert!(
+        matches!(plan, Plan::Apply { changes } if matches!(changes.as_slice(),
+        [KubernetesChange::EnsureReplacementScaffolding { replacing, .. }] if replacing == &new))
+    );
+}
+
+#[tokio::test]
+async fn replacement_cleanup_does_not_adopt_churned_uids_or_list_absence() {
+    for resource in [
+        ScaleDownResource::Endpoint,
+        ScaleDownResource::Pod,
+        ScaleDownResource::Pvc,
+    ] {
+        let (raw, _, new) = replacement_at_commit();
+        let api = Arc::new(InMemoryClusterApi::new(raw));
+        let (observed, change) = at_delete(&api, resource).await;
+        let KubernetesChange::DeleteScaleDownResource {
+            name,
+            uid,
+            resource_version,
+            ..
+        } = change
+        else {
+            unreachable!()
+        };
+        let frozen = observed
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .last_replacement
+            .clone()
+            .unwrap();
+        let kind = match resource {
+            ScaleDownResource::Endpoint => "Service",
+            ScaleDownResource::Pod => "Pod",
+            ScaleDownResource::Pvc => "PVC",
+        };
+        api.fail_exact_lookup(format!("{kind}/{name}"), Some("unavailable".into()))
+            .await;
+        assert_eq!(tick(&api).await.0, ReconcileKind::Waiting);
+        assert_eq!(
+            api.observation()
+                .await
+                .set
+                .status
+                .unwrap()
+                .authority
+                .last_replacement,
+            Some(frozen.clone())
+        );
+        api.fail_exact_lookup(format!("{kind}/{name}"), None).await;
+        let mut raw = api.observation().await;
+        let meta = metadata(&mut raw, resource, &name);
+        meta.uid = Some("unrelated-recreated-resource".into());
+        meta.resource_version = Some("999".into());
+        meta.labels = None;
+        api.set_observation(raw).await;
+        assert!(matches!(
+            api.delete_scale_down_resource(&observed, resource, &name, &uid, &resource_version)
+                .await,
+            Err(ControllerError::ObservationStale)
+        ));
+        let restarted = Arc::new(InMemoryClusterApi::new(api.observation().await));
+        finish(&restarted).await;
+        let mut raw = restarted.observation().await;
+        assert_eq!(
+            metadata(&mut raw, resource, &name).uid.as_deref(),
+            Some("unrelated-recreated-resource")
+        );
+        assert!(raw.set.status.unwrap().authority.last_replacement.is_none());
+        assert!(
+            raw.pods
+                .iter()
+                .any(|p| p.uid().as_deref() == Some(new.instance_id.as_str()))
+        );
+        assert!(
+            raw.pvcs
+                .iter()
+                .any(|p| p.uid().as_deref() == Some("replacement-pvc"))
+        );
+        assert!(!restarted.effects().await.iter().any(|e| matches!(
+            e,
+            EffectRecord::DeleteScaffolding { .. } | EffectRecord::EnsureReplacement(_)
+        )));
+    }
+}
+
+#[tokio::test]
 async fn same_name_replacements_and_rv_races_never_acquire_cleanup_authority() {
     for resource in [
         ScaleDownResource::Endpoint,

@@ -181,6 +181,14 @@ impl QuorumTracker {
         &mut self,
         witness: &SecondaryRemovalWitness,
     ) -> Result<()> {
+        if let Some(session) = self.sessions.get(&witness.identity)
+            && session != &witness.process_session_id
+        {
+            // The certificate authorizes the configuration, not obsolete
+            // session credit. Session registration erased that credit;
+            // catch-up now requires freshly verified current-session reports.
+            return Ok(());
+        }
         // A frozen commit certificate can arrive after fresher peer discovery.
         // Retain the newer verified credit, without replaying an older sequence.
         if self
@@ -188,6 +196,8 @@ impl QuorumTracker {
             .get(&witness.identity)
             .is_some_and(|current| {
                 current.process_session_id == witness.process_session_id
+                    && current.resource_uid == witness.resource_uid
+                    && current.role == witness.role
                     && current.epoch == witness.epoch
                     && current.current_configuration_id == witness.current_configuration_id
                     && current.previous_configuration_id == witness.previous_configuration_id
@@ -198,6 +208,19 @@ impl QuorumTracker {
             return Ok(());
         }
         self.observe_secondary_removal(witness)
+    }
+
+    pub(crate) fn restore_committed_secondary_removal(
+        &mut self,
+        witness: &SecondaryRemovalWitness,
+    ) -> Result<()> {
+        if !self.sessions.contains_key(&witness.identity) {
+            self.register_peer_session(
+                witness.identity.clone(),
+                witness.process_session_id.clone(),
+            )?;
+        }
+        self.observe_committed_secondary_removal(witness)
     }
 
     pub fn register_write(&mut self, lsn: Lsn) -> Result<oneshot::Receiver<Result<Lsn>>> {
@@ -491,4 +514,99 @@ fn has_quorum(
         .filter(|member| progress.get(&member.identity).copied().unwrap_or(0) >= lsn)
         .count()
         >= configuration.write_quorum as usize
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod removal_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_witness_cannot_revive_obsolete_credit_after_session_change() {
+        let intent = removal_fixture::intent(&[1, 2, 3], 1);
+        let authority = AdmittedAuthority {
+            local_identity: intent.primary.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: intent.current_configuration.clone(),
+            switchover_handoff: None,
+            secondary_removal: Some(removal_fixture::evidence(&intent)),
+        };
+        let mut tracker = QuorumTracker::default();
+        tracker.configure(authority, 10).unwrap();
+        tracker.record_verified_local_progress(10);
+        let mut frozen =
+            removal_fixture::witnesses(&intent, SecondaryRemovalStage::CurrentOnly)[1].clone();
+        frozen.verified_replication_lsn = 11;
+        assert!(
+            tracker
+                .observe_committed_secondary_removal(&frozen)
+                .is_err()
+        );
+        assert!(!tracker.catch_up_complete());
+        tracker
+            .restore_committed_secondary_removal(&frozen)
+            .unwrap();
+        assert!(tracker.catch_up_complete());
+        let session = ProcessSessionId::new("restarted");
+        tracker
+            .register_peer_session(frozen.identity.clone(), session.clone())
+            .unwrap();
+        tracker
+            .observe_committed_secondary_removal(&frozen)
+            .unwrap();
+        tracker
+            .restore_committed_secondary_removal(&frozen)
+            .unwrap();
+        assert!(
+            !tracker.catch_up_complete(),
+            "frozen authorization is not current-session credit"
+        );
+        let mut fresh = frozen.clone();
+        fresh.process_session_id = session;
+        fresh.report_sequence = 1;
+        fresh.verified_replication_lsn = 10;
+        for mutation in 0..6 {
+            let mut wrong = fresh.clone();
+            match mutation {
+                0 => {
+                    wrong.identity.agent_generation =
+                        kuberic_protocol::types::AgentGeneration::new("substitute")
+                }
+                1 => {
+                    wrong.current_configuration_id =
+                        kuberic_protocol::types::ConfigurationId::new("other")
+                }
+                2 => {
+                    wrong.previous_configuration_id =
+                        Some(intent.previous_configuration.configuration_id.clone())
+                }
+                3 => wrong.verified_replication_lsn = 9,
+                4 => wrong.resource_uid = kuberic_protocol::types::ResourceUid::new("other"),
+                _ => wrong.epoch.configuration_number += 1,
+            }
+            assert!(tracker.observe_secondary_removal(&wrong).is_err());
+            tracker
+                .observe_committed_secondary_removal(&frozen)
+                .unwrap();
+            assert!(!tracker.catch_up_complete());
+        }
+        tracker.observe_secondary_removal(&fresh).unwrap();
+        tracker
+            .observe_committed_secondary_removal(&frozen)
+            .unwrap();
+        assert!(tracker.catch_up_complete());
+        assert_eq!(tracker.witnesses.get(&fresh.identity), Some(&fresh));
+        assert!(
+            tracker
+                .register_peer_session(frozen.identity.clone(), frozen.process_session_id.clone())
+                .is_err()
+        );
+        assert!(tracker.observe_secondary_removal(&frozen).is_err());
+        assert_eq!(tracker.witnesses.get(&fresh.identity), Some(&fresh));
+    }
 }

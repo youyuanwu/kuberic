@@ -80,6 +80,10 @@ write-quorum witnesses, including the unchanged primary; ordinary client
 commits still require both PC and CC write quorums. Removal grants no PC/CC
 client writes. A separate accepted current-only certificate and verified
 catch-up gate the write regrant, including singleton recovery.
+Frozen quorum certificates remain immutable authorization evidence after a
+retained peer restarts. They cannot restore obsolete-session credit: acceptance
+uses freshly verified current-session progress for the exact reduced authority
+and prepared boundary. Old-session reports, ACKs, and registration still reject.
 
 Exact peer eviction after PC removal cancels retained windows and prevents a
 delayed session from reconnecting the excluded incarnation. Local retirement

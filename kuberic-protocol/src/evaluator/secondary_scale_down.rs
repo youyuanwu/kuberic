@@ -73,7 +73,7 @@ fn report<'a>(
     }
 }
 
-fn resources<'a>(
+pub(super) fn resources<'a>(
     snapshot: &'a ObservationSnapshot,
     target: &ReplicaIdentity,
 ) -> Option<&'a SecondaryScaleDownResourceObservation> {
@@ -85,7 +85,10 @@ fn resources<'a>(
     observations.next().is_none().then_some(result)
 }
 
-fn absent(identity: &CleanupResourceIdentity, observation: &ExactResourceObservation) -> bool {
+pub(super) fn absent(
+    identity: &CleanupResourceIdentity,
+    observation: &ExactResourceObservation,
+) -> bool {
     match (identity, observation) {
         (_, ExactResourceObservation::NotFound) => true,
         (
@@ -107,7 +110,10 @@ fn absent(identity: &CleanupResourceIdentity, observation: &ExactResourceObserva
     }
 }
 
-fn observed(identity: &CleanupResourceIdentity, observation: &ExactResourceObservation) -> bool {
+pub(super) fn observed(
+    identity: &CleanupResourceIdentity,
+    observation: &ExactResourceObservation,
+) -> bool {
     absent(identity, observation)
         || matches!((identity, observation),
             (CleanupResourceIdentity::Present { .. }, ExactResourceObservation::FrozenUidPresent { resource_version })
@@ -670,7 +676,7 @@ pub(super) fn transition(
     ))
 }
 
-fn delete(
+pub(super) fn delete(
     resource: ScaleDownResource,
     identity: &CleanupResourceIdentity,
     observation: &ExactResourceObservation,

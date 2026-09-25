@@ -5904,6 +5904,8 @@ fn bootstrap_report_cannot_claim_previous_configuration() {
 
 #[test]
 fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use kuberic_protocol::types::ReplacementCleanup;
     let accepted = configuration();
     let member = accepted
         .members
@@ -5987,11 +5989,11 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
     };
     let deletes = |plan: Plan| {
         matches!(plan, Plan::Apply { changes }
-        if changes.iter().any(|change| matches!(change, KubernetesChange::DeleteReplicaScaffolding { .. })))
+        if changes.iter().any(|change| matches!(change, KubernetesChange::DeleteScaleDownResource { .. })))
     };
     assert!(!deletes(evaluate(&snapshot, &enabled)));
     let retired_pod = PodUid::new("old-pod");
-    snapshot.status.last_replacement = Some(ReplicaIdentity {
+    let retired = ReplicaIdentity {
         replica_id: member.identity.replica_id,
         instance_id: ReplicaInstanceId::new(retired_pod.as_str()),
         agent_generation: derive_agent_generation(&derive_initialization_id(
@@ -6000,22 +6002,86 @@ fn replacement_cleanup_does_not_replace_a_healthy_accepted_incarnation() {
             &retired_pod,
             &PvcUid::new("old-pvc"),
         )),
+    };
+    let mut exact = replacement_resources(&snapshot.resource_uid, &retired);
+    exact.pvc = ExactResourceObservation::FrozenUidPresent {
+        resource_version: "1".into(),
+    };
+    snapshot.status.last_replacement = Some(ReplacementCleanup {
+        resource_uid: snapshot.resource_uid.clone(),
+        target: retired,
+        resources: exact.identity.clone(),
     });
+    snapshot.secondary_scale_down_resources.push(exact);
+    let mut wrong_storage = snapshot.status.clone();
+    wrong_storage
+        .last_replacement
+        .as_mut()
+        .unwrap()
+        .resources
+        .pvc = kuberic_protocol::types::CleanupResourceIdentity::Present {
+        name: "old-data".into(),
+        uid: "another-incarnations-storage".into(),
+    };
+    assert!(validate_status(&wrong_storage).is_err());
     assert!(deletes(evaluate(&snapshot, &enabled)));
-    let old = snapshot
+    let mut failed_again = snapshot.clone();
+    let AgentObservation::Report(report) = &mut failed_again
         .replicas
         .get_mut(&ReplicaObservationKey::new(
             member.identity.replica_id,
-            ReplicaInstanceId::new("orphan-old-pvc"),
+            member.identity.instance_id.clone(),
         ))
         .unwrap()
-        .kubernetes
-        .as_mut()
-        .unwrap();
-    old.pvc_uid = Some(PvcUid::new("same-name-different-uid"));
+        .agent
+    else {
+        unreachable!()
+    };
+    report.reported_fault = Some(kuberic_protocol::types::FaultType::Permanent);
+    assert!(
+        deletes(evaluate(&failed_again, &enabled)),
+        "a second replacement must not overtake the first cleanup obligation"
+    );
+    snapshot.secondary_scale_down_resources[0].pvc = ExactResourceObservation::ReplacementPresent {
+        uid: "same-name-different-uid".into(),
+        resource_version: "2".into(),
+    };
     assert!(!deletes(evaluate(&snapshot, &enabled)));
-    snapshot.status.last_replacement = Some(member.identity);
+    snapshot.status.last_replacement.as_mut().unwrap().target = member.identity;
     assert!(validate_status(&snapshot.status).is_err());
+}
+
+fn replacement_resources(
+    resource_uid: &ResourceUid,
+    target: &ReplicaIdentity,
+) -> kuberic_protocol::observation::SecondaryScaleDownResourceObservation {
+    use kuberic_protocol::observation::{
+        ExactResourceObservation, SecondaryScaleDownResourceObservation,
+    };
+    use kuberic_protocol::types::{
+        CleanupResourceIdentity, ReplicaCleanupIdentity, derive_replica_endpoint_name,
+    };
+    SecondaryScaleDownResourceObservation {
+        resource_uid: resource_uid.clone(),
+        target: target.clone(),
+        identity: ReplicaCleanupIdentity {
+            pod: CleanupResourceIdentity::Present {
+                name: "old".into(),
+                uid: target.instance_id.to_string(),
+            },
+            pvc: CleanupResourceIdentity::Present {
+                name: "old-data".into(),
+                uid: "old-pvc".into(),
+            },
+            endpoint: CleanupResourceIdentity::Present {
+                name: derive_replica_endpoint_name(resource_uid, target),
+                uid: "old-endpoint".into(),
+            },
+        },
+        pod: ExactResourceObservation::NotFound,
+        pvc: ExactResourceObservation::NotFound,
+        endpoint: ExactResourceObservation::NotFound,
+    }
 }
 
 #[test]
@@ -6168,7 +6234,24 @@ fn primary_failure_abandons_pre_cc_provisioning_and_fences_routing() {
 
 #[test]
 fn replacement_accepts_current_only_quorum_with_missing_target() {
-    let previous = configuration();
+    let configuration = configuration();
+    let mut members = configuration.members.clone();
+    let replacing = members
+        .iter_mut()
+        .find(|m| m.identity.replica_id != configuration.primary_id)
+        .unwrap();
+    replacing.identity.agent_generation = derive_agent_generation(&derive_initialization_id(
+        &ResourceUid::new("resource-uid"),
+        replacing.identity.replica_id,
+        &PodUid::new(replacing.identity.instance_id.as_str()),
+        &PvcUid::new("old-pvc"),
+    ));
+    let previous = ConfigurationDescriptor::new(
+        configuration.epoch,
+        configuration.primary_id,
+        members,
+        configuration.write_quorum,
+    );
     let replacing = previous
         .members
         .iter()
@@ -6230,6 +6313,11 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
         }),
         ..AcceptedStatus::default()
     };
+    let mut resources = replacement_resources(&snapshot.resource_uid, &replacing.identity);
+    resources.pvc = kuberic_protocol::observation::ExactResourceObservation::FrozenUidPresent {
+        resource_version: "held-by-finalizer".into(),
+    };
+    snapshot.secondary_scale_down_resources.push(resources);
     for member in current
         .members
         .iter()
@@ -6320,6 +6408,30 @@ fn replacement_accepts_current_only_quorum_with_missing_target() {
     });
     let accepted = accepted.expect("accepted replacement topology");
     snapshot.status = accepted;
+    let first_receipt = snapshot.status.last_replacement.clone().unwrap();
+    for _ in 0..3 {
+        snapshot.status =
+            serde_json::from_value(serde_json::to_value(&snapshot.status).unwrap()).unwrap();
+        assert!(matches!(evaluate(&snapshot, &EvaluationConfig::default()),
+            Plan::Apply { changes } if matches!(changes.as_slice(),
+                [KubernetesChange::DeleteScaleDownResource { resource: kuberic_protocol::command::ScaleDownResource::Pvc, uid, .. }]
+                if uid == "old-pvc")));
+        assert_eq!(
+            snapshot.status.last_replacement,
+            Some(first_receipt.clone())
+        );
+        assert!(snapshot.status.provisioning.is_none());
+    }
+    snapshot.secondary_scale_down_resources[0].pvc =
+        kuberic_protocol::observation::ExactResourceObservation::NotFound;
+    let Plan::Apply { changes } = evaluate(&snapshot, &EvaluationConfig::default()) else {
+        panic!("exact absence must clear the cleanup gate");
+    };
+    let KubernetesChange::PersistStatus { status } = changes[0].clone() else {
+        panic!("cleanup completion");
+    };
+    assert!(status.last_replacement.is_none());
+    snapshot.status = *status;
     snapshot.replicas.insert(
         ReplicaObservationKey::new(
             target.identity.replica_id,

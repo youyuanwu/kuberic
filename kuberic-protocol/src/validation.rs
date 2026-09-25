@@ -184,6 +184,14 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
         return Err(ValidationError::DesiredReplicasZero);
     }
     validate_status(&snapshot.status)?;
+    if snapshot
+        .status
+        .last_replacement
+        .as_ref()
+        .is_some_and(|cleanup| cleanup.resource_uid != snapshot.resource_uid)
+    {
+        return Err(ValidationError::InvalidReplacementCleanup);
+    }
     let removal = snapshot
         .status
         .transition
@@ -852,16 +860,35 @@ fn observation_key_string(key: &ReplicaObservationKey) -> String {
 
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
-    if let Some(retired) = &status.last_replacement
-        && (retired.replica_id.value() <= 0
-            || retired.instance_id.is_empty()
-            || retired.agent_generation.is_empty()
+    if let Some(cleanup) = &status.last_replacement
+        && (cleanup.target.replica_id.value() <= 0
+            || cleanup.target.instance_id.is_empty()
+            || cleanup.target.agent_generation.is_empty()
+            || cleanup.resource_uid.is_empty()
+            || status.provisioning.is_some()
+            || status.transition.is_some()
+            || status.secondary_scale_down_cleanup.is_some()
+            || [&cleanup.resources.pod, &cleanup.resources.pvc, &cleanup.resources.endpoint]
+                .iter()
+                .any(|r| r.name().is_empty()
+                    || matches!(r, crate::types::CleanupResourceIdentity::Present { uid, .. } if uid.is_empty()))
+            || matches!(&cleanup.resources.pod, crate::types::CleanupResourceIdentity::Present { uid, .. }
+                if uid != cleanup.target.instance_id.as_str())
+            || matches!(&cleanup.resources.pvc, crate::types::CleanupResourceIdentity::Present { uid, .. }
+                if crate::types::derive_agent_generation(&crate::types::derive_initialization_id(
+                    &cleanup.resource_uid,
+                    cleanup.target.replica_id,
+                    &crate::types::PodUid::new(cleanup.target.instance_id.as_str()),
+                    &crate::types::PvcUid::new(uid),
+                )) != cleanup.target.agent_generation)
+            || cleanup.resources.endpoint.name()
+                != crate::types::derive_replica_endpoint_name(&cleanup.resource_uid, &cleanup.target)
             || status.topology.as_ref().is_none_or(|topology| {
                 topology
                     .configuration
                     .members
                     .iter()
-                    .any(|member| member.identity == *retired)
+                    .any(|member| member.identity == cleanup.target)
             }))
     {
         return Err(ValidationError::InvalidReplacementCleanup);

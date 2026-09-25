@@ -27,22 +27,33 @@ pub(crate) fn requests(
     {
         return vec![(intent.target.clone(), intent.cleanup.clone(), true)];
     }
+    if let Some(cleanup) = &status.last_replacement {
+        return vec![(cleanup.target.clone(), cleanup.resources.clone(), true)];
+    }
     let Some(topology) = status.topology.as_ref() else {
         return Vec::new();
     };
-    if raw.set.spec.replicas == 0
-        || raw.set.spec.replicas as usize >= topology.configuration.members.len()
+    let target = if let Some(transition) = &status.transition {
+        topology.configuration.members.iter().find(|old| {
+            !transition
+                .current_configuration
+                .members
+                .iter()
+                .any(|new| new.identity == old.identity)
+        })
+    } else if raw.set.spec.replicas > 0
+        && (raw.set.spec.replicas as usize) < topology.configuration.members.len()
     {
-        return Vec::new();
-    }
-    let Some(target) = topology
-        .configuration
-        .members
-        .iter()
-        .filter(|m| m.role == ReplicaRole::ActiveSecondary)
-        .max_by_key(|m| m.identity.replica_id)
-        .map(|m| &m.identity)
-    else {
+        topology
+            .configuration
+            .members
+            .iter()
+            .filter(|m| m.role == ReplicaRole::ActiveSecondary)
+            .max_by_key(|m| m.identity.replica_id)
+    } else {
+        None
+    };
+    let Some(target) = target.map(|m| &m.identity) else {
         return Vec::new();
     };
     let resource_uid = ResourceUid::new(raw.set.uid().unwrap_or_default());
@@ -134,6 +145,7 @@ pub(crate) fn protected(
         .chain(status.secondary_scale_down_cleanup.iter().map(|c| &c.evidence.preparation.intent))
         .chain(status.last_secondary_removal.iter().map(|r| &r.evidence.preparation.intent))
         .flat_map(|intent| [&intent.cleanup.pod, &intent.cleanup.pvc, &intent.cleanup.endpoint])
+        .chain(status.last_replacement.iter().flat_map(|c| [&c.resources.pod, &c.resources.pvc, &c.resources.endpoint]))
         .any(|identity| resource_name == Some(name(identity))
             || matches!(identity, CleanupResourceIdentity::Present { uid, .. } if resource_uid == Some(uid.as_str())))
 }
