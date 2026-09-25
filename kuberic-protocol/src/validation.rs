@@ -199,6 +199,18 @@ pub fn validate_snapshot(snapshot: &ObservationSnapshot) -> Result<(), Validatio
             "resource UID mismatch",
         ));
     }
+    if snapshot
+        .status
+        .last_secondary_removal
+        .as_ref()
+        .is_some_and(|receipt| {
+            receipt.evidence.preparation.intent.resource_uid != snapshot.resource_uid
+        })
+    {
+        return Err(ValidationError::InvalidSecondaryScaleDown(
+            "completed removal resource UID mismatch",
+        ));
+    }
 
     if let Some(provisioning) = &snapshot.status.provisioning {
         let target = provisioning.target_identity(&snapshot.resource_uid);
@@ -452,18 +464,27 @@ fn validate_report_authority(
     snapshot: &ObservationSnapshot,
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
+    let completed = snapshot
+        .status
+        .last_secondary_removal
+        .as_ref()
+        .filter(|receipt| {
+            snapshot.status.topology.as_ref().is_some_and(|topology| {
+                topology.configuration == receipt.evidence.preparation.intent.current_configuration
+            })
+        })
+        .map(|receipt| receipt.committed());
+    let committed = snapshot
+        .status
+        .secondary_scale_down_cleanup
+        .as_ref()
+        .or(completed.as_ref());
     let removal = snapshot
         .status
         .transition
         .as_ref()
         .and_then(|transition| transition.secondary_scale_down.as_ref())
-        .or_else(|| {
-            snapshot
-                .status
-                .secondary_scale_down_cleanup
-                .as_ref()
-                .map(|cleanup| &cleanup.evidence.preparation.intent)
-        });
+        .or_else(|| committed.map(|cleanup| &cleanup.evidence.preparation.intent));
     for intent in [
         report
             .prepared_secondary_removal
@@ -510,16 +531,15 @@ fn validate_report_authority(
             .accepted_secondary_removal
             .as_ref()
             .is_some_and(|c| c.evidence.preparation.intent == *intent)
-        && snapshot.status.secondary_scale_down_cleanup.is_none()
+        && committed.is_none_or(|c| c.evidence.preparation.intent != *intent)
     {
         return Err(ValidationError::InvalidSecondaryScaleDown(
             "local acceptance cannot precede committed cluster topology",
         ));
     }
-    if let (Some(committed), Some(reported)) = (
-        snapshot.status.secondary_scale_down_cleanup.as_ref(),
-        report.accepted_secondary_removal.as_ref(),
-    ) && reported.evidence.preparation.intent == committed.evidence.preparation.intent
+    if let (Some(committed), Some(reported)) =
+        (committed, report.accepted_secondary_removal.as_ref())
+        && reported.evidence.preparation.intent == committed.evidence.preparation.intent
         && (reported.evidence != committed.evidence
             || reported.current_only_write_quorum != committed.current_only_write_quorum)
     {
@@ -530,7 +550,13 @@ fn validate_report_authority(
     if let Some(intent) = removal
         && report.current_configuration.as_ref() == Some(&intent.current_configuration)
         && (report.secondary_removal_evidence.is_none()
-            || (snapshot.status.transition.is_some()
+            || (snapshot
+                .status
+                .transition
+                .as_ref()
+                .is_some_and(|transition| {
+                    transition.secondary_scale_down.as_ref() == Some(intent)
+                })
                 && report.write_status == AccessStatus::Granted))
     {
         return Err(ValidationError::InvalidSecondaryScaleDown(
@@ -543,10 +569,8 @@ fn validate_report_authority(
         .as_ref()
         .and_then(|transition| transition.secondary_removal_evidence.as_ref())
         .or_else(|| {
-            snapshot
-                .status
-                .secondary_scale_down_cleanup
-                .as_ref()
+            committed
+                .filter(|cleanup| removal == Some(&cleanup.evidence.preparation.intent))
                 .map(|cleanup| &cleanup.evidence)
         });
     if let Some(evidence) = &report.secondary_removal_evidence
@@ -826,6 +850,22 @@ fn observation_key_string(key: &ReplicaObservationKey) -> String {
 
 /// Validates durable topology, provisioning, and active transition intent.
 pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
+    if let Some(receipt) = &status.last_secondary_removal {
+        validate_secondary_scale_down_cleanup(&receipt.committed())?;
+        let intent = &receipt.evidence.preparation.intent;
+        if status.secondary_scale_down_cleanup.is_some()
+            || status.topology.as_ref().is_none_or(|topology| {
+                topology.configuration.epoch < intent.current_configuration.epoch
+                    || (topology.configuration.epoch == intent.current_configuration.epoch
+                        && (topology.configuration != intent.current_configuration
+                            || status.effective_policy.as_ref() != Some(&intent.current_policy)))
+            })
+        {
+            return Err(ValidationError::InvalidSecondaryScaleDown(
+                "completed removal must bind accepted or superseded authority without cleanup",
+            ));
+        }
+    }
     if let Some(cleanup) = &status.secondary_scale_down_cleanup {
         validate_secondary_scale_down_cleanup(cleanup)?;
         let intent = &cleanup.evidence.preparation.intent;

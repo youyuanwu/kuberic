@@ -78,9 +78,26 @@ supplies none. `DeleteScaleDownResource` carries frozen name/UID and fresh resou
 version and is explicitly rejected by the production executor. Endpoint cleanup
 precedes exact Pod fencing; PVC cleanup requires authoritative Pod-UID absence.
 Same-name replacement UIDs are never adopted or deleted, including after the
-receipt is cleared. Unknown extra resources do not confer deletion authority.
+cleanup obligation is cleared. Unknown extra resources do not confer deletion authority.
 Existing status JSON defaults the optional fields to absent; absence never
 supplies scale-down authority.
+
+Installed configuration authority is not command completion: an exact pending
+PC/CC, current-only, or retirement command is replayed with its immutable evidence.
+New admissions precede installed-pending replays so catch-up cannot starve primary
+admission. Conflicting pending work is neither overwritten nor credited.
+
+Cleanup completion replaces the deletion obligation with one bounded
+`lastSecondaryRemoval` receipt containing only the immutable admission and
+current-only quorum proof (no retirement report). It authorizes retained-member
+convergence and local commit publication only while its exact reduced topology
+is accepted, never resource deletion or retirement. Late members first finish
+PC/CC, then current-only, with writes closed. Before another removal supersedes
+this proof, each retained member must have completed current-only evidence in
+the receipt or currently attest completed local acceptance; otherwise
+`ScaleDownRetainedMemberPending` waits for the late member. The next accepted
+removal replaces the receipt, not an accumulating history. The optional status
+field preserves restart recovery without re-authorizing cleanup of replacements.
 
 Scale-down progress projects stable reasons for preparation, previous read quorum
 (`ScaleDownPreviousReadQuorumUnavailable`), reduced write quorum and verified

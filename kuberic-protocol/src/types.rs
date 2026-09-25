@@ -781,6 +781,25 @@ pub struct SecondaryScaleDownCleanup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+/// Last completed removal's immutable convergence proof, never deletion authority.
+/// One receipt is retained; a later removal supersedes it only after lagging members settle.
+pub struct SecondaryRemovalReceipt {
+    pub evidence: SecondaryRemovalEvidence,
+    pub current_only_write_quorum: Vec<SecondaryRemovalWitness>,
+}
+
+impl SecondaryRemovalReceipt {
+    pub fn committed(&self) -> SecondaryScaleDownCleanup {
+        SecondaryScaleDownCleanup {
+            evidence: self.evidence.clone(),
+            current_only_write_quorum: self.current_only_write_quorum.clone(),
+            retirement: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ReplicaRepairIntent {
     pub operation_id: OperationId,
     pub target: ReplicaIdentity,
@@ -835,6 +854,8 @@ pub struct AcceptedStatus {
     pub last_switchover: Option<PlannedSwitchoverReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_scale_down_cleanup: Option<SecondaryScaleDownCleanup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_secondary_removal: Option<SecondaryRemovalReceipt>,
     pub conditions: Vec<StatusCondition>,
 }
 

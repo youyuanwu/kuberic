@@ -946,6 +946,51 @@ fn terminal_switchover_receipt_writer_process() {
 mod scale_down_model;
 
 #[test]
+fn scale_down_model_lost_replies_at_intent_pending_and_effect_boundaries() {
+    use kuberic_protocol::command::ProtocolCommand;
+    use kuberic_protocol::plan::Plan;
+    use kuberic_protocol::types::TransitionKind;
+    use scale_down_model::{CommandBoundary, Model};
+    let mut trace = Model::new(&[1, 2, 3], 1, 2);
+    let mut interrupted = 0;
+    for _ in 0..80 {
+        let plan = trace.plan();
+        if matches!(&plan, Plan::Execute { command } if matches!(command,
+            ProtocolCommand::EnsureConfiguration(c) if c.transition_kind == TransitionKind::SecondaryScaleDown)
+            || matches!(command, ProtocolCommand::RetireReplica(_)))
+        {
+            for boundary in [
+                CommandBoundary::Intent,
+                CommandBoundary::Pending,
+                CommandBoundary::Effect,
+            ] {
+                let mut replay = trace.clone();
+                replay.interrupt(plan.clone(), boundary);
+                replay.controller_restart();
+                replay.finish();
+                assert!(replay.inflight.is_empty(), "{boundary:?}");
+                assert!(replay.applied_effects.is_empty(), "{boundary:?}");
+                assert_eq!(replay.removed.len(), 1);
+                assert_eq!(replay.deletes.len(), 3);
+                let deletes = replay.deletes.clone();
+                replay.controller_restart();
+                replay.finish();
+                assert_eq!(replay.deletes, deletes);
+            }
+            interrupted += 1;
+        }
+        trace.apply(plan.clone());
+        if matches!(plan, Plan::Stable { .. }) {
+            break;
+        }
+    }
+    assert_eq!(
+        interrupted, 5,
+        "two PC/CC, two current-only, and retirement"
+    );
+}
+
+#[test]
 fn scale_down_model_desired_mutations_and_ambiguous_replies_at_every_boundary() {
     use kuberic_protocol::types::TransitionKind;
     use scale_down_model::Model;

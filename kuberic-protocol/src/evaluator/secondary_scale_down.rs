@@ -6,8 +6,9 @@ use crate::observation::{
     AgentReport, ExactResourceObservation, SecondaryScaleDownResourceObservation,
 };
 use crate::types::{
-    CleanupResourceIdentity, SecondaryRemovalEvidence, SecondaryRemovalStage,
-    SecondaryRemovalWitness, SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
+    CleanupResourceIdentity, SecondaryRemovalEvidence, SecondaryRemovalReceipt,
+    SecondaryRemovalStage, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
+    SecondaryScaleDownIntent,
 };
 use crate::validation::{
     validate_secondary_removal_evidence, validate_secondary_scale_down,
@@ -16,6 +17,16 @@ use crate::validation::{
 
 pub(super) fn active(snapshot: &ObservationSnapshot) -> bool {
     snapshot.status.secondary_scale_down_cleanup.is_some()
+        || snapshot
+            .status
+            .last_secondary_removal
+            .as_ref()
+            .is_some_and(|receipt| {
+                snapshot.status.topology.as_ref().is_some_and(|topology| {
+                    topology.configuration
+                        == receipt.evidence.preparation.intent.current_configuration
+                })
+            })
         || snapshot
             .status
             .transition
@@ -130,6 +141,27 @@ pub(super) fn begin(
     let policy = status.effective_policy.as_ref()?;
     if snapshot.desired.replicas >= policy.replica_set_size {
         return None;
+    }
+    if let Some(receipt) = &status.last_secondary_removal
+        && receipt.evidence.preparation.intent.current_configuration == *previous
+        && previous.members.iter().any(|member| {
+            !receipt
+                .current_only_write_quorum
+                .iter()
+                .any(|w| w.identity == member.identity)
+                && report(snapshot, &member.identity).is_none_or(|r| {
+                    !stable_member_report(r, member, previous)
+                        || r.prepared_secondary_removal.is_some()
+                        || r.accepted_secondary_removal.as_ref() != Some(&receipt.committed())
+                })
+        })
+    {
+        return Some(wait(
+            status,
+            "ScaleDownRetainedMemberPending",
+            "Settle late retained members before superseding their last removal proof",
+            config,
+        ));
     }
     let status = drift_status(snapshot, status.clone());
     if status
@@ -397,14 +429,15 @@ fn dispatch(
     current_only: bool,
 ) -> Option<Plan> {
     let intent = &evidence.preparation.intent;
-    // Admit available secondaries before the unchanged primary. Pending local
-    // catch-up does not prevent dispatch to the primary that supplies it.
+    // Admit all available members before replaying installed work, then resume
+    // the primary first so secondary catch-up cannot starve its source.
     let mut members = intent
         .current_configuration
         .members
         .iter()
         .collect::<Vec<_>>();
     members.sort_by_key(|m| (m.role == ReplicaRole::Primary, m.identity.replica_id));
+    let mut replay = None;
     for member in members {
         let Some(r) = report(snapshot, &member.identity) else {
             continue;
@@ -415,20 +448,24 @@ fn dispatch(
         {
             continue;
         }
-        if r.current_configuration.as_ref() == Some(&intent.current_configuration)
-            && (!current_only || r.previous_configuration.is_none())
+        let mut admission = evidence.clone();
+        admission.reduced_write_quorum.clear();
+        let pc_cc = configuration_command(&admission, &member.identity, false);
+        let installed = r.current_configuration.as_ref() == Some(&intent.current_configuration);
+        let pending_admission = r.pending_operation_id.as_ref() == Some(&pc_cc.operation_id);
+        let command = if !installed || (pending_admission && r.previous_configuration.is_some()) {
+            pc_cc
+        } else if current_only
+            && (r.previous_configuration.is_some()
+                || r.pending_operation_id.as_ref()
+                    == Some(&intent.command_operation_id(
+                        SecondaryRemovalStage::CurrentOnly,
+                        &member.identity,
+                    )))
         {
-            continue;
-        }
-        // A late member must first admit the frozen PC/CC; never skip authority.
-        let command = if current_only
-            && r.current_configuration.as_ref() != Some(&intent.current_configuration)
-        {
-            let mut admission = evidence.clone();
-            admission.reduced_write_quorum.clear();
-            configuration_command(&admission, &member.identity, false)
+            configuration_command(evidence, &member.identity, true)
         } else {
-            configuration_command(evidence, &member.identity, current_only)
+            continue;
         };
         if r.pending_operation_id
             .as_ref()
@@ -436,11 +473,18 @@ fn dispatch(
         {
             continue;
         }
-        return Some(Plan::Execute {
+        let plan = Plan::Execute {
             command: ProtocolCommand::EnsureConfiguration(Box::new(command)),
-        });
+        };
+        if installed && r.pending_operation_id.is_some() {
+            if replay.is_none() || member.role == ReplicaRole::Primary {
+                replay = Some(plan);
+            }
+        } else {
+            return Some(plan);
+        }
     }
-    None
+    replay
 }
 
 pub(super) fn transition(
@@ -618,6 +662,7 @@ pub(super) fn transition(
     status.transition = None;
     status.quorum_loss = None;
     status.secondary_scale_down_cleanup = Some(cleanup);
+    status.last_secondary_removal = None;
     persist(waiting_status(
         status,
         "ScaleDownRetirementPending",
@@ -664,34 +709,8 @@ pub(super) fn cleanup(
             config,
         );
     };
-    if let Some(plan) = dispatch(snapshot, &cleanup.evidence, true) {
+    if let Some(plan) = converge_committed(snapshot, cleanup) {
         return plan;
-    }
-    for member in &intent.current_configuration.members {
-        if let Some(r) = report(snapshot, &member.identity)
-            && stable_member_report(r, member, &intent.current_configuration)
-            && r.accepted_secondary_removal
-                .as_ref()
-                .is_none_or(|accepted| {
-                    accepted.evidence != cleanup.evidence
-                        || accepted.current_only_write_quorum != cleanup.current_only_write_quorum
-                })
-        {
-            let mut committed = cleanup.clone();
-            committed.retirement = None;
-            return Plan::Execute {
-                command: ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
-                    AcceptSecondaryRemovalCommit {
-                        operation_id: intent.command_operation_id(
-                            SecondaryRemovalStage::AcceptCommit,
-                            &member.identity,
-                        ),
-                        target: member.identity.clone(),
-                        committed,
-                    },
-                )),
-            };
-        }
     }
     let quorum = intent
         .current_configuration
@@ -780,7 +799,9 @@ pub(super) fn cleanup(
                 "Exact target retirement is durable; resource cleanup remains",
             ));
         }
-        if target.pending_operation_id.is_none() {
+        if target.pending_operation_id.as_ref().is_none_or(|id| {
+            id == &intent.command_operation_id(SecondaryRemovalStage::Retire, &intent.target)
+        }) {
             return Plan::Execute {
                 command: ProtocolCommand::RetireReplica(Box::new(RetireReplica {
                     operation_id: intent
@@ -847,11 +868,84 @@ pub(super) fn cleanup(
         );
     }
     status.secondary_scale_down_cleanup = None;
+    status.last_secondary_removal = Some(SecondaryRemovalReceipt {
+        evidence: cleanup.evidence.clone(),
+        current_only_write_quorum: cleanup.current_only_write_quorum.clone(),
+    });
     persist(waiting_status(
         status,
         "ScaleDownCleanupComplete",
         "Exact cleanup completed; re-observe latest desired state before another removal",
     ))
+}
+
+pub(super) fn completed(
+    snapshot: &ObservationSnapshot,
+    receipt: &SecondaryRemovalReceipt,
+    config: &EvaluationConfig,
+) -> Option<Plan> {
+    if snapshot.status.topology.as_ref()?.configuration
+        != receipt.evidence.preparation.intent.current_configuration
+    {
+        return None;
+    }
+    if let Some(plan) = converge_committed(snapshot, &receipt.committed()) {
+        return Some(plan);
+    }
+    let intent = &receipt.evidence.preparation.intent;
+    if intent.current_configuration.members.iter().any(|member| {
+        snapshot
+            .observation_for_identity(&member.identity)
+            .is_some_and(|observation| {
+                matches!(&observation.agent, AgentObservation::Report(r)
+                    if !stable_member_report(r, member, &intent.current_configuration))
+            })
+    }) {
+        return Some(wait(
+            snapshot.status.clone(),
+            "ScaleDownRetainedMemberPending",
+            "Retained local work must complete; conflicting pending commands cannot be replaced",
+            config,
+        ));
+    }
+    None
+}
+
+fn converge_committed(
+    snapshot: &ObservationSnapshot,
+    cleanup: &SecondaryScaleDownCleanup,
+) -> Option<Plan> {
+    if let Some(plan) = dispatch(snapshot, &cleanup.evidence, true) {
+        return Some(plan);
+    }
+    let intent = &cleanup.evidence.preparation.intent;
+    for member in &intent.current_configuration.members {
+        if let Some(r) = report(snapshot, &member.identity)
+            && stable_member_report(r, member, &intent.current_configuration)
+            && r.accepted_secondary_removal
+                .as_ref()
+                .is_none_or(|accepted| {
+                    accepted.evidence != cleanup.evidence
+                        || accepted.current_only_write_quorum != cleanup.current_only_write_quorum
+                })
+        {
+            let mut committed = cleanup.clone();
+            committed.retirement = None;
+            return Some(Plan::Execute {
+                command: ProtocolCommand::AcceptSecondaryRemovalCommit(Box::new(
+                    AcceptSecondaryRemovalCommit {
+                        operation_id: intent.command_operation_id(
+                            SecondaryRemovalStage::AcceptCommit,
+                            &member.identity,
+                        ),
+                        target: member.identity.clone(),
+                        committed,
+                    },
+                )),
+            });
+        }
+    }
+    None
 }
 
 fn access(

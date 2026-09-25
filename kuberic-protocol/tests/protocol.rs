@@ -7,6 +7,273 @@ use scale_down_model::fixture as scale_down_fixture;
 mod scale_down_model;
 
 #[test]
+fn evaluator_scale_down_replays_installed_pending_configurations_after_restart() {
+    use scale_down_model::{CommandBoundary, Model};
+    for current_only in [false, true] {
+        for id in [1, 2] {
+            let mut model = Model::new(&[1, 2, 3], 1, 2);
+            model.until(|m| {
+                matches!(m.plan(), Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(c)
+            } if c.transition_kind == TransitionKind::SecondaryScaleDown
+                && c.current_only == current_only && c.local_replica_id.value() == id)
+            });
+            let original = model.plan();
+            model.interrupt(original.clone(), CommandBoundary::Effect);
+            model.controller_restart();
+            // Other admissions may precede replay, notably the primary that supplies catch-up.
+            model.until(|m| m.plan() == original);
+            assert!(model.removed.is_empty());
+            model.step();
+            assert!(model.report(id).pending_operation_id.is_none());
+            model.finish();
+            assert_eq!(model.removed.len(), 1);
+            assert_eq!(model.deletes.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn evaluator_scale_down_pending_primary_replay_precedes_secondary_catch_up() {
+    use scale_down_model::{CommandBoundary, Model};
+    let mut model = Model::new(&[1, 2, 3], 1, 2);
+    model.until(|m| {
+        matches!(m.plan(), Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(c)
+    } if c.transition_kind == TransitionKind::SecondaryScaleDown)
+    });
+    model.interrupt(model.plan(), CommandBoundary::Effect);
+    let primary = model.plan();
+    assert!(matches!(&primary, Plan::Execute {
+        command: ProtocolCommand::EnsureConfiguration(c)
+    } if c.local_replica_id.value() == 1));
+    model.interrupt(primary.clone(), CommandBoundary::Effect);
+    model.controller_restart();
+    assert_eq!(model.plan(), primary);
+    model.finish();
+    assert!(model.inflight.is_empty());
+    assert!(model.applied_effects.is_empty());
+}
+
+#[test]
+fn evaluator_scale_down_replays_pending_retirement_but_not_conflicting_work() {
+    use scale_down_model::{CommandBoundary, Model, reason};
+    let mut model = Model::new(&[1, 2], 1, 1);
+    model.until(|m| {
+        matches!(
+            m.plan(),
+            Plan::Execute {
+                command: ProtocolCommand::RetireReplica(_)
+            }
+        )
+    });
+    let original = model.plan();
+    model.interrupt(original.clone(), CommandBoundary::Effect);
+    model.controller_restart();
+    assert_eq!(model.plan(), original);
+    assert!(model.deletes.is_empty());
+    let mut conflict = model.clone();
+    conflict.report(2).pending_operation_id = Some(OperationId::new("different-retirement"));
+    assert!(matches!(conflict.plan(), Plan::Wait { .. }));
+    assert_eq!(reason(&conflict.plan()), "ScaleDownRetirementPending");
+    model.finish();
+    assert_eq!(model.deletes.len(), 3);
+}
+
+#[test]
+fn evaluator_scale_down_conflicting_pending_configuration_is_not_overwritten_or_credited() {
+    use scale_down_model::{CommandBoundary, Model};
+    for current_only in [false, true] {
+        let mut model = Model::new(&[1, 2, 3], 1, 2);
+        model.until(|m| {
+            matches!(m.plan(), Plan::Execute {
+            command: ProtocolCommand::EnsureConfiguration(c)
+        } if c.transition_kind == TransitionKind::SecondaryScaleDown
+            && c.current_only == current_only && c.local_replica_id.value() == 2)
+        });
+        model.interrupt(model.plan(), CommandBoundary::Effect);
+        model.report(2).pending_operation_id = Some(OperationId::new("conflicting-work"));
+        model.until(|m| matches!(m.plan(), Plan::Wait { .. }));
+        assert!(model.removed.is_empty());
+        assert!(model.deletes.is_empty());
+        assert_eq!(
+            model
+                .report(2)
+                .pending_operation_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "conflicting-work"
+        );
+    }
+}
+
+#[test]
+fn evaluator_scale_down_completed_receipt_converges_late_members_without_cleanup_authority() {
+    use kuberic_protocol::observation::ExactResourceObservation;
+    use scale_down_model::{CommandBoundary, Model, reason};
+    for late_stage in 0..4 {
+        let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+        if late_stage > 0 {
+            model.until(|m| {
+                matches!(m.plan(), Plan::Execute {
+                command: ProtocolCommand::EnsureConfiguration(c)
+            } if c.transition_kind == TransitionKind::SecondaryScaleDown
+                && c.current_only == (late_stage == 3) && c.local_replica_id.value() == 3)
+            });
+            if late_stage == 2 {
+                model.step();
+            } else {
+                model.interrupt(model.plan(), CommandBoundary::Effect);
+            }
+        }
+        let late = model.report(3).clone();
+        let key = model.key(3);
+        model.unavailable(3);
+        model.until(|m| m.snapshot.status.last_secondary_removal.is_some());
+        assert!(model.snapshot.status.secondary_scale_down_cleanup.is_none());
+        assert_eq!(model.deletes.len(), 3);
+        let receipt = model
+            .snapshot
+            .status
+            .last_secondary_removal
+            .clone()
+            .unwrap();
+        model.controller_restart();
+
+        let exact = model.exact(4);
+        for resource in [&mut exact.pod, &mut exact.pvc, &mut exact.endpoint] {
+            *resource = ExactResourceObservation::ReplacementPresent {
+                uid: "replacement-must-survive".into(),
+                resource_version: "replacement-rv".into(),
+            };
+        }
+        // A single bounded receipt must not be superseded while a non-witness still needs it.
+        model.snapshot.desired.replicas = 2;
+        assert_eq!(reason(&model.plan()), "ScaleDownRetainedMemberPending");
+        model.snapshot.desired.replicas = 3;
+        model.snapshot.replicas.get_mut(&key).unwrap().agent =
+            AgentObservation::Report(Box::new(late));
+        let mut conflict = model.clone();
+        conflict.report(3).pending_operation_id = Some(OperationId::new("unrelated-local-work"));
+        assert_eq!(reason(&conflict.plan()), "ScaleDownRetainedMemberPending");
+        assert!(matches!(conflict.plan(), Plan::Wait { .. }));
+        let mut unhealthy = model.clone();
+        unhealthy.report(3).healthy = false;
+        assert_eq!(reason(&unhealthy.plan()), "ScaleDownRetainedMemberPending");
+        assert!(matches!(unhealthy.plan(), Plan::Wait { .. }));
+        let mut forged = model.clone();
+        forged
+            .snapshot
+            .status
+            .last_secondary_removal
+            .as_mut()
+            .unwrap()
+            .current_only_write_quorum
+            .clear();
+        assert!(matches!(forged.plan(), Plan::Unsafe { .. }));
+        assert!(matches!(
+            evaluate(&model.snapshot, &EvaluationConfig::default()),
+            Plan::Unsafe { .. }
+        ));
+        model.finish();
+        assert!(model.inflight.is_empty());
+        assert!(model.applied_effects.is_empty());
+        assert!(model.report(3).previous_configuration.is_none());
+        assert!(model.report(3).pending_operation_id.is_none());
+        assert_eq!(model.report(3).write_status, AccessStatus::NotPrimary);
+        assert_eq!(
+            model.report(3).accepted_secondary_removal,
+            Some(receipt.committed())
+        );
+        assert_eq!(
+            model.deletes.len(),
+            3,
+            "completed receipt cannot reissue cleanup"
+        );
+        assert_eq!(
+            model.snapshot.status.last_secondary_removal.as_ref(),
+            Some(&receipt)
+        );
+        model.controller_restart();
+        assert!(matches!(model.plan(), Plan::Stable { .. }));
+
+        model.snapshot.desired.replicas = 2;
+        model.finish();
+        assert_eq!(model.removed.len(), 2);
+        assert_eq!(model.deletes.len(), 6);
+        let next = model
+            .snapshot
+            .status
+            .last_secondary_removal
+            .as_ref()
+            .unwrap();
+        assert_ne!(
+            next.evidence.preparation.intent.operation_id,
+            receipt.evidence.preparation.intent.operation_id
+        );
+        assert_eq!(
+            next.evidence.preparation.intent.target.replica_id.value(),
+            3
+        );
+        let mut mixed = model.clone();
+        mixed
+            .snapshot
+            .status
+            .last_secondary_removal
+            .as_mut()
+            .unwrap()
+            .evidence = receipt.evidence;
+        assert!(
+            matches!(mixed.plan(), Plan::Unsafe { .. }),
+            "one removal cannot supply another's proof"
+        );
+    }
+}
+
+#[test]
+fn evaluator_scale_down_completed_witness_can_be_absent_during_next_removal() {
+    use scale_down_model::Model;
+    let mut model = Model::new(&[1, 2, 3, 4], 1, 3);
+    model.finish();
+    let previous = model
+        .snapshot
+        .status
+        .last_secondary_removal
+        .clone()
+        .unwrap();
+    assert!(
+        previous
+            .current_only_write_quorum
+            .iter()
+            .any(|w| w.identity.replica_id.value() == 3)
+    );
+    model.unavailable(3);
+    model.snapshot.desired.replicas = 2;
+    model.controller_restart();
+    model.finish();
+    assert_eq!(model.removed.len(), 2);
+    assert_eq!(model.deletes.len(), 6);
+    let current = model
+        .snapshot
+        .status
+        .last_secondary_removal
+        .as_ref()
+        .unwrap();
+    assert_ne!(previous.evidence, current.evidence);
+    assert_eq!(
+        current
+            .evidence
+            .preparation
+            .intent
+            .target
+            .replica_id
+            .value(),
+        3
+    );
+}
+
+#[test]
 fn evaluator_scale_down_healthy_traces_preserve_exact_authority() {
     use scale_down_model::Model;
     for (ids, primary, desired, targets) in [
@@ -1379,6 +1646,13 @@ fn existing_json_status_and_transition_default_new_authority_to_none() {
     }))
     .unwrap();
     assert!(status.secondary_scale_down_cleanup.is_none());
+    assert!(status.last_secondary_removal.is_none());
+    assert!(
+        serde_json::to_value(&status)
+            .unwrap()
+            .get("lastSecondaryRemoval")
+            .is_none()
+    );
     let mut value = serde_json::to_value(scale_down_fixture::transition(
         &scale_down_fixture::intent(&[1, 2], 1),
     ))

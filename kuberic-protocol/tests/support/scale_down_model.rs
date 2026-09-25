@@ -17,12 +17,21 @@ pub fn config() -> EvaluationConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum CommandBoundary {
+    Intent,
+    Pending,
+    Effect,
+}
+
 #[derive(Clone)]
 pub struct Model {
     pub snapshot: ObservationSnapshot,
     pub commands: Vec<ProtocolCommand>,
     pub removed: Vec<ReplicaIdentity>,
     pub deletes: Vec<(ScaleDownResource, String)>,
+    pub inflight: BTreeMap<ReplicaId, ProtocolCommand>,
+    pub applied_effects: BTreeMap<ReplicaId, AgentReport>,
 }
 
 impl Model {
@@ -138,6 +147,8 @@ impl Model {
             commands: Vec::new(),
             removed: Vec::new(),
             deletes: Vec::new(),
+            inflight: BTreeMap::new(),
+            applied_effects: BTreeMap::new(),
         }
     }
 
@@ -182,6 +193,39 @@ impl Model {
             "evaluation is pure"
         );
         plan
+    }
+
+    pub fn controller_restart(&mut self) {
+        let durable = serde_json::to_vec(&self.snapshot.status).unwrap();
+        self.snapshot.status = serde_json::from_slice(&durable).unwrap();
+        self.snapshot.previous_report_watermarks.clear();
+    }
+
+    pub fn interrupt(&mut self, plan: Plan, boundary: CommandBoundary) {
+        let Plan::Execute { command } = &plan else {
+            panic!("expected command")
+        };
+        let (id, operation_id) = match command {
+            ProtocolCommand::EnsureConfiguration(c) => (c.local_replica_id, c.operation_id.clone()),
+            ProtocolCommand::RetireReplica(c) => (c.local_replica_id, c.operation_id.clone()),
+            _ => panic!("unsupported interruption {command:?}"),
+        };
+        let command = command.clone();
+        let before = self.report(id.value()).clone();
+        if matches!(boundary, CommandBoundary::Effect) {
+            self.apply(plan);
+            let applied = self.report(id.value()).clone();
+            self.applied_effects.insert(id, applied);
+            // Retirement's terminal projection is not published until the reply/report boundary.
+            if matches!(command, ProtocolCommand::RetireReplica(_)) {
+                *self.report(id.value()) = before;
+            }
+        }
+        if !matches!(boundary, CommandBoundary::Intent) {
+            self.report(id.value()).pending_operation_id = Some(operation_id);
+        }
+        self.inflight.insert(id, command);
+        validate_snapshot(&self.snapshot).unwrap();
     }
 
     pub fn apply(&mut self, plan: Plan) {
@@ -286,6 +330,15 @@ impl Model {
                 }
             }
             Plan::Execute { command } => {
+                let id = match &command {
+                    ProtocolCommand::EnsureConfiguration(c) => Some(c.local_replica_id),
+                    ProtocolCommand::RetireReplica(c) => Some(c.local_replica_id),
+                    _ => None,
+                };
+                if let Some(original) = id.and_then(|id| self.inflight.remove(&id)) {
+                    assert_eq!(command, original, "replay must preserve the entire command");
+                }
+                let effect = id.and_then(|id| self.applied_effects.remove(&id));
                 self.commands.push(command.clone());
                 match command {
                     ProtocolCommand::PrepareSecondaryRemoval(c) => {
@@ -365,11 +418,18 @@ impl Model {
                     ProtocolCommand::AcceptSecondaryRemovalCommit(c) => {
                         kuberic_protocol::validation::validate_accept_secondary_removal_commit(&c)
                             .unwrap();
+                        let completed = self
+                            .snapshot
+                            .status
+                            .last_secondary_removal
+                            .as_ref()
+                            .map(|receipt| receipt.committed());
                         let cleanup = self
                             .snapshot
                             .status
                             .secondary_scale_down_cleanup
                             .as_ref()
+                            .or(completed.as_ref())
                             .unwrap();
                         assert_eq!(cleanup.evidence, c.committed.evidence);
                         assert_eq!(
@@ -415,6 +475,22 @@ impl Model {
                         r.accepted_secondary_removal = None;
                     }
                     other => panic!("unexpected command {other:?}"),
+                }
+                if let Some(effect) = effect {
+                    let r = self.report(id.unwrap().value());
+                    assert_eq!(r.epoch, effect.epoch);
+                    assert_eq!(r.role, effect.role);
+                    assert_eq!(r.previous_configuration, effect.previous_configuration);
+                    assert_eq!(r.current_configuration, effect.current_configuration);
+                    assert_eq!(r.write_status, effect.write_status);
+                    assert_eq!(
+                        r.retired_replica.as_ref().map(|retired| &retired.intent),
+                        effect
+                            .retired_replica
+                            .as_ref()
+                            .map(|retired| &retired.intent),
+                        "replay publishes the same already-applied retirement"
+                    );
                 }
             }
             Plan::Wait { status, .. } | Plan::Stable { status, .. } => {

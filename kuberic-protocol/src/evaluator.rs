@@ -46,6 +46,7 @@ impl Default for EvaluationConfig {
 /// Validates one snapshot and returns the next safe reconciliation outcome.
 pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Plan {
     if !config.enable_secondary_scale_down && (snapshot.status.secondary_scale_down_cleanup.is_some()
+        || snapshot.status.last_secondary_removal.is_some()
         || snapshot.status.transition.as_ref().is_some_and(|transition| transition.kind == TransitionKind::SecondaryScaleDown)
         || snapshot.replicas.values().any(|replica| matches!(&replica.agent, AgentObservation::Report(report) if report.prepared_secondary_removal.is_some() || report.secondary_removal_evidence.is_some() || report.retired_replica.is_some() || report.accepted_secondary_removal.is_some())))
     {
@@ -147,6 +148,12 @@ pub fn evaluate(snapshot: &ObservationSnapshot, config: &EvaluationConfig) -> Pl
 
     if let Some(cleanup) = &snapshot.status.secondary_scale_down_cleanup {
         return secondary_scale_down::cleanup(snapshot, cleanup, config);
+    }
+
+    if let Some(receipt) = &snapshot.status.last_secondary_removal
+        && let Some(plan) = secondary_scale_down::completed(snapshot, receipt, config)
+    {
+        return plan;
     }
 
     if snapshot.status.initialized {
