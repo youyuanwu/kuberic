@@ -47,6 +47,10 @@ pub enum RuntimeEffectAction {
         session: ProcessSessionId,
     },
     ObserveSecondaryRemovalWitness(Box<SecondaryRemovalWitness>),
+    ObserveSecondaryRemovalProgress {
+        witness: Box<SecondaryRemovalWitness>,
+        committed: Box<SecondaryScaleDownCleanup>,
+    },
     ObserveReplicationAck {
         acknowledgement: Box<crate::transport::ReplicationAck>,
         session: ProcessSessionId,

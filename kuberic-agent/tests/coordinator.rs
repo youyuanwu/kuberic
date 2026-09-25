@@ -105,6 +105,43 @@ fn accepted_removal_access_command_preserves_admitted_evidence() {
 }
 
 #[tokio::test]
+async fn older_excluded_target_cannot_admit_exact_previous_authority_retirement() {
+    let intent = removal_fixture::intent(&[1, 2, 3, 4], 1);
+    let mut state = removal_state(&intent, true);
+    let previous = &intent.previous_configuration;
+    let older = ConfigurationDescriptor::new(
+        Epoch::new(
+            previous.epoch.data_loss_number,
+            previous.epoch.configuration_number - 1,
+        ),
+        previous.primary_id,
+        previous.members.clone(),
+        previous.write_quorum,
+    );
+    state.highest_epoch = older.epoch;
+    state.current_configuration = Some(older);
+    let directory = tempdir().unwrap();
+    let store = Arc::new(
+        SqliteStore::create_authorized(directory.path().join("agent.db"), state.clone()).unwrap(),
+    );
+    let runtime = removal_runtime(&state);
+    let result = Coordinator::new(store.clone(), runtime)
+        .ensure_replica_retired(
+            removal_fixture::retire_command(&intent),
+            kuberic_protocol::types::ProcessSessionId::new("returned"),
+            1,
+        )
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("exact previous secondary authority")
+    );
+    assert_eq!(store.load_state().await.unwrap(), state);
+}
+
+#[tokio::test]
 async fn reduction_coordinates_retained_secondaries_but_never_admits_the_excluded_target() {
     let intent = removal_fixture::intent(&[1, 2, 3], 1);
     for local in [

@@ -2898,6 +2898,12 @@ impl DefaultReplicatorInner {
                     .await
                     .observe_secondary_removal(&witness)?;
             }
+            RuntimeEffectAction::ObserveSecondaryRemovalProgress { witness, committed } => {
+                self.replicator
+                    .lock()
+                    .await
+                    .observe_secondary_removal_progress(&witness, &committed)?;
+            }
             RuntimeEffectAction::ObserveReplicationAck {
                 acknowledgement,
                 session,
@@ -2939,6 +2945,10 @@ impl DefaultReplicatorInner {
                     ));
                 }
                 drop(state);
+                self.replicator
+                    .lock()
+                    .await
+                    .validate_secondary_removal_commit(&committed)?;
                 for witness in &committed.current_only_write_quorum {
                     if witness.identity != self.identity {
                         self.replicator

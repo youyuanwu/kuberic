@@ -508,6 +508,31 @@ fn validate_report_authority(
     snapshot: &ObservationSnapshot,
     report: &crate::observation::AgentReport,
 ) -> Result<(), ValidationError> {
+    let historical_receipt = snapshot.status.last_secondary_removal.as_ref();
+    // A completed certificate remains evidence of local history after accepted
+    // authority advances, but never authorizes work or access at that authority.
+    let stale_completed = historical_receipt.is_some_and(|receipt| {
+        let intent = &receipt.evidence.preparation.intent;
+        snapshot.status.topology.as_ref().is_some_and(|topology| {
+            report.epoch < topology.configuration.epoch
+                && topology
+                    .configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == report.identity)
+        }) && report.write_status != AccessStatus::Granted
+            && report.previous_configuration.is_none()
+            && report.prepared_secondary_removal.is_none()
+            && report.current_configuration.as_ref() == Some(&intent.current_configuration)
+            && report.secondary_removal_evidence.as_ref() == Some(&receipt.evidence)
+            && report
+                .accepted_secondary_removal
+                .as_ref()
+                .is_none_or(|accepted| {
+                    accepted.evidence == receipt.evidence
+                        && accepted.current_only_write_quorum == receipt.current_only_write_quorum
+                })
+    });
     let completed = snapshot
         .status
         .last_secondary_removal
@@ -564,7 +589,10 @@ fn validate_report_authority(
                             })
                     })
             });
-        if removal != Some(intent) && !historical {
+        let known_history = stale_completed
+            && historical_receipt
+                .is_some_and(|receipt| &receipt.evidence.preparation.intent == intent);
+        if removal != Some(intent) && !historical && !known_history {
             return Err(ValidationError::InvalidSecondaryScaleDown(
                 "report is not authorized by the frozen removal",
             ));

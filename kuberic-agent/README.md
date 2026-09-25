@@ -103,6 +103,18 @@ without waiting for an unavailable old write quorum.
 
 Frozen certificates survive retained-peer restart but do not reinstate
 obsolete-session credit; acceptance revalidates current-session progress.
+An already committed reduction has a separate live-progress path: exact
+current-only peers retain the same immutable commit proof, cover the prepared
+boundary, and report completed work in their current session. The primary may
+already have granted access. Pre-commit witnesses remain write-closed. Startup
+keeps a pending commit-acceptance effect replayable while discovery restores
+fresh peer evidence, rather than requiring obsolete-session credit before
+the control plane can start.
+
+`ReplicaDiagnostics.retired` is a compact terminal-retirement indicator from
+durable or runtime authority. Unlike role `None` or denied access alone, `true`
+means a retirement tombstone exists. The JSON field is additive; older diagnostic
+responses may omit it. Diagnostics do not expose managed certificates.
 Controller admission and exact Kubernetes cleanup are enabled; these local
 contracts never select the target or authorize arbitrary Pod/PVC deletion.
 Use a fresh coordinated protocol-6/schema-2 deployment, not a rolling upgrade.

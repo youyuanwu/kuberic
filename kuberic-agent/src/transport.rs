@@ -845,6 +845,7 @@ where
                                         pending_operation_id: report.pending_operation_id.clone(),
                                         retained_operation_id: report.retained_operation_id.clone(),
                                     },
+                                    report.accepted_secondary_removal.clone(),
                                 )
                                 .await;
                         }

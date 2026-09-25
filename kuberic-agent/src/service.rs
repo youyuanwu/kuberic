@@ -575,14 +575,25 @@ where
         {
             self.runtime.apply_effect(retained.effect.clone()).await?;
         }
+        let pending_acceptance = state.pending_effect.as_ref().is_some_and(|pending| {
+            matches!(pending.effect.action,
+                kuberic_runtime_internal::effects::RuntimeEffectAction::AcceptSecondaryRemovalCommit(_))
+        });
         let pending_catchup = state.pending_effect.as_ref().is_some_and(|pending| {
             matches!(
                 pending.effect.action,
                 kuberic_runtime_internal::effects::RuntimeEffectAction::WaitForCatchup
             )
         });
-        if !pending_catchup {
-            self.coordinator.resume_pending().await?;
+        if !pending_catchup
+            && let Err(error) = self.coordinator.resume_pending().await
+            && !(pending_acceptance
+                && matches!(
+                    error,
+                    AgentError::Runtime(kuberic_runtime::RuntimeError::ReconfigurationPending)
+                ))
+        {
+            return Err(error);
         }
         Ok(())
     }

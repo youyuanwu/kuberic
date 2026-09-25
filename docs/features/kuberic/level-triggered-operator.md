@@ -250,7 +250,10 @@ Only after membership commit does cleanup delete the frozen peer endpoint,
 retire the exact target, delete its Pod, and finally delete its PVC. Reachable
 retirement proves role `None`, closed application, and fenced client/peer access.
 An unreachable target is **not** proven retired: post-commit deletion of its
-exact Pod supplies the final local fence. Authoritative exact-name observation
+exact Pod supplies the final local fence. The same post-commit fence applies to
+a reachable exact target whose positively observed older authority cannot admit
+the exact retirement command; this does not fabricate a retirement receipt.
+Authoritative exact-name observation
 must prove that Pod UID absent before PVC deletion. Deletes use frozen UIDs and
 fresh resource versions; label-list omission or RPC failure is not absence.
 Same-name/different-UID resources are preserved, including after cleanup ends.
@@ -305,6 +308,13 @@ on restart: a fresh process finishes interrupted retirement without reopening
 the removed application, then reports the exact receipt. Frozen quorum proof
 does not restore stale session credit; current-session verified progress is
 required after retained-peer restart.
+For an already committed reduction, that progress may come from a current-only
+primary that has restarted and resumed writes, provided its live report retains
+the exact commit proof. Pre-commit witnesses remain strictly write-closed.
+After a later accepted failover or replacement, matching bounded historical
+removal evidence permits stale-member correction, not new authority.
+Peer endpoint scaffolding and accepted-configuration catch-up run before a new
+switchover or removal is admitted.
 
 ## Planned Switchover
 
@@ -673,7 +683,10 @@ absence. Do not remove finalizers or edit status merely to force progress.
 
 Each replica also exposes `GET /status`, including its exact identity, durable
 generation, process session, role, epoch, PC/CC IDs, progress, committed LSN,
-write status, pending operation, and active builds.
+write status, pending operation, active builds, and an additive `retired` boolean.
+`retired: true` reflects terminal durable/runtime retirement, not merely role
+`None` or denied access. Older diagnostic responses can omit the field; managed
+certificates remain confined to the authenticated control plane.
 Agent reports expose `preparedSwitchover`; the full CR retains the frozen
 handoff in `status.transition.switchover.handoff`. Conditions such as
 `SwitchoverTargetCatchupPending`, `SwitchoverAuthorityAdmissionUnknown`, and

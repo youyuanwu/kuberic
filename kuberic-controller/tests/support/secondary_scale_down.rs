@@ -192,17 +192,28 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
                     operation_id: c.operation_id.clone(),
                     process_session_id: ProcessSessionId::new(&report.process_session_id),
                     report_sequence: report.report_sequence,
-                    boundary_lsn: 5,
+                    boundary_lsn: report.verified_replication_lsn.unwrap(),
                 }
                 .into(),
             );
             report.retained_operation_id = c.operation_id.to_string();
         }
         ProtocolCommand::EnsureConfiguration(c) => {
+            if report.current_configuration.as_ref()
+                != Some(&c.current_configuration.clone().into())
+                && c.secondary_removal_evidence.is_none()
+            {
+                report.secondary_removal_evidence = None;
+                report.accepted_secondary_removal = None;
+                report.prepared_secondary_removal = None;
+            }
             report.epoch = Some(c.current_epoch.into());
             report.previous_configuration = c.previous_configuration.clone().map(Into::into);
             report.current_configuration = Some(c.current_configuration.clone().into());
             if let Some(evidence) = &c.secondary_removal_evidence {
+                if report.secondary_removal_evidence.as_ref() != Some(&evidence.clone().into()) {
+                    report.accepted_secondary_removal = None;
+                }
                 report.secondary_removal_evidence = Some(evidence.clone().into());
             }
             report.role = if c.current_configuration.primary_id == c.local_replica_id {
@@ -224,7 +235,12 @@ async fn apply_command(api: &InMemoryClusterApi, command: &ProtocolCommand) {
                 .secondary_removal_evidence
                 .as_ref()
                 .map(|e| e.preparation.boundary_lsn);
-            report.current_configuration_quorum_progress = 5;
+            report.current_configuration_quorum_progress = report.current_progress;
+            if c.transition_kind == TransitionKind::Failover {
+                report.deactivation_epoch = Some(c.current_epoch.into());
+                report.deactivated_lsn = Some(report.current_progress);
+                report.catch_up_boundary = c.failover_safe_lsn;
+            }
             report.pending_operation_id.clear();
         }
         ProtocolCommand::AcceptSecondaryRemovalCommit(c) => {
@@ -425,6 +441,368 @@ async fn healthy_reductions_are_sequential_exact_and_quiescent() {
         }
         assert_eq!(api.effects().await, effects);
     }
+}
+
+#[tokio::test]
+async fn completed_reduction_then_real_failover_corrects_returning_old_primary() {
+    let api = Arc::new(InMemoryClusterApi::new(fixture(4, 3)));
+    finish(&api).await;
+    let mut raw = api.observation().await;
+    let topology = raw
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .clone()
+        .unwrap();
+    let old_primary = topology.configuration.members[0].identity.clone();
+    let key = ReplicaObservationKey::new(old_primary.replica_id, old_primary.instance_id.clone());
+    let RawAgentObservation::Report(mut returning) = raw.agents.remove(&key).unwrap() else {
+        unreachable!()
+    };
+    returning.write_status = proto::AccessStatus::ReconfigurationPending as i32;
+    raw.set.status.as_mut().unwrap().authority.primary_failure = Some(PrimaryFailureObservation {
+        primary: old_primary,
+        started_at_unix_seconds: 0,
+    });
+    raw.services
+        .iter_mut()
+        .find(|s| s.name_any() == "db-write")
+        .unwrap()
+        .spec
+        .as_mut()
+        .unwrap()
+        .selector = None;
+    api.set_observation(raw).await;
+    for _ in 0..80 {
+        let status = api.observation().await.set.status.unwrap().authority;
+        if status.transition.is_none() && status.topology != Some(topology.clone()) {
+            break;
+        }
+        assert_ne!(tick(&api).await.0, ReconcileKind::Unsafe);
+    }
+    let mut raw = api.observation().await;
+    let accepted = raw
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    assert_eq!(accepted.primary_id, ReplicaId::new(2));
+    assert!(accepted.epoch > topology.configuration.epoch);
+    assert!(
+        raw.set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .transition
+            .is_none()
+    );
+    raw.agents
+        .insert(key, RawAgentObservation::Report(returning));
+    *raw.services
+        .iter_mut()
+        .find(|s| s.name_any() == "db-write")
+        .unwrap() = write_service("pod-uid-2");
+    api.set_observation(raw).await;
+    let (_, plan) = next_plan(&api).await;
+    assert!(
+        matches!(plan, Plan::Execute { command: ProtocolCommand::EnsureConfiguration(ref c) } if c.local_replica_id.value() == 1),
+        "{plan:?}"
+    );
+    finish(&api).await;
+    assert_eq!(
+        api.observation()
+            .await
+            .set
+            .status
+            .unwrap()
+            .authority
+            .topology
+            .unwrap()
+            .configuration,
+        accepted
+    );
+}
+
+#[tokio::test]
+async fn historical_removal_survives_new_authority_and_status_reload() {
+    for replacement in [false, true] {
+        let api = Arc::new(InMemoryClusterApi::new(fixture(4, 3)));
+        finish(&api).await;
+        let mut raw = api.observation().await;
+        let previous = raw
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        let late = if replacement { 3 } else { 1 };
+        let mut members = previous.members.clone();
+        if replacement {
+            let identity = &mut members[1].identity;
+            identity.instance_id = ReplicaInstanceId::new("replacement-pod-2");
+            identity.agent_generation = derive_agent_generation(&derive_initialization_id(
+                &ResourceUid::new(UID),
+                identity.replica_id,
+                &PodUid::new(identity.instance_id.as_str()),
+                &PvcUid::new("pvc-uid-2"),
+            ));
+            raw.pods[1].metadata.uid = Some(identity.instance_id.to_string());
+            raw.pods[1]
+                .metadata
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert(INSTANCE_LABEL.into(), identity.instance_id.to_string());
+            let service = raw
+                .services
+                .iter_mut()
+                .find(|s| s.metadata.uid.as_deref() == Some("endpoint-2"))
+                .unwrap();
+            service.metadata.name = Some(derive_replica_endpoint_name(
+                &ResourceUid::new(UID),
+                identity,
+            ));
+            service.spec.as_mut().unwrap().selector = Some(BTreeMap::from([(
+                INSTANCE_LABEL.into(),
+                identity.instance_id.to_string(),
+            )]));
+        } else {
+            members[0].role = ReplicaRole::ActiveSecondary;
+            members[1].role = ReplicaRole::Primary;
+        }
+        let accepted = ConfigurationDescriptor::new(
+            Epoch::new(
+                previous.epoch.data_loss_number,
+                previous.epoch.configuration_number + 1,
+            ),
+            ReplicaId::new(if replacement { 1 } else { 2 }),
+            members,
+            previous.write_quorum,
+        );
+        for member in &accepted.members {
+            let key = raw
+                .agents
+                .keys()
+                .find(|k| k.replica_id == member.identity.replica_id)
+                .unwrap()
+                .clone();
+            let RawAgentObservation::Report(mut report) = raw.agents.remove(&key).unwrap() else {
+                unreachable!()
+            };
+            if member.identity.replica_id.value() == late {
+                report.write_status = proto::AccessStatus::ReconfigurationPending as i32;
+            } else {
+                report.identity = Some(member.identity.clone().into());
+                report.pod_uid = member.identity.instance_id.to_string();
+                report.epoch = Some(accepted.epoch.into());
+                report.current_configuration = Some(accepted.clone().into());
+                report.previous_configuration = None;
+                report.secondary_removal_evidence = None;
+                report.accepted_secondary_removal = None;
+                report.prepared_secondary_removal = None;
+                report.role = if member.role == ReplicaRole::Primary {
+                    proto::ReplicaRole::Primary
+                } else {
+                    proto::ReplicaRole::ActiveSecondary
+                } as i32;
+                report.write_status = if member.role == ReplicaRole::Primary {
+                    proto::AccessStatus::Granted
+                } else {
+                    proto::AccessStatus::NotPrimary
+                } as i32;
+            }
+            raw.agents.insert(
+                ReplicaObservationKey::new(
+                    member.identity.replica_id,
+                    member.identity.instance_id.clone(),
+                ),
+                RawAgentObservation::Report(report),
+            );
+        }
+        raw.set.status.as_mut().unwrap().authority.topology = Some(AcceptedTopology {
+            configuration: accepted.clone(),
+        });
+        if !replacement {
+            let service = raw
+                .services
+                .iter_mut()
+                .find(|s| s.name_any() == "db-write")
+                .unwrap();
+            *service = write_service("pod-uid-2");
+        }
+        api.set_observation(raw).await;
+        let (_, plan) = next_plan(&api).await;
+        assert!(
+            matches!(plan, Plan::Execute { command: ProtocolCommand::EnsureConfiguration(ref c) } if c.local_replica_id.value() == late),
+            "{plan:?}"
+        );
+        finish(&api).await;
+        let result = api.observation().await;
+        assert_eq!(
+            result
+                .set
+                .status
+                .as_ref()
+                .unwrap()
+                .authority
+                .topology
+                .as_ref()
+                .unwrap()
+                .configuration,
+            accepted
+        );
+        assert!(
+            result
+                .set
+                .status
+                .unwrap()
+                .authority
+                .last_secondary_removal
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn transition_request_waits_for_endpoint_and_retained_configuration_catchup() {
+    for switchover in [false, true] {
+        let mut raw = fixture(4, 3);
+        if switchover {
+            raw.set.spec.switchover = Some(kuberic_controller::crd::PlannedSwitchoverRequestSpec {
+                request_id: "after-convergence".into(),
+                target_replica_id: 3,
+            });
+        } else {
+            let key = raw
+                .agents
+                .keys()
+                .find(|k| k.replica_id.value() == 4)
+                .unwrap()
+                .clone();
+            raw.agents.remove(&key);
+        }
+        let accepted = raw
+            .set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .topology
+            .as_ref()
+            .unwrap()
+            .configuration
+            .clone();
+        // A member on accepted CC with PC still installed must complete current-only first.
+        let key = raw
+            .agents
+            .keys()
+            .find(|k| k.replica_id.value() == 2)
+            .unwrap()
+            .clone();
+        let RawAgentObservation::Report(report) = raw.agents.get_mut(&key).unwrap() else {
+            unreachable!()
+        };
+        let older = ConfigurationDescriptor::new(
+            Epoch::new(0, 0),
+            accepted.primary_id,
+            accepted.members.clone(),
+            accepted.write_quorum,
+        );
+        report.previous_configuration = Some(older.into());
+        let endpoint = raw
+            .services
+            .iter()
+            .find(|s| s.metadata.uid.as_deref() == Some("endpoint-3"))
+            .unwrap()
+            .clone();
+        raw.services
+            .retain(|s| s.metadata.uid.as_deref() != Some("endpoint-3"));
+        let api = Arc::new(InMemoryClusterApi::new(raw));
+        let (_, plan) = next_plan(&api).await;
+        assert!(
+            matches!(plan, Plan::Apply { ref changes } if matches!(changes[0], KubernetesChange::EnsureReplicaScaffolding { .. })),
+            "{plan:?}"
+        );
+        tick(&api).await;
+        // The in-memory API records scaffolding; a later API observation reports readiness.
+        let mut raw = api.observation().await;
+        raw.services.retain(|s| s.name_any() != endpoint.name_any());
+        raw.services.push(endpoint);
+        api.set_observation(raw).await;
+        let (_, plan) = next_plan(&api).await;
+        assert!(
+            matches!(plan, Plan::Execute { command: ProtocolCommand::EnsureConfiguration(ref c) } if c.local_replica_id.value() == 2 && c.current_only),
+            "{plan:?}"
+        );
+        tick(&api).await;
+        tick(&api).await;
+        let status = api.observation().await.set.status.unwrap().authority;
+        assert_eq!(
+            status.transition.unwrap().kind,
+            if switchover {
+                TransitionKind::PlannedSwitchover
+            } else {
+                TransitionKind::SecondaryScaleDown
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn obsolete_returning_target_is_pod_fenced_then_next_removal_completes() {
+    let mut raw = fixture(4, 2);
+    let key = raw
+        .agents
+        .keys()
+        .find(|k| k.replica_id.value() == 4)
+        .unwrap()
+        .clone();
+    let RawAgentObservation::Report(mut saved) = raw.agents.remove(&key).unwrap() else {
+        unreachable!()
+    };
+    let previous = raw
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .topology
+        .as_ref()
+        .unwrap()
+        .configuration
+        .clone();
+    let older = ConfigurationDescriptor::new(
+        Epoch::new(0, 0),
+        previous.primary_id,
+        previous.members.clone(),
+        previous.write_quorum,
+    );
+    saved.epoch = Some(older.epoch.into());
+    saved.current_configuration = Some(older.into());
+    let api = Arc::new(InMemoryClusterApi::new(raw));
+    let (mut raw, _) = at_delete(&api, ScaleDownResource::Endpoint).await;
+    raw.agents.insert(key, RawAgentObservation::Report(saved));
+    api.set_observation(raw).await;
+    finish(&api).await;
+    assert_eq!(api.observation().await.pods.len(), 2);
+    let effects = api.effects().await;
+    assert!(!effects.iter().any(|e| matches!(e, EffectRecord::Execute(ProtocolCommand::RetireReplica(c)) if c.local_replica_id.value() == 4)));
+    assert!(effects.iter().any(|e| matches!(e, EffectRecord::DeleteScaleDownResource { resource: ScaleDownResource::Pod, uid, .. } if uid == "pod-uid-4")));
 }
 
 #[tokio::test]
@@ -1526,6 +1904,77 @@ async fn ambiguous_commands_reobserve_exact_sessions_before_replay() {
         }
     }
     panic!("ambiguous command convergence failed")
+}
+
+#[tokio::test]
+async fn late_member_after_cleanup_and_writable_primary_restart_allows_next_removal() {
+    let mut original = fixture(4, 3);
+    let key = ReplicaObservationKey::new(ReplicaId::new(3), ReplicaInstanceId::new("pod-uid-3"));
+    let late = original.agents.remove(&key).unwrap();
+    let api = Arc::new(InMemoryClusterApi::new(original));
+    finish(&api).await;
+    let mut raw = api.observation().await;
+    let receipt = raw
+        .set
+        .status
+        .as_ref()
+        .unwrap()
+        .authority
+        .last_secondary_removal
+        .clone()
+        .unwrap();
+    assert!(
+        receipt
+            .current_only_write_quorum
+            .iter()
+            .all(|w| w.identity.replica_id.value() != 3)
+    );
+    let primary_key =
+        ReplicaObservationKey::new(ReplicaId::new(1), ReplicaInstanceId::new("pod-uid-1"));
+    let RawAgentObservation::Report(primary) = raw.agents.get_mut(&primary_key).unwrap() else {
+        unreachable!()
+    };
+    primary.process_session_id = "restarted-writing-primary".into();
+    primary.report_sequence = 1;
+    primary.current_progress = 10;
+    primary.committed_lsn = 10;
+    primary.verified_replication_lsn = Some(10);
+    assert_eq!(primary.write_status, proto::AccessStatus::Granted as i32);
+    raw.agents.insert(key.clone(), late);
+    let restarted = Arc::new(InMemoryClusterApi::new(raw));
+    finish(&restarted).await;
+    let mut raw = restarted.observation().await;
+    assert_eq!(
+        raw.set
+            .status
+            .as_ref()
+            .unwrap()
+            .authority
+            .last_secondary_removal,
+        Some(receipt)
+    );
+    assert!(restarted.effects().await.iter().any(|e| matches!(e,
+        EffectRecord::Execute(ProtocolCommand::AcceptSecondaryRemovalCommit(c)) if c.target.replica_id.value() == 3)));
+    assert!(
+        !restarted
+            .effects()
+            .await
+            .iter()
+            .any(|e| matches!(e, EffectRecord::DeleteScaleDownResource { .. }))
+    );
+    raw.set.spec.replicas = 2;
+    raw.set.metadata.generation = Some(3);
+    // Replication catches the retained secondary through the primary's fresh prefix.
+    for report in raw.agents.values_mut() {
+        if let RawAgentObservation::Report(report) = report {
+            report.current_progress = 10;
+            report.committed_lsn = 10;
+            report.verified_replication_lsn = Some(10);
+        }
+    }
+    restarted.set_observation(raw).await;
+    finish(&restarted).await;
+    assert_eq!(restarted.observation().await.pods.len(), 2);
 }
 
 #[tokio::test]

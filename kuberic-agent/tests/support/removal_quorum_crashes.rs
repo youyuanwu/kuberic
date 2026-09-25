@@ -10,6 +10,7 @@ struct Member {
     runtime: Arc<PodRuntime>,
     application: Arc<CrashState>,
     session: ProcessSessionId,
+    service: kuberic_agent::service::AgentService<SqliteStore, PodRuntime>,
 }
 
 async fn member(
@@ -64,6 +65,7 @@ async fn member(
         runtime,
         application,
         session: service.sessions().local_session().clone(),
+        service,
     }
 }
 
@@ -180,7 +182,7 @@ async fn write_success(primary: &Member, secondary: &Member, id: &str) -> i64 {
     if authority.secondary_removal.is_some() {
         assert_eq!(
             pending.replication_items.len(),
-            1,
+            authority.current_configuration.members.len() - 1,
             "excluded target receives no replication"
         );
     }
@@ -251,6 +253,317 @@ async fn write_success(primary: &Member, secondary: &Member, id: &str) -> i64 {
         kuberic_runtime_internal::authority::LocalWritePhase::Committed
     );
     lsn
+}
+
+#[test]
+fn late_member_accepts_after_primary_restart_live_writes_and_durable_replay() {
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(25),
+                        late_member_recovery(),
+                    )
+                    .await
+                    .unwrap();
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn late_member_recovery() {
+    use kuberic_agent::transport::{
+        GrpcOutboundDispatcher, ReliableTransport, ReplicaEndpointResolver, run_peer_discovery,
+    };
+    use kuberic_protocol::command::AcceptSecondaryRemovalCommit;
+    use tokio::sync::{Mutex as AsyncMutex, watch};
+    struct Endpoints(BTreeMap<ReplicaIdentity, String>);
+    impl ReplicaEndpointResolver for Endpoints {
+        fn control_endpoint(&self, identity: &ReplicaIdentity) -> String {
+            self.0
+                .get(identity)
+                .cloned()
+                .unwrap_or_else(|| "http://127.0.0.1:1".into())
+        }
+        fn replication_endpoint(&self, identity: &ReplicaIdentity) -> String {
+            self.control_endpoint(identity)
+        }
+    }
+    fn address() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+    let directory = tempdir().unwrap();
+    let intent = fixture::intent(&[1, 2, 3, 4], 1);
+    let primary = member(directory.path(), &intent, 0, true).await;
+    let secondary = member(directory.path(), &intent, 1, true).await;
+    let late = member(directory.path(), &intent, 2, true).await;
+    for peer in [&secondary, &late] {
+        register(&primary, peer).await;
+    }
+    let write = primary
+        .runtime
+        .data_plane()
+        .begin_write(ClientWrite {
+            operation_id: OperationId::new("four-member-acknowledged"),
+            data: Bytes::from_static(b"preserved-before-removal"),
+        })
+        .await
+        .unwrap();
+    for peer in [&secondary, &late] {
+        let identity = peer.runtime.snapshot().await.identity;
+        let item = write
+            .replication_items
+            .iter()
+            .find(|item| item.receiver.as_ref() == Some(&identity.clone().into()))
+            .unwrap()
+            .clone();
+        let mut ack = peer
+            .runtime
+            .data_plane()
+            .receive_replication(item)
+            .await
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
+        ack.receiver_session_id = peer.session.to_string();
+        primary
+            .runtime
+            .data_plane()
+            .accept_acknowledgement(ack)
+            .await
+            .unwrap();
+    }
+    assert_eq!(write.committed().await.unwrap().lsn, 1);
+    let preparation = Coordinator::new(primary.store.clone(), primary.runtime.clone())
+        .ensure_secondary_removal_prepared(
+            fixture::prepare_command(&intent),
+            primary.session.clone(),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preparation.boundary_lsn, 1);
+    let mut evidence = SecondaryRemovalEvidence {
+        preparation,
+        previous_read_quorum: vec![
+            witness(&primary, &intent, 2).await,
+            witness(&secondary, &intent, 2).await,
+        ],
+        reduced_write_quorum: Vec::new(),
+    };
+    for member in [&secondary, &primary] {
+        configure(member, &evidence, false).await;
+    }
+    evidence.reduced_write_quorum = vec![
+        witness(&primary, &intent, 3).await,
+        witness(&secondary, &intent, 3).await,
+    ];
+    for member in [&secondary, &primary] {
+        configure(member, &evidence, true).await;
+    }
+    let committed = cleanup(&primary, &secondary, evidence.clone()).await;
+    let accept = |identity: &ReplicaIdentity| AcceptSecondaryRemovalCommit {
+        operation_id: intent.command_operation_id(SecondaryRemovalStage::AcceptCommit, identity),
+        target: identity.clone(),
+        committed: committed.clone(),
+    };
+    register(&primary, &secondary).await;
+    register(&secondary, &primary).await;
+    for member in [&primary, &secondary] {
+        Coordinator::new(member.store.clone(), member.runtime.clone())
+            .accept_secondary_removal_commit(accept(&member.runtime.snapshot().await.identity))
+            .await
+            .unwrap();
+        member.runtime.abort();
+    }
+    let old_primary_session = primary.session.clone();
+    drop(primary);
+    drop(secondary);
+    let primary = member(directory.path(), &intent, 0, false).await;
+    let secondary = member(directory.path(), &intent, 1, false).await;
+    assert_ne!(primary.session, old_primary_session);
+    register(&primary, &secondary).await;
+    action(
+        &primary,
+        RuntimeEffectAction::ObserveSecondaryRemovalProgress {
+            witness: Box::new(witness(&secondary, &intent, 8).await),
+            committed: Box::new(committed.clone()),
+        },
+    )
+    .await;
+    let mut grant = fixture::configuration_command(&intent, true);
+    grant.operation_id = OperationId::new(format!(
+        "availability:{}:grant-write",
+        intent.current_configuration.configuration_id
+    ));
+    grant.transition_kind = kuberic_protocol::types::TransitionKind::Bootstrap;
+    grant.current_only = false;
+    grant.previous_policy = None;
+    grant.secondary_removal_evidence = None;
+    grant.primary_write_status = AccessStatus::Granted;
+    Coordinator::new(primary.store.clone(), primary.runtime.clone())
+        .ensure_configuration(grant)
+        .await
+        .unwrap();
+    assert_eq!(
+        write_success(&primary, &secondary, "live-before-late-return").await,
+        2
+    );
+    // Cleanup does not require this retained member. It installs the frozen
+    // authority later, without rewriting the certificate's old primary session.
+    let mut joint = evidence.clone();
+    joint.reduced_write_quorum.clear();
+    configure(&late, &joint, false).await;
+    configure(&late, &evidence, true).await;
+    register(&late, &primary).await;
+    assert!(!late.runtime.snapshot().await.catch_up_complete);
+    let result = Coordinator::new(late.store.clone(), late.runtime.clone())
+        .accept_secondary_removal_commit(accept(&late.runtime.snapshot().await.identity))
+        .await;
+    assert!(
+        result.is_err(),
+        "old certificate cannot credit the new primary session"
+    );
+    // Reopen with the durable failed acceptance effect and re-observe real RPC reports.
+    late.runtime.abort();
+    drop(late);
+    let late = member(directory.path(), &intent, 2, false).await;
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let mut endpoints = BTreeMap::new();
+    let mut servers = Vec::new();
+    for member in [&primary, &secondary] {
+        let control = address();
+        endpoints.insert(
+            member.runtime.snapshot().await.identity,
+            format!("http://{control}"),
+        );
+        let (ready, mut ready_rx) = watch::channel(false);
+        servers.push(tokio::spawn(member.service.clone().serve(
+            control,
+            address(),
+            ready,
+            shutdown_rx.clone(),
+        )));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ready_rx.wait_for(|ready| *ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let transport = Arc::new(AsyncMutex::new(
+        ReliableTransport::new(late.session.clone(), 16).unwrap(),
+    ));
+    let dispatcher = Arc::new(
+        GrpcOutboundDispatcher::new(
+            late.runtime.clone(),
+            transport.clone(),
+            Arc::new(Endpoints(endpoints)),
+            intent.resource_uid.to_string(),
+            "token",
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap(),
+    );
+    let report = dispatcher.peer_report(&intent.primary).await.unwrap();
+    assert_eq!(report.write_status, AccessStatus::Granted);
+    assert_eq!(report.process_session_id, primary.session);
+    assert_eq!(
+        report.accepted_secondary_removal.as_ref().unwrap(),
+        &committed
+    );
+    assert!(report.verified_replication_lsn.unwrap() >= 2);
+    let discovery = tokio::spawn(run_peer_discovery(
+        late.runtime.snapshot().await.identity,
+        late.runtime.clone(),
+        late.store.clone(),
+        transport,
+        dispatcher,
+        late.service.sessions().clone(),
+        shutdown_rx,
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !late.runtime.snapshot().await.catch_up_complete {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    Coordinator::new(late.store.clone(), late.runtime.clone())
+        .accept_secondary_removal_commit(accept(&late.runtime.snapshot().await.identity))
+        .await
+        .unwrap();
+    assert_eq!(
+        late.store
+            .load_state()
+            .await
+            .unwrap()
+            .accepted_secondary_removal,
+        Some(committed.clone())
+    );
+    let sequence = late.store.load_state().await.unwrap().next_effect_sequence;
+    assert!(
+        late.runtime
+            .apply_effect(RuntimeEffect {
+                operation_id: OperationId::new("obsolete-primary-session"),
+                sequence,
+                action: RuntimeEffectAction::RegisterPeerSession {
+                    identity: intent.primary.clone(),
+                    session: old_primary_session
+                },
+            })
+            .await
+            .is_err()
+    );
+    late.runtime.abort();
+    let late = member(directory.path(), &intent, 2, false).await;
+    assert_eq!(
+        late.runtime.snapshot().await.accepted_secondary_removal,
+        Some(committed)
+    );
+    assert_eq!(
+        write_success(&primary, &secondary, "live-after-late-return").await,
+        3
+    );
+    // The next exact removal can now close this live primary at the new boundary.
+    let mut next = fixture::intent(&[1, 2, 3], 1);
+    next.previous_configuration = intent.current_configuration.clone();
+    next.current_configuration = kuberic_protocol::types::ConfigurationDescriptor::new(
+        kuberic_protocol::types::Epoch::new(
+            intent.current_configuration.epoch.data_loss_number,
+            intent.current_configuration.epoch.configuration_number + 1,
+        ),
+        intent.current_configuration.primary_id,
+        next.current_configuration.members.clone(),
+        next.current_policy.write_quorum,
+    );
+    next.operation_id = next.expected_operation_id();
+    let prepared = Coordinator::new(primary.store.clone(), primary.runtime.clone())
+        .ensure_secondary_removal_prepared(
+            fixture::prepare_command(&next),
+            primary.session.clone(),
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.boundary_lsn, 3);
+    shutdown.send_replace(true);
+    discovery.await.unwrap().unwrap();
+    for server in servers {
+        server.await.unwrap().unwrap();
+    }
 }
 
 async fn cleanup(

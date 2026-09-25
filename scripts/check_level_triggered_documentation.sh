@@ -131,6 +131,10 @@ assert re.search(r"pub const SCHEMA_VERSION: u32 = 2;", store)
 assert "Protocol version 6" in guide_text and "schema 2" in guide_text
 assert "Protocol version 6" in (root / "kuberic-wire/README.md").read_text()
 assert "Protocol 6" in sample and "schema 2" in sample
+diagnostics = (root / "kuberic-agent/src/process.rs").read_text()
+assert "pub retired: bool" in diagnostics
+assert "state.retired_authority.is_some() || snapshot.retired_authority.is_some()" in diagnostics
+assert "`retired: true`" in guide_text and "Older diagnostic responses can omit" in guide_text
 
 recipes = (root / "justfile").read_text()
 workflow = (root / ".github/workflows/level-triggered-CI.yml").read_text()

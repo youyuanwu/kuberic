@@ -101,6 +101,13 @@ the receipt or currently attest completed local acceptance; otherwise
 `ScaleDownRetainedMemberPending` waits for the late member. The next accepted
 removal replaces the receipt, not an accumulating history. The optional status
 field preserves restart recovery without re-authorizing cleanup of replacements.
+After a later failover or replacement, that receipt can also validate a returning
+exact accepted member's older, write-closed current-only removal report. This is
+bounded local history only: normal stale-authority correction still runs, and
+historical evidence grants no writes, quorum votes, cleanup, or new transition.
+Endpoint scaffolding and accepted-authority convergence precede new transition
+admission; switchover then precedes reduction, which precedes replacement of an
+unavailable selected removal target.
 
 Scale-down progress projects stable reasons for preparation, previous read quorum
 (`ScaleDownPreviousReadQuorumUnavailable`), reduced write quorum and verified

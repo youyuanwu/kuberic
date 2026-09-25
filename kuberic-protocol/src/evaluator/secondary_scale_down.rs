@@ -817,6 +817,10 @@ pub(super) fn cleanup(
             .map(|r| &r.agent)
         && !target.process_session_id.is_empty()
         && target.report_sequence > 0
+        // Older installed authority cannot admit the exact-PC retirement command.
+        // Positive observation permits only the already committed exact Pod fence.
+        && !(target.epoch < intent.previous_configuration.epoch
+            && target.current_configuration.is_some())
     {
         if let Some(retirement) = &target.retired_replica {
             status

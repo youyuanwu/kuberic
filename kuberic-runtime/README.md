@@ -84,6 +84,10 @@ Frozen quorum certificates remain immutable authorization evidence after a
 retained peer restarts. They cannot restore obsolete-session credit: acceptance
 uses freshly verified current-session progress for the exact reduced authority
 and prepared boundary. Old-session reports, ACKs, and registration still reject.
+Post-commit live progress is validated separately from transition witnesses and
+binds the exact immutable commit certificate. A current-only primary may report
+Granted access with its completed availability command after restarting and
+resuming writes. This does not relax pre-commit write closure or alter certificates.
 
 Exact peer eviction after PC removal cancels retained windows and prevents a
 delayed session from reconnecting the excluded incarnation. Local retirement

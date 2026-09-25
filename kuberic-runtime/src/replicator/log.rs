@@ -461,6 +461,22 @@ impl ReplicationLog {
         self.quorum.observe_committed_secondary_removal(witness)
     }
 
+    pub(crate) fn observe_secondary_removal_progress(
+        &mut self,
+        witness: &kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.quorum
+            .observe_secondary_removal_progress(witness, committed)
+    }
+
+    pub(crate) fn validate_secondary_removal_commit(
+        &self,
+        committed: &kuberic_protocol::types::SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        self.quorum.validate_secondary_removal_commit(committed)
+    }
+
     pub(crate) fn restore_committed_secondary_removal(
         &mut self,
         witness: &kuberic_protocol::types::SecondaryRemovalWitness,

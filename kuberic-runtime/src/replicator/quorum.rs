@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kuberic_protocol::types::{
-    ConfigurationDescriptor, ProcessSessionId, ReplicaIdentity, ReplicaRole, SecondaryRemovalStage,
-    SecondaryRemovalWitness,
+    AccessStatus, ConfigurationDescriptor, OperationId, ProcessSessionId, ReplicaIdentity,
+    ReplicaRole, SecondaryRemovalStage, SecondaryRemovalWitness, SecondaryScaleDownCleanup,
 };
 use kuberic_runtime_internal::transport::ReplicationAck;
 use tokio::sync::oneshot;
@@ -24,6 +24,7 @@ pub struct QuorumTracker {
     obsolete_sessions: BTreeSet<(ReplicaIdentity, ProcessSessionId)>,
     verified: BTreeMap<ReplicaIdentity, (u64, Lsn)>,
     witnesses: BTreeMap<ReplicaIdentity, SecondaryRemovalWitness>,
+    live_commits: BTreeMap<ReplicaIdentity, SecondaryScaleDownCleanup>,
 }
 
 impl QuorumTracker {
@@ -41,6 +42,7 @@ impl QuorumTracker {
             self.progress.clear();
             self.verified.clear();
             self.witnesses.clear();
+            self.live_commits.clear();
         }
         let members = authority_members(&authority);
         self.sessions
@@ -92,6 +94,18 @@ impl QuorumTracker {
             ));
         }
         if self.sessions.get(&identity) != Some(&session) {
+            if let Some(evidence) = &authority.secondary_removal {
+                for historical in evidence
+                    .previous_read_quorum
+                    .iter()
+                    .chain(&evidence.reduced_write_quorum)
+                {
+                    if historical.identity == identity && historical.process_session_id != session {
+                        self.obsolete_sessions
+                            .insert((identity.clone(), historical.process_session_id.clone()));
+                    }
+                }
+            }
             if let Some(previous) = self.sessions.get(&identity) {
                 self.obsolete_sessions
                     .insert((identity.clone(), previous.clone()));
@@ -99,6 +113,7 @@ impl QuorumTracker {
             self.progress.remove(&identity);
             self.verified.remove(&identity);
             self.witnesses.remove(&identity);
+            self.live_commits.remove(&identity);
             self.sessions.insert(identity, session);
         }
         Ok(())
@@ -112,7 +127,9 @@ impl QuorumTracker {
     }
 
     pub fn observe_secondary_removal(&mut self, witness: &SecondaryRemovalWitness) -> Result<()> {
-        if self.witnesses.get(&witness.identity) == Some(witness) {
+        if self.witnesses.get(&witness.identity) == Some(witness)
+            && !self.live_commits.contains_key(&witness.identity)
+        {
             return Ok(());
         }
         let authority = self
@@ -177,13 +194,120 @@ impl QuorumTracker {
         Ok(())
     }
 
+    /// Fresh progress for an already committed reduction is not a transition witness.
+    pub(crate) fn observe_secondary_removal_progress(
+        &mut self,
+        witness: &SecondaryRemovalWitness,
+        committed: &SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        kuberic_protocol::validation::validate_secondary_scale_down_cleanup(committed)
+            .map_err(|e| RuntimeError::AuthorityMismatch(e.to_string()))?;
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let intent = &committed.evidence.preparation.intent;
+        let operation = witness.retained_operation_id.as_ref();
+        let retained = operation
+            == Some(
+                &intent.command_operation_id(SecondaryRemovalStage::CurrentOnly, &witness.identity),
+            )
+            || operation
+                == Some(
+                    &intent.command_operation_id(
+                        SecondaryRemovalStage::AcceptCommit,
+                        &witness.identity,
+                    ),
+                )
+            || (witness.identity == intent.primary
+                && operation
+                    == Some(&OperationId::new(format!(
+                        "availability:{}:{}",
+                        intent.current_configuration.configuration_id,
+                        if witness.write_status == AccessStatus::Granted {
+                            "grant-write"
+                        } else {
+                            "no-write-quorum"
+                        }
+                    ))));
+        if authority.previous_configuration.is_some()
+            || authority.secondary_removal.as_ref() != Some(&committed.evidence)
+            || authority.current_configuration != intent.current_configuration
+            || witness.identity == authority.local_identity
+            || self.sessions.get(&witness.identity) != Some(&witness.process_session_id)
+            || witness.resource_uid != intent.resource_uid
+            || witness.epoch != intent.current_configuration.epoch
+            || witness.previous_configuration_id.is_some()
+            || witness.current_configuration_id != intent.current_configuration.configuration_id
+            || !intent
+                .current_configuration
+                .members
+                .iter()
+                .any(|member| member.identity == witness.identity && member.role == witness.role)
+            || witness.report_sequence == 0
+            || witness.verified_replication_lsn < committed.evidence.preparation.boundary_lsn
+            || witness.pending_operation_id.is_some()
+            || (witness.write_status == AccessStatus::Granted && witness.identity != intent.primary)
+            || !retained
+            || self.live_commits.values().any(|old| {
+                old.evidence != committed.evidence
+                    || old.current_only_write_quorum != committed.current_only_write_quorum
+            })
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "invalid committed-removal live progress".into(),
+            ));
+        }
+        if self.witnesses.get(&witness.identity) == Some(witness)
+            && self.live_commits.contains_key(&witness.identity)
+        {
+            return Ok(());
+        }
+        if self
+            .verified
+            .get(&witness.identity)
+            .is_some_and(|(sequence, _)| *sequence >= witness.report_sequence)
+            || committed.current_only_write_quorum.iter().any(|old| {
+                old.identity == witness.identity
+                    && old.process_session_id == witness.process_session_id
+                    && old.report_sequence >= witness.report_sequence
+            })
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "stale committed-removal live progress".into(),
+            ));
+        }
+        self.verified.insert(
+            witness.identity.clone(),
+            (witness.report_sequence, witness.verified_replication_lsn),
+        );
+        self.witnesses
+            .insert(witness.identity.clone(), witness.clone());
+        self.live_commits
+            .insert(witness.identity.clone(), committed.clone());
+        Ok(())
+    }
+
+    pub(crate) fn validate_secondary_removal_commit(
+        &self,
+        committed: &SecondaryScaleDownCleanup,
+    ) -> Result<()> {
+        if self.live_commits.values().any(|old| {
+            old.evidence != committed.evidence
+                || old.current_only_write_quorum != committed.current_only_write_quorum
+        }) {
+            return Err(RuntimeError::AuthorityMismatch(
+                "commit differs from live progress proof".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn observe_committed_secondary_removal(
         &mut self,
         witness: &SecondaryRemovalWitness,
     ) -> Result<()> {
-        if let Some(session) = self.sessions.get(&witness.identity)
-            && session != &witness.process_session_id
-        {
+        if self.sessions.get(&witness.identity) != Some(&witness.process_session_id) {
             // The certificate authorizes the configuration, not obsolete
             // session credit. Session registration erased that credit;
             // catch-up now requires freshly verified current-session reports.
@@ -526,6 +650,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn late_member_uses_live_committed_primary_progress_not_a_transition_certificate() {
+        let intent = removal_fixture::intent(&[1, 2, 3, 4], 1);
+        let committed = removal_fixture::cleanup(&intent);
+        let local = intent.current_configuration.members[2].identity.clone();
+        let authority = AdmittedAuthority {
+            local_identity: local,
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: intent.current_configuration.clone(),
+            switchover_handoff: None,
+            secondary_removal: Some(committed.evidence.clone()),
+        };
+        let mut fresh = committed.current_only_write_quorum[0].clone();
+        fresh.process_session_id = ProcessSessionId::new("primary-restarted");
+        fresh.report_sequence = 1;
+        fresh.verified_replication_lsn = 12;
+        fresh.write_status = AccessStatus::Granted;
+        fresh.retained_operation_id = Some(OperationId::new(format!(
+            "availability:{}:grant-write",
+            intent.current_configuration.configuration_id
+        )));
+        let mut tracker = QuorumTracker::default();
+        tracker.configure(authority.clone(), 10).unwrap();
+        tracker.record_verified_local_progress(10);
+        tracker
+            .register_peer_session(
+                fresh.identity.clone(),
+                committed.current_only_write_quorum[0]
+                    .process_session_id
+                    .clone(),
+            )
+            .unwrap();
+        tracker
+            .register_peer_session(fresh.identity.clone(), fresh.process_session_id.clone())
+            .unwrap();
+        assert!(tracker.observe_secondary_removal(&fresh).is_err());
+        for mutation in 0..10 {
+            let mut invalid = fresh.clone();
+            let mut proof = committed.clone();
+            match mutation {
+                0 => {
+                    invalid.process_session_id = committed.current_only_write_quorum[0]
+                        .process_session_id
+                        .clone()
+                }
+                1 => invalid.resource_uid = kuberic_protocol::types::ResourceUid::new("other"),
+                2 => invalid.identity = intent.target.clone(),
+                3 => invalid.epoch.configuration_number += 1,
+                4 => {
+                    invalid.previous_configuration_id =
+                        Some(intent.previous_configuration.configuration_id.clone())
+                }
+                5 => invalid.verified_replication_lsn = 9,
+                6 => invalid.pending_operation_id = Some(OperationId::new("pending")),
+                7 => invalid.retained_operation_id = Some(OperationId::new("unrelated")),
+                8 => proof.evidence.preparation.boundary_lsn -= 1,
+                _ => invalid.role = ReplicaRole::ActiveSecondary,
+            }
+            assert!(
+                tracker
+                    .observe_secondary_removal_progress(&invalid, &proof)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            assert!(!tracker.catch_up_complete());
+        }
+        let mut joint = authority;
+        joint.previous_configuration = Some(intent.previous_configuration.clone());
+        joint.transition_kind = Some(kuberic_protocol::types::TransitionKind::SecondaryScaleDown);
+        let mut precommit = QuorumTracker::default();
+        precommit.configure(joint, 10).unwrap();
+        precommit
+            .register_peer_session(fresh.identity.clone(), fresh.process_session_id.clone())
+            .unwrap();
+        assert!(
+            precommit
+                .observe_secondary_removal_progress(&fresh, &committed)
+                .is_err()
+        );
+        tracker
+            .observe_secondary_removal_progress(&fresh, &committed)
+            .unwrap();
+        tracker
+            .observe_secondary_removal_progress(&fresh, &committed)
+            .unwrap();
+        assert!(tracker.catch_up_complete());
+        assert!(
+            tracker.observe_secondary_removal(&fresh).is_err(),
+            "live progress never becomes a transition witness"
+        );
+        tracker
+            .observe_committed_secondary_removal(&committed.current_only_write_quorum[0])
+            .unwrap();
+        assert!(tracker.catch_up_complete());
+        let mut conflicting = committed.clone();
+        conflicting.current_only_write_quorum[0].report_sequence += 1;
+        assert!(
+            tracker
+                .validate_secondary_removal_commit(&conflicting)
+                .is_err()
+        );
+        assert!(
+            tracker
+                .register_peer_session(
+                    fresh.identity,
+                    committed.current_only_write_quorum[0]
+                        .process_session_id
+                        .clone()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn committed_witness_cannot_revive_obsolete_credit_after_session_change() {
         let intent = removal_fixture::intent(&[1, 2, 3], 1);
         let authority = AdmittedAuthority {
@@ -542,11 +780,9 @@ mod tests {
         let mut frozen =
             removal_fixture::witnesses(&intent, SecondaryRemovalStage::CurrentOnly)[1].clone();
         frozen.verified_replication_lsn = 11;
-        assert!(
-            tracker
-                .observe_committed_secondary_removal(&frozen)
-                .is_err()
-        );
+        tracker
+            .observe_committed_secondary_removal(&frozen)
+            .unwrap();
         assert!(!tracker.catch_up_complete());
         tracker
             .restore_committed_secondary_removal(&frozen)

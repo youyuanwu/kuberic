@@ -210,29 +210,29 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
     } else if spec_fully_observed {
         status.observed_generation = snapshot.desired.generation;
     }
-    status = project_switchover_request(snapshot, status);
-    if switchover_rejection(&status) != switchover_rejection(&snapshot.status) {
-        return Plan::Apply {
-            changes: vec![KubernetesChange::PersistStatus {
-                status: Box::new(status),
-            }],
-        };
-    }
-
     if let Some(plan) = maybe_begin_stable_failover(snapshot, status.clone(), config) {
         return plan;
     }
 
-    if config.enable_secondary_scale_down && status.pending_replacement_cleanup.is_none() {
-        if let Some(plan) = begin_switchover(snapshot, &status, config) {
-            return plan;
-        }
-        if let Some(plan) = secondary_scale_down::begin(snapshot, status.clone(), config) {
-            return plan;
-        }
-    }
-
+    let removal_target = (config.enable_secondary_scale_down
+        && snapshot.desired.replicas < policy.replica_set_size
+        && status.pending_replacement_cleanup.is_none())
+    .then(|| {
+        configuration
+            .members
+            .iter()
+            .filter(|member| member.role == ReplicaRole::ActiveSecondary)
+            .max_by_key(|member| member.identity.replica_id)
+    })
+    .flatten();
     if configuration.members.iter().any(|member| {
+        if removal_target == Some(member)
+            && snapshot
+                .observation_for_identity(&member.identity)
+                .is_none_or(|o| !matches!(o.agent, AgentObservation::Report(_)))
+        {
+            return false;
+        }
         if status
             .pending_replacement_cleanup
             .as_ref()
@@ -267,10 +267,7 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 AgentObservation::Report(report) => Some(report.as_ref()),
                 _ => None,
             })?;
-        (report.epoch < configuration.epoch
-            && (report.role == ReplicaRole::Primary
-                || report.write_status == AccessStatus::Granted))
-            .then_some((member, report))
+        (report.epoch < configuration.epoch).then_some((member, report))
     }) {
         if let Some(previous) = report.current_configuration.as_ref() {
             return Plan::Execute {
@@ -329,6 +326,27 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 ),
             )),
         };
+    }
+
+    // Converge accepted authority before freezing another transition. Switchover
+    // wins over reduction, which wins over replacing an unavailable removal target.
+    status = project_switchover_request(snapshot, status);
+    if switchover_rejection(&status) != switchover_rejection(&snapshot.status) {
+        return Plan::Apply {
+            changes: vec![KubernetesChange::PersistStatus {
+                status: Box::new(status),
+            }],
+        };
+    }
+    if status.pending_replacement_cleanup.is_none() {
+        if let Some(plan) = begin_switchover(snapshot, &status, config) {
+            return plan;
+        }
+        if config.enable_secondary_scale_down
+            && let Some(plan) = secondary_scale_down::begin(snapshot, status.clone(), config)
+        {
+            return plan;
+        }
     }
 
     let recovering_service = status.last_switchover.as_ref().is_some_and(|receipt| {
@@ -610,9 +628,6 @@ fn evaluate_stable(snapshot: &ObservationSnapshot, config: &EvaluationConfig) ->
                 ],
             };
         }
-    }
-    if let Some(plan) = begin_switchover(snapshot, &status, config) {
-        return plan;
     }
     status = status.with_condition(ready_condition());
     Plan::Stable {

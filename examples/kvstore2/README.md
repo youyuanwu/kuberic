@@ -10,7 +10,9 @@ The HTTP API is:
 - `PUT /kv/{key}` with a UTF-8 request body, returning the committed LSN;
 - `GET /kv/{key}`;
 - `GET /status` for exact replica, authority, progress, access, and build
-  diagnostics.
+  diagnostics. Its additive `retired` boolean distinguishes terminal retirement
+  from an ordinary role-None/access-denied state without exposing authority
+  certificates; older responses may omit this field.
 
 Application state lives under `/var/lib/kuberic/application`; agent authority
 lives separately under `/var/lib/kuberic/.kuberic/agent.sqlite3`.

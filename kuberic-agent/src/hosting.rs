@@ -462,13 +462,16 @@ impl PodRuntime {
     pub(crate) async fn observe_secondary_removal_witness(
         &self,
         witness: kuberic_protocol::types::SecondaryRemovalWitness,
+        committed: Option<kuberic_protocol::types::SecondaryScaleDownCleanup>,
     ) -> Result<()> {
-        self.host
-            .managed()?
-            .execute_action(RuntimeEffectAction::ObserveSecondaryRemovalWitness(
-                Box::new(witness),
-            ))
-            .await
+        let action = match committed {
+            Some(committed) => RuntimeEffectAction::ObserveSecondaryRemovalProgress {
+                witness: Box::new(witness),
+                committed: Box::new(committed),
+            },
+            None => RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness)),
+        };
+        self.host.managed()?.execute_action(action).await
     }
 
     pub async fn partition_report(&self) -> PartitionReportSnapshot {
@@ -1254,6 +1257,7 @@ impl RuntimeHost {
             RuntimeEffectAction::PrepareSecondaryRemoval { .. }
             | RuntimeEffectAction::RegisterPeerSession { .. }
             | RuntimeEffectAction::ObserveSecondaryRemovalWitness(_)
+            | RuntimeEffectAction::ObserveSecondaryRemovalProgress { .. }
             | RuntimeEffectAction::ObserveReplicationAck { .. }
             | RuntimeEffectAction::AcceptSecondaryRemovalCommit(_)
             | RuntimeEffectAction::RetireReplica(_)

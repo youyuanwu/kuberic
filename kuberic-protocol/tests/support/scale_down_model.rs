@@ -274,6 +274,15 @@ impl Model {
                         KubernetesChange::EnsureWriteRoutingService => {
                             self.snapshot.routing.service_present = true
                         }
+                        KubernetesChange::EnsureReplicaScaffolding { replica_ids } => {
+                            for observation in self.snapshot.replicas.values_mut() {
+                                if let Some(kubernetes) = &mut observation.kubernetes
+                                    && replica_ids.contains(&kubernetes.replica_id)
+                                {
+                                    kubernetes.peer_endpoint_ready = true;
+                                }
+                            }
+                        }
                         KubernetesChange::DeleteScaleDownResource {
                             resource,
                             name,
@@ -400,6 +409,20 @@ impl Model {
                         r.report_sequence += 1;
                         r.epoch = c.current_epoch;
                         r.previous_configuration = c.previous_configuration;
+                        r.role = c
+                            .current_configuration
+                            .members
+                            .iter()
+                            .find(|m| m.identity == r.identity)
+                            .unwrap()
+                            .role;
+                        if r.current_configuration.as_ref() != Some(&c.current_configuration)
+                            && c.secondary_removal_evidence.is_none()
+                        {
+                            r.secondary_removal_evidence = None;
+                            r.accepted_secondary_removal = None;
+                            r.prepared_secondary_removal = None;
+                        }
                         r.current_configuration = Some(c.current_configuration);
                         r.pending_operation_id = None;
                         r.retained_operation_id = Some(c.operation_id);
