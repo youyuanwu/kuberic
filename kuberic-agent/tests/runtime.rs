@@ -643,6 +643,66 @@ async fn secondary_removal_retirement_closes_host_and_survives_reconstruction() 
 }
 
 #[tokio::test]
+async fn secondary_removal_retirement_cancels_unacknowledged_inbound_delivery() {
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let app = Arc::new(TestApplication::default());
+    app.manual_streams.store(true, Ordering::SeqCst);
+    let target = open_removal_member(
+        &intent,
+        intent.target.clone(),
+        app.clone(),
+        Arc::new(MemoryAuthorityStore::default()),
+    )
+    .await;
+    let old_authority = target.snapshot().await.authority.unwrap();
+    let pending = target
+        .data_plane()
+        .receive_replication(retry_item(
+            &acknowledgement(&old_authority, intent.target.clone(), 1),
+            intent.target.clone(),
+        ))
+        .await
+        .unwrap();
+    let applied = tokio::spawn(async move { pending.applied().await });
+    let mut stream = app.held_streams.lock().unwrap().remove(0);
+    let operation = stream.get_operation().await.unwrap().unwrap();
+    let retired = kuberic_runtime_internal::authority::RetiredAuthority {
+        committed: removal_fixture::cleanup(&intent),
+        report: removal_fixture::retirement(&intent),
+    };
+
+    let result = timeout(
+        Duration::from_secs(1),
+        target.apply_effect(effect(
+            5,
+            RuntimeEffectAction::RetireReplica(Box::new(retired)),
+        )),
+    )
+    .await
+    .expect("retirement must not wait for the old application acknowledgement")
+    .unwrap();
+
+    assert!(!result.postcondition.open);
+    assert_eq!(result.postcondition.role, ReplicaRole::None);
+    assert!(applied.await.unwrap().is_err());
+    assert!(
+        operation
+            .acknowledge(DurableApplicationProgress {
+                applied_lsn: 1,
+                committed_lsn: 0,
+            })
+            .is_err()
+    );
+    assert!(
+        app.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "service.close")
+    );
+}
+
+#[tokio::test]
 async fn secondary_removal_preparation_failure_is_closed_and_exactly_replayable() {
     for ambiguous in [false, true] {
         let intent = removal_fixture::intent(&[1, 2], 1);

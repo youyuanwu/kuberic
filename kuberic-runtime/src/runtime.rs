@@ -2902,6 +2902,9 @@ impl DefaultReplicatorInner {
             }
             RuntimeEffectAction::FenceRetirement(retired) => {
                 retired.validate(&self.identity)?;
+                if let Some(streams) = self.streams.read().await.as_ref() {
+                    streams.shutdown();
+                }
                 let mut state = self.state.write().await;
                 if state
                     .retiring_authority
