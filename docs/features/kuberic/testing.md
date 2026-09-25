@@ -16,6 +16,14 @@ and explicitly owned KinD scenarios. Secondary scale-down covers healthy 3→2,
 2→1 and singleton restart, sequential 5→2, unavailable-target evidence, retirement,
 and exact Pod/PVC/endpoint cleanup without deleting replacement UIDs.
 
+The scale-down routed-write assertion verifies the exact primary Service selector
+and requires HTTP 200 through `kvstore2-write` before recording an acknowledged
+value. Within the existing scenario deadline, it retries HTTP 503 and recognized
+curl transport or Kubernetes exec/restart races: Pod readiness can precede
+EndpointSlice recovery. Other HTTP statuses (including 500), malformed responses,
+and unknown command failures fail immediately with the last status/stderr.
+Retained-session and deleted-target rejection assertions remain strict.
+
 ```bash
 cargo test -p kuberic-protocol --test protocol --test model
 cargo test -p kuberic-agent --test crash_boundaries --test runtime -- --test-threads=1

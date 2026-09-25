@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -991,6 +991,200 @@ fn identity(member: &Value) -> Value {
 
 fn routing_instance(service: &Value) -> Option<&str> {
     service["spec"]["selector"]["operator.kuberic.io/instance"].as_str()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RoutedWriteOutcome {
+    Acknowledged,
+    Retry,
+}
+
+fn transient_routed_exec_error(stderr: &str) -> bool {
+    let stderr = stderr.trim();
+    let upgrade = stderr.starts_with("error: unable to upgrade connection:")
+        || stderr.starts_with("error: Internal error occurred: unable to upgrade connection:");
+    let exec =
+        stderr.starts_with("error: Internal error occurred: error executing command in container:");
+    let backend = stderr.starts_with("Error from server: error dialing backend:")
+        || stderr.starts_with("error: error upgrading connection:");
+    (upgrade && stderr.contains("container not found ("))
+        || ((upgrade || exec || stderr.starts_with("Error from server (BadRequest): container "))
+            && (stderr.contains("container is not running")
+                || stderr.ends_with(" is not running")
+                || stderr.contains("container is in CONTAINER_EXITED state")))
+        || ((upgrade || backend)
+            && [
+                "connect: connection refused",
+                "connection reset by peer",
+                "i/o timeout",
+                "context deadline exceeded",
+                "EOF",
+            ]
+            .iter()
+            .any(|suffix| stderr.ends_with(suffix)))
+        || stderr == "error: lost connection to pod"
+}
+
+fn classify_routed_write(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<RoutedWriteOutcome> {
+    match stdout {
+        "200" if exit_code == Some(0) => return Ok(RoutedWriteOutcome::Acknowledged),
+        "503" if exit_code == Some(0) => return Ok(RoutedWriteOutcome::Retry),
+        // A failed transfer can still report its HTTP status. Never hide a 500
+        // (or malformed output) behind an otherwise retryable transport error.
+        "" | "000" | "200" | "503" if exit_code != Some(0) => {}
+        _ => bail!("unexpected routed HTTP status/output {stdout:?}"),
+    }
+    let curl_transport = exit_code.is_some_and(|code| {
+        matches!(code, 7 | 28 | 52 | 56)
+            && stderr
+                .lines()
+                .any(|line| line.starts_with(&format!("curl: ({code}) ")))
+    });
+    ensure!(
+        curl_transport || (exit_code == Some(1) && transient_routed_exec_error(stderr)),
+        "unrecognized routed command failure: exit={exit_code:?}, stdout={stdout:?}, stderr={stderr:?}"
+    );
+    Ok(RoutedWriteOutcome::Retry)
+}
+
+fn wait_routed_write(deadline: Instant, mut attempt: impl FnMut() -> Result<Output>) -> Result<()> {
+    let mut last = "no attempt made".to_string();
+    loop {
+        ensure!(
+            Instant::now() < deadline,
+            "deadline exceeded waiting for routed Service write; last {last}"
+        );
+        let output = attempt().with_context(|| format!("routed Service write; last {last}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        last = format!(
+            "exit={}, stdout={stdout:?}, stderr={stderr:?}",
+            output.status
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "deadline exceeded waiting for routed Service write; last {last}"
+        );
+        match classify_routed_write(output.status.code(), &stdout, &stderr)
+            .with_context(|| format!("routed Service write; last {last}"))?
+        {
+            RoutedWriteOutcome::Acknowledged => return Ok(()),
+            RoutedWriteOutcome::Retry => std::thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            ),
+        }
+    }
+}
+
+fn routed_kubectl(cluster: &SwitchoverCluster, deadline: Instant, args: &[&str]) -> Result<Output> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ensure!(
+        !remaining.is_zero(),
+        "routed Service deadline expired before kubectl {args:?}"
+    );
+    // Bound exec and API discovery by the scenario deadline, not a fresh timeout.
+    Command::new("timeout")
+        .args([
+            "--signal=KILL",
+            &format!("{}s", remaining.as_secs_f64()),
+            "kubectl",
+        ])
+        .args([
+            "--kubeconfig",
+            &cluster.kubeconfig,
+            "--context",
+            &cluster.context,
+            "--request-timeout=10s",
+        ])
+        .args(args)
+        .output()
+        .with_context(|| format!("routed kubectl {args:?}"))
+}
+
+fn assert_routed_service_write(
+    cluster: &SwitchoverCluster,
+    primary: &Value,
+    key: &str,
+    value: &str,
+    deadline: Instant,
+) -> Result<()> {
+    wait_routed_write(deadline, || {
+        let service = routed_kubectl(
+            cluster,
+            deadline,
+            &[
+                "-n",
+                "default",
+                "get",
+                "service",
+                "kvstore2-write",
+                "-o",
+                "json",
+            ],
+        )?;
+        if !service.status.success() {
+            return Ok(service);
+        }
+        let service: Value = serde_json::from_slice(&service.stdout)?;
+        ensure!(
+            routing_instance(&service) == primary["instanceId"].as_str(),
+            "routing lost exact primary: {service}"
+        );
+        let pods = routed_kubectl(
+            cluster,
+            deadline,
+            &[
+                "-n",
+                "default",
+                "get",
+                "pods",
+                "-l",
+                "operator.kuberic.io/set-name=kvstore2",
+                "-o",
+                "json",
+            ],
+        )?;
+        if !pods.status.success() {
+            return Ok(pods);
+        }
+        let pods: Value = serde_json::from_slice(&pods.stdout)?;
+        let pod = pods["items"]
+            .as_array()
+            .context("routed primary Pod list")?
+            .iter()
+            .find(|pod| pod["metadata"]["uid"] == primary["instanceId"])
+            .and_then(|pod| pod["metadata"]["name"].as_str())
+            .context("exact accepted primary Pod incarnation is absent")?;
+        routed_kubectl(
+            cluster,
+            deadline,
+            &[
+                "-n",
+                "default",
+                "exec",
+                pod,
+                "--",
+                "curl",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "5",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "PUT",
+                "--data-binary",
+                value,
+                &format!("http://kvstore2-write/kv/{key}"),
+            ],
+        )
+    })
 }
 
 fn check_receipt(
@@ -2070,42 +2264,18 @@ impl<'a> ScaleCase<'a> {
             topology_primary_id(&status) == self.primary["replicaId"].as_i64(),
             "primary changed"
         );
-        let service: Value = serde_json::from_str(&self.cluster.kubectl(&[
-            "-n",
-            "default",
-            "get",
-            "service",
-            "kvstore2-write",
-            "-o",
-            "json",
-        ])?)?;
-        ensure!(
-            routing_instance(&service) == self.primary["instanceId"].as_str(),
-            "routing lost exact primary"
-        );
         let routed_key = format!(
             "routed-{}-{}",
             self.start["metadata"]["uid"].as_str().unwrap(),
             self.acknowledged.len()
         );
-        self.cluster.kubectl(&[
-            "-n",
-            "default",
-            "exec",
-            &self.cluster.pod(&self.primary)?,
-            "--",
-            "curl",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "5",
-            "-X",
-            "PUT",
-            "--data-binary",
+        assert_routed_service_write(
+            self.cluster,
+            &self.primary,
+            &routed_key,
             "routed-after-removal",
-            &format!("http://kvstore2-write/kv/{routed_key}"),
-        ])?;
+            self.deadline,
+        )?;
         self.acknowledged
             .push((routed_key, "routed-after-removal".into()));
         self.write("after")?;
@@ -3296,6 +3466,184 @@ fn switchover_owned_cluster_contract_rejects_ambient_or_mismatched_contexts() {
     ] {
         assert!(validate_cluster_contract(config, context, cluster, receipt).is_err());
     }
+}
+
+#[test]
+fn scale_routed_write_requires_exact_http_success() {
+    assert_eq!(
+        classify_routed_write(Some(0), "200", "").unwrap(),
+        RoutedWriteOutcome::Acknowledged
+    );
+    assert_eq!(
+        classify_routed_write(Some(0), "503", "").unwrap(),
+        RoutedWriteOutcome::Retry
+    );
+    for stdout in [
+        "500", "201", "404", "", "000", "20", "200\n", "200200", "garbage", "\u{fffd}",
+    ] {
+        assert!(
+            classify_routed_write(Some(0), stdout, "").is_err(),
+            "{stdout:?}"
+        );
+        assert!(
+            classify_routed_write(Some(56), stdout, "curl: (56) Connection reset by peer").is_err()
+                || matches!(stdout, "" | "000"),
+            "transport failure concealed {stdout:?}"
+        );
+    }
+    assert!(classify_routed_write(Some(1), "200", "unknown failure").is_err());
+    assert!(classify_routed_write(Some(1), "503", "unknown failure").is_err());
+}
+
+#[test]
+fn scale_routed_write_retries_only_known_transport_and_exec_errors() {
+    for (code, message) in [
+        (
+            7,
+            "Failed to connect to kvstore2-write port 80: Connection refused",
+        ),
+        (28, "Operation timed out"),
+        (52, "Empty reply from server"),
+        (56, "Recv failure: Connection reset by peer"),
+    ] {
+        let stderr =
+            format!("curl: ({code}) {message}\ncommand terminated with exit code {code}\n");
+        for stdout in ["000", "", "200", "503"] {
+            assert_eq!(
+                classify_routed_write(Some(code), stdout, &stderr).unwrap(),
+                RoutedWriteOutcome::Retry
+            );
+        }
+    }
+    for stderr in [
+        "error: unable to upgrade connection: container not found (\"kvstore2\")",
+        "error: Internal error occurred: unable to upgrade connection: container not found (\"kvstore2\")",
+        "Error from server (BadRequest): container kvstore2 is not running",
+        "error: Internal error occurred: error executing command in container: failed to exec in container: container is not running",
+        "error: Internal error occurred: error executing command in container: container is in CONTAINER_EXITED state",
+        "Error from server: error dialing backend: dial tcp 10.0.0.1:10250: connect: connection refused",
+        "Error from server: error dialing backend: read tcp 10.0.0.1:10250: connection reset by peer",
+        "Error from server: error dialing backend: i/o timeout",
+        "error: error upgrading connection: context deadline exceeded",
+        "error: unable to upgrade connection: EOF",
+        "error: lost connection to pod",
+    ] {
+        assert_eq!(
+            classify_routed_write(Some(1), "", stderr).unwrap(),
+            RoutedWriteOutcome::Retry,
+            "{stderr}"
+        );
+        assert!(classify_routed_write(Some(1), "500", stderr).is_err());
+        assert!(classify_routed_write(Some(1), "malformed", stderr).is_err());
+    }
+    for (code, stderr) in [
+        (1, "unknown exec failure"),
+        (1, "Error from server: error dialing backend: Unauthorized"),
+        (1, "error: unable to upgrade connection: Forbidden"),
+        (
+            1,
+            "error: Internal error occurred: error executing command in container: curl not found",
+        ),
+        (
+            1,
+            "Error from server (NotFound): pods \"wrong-pod\" not found",
+        ),
+        (7, "unknown stderr"),
+        (28, "unknown timeout"),
+        (6, "curl: (6) Could not resolve host: kvstore2-write"),
+        (22, "curl: (22) The requested URL returned error: 500"),
+        (137, "command terminated with exit code 137"),
+    ] {
+        assert!(
+            classify_routed_write(Some(code), "", stderr).is_err(),
+            "{stderr}"
+        );
+    }
+    assert!(classify_routed_write(None, "", "").is_err());
+}
+
+#[cfg(unix)]
+fn routed_test_output(code: i32, stdout: &str, stderr: &str) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn scale_routed_write_poll_stops_on_success_or_unknown_failure() -> Result<()> {
+    let mut attempts = 0;
+    wait_routed_write(Instant::now() + Duration::from_secs(5), || {
+        attempts += 1;
+        Ok(match attempts {
+            1 => routed_test_output(7, "000", "curl: (7) Connection refused"),
+            2 => routed_test_output(0, "503", ""),
+            3 => routed_test_output(0, "200", ""),
+            _ => panic!("must stop after acknowledgement"),
+        })
+    })?;
+    assert_eq!(attempts, 3);
+    for output in [
+        routed_test_output(0, "500", ""),
+        routed_test_output(0, "malformed", ""),
+        routed_test_output(1, "", "unknown stderr"),
+    ] {
+        let mut attempts = 0;
+        let error = wait_routed_write(Instant::now() + Duration::from_secs(5), || {
+            attempts += 1;
+            Ok(output.clone())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("stdout=") && error.contains("stderr="),
+            "{error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn scale_routed_write_preserves_hard_deadline_and_last_response() {
+    let deadline = Instant::now();
+    assert!(wait_routed_write(deadline, || panic!("must not attempt past deadline")).is_err());
+
+    let deadline = Instant::now() + Duration::from_millis(35);
+    let mut attempts = 0;
+    let error = wait_routed_write(deadline, || {
+        attempts += 1;
+        Ok(routed_test_output(
+            28,
+            "000",
+            "curl: (28) Operation timed out",
+        ))
+    })
+    .unwrap_err()
+    .to_string();
+    assert_eq!(attempts, 1);
+    assert!(Instant::now() >= deadline);
+    assert!(error.contains("deadline exceeded"), "{error}");
+    assert!(
+        error.contains("000") && error.contains("Operation timed out"),
+        "{error}"
+    );
+
+    let deadline = Instant::now() + Duration::from_millis(35);
+    let error = wait_routed_write(deadline, || {
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        Ok(routed_test_output(0, "200", ""))
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("deadline exceeded") && error.contains("200"),
+        "{error}"
+    );
 }
 
 #[test]
