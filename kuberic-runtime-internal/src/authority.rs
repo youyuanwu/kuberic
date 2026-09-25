@@ -5,7 +5,15 @@ use kuberic_protocol::types::{
     ConfigurationDescriptor, ConfigurationId, EffectivePolicy, Epoch, OperationId, ReplicaIdentity,
     ReplicaRole, SwitchoverHandoff, TransitionKind,
 };
+use kuberic_protocol::types::{
+    ReplicaRetirementReport, SecondaryRemovalEvidence, SecondaryRemovalPreparation,
+    SecondaryScaleDownCleanup,
+};
 use kuberic_protocol::validation::{validate_configuration, validate_transition_relationship};
+use kuberic_protocol::validation::{
+    validate_replica_retirement, validate_secondary_removal_evidence,
+    validate_secondary_removal_preparation, validate_secondary_scale_down_cleanup,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::transport::{CopyItem, ReplicationAck, ReplicationItem};
@@ -75,6 +83,8 @@ pub struct AdmittedAuthority {
     pub current_configuration: ConfigurationDescriptor,
     #[serde(default)]
     pub switchover_handoff: Option<SwitchoverHandoff>,
+    #[serde(default)]
+    pub secondary_removal: Option<SecondaryRemovalEvidence>,
 }
 
 impl AdmittedAuthority {
@@ -85,6 +95,17 @@ impl AdmittedAuthority {
             && self.previous_configuration.is_none()
             && self.transition_kind.is_none()
             && self.switchover_handoff == existing.switchover_handoff
+            && match (&self.secondary_removal, &existing.secondary_removal) {
+                (Some(next), Some(old)) => {
+                    next.preparation == old.preparation
+                        && next.previous_read_quorum == old.previous_read_quorum
+                        && (old.reduced_write_quorum.is_empty()
+                            || next.reduced_write_quorum == old.reduced_write_quorum)
+                        && validate_secondary_removal_evidence(next, true).is_ok()
+                }
+                (None, None) => true,
+                _ => false,
+            }
     }
 
     pub fn fence(&self) -> AuthorityFence {
@@ -99,10 +120,33 @@ impl AdmittedAuthority {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.transition_kind == Some(TransitionKind::SecondaryScaleDown) {
-            return Err(ContractError::AuthorityMismatch(
-                "secondary scale-down execution is not enabled".into(),
-            ));
+        if let Some(evidence) = &self.secondary_removal {
+            validate_secondary_removal_evidence(evidence, self.previous_configuration.is_none())
+                .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
+            let intent = &evidence.preparation.intent;
+            if self.current_configuration != intent.current_configuration
+                || self.previous_configuration.as_ref()
+                    != self
+                        .previous_configuration
+                        .as_ref()
+                        .map(|_| &intent.previous_configuration)
+                || self.transition_kind
+                    != self
+                        .previous_configuration
+                        .as_ref()
+                        .map(|_| TransitionKind::SecondaryScaleDown)
+                || self.switchover_handoff.is_some()
+                || !intent
+                    .current_configuration
+                    .members
+                    .iter()
+                    .any(|m| m.identity == self.local_identity)
+            {
+                return Err(ContractError::AuthorityMismatch(
+                    "reduction differs from exact prepared authority".into(),
+                ));
+            }
+            return Ok(());
         }
         validate_configuration(&self.current_configuration, None)
             .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
@@ -301,11 +345,68 @@ impl AdmittedAuthority {
     }
 }
 
+/// Durable runtime outputs. The agent must persist these before acknowledging
+/// the enclosing effect and load the tombstone before opening application state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredAuthority {
+    pub committed: SecondaryScaleDownCleanup,
+    pub report: ReplicaRetirementReport,
+}
+
+impl RetiredAuthority {
+    pub fn validate(&self, local: &ReplicaIdentity) -> Result<()> {
+        validate_secondary_scale_down_cleanup(&self.committed)
+            .and_then(|_| validate_replica_retirement(&self.report))
+            .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
+        if self.report.intent != self.committed.evidence.preparation.intent
+            || &self.report.intent.target != local
+            || self
+                .committed
+                .retirement
+                .as_ref()
+                .is_some_and(|r| r != &self.report)
+        {
+            return Err(ContractError::AuthorityMismatch(
+                "retirement target or evidence differs".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 pub trait ReplicaAuthorityStore: Send + Sync {
     async fn load(&self) -> Result<Option<AdmittedAuthority>>;
 
     async fn admit(&self, authority: &AdmittedAuthority) -> Result<()>;
+
+    async fn load_secondary_removal(&self) -> Result<Option<SecondaryRemovalPreparation>> {
+        Ok(None)
+    }
+
+    /// Replay is exact. A later preparation may replace a completed predecessor
+    /// only with a starting epoch at least as new as its reduced configuration.
+    async fn record_secondary_removal(
+        &self,
+        preparation: &SecondaryRemovalPreparation,
+    ) -> Result<()> {
+        validate_secondary_removal_preparation(preparation)
+            .map_err(|error| ContractError::AuthorityMismatch(error.to_string()))?;
+        Err(ContractError::Persistence(
+            "secondary-removal persistence is unavailable".into(),
+        ))
+    }
+
+    async fn load_retired_authority(&self) -> Result<Option<RetiredAuthority>> {
+        Ok(None)
+    }
+
+    /// Must atomically reject conflicting tombstones and all subsequent active admission.
+    async fn retire(&self, _authority: &RetiredAuthority) -> Result<()> {
+        Err(ContractError::Persistence(
+            "retirement persistence is unavailable".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -371,4 +472,90 @@ impl<T> AuthorityStore for T where
         + BuildAuthorityStore
         + BuildProgressStore
 {
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod removal_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduction_requires_independent_policies_and_frozen_old_read_evidence() {
+        for size in 2..=5 {
+            let intent = removal_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
+            let mut evidence = removal_fixture::evidence(&intent);
+            evidence.reduced_write_quorum.clear();
+            let mut authority = AdmittedAuthority {
+                local_identity: intent.primary.clone(),
+                transition_kind: Some(TransitionKind::SecondaryScaleDown),
+                previous_configuration: Some(intent.previous_configuration.clone()),
+                current_configuration: intent.current_configuration.clone(),
+                switchover_handoff: None,
+                secondary_removal: Some(evidence),
+            };
+            authority.validate().unwrap();
+            let good = authority.clone();
+            authority
+                .secondary_removal
+                .as_mut()
+                .unwrap()
+                .previous_read_quorum
+                .truncate(intent.previous_policy.read_quorum as usize - 1);
+            assert!(authority.validate().is_err());
+            authority = good.clone();
+            authority
+                .secondary_removal
+                .as_mut()
+                .unwrap()
+                .preparation
+                .intent
+                .current_policy = intent.previous_policy.clone();
+            assert!(authority.validate().is_err());
+            let mut completed = good.clone();
+            completed.previous_configuration = None;
+            completed.transition_kind = None;
+            assert!(
+                completed.validate().is_err(),
+                "current-only needs the frozen reduced write quorum"
+            );
+            completed.secondary_removal = Some(removal_fixture::evidence(&intent));
+            completed.validate().unwrap();
+            assert!(completed.is_current_only_completion_of(&good));
+            completed
+                .secondary_removal
+                .as_mut()
+                .unwrap()
+                .previous_read_quorum[0]
+                .report_sequence += 1;
+            assert!(!completed.is_current_only_completion_of(&good));
+        }
+    }
+
+    #[test]
+    fn retirement_binds_terminal_postconditions_and_exact_committed_target() {
+        let intent = removal_fixture::intent(&[1, 2, 3], 1);
+        let retired = RetiredAuthority {
+            committed: removal_fixture::cleanup(&intent),
+            report: removal_fixture::retirement(&intent),
+        };
+        retired.validate(&intent.target).unwrap();
+        assert!(retired.validate(&intent.primary).is_err());
+        for mutate in [
+            |r: &mut RetiredAuthority| r.report.application_closed = false,
+            |r: &mut RetiredAuthority| r.report.peers_fenced = false,
+            |r: &mut RetiredAuthority| r.report.role = ReplicaRole::ActiveSecondary,
+            |r: &mut RetiredAuthority| {
+                r.report.write_status = kuberic_protocol::types::AccessStatus::Granted
+            },
+            |r: &mut RetiredAuthority| r.committed.current_only_write_quorum.clear(),
+        ] {
+            let mut invalid = retired.clone();
+            mutate(&mut invalid);
+            assert!(invalid.validate(&intent.target).is_err());
+        }
+    }
 }

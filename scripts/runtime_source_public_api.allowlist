@@ -176,6 +176,7 @@ public-path hidden impl crate::internal::PendingWrite::async fn committed (self)
 public-path hidden impl crate::replicator::ReplicatorFactoryContext::fn new (_token : RuntimeHostToken , identity : ReplicaIdentity , access : Arc < dyn PartitionAccessView > , registration : Arc < dyn ReplicatorRegistration > , default_dependencies : DefaultReplicatorDependencies ,) -> Self
 public-path hidden impl crate::replicator::StatefulServicePartition::fn new (_token : RuntimeHostToken , registration : Arc < dyn ReplicatorRegistration > , context : ReplicatorFactoryContext ,) -> Self
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn acknowledge (& mut self , acknowledgement : & ReplicationAck) -> Result < () >
+public-path hidden impl crate::replicator::quorum::QuorumTracker::fn acknowledge_in_session (& mut self , acknowledgement : & ReplicationAck , session : & ProcessSessionId ,) -> Result < () >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn catch_up_boundary (& self) -> Option < Lsn >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn catch_up_complete (& self) -> bool
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn committed_lsn (& self) -> Lsn
@@ -184,9 +185,12 @@ public-path hidden impl crate::replicator::quorum::QuorumTracker::fn current_con
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn fail_pending (& mut self)
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn finalize_commit (& mut self , committed_lsn : Lsn) -> Result < () >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn highest_lsn (& self) -> Lsn
+public-path hidden impl crate::replicator::quorum::QuorumTracker::fn observe_secondary_removal (& mut self , witness : & SecondaryRemovalWitness) -> Result < () >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn ready_commit_lsn (& self) -> Option < Lsn >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn record_build_handoff_progress (& mut self , identity : ReplicaIdentity , lsn : Lsn ,) -> Result < () >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn record_local_progress (& mut self , lsn : Lsn) -> Result < () >
+public-path hidden impl crate::replicator::quorum::QuorumTracker::fn record_verified_local_progress (& mut self , lsn : Lsn)
+public-path hidden impl crate::replicator::quorum::QuorumTracker::fn register_peer_session (& mut self , identity : ReplicaIdentity , session : ProcessSessionId ,) -> Result < () >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn register_write (& mut self , lsn : Lsn) -> Result < oneshot :: Receiver < Result < Lsn > > >
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn reset_progress_after_data_loss (& mut self , local_identity : ReplicaIdentity , current_progress : Lsn , committed_lsn : Lsn ,)
 public-path hidden impl crate::replicator::quorum::QuorumTracker::fn restore_committed_lsn (& mut self , committed_lsn : Lsn)
@@ -194,6 +198,7 @@ public-path hidden impl crate::replicator::sender::ReliableSender::const fn retr
 public-path hidden impl crate::replicator::sender::ReliableSender::fn acknowledge_copy (& mut self , receiver : & ReplicaIdentity , item_sequence : u64 ,) -> Result < () >
 public-path hidden impl crate::replicator::sender::ReliableSender::fn acknowledge_replication (& mut self , receiver : & ReplicaIdentity , applied_lsn : i64 ,) -> Result < () >
 public-path hidden impl crate::replicator::sender::ReliableSender::fn admit_peer (& mut self , identity : ReplicaIdentity , session : ProcessSessionId ,) -> Result < () >
+public-path hidden impl crate::replicator::sender::ReliableSender::fn evict_peer (& mut self , receiver : & ReplicaIdentity)
 public-path hidden impl crate::replicator::sender::ReliableSender::fn local_session (& self) -> & ProcessSessionId
 public-path hidden impl crate::replicator::sender::ReliableSender::fn new (local_session : ProcessSessionId , capacity : usize) -> Result < Self >
 public-path hidden impl crate::replicator::sender::ReliableSender::fn peer_for_replica (& self , replica_id : ReplicaId) -> Option < ReplicaIdentity >
@@ -275,5 +280,6 @@ public-path hidden variant crate::replicator::sender::RoleTransportState::Primar
 public-path hidden variant crate::replicator::sender::RoleTransportState::Secondary { { source : ReplicaIdentity , } }
 public-path hidden variant crate::replicator::sender::SenderOutbound::Build((ReplicaEndpoint))
 public-path hidden variant crate::replicator::sender::SenderOutbound::Copy { { receiver : ReplicaIdentity , sender_session : ProcessSessionId , receiver_session : ProcessSessionId , message : RetainedMessage < CopyItem > , } }
+public-path hidden variant crate::replicator::sender::SenderOutbound::Evict((ReplicaIdentity))
 public-path hidden variant crate::replicator::sender::SenderOutbound::Remove((ReplicaId))
 public-path hidden variant crate::replicator::sender::SenderOutbound::Replication { { receiver : ReplicaIdentity , sender_session : ProcessSessionId , receiver_session : ProcessSessionId , message : RetainedMessage < ReplicationItem > , } }

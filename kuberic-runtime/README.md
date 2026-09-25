@@ -72,6 +72,24 @@ During failover it records only the controller-selected election-safe prefix
 under the new authority fence; a replica cannot reuse an arbitrary
 previous-epoch suffix as verified progress.
 
+Managed secondary-removal preparation serializes with write admission and ACK
+completion, closes writes, reconciles journaled operation identities, and
+persists an authority-verified durable prefix. PC and reduced CC retain their
+independent policies. Removal catch-up needs session-bound, exact reduced-CC
+write-quorum witnesses, including the unchanged primary; ordinary client
+commits still require both PC and CC write quorums. Removal grants no PC/CC
+client writes. A separate accepted current-only certificate and verified
+catch-up gate the write regrant, including singleton recovery.
+
+Exact peer eviction after PC removal cancels retained windows and prevents a
+delayed session from reconnecting the excluded incarnation. Local retirement
+revokes access, fences traffic, drives role None and hosting Close, and only
+then persists a terminal tombstone. Hosting checks that tombstone before Open.
+Preparation, acceptance, and retirement postconditions are unpublished managed
+contracts, not additions to the SF-shaped application traits. Production agent
+coordination/storage and controller scale-down admission remain disabled;
+the new store persistence hooks deliberately fail closed until implemented.
+
 `ReplicatorFactoryContext` exposes stable identity and partition-access
 capabilities, not a concrete runtime or default-engine pointer. Application
 and custom-factory code constructs only the SF-shaped interface bundle through

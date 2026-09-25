@@ -140,6 +140,7 @@ impl SwitchoverRecoveryRuntime {
         snapshot.current_configuration_quorum_progress = 7;
         snapshot.catch_up_complete = true;
         snapshot.authority = Some(AdmittedAuthority {
+            secondary_removal: None,
             local_identity: state.identity.local_identity.clone(),
             transition_kind: state
                 .previous_configuration
@@ -774,6 +775,9 @@ fn result() -> RuntimeEffectResult {
         operation_id: OperationId::new("effect-1"),
         sequence: 1,
         postcondition: RuntimePostcondition {
+            prepared_secondary_removal: None,
+            retired_authority: None,
+            accepted_secondary_removal: None,
             open: true,
             role: ReplicaRole::None,
             role_transition: None,
@@ -817,6 +821,9 @@ fn switchover_result() -> RuntimeEffectResult {
         operation_id: OperationId::new("prepare-switchover-1"),
         sequence: 1,
         postcondition: RuntimePostcondition {
+            prepared_secondary_removal: None,
+            retired_authority: None,
+            accepted_secondary_removal: None,
             open: true,
             role: ReplicaRole::Primary,
             role_transition: None,
@@ -842,6 +849,7 @@ fn switchover_authority() -> AdmittedAuthority {
         agent_generation: AgentGeneration::new("generation-2"),
     };
     AdmittedAuthority {
+        secondary_removal: None,
         local_identity: source.clone(),
         transition_kind: None,
         previous_configuration: None,
@@ -866,6 +874,9 @@ fn switchover_authority() -> AdmittedAuthority {
 
 fn snapshot(write_status: AccessStatus) -> RuntimeSnapshot {
     RuntimeSnapshot {
+        prepared_secondary_removal: None,
+        retired_authority: None,
+        accepted_secondary_removal: None,
         identity: storage_identity().local_identity,
         open: false,
         replication_address: None,
@@ -1516,6 +1527,7 @@ fn local_write_recovery_writer_process() {
         let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
         store
             .admit(&AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: switchover_storage_identity().local_identity,
                 transition_kind: None,
                 previous_configuration: None,
@@ -1852,6 +1864,7 @@ fn real_handoff_configuration_writer_process() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (state, command) = real_handoff_fixture(&scenario);
         let authority = AdmittedAuthority {
+            secondary_removal: None,
             local_identity: state.identity.local_identity.clone(),
             transition_kind: state
                 .previous_configuration
@@ -2157,6 +2170,7 @@ fn real_switchover_preparation_writer_process() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let authority = AdmittedAuthority {
+            secondary_removal: None,
             local_identity: switchover_storage_identity().local_identity,
             transition_kind: None,
             previous_configuration: None,

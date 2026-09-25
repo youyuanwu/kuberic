@@ -35,9 +35,956 @@ use kuberic_wire::proto;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 
+#[allow(dead_code)]
+#[path = "../../kuberic-protocol/tests/support/secondary_scale_down.rs"]
+mod removal_fixture;
+
+async fn open_removal_member(
+    intent: &kuberic_protocol::types::SecondaryScaleDownIntent,
+    local: ReplicaIdentity,
+    application: Arc<TestApplication>,
+    store: Arc<MemoryAuthorityStore>,
+) -> Arc<PodRuntime> {
+    let primary = local == intent.primary;
+    let runtime = Arc::new(PodRuntime::new(local.clone(), application, store));
+    for (index, action) in [
+        RuntimeEffectAction::Open(OpenMode::Existing),
+        RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+            local_identity: local,
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: intent.previous_configuration.clone(),
+            switchover_handoff: None,
+            secondary_removal: None,
+        })),
+        RuntimeEffectAction::ChangeRole(if primary {
+            ReplicaRole::Primary
+        } else {
+            ReplicaRole::ActiveSecondary
+        }),
+        RuntimeEffectAction::SetAccessStatus {
+            read: AccessStatus::Granted,
+            write: if primary {
+                AccessStatus::Granted
+            } else {
+                AccessStatus::NotPrimary
+            },
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        runtime
+            .apply_effect(effect(index as u64 + 1, action))
+            .await
+            .unwrap();
+    }
+    runtime
+}
+
+fn prepare_removal(
+    intent: &kuberic_protocol::types::SecondaryScaleDownIntent,
+) -> RuntimeEffectAction {
+    RuntimeEffectAction::PrepareSecondaryRemoval {
+        intent: Box::new(intent.clone()),
+        process_session_id: removal_fixture::preparation(intent).process_session_id,
+        report_sequence: 1,
+    }
+}
+
+fn removal_evidence(
+    preparation: kuberic_protocol::types::SecondaryRemovalPreparation,
+) -> kuberic_protocol::types::SecondaryRemovalEvidence {
+    let mut evidence = removal_fixture::evidence(&preparation.intent);
+    for witness in evidence
+        .previous_read_quorum
+        .iter_mut()
+        .chain(&mut evidence.reduced_write_quorum)
+    {
+        witness.verified_replication_lsn = preparation.boundary_lsn;
+    }
+    evidence.preparation = preparation;
+    evidence
+}
+
+async fn converge_removal(runtime: &PodRuntime, sequence: &mut u64) -> AdmittedAuthority {
+    use kuberic_protocol::types::SecondaryRemovalStage;
+    let preparation = runtime.snapshot().await.prepared_secondary_removal.unwrap();
+    let intent = preparation.intent.clone();
+    let evidence = removal_evidence(preparation);
+    let mut admitted = AdmittedAuthority {
+        local_identity: intent.primary.clone(),
+        transition_kind: Some(TransitionKind::SecondaryScaleDown),
+        previous_configuration: Some(intent.previous_configuration.clone()),
+        current_configuration: intent.current_configuration.clone(),
+        switchover_handoff: None,
+        secondary_removal: Some(evidence.clone()),
+    };
+    recovery_action(
+        runtime,
+        sequence,
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+    )
+    .await;
+    assert_eq!(
+        runtime.snapshot().await.write_status,
+        AccessStatus::ReconfigurationPending
+    );
+    assert!(
+        runtime
+            .apply_effect(effect(
+                *sequence,
+                RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+            ))
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("forbidden-pc-write"),
+                data: Bytes::new()
+            })
+            .await
+            .is_err()
+    );
+    for witness in evidence
+        .reduced_write_quorum
+        .iter()
+        .filter(|w| w.identity != intent.primary)
+    {
+        recovery_action(
+            runtime,
+            sequence,
+            RuntimeEffectAction::RegisterPeerSession {
+                identity: witness.identity.clone(),
+                session: witness.process_session_id.clone(),
+            },
+        )
+        .await;
+        recovery_action(
+            runtime,
+            sequence,
+            RuntimeEffectAction::ObserveSecondaryRemovalWitness(Box::new(witness.clone())),
+        )
+        .await;
+    }
+    assert!(runtime.snapshot().await.catch_up_complete);
+    admitted.previous_configuration = None;
+    admitted.transition_kind = None;
+    recovery_action(
+        runtime,
+        sequence,
+        RuntimeEffectAction::AdmitAuthority(Box::new(admitted.clone())),
+    )
+    .await;
+    assert!(matches!(
+        timeout(Duration::from_secs(1), runtime.data_plane().next_outbound()).await.unwrap(),
+        Some(OutboundReplication::Evict(identity)) if identity == intent.target
+    ));
+    assert!(
+        runtime
+            .data_plane()
+            .accept_acknowledgement(acknowledgement(&admitted, intent.target.clone(), 100))
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .apply_effect(effect(
+                *sequence,
+                RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+            ))
+            .await
+            .is_err()
+    );
+    let mut current_witnesses =
+        removal_fixture::witnesses(&intent, SecondaryRemovalStage::CurrentOnly);
+    for witness in &mut current_witnesses {
+        witness.verified_replication_lsn = evidence.preparation.boundary_lsn;
+        if witness.identity != intent.primary {
+            recovery_action(
+                runtime,
+                sequence,
+                RuntimeEffectAction::RegisterPeerSession {
+                    identity: witness.identity.clone(),
+                    session: witness.process_session_id.clone(),
+                },
+            )
+            .await;
+        }
+    }
+    let committed = kuberic_protocol::types::SecondaryScaleDownCleanup {
+        evidence,
+        current_only_write_quorum: current_witnesses,
+        retirement: None,
+    };
+    recovery_action(
+        runtime,
+        sequence,
+        RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed.clone())),
+    )
+    .await;
+    recovery_action(
+        runtime,
+        sequence,
+        RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed)),
+    )
+    .await;
+    recovery_action(
+        runtime,
+        sequence,
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    )
+    .await;
+    admitted
+}
+
+#[tokio::test]
+async fn secondary_removal_reaches_each_reduced_quorum_and_only_then_grants_fresh_writes() {
+    for size in 2..=5 {
+        let intent = removal_fixture::intent(&(1..=size).collect::<Vec<_>>(), 1);
+        let application = Arc::new(TestApplication::default());
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let runtime = open_removal_member(
+            &intent,
+            intent.primary.clone(),
+            application.clone(),
+            store.clone(),
+        )
+        .await;
+        let old = runtime.snapshot().await.authority.unwrap();
+        let pending = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("successful-before-removal"),
+                data: Bytes::from_static(b"retained"),
+            })
+            .await
+            .unwrap();
+        for member in intent.previous_configuration.members.iter().skip(1) {
+            runtime
+                .data_plane()
+                .accept_acknowledgement(acknowledgement(&old, member.identity.clone(), pending.lsn))
+                .await
+                .unwrap();
+        }
+        assert_eq!(pending.committed().await.unwrap().lsn, 1);
+        let prepared = runtime
+            .apply_effect(effect(5, prepare_removal(&intent)))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .postcondition
+                .prepared_secondary_removal
+                .as_ref()
+                .unwrap()
+                .boundary_lsn,
+            1
+        );
+        assert_eq!(
+            runtime
+                .apply_effect(effect(5, prepare_removal(&intent)))
+                .await
+                .unwrap(),
+            prepared
+        );
+        runtime
+            .apply_effect(effect(6, prepare_removal(&intent)))
+            .await
+            .unwrap();
+        let mut conflicting = intent.clone();
+        conflicting.cleanup.pvc = kuberic_protocol::types::CleanupResourceIdentity::Absent {
+            name: "conflicting-pvc".into(),
+        };
+        assert!(
+            runtime
+                .apply_effect(effect(7, prepare_removal(&conflicting)))
+                .await
+                .is_err()
+        );
+        let mut sequence = 7;
+        let reduced = converge_removal(&runtime, &mut sequence).await;
+        let fresh = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("fresh-after-removal"),
+                data: Bytes::from_static(b"new"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(fresh.replication_items.len(), size as usize - 2);
+        assert!(
+            fresh
+                .replication_items
+                .iter()
+                .all(|item| item.receiver.as_ref().unwrap().replica_id
+                    != intent.target.replica_id.value())
+        );
+        for member in reduced.current_configuration.members.iter().skip(1) {
+            runtime
+                .data_plane()
+                .accept_acknowledgement(acknowledgement(
+                    &reduced,
+                    member.identity.clone(),
+                    fresh.lsn,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(fresh.committed().await.unwrap().lsn, 2);
+        assert_eq!(application.applied.lock().unwrap().len(), 2);
+        assert_eq!(
+            store.load_secondary_removal().await.unwrap(),
+            prepared.postcondition.prepared_secondary_removal
+        );
+        let json = serde_json::to_vec(&prepared).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RuntimeEffectResult>(&json).unwrap(),
+            prepared
+        );
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_preparation_fences_pending_ack_and_recovers_unknown_writes() {
+    for failure in ["pending", "reserved", "applied", "registered"] {
+        let intent = removal_fixture::intent(&[1, 2], 1);
+        let application = Arc::new(TestApplication::default());
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let runtime = open_removal_member(
+            &intent,
+            intent.primary.clone(),
+            application.clone(),
+            store.clone(),
+        )
+        .await;
+        application
+            .fail_apply
+            .store(failure == "reserved", Ordering::SeqCst);
+        application
+            .fail_after_apply
+            .store(failure == "applied", Ordering::SeqCst);
+        store
+            .fail_registered_write_once
+            .store(failure == "registered", Ordering::SeqCst);
+        let write = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("unknown-outcome"),
+                data: Bytes::from_static(b"unknown"),
+            })
+            .await;
+        application.fail_apply.store(false, Ordering::SeqCst);
+        let old = runtime.snapshot().await.authority.unwrap();
+        let prepared = runtime
+            .apply_effect(effect(5, prepare_removal(&intent)))
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared
+                .postcondition
+                .prepared_secondary_removal
+                .unwrap()
+                .boundary_lsn,
+            1
+        );
+        if let Ok(pending) = write {
+            runtime
+                .data_plane()
+                .accept_acknowledgement(acknowledgement(&old, intent.target.clone(), 1))
+                .await
+                .unwrap();
+            assert!(
+                pending.committed().await.is_err(),
+                "late ACK cannot turn a fenced completion into success"
+            );
+        }
+        let mut sequence = 6;
+        converge_removal(&runtime, &mut sequence).await;
+        let replay = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("unknown-outcome"),
+                data: Bytes::from_static(b"unknown"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(replay.committed().await.unwrap().lsn, 1);
+        assert_eq!(
+            application.applied.lock().unwrap().len(),
+            1,
+            "unknown original identity was not duplicated"
+        );
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_preparation_serializes_apply_and_successful_commit_races() {
+    for race in ["apply", "commit"] {
+        let intent = removal_fixture::intent(&[1, 2], 1);
+        let application = Arc::new(TestApplication::default());
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let runtime = open_removal_member(
+            &intent,
+            intent.primary.clone(),
+            application.clone(),
+            store.clone(),
+        )
+        .await;
+        application
+            .pause_after_apply
+            .store(race == "apply", Ordering::SeqCst);
+        store
+            .pause_committed_write
+            .store(race == "commit", Ordering::SeqCst);
+        let writer = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                runtime
+                    .data_plane()
+                    .begin_write(ClientWrite {
+                        operation_id: OperationId::new("racing-write"),
+                        data: Bytes::from_static(b"race"),
+                    })
+                    .await
+                    .unwrap()
+            })
+        };
+        if race == "apply" {
+            application.applied_notify.notified().await;
+        } else {
+            let pending = writer.await.unwrap();
+            let old = runtime.snapshot().await.authority.unwrap();
+            let ack = acknowledgement(&old, intent.target.clone(), 1);
+            let ack_runtime = runtime.clone();
+            let ack_task =
+                tokio::spawn(
+                    async move { ack_runtime.data_plane().accept_acknowledgement(ack).await },
+                );
+            store.committed_write_notify.notified().await;
+            // The writer handle is consumed only in this branch.
+            let prepare = {
+                let runtime = runtime.clone();
+                let intent = intent.clone();
+                tokio::spawn(async move {
+                    runtime
+                        .apply_effect(effect(5, prepare_removal(&intent)))
+                        .await
+                })
+            };
+            tokio::task::yield_now().await;
+            assert!(!prepare.is_finished());
+            store.resume_committed_write_notify.notify_one();
+            ack_task.await.unwrap().unwrap();
+            assert_eq!(pending.committed().await.unwrap().lsn, 1);
+            assert_eq!(
+                prepare
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .postcondition
+                    .prepared_secondary_removal
+                    .unwrap()
+                    .boundary_lsn,
+                1
+            );
+            continue;
+        }
+        let prepare = {
+            let runtime = runtime.clone();
+            let intent = intent.clone();
+            tokio::spawn(async move {
+                runtime
+                    .apply_effect(effect(5, prepare_removal(&intent)))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!prepare.is_finished());
+        application.resume_notify.notify_one();
+        let pending = writer.await.unwrap();
+        assert_eq!(
+            prepare
+                .await
+                .unwrap()
+                .unwrap()
+                .postcondition
+                .prepared_secondary_removal
+                .unwrap()
+                .boundary_lsn,
+            1
+        );
+        assert!(pending.committed().await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_retirement_closes_host_and_survives_reconstruction() {
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let app = Arc::new(TestApplication::default());
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let target =
+        open_removal_member(&intent, intent.target.clone(), app.clone(), store.clone()).await;
+    let old_authority = target.snapshot().await.authority.unwrap();
+    let retired = kuberic_runtime_internal::authority::RetiredAuthority {
+        committed: removal_fixture::cleanup(&intent),
+        report: removal_fixture::retirement(&intent),
+    };
+    let effect = effect(
+        5,
+        RuntimeEffectAction::RetireReplica(Box::new(retired.clone())),
+    );
+    let result = target.apply_effect(effect.clone()).await.unwrap();
+    assert_eq!(target.apply_effect(effect).await.unwrap(), result);
+    assert!(!result.postcondition.open);
+    assert_eq!(result.postcondition.role, ReplicaRole::None);
+    assert_eq!(result.postcondition.read_status, AccessStatus::NotPrimary);
+    assert_eq!(result.postcondition.write_status, AccessStatus::NotPrimary);
+    assert!(result.postcondition.authority.is_none());
+    assert_eq!(
+        result.postcondition.retired_authority,
+        Some(retired.clone())
+    );
+    assert!(
+        target
+            .apply_effect(self::effect(
+                2,
+                RuntimeEffectAction::AdmitAuthority(Box::new(old_authority.clone()))
+            ))
+            .await
+            .is_err(),
+        "cached active effects cannot replay across terminal retirement"
+    );
+    let late = retry_item(
+        &acknowledgement(&old_authority, intent.target.clone(), 1),
+        intent.target.clone(),
+    );
+    assert!(target.data_plane().receive_replication(late).await.is_err());
+    assert_eq!(
+        store.load_retired_authority().await.unwrap(),
+        Some(retired.clone())
+    );
+    assert!(
+        app.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "service.close")
+    );
+    let retained_handle = app.state_replicator.lock().unwrap().clone().unwrap();
+    assert!(retained_handle.replicate(Bytes::new()).await.is_err());
+    assert!(
+        target
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("retired-write"),
+                data: Bytes::new()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        target
+            .apply_effect(self::effect(
+                6,
+                RuntimeEffectAction::SetReadStatus(AccessStatus::Granted)
+            ))
+            .await
+            .is_err()
+    );
+    let mut conflict = retired.clone();
+    conflict.report.process_session_id =
+        kuberic_protocol::types::ProcessSessionId::new("conflicting-session");
+    assert!(
+        target
+            .apply_effect(self::effect(
+                6,
+                RuntimeEffectAction::RetireReplica(Box::new(conflict))
+            ))
+            .await
+            .is_err()
+    );
+    let json = serde_json::to_vec(&result).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<RuntimeEffectResult>(&json).unwrap(),
+        result
+    );
+    drop(target);
+    let restarted_app = Arc::new(TestApplication::default());
+    let restarted = PodRuntime::new(intent.target.clone(), restarted_app.clone(), store);
+    restarted
+        .reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::ActiveSecondary,
+            AccessStatus::Granted,
+            AccessStatus::NotPrimary,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!restarted.snapshot().await.open);
+    assert_eq!(restarted.snapshot().await.retired_authority, Some(retired));
+    assert!(
+        restarted_app.partition.lock().unwrap().is_none(),
+        "tombstone checked before application Open"
+    );
+    assert!(
+        restarted
+            .apply_effect(self::effect(
+                1,
+                RuntimeEffectAction::Open(OpenMode::Existing)
+            ))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn secondary_removal_preparation_failure_is_closed_and_exactly_replayable() {
+    for ambiguous in [false, true] {
+        let intent = removal_fixture::intent(&[1, 2], 1);
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let runtime = open_removal_member(
+            &intent,
+            intent.primary.clone(),
+            Arc::new(TestApplication::default()),
+            store.clone(),
+        )
+        .await;
+        store
+            .fail_preparation_once
+            .store(!ambiguous, Ordering::SeqCst);
+        store
+            .fail_after_preparation_once
+            .store(ambiguous, Ordering::SeqCst);
+        assert!(
+            runtime
+                .apply_effect(effect(5, prepare_removal(&intent)))
+                .await
+                .is_err()
+        );
+        assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+        assert!(
+            runtime
+                .apply_effect(effect(
+                    5,
+                    RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+                ))
+                .await
+                .is_err()
+        );
+        let mut conflict = intent.clone();
+        conflict.cleanup.pvc = kuberic_protocol::types::CleanupResourceIdentity::Absent {
+            name: "other".into(),
+        };
+        assert!(
+            runtime
+                .apply_effect(effect(5, prepare_removal(&conflict)))
+                .await
+                .is_err()
+        );
+        let result = runtime
+            .apply_effect(effect(5, prepare_removal(&intent)))
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .postcondition
+                .prepared_secondary_removal
+                .unwrap()
+                .boundary_lsn,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_never_certifies_raw_application_progress() {
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let app = Arc::new(TestApplication::default());
+    *app.progress.lock().unwrap() = DurableApplicationProgress {
+        applied_lsn: 100,
+        committed_lsn: 100,
+    };
+    let runtime = open_removal_member(
+        &intent,
+        intent.primary.clone(),
+        app,
+        Arc::new(MemoryAuthorityStore::default()),
+    )
+    .await;
+    assert!(
+        runtime
+            .apply_effect(effect(5, prepare_removal(&intent)))
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .snapshot()
+            .await
+            .prepared_secondary_removal
+            .is_none()
+    );
+    assert_ne!(runtime.snapshot().await.write_status, AccessStatus::Granted);
+}
+
+#[tokio::test]
+async fn secondary_removal_reconstructs_successful_and_unknown_prefixes_and_singleton() {
+    for successful in [false, true] {
+        let intent = removal_fixture::intent(&[1, 2], 1);
+        let store = Arc::new(MemoryAuthorityStore::default());
+        let app = Arc::new(TestApplication::default());
+        let runtime =
+            open_removal_member(&intent, intent.primary.clone(), app.clone(), store.clone()).await;
+        let pending = runtime
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("before-restart"),
+                data: Bytes::from_static(b"persistent"),
+            })
+            .await
+            .unwrap();
+        if successful {
+            let old = runtime.snapshot().await.authority.unwrap();
+            runtime
+                .data_plane()
+                .accept_acknowledgement(acknowledgement(&old, intent.target.clone(), 1))
+                .await
+                .unwrap();
+            assert_eq!(pending.committed().await.unwrap().lsn, 1);
+        } else {
+            drop(pending);
+        }
+        let durable = *app.progress.lock().unwrap();
+        let operations = app.applied.lock().unwrap().clone();
+        drop(runtime);
+        let reopened_app = Arc::new(TestApplication::default());
+        *reopened_app.progress.lock().unwrap() = durable;
+        *reopened_app.applied.lock().unwrap() = operations;
+        let reopened = PodRuntime::new(intent.primary.clone(), reopened_app.clone(), store.clone());
+        reopened
+            .reconstruct(
+                OpenMode::Existing,
+                ReplicaRole::Primary,
+                AccessStatus::ReconfigurationPending,
+                AccessStatus::ReconfigurationPending,
+                None,
+            )
+            .await
+            .unwrap();
+        reopened
+            .apply_effect(effect(1, prepare_removal(&intent)))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .snapshot()
+                .await
+                .prepared_secondary_removal
+                .unwrap()
+                .boundary_lsn,
+            1
+        );
+        let mut sequence = 2;
+        converge_removal(&reopened, &mut sequence).await;
+        let committed = reopened
+            .snapshot()
+            .await
+            .accepted_secondary_removal
+            .unwrap();
+        let durable = *reopened_app.progress.lock().unwrap();
+        let operations = reopened_app.applied.lock().unwrap().clone();
+        drop(reopened);
+        let singleton_app = Arc::new(TestApplication::default());
+        *singleton_app.progress.lock().unwrap() = durable;
+        *singleton_app.applied.lock().unwrap() = operations;
+        let singleton = PodRuntime::new(intent.primary.clone(), singleton_app, store);
+        singleton
+            .reconstruct(
+                OpenMode::Existing,
+                ReplicaRole::Primary,
+                AccessStatus::ReconfigurationPending,
+                AccessStatus::ReconfigurationPending,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            singleton
+                .apply_effect(effect(
+                    1,
+                    RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted)
+                ))
+                .await
+                .is_err()
+        );
+        singleton
+            .apply_effect(effect(
+                1,
+                RuntimeEffectAction::AcceptSecondaryRemovalCommit(Box::new(committed)),
+            ))
+            .await
+            .unwrap();
+        singleton
+            .apply_effect(effect(
+                2,
+                RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+            ))
+            .await
+            .unwrap();
+        let write = singleton
+            .data_plane()
+            .begin_write(ClientWrite {
+                operation_id: OperationId::new("new-singleton-write"),
+                data: Bytes::from_static(b"fresh"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(write.committed().await.unwrap().lsn, 2);
+    }
+}
+
+#[tokio::test]
+async fn secondary_removal_retirement_publishes_tombstone_only_after_host_closes() {
+    for ambiguous in [false, true] {
+        secondary_removal_retirement_persistence_boundary(ambiguous).await;
+    }
+}
+
+async fn secondary_removal_retirement_persistence_boundary(ambiguous: bool) {
+    let intent = removal_fixture::intent(&[1, 2], 1);
+    let store = Arc::new(MemoryAuthorityStore::default());
+    let app = Arc::new(TestApplication::default());
+    let target =
+        open_removal_member(&intent, intent.target.clone(), app.clone(), store.clone()).await;
+    let retired = kuberic_runtime_internal::authority::RetiredAuthority {
+        committed: removal_fixture::cleanup(&intent),
+        report: removal_fixture::retirement(&intent),
+    };
+    app.pause_close.store(true, Ordering::SeqCst);
+    store
+        .fail_retirement_once
+        .store(!ambiguous, Ordering::SeqCst);
+    store
+        .fail_after_retirement_once
+        .store(ambiguous, Ordering::SeqCst);
+    let action = effect(
+        5,
+        RuntimeEffectAction::RetireReplica(Box::new(retired.clone())),
+    );
+    let task = {
+        let target = target.clone();
+        let action = action.clone();
+        tokio::spawn(async move { target.apply_effect(action).await })
+    };
+    app.close_notify.notified().await;
+    assert!(store.load_retired_authority().await.unwrap().is_none());
+    assert!(target.snapshot().await.retired_authority.is_none());
+    assert_ne!(target.snapshot().await.read_status, AccessStatus::Granted);
+    assert_ne!(target.snapshot().await.write_status, AccessStatus::Granted);
+    app.resume_close_notify.notify_one();
+    assert!(
+        task.await.unwrap().is_err(),
+        "tombstone persistence failure must not acknowledge retirement"
+    );
+    assert!(target.snapshot().await.retired_authority.is_none());
+    let result = target.apply_effect(action).await.unwrap();
+    assert_eq!(result.postcondition.retired_authority, Some(retired));
+    assert_eq!(
+        app.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "service.close")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn secondary_removal_preparations_advance_only_after_the_previous_commit() {
+    let first = removal_fixture::intent(&[1, 2, 3], 1);
+    let runtime = open_removal_member(
+        &first,
+        first.primary.clone(),
+        Arc::new(TestApplication::default()),
+        Arc::new(MemoryAuthorityStore::default()),
+    )
+    .await;
+    runtime
+        .apply_effect(effect(5, prepare_removal(&first)))
+        .await
+        .unwrap();
+    let mut sequence = 6;
+    let reduced = converge_removal(&runtime, &mut sequence).await;
+    let mut second = removal_fixture::intent(&[1, 2], 1);
+    second.previous_configuration = reduced.current_configuration;
+    second.current_configuration = ConfigurationDescriptor::new(
+        Epoch::new(2, 12),
+        second.current_configuration.primary_id,
+        second.current_configuration.members.clone(),
+        1,
+    );
+    second.operation_id = second.expected_operation_id();
+    recovery_action(&runtime, &mut sequence, prepare_removal(&second)).await;
+    let singleton = converge_removal(&runtime, &mut sequence).await;
+    assert_eq!(singleton.current_configuration.members.len(), 1);
+    assert!(
+        runtime
+            .apply_effect(effect(sequence, prepare_removal(&first)))
+            .await
+            .is_err()
+    );
+    let newer = AdmittedAuthority {
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(2, 13),
+            singleton.current_configuration.primary_id,
+            singleton.current_configuration.members.clone(),
+            1,
+        ),
+        secondary_removal: None,
+        ..singleton
+    };
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::AdmitAuthority(Box::new(newer)),
+    )
+    .await;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::ChangeRole(ReplicaRole::Primary),
+    )
+    .await;
+    recovery_action(
+        &runtime,
+        &mut sequence,
+        RuntimeEffectAction::SetWriteStatus(AccessStatus::Granted),
+    )
+    .await;
+    assert!(
+        runtime
+            .snapshot()
+            .await
+            .prepared_secondary_removal
+            .is_none()
+    );
+}
+
 #[derive(Default)]
 struct MemoryAuthorityStore {
     authority: Mutex<Option<AdmittedAuthority>>,
+    prepared_secondary_removal: Mutex<Option<kuberic_protocol::types::SecondaryRemovalPreparation>>,
+    retired_authority: Mutex<Option<kuberic_runtime_internal::authority::RetiredAuthority>>,
+    fail_preparation_once: AtomicBool,
+    fail_after_preparation_once: AtomicBool,
+    fail_retirement_once: AtomicBool,
+    fail_after_retirement_once: AtomicBool,
     replication_progress: Mutex<BTreeMap<AuthorityFence, ReplicationProgress>>,
     local_writes: Mutex<BTreeMap<OperationId, DurableLocalWrite>>,
     builds: Mutex<BTreeMap<OperationId, BuildAuthority>>,
@@ -56,11 +1003,84 @@ struct MemoryAuthorityStore {
 
 #[async_trait]
 impl ReplicaAuthorityStore for MemoryAuthorityStore {
+    async fn load_secondary_removal(
+        &self,
+    ) -> ContractResult<Option<kuberic_protocol::types::SecondaryRemovalPreparation>> {
+        Ok(self.prepared_secondary_removal.lock().unwrap().clone())
+    }
+
+    async fn record_secondary_removal(
+        &self,
+        preparation: &kuberic_protocol::types::SecondaryRemovalPreparation,
+    ) -> ContractResult<()> {
+        if self.fail_preparation_once.swap(false, Ordering::SeqCst) {
+            return Err(ContractError::Persistence(
+                "injected preparation failure".into(),
+            ));
+        }
+        let mut stored = self.prepared_secondary_removal.lock().unwrap();
+        if stored.as_ref().is_some_and(|existing| {
+            existing != preparation
+                && (existing.intent == preparation.intent
+                    || preparation.intent.previous_configuration.epoch
+                        < existing.intent.current_configuration.epoch)
+        }) {
+            return Err(ContractError::AuthorityMismatch(
+                "conflicting preparation".into(),
+            ));
+        }
+        *stored = Some(preparation.clone());
+        if self
+            .fail_after_preparation_once
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(ContractError::Persistence("ambiguous preparation".into()));
+        }
+        Ok(())
+    }
+
+    async fn load_retired_authority(
+        &self,
+    ) -> ContractResult<Option<kuberic_runtime_internal::authority::RetiredAuthority>> {
+        Ok(self.retired_authority.lock().unwrap().clone())
+    }
+
+    async fn retire(
+        &self,
+        retired: &kuberic_runtime_internal::authority::RetiredAuthority,
+    ) -> ContractResult<()> {
+        if self.fail_retirement_once.swap(false, Ordering::SeqCst) {
+            return Err(ContractError::Persistence(
+                "injected tombstone failure".into(),
+            ));
+        }
+        let mut stored = self.retired_authority.lock().unwrap();
+        if stored.as_ref().is_some_and(|existing| existing != retired) {
+            return Err(ContractError::AuthorityMismatch(
+                "conflicting retirement".into(),
+            ));
+        }
+        *stored = Some(retired.clone());
+        *self.authority.lock().unwrap() = None;
+        if self
+            .fail_after_retirement_once
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(ContractError::Persistence(
+                "ambiguous tombstone persistence".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn load(&self) -> ContractResult<Option<AdmittedAuthority>> {
         Ok(self.authority.lock().unwrap().clone())
     }
 
     async fn admit(&self, authority: &AdmittedAuthority) -> ContractResult<()> {
+        if self.retired_authority.lock().unwrap().is_some() {
+            return Err(ContractError::AuthorityMismatch("retired identity".into()));
+        }
         self.admit_count.fetch_add(1, Ordering::SeqCst);
         *self.authority.lock().unwrap() = Some(authority.clone());
         if self.fail_after_admit.swap(false, Ordering::SeqCst) {
@@ -1886,6 +2906,7 @@ async fn newer_primary_authority_stays_write_closed_until_epoch_stage_completes(
     let application = Arc::new(TestApplication::default());
     let runtime = open_primary(application.clone(), vec![local.clone()]).await;
     let newer = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: local.clone(),
         transition_kind: None,
         previous_configuration: None,
@@ -2496,6 +3517,7 @@ fn authority(local: ReplicaIdentity, members: Vec<ReplicaIdentity>) -> AdmittedA
         write_quorum,
     );
     AdmittedAuthority {
+        secondary_removal: None,
         local_identity: local,
         transition_kind: None,
         previous_configuration: None,
@@ -3273,6 +4295,7 @@ async fn failover_does_not_inherit_previous_primary_verification_credit() {
         .apply_effect(effect(
             2,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: local,
                 transition_kind: Some(TransitionKind::Failover),
                 previous_configuration: Some(previous),
@@ -3530,6 +4553,7 @@ async fn failed_or_cancelled_secondary_epoch_admission_stays_write_fenced() {
         2,
     );
     let demoted_authority = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: old_primary.clone(),
         transition_kind: Some(TransitionKind::Failover),
         previous_configuration: Some(previous.current_configuration.clone()),
@@ -4082,6 +5106,7 @@ async fn switchover_recovery_commits_different_writes_after_restoration_compensa
                 for action in [
                     RuntimeEffectAction::Open(OpenMode::Existing),
                     RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                        secondary_removal: None,
                         local_identity: identities[index].clone(),
                         transition_kind: None,
                         previous_configuration: None,
@@ -4174,6 +5199,7 @@ async fn switchover_recovery_commits_different_writes_after_restoration_compensa
                                 &runtimes[index],
                                 &mut sequences[index],
                                 RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                                    secondary_removal: None,
                                     local_identity: identities[index].clone(),
                                     transition_kind: (!current_only)
                                         .then_some(TransitionKind::PlannedSwitchover),
@@ -4573,6 +5599,7 @@ async fn switchover_drain_serializes_durable_boundaries_and_delayed_direct_clien
             .apply_effect(effect(
                 6,
                 RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                    secondary_removal: None,
                     local_identity: source,
                     transition_kind: Some(TransitionKind::PlannedSwitchover),
                     previous_configuration: Some(starting.current_configuration),
@@ -5335,6 +6362,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         2,
     );
     let new_source_authority = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: source.clone(),
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous_authority.current_configuration.clone()),
@@ -5384,6 +6412,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .apply_effect(effect(
             2,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: secondary.clone(),
                 ..new_source_authority.clone()
             })),
@@ -5455,6 +6484,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .apply_effect(effect(
             6,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: replacement.clone(),
                 transition_kind: None,
                 previous_configuration: None,
@@ -5472,6 +6502,7 @@ async fn completed_copy_hands_off_to_new_authority_and_normal_quorum_replication
         .apply_effect(effect(
             6,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: source,
                 transition_kind: None,
                 previous_configuration: None,
@@ -5957,6 +6988,7 @@ async fn runtime_exposes_cc_boundary_catch_up_evidence() {
         2,
     );
     let admitted = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: primary.clone(),
         transition_kind: Some(TransitionKind::Replacement),
         previous_configuration: Some(previous),
@@ -6130,6 +7162,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         let application = Arc::new(TestApplication::default());
         application.seed_progress(if index == 1 { 9 } else { 7 });
         let authority = AdmittedAuthority {
+            secondary_removal: None,
             local_identity: identity.clone(),
             transition_kind: None,
             previous_configuration: None,
@@ -6197,6 +7230,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
     for index in [0, 2, 1] {
         let runtime = &runtimes[index];
         let authority = AdmittedAuthority {
+            secondary_removal: None,
             local_identity: identities[index].clone(),
             transition_kind: Some(TransitionKind::PlannedSwitchover),
             previous_configuration: Some(starting.clone()),
@@ -6290,6 +7324,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
             .apply_effect(effect(
                 sequences[index],
                 RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                    secondary_removal: None,
                     local_identity: identities[index].clone(),
                     transition_kind: None,
                     previous_configuration: None,
@@ -6311,6 +7346,7 @@ async fn planned_handoff_role_recovery(compensate: bool) {
         for index in [1, 2, 0] {
             let runtime = &runtimes[index];
             let authority = AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: identities[index].clone(),
                 transition_kind: Some(TransitionKind::PlannedSwitchover),
                 previous_configuration: Some(current.clone()),
@@ -6529,6 +7565,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
     let target_application = Arc::new(TestApplication::default());
     target_application.seed_progress(9);
     let requested_authority = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: target.clone(),
         transition_kind: Some(TransitionKind::PlannedSwitchover),
         previous_configuration: Some(starting.clone()),
@@ -6596,6 +7633,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         .apply_effect(effect(
             1,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: target.clone(),
                 transition_kind: None,
                 previous_configuration: None,
@@ -6655,6 +7693,7 @@ async fn switchover_certificate_transfers_only_the_verified_prefix_across_restar
         .apply_effect(effect(
             2,
             RuntimeEffectAction::AdmitAuthority(Box::new(AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: source.clone(),
                 transition_kind: Some(TransitionKind::PlannedSwitchover),
                 previous_configuration: Some(requested),
@@ -6729,6 +7768,7 @@ async fn runtime_exposes_derived_must_catch_up_evidence() {
         2,
     );
     let admitted = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: new_primary.clone(),
         transition_kind: Some(TransitionKind::Failover),
         previous_configuration: Some(previous),

@@ -257,7 +257,8 @@ fn secondary_scale_down_preserves_holes_and_high_id_primary() {
 fn secondary_scale_down_rejects_arbitrary_authority_changes() {
     use kuberic_protocol::types::SecondaryScaleDownIntent;
     use kuberic_protocol::validation::validate_secondary_scale_down;
-    let mutations: &[(&str, fn(&mut SecondaryScaleDownIntent))] = &[
+    type IntentMutation = (&'static str, fn(&mut SecondaryScaleDownIntent));
+    let mutations: &[IntentMutation] = &[
         ("primary target", |i| i.target = i.primary.clone()),
         ("non-highest target", |i| {
             i.target = i.previous_configuration.members[3].identity.clone();

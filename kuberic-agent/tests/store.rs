@@ -166,6 +166,7 @@ async fn sqlite_store_reopens_with_identity_authority_and_progress() {
     let store = SqliteStore::create_authorized(&path, state).unwrap();
 
     let authority = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: storage_identity.local_identity.clone(),
         transition_kind: Some(TransitionKind::Bootstrap),
         previous_configuration: None,
@@ -363,6 +364,7 @@ async fn additive_handoff_fields_default_when_reopening_legacy_json() {
     )
     .unwrap();
     let authority = AdmittedAuthority {
+        secondary_removal: None,
         local_identity: storage_identity.local_identity.clone(),
         transition_kind: Some(TransitionKind::Bootstrap),
         previous_configuration: None,

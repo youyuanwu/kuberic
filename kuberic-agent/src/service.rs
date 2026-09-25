@@ -311,6 +311,16 @@ impl SessionRegistry {
         self.peers.write().await.insert(identity, session);
     }
 
+    pub(crate) async fn retain_members(
+        &self,
+        authority: Option<&kuberic_runtime_internal::authority::AdmittedAuthority>,
+    ) {
+        self.peers
+            .write()
+            .await
+            .retain(|identity, _| authority.is_some_and(|a| a.contains_member(identity)));
+    }
+
     pub async fn validate_peer(
         &self,
         sender: &ReplicaIdentity,

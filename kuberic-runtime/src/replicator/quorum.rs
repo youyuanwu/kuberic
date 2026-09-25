@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use kuberic_protocol::types::{ConfigurationDescriptor, ReplicaIdentity, ReplicaRole};
+use kuberic_protocol::types::{
+    ConfigurationDescriptor, ProcessSessionId, ReplicaIdentity, ReplicaRole, SecondaryRemovalStage,
+    SecondaryRemovalWitness,
+};
 use kuberic_runtime_internal::transport::ReplicationAck;
 use tokio::sync::oneshot;
 
@@ -17,23 +20,16 @@ pub struct QuorumTracker {
     committed_lsn: Lsn,
     catch_up_boundary: Option<Lsn>,
     must_catch_up: BTreeSet<ReplicaIdentity>,
+    sessions: BTreeMap<ReplicaIdentity, ProcessSessionId>,
+    obsolete_sessions: BTreeSet<(ReplicaIdentity, ProcessSessionId)>,
+    verified: BTreeMap<ReplicaIdentity, (u64, Lsn)>,
+    witnesses: BTreeMap<ReplicaIdentity, SecondaryRemovalWitness>,
 }
 
 impl QuorumTracker {
     pub fn configure(&mut self, authority: AdmittedAuthority, local_progress: Lsn) -> Result<()> {
         authority.validate()?;
-        let same_fence = self.authority.as_ref().is_some_and(|existing| {
-            existing.current_configuration.configuration_id
-                == authority.current_configuration.configuration_id
-                && existing
-                    .previous_configuration
-                    .as_ref()
-                    .map(|configuration| &configuration.configuration_id)
-                    == authority
-                        .previous_configuration
-                        .as_ref()
-                        .map(|configuration| &configuration.configuration_id)
-        });
+        let same_fence = self.authority.as_ref() == Some(&authority);
         if self.authority.is_some() && !same_fence {
             for (_, senders) in std::mem::take(&mut self.pending) {
                 for sender in senders {
@@ -43,8 +39,12 @@ impl QuorumTracker {
                 }
             }
             self.progress.clear();
+            self.verified.clear();
+            self.witnesses.clear();
         }
         let members = authority_members(&authority);
+        self.sessions
+            .retain(|identity, _| members.contains(identity));
         self.progress
             .retain(|identity, _| members.contains(identity));
         self.progress
@@ -53,15 +53,127 @@ impl QuorumTracker {
             .or_insert(local_progress);
         self.highest_lsn = self.highest_lsn.max(local_progress);
         if !same_fence {
-            self.catch_up_boundary = authority.previous_configuration.as_ref().map(|_| {
-                authority
-                    .switchover_handoff
-                    .as_ref()
-                    .map_or(self.highest_lsn, |handoff| handoff.handoff_lsn)
-            });
+            self.catch_up_boundary = authority
+                .secondary_removal
+                .as_ref()
+                .map(|e| e.preparation.boundary_lsn)
+                .or_else(|| {
+                    authority.previous_configuration.as_ref().map(|_| {
+                        authority
+                            .switchover_handoff
+                            .as_ref()
+                            .map_or(self.highest_lsn, |handoff| handoff.handoff_lsn)
+                    })
+                });
             self.must_catch_up = derive_must_catch_up(&authority);
         }
         self.authority = Some(authority);
+        Ok(())
+    }
+
+    pub fn register_peer_session(
+        &mut self,
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    ) -> Result<()> {
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        if session.is_empty()
+            || identity == authority.local_identity
+            || !authority.contains_member(&identity)
+            || self
+                .obsolete_sessions
+                .contains(&(identity.clone(), session.clone()))
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "invalid peer session identity".into(),
+            ));
+        }
+        if self.sessions.get(&identity) != Some(&session) {
+            if let Some(previous) = self.sessions.get(&identity) {
+                self.obsolete_sessions
+                    .insert((identity.clone(), previous.clone()));
+            }
+            self.progress.remove(&identity);
+            self.verified.remove(&identity);
+            self.witnesses.remove(&identity);
+            self.sessions.insert(identity, session);
+        }
+        Ok(())
+    }
+
+    pub fn record_verified_local_progress(&mut self, lsn: Lsn) {
+        if let Some(authority) = &self.authority {
+            self.verified
+                .insert(authority.local_identity.clone(), (0, lsn));
+        }
+    }
+
+    pub fn observe_secondary_removal(&mut self, witness: &SecondaryRemovalWitness) -> Result<()> {
+        if self.witnesses.get(&witness.identity) == Some(witness) {
+            return Ok(());
+        }
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+        let evidence = authority
+            .secondary_removal
+            .as_ref()
+            .ok_or(RuntimeError::ReconfigurationPending)?;
+        let intent = &evidence.preparation.intent;
+        let stage = if authority.previous_configuration.is_some() {
+            SecondaryRemovalStage::PreviousCurrent
+        } else {
+            SecondaryRemovalStage::CurrentOnly
+        };
+        if witness.identity == authority.local_identity
+            || self.sessions.get(&witness.identity) != Some(&witness.process_session_id)
+            || witness.resource_uid != intent.resource_uid
+            || !intent
+                .current_configuration
+                .members
+                .iter()
+                .any(|m| m.identity == witness.identity && m.role == witness.role)
+            || witness.epoch != authority.current_configuration.epoch
+            || witness.current_configuration_id != authority.current_configuration.configuration_id
+            || witness.previous_configuration_id != authority.fence().previous_configuration_id
+            || witness.report_sequence == 0
+            || witness.verified_replication_lsn < evidence.preparation.boundary_lsn
+            || witness.pending_operation_id.is_some()
+            || witness.write_status == kuberic_protocol::types::AccessStatus::Granted
+            || witness.retained_operation_id.as_ref()
+                != Some(&intent.command_operation_id(stage, &witness.identity))
+            || self
+                .verified
+                .get(&witness.identity)
+                .is_some_and(|(seq, _)| *seq >= witness.report_sequence)
+            || evidence
+                .previous_read_quorum
+                .iter()
+                .chain(if authority.previous_configuration.is_none() {
+                    evidence.reduced_write_quorum.as_slice()
+                } else {
+                    &[]
+                })
+                .any(|old| {
+                    old.identity == witness.identity
+                        && old.process_session_id == witness.process_session_id
+                        && old.report_sequence >= witness.report_sequence
+                })
+        {
+            return Err(RuntimeError::AuthorityMismatch(
+                "stale or unverified reduced-quorum witness".into(),
+            ));
+        }
+        self.verified.insert(
+            witness.identity.clone(),
+            (witness.report_sequence, witness.verified_replication_lsn),
+        );
+        self.witnesses
+            .insert(witness.identity.clone(), witness.clone());
         Ok(())
     }
 
@@ -125,6 +237,19 @@ impl QuorumTracker {
         Ok(())
     }
 
+    pub fn acknowledge_in_session(
+        &mut self,
+        acknowledgement: &ReplicationAck,
+        session: &ProcessSessionId,
+    ) -> Result<()> {
+        if self.sessions.get(&acknowledgement.receiver) != Some(session) {
+            return Err(RuntimeError::AuthorityMismatch(
+                "acknowledgement belongs to an obsolete peer session".into(),
+            ));
+        }
+        self.acknowledge(acknowledgement)
+    }
+
     pub fn current_configuration_quorum_progress(&self) -> Lsn {
         self.authority.as_ref().map_or(0, |authority| {
             quorum_progress(&authority.current_configuration, &self.progress)
@@ -154,6 +279,26 @@ impl QuorumTracker {
     }
 
     pub fn catch_up_complete(&self) -> bool {
+        if let Some(authority) = &self.authority
+            && let Some(evidence) = &authority.secondary_removal
+        {
+            let boundary = evidence.preparation.boundary_lsn;
+            return self
+                .verified
+                .get(authority.primary_identity())
+                .is_some_and(|(_, lsn)| *lsn >= boundary)
+                && authority
+                    .current_configuration
+                    .members
+                    .iter()
+                    .filter(|m| {
+                        self.verified
+                            .get(&m.identity)
+                            .is_some_and(|(_, lsn)| *lsn >= boundary)
+                    })
+                    .count()
+                    >= authority.current_configuration.write_quorum as usize;
+        }
         let Some(boundary) = self.catch_up_boundary else {
             return true;
         };
@@ -240,6 +385,9 @@ impl QuorumTracker {
         self.committed_lsn = committed_lsn;
         self.catch_up_boundary = None;
         self.must_catch_up.clear();
+        self.sessions.clear();
+        self.verified.clear();
+        self.witnesses.clear();
     }
 }
 

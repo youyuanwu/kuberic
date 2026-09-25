@@ -200,6 +200,7 @@ pub enum SenderOutbound {
     },
     Build(ReplicaEndpoint),
     Remove(ReplicaId),
+    Evict(ReplicaIdentity),
 }
 
 struct PeerWindows {
@@ -212,6 +213,7 @@ pub struct ReliableSender {
     local_session: ProcessSessionId,
     capacity: usize,
     peers: BTreeMap<ReplicaIdentity, PeerWindows>,
+    evicted: std::collections::BTreeSet<ReplicaIdentity>,
 }
 
 impl ReliableSender {
@@ -221,6 +223,7 @@ impl ReliableSender {
             local_session,
             capacity,
             peers: BTreeMap::new(),
+            evicted: std::collections::BTreeSet::new(),
         })
     }
 
@@ -237,6 +240,9 @@ impl ReliableSender {
         identity: ReplicaIdentity,
         session: ProcessSessionId,
     ) -> Result<()> {
+        if self.evicted.contains(&identity) {
+            return Err(RuntimeError::OperationCancelled);
+        }
         if let Some(peer) = self.peers.get_mut(&identity) {
             peer.session = session;
             return Ok(());
@@ -282,6 +288,10 @@ impl ReliableSender {
             }
             OutboundOperation::Build(endpoint) => Ok(SenderOutbound::Build(endpoint)),
             OutboundOperation::Remove(replica_id) => Ok(SenderOutbound::Remove(replica_id)),
+            OutboundOperation::Evict(identity) => {
+                self.evict_peer(&identity);
+                Ok(SenderOutbound::Evict(identity))
+            }
         }
     }
 
@@ -352,5 +362,10 @@ impl ReliableSender {
             peer.replication.cancel();
             peer.copy.cancel();
         }
+    }
+
+    pub fn evict_peer(&mut self, receiver: &ReplicaIdentity) {
+        self.retire_peer(receiver);
+        self.evicted.insert(receiver.clone());
     }
 }

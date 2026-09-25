@@ -3,7 +3,12 @@ use kuberic_protocol::types::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::authority::RetiredAuthority;
 use crate::authority::{AdmittedAuthority, BuildAuthority};
+use kuberic_protocol::types::{
+    ProcessSessionId, SecondaryRemovalPreparation, SecondaryRemovalWitness,
+    SecondaryScaleDownCleanup, SecondaryScaleDownIntent,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenMode {
@@ -32,6 +37,24 @@ pub struct RuntimeEffect {
 pub enum RuntimeEffectAction {
     Open(OpenMode),
     AdmitAuthority(Box<AdmittedAuthority>),
+    PrepareSecondaryRemoval {
+        intent: Box<SecondaryScaleDownIntent>,
+        process_session_id: ProcessSessionId,
+        report_sequence: u64,
+    },
+    RegisterPeerSession {
+        identity: ReplicaIdentity,
+        session: ProcessSessionId,
+    },
+    ObserveSecondaryRemovalWitness(Box<SecondaryRemovalWitness>),
+    ObserveReplicationAck {
+        acknowledgement: Box<crate::transport::ReplicationAck>,
+        session: ProcessSessionId,
+    },
+    AcceptSecondaryRemovalCommit(Box<SecondaryScaleDownCleanup>),
+    RetireReplica(Box<RetiredAuthority>),
+    FenceRetirement(Box<RetiredAuthority>),
+    CompleteRetirement(Box<RetiredAuthority>),
     AuthorizeFailoverPrefix(i64),
     AdmitBuildAuthority(Box<BuildAuthority>),
     ChangeRole(ReplicaRole),
@@ -82,6 +105,9 @@ pub struct RuntimeSnapshot {
     pub read_status: AccessStatus,
     pub write_status: AccessStatus,
     pub authority: Option<AdmittedAuthority>,
+    pub prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
+    pub retired_authority: Option<RetiredAuthority>,
+    pub accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
     pub current_progress: i64,
     pub verified_replication_lsn: Option<i64>,
     pub committed_lsn: i64,
@@ -99,6 +125,12 @@ pub struct RuntimePostcondition {
     pub read_status: AccessStatus,
     pub write_status: AccessStatus,
     pub authority: Option<AdmittedAuthority>,
+    #[serde(default)]
+    pub prepared_secondary_removal: Option<SecondaryRemovalPreparation>,
+    #[serde(default)]
+    pub retired_authority: Option<RetiredAuthority>,
+    #[serde(default)]
+    pub accepted_secondary_removal: Option<SecondaryScaleDownCleanup>,
     pub current_progress: i64,
     pub verified_replication_lsn: Option<i64>,
     pub committed_lsn: i64,
@@ -124,6 +156,9 @@ impl From<RuntimeSnapshot> for RuntimePostcondition {
             read_status: snapshot.read_status,
             write_status: snapshot.write_status,
             authority: snapshot.authority,
+            prepared_secondary_removal: snapshot.prepared_secondary_removal,
+            retired_authority: snapshot.retired_authority,
+            accepted_secondary_removal: snapshot.accepted_secondary_removal,
             current_progress: snapshot.current_progress,
             verified_replication_lsn: snapshot.verified_replication_lsn,
             committed_lsn: snapshot.committed_lsn,

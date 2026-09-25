@@ -35,6 +35,9 @@ impl FakeRuntime {
     fn new() -> Self {
         Self {
             state: Mutex::new(RuntimePostcondition {
+                prepared_secondary_removal: None,
+                retired_authority: None,
+                accepted_secondary_removal: None,
                 open: true,
                 role: ReplicaRole::None,
                 role_transition: None,
@@ -468,6 +471,7 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
         runtime_state.write_status = AccessStatus::Granted;
         runtime_state.current_progress = 7;
         runtime_state.authority = Some(AdmittedAuthority {
+            secondary_removal: None,
             local_identity: source.clone(),
             transition_kind: None,
             previous_configuration: None,
@@ -517,6 +521,7 @@ async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visibl
         runtime_state.write_status = AccessStatus::Granted;
         runtime_state.current_progress = 7;
         runtime_state.authority = Some(AdmittedAuthority {
+            secondary_removal: None,
             local_identity: command.source.clone(),
             transition_kind: None,
             previous_configuration: None,
@@ -768,6 +773,7 @@ async fn planned_switchover_sequences_source_target_and_uninvolved_through_curre
             runtime_state.write_status = AccessStatus::ReconfigurationPending;
             runtime_state.current_progress = 7;
             runtime_state.authority = Some(AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: local.clone(),
                 transition_kind: None,
                 previous_configuration: None,
@@ -1211,6 +1217,7 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
         state.read_status = AccessStatus::Granted;
         state.write_status = AccessStatus::NotPrimary;
         state.authority = Some(AdmittedAuthority {
+            secondary_removal: None,
             local_identity: local.clone(),
             transition_kind: None,
             previous_configuration: None,
@@ -1510,6 +1517,7 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
         let mut runtime_state = runtime.state.lock().unwrap();
         runtime_state.role = ReplicaRole::Primary;
         runtime_state.authority = Some(AdmittedAuthority {
+            secondary_removal: None,
             local_identity: local.clone(),
             transition_kind: Some(TransitionKind::Replacement),
             previous_configuration: Some(previous),

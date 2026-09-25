@@ -67,6 +67,7 @@ async fn secondary_removal_contracts_are_rejected_without_durable_mutation() {
         );
         assert!(
             AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: local.clone(),
                 transition_kind: Some(kuberic_protocol::types::TransitionKind::SecondaryScaleDown),
                 previous_configuration: Some(intent.previous_configuration.clone()),
@@ -1078,6 +1079,7 @@ async fn switchover_commands_revalidate_sessions_before_replaying_durable_eviden
         let persisted = store.load_state().await.unwrap();
         store
             .admit(&AdmittedAuthority {
+                secondary_removal: None,
                 local_identity: local.clone(),
                 transition_kind: persisted
                     .previous_configuration
