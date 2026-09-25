@@ -521,6 +521,7 @@ pub struct SwitchoverHandoff {
     pub source: ReplicaIdentity,
     pub target: ReplicaIdentity,
     pub starting_configuration_id: ConfigurationId,
+    pub starting_epoch: Epoch,
     pub handoff_lsn: i64,
 }
 

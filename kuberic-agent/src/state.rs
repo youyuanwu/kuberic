@@ -4,6 +4,7 @@ use kuberic_protocol::command::EnsureConfiguration;
 use kuberic_protocol::types::{
     AccessStatus, ConfigurationDescriptor, EffectivePolicy, Epoch, FaultType, InitializationId,
     LoadMetric, OperationId, PodUid, PvcUid, ReplicaIdentity, ReplicaRole, ResourceUid,
+    SwitchoverHandoff,
 };
 use kuberic_runtime_internal::effects::{RuntimeEffect, RuntimeEffectResult};
 use serde::{Deserialize, Serialize};
@@ -117,6 +118,8 @@ pub struct AgentState {
     pub reported_fault: Option<FaultType>,
     pub pending_effect: Option<PendingEffect>,
     pub retained_result: Option<RetainedResult>,
+    #[serde(default)]
+    pub prepared_switchover: Option<SwitchoverHandoff>,
 }
 
 impl AgentState {
@@ -138,6 +141,7 @@ impl AgentState {
             reported_fault: None,
             pending_effect: None,
             retained_result: None,
+            prepared_switchover: None,
         }
     }
 }

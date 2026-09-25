@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
-use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore};
-use kuberic_protocol::types::{ReplicaRole, TransitionKind};
+use kuberic_protocol::command::{
+    EnsureConfiguration, EnsureReplicaBuild, InitializeAgentStore, PrepareSwitchover,
+};
+use kuberic_protocol::types::{AccessStatus, ReplicaRole, TransitionKind};
 use kuberic_protocol::validation::validate_transition_relationship;
 use kuberic_runtime_internal::authority::AdmittedAuthority;
 
@@ -32,6 +34,72 @@ pub fn admit_persisted_configuration(
     state: &AgentState,
 ) -> Result<AdmittedAuthority> {
     admit_configuration_with_replay(command, state, true)
+}
+
+pub fn admit_switchover_preparation(command: &PrepareSwitchover, state: &AgentState) -> Result<()> {
+    let identity = &state.identity.local_identity;
+    if command.operation_id.is_empty()
+        || command.request_id.is_empty()
+        || command.local_replica_id != identity.replica_id
+        || command.expected_instance_id != identity.instance_id
+        || command.expected_agent_generation != identity.agent_generation
+        || command.source != *identity
+    {
+        return Err(AgentError::CommandRejected(
+            "planned switchover preparation target does not match durable identity".into(),
+        ));
+    }
+    if let Some(prepared) = state.prepared_switchover.as_ref() {
+        if prepared.preparation_operation_id == command.operation_id
+            && prepared.request_id == command.request_id
+            && prepared.source == command.source
+            && prepared.target == command.target
+            && prepared.starting_configuration_id == command.current_configuration.configuration_id
+            && state.current_configuration.as_ref() == Some(&command.current_configuration)
+        {
+            return Ok(());
+        }
+        return Err(AgentError::CommandRejected(
+            "another planned switchover preparation is retained".into(),
+        ));
+    }
+    if state.reconfiguration.is_some() {
+        return Err(AgentError::CommandRejected(
+            "configuration work is already pending".into(),
+        ));
+    }
+    if state.role != ReplicaRole::Primary || state.write_status != AccessStatus::Granted {
+        return Err(AgentError::CommandRejected(
+            "planned switchover preparation requires the writable primary".into(),
+        ));
+    }
+    let current = state.current_configuration.as_ref().ok_or_else(|| {
+        AgentError::CommandRejected(
+            "planned switchover preparation requires installed authority".into(),
+        )
+    })?;
+    if current != &command.current_configuration {
+        return Err(AgentError::CommandRejected(
+            "planned switchover preparation differs from installed authority".into(),
+        ));
+    }
+    let primary = current
+        .members
+        .iter()
+        .find(|member| member.identity.replica_id == current.primary_id)
+        .expect("validated durable configuration has one primary");
+    if primary.identity != command.source
+        || command.target.replica_id == current.primary_id
+        || !current
+            .members
+            .iter()
+            .any(|member| member.identity == command.target && member.role != ReplicaRole::Primary)
+    {
+        return Err(AgentError::CommandRejected(
+            "planned switchover preparation source or target differs from authority".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn is_access_only_configuration(
@@ -232,20 +300,39 @@ fn admit_configuration_with_replay(
                 .is_some_and(|retained| retained.command == *command);
         let starting_authority_was_durably_admitted =
             completed_current_only_replay && exact_persisted_command;
+        let starting_authority_matches = starting_configuration.is_some_and(|configuration| {
+            let source_is_primary = configuration.members.iter().any(|member| {
+                member.identity == handoff.source && member.role == ReplicaRole::Primary
+            });
+            let target_is_primary = configuration.members.iter().any(|member| {
+                member.identity == handoff.target && member.role == ReplicaRole::Primary
+            });
+            let exact_members_present = configuration
+                .members
+                .iter()
+                .any(|member| member.identity == handoff.source)
+                && configuration
+                    .members
+                    .iter()
+                    .any(|member| member.identity == handoff.target);
+            exact_members_present
+                && if source_is_primary {
+                    configuration.configuration_id == handoff.starting_configuration_id
+                        && configuration.epoch == handoff.starting_epoch
+                } else {
+                    target_is_primary
+                        && command.current_configuration.primary_id == handoff.source.replica_id
+                        && configuration.epoch.data_loss_number
+                            == handoff.starting_epoch.data_loss_number
+                        && configuration.epoch.configuration_number
+                            > handoff.starting_epoch.configuration_number
+                }
+        });
         let retirement_ids = command
             .retire_switchover_preparation_ids
             .iter()
             .collect::<BTreeSet<_>>();
-        if (!starting_authority_was_durably_admitted
-            && starting_configuration.is_none_or(|configuration| {
-                configuration.configuration_id != handoff.starting_configuration_id
-                    || !configuration.members.iter().any(|member| {
-                        member.identity == handoff.source && member.role == ReplicaRole::Primary
-                    })
-                    || !configuration.members.iter().any(|member| {
-                        member.identity == handoff.target && member.role != ReplicaRole::Primary
-                    })
-            }))
+        if (!starting_authority_was_durably_admitted && !starting_authority_matches)
             || !command
                 .current_configuration
                 .members
@@ -285,6 +372,7 @@ fn admit_configuration_with_replay(
             .then_some(command.transition_kind),
         previous_configuration: command.previous_configuration.clone(),
         current_configuration: command.current_configuration.clone(),
+        switchover_handoff: command.switchover_handoff.clone(),
     };
     admitted
         .validate()

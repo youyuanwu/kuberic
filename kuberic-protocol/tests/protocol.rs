@@ -427,6 +427,7 @@ fn planned_switchover_status_binds_request_handoff_and_receipt() {
         source: source.clone(),
         target: target.clone(),
         starting_configuration_id: previous.configuration_id.clone(),
+        starting_epoch: previous.epoch,
         handoff_lsn: 12,
     };
     let status = AcceptedStatus {

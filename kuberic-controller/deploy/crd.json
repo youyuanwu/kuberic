@@ -605,6 +605,24 @@
                               "startingConfigurationId": {
                                 "type": "string"
                               },
+                              "startingEpoch": {
+                                "description": "Monotonic replication authority version, ordered by data loss then configuration.",
+                                "properties": {
+                                  "configurationNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  },
+                                  "dataLossNumber": {
+                                    "format": "int64",
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "configurationNumber",
+                                  "dataLossNumber"
+                                ],
+                                "type": "object"
+                              },
                               "target": {
                                 "description": "Exact authority identity: logical replica, Pod incarnation, and durable generation.",
                                 "properties": {
@@ -633,6 +651,7 @@
                               "requestId",
                               "source",
                               "startingConfigurationId",
+                              "startingEpoch",
                               "target"
                             ],
                             "type": "object"

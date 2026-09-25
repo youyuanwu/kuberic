@@ -1059,6 +1059,7 @@ impl RuntimeHost {
             RuntimeEffectAction::AdmitAuthority(_)
             | RuntimeEffectAction::AuthorizeFailoverPrefix(_)
             | RuntimeEffectAction::AdmitBuildAuthority(_)
+            | RuntimeEffectAction::PrepareSwitchover { .. }
             | RuntimeEffectAction::WaitForCatchup
             | RuntimeEffectAction::BuildReplica { .. }
             | RuntimeEffectAction::RetireBuild(_) => {

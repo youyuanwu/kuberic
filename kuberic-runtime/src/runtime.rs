@@ -2384,6 +2384,54 @@ impl DefaultReplicatorInner {
                 }
                 self.state.write().await.write_status = write_status;
             }
+            RuntimeEffectAction::PrepareSwitchover {
+                request_id,
+                source,
+                target,
+                starting_configuration_id,
+                starting_epoch,
+            } => {
+                if request_id.is_empty() {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "planned switchover request ID must not be empty".to_string(),
+                    ));
+                }
+                let state = self.state.read().await;
+                if !state.open {
+                    return Err(RuntimeError::NotOpen);
+                }
+                if state.role != ReplicaRole::Primary || state.write_status != AccessStatus::Granted
+                {
+                    return Err(RuntimeError::NotPrimary);
+                }
+                let authority = state
+                    .authority
+                    .as_ref()
+                    .ok_or(RuntimeError::AuthorityNotAdmitted)?;
+                let current = &authority.current_configuration;
+                let primary = current
+                    .members
+                    .iter()
+                    .find(|member| member.identity.replica_id == current.primary_id)
+                    .expect("validated authority has one primary");
+                if current.configuration_id != starting_configuration_id
+                    || current.epoch != starting_epoch
+                    || source != self.identity
+                    || primary.identity != source
+                    || target.replica_id == current.primary_id
+                    || !current.members.iter().any(|member| {
+                        member.identity == target && member.role != ReplicaRole::Primary
+                    })
+                {
+                    return Err(RuntimeError::AuthorityMismatch(
+                        "planned switchover preparation differs from admitted authority"
+                            .to_string(),
+                    ));
+                }
+                drop(state);
+                self.replicator.lock().await.fence_client_writes();
+                self.state.write().await.write_status = AccessStatus::ReconfigurationPending;
+            }
             RuntimeEffectAction::RefreshApplicationProgress => {
                 let progress = if let Some(storage) = self.storage.read().await.clone() {
                     storage.durable_progress().await?
@@ -2579,6 +2627,41 @@ impl DefaultReplicatorInner {
             {
                 progress.verified_lsn = progress.verified_lsn.max(previous_progress.verified_lsn);
             }
+        }
+        if let Some(handoff) = &authority.switchover_handoff {
+            let starting_fence = crate::authority::AuthorityFence {
+                epoch: handoff.starting_epoch,
+                previous_configuration_id: None,
+                current_configuration_id: handoff.starting_configuration_id.clone(),
+            };
+            let stored_progress = self
+                .replication_progress_store
+                .load_replication_progress(&starting_fence)
+                .await?
+                .map_or(0, |progress| progress.verified_lsn);
+            let configuration_progress = self
+                .replication_progress_store
+                .load_configuration_progress(
+                    handoff.starting_epoch,
+                    &handoff.starting_configuration_id,
+                )
+                .await?
+                .map_or(0, |progress| progress.verified_lsn);
+            let starting_progress = if self.identity == handoff.source {
+                self.state.read().await.current_progress
+            } else {
+                stored_progress.max(configuration_progress)
+            };
+            if self.identity == *authority.primary_identity()
+                && starting_progress < handoff.handoff_lsn
+            {
+                return Err(RuntimeError::AuthorityMismatch(
+                    "new switchover primary lacks the certified handoff prefix".to_string(),
+                ));
+            }
+            progress.verified_lsn = progress
+                .verified_lsn
+                .max(starting_progress.min(handoff.handoff_lsn));
         }
         let handoff_lsn = self
             .state

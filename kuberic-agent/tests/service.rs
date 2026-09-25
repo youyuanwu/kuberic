@@ -11,7 +11,8 @@ use kuberic_agent::sqlite_store::SqliteStore;
 use kuberic_agent::state::{AgentState, SCHEMA_VERSION, StorageIdentity};
 use kuberic_agent::store::AgentStore;
 use kuberic_protocol::types::{
-    EffectivePolicy, PodUid, PvcUid, ReplicaId, ReplicaIdentity, ReplicaInstanceId, ResourceUid,
+    ConfigurationId, EffectivePolicy, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
+    ReplicaInstanceId, ResourceUid, SwitchoverHandoff, SwitchoverRequestId,
     derive_agent_generation, derive_initialization_id,
 };
 use kuberic_runtime::application::{
@@ -580,6 +581,84 @@ async fn restarted_agent_rejects_old_session_commands_without_mutating_store() {
         ))
         .await
         .unwrap();
+
+    shutdown_tx.send_replace(true);
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn status_reports_durable_switchover_preparation_after_reopen() {
+    let directory = tempdir().unwrap();
+    let path = SqliteStore::metadata_database_path(directory.path());
+    let storage_identity = StorageIdentity {
+        schema_version: SCHEMA_VERSION,
+        resource_uid: ResourceUid::new("resource-1"),
+        pod_uid: PodUid::new("pod-1"),
+        pvc_uid: PvcUid::new("pvc-1"),
+        initialization_id: derive_initialization_id(
+            &ResourceUid::new("resource-1"),
+            ReplicaId::new(1),
+            &PodUid::new("pod-1"),
+            &PvcUid::new("pvc-1"),
+        ),
+        local_identity: identity(),
+        effective_policy: EffectivePolicy::fixed(1, 30).unwrap(),
+    };
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: kuberic_protocol::types::AgentGeneration::new("generation-2"),
+    };
+    let handoff = SwitchoverHandoff {
+        preparation_operation_id: OperationId::new("prepare-1"),
+        request_id: SwitchoverRequestId::new("request-1"),
+        source: storage_identity.local_identity.clone(),
+        target,
+        starting_configuration_id: ConfigurationId::new("configuration-1"),
+        starting_epoch: kuberic_protocol::types::Epoch::new(0, 1),
+        handoff_lsn: 9,
+    };
+    let mut state = AgentState::new(storage_identity);
+    state.prepared_switchover = Some(handoff.clone());
+    drop(SqliteStore::create_authorized(&path, state).unwrap());
+    let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+    let runtime = Arc::new(PodRuntime::new_for_partition(
+        kuberic_protocol::types::PartitionInformation {
+            partition_id: kuberic_protocol::types::PartitionId::new("partition-1"),
+        },
+        identity(),
+        Arc::new(NoopApplication {
+            streams: Mutex::new(Vec::new()),
+        }),
+        store.clone(),
+    ));
+    let control = free_address();
+    let replication = free_address();
+    let service =
+        AgentService::new(store, runtime.clone(), runtime, Arc::<str>::from("token")).unwrap();
+    let (ready_tx, mut ready_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(service.serve(control, replication, ready_tx, shutdown_rx));
+    ready_rx.wait_for(|ready| *ready).await.unwrap();
+
+    let mut client =
+        proto::agent_control_client::AgentControlClient::connect(format!("http://{control}"))
+            .await
+            .unwrap();
+    let mut status = Request::new(proto::GetAgentStatusRequest {
+        protocol_version: kuberic_protocol::PROTOCOL_VERSION,
+        resource_uid: "resource-1".to_string(),
+        replica_id: 1,
+        expected_instance_id: "pod-1".to_string(),
+    });
+    status.metadata_mut().insert(
+        "authorization",
+        format!("{} {}", "Bearer", "token").parse().unwrap(),
+    );
+    let report = client.get_status(status).await.unwrap().into_inner();
+    let prepared = report.prepared_switchover.unwrap();
+    assert_eq!(prepared.preparation_operation_id, "prepare-1");
+    assert_eq!(prepared.handoff_lsn, 9);
 
     shutdown_tx.send_replace(true);
     server.await.unwrap().unwrap();

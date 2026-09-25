@@ -143,7 +143,7 @@ fn build_report(
                 completed: build.completed,
             })
             .collect(),
-        prepared_switchover: None,
+        prepared_switchover: state.prepared_switchover.map(Into::into),
     }
 }
 

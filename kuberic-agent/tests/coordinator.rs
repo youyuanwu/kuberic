@@ -11,7 +11,7 @@ use kuberic_agent::state::{
 };
 use kuberic_agent::store::{AgentStore, BeginConfiguration};
 use kuberic_agent::{AgentError, Result};
-use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild};
+use kuberic_protocol::command::{EnsureConfiguration, EnsureReplicaBuild, PrepareSwitchover};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, BuildAuthority, BuildAuthorityKind, ConfigurationDescriptor,
     ConfigurationMember, EffectivePolicy, Epoch, InitializationId, OperationId, PodUid,
@@ -70,6 +70,7 @@ impl RuntimeEffectExecutor for FakeRuntime {
             RuntimeEffectAction::RefreshApplicationProgress => "get-lsn",
             RuntimeEffectAction::WaitForCatchup => "catchup",
             RuntimeEffectAction::SetWriteStatus(_) => "write",
+            RuntimeEffectAction::PrepareSwitchover { .. } => "prepare-switchover",
             RuntimeEffectAction::ChangeReplicatorRole(_) => "replicator-role",
             RuntimeEffectAction::UpdateEpoch => "epoch",
             RuntimeEffectAction::ChangeApplicationRole(_) => "application-role",
@@ -101,6 +102,9 @@ impl RuntimeEffectExecutor for FakeRuntime {
                 state.write_status = write;
             }
             RuntimeEffectAction::SetWriteStatus(status) => state.write_status = status,
+            RuntimeEffectAction::PrepareSwitchover { .. } => {
+                state.write_status = AccessStatus::ReconfigurationPending;
+            }
             RuntimeEffectAction::RefreshApplicationProgress
             | RuntimeEffectAction::WaitForCatchup => {}
             RuntimeEffectAction::ChangeReplicatorRole(role) => {
@@ -289,6 +293,7 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
         source: source.clone(),
         target,
         starting_configuration_id: previous.configuration_id.clone(),
+        starting_epoch: previous.epoch,
         handoff_lsn: 7,
     };
     let mut state = AgentState::new(StorageIdentity {
@@ -364,6 +369,145 @@ fn planned_switchover_admission_binds_starting_authority_and_retirement() {
         epoch: current_only.current_epoch,
     });
     assert!(admit_persisted_configuration(&current_only, &state).is_ok());
+}
+
+#[tokio::test]
+async fn planned_switchover_preparation_is_durable_idempotent_and_restart_visible() {
+    let directory = tempdir().unwrap();
+    let source = identity();
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: AgentGeneration::new("generation-2"),
+    };
+    let third = ReplicaIdentity {
+        replica_id: ReplicaId::new(3),
+        instance_id: ReplicaInstanceId::new("pod-3"),
+        agent_generation: AgentGeneration::new("generation-3"),
+    };
+    let policy = EffectivePolicy::fixed(3, 30).unwrap();
+    let current = ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source.clone(),
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: target.clone(),
+                role: ReplicaRole::ActiveSecondary,
+            },
+            ConfigurationMember {
+                identity: third,
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        policy.write_quorum,
+    );
+    let mut state = AgentState::new(StorageIdentity {
+        effective_policy: policy,
+        ..storage_identity()
+    });
+    state.highest_epoch = current.epoch;
+    state.current_configuration = Some(current.clone());
+    state.role = ReplicaRole::Primary;
+    state.read_status = AccessStatus::Granted;
+    state.write_status = AccessStatus::Granted;
+    let store = Arc::new(
+        SqliteStore::create_authorized(
+            SqliteStore::metadata_database_path(directory.path()),
+            state,
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(FakeRuntime::new());
+    {
+        let mut runtime_state = runtime.state.lock().unwrap();
+        runtime_state.role = ReplicaRole::Primary;
+        runtime_state.read_status = AccessStatus::Granted;
+        runtime_state.write_status = AccessStatus::Granted;
+        runtime_state.current_progress = 7;
+        runtime_state.authority = Some(AdmittedAuthority {
+            local_identity: source.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: current.clone(),
+            switchover_handoff: None,
+        });
+    }
+    let command = PrepareSwitchover {
+        operation_id: OperationId::new("prepare-1"),
+        request_id: SwitchoverRequestId::new("request-1"),
+        local_replica_id: source.replica_id,
+        expected_instance_id: source.instance_id.clone(),
+        expected_agent_generation: source.agent_generation.clone(),
+        source,
+        target: target.clone(),
+        current_configuration: current,
+    };
+    let coordinator = Coordinator::new(store.clone(), runtime.clone());
+    runtime.fail_once("prepare-switchover");
+    assert!(
+        coordinator
+            .ensure_switchover_prepared(command.clone())
+            .await
+            .is_err()
+    );
+    let interrupted = store.load_state().await.unwrap();
+    assert!(interrupted.pending_effect.is_some());
+    assert!(interrupted.prepared_switchover.is_none());
+
+    let reopened = Arc::new(
+        SqliteStore::open_existing(SqliteStore::metadata_database_path(directory.path()), None)
+            .unwrap(),
+    );
+    let restarted_runtime = Arc::new(FakeRuntime::new());
+    {
+        let mut runtime_state = restarted_runtime.state.lock().unwrap();
+        runtime_state.role = ReplicaRole::Primary;
+        runtime_state.read_status = AccessStatus::Granted;
+        runtime_state.write_status = AccessStatus::Granted;
+        runtime_state.current_progress = 7;
+        runtime_state.authority = Some(AdmittedAuthority {
+            local_identity: command.source.clone(),
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: command.current_configuration.clone(),
+            switchover_handoff: None,
+        });
+    }
+    let restarted = Coordinator::new(reopened.clone(), restarted_runtime.clone());
+    let prepared = restarted
+        .ensure_switchover_prepared(command.clone())
+        .await
+        .unwrap();
+    assert_eq!(prepared.handoff_lsn, 7);
+    assert_eq!(
+        reopened.load_state().await.unwrap().prepared_switchover,
+        Some(prepared.clone())
+    );
+    let calls = restarted_runtime.calls.lock().unwrap().clone();
+    assert_eq!(
+        restarted
+            .ensure_switchover_prepared(command.clone())
+            .await
+            .unwrap(),
+        prepared
+    );
+    assert_eq!(*restarted_runtime.calls.lock().unwrap(), calls);
+    assert_eq!(
+        restarted
+            .ensure_switchover_prepared(command.clone())
+            .await
+            .unwrap(),
+        prepared
+    );
+
+    let mut changed = command;
+    changed.target = target;
+    changed.request_id = SwitchoverRequestId::new("changed");
+    assert!(restarted.ensure_switchover_prepared(changed).await.is_err());
 }
 
 #[tokio::test]
@@ -535,6 +679,7 @@ async fn failover_updates_epoch_before_get_lsn_and_can_publish_no_write_quorum()
             transition_kind: None,
             previous_configuration: None,
             current_configuration: previous.clone(),
+            switchover_handoff: None,
         });
     }
     let coordinator = Coordinator::new(store.clone(), runtime.clone());
@@ -831,6 +976,7 @@ async fn current_only_replay_resumes_after_durable_pc_removal() {
             transition_kind: Some(TransitionKind::Replacement),
             previous_configuration: Some(previous),
             current_configuration: current.clone(),
+            switchover_handoff: None,
         });
     }
     let command = EnsureConfiguration {

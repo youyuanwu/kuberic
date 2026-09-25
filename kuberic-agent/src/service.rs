@@ -618,10 +618,11 @@ where
                     .await
                     .map_err(status_from_agent)?;
             }
-            ProtocolCommand::PrepareSwitchover(_) => {
-                return Err(Status::failed_precondition(
-                    "planned switchover preparation is not enabled",
-                ));
+            ProtocolCommand::PrepareSwitchover(command) => {
+                self.coordinator
+                    .ensure_switchover_prepared(*command)
+                    .await
+                    .map_err(status_from_agent)?;
             }
             ProtocolCommand::EnsureReplicaBuild(command) => {
                 if let (Some(authority), Some(source_session_id)) =

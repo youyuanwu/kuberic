@@ -855,6 +855,7 @@ pub fn validate_status(status: &AcceptedStatus) -> Result<(), ValidationError> {
                         || handoff.target != switchover.target
                         || handoff.starting_configuration_id
                             != topology.configuration.configuration_id
+                        || handoff.starting_epoch != topology.configuration.epoch
                     {
                         return Err(ValidationError::InvalidSwitchoverHandoff);
                     }
@@ -968,6 +969,8 @@ fn validate_switchover_handoff(
         || !valid_exact_identity(&handoff.source)
         || !valid_exact_identity(&handoff.target)
         || handoff.starting_configuration_id.is_empty()
+        || handoff.starting_epoch.data_loss_number < 0
+        || handoff.starting_epoch.configuration_number < 0
         || handoff.handoff_lsn < 0
     {
         return Err(ValidationError::InvalidSwitchoverHandoff);

@@ -343,6 +343,7 @@ fn planned_switchover_configuration_round_trip_preserves_handoff() {
         target: Some(target.clone().into()),
         starting_configuration_id: previous.configuration_id.to_string(),
         handoff_lsn: 12,
+        starting_epoch: Some(previous.epoch.into()),
     };
     let request = proto::ExecuteCommandRequest {
         protocol_version: kuberic_protocol::PROTOCOL_VERSION,
@@ -662,6 +663,7 @@ fn prepared_switchover_report_survives_protobuf_round_trip() {
             target: Some(target.into()),
             starting_configuration_id: configuration.configuration_id.to_string(),
             handoff_lsn: 12,
+            starting_epoch: Some(configuration.epoch.into()),
         }),
         ..Default::default()
     };

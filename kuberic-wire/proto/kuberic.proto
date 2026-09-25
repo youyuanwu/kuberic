@@ -64,6 +64,7 @@ message SwitchoverHandoff {
   ReplicaIdentity target = 4;
   string starting_configuration_id = 5;
   int64 handoff_lsn = 6;
+  Epoch starting_epoch = 7;
 }
 
 message ReplicaIdentity {

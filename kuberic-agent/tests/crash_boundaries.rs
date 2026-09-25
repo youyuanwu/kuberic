@@ -18,11 +18,11 @@ use kuberic_agent::state::{
 };
 use kuberic_agent::store::{AgentStore, BeginConfiguration, BeginEffect};
 use kuberic_agent::{AgentError, Result};
-use kuberic_protocol::command::EnsureConfiguration;
+use kuberic_protocol::command::{EnsureConfiguration, PrepareSwitchover};
 use kuberic_protocol::types::{
     AccessStatus, AgentGeneration, ConfigurationDescriptor, ConfigurationMember, EffectivePolicy,
     Epoch, InitializationId, OperationId, PodUid, PvcUid, ReplicaId, ReplicaIdentity,
-    ReplicaInstanceId, ReplicaRole, ResourceUid, TransitionKind,
+    ReplicaInstanceId, ReplicaRole, ResourceUid, SwitchoverRequestId, TransitionKind,
 };
 use kuberic_runtime::application::{
     CopyChunk, DurableApplicationAck, DurableApplicationProgress, OpenContext, Operation,
@@ -31,6 +31,7 @@ use kuberic_runtime::application::{
 use kuberic_runtime::engine::{DurableState, RetainedOperationStream};
 use kuberic_runtime::replicator::{DefaultReplicatorFactory, Replicator, ReplicatorSettings};
 use kuberic_runtime::{Result as RuntimeResult, RuntimeError};
+use kuberic_runtime_internal::authority::{AdmittedAuthority, ReplicaAuthorityStore};
 use kuberic_runtime_internal::effects::{
     OpenMode, RuntimeEffect, RuntimeEffectAction, RuntimeEffectResult, RuntimePostcondition,
     RuntimeSnapshot,
@@ -403,6 +404,80 @@ fn real_runtime(
     )
 }
 
+fn switchover_storage_identity() -> StorageIdentity {
+    StorageIdentity {
+        effective_policy: EffectivePolicy::fixed(2, 30).unwrap(),
+        ..storage_identity()
+    }
+}
+
+fn switchover_configuration() -> ConfigurationDescriptor {
+    let source = switchover_storage_identity().local_identity;
+    ConfigurationDescriptor::new(
+        Epoch::new(0, 1),
+        source.replica_id,
+        vec![
+            ConfigurationMember {
+                identity: source,
+                role: ReplicaRole::Primary,
+            },
+            ConfigurationMember {
+                identity: ReplicaIdentity {
+                    replica_id: ReplicaId::new(2),
+                    instance_id: ReplicaInstanceId::new("pod-2"),
+                    agent_generation: AgentGeneration::new("generation-2"),
+                },
+                role: ReplicaRole::ActiveSecondary,
+            },
+        ],
+        2,
+    )
+}
+
+fn switchover_prepare_command() -> PrepareSwitchover {
+    let source = switchover_storage_identity().local_identity;
+    let configuration = switchover_configuration();
+    PrepareSwitchover {
+        operation_id: OperationId::new("real-switchover-prepare"),
+        request_id: SwitchoverRequestId::new("real-switchover-request"),
+        local_replica_id: source.replica_id,
+        expected_instance_id: source.instance_id.clone(),
+        expected_agent_generation: source.agent_generation.clone(),
+        source,
+        target: configuration.members[1].identity.clone(),
+        current_configuration: configuration,
+    }
+}
+
+fn switchover_runtime_effect(command: &PrepareSwitchover, sequence: u64) -> RuntimeEffect {
+    RuntimeEffect {
+        operation_id: command.operation_id.clone(),
+        sequence,
+        action: RuntimeEffectAction::PrepareSwitchover {
+            request_id: command.request_id.clone(),
+            source: command.source.clone(),
+            target: command.target.clone(),
+            starting_configuration_id: command.current_configuration.configuration_id.clone(),
+            starting_epoch: command.current_configuration.epoch,
+        },
+    }
+}
+
+fn switchover_real_runtime(
+    store: Arc<SqliteStore>,
+    application_path: &Path,
+) -> (Arc<PodRuntime>, Arc<CrashState>) {
+    let application = Arc::new(CrashState::open(application_path));
+    (
+        Arc::new(PodRuntime::new(
+            switchover_storage_identity().local_identity,
+            application.clone(),
+            store,
+        )),
+        application,
+    )
+}
+
 fn seeded_operation() -> Operation {
     Operation {
         lsn: 1,
@@ -430,6 +505,78 @@ fn result() -> RuntimeEffectResult {
             catch_up_complete: false,
             builds: Vec::new(),
         },
+    }
+}
+
+fn switchover_effect() -> RuntimeEffect {
+    let authority = switchover_authority();
+    RuntimeEffect {
+        operation_id: OperationId::new("prepare-switchover-1"),
+        sequence: 1,
+        action: RuntimeEffectAction::PrepareSwitchover {
+            request_id: SwitchoverRequestId::new("request-1"),
+            source: storage_identity().local_identity,
+            target: ReplicaIdentity {
+                replica_id: ReplicaId::new(2),
+                instance_id: ReplicaInstanceId::new("pod-2"),
+                agent_generation: AgentGeneration::new("generation-2"),
+            },
+            starting_configuration_id: authority.current_configuration.configuration_id,
+            starting_epoch: authority.current_configuration.epoch,
+        },
+    }
+}
+
+fn switchover_result() -> RuntimeEffectResult {
+    let authority = switchover_authority();
+    RuntimeEffectResult {
+        operation_id: OperationId::new("prepare-switchover-1"),
+        sequence: 1,
+        postcondition: RuntimePostcondition {
+            open: true,
+            role: ReplicaRole::Primary,
+            role_transition: None,
+            read_status: AccessStatus::Granted,
+            write_status: AccessStatus::ReconfigurationPending,
+            authority: Some(authority),
+            current_progress: 9,
+            verified_replication_lsn: Some(9),
+            committed_lsn: 7,
+            current_configuration_quorum_progress: 9,
+            catch_up_boundary: None,
+            catch_up_complete: true,
+            builds: Vec::new(),
+        },
+    }
+}
+
+fn switchover_authority() -> AdmittedAuthority {
+    let source = storage_identity().local_identity;
+    let target = ReplicaIdentity {
+        replica_id: ReplicaId::new(2),
+        instance_id: ReplicaInstanceId::new("pod-2"),
+        agent_generation: AgentGeneration::new("generation-2"),
+    };
+    AdmittedAuthority {
+        local_identity: source.clone(),
+        transition_kind: None,
+        previous_configuration: None,
+        current_configuration: ConfigurationDescriptor::new(
+            Epoch::new(0, 1),
+            source.replica_id,
+            vec![
+                ConfigurationMember {
+                    identity: source,
+                    role: ReplicaRole::Primary,
+                },
+                ConfigurationMember {
+                    identity: target,
+                    role: ReplicaRole::ActiveSecondary,
+                },
+            ],
+            2,
+        ),
+        switchover_handoff: None,
     }
 }
 
@@ -654,6 +801,7 @@ fn configuration_boundaries_survive_process_termination_without_destructors() {
                     EffectStage::IntentCommitted
                 );
             }
+
             "effect-complete-before-stage-advance" => {
                 assert_eq!(
                     state.reconfiguration.unwrap().stage,
@@ -677,6 +825,110 @@ fn configuration_boundaries_survive_process_termination_without_destructors() {
             }
             _ => unreachable!(),
         }
+    }
+}
+
+#[test]
+fn switchover_preparation_boundaries_survive_process_termination() {
+    for boundary in ["pending-effect", "effect-applied", "effect-completed"] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "switchover_preparation_writer_process",
+            ])
+            .env("KUBERIC_SWITCHOVER_PATH", &path)
+            .env("KUBERIC_SWITCHOVER_BOUNDARY", boundary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "switchover child failed at {boundary}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(SqliteStore::open_existing(&path, None).unwrap());
+            if boundary != "effect-completed" {
+                let adapter = RuntimeAdapter::new(
+                    store.clone(),
+                    Arc::new(FakeRuntime {
+                        calls: AtomicUsize::new(0),
+                        result: switchover_result(),
+                    }),
+                );
+                adapter.resume_pending().await.unwrap();
+            }
+            let state = store.load_state().await.unwrap();
+            assert!(state.pending_effect.is_none());
+            let prepared = state.prepared_switchover.unwrap();
+            assert_eq!(
+                prepared.preparation_operation_id,
+                switchover_effect().operation_id
+            );
+            assert_eq!(prepared.handoff_lsn, 9);
+        });
+    }
+}
+
+#[test]
+fn real_runtime_switchover_preparation_recovers_after_process_termination() {
+    for boundary in ["pending-effect", "effect-applied", "effect-completed"] {
+        let directory = tempdir().unwrap();
+        let path = SqliteStore::metadata_database_path(directory.path());
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "real_switchover_preparation_writer_process",
+            ])
+            .env("KUBERIC_REAL_SWITCHOVER_PATH", &path)
+            .env("KUBERIC_REAL_SWITCHOVER_BOUNDARY", boundary)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "real switchover child failed at {boundary}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let store = Arc::new(
+                SqliteStore::open_existing(&path, Some(&switchover_storage_identity())).unwrap(),
+            );
+            let state = store.load_state().await.unwrap();
+            let application_path = crash_application_path(&path);
+            let (pod, application) = switchover_real_runtime(store.clone(), &application_path);
+            assert!(
+                application
+                    .verify_applied(&seeded_operation())
+                    .await
+                    .unwrap()
+            );
+            pod.reconstruct(
+                OpenMode::Existing,
+                state.role,
+                state.read_status,
+                state.write_status,
+                None,
+            )
+            .await
+            .unwrap();
+            let coordinator = Coordinator::new(store.clone(), pod);
+            let prepared = coordinator
+                .ensure_switchover_prepared(switchover_prepare_command())
+                .await
+                .unwrap();
+            assert!(prepared.handoff_lsn >= 1);
+            let recovered = store.load_state().await.unwrap();
+            assert!(recovered.pending_effect.is_none());
+            assert_eq!(recovered.write_status, AccessStatus::ReconfigurationPending);
+            assert_eq!(recovered.prepared_switchover, Some(prepared));
+        });
     }
 }
 
@@ -806,6 +1058,7 @@ fn crash_boundary_writer_process() {
                     BeginEffect::Execute(effect())
                 );
             }
+
             "effect-complete-before-stage-advance" => {
                 assert!(matches!(
                     store
@@ -845,6 +1098,101 @@ fn crash_boundary_writer_process() {
                     .unwrap();
             }
             _ => panic!("unknown crash boundary {boundary}"),
+        }
+    });
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "helper process for switchover_preparation_boundaries_survive_process_termination"]
+fn switchover_preparation_writer_process() {
+    let (Ok(path), Ok(boundary)) = (
+        env::var("KUBERIC_SWITCHOVER_PATH"),
+        env::var("KUBERIC_SWITCHOVER_BOUNDARY"),
+    ) else {
+        return;
+    };
+    let store = SqliteStore::create_authorized(path, AgentState::new(storage_identity())).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let effect = switchover_effect();
+        store.begin_effect(&effect).await.unwrap();
+        match boundary.as_str() {
+            "pending-effect" => {}
+            "effect-applied" => {
+                store.mark_effect_applied(&effect).await.unwrap();
+            }
+            "effect-completed" => {
+                store.mark_effect_applied(&effect).await.unwrap();
+                store.complete_effect(&switchover_result()).await.unwrap();
+            }
+            _ => panic!("unknown switchover boundary {boundary}"),
+        }
+    });
+    std::process::exit(0);
+}
+
+#[test]
+#[ignore = "helper process for real_runtime_switchover_preparation_recovers_after_process_termination"]
+fn real_switchover_preparation_writer_process() {
+    let (Ok(path), Ok(boundary)) = (
+        env::var("KUBERIC_REAL_SWITCHOVER_PATH"),
+        env::var("KUBERIC_REAL_SWITCHOVER_BOUNDARY"),
+    ) else {
+        return;
+    };
+    let configuration = switchover_configuration();
+    let mut state = AgentState::new(switchover_storage_identity());
+    state.highest_epoch = configuration.epoch;
+    state.current_configuration = Some(configuration.clone());
+    state.role = ReplicaRole::Primary;
+    state.read_status = AccessStatus::Granted;
+    state.write_status = AccessStatus::Granted;
+    let store = Arc::new(SqliteStore::create_authorized(&path, state).unwrap());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let authority = AdmittedAuthority {
+            local_identity: switchover_storage_identity().local_identity,
+            transition_kind: None,
+            previous_configuration: None,
+            current_configuration: configuration,
+            switchover_handoff: None,
+        };
+        store.admit(&authority).await.unwrap();
+        let application_path = crash_application_path(Path::new(&path));
+        let (pod, application) = switchover_real_runtime(store.clone(), &application_path);
+        application.apply(seeded_operation()).await.unwrap();
+        application.commit(1).await.unwrap();
+        pod.reconstruct(
+            OpenMode::Existing,
+            ReplicaRole::Primary,
+            AccessStatus::Granted,
+            AccessStatus::Granted,
+            None,
+        )
+        .await
+        .unwrap();
+        let command = switchover_prepare_command();
+        let effect = switchover_runtime_effect(
+            &command,
+            store.load_state().await.unwrap().next_effect_sequence,
+        );
+        match boundary.as_str() {
+            "pending-effect" => {
+                store.begin_effect(&effect).await.unwrap();
+            }
+            "effect-applied" => {
+                store.begin_effect(&effect).await.unwrap();
+                pod.apply_effect(effect.clone()).await.unwrap();
+                store.mark_effect_applied(&effect).await.unwrap();
+            }
+            "effect-completed" => {
+                Coordinator::new(store.clone(), pod)
+                    .ensure_switchover_prepared(command)
+                    .await
+                    .unwrap();
+            }
+            _ => panic!("unknown real switchover boundary {boundary}"),
         }
     });
     std::process::exit(0);

@@ -653,13 +653,32 @@ pub fn validate_execute_request(request: &proto::ExecuteCommandRequest) -> Resul
                         .iter()
                         .any(|member| member.identity == handoff.target);
                 let previous_matches_handoff = previous.as_ref().is_none_or(|configuration| {
-                    configuration.configuration_id == handoff.starting_configuration_id
-                        && configuration.members.iter().any(|member| {
-                            member.identity == handoff.source && member.role == ReplicaRole::Primary
-                        })
-                        && configuration.members.iter().any(|member| {
-                            member.identity == handoff.target && member.role != ReplicaRole::Primary
-                        })
+                    let source_is_primary = configuration.members.iter().any(|member| {
+                        member.identity == handoff.source && member.role == ReplicaRole::Primary
+                    });
+                    let target_is_primary = configuration.members.iter().any(|member| {
+                        member.identity == handoff.target && member.role == ReplicaRole::Primary
+                    });
+                    let exact_members_present = configuration
+                        .members
+                        .iter()
+                        .any(|member| member.identity == handoff.source)
+                        && configuration
+                            .members
+                            .iter()
+                            .any(|member| member.identity == handoff.target);
+                    exact_members_present
+                        && if source_is_primary {
+                            configuration.configuration_id == handoff.starting_configuration_id
+                                && configuration.epoch == handoff.starting_epoch
+                        } else {
+                            target_is_primary
+                                && current.primary_id == handoff.source.replica_id
+                                && configuration.epoch.data_loss_number
+                                    == handoff.starting_epoch.data_loss_number
+                                && configuration.epoch.configuration_number
+                                    > handoff.starting_epoch.configuration_number
+                        }
                 });
                 let retirement_ids = command
                     .retire_switchover_preparation_ids
@@ -1324,6 +1343,7 @@ impl From<SwitchoverHandoff> for proto::SwitchoverHandoff {
             target: Some(handoff.target.into()),
             starting_configuration_id: handoff.starting_configuration_id.to_string(),
             handoff_lsn: handoff.handoff_lsn,
+            starting_epoch: Some(handoff.starting_epoch.into()),
         }
     }
 }
@@ -1360,6 +1380,10 @@ fn switchover_handoff_from_proto(
             .ok_or(WireError::MissingField("switchover_handoff.target"))?
             .try_into()?,
         starting_configuration_id: ConfigurationId::new(handoff.starting_configuration_id),
+        starting_epoch: handoff
+            .starting_epoch
+            .ok_or(WireError::MissingField("switchover_handoff.starting_epoch"))?
+            .into(),
         handoff_lsn: handoff.handoff_lsn,
     };
     if handoff.source == handoff.target {
