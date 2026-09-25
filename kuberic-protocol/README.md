@@ -5,6 +5,7 @@ Pure domain model for the level-triggered Kuberic stack.
 The crate defines:
 
 - replica identity, epoch, PC/CC, topology, provisioning, and transition types;
+- explicit switchover requests, frozen handoffs, and terminal receipts;
 - normalized Kubernetes and replica-agent observations;
 - fenced protocol commands and reconciliation plans;
 - validation for quorum, incarnation, epoch, and transition invariants;
@@ -15,9 +16,9 @@ dependencies. Controllers and agents exchange these canonical types through
 transport adapters such as `kuberic-wire`.
 
 The evaluator covers write-closed bootstrap, same-cardinality replacement,
-ordinary failover, and quorum loss. Failover persists exact failure timing,
-fences routing before newer authority, requires PC and outstanding-CC read
-quorum, selects from epoch-fenced deactivation/progress evidence, authorizes
+ordinary failover, planned switchover, and quorum loss. Failover persists exact
+failure timing, fences routing before newer authority, requires PC and
+outstanding-CC read quorum, selects from epoch-fenced deactivation/progress evidence, authorizes
 only the elected safe prefix under the new fence, performs retained-history or
 full-copy repair, and accepts only current-only quorum evidence. Quorum loss
 publishes `NoWriteQuorum` without changing the data-loss epoch and restores
@@ -36,9 +37,16 @@ configuration or infer authority from Kubernetes readiness, routing, or raw
 application progress.
 
 The supported evaluator contract is fixed-cardinality bootstrap,
-same-cardinality replacement, ordinary failover, planned switchover, and non-destructive quorum
-loss/recovery. Scaling, timed replica dropping, destructive
-data-loss recovery, and mixed-version negotiation remain fail-closed.
+same-cardinality replacement, ordinary failover, planned switchover, and
+non-destructive quorum loss/recovery. Scaling, timed replica dropping,
+destructive data-loss recovery, and mixed-version negotiation remain fail-closed.
+
+Switchover requires a nonempty request ID and a committed logical secondary
+ID. Identical active or latest-receipted requests are idempotent; cancellation,
+retargeting, and conflicting reuse of that receipt's ID are rejected through
+conditions. Only one terminal receipt is retained, not an operation history.
+Admission rejection uses `SwitchoverRejected`; the receipt enum's `rejected`
+value is reserved and not currently emitted by the evaluator.
 
 Planned switchover freezes an exact source, named target, membership, policy,
 and handoff certificate. Definitive target loss before authority admission

@@ -24,9 +24,11 @@ certificate used to close failover catch-up without treating raw application
 progress as quorum credit.
 Protocol version 4 binds every control command dispatch to the exact observed
 target process session and adds the planned-switchover command and handoff wire
-contracts used by canonical request and receipt authority. Planned-switchover
-execution remains fail-closed until its evaluator and runtime phases are
-implemented.
+contracts used by canonical request and receipt authority. These contracts now
+have supported evaluator, agent, and runtime execution: `PrepareSwitchover`
+returns durable write-closed handoff evidence, and configuration commands carry
+the certificate and exact preparation-retirement IDs. They are no longer
+reserved for a future execution phase.
 
 `kuberic-wire` contains transport definitions only; protocol decisions remain
 in `kuberic-protocol`.
@@ -37,6 +39,9 @@ sender and receiver process-session IDs; the agent rejects retired sessions
 before runtime mutation. Agent reports include independent read/write access,
 quorum/catch-up progress, deactivation evidence, load/fault reports, and
 pending or retained command identity.
+Reports also expose retained preparation evidence. A durable operation can be
+replayed after restart, but each dispatch must use the freshly observed target
+process session; the session is an envelope fence, not part of its durable ID.
 Deactivation evidence carries its own epoch with the LSN so later
 configurations cannot relabel historical evidence.
 

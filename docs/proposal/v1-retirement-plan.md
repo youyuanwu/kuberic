@@ -1,6 +1,7 @@
 # Kuberic v1 Retirement Plan
 
-> **Status:** Proposed
+> **Status:** In progress — Workstream 1 implemented and validated; broader
+> retirement remains proposed.
 >
 > **Goal:** Make the level-triggered stack the default Kuberic implementation,
 > deprecate the classic v1 stack, and eventually remove it.
@@ -23,7 +24,7 @@ available or destructive recovery path.
 
 The work should proceed in this order:
 
-1. Add planned switchover to v2.
+1. Add planned switchover to v2 — implemented and validated.
 2. Add scale-up and scale-down to v2.
 3. Add a v2 SQLite application.
 4. Move the PostgreSQL application to v2.
@@ -75,20 +76,22 @@ The level-triggered stack already supports:
 - quorum replication with authority-bound progress;
 - exact-incarnation, same-cardinality replica replacement;
 - ordinary primary failover;
+- explicit named-target planned switchover with durable handoff, restoration,
+  newer-epoch compensation, and terminal write-closed Unsafe outcomes;
 - retained-history repair and full-copy fallback;
 - explicit quorum-loss write blocking and non-destructive recovery;
 - restart recovery for the controller, replica agent, runtime, and
   application;
 - bounded level-triggered reconciliation and stale-command fencing;
 - the `kvstore2` conformance application;
-- isolated KinD bootstrap, replacement, failover, quorum-loss, and
-  adversarial test scenarios.
+- isolated KinD bootstrap, replacement, failover, quorum-loss, healthy
+  switchover, and adversarial restart/target-loss test scenarios.
 
 The principal retirement gaps are:
 
 | Area | Classic v1 | Level-triggered v2 | Retirement disposition |
 |---|---|---|---|
-| Planned switchover | Supported | Not supported | Implement first |
+| Planned switchover | Supported | Explicit named-target request supported and validated | Workstream 1 complete |
 | Scale up/down | Supported | Fixed cardinality | Implement after switchover |
 | KVStore | Supported | `kvstore2` supported | Make v2 the default |
 | SQLite | Supported | Not ported | Add a v2 application |
@@ -103,29 +106,43 @@ The principal retirement gaps are:
 
 ## Workstream 1: Planned Switchover
 
-Planned switchover is the first implementation workstream. It provides
-controlled primary movement for maintenance and establishes the ordering
-primitive needed by later operational features.
+**Implemented and validated.** The
+[planned-switchover guide](../features/kuberic/level-triggered-operator.md#planned-switchover)
+describes the as-built request and operational contract.
 
-The design must:
+- `spec.switchover` names a unique request ID and committed logical secondary;
+  acceptance freezes exact source/target identities, membership, and policy.
+  An active request cannot be cancelled or retargeted. Identical active or
+  latest-receipted requests are idempotent; status retains only the latest receipt.
+- Protocol version 4 fences each control dispatch to the observed process
+  session. Durable preparation closes source writes and records a handoff
+  certificate; target catch-up must use authority-verified progress.
+- Write-closed PC/CC and current-only convergence precede accepted topology,
+  write grant, and exact-Pod routing. Membership and data-loss authority remain
+  unchanged; configuration authority only advances.
+- Definitive target loss before newer-authority admission permits
+  original-authority restoration. After admission, only evidence-proven,
+  strictly newer-epoch compensation can restore the old primary. Impossible
+  completion converges every possible writer to closed or absent before
+  publishing Unsafe. There is no destructive data-loss recovery.
+- Durable replica-local effects and fresh observation resolve restarts and
+  ambiguous replies without a controller phase journal. Writes and connections
+  may be briefly interrupted; zero downtime and a fixed completion time are not
+  promised.
 
-- expose a declarative, idempotent primary-movement request;
-- durably fence the request to the resource, epoch, PC/CC authority, target
-  identity, and process session;
-- revoke and drain writes before demoting the old primary;
-- prove the target is caught up before promotion;
-- promote exactly one primary and publish routing only after authority is
-  accepted;
-- recover from controller, agent, runtime, and Pod restarts at every ordering
-  boundary;
-- reject stale, conflicting, or impossible requests;
-- fail closed when the old primary cannot be safely demoted or the target
-  cannot be safely promoted;
-- define cancellation and supersession behavior without reintroducing a
-  controller-owned phase journal.
+Validation includes pure evaluator/recovery models, runtime write-completion
+races, durable agent subprocess crash boundaries, controller ambiguity/session
+tests, and isolated healthy/adversarial KinD scenarios. The standalone healthy
+run took 15.1 s total / 8.2 s after readiness. Two fresh full matrices measured
+healthy 4.2/4.3 s and adversarial 44.5/48.8 s; the strict retained-session
+rejection adversarial rerun took 45.2 s. All owned clusters and kubeconfigs were
+cleaned. These are scenario timings, not outage guarantees.
 
-Completion requires pure evaluator tests, durable agent/runtime crash tests,
-and an isolated KinD switchover scenario.
+This completes only Workstream 1, not v1 retirement. Scaling is next, followed
+by SQLite, PostgreSQL, distribution, deprecation, and separately approved
+removal. Automatic target selection, cancellation/retargeting, node maintenance,
+rolling upgrades, destructive recovery, and data migration/import remain
+unsupported or deferred.
 
 ## Workstream 2: Scale Up and Scale Down
 
@@ -265,7 +282,8 @@ gone.
 
 V1 may be marked deprecated when:
 
-- planned switchover passes unit, crash-boundary, and KinD validation;
+- planned switchover passes unit, crash-boundary, and KinD validation
+  (**satisfied by Workstream 1**; must remain green);
 - scale-up and scale-down pass unit, crash-boundary, and KinD validation;
 - KVStore, SQLite, and PostgreSQL v2 applications pass their applicable
   bootstrap, replacement, failover, quorum-loss, switchover, and scaling
